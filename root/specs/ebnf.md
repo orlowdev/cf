@@ -55,8 +55,10 @@ the lexer takes the `!` into the identifier iff the next character is not `=`. S
 `alloc!` and `alloc!()` are one identifier, but `n != 0` and `n!= 0` both lex as
 `n`, `!=`, `0`. Write `alloc! = …` with a space so the `!` binds to the name
 rather than to the operator. (Because `!` is not a legal symbol character for the
-QBE/`as` backend, it is stripped from the emitted symbol — `alloc!` lowers to the
-symbol `alloc` — so a program may not define both `foo` and `foo!`.)
+QBE/`as` backend, it is mangled off the emitted symbol — internally to a `_b`
+suffix (`alloc!` → `alloc_b`), and stripped bare only for a C export
+(`alloc!` → `alloc`, which is why `foo` and `foo!` cannot both be exported to C).
+See the mangling scheme in [[order_of_compilation.md]].)
 
 ## Types
 
