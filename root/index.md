@@ -4,6 +4,7 @@
 
 - [[ebnf.md]]
 - [[memory_model.md]]
+- [[order_of_compilation.md]]
 - [[geometry_lowering.md]]
 - [[versioning.md]]
 - [[seed_subset.md]]
