@@ -1,6 +1,6 @@
 # C! Committing
 
-Every commit should be a single, self-contained change definition. If the change is too large, it should be broken down into smaller, self-contained changes. If the change is affecting the version (see [[versioning.md]] for details), the message should naturally reflect the kind of change being made:
+Every commit should be a single, self-contained change definition without a body. If the change is too large, it should be broken down into smaller, self-contained changes. If the change is affecting the version (see [[versioning.md]] for details), the message should naturally reflect the kind of change being made:
 
 - **Glory** commits start with `GLORIOUSLY` verbatim:
   - `GLORIOUSLY remove the lexer from the codebase`
