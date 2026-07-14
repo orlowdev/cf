@@ -255,9 +255,19 @@ same name). So with `const value = 1`, the literal `{ value }` means
 `{ value: value }`. Parsing forks on a single-token peek after the name: a `:`
 begins an explicit `field_init`, anything else (`,` or `}`) is a pun.
 
-A `{ … }` in value position is a data literal; a `{ … }` in statement position
-(a function body after `->`, a nested block) is a `block` — position
-disambiguates, as settled under Functions. Whether a data literal may be written
+A `{ … }` opens either a **`data_literal`** or a **`block`** — blocks are values
+too (see Blocks as Values under Expressions). In **statement** position (a
+function body after `->`, a nested block) it is always a `block`. In **value**
+position the two overlap, so a two-token peek past the `{` forks them:
+
+- `}` immediately → the empty `data_literal` (`{}`).
+- a `var_name` then `:`, `,`, or `}` → `data_literal` (an explicit field or a pun).
+- anything else → `block` — a statement keyword (`const`, `let`, `return`, `<-`),
+  or a `var_name` that continues as a statement rather than a field (`x = …`,
+  `x.f = …`, `x + 1`, `f(x)`), or any other expression-leading token.
+
+So `{ x }` stays the pun and a value block over `x` is `{ <- x }` (a value block
+must yield with `<-`, per Control Flow). Whether a data literal may be written
 without a type annotation (nominal vs structural typing) is a type-system
 decision, not grammar.
 
@@ -477,7 +487,7 @@ expression     = if_expr | match_expr | loop_expr | for_expr
                | pipe , [ "in" , logical_or ] ;   (* control-flow forms: see Control Flow / Pattern Matching / Loops; pipe + in clause: below *)
 pipe           = logical_or , { "|>" , pipe_target } ;   (* x |> f ≡ f(x); left-associative *)
 pipe_target    = postfix | defer_expr ;
-defer_expr     = "defer" , postfix ;                     (* tap: schedule the call at scope exit, yield its tapped argument *)
+defer_expr     = "defer" , ( postfix | block ) ;         (* tap a call (yield its arg) — or schedule a whole block at scope exit *)
 logical_or     = logical_and , { "||" , logical_and } ;
 logical_and    = comparison , { "&&" , comparison } ;
 comparison     = bit_or , [ comparison_op , bit_or ] ;   (* non-associative: no a < b < c *)
@@ -497,7 +507,7 @@ call           = [ type_args ] , "(" , [ argument , { "," , argument } ] , ")" ;
 type_args      = "[" , type_arg , { "," , type_arg } , "]" ;                        (* explicit generics: [Int], [8, Int] *)
 type_arg       = type | expression ;                                                (* Int (type)  |  8 (comptime value) *)
 argument       = expression ;
-primary        = var_name | value | "(" , expression , ")" ;
+primary        = var_name | value | block | "(" , expression , ")" ;   (* a block is a value too — see Blocks as Values; forks from a data_literal by a two-token peek *)
 ```
 
 Each tier binds tighter than the one above and is left-associative, so
@@ -517,6 +527,31 @@ aggregate pointer is reached through `.field` (which auto-dereferences) and
 needed (see [[memory_model.md]]). Arithmetic operands must be numbers and bitwise
 operands integers — type rules, not grammar. Braces are never grouping; they
 belong to data literals and to blocks.
+
+**Blocks are values, placed narrowly.** A `block` (defined under Functions) is
+grammatically a `primary`, but as a value it is well-formed in only two spots:
+the **right-hand side of a binding or assignment**, and as a **standalone
+statement** (run for its scope and effects). It is deliberately kept out of
+argument, operand, index, aggregate-element, and pipe positions — a block buried
+inside a call or expression would clutter the reading. That restriction is a
+semantic check, exactly as with lvalue-ness and the `in` clause: the grammar
+admits the block and the checker rejects the misplaced ones.
+
+```
+let x = {
+  const a = compute()
+  <- a.total
+}
+```
+
+runs the block as its own scope and binds its `<-` yield — the same block that
+heads a lambda body or an `if`/`match` branch, so it keeps the same rule: **a
+block used as a value must yield with `<-`** (no `<-` → no value, rejected where a
+value is wanted). Against a `data_literal` the fork is the two-token peek in Data
+Literals: `{ x }` is the pun, `{ <- x }` the value block. Because a block is an
+ordinary nested scope, an aggregate it yields escapes through the `<-` exactly as
+a returned value does, and its own residue dies at the block's scope exit
+(`on_ret`; see [[memory_model.md]]).
 
 The index is grammatically an integer literal or a variable; which is _legal_
 depends on the receiver's type (a semantic rule — see Aggregate Literals). Arrays,
@@ -626,6 +661,22 @@ mid-chain (`x |> f |> defer log |> g`). Which argument is the tapped one when a
 call takes several, when deferred cleanups fire, and their order (LIFO), are
 semantic rules.
 
+**`defer { … }`** defers a whole **block** instead of a single call. The block is
+an ordinary nested scope — its own `on_scope_enter`/`on_scope_exit` (a nested mark
+on the ambient node, never a new node) — scheduled to run at scope exit. Unlike
+the call form it taps no argument and yields nothing, so it is a statement:
+
+```
+defer {
+  log(a)
+  free(b)
+}
+```
+
+and is **not** a pipe target: a block accepts no piped value. It is the deferred
+counterpart of the block-as-value form above; both reuse the one `block`
+production.
+
 The **`in` clause** is the single loosest-binding form, below even the pipe:
 `f() in arena` is `(f()) in arena`. It wires a call and its whole subtree to a
 **geometry** (a memory-placement policy — see the memory model); `arena` is an
@@ -732,7 +783,7 @@ param          = [ type ] , var_name | type , record_pattern ;   (* Int x  |  x 
 block          = "{" , { statement } , "}" ;
 statement      = var_decl | return_stmt | yield_stmt | assign_stmt | expression ;   (* (temporary) — widened further with more control flow *)
 return_stmt    = "return" , [ expression ] ;                   (* exits the whole function *)
-yield_stmt     = "<-" , expression ;                           (* yields a block's value; inside a loop it breaks the loop with that value *)
+yield_stmt     = "<-" , expression ;                           (* yields a block's value and ends the block (terminal, like return); inside a loop it breaks the loop with that value *)
 ```
 
 Examples:
@@ -784,7 +835,8 @@ Points:
   This settles the brace ambiguity flagged under Data Literals even though the
   body may now be a bare expression: a single-expression body that _is_ a data
   literal must be parenthesized — `-> ({ x: 0 })`. Inside a block, `{…}` in value
-  position is still a data literal.
+  position forks between a `data_literal` and a value `block` by the two-token
+  peek (see Data Literals).
 - **`(` opens a lambda vs. a group by lookahead to `->`.** In value position a
   `(` begins a `function`'s `param_list` iff the matching `)` (with an optional
   return `type`) is followed by `->`; otherwise it opens a parenthesized
@@ -963,12 +1015,16 @@ Points:
 - **A block branch yields with `<-`, never `return`.** `<-` (`yield_stmt`)
   propagates a value out of the block to the enclosing block-expression; `return`
   forcefully exits the whole _function_. A block's value is therefore never
-  "just the last line" — it is exactly what `<-` yields.
+  "just the last line" — it is exactly what `<-` yields. **`<-` is terminal**,
+  like `return`: it ends its block (or breaks its enclosing loop — see Loops)
+  with that value, so a block holds at most one live `<-`, and any statements
+  after it are unreachable and ignored — write `<-` last.
 - **`if c then { x }` is invalid.** A block in value position must yield through
   `<-`: write the single-line `then x`, or `then { <- x }` if a block is truly
   wanted. A block whose body is a bare expression with no `<-` yields nothing, so
-  it is rejected wherever a value is expected. This is a semantic
-  well-formedness rule — the grammar admits the block; the checker rejects it.
+  it is rejected wherever a value is expected — in particular it **cannot be a
+  binding or assignment right-hand side**. This is a semantic well-formedness
+  rule — the grammar admits the block; the checker rejects it.
 - **`else` is optional, and its absence changes the type, not the grammar.** With
   both branches the value is their common type; with only `then`, the value is an
   `Option` — `Some(v)` when the branch runs, `None` when the condition is false
@@ -1261,8 +1317,35 @@ A **module is a `.cf` file**. Its top level is a sequence of imports and
 declarations in any order; there is no separate module keyword or wrapper.
 
 ```ebnf
-module = { import_decl | declaration } ;
+module        = { module_item } ;
+module_item   = import_decl | declaration | comptime_if ;   (* comptime_if: build-time selection, below *)
+comptime_if   = "if" , expression , "then" , module_branch , [ "else" , module_branch ] ;
+module_branch = module_item | "{" , { module_item } , "}" ;   (* one item, or a braced group *)
 ```
+
+A **`comptime_if`** brings **build-time conditional compilation** to the top
+level. It reuses `if … then … else` — position tells it from the value-level
+`if_expr`, since a module item is never an expression — but it is evaluated at
+**comptime**, during import resolution, against comptime-known values, chiefly the
+compiler-supplied `"comptime"` module (`os`, `arch`, and the target). Exactly one
+branch's items survive into the module; the losing branch and the `if` scaffolding
+itself dissolve. It **surrounds** items — imports never branch internally — so it
+is how a single name resolves to a different backing per target:
+
+```
+import "comptime" as { os, arch, Os, Arch }
+
+if os.target == Os.Darwin then
+  if arch.target == Arch.Arm64 then import "sys/darwin/arm64" as { read_file }
+  else import "sys/darwin/amd64" as { read_file }
+else import "sys/linux" as { read_file }
+```
+
+Exactly one `read_file` reaches the rest of the module and the selection leaves no
+trace. `else if` chains for free (a `module_branch` may itself be a `comptime_if`),
+and a branch may brace a group of items. That the condition must be
+comptime-evaluable, and the `"comptime"` module's full surface, are semantic
+concerns — the latter its own deferred spec; the grammar only admits the form.
 
 Another module is named by a **path string with no `.cf` extension**
 (`"std/mem"`), resolved to a file by the toolchain — a semantic concern. A
