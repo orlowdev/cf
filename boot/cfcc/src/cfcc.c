@@ -90,7 +90,11 @@ typedef enum {
 	TK_LBRACKET,
 	TK_RBRACKET,
 	TK_COMMA,
-	TK_STAR,
+	TK_STAR,    /* * — multiply, and pointer types */
+	TK_PLUS,
+	TK_MINUS,
+	TK_SLASH,
+	TK_PERCENT,
 	TK_EQ,
 	TK_ARROW, /* -> */
 } TokKind;
@@ -192,6 +196,10 @@ static void lex(Lexer *lx) {
 		case ']': push_tok(lx, TK_RBRACKET, s + lx->pos, 1, 0); lx->pos++; continue;
 		case ',': push_tok(lx, TK_COMMA, s + lx->pos, 1, 0); lx->pos++; continue;
 		case '*': push_tok(lx, TK_STAR, s + lx->pos, 1, 0); lx->pos++; continue;
+		case '+': push_tok(lx, TK_PLUS, s + lx->pos, 1, 0); lx->pos++; continue;
+		case '-': push_tok(lx, TK_MINUS, s + lx->pos, 1, 0); lx->pos++; continue; /* -> handled above */
+		case '/': push_tok(lx, TK_SLASH, s + lx->pos, 1, 0); lx->pos++; continue;
+		case '%': push_tok(lx, TK_PERCENT, s + lx->pos, 1, 0); lx->pos++; continue;
 		case '=': push_tok(lx, TK_EQ, s + lx->pos, 1, 0); lx->pos++; continue;
 		}
 		die(lx->line, "unexpected character");
@@ -218,14 +226,41 @@ typedef struct {
 	ParamKind kind;
 } Param;
 
+/* Expression AST. M0 bodies are word-valued integer expressions: literals, Int
+ * parameter references (argc), unary negation, and the binary arithmetic ops
+ * with the ebnf precedence (additive over multiplicative over unary). */
+typedef enum {
+	EX_INT,   /* integer literal (ival) */
+	EX_PARAM, /* reference to an Int parameter; QBE temp is %<name> */
+	EX_NEG,   /* unary minus (lhs) */
+	EX_ADD,
+	EX_SUB,
+	EX_MUL,
+	EX_DIV,
+	EX_REM,
+} ExprKind;
+
+typedef struct Expr Expr;
+struct Expr {
+	ExprKind kind;
+	long ival;       /* EX_INT */
+	char name[64];   /* EX_PARAM */
+	Expr *lhs, *rhs; /* operands (unary uses lhs) */
+};
+
+static Expr *new_expr(ExprKind kind) {
+	Expr *e = xmalloc(sizeof *e);
+	memset(e, 0, sizeof *e);
+	e->kind = kind;
+	return e;
+}
+
 /* The whole program the M0 slice can express: `main(params) -> body`, where the
- * body returns either an integer literal or one of main's Int parameters. */
+ * body is a word-valued integer expression returned as the exit code. */
 typedef struct {
 	Param params[3];
 	int nparams;
-	int returns_param;  /* body is a param reference (else an integer literal) */
-	char ret_name[64];  /* the referenced param name, when returns_param */
-	long exit_code;     /* the literal value, otherwise */
+	Expr *body;
 } Program;
 
 static Token *peek(Parser *p) {
@@ -326,46 +361,108 @@ static void parse_param(Parser *p, Param *out) {
 	advance(p);
 }
 
-/* The value a body returns: an integer literal (bounded to the `w` exit code) or
- * a reference to one of main's Int parameters (argc). */
-static void parse_body_value(Parser *p, Program *prog) {
+static Expr *parse_expr(Parser *p, Program *prog); /* forward */
+
+/* primary = INT | var_name | "(" expr ")"
+ * A var_name must resolve to one of main's Int parameters (only word-typed
+ * values flow through the integer expression grammar). */
+static Expr *parse_primary(Parser *p, Program *prog) {
 	Token *t = peek(p);
 	if (t->kind == TK_INT) {
 		advance(p);
-		/* `main` lowers to a QBE `w` return; reject a literal that would not
-		 * survive the word so cfcc never emits a silently-truncated exit code.
-		 * Literals are unsigned (ebnf Numbers), so only the upper bound bites. */
+		/* Every integer is a word in M0, so a literal must fit one (literals are
+		 * unsigned per ebnf Numbers, so only the upper bound bites). */
 		if (t->ival > INT32_MAX)
-			die(t->line, "exit code out of range (M0 supports 0..2147483647)");
-		prog->returns_param = 0;
-		prog->exit_code = t->ival;
-		return;
+			die(t->line, "integer literal out of range (M0 supports 0..2147483647)");
+		Expr *e = new_expr(EX_INT);
+		e->ival = t->ival;
+		return e;
+	}
+	if (t->kind == TK_LPAREN) {
+		advance(p);
+		Expr *e = parse_expr(p, prog);
+		expect(p, TK_RPAREN, "expected `)`");
+		return e;
 	}
 	if (t->kind == TK_IDENT && !is_type_ident(t)) {
 		if (t->text[t->len - 1] == '!')
 			die(t->line, "M0 does not support `!` in a name here");
-		tok_copy(t, prog->ret_name, sizeof prog->ret_name);
+		Expr *e = new_expr(EX_PARAM);
+		tok_copy(t, e->name, sizeof e->name);
 		advance(p);
 		int found = -1;
 		for (int i = 0; i < prog->nparams; i++)
-			if (strcmp(prog->params[i].name, prog->ret_name) == 0) {
+			if (strcmp(prog->params[i].name, e->name) == 0) {
 				found = i;
 				break;
 			}
 		if (found < 0)
-			die(t->line, "unknown name in body (M0 body returns an integer or a parameter)");
+			die(t->line, "unknown name (M0 expressions use integers and Int parameters)");
 		if (prog->params[found].kind != PK_WORD)
-			die(t->line, "M0 can only return an Int parameter (e.g. argc) as the exit code");
-		prog->returns_param = 1;
-		return;
+			die(t->line, "M0 expressions can only use Int parameters (e.g. argc)");
+		return e;
 	}
-	die(t->line, "expected an integer or a parameter name (M0 body)");
+	die(t->line, "expected an integer, a parameter, or `(`");
+	return NULL; /* unreachable; die() exits */
 }
 
-/* module = "pub" "const" "main" "=" param_list "->" body
+/* unary = "-" unary | primary   (right-associative negation) */
+static Expr *parse_unary(Parser *p, Program *prog) {
+	if (peek(p)->kind == TK_MINUS) {
+		advance(p);
+		Expr *e = new_expr(EX_NEG);
+		e->lhs = parse_unary(p, prog);
+		return e;
+	}
+	return parse_primary(p, prog);
+}
+
+/* Left-associative binary level: fold `left op right op ...` given a pair of
+ * token→ExprKind mappings supplied by the two callers below. */
+static Expr *fold_binary(Parser *p, Program *prog, Expr *(*next)(Parser *, Program *),
+                         TokKind t0, ExprKind k0, TokKind t1, ExprKind k1,
+                         TokKind t2, ExprKind k2) {
+	Expr *e = next(p, prog);
+	for (;;) {
+		TokKind k = peek(p)->kind;
+		ExprKind op;
+		if (k == t0)
+			op = k0;
+		else if (k == t1)
+			op = k1;
+		else if (t2 != TK_EOF && k == t2)
+			op = k2;
+		else
+			break;
+		advance(p);
+		Expr *bin = new_expr(op);
+		bin->lhs = e;
+		bin->rhs = next(p, prog);
+		e = bin;
+	}
+	return e;
+}
+
+/* multiplicative = unary { ("*" | "/" | "%") unary } */
+static Expr *parse_mul(Parser *p, Program *prog) {
+	return fold_binary(p, prog, parse_unary, TK_STAR, EX_MUL, TK_SLASH, EX_DIV,
+	                   TK_PERCENT, EX_REM);
+}
+
+/* additive = multiplicative { ("+" | "-") multiplicative } */
+static Expr *parse_add(Parser *p, Program *prog) {
+	return fold_binary(p, prog, parse_mul, TK_PLUS, EX_ADD, TK_MINUS, EX_SUB,
+	                   TK_EOF, EX_ADD /* unused third slot */);
+}
+
+static Expr *parse_expr(Parser *p, Program *prog) {
+	return parse_add(p, prog);
+}
+
+/* module     = "pub" "const" "main" "=" param_list "->" body
  * param_list = "(" [ param { "," param } ] ")"             (0..3 entry params)
- * body       = value | "{" "return" value "}"
- * value      = INT | var_name                              (M0 slice) */
+ * body       = expr | "{" "return" expr "}"
+ * expr       = additive over multiplicative over unary over primary  (M0 slice) */
 static void parse(Parser *p, Program *prog) {
 	skip_newlines(p);
 	expect_ident(p, "pub");
@@ -399,11 +496,11 @@ static void parse(Parser *p, Program *prog) {
 		advance(p);
 		skip_newlines(p);
 		expect_ident(p, "return");
-		parse_body_value(p, prog);
+		prog->body = parse_expr(p, prog);
 		skip_newlines(p);
 		expect(p, TK_RBRACE, "expected `}`");
 	} else {
-		parse_body_value(p, prog);
+		prog->body = parse_expr(p, prog);
 	}
 
 	skip_newlines(p);
@@ -412,6 +509,49 @@ static void parse(Parser *p, Program *prog) {
 }
 
 /* ------------------------------------------------------------- emit QBE - */
+
+/* Emit the code that computes `e` into a fresh word temp, writing the operand
+ * that names its value (a literal, a `%param`, or a `%tN` temp) into `dst`.
+ * Constants are inlined — QBE accepts them directly as instruction operands. */
+static void emit_expr(FILE *out, Expr *e, int *tmp, char *dst, size_t cap) {
+	switch (e->kind) {
+	case EX_INT:
+		snprintf(dst, cap, "%ld", e->ival);
+		return;
+	case EX_PARAM:
+		snprintf(dst, cap, "%%%s", e->name);
+		return;
+	case EX_NEG: {
+		char a[96];
+		emit_expr(out, e->lhs, tmp, a, sizeof a);
+		int t = (*tmp)++;
+		fprintf(out, "\t%%t%d =w neg %s\n", t, a);
+		snprintf(dst, cap, "%%t%d", t);
+		return;
+	}
+	case EX_ADD:
+	case EX_SUB:
+	case EX_MUL:
+	case EX_DIV:
+	case EX_REM: {
+		char a[96], b[96];
+		emit_expr(out, e->lhs, tmp, a, sizeof a);
+		emit_expr(out, e->rhs, tmp, b, sizeof b);
+		const char *op = e->kind == EX_ADD ? "add"
+		               : e->kind == EX_SUB ? "sub"
+		               : e->kind == EX_MUL ? "mul"
+		               : e->kind == EX_DIV ? "div"
+		                                   : "rem"; /* EX_REM; div/rem are signed */
+		int t = (*tmp)++;
+		fprintf(out, "\t%%t%d =w %s %s, %s\n", t, op, a, b);
+		snprintf(dst, cap, "%%t%d", t);
+		return;
+	}
+	}
+	/* All ExprKinds are handled above (no default, so -Wswitch catches a new one
+	 * before it can be miscompiled); this guards a corrupted node. */
+	die(0, "internal: unhandled expression kind");
+}
 
 static void emit_qbe(FILE *out, const Program *prog) {
 	/* `main` returns a word (Int exit code) and takes argc/argv/envp per arity —
@@ -424,10 +564,10 @@ static void emit_qbe(FILE *out, const Program *prog) {
 		        prog->params[i].kind == PK_WORD ? "w" : "l", prog->params[i].name);
 	fprintf(out, ") {\n");
 	fprintf(out, "@start\n");
-	if (prog->returns_param)
-		fprintf(out, "\tret %%%s\n", prog->ret_name);
-	else
-		fprintf(out, "\tret %ld\n", prog->exit_code);
+	char result[96];
+	int tmp = 0;
+	emit_expr(out, prog->body, &tmp, result, sizeof result);
+	fprintf(out, "\tret %s\n", result);
 	fprintf(out, "}\n");
 }
 
