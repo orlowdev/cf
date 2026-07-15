@@ -137,8 +137,8 @@ not received as a parameter.
 
 ```
 const my_allocating_function! = () -> {
-  const Point p = { x: 0, y: 0 }   (* own residue — never escapes *)
-  return p.x                       (* only a scalar leaves *)
+  const Point p = { x: 0, y: 0 }   # own residue — never escapes
+  return p.x                       # only a scalar leaves
 }
 ```
 
