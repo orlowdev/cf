@@ -161,9 +161,10 @@ paying the dependency for the interop. So there are two link modes: **freestandi
 (default, self-contained, no C) and **hosted** (opt-in, C externs available).
 
 That two-mode policy, how externs are declared and linked, and the rest of the
-compiler's command surface are **compiler-API concerns, left to a dedicated spec**.
-They surface here only because the bootstrap already straddles the line: the
-compiler is hosted, what it emits is freestanding.
+compiler's command surface are the CLI's concern — the `--libc` flag is
+[[cf_cli.md]] §4, the C-extern surface is deferred there (§8). They surface here
+only because the bootstrap already straddles the line: the compiler is hosted, what
+it emits is freestanding.
 
 ## 4. The feature boundary
 
@@ -365,8 +366,8 @@ The evergreen line (`cf 1.x`) is where the language becomes whole. Everything
 | table `match` dispatch   | [[order_of_compilation.md]], Backend              |
 | deep comptime            | the comptime spec (deferred)                      |
 | observability & resume   | [[order_of_compilation.md]] §1, §6                |
-| multi-target codegen     | the target / compiler-API spec (deferred)         |
-| hosted C interop, link modes | the compiler-API spec (deferred)              |
+| multi-target codegen     | [[cf_cli.md]] §5 — wasm + cross-linking deferred there |
+| hosted C interop, link modes | [[cf_cli.md]] §4                              |
 
 The pattern is the project's whole shape in miniature: each release **restores
 capability while the source stays idiomatic**. `cf0` is the floor — generous by
