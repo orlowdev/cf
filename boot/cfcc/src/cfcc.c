@@ -87,6 +87,10 @@ typedef enum {
 	TK_RPAREN,
 	TK_LBRACE,
 	TK_RBRACE,
+	TK_LBRACKET,
+	TK_RBRACKET,
+	TK_COMMA,
+	TK_STAR,
 	TK_EQ,
 	TK_ARROW, /* -> */
 } TokKind;
@@ -184,6 +188,10 @@ static void lex(Lexer *lx) {
 		case ')': push_tok(lx, TK_RPAREN, s + lx->pos, 1, 0); lx->pos++; continue;
 		case '{': push_tok(lx, TK_LBRACE, s + lx->pos, 1, 0); lx->pos++; continue;
 		case '}': push_tok(lx, TK_RBRACE, s + lx->pos, 1, 0); lx->pos++; continue;
+		case '[': push_tok(lx, TK_LBRACKET, s + lx->pos, 1, 0); lx->pos++; continue;
+		case ']': push_tok(lx, TK_RBRACKET, s + lx->pos, 1, 0); lx->pos++; continue;
+		case ',': push_tok(lx, TK_COMMA, s + lx->pos, 1, 0); lx->pos++; continue;
+		case '*': push_tok(lx, TK_STAR, s + lx->pos, 1, 0); lx->pos++; continue;
 		case '=': push_tok(lx, TK_EQ, s + lx->pos, 1, 0); lx->pos++; continue;
 		}
 		die(lx->line, "unexpected character");
@@ -197,9 +205,27 @@ typedef struct {
 	size_t pos;
 } Parser;
 
-/* The whole program the M0 slice can express: `main` returns this Int. */
+/* The entry ABI kinds an M0 `main` parameter can take: a word (Int, e.g. argc)
+ * or a long (a pointer, e.g. *[Str] argv/envp). darwin hands these to _start in
+ * x0/x1/x2, which forwards them unchanged, so QBE reads them as ordinary args. */
+typedef enum {
+	PK_WORD, /* Int  -> w (argc) */
+	PK_LONG, /* *T   -> l (argv, envp) */
+} ParamKind;
+
 typedef struct {
-	long exit_code;
+	char name[64];
+	ParamKind kind;
+} Param;
+
+/* The whole program the M0 slice can express: `main(params) -> body`, where the
+ * body returns either an integer literal or one of main's Int parameters. */
+typedef struct {
+	Param params[3];
+	int nparams;
+	int returns_param;  /* body is a param reference (else an integer literal) */
+	char ret_name[64];  /* the referenced param name, when returns_param */
+	long exit_code;     /* the literal value, otherwise */
 } Program;
 
 static Token *peek(Parser *p) {
@@ -233,43 +259,152 @@ static Token *expect(Parser *p, TokKind kind, const char *what) {
 static Token *expect_ident(Parser *p, const char *kw) {
 	Token *t = peek(p);
 	if (!is_ident(t, kw))
-		die(t->line, "unexpected token (M0 accepts only `pub const main = () -> <int>`)");
+		die(t->line, "unexpected token (M0 accepts a single `pub const main`)");
 	return advance(p);
 }
 
-/* module = "pub" "const" "main" "=" "(" ")" "->" body
- * body   = INT | "{" "return" INT "}"                     (M0 slice) */
+/* Copy a token's text into a fixed buffer, or die if it does not fit. */
+static void tok_copy(Token *t, char *buf, size_t cap) {
+	if ((size_t)t->len >= cap)
+		die(t->line, "identifier too long");
+	memcpy(buf, t->text, t->len);
+	buf[t->len] = '\0';
+}
+
+/* True if an identifier names a type (PascalCase — leading uppercase). */
+static int is_type_ident(Token *t) {
+	return t->kind == TK_IDENT && t->len > 0 && t->text[0] >= 'A' && t->text[0] <= 'Z';
+}
+
+/* Consume an entry parameter's type and classify it by ABI width. M0 entry types
+ * are only `Int` (a word — argc) and pointer types like `*[Str]` (a long — argv,
+ * envp); a pointer's pointee is skipped wholesale since only the top-level shape
+ * sets the register width. */
+static ParamKind parse_param_type(Parser *p) {
+	Token *t = peek(p);
+	if (is_ident(t, "Int")) {
+		advance(p);
+		return PK_WORD;
+	}
+	if (t->kind == TK_STAR) {
+		advance(p);
+		Token *u = peek(p);
+		if (u->kind == TK_LBRACKET) { /* skip a balanced [ ... ] pointee */
+			int depth = 0;
+			do {
+				Token *v = advance(p);
+				if (v->kind == TK_LBRACKET)
+					depth++;
+				else if (v->kind == TK_RBRACKET)
+					depth--;
+				else if (v->kind == TK_EOF)
+					die(v->line, "unterminated pointer type");
+			} while (depth > 0);
+		} else if (is_type_ident(u)) {
+			advance(p);
+		} else {
+			die(u->line, "expected a type after `*`");
+		}
+		return PK_LONG;
+	}
+	die(t->line, "M0 entry parameters must be `Int` or a pointer type (e.g. `*[Str]`)");
+	return PK_WORD; /* unreachable; die() exits */
+}
+
+/* param = type var_name  (typed; M0 entry params always carry their type). */
+static void parse_param(Parser *p, Param *out) {
+	out->kind = parse_param_type(p);
+	Token *name = peek(p);
+	if (name->kind != TK_IDENT || is_type_ident(name))
+		die(name->line, "expected a parameter name");
+	/* A trailing `!` is a legal var_name char (ebnf) but is not a QBE-legal temp
+	 * char; M0 has no `!`-named entry params, so reject it with a source-level
+	 * error instead of letting `%x!` reach qbe. */
+	if (name->text[name->len - 1] == '!')
+		die(name->line, "M0 does not support `!` in a parameter name");
+	tok_copy(name, out->name, sizeof out->name);
+	advance(p);
+}
+
+/* The value a body returns: an integer literal (bounded to the `w` exit code) or
+ * a reference to one of main's Int parameters (argc). */
+static void parse_body_value(Parser *p, Program *prog) {
+	Token *t = peek(p);
+	if (t->kind == TK_INT) {
+		advance(p);
+		/* `main` lowers to a QBE `w` return; reject a literal that would not
+		 * survive the word so cfcc never emits a silently-truncated exit code.
+		 * Literals are unsigned (ebnf Numbers), so only the upper bound bites. */
+		if (t->ival > INT32_MAX)
+			die(t->line, "exit code out of range (M0 supports 0..2147483647)");
+		prog->returns_param = 0;
+		prog->exit_code = t->ival;
+		return;
+	}
+	if (t->kind == TK_IDENT && !is_type_ident(t)) {
+		if (t->text[t->len - 1] == '!')
+			die(t->line, "M0 does not support `!` in a name here");
+		tok_copy(t, prog->ret_name, sizeof prog->ret_name);
+		advance(p);
+		int found = -1;
+		for (int i = 0; i < prog->nparams; i++)
+			if (strcmp(prog->params[i].name, prog->ret_name) == 0) {
+				found = i;
+				break;
+			}
+		if (found < 0)
+			die(t->line, "unknown name in body (M0 body returns an integer or a parameter)");
+		if (prog->params[found].kind != PK_WORD)
+			die(t->line, "M0 can only return an Int parameter (e.g. argc) as the exit code");
+		prog->returns_param = 1;
+		return;
+	}
+	die(t->line, "expected an integer or a parameter name (M0 body)");
+}
+
+/* module = "pub" "const" "main" "=" param_list "->" body
+ * param_list = "(" [ param { "," param } ] ")"             (0..3 entry params)
+ * body       = value | "{" "return" value "}"
+ * value      = INT | var_name                              (M0 slice) */
 static void parse(Parser *p, Program *prog) {
 	skip_newlines(p);
 	expect_ident(p, "pub");
 	expect_ident(p, "const");
 	expect_ident(p, "main");
 	expect(p, TK_EQ, "expected `=`");
+
 	expect(p, TK_LPAREN, "expected `(`");
-	expect(p, TK_RPAREN, "expected `)` (M0 main takes no parameters yet)");
+	prog->nparams = 0;
+	if (peek(p)->kind != TK_RPAREN) {
+		for (;;) {
+			if (prog->nparams == 3)
+				die(peek(p)->line, "main takes at most 3 parameters (argc, argv, envp)");
+			parse_param(p, &prog->params[prog->nparams]);
+			for (int j = 0; j < prog->nparams; j++)
+				if (strcmp(prog->params[j].name, prog->params[prog->nparams].name) == 0)
+					die(p->toks[p->pos - 1].line, "duplicate parameter name");
+			prog->nparams++;
+			if (peek(p)->kind == TK_COMMA) {
+				advance(p);
+				continue;
+			}
+			break;
+		}
+	}
+	expect(p, TK_RPAREN, "expected `)`");
 	expect(p, TK_ARROW, "expected `->`");
 
-	Token *t = peek(p);
-	Token *code = NULL;
-	if (t->kind == TK_INT) {
-		code = advance(p);
-	} else if (t->kind == TK_LBRACE) {
+	Token *b = peek(p);
+	if (b->kind == TK_LBRACE) {
 		advance(p);
 		skip_newlines(p);
 		expect_ident(p, "return");
-		code = expect(p, TK_INT, "expected an integer exit code");
+		parse_body_value(p, prog);
 		skip_newlines(p);
 		expect(p, TK_RBRACE, "expected `}`");
 	} else {
-		die(t->line, "expected an integer body (M0 slice)");
+		parse_body_value(p, prog);
 	}
-
-	/* `main` lowers to a QBE `w` (32-bit word) return; reject a literal that
-	 * would not survive the word so cfcc never emits a silently-truncated exit
-	 * code. Literals are unsigned (ebnf Numbers), so only the upper bound bites. */
-	if (code->ival > INT32_MAX)
-		die(code->line, "exit code out of range (M0 supports 0..2147483647)");
-	prog->exit_code = code->ival;
 
 	skip_newlines(p);
 	if (peek(p)->kind != TK_EOF)
@@ -279,11 +414,20 @@ static void parse(Parser *p, Program *prog) {
 /* ------------------------------------------------------------- emit QBE - */
 
 static void emit_qbe(FILE *out, const Program *prog) {
-	/* `main` returns a word (Int exit code). No page node is threaded yet —
-	 * a parameterless, non-allocating main carries none (M0). */
-	fprintf(out, "export function w $main() {\n");
+	/* `main` returns a word (Int exit code) and takes argc/argv/envp per arity —
+	 * darwin hands these to _start in x0/x1/x2, which forwards them, so QBE reads
+	 * them as ordinary args. No page node is threaded yet: a non-allocating main
+	 * carries none (M0). */
+	fprintf(out, "export function w $main(");
+	for (int i = 0; i < prog->nparams; i++)
+		fprintf(out, "%s%s %%%s", i ? ", " : "",
+		        prog->params[i].kind == PK_WORD ? "w" : "l", prog->params[i].name);
+	fprintf(out, ") {\n");
 	fprintf(out, "@start\n");
-	fprintf(out, "\tret %ld\n", prog->exit_code);
+	if (prog->returns_param)
+		fprintf(out, "\tret %%%s\n", prog->ret_name);
+	else
+		fprintf(out, "\tret %ld\n", prog->exit_code);
 	fprintf(out, "}\n");
 }
 
@@ -293,14 +437,16 @@ static void emit_qbe(FILE *out, const Program *prog) {
  * x16, `svc #0x80`; SYS_exit = 1. QBE's arm64_apple target underscore-prefixes
  * `$main`, so the symbol is `_main`.
  *
- * argc/argv/envp wiring and the root page-node mint come in the next M0 step;
- * this slice only needs main -> exit(code). */
+ * argc/argv/envp wiring: under LC_MAIN darwin invokes `_start` exactly like
+ * `main(argc, argv, envp, apple)` — argc in x0, argv in x1, envp in x2. `_start`
+ * touches none of x0..x2 before the call, so `main` receives them by arity for
+ * free. The root page-node mint arrives once a `main` actually allocates. */
 static void emit_runtime(FILE *out) {
 	fprintf(out, ".text\n");
 	fprintf(out, ".globl _start\n");
 	fprintf(out, ".p2align 2\n");
 	fprintf(out, "_start:\n");
-	fprintf(out, "\tbl _main\n");     /* w0 = main() return, zero-extended into x0 */
+	fprintf(out, "\tbl _main\n");     /* x0..x2 pass through: argc/argv/envp -> main */
 	fprintf(out, "\tmov x16, #1\n");  /* SYS_exit */
 	fprintf(out, "\tsvc #0x80\n");
 }
