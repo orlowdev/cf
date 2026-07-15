@@ -269,13 +269,14 @@ typedef struct {
 	ParamKind kind;
 } Param;
 
-/* Expression AST. M0 bodies are word-valued integer expressions: literals, Int
- * parameter references (argc), unary (negate / bitwise-not / logical-not), and
- * the binary arithmetic, bitwise, shift, and comparison ops, all at the ebnf
- * precedence (comparison > bit-or/xor/and > shift > additive > multiplicative). */
+/* Expression AST. M0 expressions are word-valued: literals, references to a
+ * bound Int name (a parameter or a local), unary (negate / bitwise-not /
+ * logical-not), and the binary arithmetic, bitwise, shift, and comparison ops,
+ * all at the ebnf precedence (comparison > bit-or/xor/and > shift > additive >
+ * multiplicative). */
 typedef enum {
 	EX_INT,   /* integer literal (ival) */
-	EX_PARAM, /* reference to an Int parameter; QBE temp is %<name> */
+	EX_VAR,   /* reference to a bound Int name (param or local) */
 	/* unary (lhs) */
 	EX_NEG,   /* - negate */
 	EX_BNOT,  /* ~ bitwise not */
@@ -303,7 +304,7 @@ typedef struct Expr Expr;
 struct Expr {
 	ExprKind kind;
 	long ival;       /* EX_INT */
-	char name[64];   /* EX_PARAM */
+	char name[64];   /* EX_VAR */
 	Expr *lhs, *rhs; /* operands (unary uses lhs) */
 };
 
@@ -314,13 +315,73 @@ static Expr *new_expr(ExprKind kind) {
 	return e;
 }
 
-/* The whole program the M0 slice can express: `main(params) -> body`, where the
- * body is a word-valued integer expression returned as the exit code. */
+/* A statement in a block body: a local binding (`const`/`let` name = expr) or
+ * the terminal `return expr`. Statements form a linked list in source order. */
+typedef enum {
+	ST_LOCAL,
+	ST_RETURN,
+} StmtKind;
+
+typedef struct Stmt Stmt;
+struct Stmt {
+	StmtKind kind;
+	char name[64]; /* ST_LOCAL: the bound name */
+	Expr *expr;    /* ST_LOCAL: initializer; ST_RETURN: returned value */
+	Stmt *next;
+};
+
+static Stmt *new_stmt(StmtKind kind) {
+	Stmt *s = xmalloc(sizeof *s);
+	memset(s, 0, sizeof *s);
+	s->kind = kind;
+	return s;
+}
+
+/* A bound name usable in expressions — a parameter or a local. `word` is 1 for
+ * an Int (usable in the integer expression grammar), 0 for a pointer. */
+typedef struct {
+	char name[64];
+	int word;
+} Binding;
+
+/* The whole program the M0 slice can express: `main(params) -> body`, a sequence
+ * of statements. `locals` accrues during parsing for name resolution. */
 typedef struct {
 	Param params[3];
 	int nparams;
-	Expr *body;
+	Binding *locals;
+	int nlocals, cap_locals;
+	Stmt *body;
 } Program;
+
+/* Resolve a name to a binding (params first, then locals); returns 1 and sets
+ * *word if found, else 0. */
+static int prog_find(Program *prog, const char *name, int *word) {
+	for (int i = 0; i < prog->nparams; i++)
+		if (strcmp(prog->params[i].name, name) == 0) {
+			*word = prog->params[i].kind == PK_WORD;
+			return 1;
+		}
+	for (int i = 0; i < prog->nlocals; i++)
+		if (strcmp(prog->locals[i].name, name) == 0) {
+			*word = prog->locals[i].word;
+			return 1;
+		}
+	return 0;
+}
+
+/* Record a new local (always Int/word in M0). Caller has checked for a clash. */
+static void prog_add_local(Program *prog, const char *name) {
+	if (prog->nlocals == prog->cap_locals) {
+		prog->cap_locals = prog->cap_locals ? prog->cap_locals * 2 : 16;
+		prog->locals = realloc(prog->locals, prog->cap_locals * sizeof *prog->locals);
+		if (!prog->locals)
+			die(0, "out of memory");
+	}
+	Binding *b = &prog->locals[prog->nlocals++];
+	snprintf(b->name, sizeof b->name, "%s", name);
+	b->word = 1;
+}
 
 static Token *peek(Parser *p) {
 	return &p->toks[p->pos];
@@ -446,19 +507,14 @@ static Expr *parse_primary(Parser *p, Program *prog) {
 	if (t->kind == TK_IDENT && !is_type_ident(t)) {
 		if (t->text[t->len - 1] == '!')
 			die(t->line, "M0 does not support `!` in a name here");
-		Expr *e = new_expr(EX_PARAM);
+		Expr *e = new_expr(EX_VAR);
 		tok_copy(t, e->name, sizeof e->name);
 		advance(p);
-		int found = -1;
-		for (int i = 0; i < prog->nparams; i++)
-			if (strcmp(prog->params[i].name, e->name) == 0) {
-				found = i;
-				break;
-			}
-		if (found < 0)
-			die(t->line, "unknown name (M0 expressions use integers and Int parameters)");
-		if (prog->params[found].kind != PK_WORD)
-			die(t->line, "M0 expressions can only use Int parameters (e.g. argc)");
+		int word;
+		if (!prog_find(prog, e->name, &word))
+			die(t->line, "unknown name (M0 expressions use integers, parameters, and locals)");
+		if (!word)
+			die(t->line, "M0 expressions can only use Int values (e.g. argc)");
 		return e;
 	}
 	die(t->line, "expected an integer, a parameter, or `(`");
@@ -575,9 +631,53 @@ static Expr *parse_expr(Parser *p, Program *prog) {
 	return e;
 }
 
+/* statement = local_decl | return_stmt
+ * local_decl = ("const" | "let") [ "Int" ] var_name "=" expr
+ * return_stmt = "return" expr
+ * A local is not in scope during its own initializer, and cannot shadow a
+ * parameter or an earlier local. `let` is accepted but, like `const`, binds an
+ * immutable value here — reassignment is a later increment. */
+static Stmt *parse_stmt(Parser *p, Program *prog, int *saw_return) {
+	Token *t = peek(p);
+	if (is_ident(t, "const") || is_ident(t, "let")) {
+		advance(p);
+		Token *tt = peek(p); /* optional `Int` type annotation */
+		if (is_type_ident(tt) || tt->kind == TK_STAR) {
+			if (is_ident(tt, "Int"))
+				advance(p);
+			else
+				die(tt->line, "M0 locals must be Int");
+		}
+		Token *name = peek(p);
+		if (name->kind != TK_IDENT || is_type_ident(name))
+			die(name->line, "expected a variable name");
+		if (name->text[name->len - 1] == '!')
+			die(name->line, "M0 does not support `!` in a variable name");
+		Stmt *s = new_stmt(ST_LOCAL);
+		tok_copy(name, s->name, sizeof s->name);
+		advance(p);
+		int word;
+		if (prog_find(prog, s->name, &word))
+			die(name->line, "name already defined (no shadowing in M0)");
+		expect(p, TK_EQ, "expected `=`");
+		s->expr = parse_expr(p, prog); /* initializer: name not yet in scope */
+		prog_add_local(prog, s->name);
+		return s;
+	}
+	if (is_ident(t, "return")) {
+		advance(p);
+		Stmt *s = new_stmt(ST_RETURN);
+		s->expr = parse_expr(p, prog);
+		*saw_return = 1;
+		return s;
+	}
+	die(t->line, "expected `const`, `let`, or `return`");
+	return NULL; /* unreachable; die() exits */
+}
+
 /* module     = "pub" "const" "main" "=" param_list "->" body
  * param_list = "(" [ param { "," param } ] ")"             (0..3 entry params)
- * body       = expr | "{" "return" expr "}"
+ * body       = expr | "{" { statement } "return" expr "}"
  * expr       = comparison over bit-or/xor/and over shift over additive over
  *              multiplicative over unary over primary  (M0 slice; no logical yet) */
 static void parse(Parser *p, Program *prog) {
@@ -612,12 +712,35 @@ static void parse(Parser *p, Program *prog) {
 	if (b->kind == TK_LBRACE) {
 		advance(p);
 		skip_newlines(p);
-		expect_ident(p, "return");
-		prog->body = parse_expr(p, prog);
-		skip_newlines(p);
-		expect(p, TK_RBRACE, "expected `}`");
+		Stmt *head = NULL, *tail = NULL;
+		int saw_return = 0;
+		while (peek(p)->kind != TK_RBRACE) {
+			if (peek(p)->kind == TK_EOF)
+				die(peek(p)->line, "unterminated block (expected `}`)");
+			if (saw_return)
+				die(peek(p)->line, "unreachable statement after `return`");
+			Stmt *s = parse_stmt(p, prog, &saw_return);
+			if (tail)
+				tail->next = s;
+			else
+				head = s;
+			tail = s;
+			if (peek(p)->kind != TK_RBRACE) {
+				if (peek(p)->kind == TK_EOF)
+					die(peek(p)->line, "unterminated block (expected `}`)");
+				expect(p, TK_NEWLINE, "expected a newline (one statement per line)");
+				skip_newlines(p);
+			}
+		}
+		advance(p); /* consume `}` */
+		if (!saw_return)
+			die(b->line, "main's block must end with `return`");
+		prog->body = head;
 	} else {
-		prog->body = parse_expr(p, prog);
+		/* A single-expression body is exactly `return <expr>`. */
+		Stmt *s = new_stmt(ST_RETURN);
+		s->expr = parse_expr(p, prog);
+		prog->body = s;
 	}
 
 	skip_newlines(p);
@@ -652,15 +775,18 @@ static const char *binop(ExprKind k) {
 }
 
 /* Emit the code that computes `e` into a fresh word temp, writing the operand
- * that names its value (a literal, a `%param`, or a `%tN` temp) into `dst`.
- * Constants are inlined — QBE accepts them directly as instruction operands. */
+ * that names its value (a literal, a `%u_<name>` binding, or a `%tN` temp) into
+ * `dst`. Constants are inlined — QBE accepts them as instruction operands.
+ *
+ * User names carry a `u_` prefix in QBE so they can never collide with the
+ * compiler's `%tN` expression temporaries. */
 static void emit_expr(FILE *out, Expr *e, int *tmp, char *dst, size_t cap) {
 	switch (e->kind) {
 	case EX_INT:
 		snprintf(dst, cap, "%ld", e->ival);
 		return;
-	case EX_PARAM:
-		snprintf(dst, cap, "%%%s", e->name);
+	case EX_VAR:
+		snprintf(dst, cap, "%%u_%s", e->name);
 		return;
 	case EX_NEG:
 	case EX_BNOT:
@@ -715,14 +841,19 @@ static void emit_qbe(FILE *out, const Program *prog) {
 	 * carries none (M0). */
 	fprintf(out, "export function w $main(");
 	for (int i = 0; i < prog->nparams; i++)
-		fprintf(out, "%s%s %%%s", i ? ", " : "",
+		fprintf(out, "%s%s %%u_%s", i ? ", " : "",
 		        prog->params[i].kind == PK_WORD ? "w" : "l", prog->params[i].name);
 	fprintf(out, ") {\n");
 	fprintf(out, "@start\n");
-	char result[96];
 	int tmp = 0;
-	emit_expr(out, prog->body, &tmp, result, sizeof result);
-	fprintf(out, "\tret %s\n", result);
+	for (Stmt *s = prog->body; s; s = s->next) {
+		char v[96];
+		emit_expr(out, s->expr, &tmp, v, sizeof v);
+		if (s->kind == ST_LOCAL)
+			fprintf(out, "\t%%u_%s =w copy %s\n", s->name, v); /* bind the local */
+		else
+			fprintf(out, "\tret %s\n", v); /* ST_RETURN */
+	}
 	fprintf(out, "}\n");
 }
 
