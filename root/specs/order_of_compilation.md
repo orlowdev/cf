@@ -13,7 +13,7 @@ it). It assumes the grammar of [[ebnf.md]] and the semantics of
 Status: design settled. The phase list and the observability invariant below are
 ratified; the interior of the memory passes is deferred to [[geometry_lowering.md]].
 
-## The observability invariant
+## 1. The observability invariant
 
 C! leans hard on two kinds of work the compiler does to user code — **desugaring
 runs** and **optimization passes** — and both are normally invisible. You cannot
@@ -40,7 +40,7 @@ the language you already read. Two consequences run through the whole design:
   wants to see `node_0` threaded but the hooks not yet placed. Fine-grained
   internal steps are grouped up to the nearest meaningful arc.
 
-## Gates, arcs, and the backend
+## 2. Gates, arcs, and the backend
 
 Every phase is one of three kinds:
 
@@ -52,9 +52,9 @@ Every phase is one of three kinds:
   with a `cf-stage` pragma. The six arcs are the backbone of the pipeline.
 - **Backend** — one-way lowering to non-`.cf` artifacts (`.qbe`, `.s`, the
   binary). Once you cross into the backend the `.cf` story ends; the backend is
-  not resumable (see Stopping, emitting, and resuming).
+  not resumable (see §6).
 
-## The pipeline
+## 3. The pipeline
 
 | #   | Phase                                             | Kind    | Emits                   |
 | --- | ------------------------------------------------- | ------- | ----------------------- |
@@ -89,7 +89,7 @@ C-ABI representation of C! types and the ownership contract are their own subjec
 left to a dedicated spec. A module can also just be _type-checked_ alone (the
 gates run) — and **checking is not building**.
 
-## Phases in depth
+## 4. Phases in depth
 
 ### 0–1. Lex and Parse (gates)
 
@@ -132,7 +132,7 @@ runs before them — a desugar never has to guess what a form means.
 ### Desugar → `desugared` (arc)
 
 Reduces every sugar to its core form, **type-directed**, in one arc. The full
-catalog is below (The desugar catalog). Two constructs are deliberately **not**
+catalog is below (§7). Two constructs are deliberately **not**
 desugared here — `match` and `defer` — because their lowerings are sub-language
 (dispatch tables, placed epilogues) and would smear unreadable forms across every
 later arc; they stay symbolic and lower at emit. Everything else — compound
@@ -197,7 +197,7 @@ and only the third's output is the observable `memory` `.cf`.
      a GC becomes two instances, because their inlined hooks differ. Geometry is a
      specialization axis; it is just resolved in this arc rather than the previous
      one.
-   - **Mangle names** (see Names the compiler mints): `!` → `_b`, geometry →
+   - **Mangle names** (see §5): `!` → `_b`, geometry →
      `__<geom>`, so `alloc!` under `arena` becomes `alloc_b__arena`.
    - **Thread node handles** — add the hidden node parameter **only where the
      subtree is not provably node-free** (a colorless callee taking no `!`
@@ -206,8 +206,7 @@ and only the third's output is the observable `memory` `.cf`.
      `on_alloc` / `on_realloc` / `on_ret` / `on_alloc_ret` / `on_rehome`, and open
      each scope with `on_scope_enter` plus a **`defer`'d** `on_scope_exit`.
    - **Sweep no-op hooks** — a per-step finisher DCE drops hooks a policy leaves
-     empty (an arena's `on_free`, etc.). This is the local kind of DCE (see DCE
-     below), not the whole-program pass.
+     empty (an arena's `on_free`, etc.). This is the local kind of DCE (see §4, DCE), not the whole-program pass.
 
 The hook set and the exact bodies — the `%node`/`%ret` calling convention,
 claim-once returns, compact-on-claim — are [[geometry_lowering.md]]. This arc only
@@ -253,7 +252,7 @@ Past `pruned`, the `.cf` story ends. Emit lowers what was kept symbolic:
 Then `qbe` turns the IL into assembly and `cc` assembles and links it. `qbe` is
 **vendored** into the toolchain, so building a C! binary needs no external QBE.
 
-## Names the compiler mints
+## 5. Names the compiler mints
 
 Every generated name is a legal C! identifier, so the arcs stay valid `.cf`.
 
@@ -274,9 +273,9 @@ byte identically**, which the resume byte-compare depends on. QBE-level sigils
 The `_b` bang mangling is the **internal** form. A **C export** instead strips the
 bang bare (`alloc!` → `alloc`) and carries no geometry suffix, since its symbols
 face the C world — which is why `foo` and `foo!` cannot both be exported. That
-export path is a dedicated subject (see the library note under The pipeline).
+export path is a dedicated subject (see the library note under §3).
 
-## Stopping, emitting, and resuming
+## 6. Stopping, emitting, and resuming
 
 Any arc can be a stop point. The emitted `.cf` opens with a pragma block:
 
@@ -317,7 +316,7 @@ The backend artifacts (`.qbe`, `.s`) are **not** resumable — resume is a
 `.cf`-only story, and QBE's internals are out of scope for the compiler to
 reconstruct.
 
-## The desugar catalog
+## 7. The desugar catalog
 
 Everything the `desugared` arc rewrites, and the two forms held back for emit.
 
@@ -342,7 +341,7 @@ Held back, lowered at **emit** (kept readable through every arc):
 | `match`   | dispatch — table (`cf`) or compare-chain (`cf0`) |
 | `defer`   | LIFO placement into QBE epilogue blocks          |
 
-## Worked example: `make_arr!` arc by arc
+## 8. Worked example: `make_arr!` arc by arc
 
 Source:
 
@@ -402,10 +401,10 @@ module names.)
 - **emit** — `defer`'d teardowns are placed into epilogue blocks; the result is
   QBE IL, then assembly, then a binary.
 
-## `cf` vs `cf0`
+## 9. `cf` vs `cf0`
 
 The bootstrap compiler (`cf0`) runs this **same pipeline shape** but exercises a
 narrower language and takes the cheaper choice where one exists — most visibly
-**compare-chain `match` dispatch** instead of tables, and a single geometry rather
-than the full set. Which phases `cf0` implements in full, and which it runs
+**compare-chain `match` dispatch** instead of tables, and a single userland geometry — with the internal `page` geometry
+always serving the root — rather than the full set. Which phases `cf0` implements in full, and which it runs
 degenerately, is [[seed_subset.md]].

@@ -7,7 +7,7 @@ function names and the `in` clause on calls.
 Status: design in progress. Items marked _(confirm)_ are agreed in spirit but
 not yet finally ratified.
 
-## Three separations
+## 1. Three separations
 
 C! deliberately pulls apart three things most languages fuse:
 
@@ -18,7 +18,7 @@ C! deliberately pulls apart three things most languages fuse:
 3. **Memory is detached from the program's identity.** All memory lives in one
    structure, the **manifold**, and code only ever names a _policy_ over it.
 
-## The manifold
+## 2. The manifold
 
 Memory is a **tree** of nodes called the manifold.
 
@@ -28,15 +28,20 @@ Memory is a **tree** of nodes called the manifold.
   at least one geometry node before it has usable memory.
 - Every non-root node is minted by **instantiating a geometry at runtime** —
   the `mem.arena.of(4096)` call itself creates the node (see
-  [The `in` clause](#the-in-clause)). A child node **pulls its space from
+  §4). A child node **pulls its space from
   its parent node** — it is physically _inside_ the parent.
 - A node lives exactly as long as the binding that names it, and bindings nest
   with the call structure, so **a node always outlives every node instantiated
   below it**, just as a caller always outlives its callees. This single fact
   removes the need for lifetime annotations or borrow checking (see
-  [Mutability and ownership](#mutability-and-ownership)).
+  §6).
 
-This is a region system with **pluggable region policies**.
+This is a region system with **pluggable region policies** — the manifold is a
+tree of Tofte–Talpin regions (Mads Tofte & Jean-Pierre Talpin, _Region-Based
+Memory Management_, Information and Computation 132(2), 1997; implemented in the
+[ML Kit](https://elsman.com/mlkit/)), generalized so each region carries a
+_chosen_ geometry rather than the single stack-of-regions discipline of the
+original.
 
 Node capacities form a **comptime algebra**: a bounded child must fit within
 its parent's bound, and an unbounded child (say, a GC heap) requires an
@@ -45,7 +50,7 @@ grafted into a bounded parent, or children whose total cap exceeds the
 parent's — are compile errors. This is checkable precisely because geometries
 are comptime entities and can never be assigned at runtime.
 
-## Geometries
+## 3. Geometries
 
 A geometry is a memory-management policy — arena, GC, RC, and so on. Crucially it
 is a **comptime** construct: it does not exist as a runtime object. Instead a
@@ -54,20 +59,25 @@ of every function it governs. Because the hooks are inlined at comptime, a
 geometry assigned to a call **propagates down the entire call subtree** until a
 nested call overrides it with its own geometry.
 
-The full hook set:
+The full hook set is **nine** lifecycle hooks; the exact signatures, placement,
+and bodies are [[geometry_lowering.md]]:
 
-- `on_scope_enter`
-- `on_scope_exit`
-- `on_alloc`
-- `on_realloc`
-- `on_free`
-- `on_safepoint`
-- `on_store`
+- `on_scope_enter` / `on_scope_exit` — open and close a scope
+- `on_alloc` — place residue that dies in the frame
+- `on_realloc` — grow an aggregate in place
+- `on_ret` / `on_alloc_ret` — mark a value escaping via return, and claim it in
+  the caller
+- `on_free` — reclaim one dead object
+- `on_rehome` — relocate residue into another aggregate's node
+- `on_store` — the write barrier on a reference field
 
-Different policies implement different hooks (an arena ignores `on_free` and
-`on_safepoint`; a GC leans on `on_safepoint` and `on_store`; RC leans on
-`on_store`). Hooks a policy does not need are supplied as no-ops and removed by
-dead-code elimination.
+Different policies implement different hooks (an arena leans on the scope pair and
+no-ops `on_free`/`on_store`; a GC and an RC lean on `on_store` and trigger
+collection from within their own `on_alloc`). Hooks a policy does not need are
+supplied as no-ops and removed by dead-code elimination. Two further hooks — a
+poll point `on_safepoint` and a read barrier `on_load` — are **reserved for
+concurrency** and go unused by the current sequential language (see
+[[geometry_lowering.md]]).
 
 Geometry and node are two sides of the same thing inside the manifold: the
 geometry is the comptime side (the hook set — the _shape_), the node is the
@@ -77,11 +87,11 @@ the other; hence the geometry metaphor.
 The node a geometry instantiates is passed to every governed function as a
 **hidden first parameter**, so the hooks reach it in one step. It never appears
 in source, and it is pruned entirely from provably node-free calls (see
-[Allocation algebra](#allocation-algebra-the--effect)). The call site threads the _correct_ node handle per comptime node
+§5). The call site threads the _correct_ node handle per comptime node
 identity — a hook that grows a foreign aggregate (see `on_realloc` under
-[Escaping](#escaping)) receives that aggregate's node, not the ambient one.
+§5, Escaping) receives that aggregate's node, not the ambient one.
 
-## The `in` clause
+## 4. The `in` clause
 
 A geometry is attached to a program **only at a call site**, with an `in` clause:
 
@@ -106,14 +116,15 @@ my_allocating_function!() in arena
   is torn down by the arena's `on_scope_exit` of the scope that declared it
   (because the geometry binding is itself residue — see below). Other geometries
   define `on_scope_exit` differently: GC/RC no-op it and reclaim through their
-  own hooks (`on_safepoint`/`on_store`), so **their nodes ignore scope
-  boundaries** and outlive the binding's scope by policy.
+  own hooks (collection driven from `on_alloc`, bookkeeping from `on_store`), so
+  **their nodes ignore scope boundaries** and outlive the binding's scope by
+  policy.
 - **Propagation.** A call with no `in` inherits the ambient geometry from its
   caller. `in` is therefore _required_ only where a branch that needs memory has
   no ambient geometry yet — i.e. at the top of the branch — and optional
   everywhere below.
 
-## Allocation algebra: the `!` effect
+## 5. Allocation algebra: the `!` effect
 
 Allocation is the **only effect** in C!. The effect system that tracks it is
 called the _allocation algebra_, and its marker is `!` — which is why the
@@ -153,7 +164,7 @@ would make the cost invisible. In C! the only colorless functions are the ones
 that are genuinely free.
 
 Not bleaching also buys a threading optimization. The hidden node parameter
-(see [Geometries](#geometries)) need not reach every function: a call whose
+(see §3) need not reach every function: a call whose
 callee is colorless, takes no `!` argument, and returns only scalars is
 provably node-free — its entire subtree is pure compute — so no node is
 threaded through it at all. All three facts are visible at the call site from
@@ -226,7 +237,7 @@ infection. The compiler validates every function by its body, so the body is
 the oracle for color: hide a `!` function behind a struct field and it is still
 a `!`-function body, and every call site (resolved at comptime) sees it.
 
-## Mutability and ownership
+## 6. Mutability and ownership
 
 C! has **no lifetime annotations and no borrow checker**. Four rules plus one
 comptime region-outlives check replace them.
@@ -278,7 +289,7 @@ use-after-free freedom via regions, not data-race or iterator-invalidation
 freedom. C! has no iterators, and concurrency is out of scope for now, so this is
 a deliberate, currently-cost-free tradeoff.)
 
-## Closures
+## 7. Closures
 
 C! closures are **fake**: capture is a comptime construct, not runtime
 machinery. A **capturing** function value is specialized per call site — its
@@ -296,7 +307,7 @@ Consequences:
 
 Full capture rules to be specified; the direction above is ratified.
 
-## Zero-cost return
+## 8. Zero-cost return
 
 Returning a value across a geometry boundary is **free** — no copy. Two
 distinct events hide behind "return", and both are copy-free:
@@ -333,8 +344,8 @@ copy.** Any movement is a geometry's chosen policy, not a boundary tax.
 ---
 
 **Lowering.** How all of the above is actually landed into function bodies — the hidden
-`%node`/`%ret` calling convention, the closed hook set (`on_scope_enter`/`_exit`,
-`on_alloc`, `on_alloc_ret`, `on_ret`, `on_rehome`, `on_realloc`), the per-block mark/reset
+`%node`/`%ret` calling convention, the closed nine-hook set (`on_scope_enter`/`_exit`,
+`on_alloc`, `on_realloc`, `on_ret`, `on_alloc_ret`, `on_free`, `on_rehome`, `on_store`), the per-block mark/reset
 discipline, the in-flight / claim-once return mechanics, and compact-on-claim — is the
 **settled** subject of [geometry_lowering.md](./geometry_lowering.md). It is pinned there so
 the design is not re-litigated; read it before touching Phase 3.
