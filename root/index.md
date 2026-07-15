@@ -8,6 +8,7 @@
 - [[geometry_lowering.md]]
 - [[versioning.md]]
 - [[seed_subset.md]]
+- [[cf_cli.md]]
 
 ## Code Style
 
