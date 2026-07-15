@@ -95,6 +95,21 @@ typedef enum {
 	TK_MINUS,
 	TK_SLASH,
 	TK_PERCENT,
+	TK_AMP,     /* & bitwise-and */
+	TK_PIPE,    /* | bitwise-or */
+	TK_CARET,   /* ^ bitwise-xor */
+	TK_TILDE,   /* ~ bitwise-not */
+	TK_BANG,    /* ! logical-not */
+	TK_SHL,     /* << */
+	TK_SHR,     /* >> */
+	TK_EQEQ,    /* == */
+	TK_NE,      /* != */
+	TK_LT,      /* < */
+	TK_GT,      /* > */
+	TK_LE,      /* <= */
+	TK_GE,      /* >= */
+	TK_ANDAND,  /* && (logical; deferred) */
+	TK_OROR,    /* || (logical; deferred) */
 	TK_EQ,
 	TK_ARROW, /* -> */
 } TokKind;
@@ -187,6 +202,7 @@ static void lex(Lexer *lx) {
 			lx->pos += 2;
 			continue;
 		}
+		int n = (unsigned char)s[lx->pos + 1]; /* lookahead for two-char operators */
 		switch (c) {
 		case '(': push_tok(lx, TK_LPAREN, s + lx->pos, 1, 0); lx->pos++; continue;
 		case ')': push_tok(lx, TK_RPAREN, s + lx->pos, 1, 0); lx->pos++; continue;
@@ -200,7 +216,34 @@ static void lex(Lexer *lx) {
 		case '-': push_tok(lx, TK_MINUS, s + lx->pos, 1, 0); lx->pos++; continue; /* -> handled above */
 		case '/': push_tok(lx, TK_SLASH, s + lx->pos, 1, 0); lx->pos++; continue;
 		case '%': push_tok(lx, TK_PERCENT, s + lx->pos, 1, 0); lx->pos++; continue;
-		case '=': push_tok(lx, TK_EQ, s + lx->pos, 1, 0); lx->pos++; continue;
+		case '^': push_tok(lx, TK_CARET, s + lx->pos, 1, 0); lx->pos++; continue;
+		case '~': push_tok(lx, TK_TILDE, s + lx->pos, 1, 0); lx->pos++; continue;
+		case '&':
+			if (n == '&') { push_tok(lx, TK_ANDAND, s + lx->pos, 2, 0); lx->pos += 2; }
+			else { push_tok(lx, TK_AMP, s + lx->pos, 1, 0); lx->pos++; }
+			continue;
+		case '|':
+			if (n == '|') { push_tok(lx, TK_OROR, s + lx->pos, 2, 0); lx->pos += 2; }
+			else { push_tok(lx, TK_PIPE, s + lx->pos, 1, 0); lx->pos++; }
+			continue;
+		case '<':
+			if (n == '<') { push_tok(lx, TK_SHL, s + lx->pos, 2, 0); lx->pos += 2; }
+			else if (n == '=') { push_tok(lx, TK_LE, s + lx->pos, 2, 0); lx->pos += 2; }
+			else { push_tok(lx, TK_LT, s + lx->pos, 1, 0); lx->pos++; }
+			continue;
+		case '>':
+			if (n == '>') { push_tok(lx, TK_SHR, s + lx->pos, 2, 0); lx->pos += 2; }
+			else if (n == '=') { push_tok(lx, TK_GE, s + lx->pos, 2, 0); lx->pos += 2; }
+			else { push_tok(lx, TK_GT, s + lx->pos, 1, 0); lx->pos++; }
+			continue;
+		case '=':
+			if (n == '=') { push_tok(lx, TK_EQEQ, s + lx->pos, 2, 0); lx->pos += 2; }
+			else { push_tok(lx, TK_EQ, s + lx->pos, 1, 0); lx->pos++; }
+			continue;
+		case '!': /* a lone `!`; a trailing `!` on a name is taken in the ident branch */
+			if (n == '=') { push_tok(lx, TK_NE, s + lx->pos, 2, 0); lx->pos += 2; }
+			else { push_tok(lx, TK_BANG, s + lx->pos, 1, 0); lx->pos++; }
+			continue;
 		}
 		die(lx->line, "unexpected character");
 	}
@@ -227,17 +270,33 @@ typedef struct {
 } Param;
 
 /* Expression AST. M0 bodies are word-valued integer expressions: literals, Int
- * parameter references (argc), unary negation, and the binary arithmetic ops
- * with the ebnf precedence (additive over multiplicative over unary). */
+ * parameter references (argc), unary (negate / bitwise-not / logical-not), and
+ * the binary arithmetic, bitwise, shift, and comparison ops, all at the ebnf
+ * precedence (comparison > bit-or/xor/and > shift > additive > multiplicative). */
 typedef enum {
 	EX_INT,   /* integer literal (ival) */
 	EX_PARAM, /* reference to an Int parameter; QBE temp is %<name> */
-	EX_NEG,   /* unary minus (lhs) */
+	/* unary (lhs) */
+	EX_NEG,   /* - negate */
+	EX_BNOT,  /* ~ bitwise not */
+	EX_LNOT,  /* ! logical not (yields 0/1) */
+	/* binary (lhs, rhs) */
 	EX_ADD,
 	EX_SUB,
 	EX_MUL,
 	EX_DIV,
 	EX_REM,
+	EX_BOR,   /* | */
+	EX_BXOR,  /* ^ */
+	EX_BAND,  /* & */
+	EX_SHL,   /* << */
+	EX_SHR,   /* >> (arithmetic; signed word) */
+	EX_EQ,    /* == (yields 0/1) */
+	EX_NE,    /* != */
+	EX_LT,    /* < */
+	EX_GT,    /* > */
+	EX_LE,    /* <= */
+	EX_GE,    /* >= */
 } ExprKind;
 
 typedef struct Expr Expr;
@@ -406,19 +465,24 @@ static Expr *parse_primary(Parser *p, Program *prog) {
 	return NULL; /* unreachable; die() exits */
 }
 
-/* unary = "-" unary | primary   (right-associative negation) */
+/* unary = ("-" | "~" | "!") unary | primary   (right-associative prefix ops) */
 static Expr *parse_unary(Parser *p, Program *prog) {
-	if (peek(p)->kind == TK_MINUS) {
-		advance(p);
-		Expr *e = new_expr(EX_NEG);
-		e->lhs = parse_unary(p, prog);
-		return e;
+	ExprKind op;
+	switch (peek(p)->kind) {
+	case TK_MINUS: op = EX_NEG; break;
+	case TK_TILDE: op = EX_BNOT; break;
+	case TK_BANG: op = EX_LNOT; break;
+	default: return parse_primary(p, prog);
 	}
-	return parse_primary(p, prog);
+	advance(p);
+	Expr *e = new_expr(op);
+	e->lhs = parse_unary(p, prog);
+	return e;
 }
 
-/* Left-associative binary level: fold `left op right op ...` given a pair of
- * token→ExprKind mappings supplied by the two callers below. */
+/* Left-associative binary level: fold `left op right op ...` for up to three
+ * token→ExprKind operator mappings. A level with fewer operators passes TK_EOF
+ * in the unused t1/t2 slots (guarded below); t0 is always a real operator. */
 static Expr *fold_binary(Parser *p, Program *prog, Expr *(*next)(Parser *, Program *),
                          TokKind t0, ExprKind k0, TokKind t1, ExprKind k1,
                          TokKind t2, ExprKind k2) {
@@ -428,7 +492,7 @@ static Expr *fold_binary(Parser *p, Program *prog, Expr *(*next)(Parser *, Progr
 		ExprKind op;
 		if (k == t0)
 			op = k0;
-		else if (k == t1)
+		else if (t1 != TK_EOF && k == t1)
 			op = k1;
 		else if (t2 != TK_EOF && k == t2)
 			op = k2;
@@ -452,17 +516,70 @@ static Expr *parse_mul(Parser *p, Program *prog) {
 /* additive = multiplicative { ("+" | "-") multiplicative } */
 static Expr *parse_add(Parser *p, Program *prog) {
 	return fold_binary(p, prog, parse_mul, TK_PLUS, EX_ADD, TK_MINUS, EX_SUB,
-	                   TK_EOF, EX_ADD /* unused third slot */);
+	                   TK_EOF, EX_ADD /* unused */);
+}
+
+/* The ebnf precedence ladder, tightest to loosest, above additive: shift, then
+ * bitwise and/xor/or, then comparison. Each is left-associative except
+ * comparison, which is non-associative. (TK_EOF fills an unused operator slot.) */
+static Expr *parse_shift(Parser *p, Program *prog) {
+	return fold_binary(p, prog, parse_add, TK_SHL, EX_SHL, TK_SHR, EX_SHR,
+	                   TK_EOF, EX_ADD /* unused */);
+}
+
+static Expr *parse_bit_and(Parser *p, Program *prog) {
+	return fold_binary(p, prog, parse_shift, TK_AMP, EX_BAND, TK_EOF, EX_ADD,
+	                   TK_EOF, EX_ADD /* unused */);
+}
+
+static Expr *parse_bit_xor(Parser *p, Program *prog) {
+	return fold_binary(p, prog, parse_bit_and, TK_CARET, EX_BXOR, TK_EOF, EX_ADD,
+	                   TK_EOF, EX_ADD /* unused */);
+}
+
+static Expr *parse_bit_or(Parser *p, Program *prog) {
+	return fold_binary(p, prog, parse_bit_xor, TK_PIPE, EX_BOR, TK_EOF, EX_ADD,
+	                   TK_EOF, EX_ADD /* unused */);
+}
+
+/* comparison = bit_or [ comparison_op bit_or ]   (non-associative — at most one) */
+static Expr *parse_comparison(Parser *p, Program *prog) {
+	Expr *e = parse_bit_or(p, prog);
+	ExprKind op;
+	switch (peek(p)->kind) {
+	case TK_EQEQ: op = EX_EQ; break;
+	case TK_NE: op = EX_NE; break;
+	case TK_LT: op = EX_LT; break;
+	case TK_GT: op = EX_GT; break;
+	case TK_LE: op = EX_LE; break;
+	case TK_GE: op = EX_GE; break;
+	default: return e;
+	}
+	advance(p);
+	Expr *bin = new_expr(op);
+	bin->lhs = e;
+	bin->rhs = parse_bit_or(p, prog);
+	switch (peek(p)->kind) {
+	case TK_EQEQ: case TK_NE: case TK_LT: case TK_GT: case TK_LE: case TK_GE:
+		die(peek(p)->line, "comparison is non-associative (parenthesize, e.g. `(a < b) < c`)");
+	default:
+		break;
+	}
+	return bin;
 }
 
 static Expr *parse_expr(Parser *p, Program *prog) {
-	return parse_add(p, prog);
+	Expr *e = parse_comparison(p, prog);
+	if (peek(p)->kind == TK_ANDAND || peek(p)->kind == TK_OROR)
+		die(peek(p)->line, "logical `&&`/`||` are not supported yet (M0)");
+	return e;
 }
 
 /* module     = "pub" "const" "main" "=" param_list "->" body
  * param_list = "(" [ param { "," param } ] ")"             (0..3 entry params)
  * body       = expr | "{" "return" expr "}"
- * expr       = additive over multiplicative over unary over primary  (M0 slice) */
+ * expr       = comparison over bit-or/xor/and over shift over additive over
+ *              multiplicative over unary over primary  (M0 slice; no logical yet) */
 static void parse(Parser *p, Program *prog) {
 	skip_newlines(p);
 	expect_ident(p, "pub");
@@ -510,6 +627,30 @@ static void parse(Parser *p, Program *prog) {
 
 /* ------------------------------------------------------------- emit QBE - */
 
+/* The QBE word instruction for a binary op. Comparisons are signed and yield a
+ * 0/1 word; `>>` is arithmetic (sar). div/rem are signed. */
+static const char *binop(ExprKind k) {
+	switch (k) {
+	case EX_ADD: return "add";
+	case EX_SUB: return "sub";
+	case EX_MUL: return "mul";
+	case EX_DIV: return "div";
+	case EX_REM: return "rem";
+	case EX_BOR: return "or";
+	case EX_BXOR: return "xor";
+	case EX_BAND: return "and";
+	case EX_SHL: return "shl";
+	case EX_SHR: return "sar";
+	case EX_EQ: return "ceqw";
+	case EX_NE: return "cnew";
+	case EX_LT: return "csltw";
+	case EX_GT: return "csgtw";
+	case EX_LE: return "cslew";
+	case EX_GE: return "csgew";
+	default: die(0, "internal: not a binary op"); return NULL;
+	}
+}
+
 /* Emit the code that computes `e` into a fresh word temp, writing the operand
  * that names its value (a literal, a `%param`, or a `%tN` temp) into `dst`.
  * Constants are inlined — QBE accepts them directly as instruction operands. */
@@ -521,11 +662,19 @@ static void emit_expr(FILE *out, Expr *e, int *tmp, char *dst, size_t cap) {
 	case EX_PARAM:
 		snprintf(dst, cap, "%%%s", e->name);
 		return;
-	case EX_NEG: {
+	case EX_NEG:
+	case EX_BNOT:
+	case EX_LNOT: {
 		char a[96];
 		emit_expr(out, e->lhs, tmp, a, sizeof a);
 		int t = (*tmp)++;
-		fprintf(out, "\t%%t%d =w neg %s\n", t, a);
+		/* neg; ~x is `xor x, -1`; !x is `x == 0` (0/1). */
+		if (e->kind == EX_NEG)
+			fprintf(out, "\t%%t%d =w neg %s\n", t, a);
+		else if (e->kind == EX_BNOT)
+			fprintf(out, "\t%%t%d =w xor %s, -1\n", t, a);
+		else
+			fprintf(out, "\t%%t%d =w ceqw %s, 0\n", t, a);
 		snprintf(dst, cap, "%%t%d", t);
 		return;
 	}
@@ -533,17 +682,23 @@ static void emit_expr(FILE *out, Expr *e, int *tmp, char *dst, size_t cap) {
 	case EX_SUB:
 	case EX_MUL:
 	case EX_DIV:
-	case EX_REM: {
+	case EX_REM:
+	case EX_BOR:
+	case EX_BXOR:
+	case EX_BAND:
+	case EX_SHL:
+	case EX_SHR:
+	case EX_EQ:
+	case EX_NE:
+	case EX_LT:
+	case EX_GT:
+	case EX_LE:
+	case EX_GE: {
 		char a[96], b[96];
 		emit_expr(out, e->lhs, tmp, a, sizeof a);
 		emit_expr(out, e->rhs, tmp, b, sizeof b);
-		const char *op = e->kind == EX_ADD ? "add"
-		               : e->kind == EX_SUB ? "sub"
-		               : e->kind == EX_MUL ? "mul"
-		               : e->kind == EX_DIV ? "div"
-		                                   : "rem"; /* EX_REM; div/rem are signed */
 		int t = (*tmp)++;
-		fprintf(out, "\t%%t%d =w %s %s, %s\n", t, op, a, b);
+		fprintf(out, "\t%%t%d =w %s %s, %s\n", t, binop(e->kind), a, b);
 		snprintf(dst, cap, "%%t%d", t);
 		return;
 	}
