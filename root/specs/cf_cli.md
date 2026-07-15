@@ -133,6 +133,13 @@ values of `--stop-at` exist only on the full compiler.
 - **`static` errors on darwin.** Apple does not support statically linking
   libSystem, so `--libc static` with a `darwin-*` target is a compile error, not a
   silent fallback — it is only meaningful for `linux-*`.
+- **On darwin, `none` still links libSystem.** Apple's linker refuses a dynamic
+  Mach-O with no libSystem load command, and arm64 has no static-executable path
+  (a static binary is killed on exec), so on a `darwin-*` target `none` lowers to
+  `-nostdlib -lSystem`, not `-nostdlib` alone. libSystem is present only to satisfy
+  the loader — no C-runtime symbol is referenced, the binary stays freestanding in
+  every other sense and still reaches the kernel through raw `svc` (see
+  [[ebnf.md]], Assembly). The bare `-nostdlib` in the table is the non-darwin form.
 
 `--libc` has no short flag on purpose: every candidate letter (`-C`, `-c`, `-l`,
 `-L`) is a `cc` landmine. The full C-extern surface — declaring externs, naming C
