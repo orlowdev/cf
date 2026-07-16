@@ -62,9 +62,12 @@ for cf in "$here"/[0-9]*.cf; do
 		fail=$((fail + 1))
 		continue
 	fi
-	# Word-split $args into argv on purpose.
+	# Word-split $args into argv on purpose. A per-test timeout guards against a
+	# runaway `loop` (perl's alarm kills the child after N seconds; darwin has no
+	# `timeout`). A timed-out test reports as its SIGALRM exit (128+14=142), which
+	# no test expects, so it surfaces as a failure rather than hanging the suite.
 	# shellcheck disable=SC2086
-	"$out" $args
+	perl -e 'alarm 10; exec @ARGV' "$out" $args
 	got=$?
 	if [ "$got" = "$want" ]; then
 		echo "ok   $name (exit $got)"

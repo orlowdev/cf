@@ -260,6 +260,7 @@ static void lex(Lexer *lx) {
 typedef struct {
 	Token *toks;
 	size_t pos;
+	int loop_depth; /* how many loops enclose the statement being parsed */
 } Parser;
 
 /* The type of a value. M0 has three: `Int` (a word), an opaque pointer (`*T` —
@@ -359,6 +360,10 @@ struct Expr {
 	 * tell a record value (an `l` arena pointer — passed/returned by pointer) from a
 	 * word. */
 	Type rtype;
+	/* EX_IF/EX_AND/EX_OR: id of the 4-byte stack slot that merges the branch values.
+	 * Assigned per function before emit (assign_stmt_slots) and allocated once in the
+	 * entry block, so an if/logical inside a loop does not `alloc4` each iteration. */
+	int slot;
 };
 
 static Expr *new_expr(ExprKind kind) {
@@ -375,6 +380,9 @@ typedef enum {
 	ST_ASSIGN,      /* reassign an existing `let` word local */
 	ST_FIELD_ASSIGN,/* mutate a field of a `let` record local: name.field = expr */
 	ST_RETURN,
+	ST_LOOP,        /* loop { body } — infinite loop statement */
+	ST_BREAK,       /* break (bare) or `if cond then break` (guard in expr) */
+	ST_CONTINUE,    /* continue (bare) or `if cond then continue` (guard in expr) */
 } StmtKind;
 
 typedef struct Stmt Stmt;
@@ -385,9 +393,18 @@ struct Stmt {
 	char field[64];     /* ST_FIELD_ASSIGN: the mutated field */
 	char type_name[64]; /* ST_LOCAL: the record type annotation (empty = a word local) */
 	int foff;           /* ST_FIELD_ASSIGN: the field's byte offset (filled by typecheck) */
-	Expr *expr;         /* ST_LOCAL/ST_ASSIGN/ST_FIELD_ASSIGN: value; ST_RETURN: returned */
+	Expr *expr;         /* ST_LOCAL/ST_ASSIGN/ST_FIELD_ASSIGN: value; ST_RETURN: returned;
+	                     * ST_BREAK/ST_CONTINUE: the guard condition, or NULL if bare */
+	Stmt *body;         /* ST_LOOP: the loop body statement list */
 	Stmt *next;
 };
+
+/* A statement diverges (ends its block unconditionally): a `return`, or a bare
+ * `break`/`continue`. A guarded break/continue and a loop fall through. */
+static int stmt_is_terminal(const Stmt *s) {
+	return s->kind == ST_RETURN ||
+	       ((s->kind == ST_BREAK || s->kind == ST_CONTINUE) && !s->expr);
+}
 
 static Stmt *new_stmt(StmtKind kind) {
 	Stmt *s = xmalloc(sizeof *s);
@@ -408,6 +425,7 @@ typedef struct {
 
 #define MAX_PARAMS 32
 #define MAX_FIELDS 64
+#define MAX_LOOP_DEPTH 64 /* cap on statically-nested loops (bounds Emit.loops[]) */
 
 /* A `data` record declaration: `data Name = { Int f0, Int f1, ... }`. M0 fields
  * are all Int (4 bytes), laid out in declaration order, so field i sits at byte
@@ -943,9 +961,12 @@ static Expr *parse_data_literal(Parser *p, Func *fn, const char *typename, int l
 	return e;
 }
 
-/* statement  = local_decl | assign | return_stmt
- * local_decl = ("const" | "let") [ "Int" ] var_name "=" expr
- * assign     = var_name "=" expr           (target must be a `let` local)
+static Stmt *parse_stmt_seq(Parser *p, Func *fn, int require_return, int open_line);
+
+/* statement  = local_decl | assign | return_stmt | loop | break | continue
+ *            | "if" expr "then" ("break" | "continue")
+ * local_decl = ("const" | "let") [ type ] var_name "=" (expr | data_literal)
+ * assign     = var_name "=" expr | var_name "." var_name "=" expr
  * return_stmt = "return" expr
  * A local is not in scope during its own initializer, and cannot shadow a
  * parameter or an earlier local. `let` binds a reassignable value; `const` and
@@ -1023,6 +1044,51 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 		*saw_return = 1;
 		return s;
 	}
+	if (is_ident(t, "loop")) {
+		/* loop { body } — an infinite loop statement (M0 loops don't yield a value;
+		 * that needs `<-`). No label. break/continue steer it. */
+		advance(p);
+		if (p->loop_depth >= MAX_LOOP_DEPTH)
+			die(t->line, "loops nested too deep");
+		expect(p, TK_LBRACE, "expected `{` (a loop body is a block)");
+		Stmt *s = new_stmt(ST_LOOP);
+		s->line = t->line;
+		p->loop_depth++;
+		s->body = parse_stmt_seq(p, fn, 0, t->line); /* no required `return` */
+		p->loop_depth--;
+		return s;
+	}
+	if (is_ident(t, "break") || is_ident(t, "continue")) {
+		int is_break = is_ident(t, "break");
+		advance(p);
+		if (p->loop_depth == 0)
+			die(t->line, is_break ? "`break` is only valid inside a loop"
+			                      : "`continue` is only valid inside a loop");
+		Stmt *s = new_stmt(is_break ? ST_BREAK : ST_CONTINUE);
+		s->line = t->line; /* bare — no guard, no label in M0 */
+		return s;
+	}
+	if (is_ident(t, "if")) {
+		/* In statement position `if` guards a loop control: `if <cond> then break`
+		 * or `if <cond> then continue` (the value-`if` is an expression — it appears
+		 * on a binding/return right-hand side, never as a bare statement). */
+		advance(p);
+		Expr *cond = parse_expr(p, fn);
+		if (!is_ident(peek(p), "then"))
+			die(peek(p)->line, "expected `then`");
+		advance(p);
+		Token *ctl = peek(p);
+		int is_break = is_ident(ctl, "break");
+		if (!is_break && !is_ident(ctl, "continue"))
+			die(ctl->line, "a statement-position `if` guards a `break` or `continue`");
+		advance(p);
+		if (p->loop_depth == 0)
+			die(ctl->line, "`break`/`continue` is only valid inside a loop");
+		Stmt *s = new_stmt(is_break ? ST_BREAK : ST_CONTINUE);
+		s->line = t->line;
+		s->expr = cond; /* guarded */
+		return s;
+	}
 	/* Otherwise a bare name leads an assignment: `name = expr` (reassign a `let`
 	 * word local) or `name.field = expr` (mutate a `let` record's field). */
 	if (t->kind == TK_IDENT && !is_type_ident(t)) {
@@ -1071,24 +1137,19 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 	return NULL; /* unreachable; die() exits */
 }
 
-/* body = expr | "{" { statement (newline) } "return" expr "}"   (must return). */
-static Stmt *parse_body(Parser *p, Func *fn) {
-	Token *b = peek(p);
-	if (b->kind != TK_LBRACE) {
-		/* A single-expression body is exactly `return <expr>`. */
-		Stmt *s = new_stmt(ST_RETURN);
-		s->expr = parse_expr(p, fn);
-		return s;
-	}
-	advance(p);
+/* Parse a brace-delimited statement sequence — the `{` already consumed — up to
+ * and consuming the matching `}`. One statement per line; no statement may follow
+ * a diverging one (`return`, or a bare `break`/`continue`). A function body must
+ * end with `return` (require_return); a loop body has no such requirement. */
+static Stmt *parse_stmt_seq(Parser *p, Func *fn, int require_return, int open_line) {
 	skip_newlines(p);
 	Stmt *head = NULL, *tail = NULL;
 	int saw_return = 0;
 	while (peek(p)->kind != TK_RBRACE) {
 		if (peek(p)->kind == TK_EOF)
 			die(peek(p)->line, "unterminated block (expected `}`)");
-		if (saw_return)
-			die(peek(p)->line, "unreachable statement after `return`");
+		if (tail && stmt_is_terminal(tail))
+			die(peek(p)->line, "unreachable statement after a terminating statement");
 		Stmt *s = parse_stmt(p, fn, &saw_return);
 		if (tail)
 			tail->next = s;
@@ -1103,9 +1164,22 @@ static Stmt *parse_body(Parser *p, Func *fn) {
 		}
 	}
 	advance(p); /* consume `}` */
-	if (!saw_return)
-		die(b->line, "a function's block must end with `return`");
+	if (require_return && !saw_return)
+		die(open_line, "a function's block must end with `return`");
 	return head;
+}
+
+/* body = expr | "{" stmt_seq "}"   (a function body must return). */
+static Stmt *parse_body(Parser *p, Func *fn) {
+	Token *b = peek(p);
+	if (b->kind != TK_LBRACE) {
+		/* A single-expression body is exactly `return <expr>`. */
+		Stmt *s = new_stmt(ST_RETURN);
+		s->expr = parse_expr(p, fn);
+		return s;
+	}
+	advance(p); /* consume `{` */
+	return parse_stmt_seq(p, fn, 1, b->line);
 }
 
 /* declaration = [ "pub" ] "const" var_name "=" "(" [ param { "," param } ] ")"
@@ -1428,10 +1502,10 @@ static void resolve_record_expr_binding(Program *prog, Func *fn, Stmt *s) {
 	set_local_rec(fn, s->name, d);
 }
 
-/* Type-check one function's body in source order, so a record binding's type is
- * resolved before any later statement reads its fields. */
-static void check_func(Program *prog, Func *fn) {
-	for (Stmt *s = fn->body; s; s = s->next) {
+/* Type-check a statement list in source order, so a record binding's type is
+ * resolved before any later statement reads its fields. Recurses into loop bodies. */
+static void check_stmts(Program *prog, Func *fn, Stmt *list) {
+	for (Stmt *s = list; s; s = s->next) {
 		switch (s->kind) {
 		case ST_LOCAL:
 			if (s->type_name[0]) { /* a record binding (annotated with a record type) */
@@ -1486,8 +1560,20 @@ static void check_func(Program *prog, Func *fn) {
 			}
 			break;
 		}
+		case ST_LOOP:
+			check_stmts(prog, fn, s->body);
+			break;
+		case ST_BREAK:
+		case ST_CONTINUE:
+			if (s->expr) /* guarded: `if <cond> then break/continue` */
+				expect_int(prog, fn, s->expr);
+			break;
 		}
 	}
+}
+
+static void check_func(Program *prog, Func *fn) {
+	check_stmts(prog, fn, fn->body);
 }
 
 /* Resolve every function's record parameter and return types (name → declaration)
@@ -1545,10 +1631,13 @@ static const char *binop(ExprKind k) {
 }
 
 /* Per-function emit state: the next expression-temp and control-flow-label ids
- * (both function-scoped in QBE). */
+ * (both function-scoped in QBE), plus a stack of enclosing loops' ids so `break`
+ * and `continue` reach the nearest loop's end/top labels. */
 typedef struct {
 	int tmp;
 	int lbl;
+	int loops[MAX_LOOP_DEPTH]; /* label ids of enclosing loops (innermost last) */
+	int loop_depth;
 } Emit;
 
 /* Emit the code that computes `e` into a fresh word temp, writing the operand
@@ -1558,9 +1647,9 @@ typedef struct {
  * Names live in stack slots (`%s_<name>`), so a variable reference is a `loadw`.
  * A record local's storage is an arena pointer held in `%r_<name>` (a field read
  * is a `loadw` at the field's offset off that pointer). The distinct `%s_` / `%r_`
- * / `%u_` / `%tN` / `%ifN` / `%lgN` prefixes (word slot / record pointer / incoming
- * param / temp / if-result / logical-result) mean a user name can never collide
- * with a compiler value. */
+ * / `%u_` / `%tN` / `%mN` prefixes (word slot / record pointer / incoming param /
+ * temp / if-and-logical merge slot) mean a user name can never collide with a
+ * compiler value. */
 static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 	switch (e->kind) {
 	case EX_INT:
@@ -1622,58 +1711,56 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		return;
 	}
 	case EX_IF: {
-		/* if cond then A else B — merge the two branch values through a stack
-		 * slot (a `phi` would need each value's predecessor block, which nesting
-		 * makes awkward; a slot store/load is robust and reuses the local model).
-		 * The condition is truthy when nonzero (`jnz`). */
+		/* if cond then A else B — merge the two branch values through the entry-block
+		 * slot `%m<slot>` (a `phi` would need each value's predecessor block, which
+		 * nesting makes awkward; a slot store/load is robust and reuses the local
+		 * model). The condition is truthy when nonzero (`jnz`). */
 		int id = ex->lbl++;
 		char c[96];
 		emit_expr(out, e->lhs, ex, c, sizeof c);
-		fprintf(out, "\t%%if%d =l alloc4 4\n", id);
 		fprintf(out, "\tjnz %s, @then%d, @else%d\n", c, id, id);
 		fprintf(out, "@then%d\n", id);
 		char tb[96];
 		emit_expr(out, e->rhs, ex, tb, sizeof tb);
-		fprintf(out, "\tstorew %s, %%if%d\n", tb, id);
+		fprintf(out, "\tstorew %s, %%m%d\n", tb, e->slot);
 		fprintf(out, "\tjmp @end%d\n", id);
 		fprintf(out, "@else%d\n", id);
 		char eb[96];
 		emit_expr(out, e->els, ex, eb, sizeof eb);
-		fprintf(out, "\tstorew %s, %%if%d\n", eb, id);
+		fprintf(out, "\tstorew %s, %%m%d\n", eb, e->slot);
 		fprintf(out, "\tjmp @end%d\n", id);
 		fprintf(out, "@end%d\n", id);
 		int r = ex->tmp++;
-		fprintf(out, "\t%%t%d =w loadw %%if%d\n", r, id);
+		fprintf(out, "\t%%t%d =w loadw %%m%d\n", r, e->slot);
 		snprintf(dst, cap, "%%t%d", r);
 		return;
 	}
 	case EX_AND:
 	case EX_OR: {
-		/* Short-circuit, reusing the if slot-merge. Evaluate lhs; if it settles
-		 * the result (false for &&, true for ||) store the constant and skip rhs,
-		 * else evaluate rhs and store its truthiness (`cnew b, 0` → 0/1). */
+		/* Short-circuit, reusing the entry-block merge slot `%m<slot>`. Evaluate lhs;
+		 * if it settles the result (false for &&, true for ||) store the constant and
+		 * skip rhs, else evaluate rhs and store its truthiness (`cnew b, 0` → 0/1). */
 		int id = ex->lbl++;
 		int is_and = e->kind == EX_AND;
 		char a[96];
 		emit_expr(out, e->lhs, ex, a, sizeof a);
-		fprintf(out, "\t%%lg%d =l alloc4 4\n", id);
 		if (is_and)
 			fprintf(out, "\tjnz %s, @rhs%d, @sc%d\n", a, id, id);
 		else
 			fprintf(out, "\tjnz %s, @sc%d, @rhs%d\n", a, id, id);
 		fprintf(out, "@sc%d\n", id); /* short-circuit: 0 for &&, 1 for || */
-		fprintf(out, "\tstorew %d, %%lg%d\n", is_and ? 0 : 1, id);
+		fprintf(out, "\tstorew %d, %%m%d\n", is_and ? 0 : 1, e->slot);
 		fprintf(out, "\tjmp @lend%d\n", id);
 		fprintf(out, "@rhs%d\n", id);
 		char b[96];
 		emit_expr(out, e->rhs, ex, b, sizeof b);
 		int bt = ex->tmp++;
 		fprintf(out, "\t%%t%d =w cnew %s, 0\n", bt, b); /* b != 0 → 0/1 */
-		fprintf(out, "\tstorew %%t%d, %%lg%d\n", bt, id);
+		fprintf(out, "\tstorew %%t%d, %%m%d\n", bt, e->slot);
 		fprintf(out, "\tjmp @lend%d\n", id);
 		fprintf(out, "@lend%d\n", id);
 		int r = ex->tmp++;
-		fprintf(out, "\t%%t%d =w loadw %%lg%d\n", r, id);
+		fprintf(out, "\t%%t%d =w loadw %%m%d\n", r, e->slot);
 		snprintf(dst, cap, "%%t%d", r);
 		return;
 	}
@@ -1723,6 +1810,130 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 	die(0, "internal: unhandled expression kind");
 }
 
+/* Emit a statement list. Records live in the arena (`%r_<name>`); word locals in
+ * stack slots (`%s_<name>`). A `loop` becomes a header block with a back-edge; a
+ * `break`/`continue` (bare, or guarded by `if <cond> then …`) jumps to the nearest
+ * loop's end/top label. */
+static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
+	for (Stmt *s = list; s; s = s->next) {
+		char v[96];
+		switch (s->kind) {
+		case ST_LOCAL:
+			if (s->expr->kind == EX_RECORD) {
+				/* A record local lives in the arena: bump-allocate its storage
+				 * (`%r_<name>` = the returned pointer) and store each field's value at
+				 * its offset, in declaration order (ford). */
+				DataDecl *d = s->expr->rec;
+				fprintf(out, "\t%%r_%s =l call $cf_alloc(w %d)\n", s->name, data_size(d));
+				for (int fi = 0; fi < d->nfields; fi++) {
+					char fv[96];
+					emit_expr(out, s->expr->ford[fi], ex, fv, sizeof fv);
+					if (fi == 0) {
+						fprintf(out, "\tstorew %s, %%r_%s\n", fv, s->name);
+					} else {
+						int a = ex->tmp++;
+						fprintf(out, "\t%%t%d =l add %%r_%s, %d\n", a, s->name, fi * 4);
+						fprintf(out, "\tstorew %s, %%t%d\n", fv, a);
+					}
+				}
+			} else if (s->expr->rtype.kind == TY_RECORD) {
+				/* A record local bound to a record-valued call: adopt the callee's
+				 * fresh arena pointer as this local's storage (a move, no copy). */
+				emit_expr(out, s->expr, ex, v, sizeof v);
+				fprintf(out, "\t%%r_%s =l copy %s\n", s->name, v);
+			} else {
+				/* A word local: its slot was reserved in the entry block (see
+				 * emit_func); the binding just stores the initial value. */
+				emit_expr(out, s->expr, ex, v, sizeof v);
+				fprintf(out, "\tstorew %s, %%s_%s\n", v, s->name);
+			}
+			break;
+		case ST_ASSIGN:
+			emit_expr(out, s->expr, ex, v, sizeof v);
+			fprintf(out, "\tstorew %s, %%s_%s\n", v, s->name);
+			break;
+		case ST_FIELD_ASSIGN:
+			/* Mutate a record field: store through the record's arena pointer
+			 * (`%r_<name>`) at the field's offset. */
+			emit_expr(out, s->expr, ex, v, sizeof v);
+			if (s->foff == 0) {
+				fprintf(out, "\tstorew %s, %%r_%s\n", v, s->name);
+			} else {
+				int a = ex->tmp++;
+				fprintf(out, "\t%%t%d =l add %%r_%s, %d\n", a, s->name, s->foff);
+				fprintf(out, "\tstorew %s, %%t%d\n", v, a);
+			}
+			break;
+		case ST_RETURN:
+			emit_expr(out, s->expr, ex, v, sizeof v);
+			fprintf(out, "\tret %s\n", v);
+			break;
+		case ST_LOOP: {
+			/* @ltop<id>: body ; jmp @ltop<id> (back-edge) ; @lend<id>: fall-through.
+			 * The back-edge is the body's fall-through, so it is only emitted when the
+			 * body does not itself end in a divergence (a bare break/continue/return,
+			 * which already closed the block); otherwise it would be orphaned. */
+			int id = ex->lbl++;
+			ex->loops[ex->loop_depth++] = id;
+			fprintf(out, "@ltop%d\n", id);
+			emit_stmts(out, s->body, ex);
+			ex->loop_depth--;
+			Stmt *tail = s->body;
+			while (tail && tail->next)
+				tail = tail->next;
+			if (!tail || !stmt_is_terminal(tail)) /* body can fall through → loop back */
+				fprintf(out, "\tjmp @ltop%d\n", id);
+			fprintf(out, "@lend%d\n", id);
+			break;
+		}
+		case ST_BREAK:
+		case ST_CONTINUE: {
+			/* Jump to the nearest loop's end (break) or top (continue). A guard
+			 * (`if <cond> then …`) branches over the jump; a bare one just jumps. */
+			int id = ex->loops[ex->loop_depth - 1];
+			const char *dstlbl = s->kind == ST_BREAK ? "lend" : "ltop";
+			if (s->expr) {
+				char c[96];
+				emit_expr(out, s->expr, ex, c, sizeof c);
+				int g = ex->lbl++;
+				fprintf(out, "\tjnz %s, @ldo%d, @lskip%d\n", c, g, g);
+				fprintf(out, "@ldo%d\n", g);
+				fprintf(out, "\tjmp @%s%d\n", dstlbl, id);
+				fprintf(out, "@lskip%d\n", g);
+			} else {
+				fprintf(out, "\tjmp @%s%d\n", dstlbl, id);
+			}
+			break;
+		}
+		}
+	}
+}
+
+/* Give each if/logical expression a distinct merge-slot id, counting them in *n,
+ * so emit_func can reserve all merge slots once in the entry block (see Expr.slot).
+ * Walks the whole body, including loop bodies and nested sub-expressions. */
+static void assign_expr_slots(Expr *e, int *n) {
+	if (!e)
+		return;
+	if (e->kind == EX_IF || e->kind == EX_AND || e->kind == EX_OR)
+		e->slot = (*n)++;
+	assign_expr_slots(e->lhs, n);
+	assign_expr_slots(e->rhs, n);
+	assign_expr_slots(e->els, n);
+	for (int i = 0; i < e->nargs; i++)
+		assign_expr_slots(e->args[i], n);
+	for (int i = 0; i < e->nfields; i++) /* EX_RECORD field-init values */
+		assign_expr_slots(e->fvals[i], n);
+}
+
+static void assign_stmt_slots(Stmt *list, int *n) {
+	for (Stmt *s = list; s; s = s->next) {
+		assign_expr_slots(s->expr, n);
+		if (s->kind == ST_LOOP)
+			assign_stmt_slots(s->body, n);
+	}
+}
+
 static void emit_func(FILE *out, const Func *fn) {
 	/* `main` is the exported entry (returns the Int exit code; darwin hands it
 	 * argc/argv/envp in x0/x1/x2 via _start). Other functions are internal. A record
@@ -1752,63 +1963,23 @@ static void emit_func(FILE *out, const Func *fn) {
 		}
 	}
 
+	/* Reserve every word local's stack slot once, here in the entry block — NOT at
+	 * its `let` (which may sit inside a loop; a QBE `alloc4` per iteration is an
+	 * `alloca` that would overflow the stack). The `let` then only stores. Flat
+	 * scoping makes this sound: each name has exactly one slot for the whole body. */
+	for (int i = 0; i < fn->nlocals; i++)
+		if (fn->locals[i].type.kind == TY_INT)
+			fprintf(out, "\t%%s_%s =l alloc4 4\n", fn->locals[i].name);
+
+	/* Likewise reserve every if/logical merge slot once here, not at each
+	 * evaluation (which may recur inside a loop). */
+	int nslots = 0;
+	assign_stmt_slots(fn->body, &nslots);
+	for (int i = 0; i < nslots; i++)
+		fprintf(out, "\t%%m%d =l alloc4 4\n", i);
+
 	Emit ex = {0};
-	for (Stmt *s = fn->body; s; s = s->next) {
-		char v[96];
-		switch (s->kind) {
-		case ST_LOCAL:
-			if (s->expr->kind == EX_RECORD) {
-				/* A record local lives in the arena: bump-allocate its storage
-				 * (`%r_<name>` = the returned pointer) and store each field's value at
-				 * its offset, in declaration order (ford). Arena memory outlives the
-				 * frame, which is what will make record returns a plain pointer later. */
-				DataDecl *d = s->expr->rec;
-				fprintf(out, "\t%%r_%s =l call $cf_alloc(w %d)\n", s->name, data_size(d));
-				for (int fi = 0; fi < d->nfields; fi++) {
-					char fv[96];
-					emit_expr(out, s->expr->ford[fi], &ex, fv, sizeof fv);
-					if (fi == 0) {
-						fprintf(out, "\tstorew %s, %%r_%s\n", fv, s->name);
-					} else {
-						int a = ex.tmp++;
-						fprintf(out, "\t%%t%d =l add %%r_%s, %d\n", a, s->name, fi * 4);
-						fprintf(out, "\tstorew %s, %%t%d\n", fv, a);
-					}
-				}
-			} else if (s->expr->rtype.kind == TY_RECORD) {
-				/* A record local bound to a record-valued call: the callee returns a
-				 * fresh arena pointer; adopt it as this local's storage (a move, no
-				 * copy — the value has a single owner). */
-				emit_expr(out, s->expr, &ex, v, sizeof v);
-				fprintf(out, "\t%%r_%s =l copy %s\n", s->name, v);
-			} else {
-				fprintf(out, "\t%%s_%s =l alloc4 4\n", s->name);
-				emit_expr(out, s->expr, &ex, v, sizeof v);
-				fprintf(out, "\tstorew %s, %%s_%s\n", v, s->name);
-			}
-			break;
-		case ST_ASSIGN:
-			emit_expr(out, s->expr, &ex, v, sizeof v);
-			fprintf(out, "\tstorew %s, %%s_%s\n", v, s->name);
-			break;
-		case ST_FIELD_ASSIGN:
-			/* Mutate a record field: store the value through the record's arena
-			 * pointer (`%r_<name>`) at the field's offset. */
-			emit_expr(out, s->expr, &ex, v, sizeof v);
-			if (s->foff == 0) {
-				fprintf(out, "\tstorew %s, %%r_%s\n", v, s->name);
-			} else {
-				int a = ex.tmp++;
-				fprintf(out, "\t%%t%d =l add %%r_%s, %d\n", a, s->name, s->foff);
-				fprintf(out, "\tstorew %s, %%t%d\n", v, a);
-			}
-			break;
-		case ST_RETURN:
-			emit_expr(out, s->expr, &ex, v, sizeof v);
-			fprintf(out, "\tret %s\n", v);
-			break;
-		}
-	}
+	emit_stmts(out, fn->body, &ex);
 	fprintf(out, "}\n");
 }
 
