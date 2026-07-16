@@ -898,8 +898,15 @@ static void check_expr(Program *prog, Expr *e) {
 		Func *callee = prog_find_func(prog, e->name);
 		if (!callee)
 			die(e->line, "call to an unknown function");
-		if (callee->nparams != e->nargs)
-			die(e->line, "wrong number of arguments");
+		/* Over-application is a genuine error — an M0 function returns Int, which
+		 * is not callable. Under-application is, per ebnf (Partial Application),
+		 * NOT an error: it yields a function of the remaining parameters. cfcc has
+		 * no first-class functions yet, so it is a TEMPORARY STUB error here.
+		 * REVISIT when partial application lands — allow it, and revise test 064. */
+		if (e->nargs > callee->nparams)
+			die(e->line, "too many arguments");
+		if (e->nargs < callee->nparams)
+			die(e->line, "too few arguments (partial application is not supported yet)");
 		for (int i = 0; i < callee->nparams; i++)
 			if (callee->params[i].kind != PK_WORD)
 				die(e->line, "M0 calls pass only Int arguments");
