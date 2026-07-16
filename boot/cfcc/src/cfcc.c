@@ -1050,14 +1050,16 @@ static Func *parse_func(Parser *p, Program *prog) {
 	if (name->text[name->len - 1] == '!')
 		die(name->line, "M0 does not support `!` in a function name");
 	tok_copy(name, fn->name, sizeof fn->name);
-	/* Functions emit as their bare name ($name → darwin _name). Only `start`
-	 * clashes today — it is the runtime's `.globl _start`. (A user function
-	 * sharing a libSystem name is harmless while the binary is freestanding and
-	 * references no libc symbol; reserving those would become necessary if a
-	 * future `--libc` mode links libc calls. The full compiler's name-mangling
-	 * arc removes the whole hazard.) */
-	if (strcmp(fn->name, "start") == 0)
-		die(name->line, "`start` is reserved for the runtime entry symbol");
+	/* Functions emit as their bare name ($name → darwin _name), so a user name may
+	 * not collide with a runtime symbol: `start` (the `.globl _start` entry) or the
+	 * arena runtime's `cf_alloc`/`cf_top`/`cf_limit`/`cf_oom`/`cf_mmap_fail`. (A user
+	 * function sharing a libSystem name is harmless while the binary is freestanding
+	 * and references no libc symbol; the full compiler's name-mangling arc removes
+	 * the whole hazard.) */
+	if (strcmp(fn->name, "start") == 0 || strcmp(fn->name, "cf_alloc") == 0 ||
+	    strcmp(fn->name, "cf_top") == 0 || strcmp(fn->name, "cf_limit") == 0 ||
+	    strcmp(fn->name, "cf_oom") == 0 || strcmp(fn->name, "cf_mmap_fail") == 0)
+		die(name->line, "that name is reserved for the runtime");
 	if (prog_find_func(prog, fn->name))
 		die(name->line, "function already defined");
 	advance(p);
@@ -1350,10 +1352,11 @@ typedef struct {
  * inlined — QBE accepts them as instruction operands.
  *
  * Names live in stack slots (`%s_<name>`), so a variable reference is a `loadw`.
- * A record local's storage is the slot `%r_<name>` (a field read is a `loadw` at
- * the field's offset). The distinct `%s_` / `%r_` / `%u_` / `%tN` / `%ifN` /
- * `%lgN` prefixes (word slot / record storage / incoming param / temp / if-result
- * / logical-result) mean a user name can never collide with a compiler value. */
+ * A record local's storage is an arena pointer held in `%r_<name>` (a field read
+ * is a `loadw` at the field's offset off that pointer). The distinct `%s_` / `%r_`
+ * / `%u_` / `%tN` / `%ifN` / `%lgN` prefixes (word slot / record pointer / incoming
+ * param / temp / if-result / logical-result) mean a user name can never collide
+ * with a compiler value. */
 static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 	switch (e->kind) {
 	case EX_INT:
@@ -1534,10 +1537,12 @@ static void emit_func(FILE *out, const Func *fn) {
 		switch (s->kind) {
 		case ST_LOCAL:
 			if (s->expr->kind == EX_RECORD) {
-				/* A record local: reserve its storage (`%r_<name>`) and store each
-				 * field's value at its offset, in declaration order (ford). */
+				/* A record local lives in the arena: bump-allocate its storage
+				 * (`%r_<name>` = the returned pointer) and store each field's value at
+				 * its offset, in declaration order (ford). Arena memory outlives the
+				 * frame, which is what will make record returns a plain pointer later. */
 				DataDecl *d = s->expr->rec;
-				fprintf(out, "\t%%r_%s =l alloc4 %d\n", s->name, data_size(d));
+				fprintf(out, "\t%%r_%s =l call $cf_alloc(w %d)\n", s->name, data_size(d));
 				for (int fi = 0; fi < d->nfields; fi++) {
 					char fv[96];
 					emit_expr(out, s->expr->ford[fi], &ex, fv, sizeof fv);
@@ -1568,23 +1573,94 @@ static void emit_func(FILE *out, const Func *fn) {
 	fprintf(out, "}\n");
 }
 
-/* The freestanding runtime, emitted verbatim beside the QBE-lowered code (asm
- * bypasses QBE; see ebnf Assembly). `_start` is the -nostdlib entry: it calls
- * `main` and exit-syscalls the Int return. Darwin arm64 BSD syscall: number in
- * x16, `svc #0x80`; SYS_exit = 1. QBE's arm64_apple target underscore-prefixes
- * `$main`, so the symbol is `_main`.
+/* The QBE-level runtime: the root page/arena bump allocator, emitted into the
+ * same IL module as the user functions. This is cf0's degenerate two-geometry
+ * manifold (page + one arena) collapsed to its bump core (geometry_lowering §5–6):
+ * a single global cursor `{cf_top, cf_limit}` over one OS mapping. `cf_alloc`
+ * bumps the cursor by an 8-aligned size — the degenerate `on_alloc` — and traps to
+ * `cf_oom` when it would pass the limit; there is no per-object free and no
+ * teardown (the mapping lives for the whole process). Aggregates (records) home
+ * here; scalars stay in stack slots. `cf_top`/`cf_limit` are `export`ed so the asm
+ * `_start` can initialize them after the mmap. (cfcc's own codegen — not the cf0
+ * `%node`/`%ret` ABI, which cf0.cf will emit; this is a provisional throwaway
+ * runtime, like the record layout it serves.) */
+static void emit_runtime_qbe(FILE *out) {
+	fprintf(out, "export data $cf_top = { l 0 }\n");
+	fprintf(out, "export data $cf_limit = { l 0 }\n");
+	fprintf(out, "function l $cf_alloc(w %%n) {\n");
+	fprintf(out, "@start\n");
+	fprintf(out, "\t%%r7 =w add %%n, 7\n");
+	fprintf(out, "\t%%ra =w and %%r7, -8\n");      /* round the request up to 8 bytes */
+	fprintf(out, "\t%%sz =l extuw %%ra\n");
+	fprintf(out, "\t%%p =l loadl $cf_top\n");
+	fprintf(out, "\t%%nt =l add %%p, %%sz\n");
+	fprintf(out, "\t%%lim =l loadl $cf_limit\n");
+	fprintf(out, "\t%%ok =w culel %%nt, %%lim\n");  /* new top <= limit ? */
+	fprintf(out, "\tjnz %%ok, @ok, @oom\n");
+	fprintf(out, "@oom\n");
+	fprintf(out, "\tcall $cf_oom()\n");             /* traps (exits); never returns */
+	fprintf(out, "\tret %%p\n");
+	fprintf(out, "@ok\n");
+	fprintf(out, "\tstorel %%nt, $cf_top\n");
+	fprintf(out, "\tret %%p\n");
+	fprintf(out, "}\n");
+}
+
+/* The freestanding asm runtime, emitted beside the QBE-lowered code (asm bypasses
+ * QBE; see ebnf Assembly). `_start` is the -nostdlib entry. Darwin arm64 BSD
+ * syscall: number in x16, `svc #0x80`, error flagged by the carry bit; SYS_exit=1,
+ * SYS_mmap=197. QBE's arm64_apple target underscore-prefixes symbols, so `$main`
+ * is `_main` and the exported `$cf_top`/`$cf_limit` are `_cf_top`/`_cf_limit`.
  *
- * argc/argv/envp wiring: under LC_MAIN darwin invokes `_start` exactly like
- * `main(argc, argv, envp, apple)` — argc in x0, argv in x1, envp in x2. `_start`
- * touches none of x0..x2 before the call, so `main` receives them by arity for
- * free. The root page-node mint arrives once a `main` actually allocates. */
+ * `_start` mints the root page — one 64 MiB anonymous mapping (degenerate vs the
+ * spec's remap-on-limit page: overflow just traps) — and seeds the bump cursor
+ * (cf_top=base, cf_limit=base+size) before running main. argc/argv/envp arrive in
+ * x0/x1/x2 under LC_MAIN; the mmap clobbers the arg registers, so they are parked
+ * in x19-x21 (which the kernel preserves across `svc`) and restored before the
+ * call. main then receives them by arity, exactly as before. */
 static void emit_runtime(FILE *out) {
 	fprintf(out, ".text\n");
 	fprintf(out, ".globl _start\n");
+	fprintf(out, ".globl _cf_oom\n");
 	fprintf(out, ".p2align 2\n");
 	fprintf(out, "_start:\n");
-	fprintf(out, "\tbl _main\n");     /* x0..x2 pass through: argc/argv/envp -> main */
-	fprintf(out, "\tmov x16, #1\n");  /* SYS_exit */
+	fprintf(out, "\tmov x19, x0\n");        /* park argc/argv/envp across the mmap */
+	fprintf(out, "\tmov x20, x1\n");
+	fprintf(out, "\tmov x21, x2\n");
+	/* mmap(NULL, 64 MiB, PROT_READ|PROT_WRITE, MAP_ANON|MAP_PRIVATE, -1, 0) */
+	fprintf(out, "\tmov x0, #0\n");
+	fprintf(out, "\tmov x1, #0x4000000\n"); /* 64 MiB */
+	fprintf(out, "\tmov x2, #3\n");         /* PROT_READ|PROT_WRITE */
+	fprintf(out, "\tmov x3, #0x1002\n");    /* MAP_ANON|MAP_PRIVATE (darwin) */
+	fprintf(out, "\tmov x4, #-1\n");        /* fd */
+	fprintf(out, "\tmov x5, #0\n");         /* offset */
+	fprintf(out, "\tmov x16, #197\n");      /* SYS_mmap */
+	fprintf(out, "\tsvc #0x80\n");
+	fprintf(out, "\tb.cs _cf_mmap_fail\n"); /* carry set on error */
+	/* seed the cursor: cf_top = base (x0), cf_limit = base + 64 MiB */
+	fprintf(out, "\tadrp x9, _cf_top@PAGE\n");
+	fprintf(out, "\tadd x9, x9, _cf_top@PAGEOFF\n");
+	fprintf(out, "\tstr x0, [x9]\n");
+	fprintf(out, "\tmov x1, #0x4000000\n");
+	fprintf(out, "\tadd x11, x0, x1\n");
+	fprintf(out, "\tadrp x10, _cf_limit@PAGE\n");
+	fprintf(out, "\tadd x10, x10, _cf_limit@PAGEOFF\n");
+	fprintf(out, "\tstr x11, [x10]\n");
+	/* restore argc/argv/envp and run main; exit with its Int return (x0) */
+	fprintf(out, "\tmov x0, x19\n");
+	fprintf(out, "\tmov x1, x20\n");
+	fprintf(out, "\tmov x2, x21\n");
+	fprintf(out, "\tbl _main\n");
+	fprintf(out, "\tmov x16, #1\n");        /* SYS_exit */
+	fprintf(out, "\tsvc #0x80\n");
+	/* mmap failure and arena overflow: exit with distinct nonzero codes. */
+	fprintf(out, "_cf_mmap_fail:\n");
+	fprintf(out, "\tmov x0, #71\n");
+	fprintf(out, "\tmov x16, #1\n");
+	fprintf(out, "\tsvc #0x80\n");
+	fprintf(out, "_cf_oom:\n");
+	fprintf(out, "\tmov x0, #70\n");
+	fprintf(out, "\tmov x16, #1\n");
 	fprintf(out, "\tsvc #0x80\n");
 }
 
@@ -1728,6 +1804,7 @@ int main(int argc, char **argv) {
 	FILE *f = fopen(g_qbe_il, "wb");
 	if (!f)
 		die(0, "cannot write QBE IL");
+	emit_runtime_qbe(f); /* the arena allocator + bump cursor, ahead of the user code */
 	for (int i = 0; i < prog.nfuncs; i++)
 		emit_func(f, prog.funcs[i]);
 	fclose(f);
