@@ -110,8 +110,8 @@ typedef enum {
 	TK_GT,      /* > */
 	TK_LE,      /* <= */
 	TK_GE,      /* >= */
-	TK_ANDAND,  /* && (logical; deferred) */
-	TK_OROR,    /* || (logical; deferred) */
+	TK_ANDAND,  /* && logical, short-circuit */
+	TK_OROR,    /* || logical, short-circuit */
 	TK_EQ,
 	TK_ARROW, /* -> */
 } TokKind;
@@ -302,6 +302,9 @@ typedef enum {
 	EX_GT,    /* > */
 	EX_LE,    /* <= */
 	EX_GE,    /* >= */
+	/* short-circuit logical (lhs, rhs); yield 0/1 — NOT plain binary ops */
+	EX_AND,   /* && */
+	EX_OR,    /* || */
 } ExprKind;
 
 typedef struct Expr Expr;
@@ -707,6 +710,32 @@ static Expr *parse_comparison(Parser *p, Func *fn) {
 	return bin;
 }
 
+/* logical_and = comparison { "&&" comparison }   (short-circuit; yields 0/1) */
+static Expr *parse_and(Parser *p, Func *fn) {
+	Expr *e = parse_comparison(p, fn);
+	while (peek(p)->kind == TK_ANDAND) {
+		advance(p);
+		Expr *n = new_expr(EX_AND);
+		n->lhs = e;
+		n->rhs = parse_comparison(p, fn);
+		e = n;
+	}
+	return e;
+}
+
+/* logical_or = logical_and { "||" logical_and }   (short-circuit; yields 0/1) */
+static Expr *parse_or(Parser *p, Func *fn) {
+	Expr *e = parse_and(p, fn);
+	while (peek(p)->kind == TK_OROR) {
+		advance(p);
+		Expr *n = new_expr(EX_OR);
+		n->lhs = e;
+		n->rhs = parse_and(p, fn);
+		e = n;
+	}
+	return e;
+}
+
 /* if_expr = "if" expr "then" expr "else" expr
  * An expression yielding a word: the condition is truthy when nonzero; both
  * branches are required (an else-less `if` yields an Option, which M0 lacks).
@@ -733,10 +762,7 @@ static Expr *parse_if(Parser *p, Func *fn) {
 static Expr *parse_expr(Parser *p, Func *fn) {
 	if (is_ident(peek(p), "if"))
 		return parse_if(p, fn);
-	Expr *e = parse_comparison(p, fn);
-	if (peek(p)->kind == TK_ANDAND || peek(p)->kind == TK_OROR)
-		die(peek(p)->line, "logical `&&`/`||` are not supported yet (M0)");
-	return e;
+	return parse_or(p, fn);
 }
 
 /* statement  = local_decl | assign | return_stmt
@@ -992,8 +1018,9 @@ typedef struct {
  * inlined — QBE accepts them as instruction operands.
  *
  * Names live in stack slots (`%s_<name>`), so a variable reference is a `loadw`.
- * The distinct `%s_` / `%u_` / `%tN` / `%ifN` prefixes (slot / incoming param /
- * temp / if-result) mean a user name can never collide with a compiler value. */
+ * The distinct `%s_` / `%u_` / `%tN` / `%ifN` / `%lgN` prefixes (slot / incoming
+ * param / temp / if-result / logical-result) mean a user name can never collide
+ * with a compiler value. */
 static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 	switch (e->kind) {
 	case EX_INT:
@@ -1046,6 +1073,36 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		fprintf(out, "@end%d\n", id);
 		int r = ex->tmp++;
 		fprintf(out, "\t%%t%d =w loadw %%if%d\n", r, id);
+		snprintf(dst, cap, "%%t%d", r);
+		return;
+	}
+	case EX_AND:
+	case EX_OR: {
+		/* Short-circuit, reusing the if slot-merge. Evaluate lhs; if it settles
+		 * the result (false for &&, true for ||) store the constant and skip rhs,
+		 * else evaluate rhs and store its truthiness (`cnew b, 0` → 0/1). */
+		int id = ex->lbl++;
+		int is_and = e->kind == EX_AND;
+		char a[96];
+		emit_expr(out, e->lhs, ex, a, sizeof a);
+		fprintf(out, "\t%%lg%d =l alloc4 4\n", id);
+		if (is_and)
+			fprintf(out, "\tjnz %s, @rhs%d, @sc%d\n", a, id, id);
+		else
+			fprintf(out, "\tjnz %s, @sc%d, @rhs%d\n", a, id, id);
+		fprintf(out, "@sc%d\n", id); /* short-circuit: 0 for &&, 1 for || */
+		fprintf(out, "\tstorew %d, %%lg%d\n", is_and ? 0 : 1, id);
+		fprintf(out, "\tjmp @lend%d\n", id);
+		fprintf(out, "@rhs%d\n", id);
+		char b[96];
+		emit_expr(out, e->rhs, ex, b, sizeof b);
+		int bt = ex->tmp++;
+		fprintf(out, "\t%%t%d =w cnew %s, 0\n", bt, b); /* b != 0 → 0/1 */
+		fprintf(out, "\tstorew %%t%d, %%lg%d\n", bt, id);
+		fprintf(out, "\tjmp @lend%d\n", id);
+		fprintf(out, "@lend%d\n", id);
+		int r = ex->tmp++;
+		fprintf(out, "\t%%t%d =w loadw %%lg%d\n", r, id);
 		snprintf(dst, cap, "%%t%d", r);
 		return;
 	}
