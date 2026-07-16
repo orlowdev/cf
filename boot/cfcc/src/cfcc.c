@@ -283,13 +283,17 @@ typedef struct {
  * or a long (a pointer, e.g. *[Str] argv/envp). darwin hands these to _start in
  * x0/x1/x2, which forwards them unchanged, so QBE reads them as ordinary args. */
 typedef enum {
-	PK_WORD, /* Int  -> w (argc) */
-	PK_LONG, /* *T   -> l (argv, envp) */
+	PK_WORD,   /* Int  -> w (argc) */
+	PK_LONG,   /* *T   -> l (argv, envp) — an opaque pointer, never dereferenced */
+	PK_RECORD, /* a record type -> l (a pointer to the caller's arena record) */
 } ParamKind;
 
 typedef struct {
 	char name[64];
 	ParamKind kind;
+	int line;           /* source line of the type (for diagnostics) */
+	char type_name[64]; /* PK_RECORD: the record type name (resolved in typecheck) */
+	DataDecl *rec;      /* PK_RECORD: the resolved declaration */
 } Param;
 
 /* Expression AST. M0 expressions are word-valued: literals, references to a
@@ -351,6 +355,10 @@ struct Expr {
 	Expr **fvals;
 	int nfields;
 	Expr **ford;
+	/* The expression's resolved type, filled by the typecheck pass. Emit reads it to
+	 * tell a record value (an `l` arena pointer — passed/returned by pointer) from a
+	 * word. */
+	Type rtype;
 };
 
 static Expr *new_expr(ExprKind kind) {
@@ -490,13 +498,17 @@ typedef enum {
 	R_LET,   /* a `let` local (reassignable) */
 } Resolution;
 
-/* Resolve a name (params first, then locals) and set *ty to its type. A word
- * param is Int; a pointer param is TY_PTR (argv/envp — not usable as an Int). */
+/* Resolve a name (params first, then locals) and set *ty to its type. A word param
+ * is Int; a record param is TY_RECORD (its decl, resolved in typecheck); a pointer
+ * param is TY_PTR (argv/envp — not usable as an Int). */
 static Resolution resolve_name(Func *fn, const char *name, Type *ty) {
 	for (int i = 0; i < fn->nparams; i++)
 		if (strcmp(fn->params[i].name, name) == 0) {
-			ty->kind = fn->params[i].kind == PK_WORD ? TY_INT : TY_PTR;
-			ty->rec = NULL;
+			switch (fn->params[i].kind) {
+			case PK_WORD:   ty->kind = TY_INT;    ty->rec = NULL; break;
+			case PK_RECORD: ty->kind = TY_RECORD; ty->rec = fn->params[i].rec; break;
+			case PK_LONG:   ty->kind = TY_PTR;    ty->rec = NULL; break;
+			}
 			return R_PARAM;
 		}
 	for (int i = 0; i < fn->nlocals; i++)
@@ -571,15 +583,19 @@ static int is_type_ident(Token *t) {
 	return t->kind == TK_IDENT && t->len > 0 && t->text[0] >= 'A' && t->text[0] <= 'Z';
 }
 
-/* Consume an entry parameter's type and classify it by ABI width. M0 entry types
- * are only `Int` (a word — argc) and pointer types like `*[Str]` (a long — argv,
- * envp); a pointer's pointee is skipped wholesale since only the top-level shape
- * sets the register width. */
-static ParamKind parse_param_type(Parser *p) {
+/* Consume a parameter's type and classify it. M0 param types are `Int` (a word),
+ * a record type (a long — a pointer to the caller's arena record; the type name is
+ * stashed and resolved to a decl in typecheck), or a pointer type like `*[Str]` (a
+ * long — argv/envp); a pointer's pointee is skipped wholesale since only the
+ * top-level shape sets the register width. Fills `out->kind` (and `out->type_name`
+ * for a record). */
+static void parse_param_type(Parser *p, Param *out) {
 	Token *t = peek(p);
+	out->line = t->line;
 	if (is_ident(t, "Int")) {
 		advance(p);
-		return PK_WORD;
+		out->kind = PK_WORD;
+		return;
 	}
 	if (t->kind == TK_STAR) {
 		advance(p);
@@ -600,15 +616,25 @@ static ParamKind parse_param_type(Parser *p) {
 		} else {
 			die(u->line, "expected a type after `*`");
 		}
-		return PK_LONG;
+		out->kind = PK_LONG;
+		return;
 	}
-	die(t->line, "M0 entry parameters must be `Int` or a pointer type (e.g. `*[Str]`)");
-	return PK_WORD; /* unreachable; die() exits */
+	if (is_type_ident(t)) { /* a record type name (PascalCase, non-Int) */
+		if (t->text[t->len - 1] == '!')
+			die(t->line, "M0 does not support `!` in a type name");
+		tok_copy(t, out->type_name, sizeof out->type_name);
+		out->kind = PK_RECORD;
+		advance(p);
+		if (peek(p)->kind == TK_LBRACKET)
+			die(peek(p)->line, "M0 record types are not generic");
+		return;
+	}
+	die(t->line, "a parameter type must be `Int`, a record type, or a pointer type (e.g. `*[Str]`)");
 }
 
-/* param = type var_name  (typed; M0 entry params always carry their type). */
+/* param = type var_name  (typed; M0 params always carry their type). */
 static void parse_param(Parser *p, Param *out) {
-	out->kind = parse_param_type(p);
+	parse_param_type(p, out);
 	Token *name = peek(p);
 	if (name->kind != TK_IDENT || is_type_ident(name))
 		die(name->line, "expected a parameter name");
@@ -1221,8 +1247,9 @@ static void expect_int(Program *prog, Func *fn, Expr *e) {
 
 /* Compute and validate the type of an expression, resolving field accesses and
  * calls against the whole program (so forward references and recursion work).
- * Field accesses are annotated in place (rec, foff) for emit. */
-static Type typeof_expr(Program *prog, Func *fn, Expr *e) {
+ * Field accesses are annotated in place (rec, foff) for emit. The public entry is
+ * the `typeof_expr` wrapper below, which caches the result in `e->rtype`. */
+static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 	switch (e->kind) {
 	case EX_INT:
 		return (Type){TY_INT, NULL};
@@ -1258,12 +1285,25 @@ static Type typeof_expr(Program *prog, Func *fn, Expr *e) {
 			die(e->line, "too many arguments");
 		if (e->nargs < callee->nparams)
 			die(e->line, "too few arguments (partial application is not supported yet)");
-		for (int i = 0; i < callee->nparams; i++)
-			if (callee->params[i].kind != PK_WORD)
-				die(e->line, "M0 calls pass only Int arguments");
-		for (int i = 0; i < e->nargs; i++)
-			expect_int(prog, fn, e->args[i]);
-		return (Type){TY_INT, NULL};
+		/* Each argument's type must match the parameter: Int for a word param, the
+		 * same record type for a record param. (A pointer param — only `*T` — is not
+		 * expressible as an argument in M0.) */
+		for (int i = 0; i < callee->nparams; i++) {
+			Param *pm = &callee->params[i];
+			Type at = typeof_expr(prog, fn, e->args[i]);
+			if (pm->kind == PK_WORD) {
+				if (at.kind != TY_INT)
+					die(e->line, "argument type mismatch (a word parameter expects an Int)");
+			} else if (pm->kind == PK_RECORD) {
+				if (at.kind != TY_RECORD)
+					die(e->line, "argument type mismatch (a record parameter expects a record)");
+				if (at.rec != pm->rec)
+					die(e->line, "argument type mismatch (record type differs)");
+			} else {
+				die(e->line, "M0 cannot pass a pointer argument");
+			}
+		}
+		return (Type){TY_INT, NULL}; /* M0 functions still return Int (returns: 2b-ii) */
 	}
 	case EX_IF:
 		expect_int(prog, fn, e->lhs); /* condition */
@@ -1284,6 +1324,14 @@ static Type typeof_expr(Program *prog, Func *fn, Expr *e) {
 		return (Type){TY_INT, NULL};
 	}
 	die(e->line, "internal: unhandled expression kind in typecheck");
+}
+
+/* Type an expression and cache the result in `e->rtype` so emit can dispatch on it
+ * (record → an `l` arena pointer; word → a `w`). */
+static Type typeof_expr(Program *prog, Func *fn, Expr *e) {
+	Type t = typeof_expr_compute(prog, fn, e);
+	e->rtype = t;
+	return t;
 }
 
 /* Bind an EX_RECORD data literal to its `data` declaration: check the fields
@@ -1357,7 +1405,24 @@ static void check_func(Program *prog, Func *fn) {
 	}
 }
 
+/* Resolve every function's record parameter types (name → declaration) so both
+ * bodies and call sites see the resolved decl. Done for all functions before any
+ * body is checked, since a call may reference a callee defined later. */
+static void resolve_param_types(Program *prog) {
+	for (int i = 0; i < prog->nfuncs; i++) {
+		Func *fn = prog->funcs[i];
+		for (int j = 0; j < fn->nparams; j++)
+			if (fn->params[j].kind == PK_RECORD) {
+				DataDecl *d = prog_find_data(prog, fn->params[j].type_name);
+				if (!d)
+					die(fn->params[j].line, "a parameter names an unknown data type");
+				fn->params[j].rec = d;
+			}
+	}
+}
+
 static void typecheck(Program *prog) {
+	resolve_param_types(prog);
 	for (int i = 0; i < prog->nfuncs; i++)
 		check_func(prog, prog->funcs[i]);
 }
@@ -1411,15 +1476,22 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		snprintf(dst, cap, "%ld", e->ival);
 		return;
 	case EX_VAR: {
+		/* A record-valued name is an arena pointer (`%r_<name>`), used directly as
+		 * an operand (e.g. a call argument); a word name is a `loadw` from its slot. */
+		if (e->rtype.kind == TY_RECORD) {
+			snprintf(dst, cap, "%%r_%s", e->name);
+			return;
+		}
 		int t = ex->tmp++;
 		fprintf(out, "\t%%t%d =w loadw %%s_%s\n", t, e->name);
 		snprintf(dst, cap, "%%t%d", t);
 		return;
 	}
 	case EX_FIELD: {
-		/* Read a record field. The base is a record-typed local whose storage is
-		 * the slot `%r_<name>`; the field sits at byte offset e->foff. (M0 field
-		 * bases are always a name — record-returning exprs are a later increment.) */
+		/* Read a record field. The base is a record-typed name — a local or a
+		 * parameter — whose base pointer is `%r_<name>`; the field sits at byte
+		 * offset e->foff. (M0 field bases are always a name; a field of a call result
+		 * is reached by binding it to a local first — record-returning exprs are 2b.) */
 		if (e->lhs->kind != EX_VAR)
 			die(e->line, "internal: M0 field base is not a name");
 		if (e->foff == 0) {
@@ -1438,19 +1510,21 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 	case EX_RECORD:
 		die(e->line, "internal: record literal in expression position");
 	case EX_CALL: {
-		/* Evaluate each argument into its own temp, then call. All M0 values are
-		 * word; the callee symbol is the bare function name ($<name>). */
-		int argt[MAX_PARAMS];
+		/* Evaluate each argument into its own temp, then call. A record argument is
+		 * passed by pointer (`l`); a word argument as `w`. The callee symbol is the
+		 * bare function name ($<name>); the result is a word (M0 returns Int). */
+		int argt[MAX_PARAMS], argrec[MAX_PARAMS];
 		for (int i = 0; i < e->nargs; i++) {
 			char op[96];
 			emit_expr(out, e->args[i], ex, op, sizeof op);
+			argrec[i] = e->args[i]->rtype.kind == TY_RECORD;
 			argt[i] = ex->tmp++;
-			fprintf(out, "\t%%t%d =w copy %s\n", argt[i], op);
+			fprintf(out, "\t%%t%d =%s copy %s\n", argt[i], argrec[i] ? "l" : "w", op);
 		}
 		int r = ex->tmp++;
 		fprintf(out, "\t%%t%d =w call $%s(", r, e->name);
 		for (int i = 0; i < e->nargs; i++)
-			fprintf(out, "%sw %%t%d", i ? ", " : "", argt[i]);
+			fprintf(out, "%s%s %%t%d", i ? ", " : "", argrec[i] ? "l" : "w", argt[i]);
 		fprintf(out, ")\n");
 		snprintf(dst, cap, "%%t%d", r);
 		return;
@@ -1569,15 +1643,20 @@ static void emit_func(FILE *out, const Func *fn) {
 	fprintf(out, ") {\n");
 	fprintf(out, "@start\n");
 
-	/* Every Int name lives in a stack slot so `let` reassignment is just a store.
-	 * Spill each word parameter from its incoming temp into its slot; pointer
-	 * params (e.g. main's argv/envp) are never referenced, so they get no slot. */
-	for (int i = 0; i < fn->nparams; i++)
+	/* Every Int name lives in a stack slot so `let` reassignment is just a store:
+	 * spill each word parameter from its incoming temp into its slot. A record
+	 * parameter arrives as a pointer; copy it into the `%r_<name>` form field access
+	 * uses (read-only — a param's fields cannot be mutated). Pointer params (main's
+	 * argv/envp) are never referenced, so they get no slot. */
+	for (int i = 0; i < fn->nparams; i++) {
+		const char *n = fn->params[i].name;
 		if (fn->params[i].kind == PK_WORD) {
-			const char *n = fn->params[i].name;
 			fprintf(out, "\t%%s_%s =l alloc4 4\n", n);
 			fprintf(out, "\tstorew %%u_%s, %%s_%s\n", n, n);
+		} else if (fn->params[i].kind == PK_RECORD) {
+			fprintf(out, "\t%%r_%s =l copy %%u_%s\n", n, n);
 		}
+	}
 
 	Emit ex = {0};
 	for (Stmt *s = fn->body; s; s = s->next) {
