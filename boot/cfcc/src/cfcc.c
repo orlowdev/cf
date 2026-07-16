@@ -279,6 +279,7 @@ typedef struct {
 typedef enum {
 	EX_INT,   /* integer literal (ival) */
 	EX_VAR,   /* reference to a bound Int name (param or local) */
+	EX_CALL,  /* function call: name(args) */
 	/* unary (lhs) */
 	EX_NEG,   /* - negate */
 	EX_BNOT,  /* ~ bitwise not */
@@ -305,9 +306,12 @@ typedef enum {
 typedef struct Expr Expr;
 struct Expr {
 	ExprKind kind;
-	long ival;       /* EX_INT */
-	char name[64];   /* EX_VAR */
-	Expr *lhs, *rhs; /* operands (unary uses lhs) */
+	int line;         /* source line (for EX_CALL diagnostics) */
+	long ival;        /* EX_INT */
+	char name[64];    /* EX_VAR (bound name) / EX_CALL (callee) */
+	Expr *lhs, *rhs;  /* operands (unary uses lhs) */
+	Expr **args;      /* EX_CALL argument expressions */
+	int nargs;
 };
 
 static Expr *new_expr(ExprKind kind) {
@@ -349,17 +353,51 @@ typedef struct {
 	int mutable;
 } Binding;
 
-/* The whole program the M0 slice can express: `main(params) -> body`, a sequence
- * of statements. `locals` accrues during parsing for name resolution. */
+#define MAX_PARAMS 32
+
+/* A top-level function: `[pub] const name = (params) [Int] -> body`. All M0
+ * functions return Int (word). `locals` accrues during parsing for name
+ * resolution within this function. */
 typedef struct {
-	Param params[3];
+	char name[64];
+	int is_pub;
+	Param params[MAX_PARAMS];
 	int nparams;
 	Binding *locals;
 	int nlocals, cap_locals;
 	Stmt *body;
+} Func;
+
+/* The whole program: a set of functions, one of which is `pub const main`. */
+typedef struct {
+	Func **funcs;
+	int nfuncs, cap_funcs;
 } Program;
 
-/* How a name resolves in the current scope. */
+static Func *new_func(void) {
+	Func *f = xmalloc(sizeof *f);
+	memset(f, 0, sizeof *f);
+	return f;
+}
+
+static Func *prog_find_func(Program *prog, const char *name) {
+	for (int i = 0; i < prog->nfuncs; i++)
+		if (strcmp(prog->funcs[i]->name, name) == 0)
+			return prog->funcs[i];
+	return NULL;
+}
+
+static void prog_add_func(Program *prog, Func *f) {
+	if (prog->nfuncs == prog->cap_funcs) {
+		prog->cap_funcs = prog->cap_funcs ? prog->cap_funcs * 2 : 8;
+		prog->funcs = realloc(prog->funcs, prog->cap_funcs * sizeof *prog->funcs);
+		if (!prog->funcs)
+			die(0, "out of memory");
+	}
+	prog->funcs[prog->nfuncs++] = f;
+}
+
+/* How a name resolves in a function's scope. */
 typedef enum {
 	R_NONE,  /* undefined */
 	R_PARAM, /* a parameter (immutable) */
@@ -369,29 +407,29 @@ typedef enum {
 
 /* Resolve a name (params first, then locals) and set *word to whether it is an
  * Int (usable in the integer expression grammar). */
-static Resolution resolve_name(Program *prog, const char *name, int *word) {
-	for (int i = 0; i < prog->nparams; i++)
-		if (strcmp(prog->params[i].name, name) == 0) {
-			*word = prog->params[i].kind == PK_WORD;
+static Resolution resolve_name(Func *fn, const char *name, int *word) {
+	for (int i = 0; i < fn->nparams; i++)
+		if (strcmp(fn->params[i].name, name) == 0) {
+			*word = fn->params[i].kind == PK_WORD;
 			return R_PARAM;
 		}
-	for (int i = 0; i < prog->nlocals; i++)
-		if (strcmp(prog->locals[i].name, name) == 0) {
-			*word = prog->locals[i].word;
-			return prog->locals[i].mutable ? R_LET : R_CONST;
+	for (int i = 0; i < fn->nlocals; i++)
+		if (strcmp(fn->locals[i].name, name) == 0) {
+			*word = fn->locals[i].word;
+			return fn->locals[i].mutable ? R_LET : R_CONST;
 		}
 	return R_NONE;
 }
 
 /* Record a new local (always Int/word in M0). Caller has checked for a clash. */
-static void prog_add_local(Program *prog, const char *name, int mutable) {
-	if (prog->nlocals == prog->cap_locals) {
-		prog->cap_locals = prog->cap_locals ? prog->cap_locals * 2 : 16;
-		prog->locals = realloc(prog->locals, prog->cap_locals * sizeof *prog->locals);
-		if (!prog->locals)
+static void func_add_local(Func *fn, const char *name, int mutable) {
+	if (fn->nlocals == fn->cap_locals) {
+		fn->cap_locals = fn->cap_locals ? fn->cap_locals * 2 : 16;
+		fn->locals = realloc(fn->locals, fn->cap_locals * sizeof *fn->locals);
+		if (!fn->locals)
 			die(0, "out of memory");
 	}
-	Binding *b = &prog->locals[prog->nlocals++];
+	Binding *b = &fn->locals[fn->nlocals++];
 	snprintf(b->name, sizeof b->name, "%s", name);
 	b->word = 1;
 	b->mutable = mutable;
@@ -495,12 +533,13 @@ static void parse_param(Parser *p, Param *out) {
 	advance(p);
 }
 
-static Expr *parse_expr(Parser *p, Program *prog); /* forward */
+static Expr *parse_expr(Parser *p, Func *fn); /* forward */
 
-/* primary = INT | var_name | "(" expr ")"
- * A var_name must resolve to one of main's Int parameters (only word-typed
- * values flow through the integer expression grammar). */
-static Expr *parse_primary(Parser *p, Program *prog) {
+/* primary = INT | call | var_name | "(" expr ")"
+ * call    = var_name "(" [ expr { "," expr } ] ")"
+ * A bare name resolves to an Int parameter or local; a name followed by `(` is a
+ * function call (its callee is checked against the whole program after parsing). */
+static Expr *parse_primary(Parser *p, Func *fn) {
 	Token *t = peek(p);
 	if (t->kind == TK_INT) {
 		advance(p);
@@ -514,49 +553,74 @@ static Expr *parse_primary(Parser *p, Program *prog) {
 	}
 	if (t->kind == TK_LPAREN) {
 		advance(p);
-		Expr *e = parse_expr(p, prog);
+		Expr *e = parse_expr(p, fn);
 		expect(p, TK_RPAREN, "expected `)`");
 		return e;
 	}
 	if (t->kind == TK_IDENT && !is_type_ident(t)) {
 		if (t->text[t->len - 1] == '!')
 			die(t->line, "M0 does not support `!` in a name here");
+		int line = t->line;
+		advance(p); /* `t` still points at the name token (stable in the array) */
+		if (peek(p)->kind == TK_LPAREN) {
+			advance(p);
+			Expr *e = new_expr(EX_CALL);
+			e->line = line;
+			tok_copy(t, e->name, sizeof e->name);
+			int cap = 0;
+			if (peek(p)->kind != TK_RPAREN)
+				for (;;) {
+					if (e->nargs == cap) {
+						cap = cap ? cap * 2 : 4;
+						e->args = realloc(e->args, cap * sizeof *e->args);
+						if (!e->args)
+							die(0, "out of memory");
+					}
+					e->args[e->nargs++] = parse_expr(p, fn);
+					if (peek(p)->kind == TK_COMMA) {
+						advance(p);
+						continue;
+					}
+					break;
+				}
+			expect(p, TK_RPAREN, "expected `)`");
+			return e;
+		}
 		Expr *e = new_expr(EX_VAR);
 		tok_copy(t, e->name, sizeof e->name);
-		advance(p);
 		int word;
-		if (resolve_name(prog, e->name, &word) == R_NONE)
-			die(t->line, "unknown name (M0 expressions use integers, parameters, and locals)");
+		if (resolve_name(fn, e->name, &word) == R_NONE)
+			die(line, "unknown name (M0 expressions use integers, parameters, locals, and calls)");
 		if (!word)
-			die(t->line, "M0 expressions can only use Int values (e.g. argc)");
+			die(line, "M0 expressions can only use Int values (e.g. argc)");
 		return e;
 	}
-	die(t->line, "expected an integer, a parameter, or `(`");
+	die(t->line, "expected an integer, a name, or `(`");
 	return NULL; /* unreachable; die() exits */
 }
 
 /* unary = ("-" | "~" | "!") unary | primary   (right-associative prefix ops) */
-static Expr *parse_unary(Parser *p, Program *prog) {
+static Expr *parse_unary(Parser *p, Func *fn) {
 	ExprKind op;
 	switch (peek(p)->kind) {
 	case TK_MINUS: op = EX_NEG; break;
 	case TK_TILDE: op = EX_BNOT; break;
 	case TK_BANG: op = EX_LNOT; break;
-	default: return parse_primary(p, prog);
+	default: return parse_primary(p, fn);
 	}
 	advance(p);
 	Expr *e = new_expr(op);
-	e->lhs = parse_unary(p, prog);
+	e->lhs = parse_unary(p, fn);
 	return e;
 }
 
 /* Left-associative binary level: fold `left op right op ...` for up to three
  * token→ExprKind operator mappings. A level with fewer operators passes TK_EOF
  * in the unused t1/t2 slots (guarded below); t0 is always a real operator. */
-static Expr *fold_binary(Parser *p, Program *prog, Expr *(*next)(Parser *, Program *),
+static Expr *fold_binary(Parser *p, Func *fn, Expr *(*next)(Parser *, Func *),
                          TokKind t0, ExprKind k0, TokKind t1, ExprKind k1,
                          TokKind t2, ExprKind k2) {
-	Expr *e = next(p, prog);
+	Expr *e = next(p, fn);
 	for (;;) {
 		TokKind k = peek(p)->kind;
 		ExprKind op;
@@ -571,50 +635,50 @@ static Expr *fold_binary(Parser *p, Program *prog, Expr *(*next)(Parser *, Progr
 		advance(p);
 		Expr *bin = new_expr(op);
 		bin->lhs = e;
-		bin->rhs = next(p, prog);
+		bin->rhs = next(p, fn);
 		e = bin;
 	}
 	return e;
 }
 
 /* multiplicative = unary { ("*" | "/" | "%") unary } */
-static Expr *parse_mul(Parser *p, Program *prog) {
-	return fold_binary(p, prog, parse_unary, TK_STAR, EX_MUL, TK_SLASH, EX_DIV,
+static Expr *parse_mul(Parser *p, Func *fn) {
+	return fold_binary(p, fn, parse_unary, TK_STAR, EX_MUL, TK_SLASH, EX_DIV,
 	                   TK_PERCENT, EX_REM);
 }
 
 /* additive = multiplicative { ("+" | "-") multiplicative } */
-static Expr *parse_add(Parser *p, Program *prog) {
-	return fold_binary(p, prog, parse_mul, TK_PLUS, EX_ADD, TK_MINUS, EX_SUB,
+static Expr *parse_add(Parser *p, Func *fn) {
+	return fold_binary(p, fn, parse_mul, TK_PLUS, EX_ADD, TK_MINUS, EX_SUB,
 	                   TK_EOF, EX_ADD /* unused */);
 }
 
 /* The ebnf precedence ladder, tightest to loosest, above additive: shift, then
  * bitwise and/xor/or, then comparison. Each is left-associative except
  * comparison, which is non-associative. (TK_EOF fills an unused operator slot.) */
-static Expr *parse_shift(Parser *p, Program *prog) {
-	return fold_binary(p, prog, parse_add, TK_SHL, EX_SHL, TK_SHR, EX_SHR,
+static Expr *parse_shift(Parser *p, Func *fn) {
+	return fold_binary(p, fn, parse_add, TK_SHL, EX_SHL, TK_SHR, EX_SHR,
 	                   TK_EOF, EX_ADD /* unused */);
 }
 
-static Expr *parse_bit_and(Parser *p, Program *prog) {
-	return fold_binary(p, prog, parse_shift, TK_AMP, EX_BAND, TK_EOF, EX_ADD,
+static Expr *parse_bit_and(Parser *p, Func *fn) {
+	return fold_binary(p, fn, parse_shift, TK_AMP, EX_BAND, TK_EOF, EX_ADD,
 	                   TK_EOF, EX_ADD /* unused */);
 }
 
-static Expr *parse_bit_xor(Parser *p, Program *prog) {
-	return fold_binary(p, prog, parse_bit_and, TK_CARET, EX_BXOR, TK_EOF, EX_ADD,
+static Expr *parse_bit_xor(Parser *p, Func *fn) {
+	return fold_binary(p, fn, parse_bit_and, TK_CARET, EX_BXOR, TK_EOF, EX_ADD,
 	                   TK_EOF, EX_ADD /* unused */);
 }
 
-static Expr *parse_bit_or(Parser *p, Program *prog) {
-	return fold_binary(p, prog, parse_bit_xor, TK_PIPE, EX_BOR, TK_EOF, EX_ADD,
+static Expr *parse_bit_or(Parser *p, Func *fn) {
+	return fold_binary(p, fn, parse_bit_xor, TK_PIPE, EX_BOR, TK_EOF, EX_ADD,
 	                   TK_EOF, EX_ADD /* unused */);
 }
 
 /* comparison = bit_or [ comparison_op bit_or ]   (non-associative — at most one) */
-static Expr *parse_comparison(Parser *p, Program *prog) {
-	Expr *e = parse_bit_or(p, prog);
+static Expr *parse_comparison(Parser *p, Func *fn) {
+	Expr *e = parse_bit_or(p, fn);
 	ExprKind op;
 	switch (peek(p)->kind) {
 	case TK_EQEQ: op = EX_EQ; break;
@@ -628,7 +692,7 @@ static Expr *parse_comparison(Parser *p, Program *prog) {
 	advance(p);
 	Expr *bin = new_expr(op);
 	bin->lhs = e;
-	bin->rhs = parse_bit_or(p, prog);
+	bin->rhs = parse_bit_or(p, fn);
 	switch (peek(p)->kind) {
 	case TK_EQEQ: case TK_NE: case TK_LT: case TK_GT: case TK_LE: case TK_GE:
 		die(peek(p)->line, "comparison is non-associative (parenthesize, e.g. `(a < b) < c`)");
@@ -638,8 +702,8 @@ static Expr *parse_comparison(Parser *p, Program *prog) {
 	return bin;
 }
 
-static Expr *parse_expr(Parser *p, Program *prog) {
-	Expr *e = parse_comparison(p, prog);
+static Expr *parse_expr(Parser *p, Func *fn) {
+	Expr *e = parse_comparison(p, fn);
 	if (peek(p)->kind == TK_ANDAND || peek(p)->kind == TK_OROR)
 		die(peek(p)->line, "logical `&&`/`||` are not supported yet (M0)");
 	return e;
@@ -652,7 +716,7 @@ static Expr *parse_expr(Parser *p, Program *prog) {
  * A local is not in scope during its own initializer, and cannot shadow a
  * parameter or an earlier local. `let` binds a reassignable value; `const` and
  * parameters cannot be reassigned. */
-static Stmt *parse_stmt(Parser *p, Program *prog, int *saw_return) {
+static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 	Token *t = peek(p);
 	if (is_ident(t, "const") || is_ident(t, "let")) {
 		int mutable = is_ident(t, "let");
@@ -673,17 +737,17 @@ static Stmt *parse_stmt(Parser *p, Program *prog, int *saw_return) {
 		tok_copy(name, s->name, sizeof s->name);
 		advance(p);
 		int word;
-		if (resolve_name(prog, s->name, &word) != R_NONE)
+		if (resolve_name(fn, s->name, &word) != R_NONE)
 			die(name->line, "name already defined (no shadowing in M0)");
 		expect(p, TK_EQ, "expected `=`");
-		s->expr = parse_expr(p, prog); /* initializer: name not yet in scope */
-		prog_add_local(prog, s->name, mutable);
+		s->expr = parse_expr(p, fn); /* initializer: name not yet in scope */
+		func_add_local(fn, s->name, mutable);
 		return s;
 	}
 	if (is_ident(t, "return")) {
 		advance(p);
 		Stmt *s = new_stmt(ST_RETURN);
-		s->expr = parse_expr(p, prog);
+		s->expr = parse_expr(p, fn);
 		*saw_return = 1;
 		return s;
 	}
@@ -696,90 +760,160 @@ static Stmt *parse_stmt(Parser *p, Program *prog, int *saw_return) {
 		advance(p);
 		expect(p, TK_EQ, "expected `=` (M0 statements are const/let, a reassignment, or return)");
 		int word;
-		switch (resolve_name(prog, s->name, &word)) {
+		switch (resolve_name(fn, s->name, &word)) {
 		case R_NONE: die(t->line, "unknown name (assign to a declared `let` local)");
 		case R_PARAM: die(t->line, "cannot reassign a parameter");
 		case R_CONST: die(t->line, "cannot reassign a `const` binding (declare it with `let`)");
 		case R_LET: break; /* ok */
 		}
-		s->expr = parse_expr(p, prog);
+		s->expr = parse_expr(p, fn);
 		return s;
 	}
 	die(t->line, "expected `const`, `let`, `return`, or an assignment");
 	return NULL; /* unreachable; die() exits */
 }
 
-/* module     = "pub" "const" "main" "=" param_list "->" body
- * param_list = "(" [ param { "," param } ] ")"             (0..3 entry params)
- * body       = expr | "{" { statement } "return" expr "}"
- * expr       = comparison over bit-or/xor/and over shift over additive over
- *              multiplicative over unary over primary  (M0 slice; no logical yet) */
-static void parse(Parser *p, Program *prog) {
+/* body = expr | "{" { statement (newline) } "return" expr "}"   (must return). */
+static Stmt *parse_body(Parser *p, Func *fn) {
+	Token *b = peek(p);
+	if (b->kind != TK_LBRACE) {
+		/* A single-expression body is exactly `return <expr>`. */
+		Stmt *s = new_stmt(ST_RETURN);
+		s->expr = parse_expr(p, fn);
+		return s;
+	}
+	advance(p);
 	skip_newlines(p);
-	expect_ident(p, "pub");
+	Stmt *head = NULL, *tail = NULL;
+	int saw_return = 0;
+	while (peek(p)->kind != TK_RBRACE) {
+		if (peek(p)->kind == TK_EOF)
+			die(peek(p)->line, "unterminated block (expected `}`)");
+		if (saw_return)
+			die(peek(p)->line, "unreachable statement after `return`");
+		Stmt *s = parse_stmt(p, fn, &saw_return);
+		if (tail)
+			tail->next = s;
+		else
+			head = s;
+		tail = s;
+		if (peek(p)->kind != TK_RBRACE) {
+			if (peek(p)->kind == TK_EOF)
+				die(peek(p)->line, "unterminated block (expected `}`)");
+			expect(p, TK_NEWLINE, "expected a newline (one statement per line)");
+			skip_newlines(p);
+		}
+	}
+	advance(p); /* consume `}` */
+	if (!saw_return)
+		die(b->line, "a function's block must end with `return`");
+	return head;
+}
+
+/* declaration = [ "pub" ] "const" var_name "=" "(" [ param { "," param } ] ")"
+ *               [ "Int" ] "->" body
+ * All M0 functions return Int. Params resolve within the function only. */
+static Func *parse_func(Parser *p, Program *prog) {
+	Func *fn = new_func();
+	if (is_ident(peek(p), "pub")) {
+		fn->is_pub = 1;
+		advance(p);
+	}
 	expect_ident(p, "const");
-	expect_ident(p, "main");
+	Token *name = peek(p);
+	if (name->kind != TK_IDENT || is_type_ident(name))
+		die(name->line, "expected a function name");
+	if (name->text[name->len - 1] == '!')
+		die(name->line, "M0 does not support `!` in a function name");
+	tok_copy(name, fn->name, sizeof fn->name);
+	/* Functions emit as their bare name ($name → darwin _name). Only `start`
+	 * clashes today — it is the runtime's `.globl _start`. (A user function
+	 * sharing a libSystem name is harmless while the binary is freestanding and
+	 * references no libc symbol; reserving those would become necessary if a
+	 * future `--libc` mode links libc calls. The full compiler's name-mangling
+	 * arc removes the whole hazard.) */
+	if (strcmp(fn->name, "start") == 0)
+		die(name->line, "`start` is reserved for the runtime entry symbol");
+	if (prog_find_func(prog, fn->name))
+		die(name->line, "function already defined");
+	advance(p);
 	expect(p, TK_EQ, "expected `=`");
 
 	expect(p, TK_LPAREN, "expected `(`");
-	prog->nparams = 0;
-	if (peek(p)->kind != TK_RPAREN) {
+	if (peek(p)->kind != TK_RPAREN)
 		for (;;) {
-			if (prog->nparams == 3)
-				die(peek(p)->line, "main takes at most 3 parameters (argc, argv, envp)");
-			parse_param(p, &prog->params[prog->nparams]);
-			for (int j = 0; j < prog->nparams; j++)
-				if (strcmp(prog->params[j].name, prog->params[prog->nparams].name) == 0)
+			if (fn->nparams == MAX_PARAMS)
+				die(peek(p)->line, "too many parameters");
+			parse_param(p, &fn->params[fn->nparams]);
+			for (int j = 0; j < fn->nparams; j++)
+				if (strcmp(fn->params[j].name, fn->params[fn->nparams].name) == 0)
 					die(p->toks[p->pos - 1].line, "duplicate parameter name");
-			prog->nparams++;
+			fn->nparams++;
 			if (peek(p)->kind == TK_COMMA) {
 				advance(p);
 				continue;
 			}
 			break;
 		}
-	}
 	expect(p, TK_RPAREN, "expected `)`");
-	expect(p, TK_ARROW, "expected `->`");
 
-	Token *b = peek(p);
-	if (b->kind == TK_LBRACE) {
-		advance(p);
-		skip_newlines(p);
-		Stmt *head = NULL, *tail = NULL;
-		int saw_return = 0;
-		while (peek(p)->kind != TK_RBRACE) {
-			if (peek(p)->kind == TK_EOF)
-				die(peek(p)->line, "unterminated block (expected `}`)");
-			if (saw_return)
-				die(peek(p)->line, "unreachable statement after `return`");
-			Stmt *s = parse_stmt(p, prog, &saw_return);
-			if (tail)
-				tail->next = s;
-			else
-				head = s;
-			tail = s;
-			if (peek(p)->kind != TK_RBRACE) {
-				if (peek(p)->kind == TK_EOF)
-					die(peek(p)->line, "unterminated block (expected `}`)");
-				expect(p, TK_NEWLINE, "expected a newline (one statement per line)");
-				skip_newlines(p);
-			}
-		}
-		advance(p); /* consume `}` */
-		if (!saw_return)
-			die(b->line, "main's block must end with `return`");
-		prog->body = head;
-	} else {
-		/* A single-expression body is exactly `return <expr>`. */
-		Stmt *s = new_stmt(ST_RETURN);
-		s->expr = parse_expr(p, prog);
-		prog->body = s;
+	Token *rt = peek(p); /* optional Int return type */
+	if (is_type_ident(rt) || rt->kind == TK_STAR) {
+		if (is_ident(rt, "Int"))
+			advance(p);
+		else
+			die(rt->line, "M0 functions return Int");
 	}
+	expect(p, TK_ARROW, "expected `->`");
+	fn->body = parse_body(p, fn);
+	return fn;
+}
 
+/* module = { declaration } — one per line; exactly one is `pub const main`. */
+static void parse(Parser *p, Program *prog) {
 	skip_newlines(p);
-	if (peek(p)->kind != TK_EOF)
-		die(peek(p)->line, "trailing input (M0 accepts only a single `main`)");
+	while (peek(p)->kind != TK_EOF) {
+		prog_add_func(prog, parse_func(p, prog));
+		if (peek(p)->kind != TK_EOF) {
+			expect(p, TK_NEWLINE, "expected a newline between declarations");
+			skip_newlines(p);
+		}
+	}
+	Func *m = prog_find_func(prog, "main");
+	if (!m)
+		die(0, "no entry point: define `pub const main`");
+	if (!m->is_pub)
+		die(0, "`main` must be `pub`");
+	if (m->nparams > 3)
+		die(0, "main takes at most 3 parameters (argc, argv, envp)");
+}
+
+/* After parsing, check every call: the callee exists, the arity matches, and its
+ * parameters are Int (M0 passes only Int arguments). Runs over the whole program
+ * so forward references and recursion resolve. */
+static void check_expr(Program *prog, Expr *e) {
+	if (!e)
+		return;
+	if (e->kind == EX_CALL) {
+		Func *callee = prog_find_func(prog, e->name);
+		if (!callee)
+			die(e->line, "call to an unknown function");
+		if (callee->nparams != e->nargs)
+			die(e->line, "wrong number of arguments");
+		for (int i = 0; i < callee->nparams; i++)
+			if (callee->params[i].kind != PK_WORD)
+				die(e->line, "M0 calls pass only Int arguments");
+	}
+	for (int i = 0; i < e->nargs; i++)
+		check_expr(prog, e->args[i]);
+	check_expr(prog, e->lhs);
+	check_expr(prog, e->rhs);
+}
+
+static void validate_calls(Program *prog) {
+	for (int i = 0; i < prog->nfuncs; i++)
+		for (Stmt *s = prog->funcs[i]->body; s; s = s->next)
+			check_expr(prog, s->expr);
 }
 
 /* ------------------------------------------------------------- emit QBE - */
@@ -824,6 +958,24 @@ static void emit_expr(FILE *out, Expr *e, int *tmp, char *dst, size_t cap) {
 		int t = (*tmp)++;
 		fprintf(out, "\t%%t%d =w loadw %%s_%s\n", t, e->name);
 		snprintf(dst, cap, "%%t%d", t);
+		return;
+	}
+	case EX_CALL: {
+		/* Evaluate each argument into its own temp, then call. All M0 values are
+		 * word; the callee symbol is the bare function name ($<name>). */
+		int argt[MAX_PARAMS];
+		for (int i = 0; i < e->nargs; i++) {
+			char op[96];
+			emit_expr(out, e->args[i], tmp, op, sizeof op);
+			argt[i] = (*tmp)++;
+			fprintf(out, "\t%%t%d =w copy %s\n", argt[i], op);
+		}
+		int r = (*tmp)++;
+		fprintf(out, "\t%%t%d =w call $%s(", r, e->name);
+		for (int i = 0; i < e->nargs; i++)
+			fprintf(out, "%sw %%t%d", i ? ", " : "", argt[i]);
+		fprintf(out, ")\n");
+		snprintf(dst, cap, "%%t%d", r);
 		return;
 	}
 	case EX_NEG:
@@ -872,30 +1024,30 @@ static void emit_expr(FILE *out, Expr *e, int *tmp, char *dst, size_t cap) {
 	die(0, "internal: unhandled expression kind");
 }
 
-static void emit_qbe(FILE *out, const Program *prog) {
-	/* `main` returns a word (Int exit code) and takes argc/argv/envp per arity —
-	 * darwin hands these to _start in x0/x1/x2, which forwards them, so QBE reads
-	 * them as ordinary args. No page node is threaded yet: a non-allocating main
-	 * carries none (M0). */
-	fprintf(out, "export function w $main(");
-	for (int i = 0; i < prog->nparams; i++)
+static void emit_func(FILE *out, const Func *fn) {
+	/* `main` is the exported entry (returns the Int exit code; darwin hands it
+	 * argc/argv/envp in x0/x1/x2 via _start). Other functions are internal. No
+	 * page node is threaded yet: a non-allocating body carries none (M0). */
+	int is_main = strcmp(fn->name, "main") == 0;
+	fprintf(out, "%sfunction w $%s(", is_main ? "export " : "", fn->name);
+	for (int i = 0; i < fn->nparams; i++)
 		fprintf(out, "%s%s %%u_%s", i ? ", " : "",
-		        prog->params[i].kind == PK_WORD ? "w" : "l", prog->params[i].name);
+		        fn->params[i].kind == PK_WORD ? "w" : "l", fn->params[i].name);
 	fprintf(out, ") {\n");
 	fprintf(out, "@start\n");
 
 	/* Every Int name lives in a stack slot so `let` reassignment is just a store.
-	 * Spill each word parameter (argc) from its incoming temp into its slot; the
-	 * pointer params (argv/envp) are never referenced, so they get no slot. */
-	for (int i = 0; i < prog->nparams; i++)
-		if (prog->params[i].kind == PK_WORD) {
-			const char *n = prog->params[i].name;
+	 * Spill each word parameter from its incoming temp into its slot; pointer
+	 * params (e.g. main's argv/envp) are never referenced, so they get no slot. */
+	for (int i = 0; i < fn->nparams; i++)
+		if (fn->params[i].kind == PK_WORD) {
+			const char *n = fn->params[i].name;
 			fprintf(out, "\t%%s_%s =l alloc4 4\n", n);
 			fprintf(out, "\tstorew %%u_%s, %%s_%s\n", n, n);
 		}
 
 	int tmp = 0;
-	for (Stmt *s = prog->body; s; s = s->next) {
+	for (Stmt *s = fn->body; s; s = s->next) {
 		char v[96];
 		switch (s->kind) {
 		case ST_LOCAL:
@@ -1037,6 +1189,7 @@ int main(int argc, char **argv) {
 	ps.toks = lx.toks;
 	Program prog = {0};
 	parse(&ps, &prog);
+	validate_calls(&prog);
 
 	/* Default artifact: ./out/<stem>. */
 	char *stem = stem_of(input);
@@ -1075,7 +1228,8 @@ int main(int argc, char **argv) {
 	FILE *f = fopen(g_qbe_il, "wb");
 	if (!f)
 		die(0, "cannot write QBE IL");
-	emit_qbe(f, &prog);
+	for (int i = 0; i < prog.nfuncs; i++)
+		emit_func(f, prog.funcs[i]);
 	fclose(f);
 
 	f = fopen(g_rt_s, "wb");
