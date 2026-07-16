@@ -380,11 +380,12 @@ typedef enum {
 typedef struct Stmt Stmt;
 struct Stmt {
 	StmtKind kind;
-	int line;       /* source line of the statement (for diagnostics) */
-	char name[64];  /* ST_LOCAL/ST_ASSIGN/ST_FIELD_ASSIGN: the target name */
-	char field[64]; /* ST_FIELD_ASSIGN: the mutated field */
-	int foff;       /* ST_FIELD_ASSIGN: the field's byte offset (filled by typecheck) */
-	Expr *expr;     /* ST_LOCAL/ST_ASSIGN/ST_FIELD_ASSIGN: the value; ST_RETURN: returned */
+	int line;           /* source line of the statement (for diagnostics) */
+	char name[64];      /* ST_LOCAL/ST_ASSIGN/ST_FIELD_ASSIGN: the target name */
+	char field[64];     /* ST_FIELD_ASSIGN: the mutated field */
+	char type_name[64]; /* ST_LOCAL: the record type annotation (empty = a word local) */
+	int foff;           /* ST_FIELD_ASSIGN: the field's byte offset (filled by typecheck) */
+	Expr *expr;         /* ST_LOCAL/ST_ASSIGN/ST_FIELD_ASSIGN: value; ST_RETURN: returned */
 	Stmt *next;
 };
 
@@ -428,14 +429,18 @@ static int data_field_index(const DataDecl *d, const char *name) {
 	return -1;
 }
 
-/* A top-level function: `[pub] const name = (params) [Int] -> body`. All M0
- * functions return Int (word). `locals` accrues during parsing for name
- * resolution within this function. */
+/* A top-level function: `[pub] const name = (params) [ret] -> body`. A function
+ * returns Int (word) unless `ret_type_name` names a record type, in which case it
+ * returns that record by pointer (`ret_rec`, resolved in typecheck). `locals`
+ * accrues during parsing for name resolution within this function. */
 typedef struct {
 	char name[64];
 	int is_pub;
 	Param params[MAX_PARAMS];
 	int nparams;
+	char ret_type_name[64]; /* empty = Int; else a record return type */
+	int ret_line;           /* source line of the return type (for diagnostics) */
+	DataDecl *ret_rec;      /* resolved record return type (typecheck) */
 	Binding *locals;
 	int nlocals, cap_locals;
 	Stmt *body;
@@ -972,6 +977,7 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 		if (name->text[name->len - 1] == '!')
 			die(name->line, "M0 does not support `!` in a variable name");
 		Stmt *s = new_stmt(ST_LOCAL);
+		s->line = name->line;
 		tok_copy(name, s->name, sizeof s->name);
 		advance(p);
 		Type ty;
@@ -979,9 +985,17 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 			die(name->line, "name already defined (no shadowing in M0)");
 		expect(p, TK_EQ, "expected `=`");
 		if (is_record) {
-			/* A record local is built from a data literal; a `let` record's fields
-			 * may later be mutated (`p.x = 5`). Its rec is bound in typecheck. */
-			s->expr = parse_data_literal(p, fn, rectype, name->line);
+			/* A record local's initializer is a data literal (`{ … }`) or a
+			 * record-valued expression such as a call that returns this record
+			 * (`mk(…)`). Binding from another record variable is not allowed — that is
+			 * an aggregate copy, which needs an explicit `copy` (memory_model §6). A
+			 * `let` record's fields may later be mutated. Its rec is bound in
+			 * typecheck; the annotation is kept in type_name to check the initializer. */
+			snprintf(s->type_name, sizeof s->type_name, "%s", rectype);
+			if (peek(p)->kind == TK_LBRACE)
+				s->expr = parse_data_literal(p, fn, rectype, name->line);
+			else
+				s->expr = parse_expr(p, fn);
 			Type rt = {TY_RECORD, NULL};
 			func_add_local(fn, s->name, mutable, rt);
 		} else {
@@ -999,6 +1013,12 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 	if (is_ident(t, "return")) {
 		advance(p);
 		Stmt *s = new_stmt(ST_RETURN);
+		s->line = t->line;
+		/* Returning a bare record literal is not lowered yet — bind it to a local
+		 * first, then return the local. */
+		if (peek(p)->kind == TK_LBRACE)
+			die(peek(p)->line,
+			    "M0 cannot return a record literal directly (bind it to a local, then return it)");
 		s->expr = parse_expr(p, fn);
 		*saw_return = 1;
 		return s;
@@ -1137,12 +1157,23 @@ static Func *parse_func(Parser *p, Program *prog) {
 		}
 	expect(p, TK_RPAREN, "expected `)`");
 
-	Token *rt = peek(p); /* optional Int return type */
-	if (is_type_ident(rt) || rt->kind == TK_STAR) {
-		if (is_ident(rt, "Int"))
+	/* Optional return type: `Int` (a word) or a record type (returned by pointer;
+	 * resolved to a decl in typecheck). A pointer return type has no M0 use. */
+	Token *rt = peek(p);
+	if (rt->kind == TK_STAR)
+		die(rt->line, "M0 functions return `Int` or a record, not a pointer");
+	if (is_type_ident(rt)) {
+		if (is_ident(rt, "Int")) {
 			advance(p);
-		else
-			die(rt->line, "M0 functions return Int");
+		} else {
+			if (rt->text[rt->len - 1] == '!')
+				die(rt->line, "M0 does not support `!` in a type name");
+			tok_copy(rt, fn->ret_type_name, sizeof fn->ret_type_name);
+			fn->ret_line = rt->line;
+			advance(p);
+			if (peek(p)->kind == TK_LBRACKET)
+				die(peek(p)->line, "M0 record types are not generic");
+		}
 	}
 	expect(p, TK_ARROW, "expected `->`");
 	fn->body = parse_body(p, fn);
@@ -1232,11 +1263,14 @@ static void parse(Parser *p, Program *prog) {
 		die(0, "`main` must be `pub`");
 	if (m->nparams > 3)
 		die(0, "main takes at most 3 parameters (argc, argv, envp)");
+	if (m->ret_type_name[0])
+		die(0, "`main` must return Int (its value is the exit code)");
 }
 
 /* ------------------------------------------------------------- typecheck - */
 
 static Type typeof_expr(Program *prog, Func *fn, Expr *e);
+static Type func_ret_type(const Func *fn);
 
 /* Require that `e` yields an Int. A record is legal only as a field-access base
  * and a pointer never, so wherever an Int is expected this rejects them both. */
@@ -1303,7 +1337,7 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 				die(e->line, "M0 cannot pass a pointer argument");
 			}
 		}
-		return (Type){TY_INT, NULL}; /* M0 functions still return Int (returns: 2b-ii) */
+		return func_ret_type(callee); /* Int, or a record returned by pointer */
 	}
 	case EX_IF:
 		expect_int(prog, fn, e->lhs); /* condition */
@@ -1334,6 +1368,22 @@ static Type typeof_expr(Program *prog, Func *fn, Expr *e) {
 	return t;
 }
 
+/* A function's declared return type: a record (returned by pointer) or Int. */
+static Type func_ret_type(const Func *fn) {
+	if (fn->ret_type_name[0])
+		return (Type){TY_RECORD, fn->ret_rec};
+	return (Type){TY_INT, NULL};
+}
+
+/* Backfill a record local's declaration so later field accesses resolve. */
+static void set_local_rec(Func *fn, const char *name, DataDecl *d) {
+	for (int i = 0; i < fn->nlocals; i++)
+		if (strcmp(fn->locals[i].name, name) == 0) {
+			fn->locals[i].type.rec = d;
+			return;
+		}
+}
+
 /* Bind an EX_RECORD data literal to its `data` declaration: check the fields
  * cover it exactly (each declared field set once, no unknowns, none missing),
  * type-check the values, reorder them into declaration order (`ford`), and
@@ -1359,11 +1409,23 @@ static void resolve_record_binding(Program *prog, Func *fn, Stmt *s) {
 	for (int i = 0; i < d->nfields; i++)
 		if (!e->ford[i])
 			die(e->line, "data literal is missing a field");
-	for (int i = 0; i < fn->nlocals; i++)
-		if (strcmp(fn->locals[i].name, s->name) == 0) {
-			fn->locals[i].type.rec = d;
-			break;
-		}
+	set_local_rec(fn, s->name, d);
+}
+
+/* Resolve a record local whose initializer is a record-valued expression (not a
+ * literal) — in M0, a call that returns this record. Binding from another record
+ * variable is rejected (an aggregate copy needs an explicit `copy`, memory_model
+ * §6). Sets the local's record type from the annotation. */
+static void resolve_record_expr_binding(Program *prog, Func *fn, Stmt *s) {
+	DataDecl *d = prog_find_data(prog, s->type_name);
+	if (!d)
+		die(s->line, "unknown data type");
+	if (s->expr->kind == EX_VAR)
+		die(s->line, "cannot bind a record from another record (an aggregate copy needs an explicit copy — not in M0)");
+	Type it = typeof_expr(prog, fn, s->expr);
+	if (it.kind != TY_RECORD || it.rec != d)
+		die(s->line, "initializer type does not match the record binding");
+	set_local_rec(fn, s->name, d);
 }
 
 /* Type-check one function's body in source order, so a record binding's type is
@@ -1372,10 +1434,14 @@ static void check_func(Program *prog, Func *fn) {
 	for (Stmt *s = fn->body; s; s = s->next) {
 		switch (s->kind) {
 		case ST_LOCAL:
-			if (s->expr->kind == EX_RECORD)
-				resolve_record_binding(prog, fn, s);
-			else
-				expect_int(prog, fn, s->expr);
+			if (s->type_name[0]) { /* a record binding (annotated with a record type) */
+				if (s->expr->kind == EX_RECORD)
+					resolve_record_binding(prog, fn, s);      /* { … } literal */
+				else
+					resolve_record_expr_binding(prog, fn, s); /* a record-valued call */
+			} else {
+				expect_int(prog, fn, s->expr);                /* a word local */
+			}
 			break;
 		case ST_FIELD_ASSIGN: {
 			/* `name.field = expr` — target must be a mutable (`let`) record local,
@@ -1398,17 +1464,36 @@ static void check_func(Program *prog, Func *fn) {
 			break;
 		}
 		case ST_ASSIGN: /* target is a `let` word local; value is Int */
-		case ST_RETURN: /* M0 functions return Int */
 			expect_int(prog, fn, s->expr);
 			break;
+		case ST_RETURN: {
+			/* The returned value must match the function's return type. A record
+			 * return may not be a bare parameter — that would hand the caller an alias
+			 * of its own argument; a returned record must be freshly built (a local or
+			 * another call's result), which the arena keeps alive past the frame. */
+			Type rt = func_ret_type(fn);
+			if (rt.kind == TY_RECORD) {
+				if (s->expr->kind == EX_VAR) {
+					Type vt;
+					if (resolve_name(fn, s->expr->name, &vt) == R_PARAM && vt.kind == TY_RECORD)
+						die(s->expr->line, "cannot return a parameter record (build a fresh one)");
+				}
+				Type et = typeof_expr(prog, fn, s->expr);
+				if (et.kind != TY_RECORD || et.rec != rt.rec)
+					die(s->expr->line, "returned value does not match the record return type");
+			} else {
+				expect_int(prog, fn, s->expr);
+			}
+			break;
+		}
 		}
 	}
 }
 
-/* Resolve every function's record parameter types (name → declaration) so both
- * bodies and call sites see the resolved decl. Done for all functions before any
- * body is checked, since a call may reference a callee defined later. */
-static void resolve_param_types(Program *prog) {
+/* Resolve every function's record parameter and return types (name → declaration)
+ * so both bodies and call sites see the resolved decls. Done for all functions
+ * before any body is checked, since a call may reference a callee defined later. */
+static void resolve_signatures(Program *prog) {
 	for (int i = 0; i < prog->nfuncs; i++) {
 		Func *fn = prog->funcs[i];
 		for (int j = 0; j < fn->nparams; j++)
@@ -1418,11 +1503,17 @@ static void resolve_param_types(Program *prog) {
 					die(fn->params[j].line, "a parameter names an unknown data type");
 				fn->params[j].rec = d;
 			}
+		if (fn->ret_type_name[0]) {
+			DataDecl *d = prog_find_data(prog, fn->ret_type_name);
+			if (!d)
+				die(fn->ret_line, "a return type names an unknown data type");
+			fn->ret_rec = d;
+		}
 	}
 }
 
 static void typecheck(Program *prog) {
-	resolve_param_types(prog);
+	resolve_signatures(prog);
 	for (int i = 0; i < prog->nfuncs; i++)
 		check_func(prog, prog->funcs[i]);
 }
@@ -1522,7 +1613,8 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 			fprintf(out, "\t%%t%d =%s copy %s\n", argt[i], argrec[i] ? "l" : "w", op);
 		}
 		int r = ex->tmp++;
-		fprintf(out, "\t%%t%d =w call $%s(", r, e->name);
+		const char *rty = e->rtype.kind == TY_RECORD ? "l" : "w"; /* record → pointer */
+		fprintf(out, "\t%%t%d =%s call $%s(", r, rty, e->name);
 		for (int i = 0; i < e->nargs; i++)
 			fprintf(out, "%s%s %%t%d", i ? ", " : "", argrec[i] ? "l" : "w", argt[i]);
 		fprintf(out, ")\n");
@@ -1633,10 +1725,12 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 
 static void emit_func(FILE *out, const Func *fn) {
 	/* `main` is the exported entry (returns the Int exit code; darwin hands it
-	 * argc/argv/envp in x0/x1/x2 via _start). Other functions are internal. No
-	 * page node is threaded yet: a non-allocating body carries none (M0). */
+	 * argc/argv/envp in x0/x1/x2 via _start). Other functions are internal. A record
+	 * return type lowers to `l` (a pointer to the arena record); Int is `w`. No page
+	 * node is threaded yet: a non-allocating body carries none (M0). */
 	int is_main = strcmp(fn->name, "main") == 0;
-	fprintf(out, "%sfunction w $%s(", is_main ? "export " : "", fn->name);
+	const char *retty = func_ret_type(fn).kind == TY_RECORD ? "l" : "w";
+	fprintf(out, "%sfunction %s $%s(", is_main ? "export " : "", retty, fn->name);
 	for (int i = 0; i < fn->nparams; i++)
 		fprintf(out, "%s%s %%u_%s", i ? ", " : "",
 		        fn->params[i].kind == PK_WORD ? "w" : "l", fn->params[i].name);
@@ -1681,6 +1775,12 @@ static void emit_func(FILE *out, const Func *fn) {
 						fprintf(out, "\tstorew %s, %%t%d\n", fv, a);
 					}
 				}
+			} else if (s->expr->rtype.kind == TY_RECORD) {
+				/* A record local bound to a record-valued call: the callee returns a
+				 * fresh arena pointer; adopt it as this local's storage (a move, no
+				 * copy — the value has a single owner). */
+				emit_expr(out, s->expr, &ex, v, sizeof v);
+				fprintf(out, "\t%%r_%s =l copy %s\n", s->name, v);
 			} else {
 				fprintf(out, "\t%%s_%s =l alloc4 4\n", s->name);
 				emit_expr(out, s->expr, &ex, v, sizeof v);
