@@ -280,6 +280,7 @@ typedef enum {
 	EX_INT,   /* integer literal (ival) */
 	EX_VAR,   /* reference to a bound Int name (param or local) */
 	EX_CALL,  /* function call: name(args) */
+	EX_IF,    /* if cond then a else b (lhs=cond, rhs=then, els=else) */
 	/* unary (lhs) */
 	EX_NEG,   /* - negate */
 	EX_BNOT,  /* ~ bitwise not */
@@ -309,7 +310,8 @@ struct Expr {
 	int line;         /* source line (for EX_CALL diagnostics) */
 	long ival;        /* EX_INT */
 	char name[64];    /* EX_VAR (bound name) / EX_CALL (callee) */
-	Expr *lhs, *rhs;  /* operands (unary uses lhs) */
+	Expr *lhs, *rhs;  /* operands (unary uses lhs; EX_IF: lhs=cond, rhs=then) */
+	Expr *els;        /* EX_IF: else branch */
 	Expr **args;      /* EX_CALL argument expressions */
 	int nargs;
 };
@@ -558,6 +560,9 @@ static Expr *parse_primary(Parser *p, Func *fn) {
 		return e;
 	}
 	if (t->kind == TK_IDENT && !is_type_ident(t)) {
+		if (is_ident(t, "if"))
+			die(t->line, "an `if` expression must stand alone or be parenthesized "
+			             "(e.g. `1 + (if c then a else b)`)");
 		if (t->text[t->len - 1] == '!')
 			die(t->line, "M0 does not support `!` in a name here");
 		int line = t->line;
@@ -702,7 +707,32 @@ static Expr *parse_comparison(Parser *p, Func *fn) {
 	return bin;
 }
 
+/* if_expr = "if" expr "then" expr "else" expr
+ * An expression yielding a word: the condition is truthy when nonzero; both
+ * branches are required (an else-less `if` yields an Option, which M0 lacks).
+ * Branches are expressions (a block branch with `<-` is deferred); `else if`
+ * chains for free because the else branch is itself an expression. */
+static Expr *parse_if(Parser *p, Func *fn) {
+	Token *kw = peek(p);
+	advance(p); /* `if` */
+	Expr *e = new_expr(EX_IF);
+	e->line = kw->line;
+	e->lhs = parse_expr(p, fn); /* condition */
+	if (!is_ident(peek(p), "then"))
+		die(peek(p)->line, "expected `then`");
+	advance(p);
+	e->rhs = parse_expr(p, fn); /* then branch */
+	if (!is_ident(peek(p), "else"))
+		die(peek(p)->line,
+		    "M0 requires an `else` branch (else-less `if` yields an Option, not supported yet)");
+	advance(p);
+	e->els = parse_expr(p, fn); /* else branch */
+	return e;
+}
+
 static Expr *parse_expr(Parser *p, Func *fn) {
+	if (is_ident(peek(p), "if"))
+		return parse_if(p, fn);
 	Expr *e = parse_comparison(p, fn);
 	if (peek(p)->kind == TK_ANDAND || peek(p)->kind == TK_OROR)
 		die(peek(p)->line, "logical `&&`/`||` are not supported yet (M0)");
@@ -915,6 +945,7 @@ static void check_expr(Program *prog, Expr *e) {
 		check_expr(prog, e->args[i]);
 	check_expr(prog, e->lhs);
 	check_expr(prog, e->rhs);
+	check_expr(prog, e->els);
 }
 
 static void validate_calls(Program *prog) {
@@ -949,20 +980,27 @@ static const char *binop(ExprKind k) {
 	}
 }
 
+/* Per-function emit state: the next expression-temp and control-flow-label ids
+ * (both function-scoped in QBE). */
+typedef struct {
+	int tmp;
+	int lbl;
+} Emit;
+
 /* Emit the code that computes `e` into a fresh word temp, writing the operand
  * that names its value (a literal or a `%tN` temp) into `dst`. Constants are
  * inlined — QBE accepts them as instruction operands.
  *
  * Names live in stack slots (`%s_<name>`), so a variable reference is a `loadw`.
- * The distinct `%s_` / `%u_` / `%tN` prefixes (slot / incoming param / temp)
- * mean a user name can never collide with a compiler temporary. */
-static void emit_expr(FILE *out, Expr *e, int *tmp, char *dst, size_t cap) {
+ * The distinct `%s_` / `%u_` / `%tN` / `%ifN` prefixes (slot / incoming param /
+ * temp / if-result) mean a user name can never collide with a compiler value. */
+static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 	switch (e->kind) {
 	case EX_INT:
 		snprintf(dst, cap, "%ld", e->ival);
 		return;
 	case EX_VAR: {
-		int t = (*tmp)++;
+		int t = ex->tmp++;
 		fprintf(out, "\t%%t%d =w loadw %%s_%s\n", t, e->name);
 		snprintf(dst, cap, "%%t%d", t);
 		return;
@@ -973,11 +1011,11 @@ static void emit_expr(FILE *out, Expr *e, int *tmp, char *dst, size_t cap) {
 		int argt[MAX_PARAMS];
 		for (int i = 0; i < e->nargs; i++) {
 			char op[96];
-			emit_expr(out, e->args[i], tmp, op, sizeof op);
-			argt[i] = (*tmp)++;
+			emit_expr(out, e->args[i], ex, op, sizeof op);
+			argt[i] = ex->tmp++;
 			fprintf(out, "\t%%t%d =w copy %s\n", argt[i], op);
 		}
-		int r = (*tmp)++;
+		int r = ex->tmp++;
 		fprintf(out, "\t%%t%d =w call $%s(", r, e->name);
 		for (int i = 0; i < e->nargs; i++)
 			fprintf(out, "%sw %%t%d", i ? ", " : "", argt[i]);
@@ -985,12 +1023,38 @@ static void emit_expr(FILE *out, Expr *e, int *tmp, char *dst, size_t cap) {
 		snprintf(dst, cap, "%%t%d", r);
 		return;
 	}
+	case EX_IF: {
+		/* if cond then A else B — merge the two branch values through a stack
+		 * slot (a `phi` would need each value's predecessor block, which nesting
+		 * makes awkward; a slot store/load is robust and reuses the local model).
+		 * The condition is truthy when nonzero (`jnz`). */
+		int id = ex->lbl++;
+		char c[96];
+		emit_expr(out, e->lhs, ex, c, sizeof c);
+		fprintf(out, "\t%%if%d =l alloc4 4\n", id);
+		fprintf(out, "\tjnz %s, @then%d, @else%d\n", c, id, id);
+		fprintf(out, "@then%d\n", id);
+		char tb[96];
+		emit_expr(out, e->rhs, ex, tb, sizeof tb);
+		fprintf(out, "\tstorew %s, %%if%d\n", tb, id);
+		fprintf(out, "\tjmp @end%d\n", id);
+		fprintf(out, "@else%d\n", id);
+		char eb[96];
+		emit_expr(out, e->els, ex, eb, sizeof eb);
+		fprintf(out, "\tstorew %s, %%if%d\n", eb, id);
+		fprintf(out, "\tjmp @end%d\n", id);
+		fprintf(out, "@end%d\n", id);
+		int r = ex->tmp++;
+		fprintf(out, "\t%%t%d =w loadw %%if%d\n", r, id);
+		snprintf(dst, cap, "%%t%d", r);
+		return;
+	}
 	case EX_NEG:
 	case EX_BNOT:
 	case EX_LNOT: {
 		char a[96];
-		emit_expr(out, e->lhs, tmp, a, sizeof a);
-		int t = (*tmp)++;
+		emit_expr(out, e->lhs, ex, a, sizeof a);
+		int t = ex->tmp++;
 		/* neg; ~x is `xor x, -1`; !x is `x == 0` (0/1). */
 		if (e->kind == EX_NEG)
 			fprintf(out, "\t%%t%d =w neg %s\n", t, a);
@@ -1018,9 +1082,9 @@ static void emit_expr(FILE *out, Expr *e, int *tmp, char *dst, size_t cap) {
 	case EX_LE:
 	case EX_GE: {
 		char a[96], b[96];
-		emit_expr(out, e->lhs, tmp, a, sizeof a);
-		emit_expr(out, e->rhs, tmp, b, sizeof b);
-		int t = (*tmp)++;
+		emit_expr(out, e->lhs, ex, a, sizeof a);
+		emit_expr(out, e->rhs, ex, b, sizeof b);
+		int t = ex->tmp++;
 		fprintf(out, "\t%%t%d =w %s %s, %s\n", t, binop(e->kind), a, b);
 		snprintf(dst, cap, "%%t%d", t);
 		return;
@@ -1053,21 +1117,21 @@ static void emit_func(FILE *out, const Func *fn) {
 			fprintf(out, "\tstorew %%u_%s, %%s_%s\n", n, n);
 		}
 
-	int tmp = 0;
+	Emit ex = {0};
 	for (Stmt *s = fn->body; s; s = s->next) {
 		char v[96];
 		switch (s->kind) {
 		case ST_LOCAL:
 			fprintf(out, "\t%%s_%s =l alloc4 4\n", s->name);
-			emit_expr(out, s->expr, &tmp, v, sizeof v);
+			emit_expr(out, s->expr, &ex, v, sizeof v);
 			fprintf(out, "\tstorew %s, %%s_%s\n", v, s->name);
 			break;
 		case ST_ASSIGN:
-			emit_expr(out, s->expr, &tmp, v, sizeof v);
+			emit_expr(out, s->expr, &ex, v, sizeof v);
 			fprintf(out, "\tstorew %s, %%s_%s\n", v, s->name);
 			break;
 		case ST_RETURN:
-			emit_expr(out, s->expr, &tmp, v, sizeof v);
+			emit_expr(out, s->expr, &ex, v, sizeof v);
 			fprintf(out, "\tret %s\n", v);
 			break;
 		}
