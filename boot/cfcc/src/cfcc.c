@@ -41,7 +41,9 @@
 
 static const char *g_path = "<input>";
 
-static void die(int line, const char *msg) {
+/* _Noreturn so the compiler knows `case X: die(...)` arms don't fall through and
+ * the `die(...); return ...` stubs after a diagnostic are genuinely unreachable. */
+static _Noreturn void die(int line, const char *msg) {
 	if (line > 0)
 		fprintf(stderr, "%s:%d: error: %s\n", g_path, line, msg);
 	else
@@ -318,15 +320,16 @@ static Expr *new_expr(ExprKind kind) {
 /* A statement in a block body: a local binding (`const`/`let` name = expr) or
  * the terminal `return expr`. Statements form a linked list in source order. */
 typedef enum {
-	ST_LOCAL,
+	ST_LOCAL,  /* const/let binding: declare + initialize */
+	ST_ASSIGN, /* reassign an existing `let` local */
 	ST_RETURN,
 } StmtKind;
 
 typedef struct Stmt Stmt;
 struct Stmt {
 	StmtKind kind;
-	char name[64]; /* ST_LOCAL: the bound name */
-	Expr *expr;    /* ST_LOCAL: initializer; ST_RETURN: returned value */
+	char name[64]; /* ST_LOCAL/ST_ASSIGN: the target name */
+	Expr *expr;    /* ST_LOCAL/ST_ASSIGN: the value; ST_RETURN: returned value */
 	Stmt *next;
 };
 
@@ -337,11 +340,13 @@ static Stmt *new_stmt(StmtKind kind) {
 	return s;
 }
 
-/* A bound name usable in expressions — a parameter or a local. `word` is 1 for
- * an Int (usable in the integer expression grammar), 0 for a pointer. */
+/* A local binding. `word` is 1 for an Int (usable in the integer expression
+ * grammar); M0 locals are always Int. `mutable` is 1 for `let` (reassignable),
+ * 0 for `const`. */
 typedef struct {
 	char name[64];
 	int word;
+	int mutable;
 } Binding;
 
 /* The whole program the M0 slice can express: `main(params) -> body`, a sequence
@@ -354,24 +359,32 @@ typedef struct {
 	Stmt *body;
 } Program;
 
-/* Resolve a name to a binding (params first, then locals); returns 1 and sets
- * *word if found, else 0. */
-static int prog_find(Program *prog, const char *name, int *word) {
+/* How a name resolves in the current scope. */
+typedef enum {
+	R_NONE,  /* undefined */
+	R_PARAM, /* a parameter (immutable) */
+	R_CONST, /* a `const` local (immutable) */
+	R_LET,   /* a `let` local (reassignable) */
+} Resolution;
+
+/* Resolve a name (params first, then locals) and set *word to whether it is an
+ * Int (usable in the integer expression grammar). */
+static Resolution resolve_name(Program *prog, const char *name, int *word) {
 	for (int i = 0; i < prog->nparams; i++)
 		if (strcmp(prog->params[i].name, name) == 0) {
 			*word = prog->params[i].kind == PK_WORD;
-			return 1;
+			return R_PARAM;
 		}
 	for (int i = 0; i < prog->nlocals; i++)
 		if (strcmp(prog->locals[i].name, name) == 0) {
 			*word = prog->locals[i].word;
-			return 1;
+			return prog->locals[i].mutable ? R_LET : R_CONST;
 		}
-	return 0;
+	return R_NONE;
 }
 
 /* Record a new local (always Int/word in M0). Caller has checked for a clash. */
-static void prog_add_local(Program *prog, const char *name) {
+static void prog_add_local(Program *prog, const char *name, int mutable) {
 	if (prog->nlocals == prog->cap_locals) {
 		prog->cap_locals = prog->cap_locals ? prog->cap_locals * 2 : 16;
 		prog->locals = realloc(prog->locals, prog->cap_locals * sizeof *prog->locals);
@@ -381,6 +394,7 @@ static void prog_add_local(Program *prog, const char *name) {
 	Binding *b = &prog->locals[prog->nlocals++];
 	snprintf(b->name, sizeof b->name, "%s", name);
 	b->word = 1;
+	b->mutable = mutable;
 }
 
 static Token *peek(Parser *p) {
@@ -511,7 +525,7 @@ static Expr *parse_primary(Parser *p, Program *prog) {
 		tok_copy(t, e->name, sizeof e->name);
 		advance(p);
 		int word;
-		if (!prog_find(prog, e->name, &word))
+		if (resolve_name(prog, e->name, &word) == R_NONE)
 			die(t->line, "unknown name (M0 expressions use integers, parameters, and locals)");
 		if (!word)
 			die(t->line, "M0 expressions can only use Int values (e.g. argc)");
@@ -631,15 +645,17 @@ static Expr *parse_expr(Parser *p, Program *prog) {
 	return e;
 }
 
-/* statement = local_decl | return_stmt
+/* statement  = local_decl | assign | return_stmt
  * local_decl = ("const" | "let") [ "Int" ] var_name "=" expr
+ * assign     = var_name "=" expr           (target must be a `let` local)
  * return_stmt = "return" expr
  * A local is not in scope during its own initializer, and cannot shadow a
- * parameter or an earlier local. `let` is accepted but, like `const`, binds an
- * immutable value here — reassignment is a later increment. */
+ * parameter or an earlier local. `let` binds a reassignable value; `const` and
+ * parameters cannot be reassigned. */
 static Stmt *parse_stmt(Parser *p, Program *prog, int *saw_return) {
 	Token *t = peek(p);
 	if (is_ident(t, "const") || is_ident(t, "let")) {
+		int mutable = is_ident(t, "let");
 		advance(p);
 		Token *tt = peek(p); /* optional `Int` type annotation */
 		if (is_type_ident(tt) || tt->kind == TK_STAR) {
@@ -657,11 +673,11 @@ static Stmt *parse_stmt(Parser *p, Program *prog, int *saw_return) {
 		tok_copy(name, s->name, sizeof s->name);
 		advance(p);
 		int word;
-		if (prog_find(prog, s->name, &word))
+		if (resolve_name(prog, s->name, &word) != R_NONE)
 			die(name->line, "name already defined (no shadowing in M0)");
 		expect(p, TK_EQ, "expected `=`");
 		s->expr = parse_expr(p, prog); /* initializer: name not yet in scope */
-		prog_add_local(prog, s->name);
+		prog_add_local(prog, s->name, mutable);
 		return s;
 	}
 	if (is_ident(t, "return")) {
@@ -671,7 +687,25 @@ static Stmt *parse_stmt(Parser *p, Program *prog, int *saw_return) {
 		*saw_return = 1;
 		return s;
 	}
-	die(t->line, "expected `const`, `let`, or `return`");
+	/* Otherwise a bare name leads an assignment: `name = expr`. */
+	if (t->kind == TK_IDENT && !is_type_ident(t)) {
+		if (t->text[t->len - 1] == '!')
+			die(t->line, "M0 does not support `!` in a name here");
+		Stmt *s = new_stmt(ST_ASSIGN);
+		tok_copy(t, s->name, sizeof s->name);
+		advance(p);
+		expect(p, TK_EQ, "expected `=` (M0 statements are const/let, a reassignment, or return)");
+		int word;
+		switch (resolve_name(prog, s->name, &word)) {
+		case R_NONE: die(t->line, "unknown name (assign to a declared `let` local)");
+		case R_PARAM: die(t->line, "cannot reassign a parameter");
+		case R_CONST: die(t->line, "cannot reassign a `const` binding (declare it with `let`)");
+		case R_LET: break; /* ok */
+		}
+		s->expr = parse_expr(p, prog);
+		return s;
+	}
+	die(t->line, "expected `const`, `let`, `return`, or an assignment");
 	return NULL; /* unreachable; die() exits */
 }
 
@@ -775,19 +809,23 @@ static const char *binop(ExprKind k) {
 }
 
 /* Emit the code that computes `e` into a fresh word temp, writing the operand
- * that names its value (a literal, a `%u_<name>` binding, or a `%tN` temp) into
- * `dst`. Constants are inlined — QBE accepts them as instruction operands.
+ * that names its value (a literal or a `%tN` temp) into `dst`. Constants are
+ * inlined — QBE accepts them as instruction operands.
  *
- * User names carry a `u_` prefix in QBE so they can never collide with the
- * compiler's `%tN` expression temporaries. */
+ * Names live in stack slots (`%s_<name>`), so a variable reference is a `loadw`.
+ * The distinct `%s_` / `%u_` / `%tN` prefixes (slot / incoming param / temp)
+ * mean a user name can never collide with a compiler temporary. */
 static void emit_expr(FILE *out, Expr *e, int *tmp, char *dst, size_t cap) {
 	switch (e->kind) {
 	case EX_INT:
 		snprintf(dst, cap, "%ld", e->ival);
 		return;
-	case EX_VAR:
-		snprintf(dst, cap, "%%u_%s", e->name);
+	case EX_VAR: {
+		int t = (*tmp)++;
+		fprintf(out, "\t%%t%d =w loadw %%s_%s\n", t, e->name);
+		snprintf(dst, cap, "%%t%d", t);
 		return;
+	}
 	case EX_NEG:
 	case EX_BNOT:
 	case EX_LNOT: {
@@ -845,14 +883,35 @@ static void emit_qbe(FILE *out, const Program *prog) {
 		        prog->params[i].kind == PK_WORD ? "w" : "l", prog->params[i].name);
 	fprintf(out, ") {\n");
 	fprintf(out, "@start\n");
+
+	/* Every Int name lives in a stack slot so `let` reassignment is just a store.
+	 * Spill each word parameter (argc) from its incoming temp into its slot; the
+	 * pointer params (argv/envp) are never referenced, so they get no slot. */
+	for (int i = 0; i < prog->nparams; i++)
+		if (prog->params[i].kind == PK_WORD) {
+			const char *n = prog->params[i].name;
+			fprintf(out, "\t%%s_%s =l alloc4 4\n", n);
+			fprintf(out, "\tstorew %%u_%s, %%s_%s\n", n, n);
+		}
+
 	int tmp = 0;
 	for (Stmt *s = prog->body; s; s = s->next) {
 		char v[96];
-		emit_expr(out, s->expr, &tmp, v, sizeof v);
-		if (s->kind == ST_LOCAL)
-			fprintf(out, "\t%%u_%s =w copy %s\n", s->name, v); /* bind the local */
-		else
-			fprintf(out, "\tret %s\n", v); /* ST_RETURN */
+		switch (s->kind) {
+		case ST_LOCAL:
+			fprintf(out, "\t%%s_%s =l alloc4 4\n", s->name);
+			emit_expr(out, s->expr, &tmp, v, sizeof v);
+			fprintf(out, "\tstorew %s, %%s_%s\n", v, s->name);
+			break;
+		case ST_ASSIGN:
+			emit_expr(out, s->expr, &tmp, v, sizeof v);
+			fprintf(out, "\tstorew %s, %%s_%s\n", v, s->name);
+			break;
+		case ST_RETURN:
+			emit_expr(out, s->expr, &tmp, v, sizeof v);
+			fprintf(out, "\tret %s\n", v);
+			break;
+		}
 	}
 	fprintf(out, "}\n");
 }
