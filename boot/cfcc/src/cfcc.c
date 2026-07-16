@@ -92,6 +92,8 @@ typedef enum {
 	TK_LBRACKET,
 	TK_RBRACKET,
 	TK_COMMA,
+	TK_DOT,     /* . — field access */
+	TK_COLON,   /* : — data-literal field separator */
 	TK_STAR,    /* * — multiply, and pointer types */
 	TK_PLUS,
 	TK_MINUS,
@@ -213,6 +215,8 @@ static void lex(Lexer *lx) {
 		case '[': push_tok(lx, TK_LBRACKET, s + lx->pos, 1, 0); lx->pos++; continue;
 		case ']': push_tok(lx, TK_RBRACKET, s + lx->pos, 1, 0); lx->pos++; continue;
 		case ',': push_tok(lx, TK_COMMA, s + lx->pos, 1, 0); lx->pos++; continue;
+		case '.': push_tok(lx, TK_DOT, s + lx->pos, 1, 0); lx->pos++; continue;
+		case ':': push_tok(lx, TK_COLON, s + lx->pos, 1, 0); lx->pos++; continue;
 		case '*': push_tok(lx, TK_STAR, s + lx->pos, 1, 0); lx->pos++; continue;
 		case '+': push_tok(lx, TK_PLUS, s + lx->pos, 1, 0); lx->pos++; continue;
 		case '-': push_tok(lx, TK_MINUS, s + lx->pos, 1, 0); lx->pos++; continue; /* -> handled above */
@@ -258,6 +262,23 @@ typedef struct {
 	size_t pos;
 } Parser;
 
+/* The type of a value. M0 has three: `Int` (a word), an opaque pointer (`*T` —
+ * argv/envp, never dereferenced), and a named record (`data`) type. A record
+ * carries a pointer to its declaration, which fixes its fields and layout; the
+ * pointer is filled in by the typecheck pass (parse leaves it NULL). */
+typedef struct DataDecl DataDecl;
+
+typedef enum {
+	TY_INT,    /* Int — a word */
+	TY_PTR,    /* *T  — an opaque pointer (a long; not usable in Int expressions) */
+	TY_RECORD, /* a `data` record type (see rec) */
+} TypeKind;
+
+typedef struct {
+	TypeKind kind;
+	DataDecl *rec; /* TY_RECORD: the record's declaration */
+} Type;
+
 /* The entry ABI kinds an M0 `main` parameter can take: a word (Int, e.g. argc)
  * or a long (a pointer, e.g. *[Str] argv/envp). darwin hands these to _start in
  * x0/x1/x2, which forwards them unchanged, so QBE reads them as ordinary args. */
@@ -278,7 +299,9 @@ typedef struct {
  * multiplicative). */
 typedef enum {
 	EX_INT,   /* integer literal (ival) */
-	EX_VAR,   /* reference to a bound Int name (param or local) */
+	EX_VAR,   /* reference to a bound name (param or local; any type) */
+	EX_FIELD, /* record field access: base.name (lhs=base record expr) */
+	EX_RECORD,/* record construction: a data literal { f: v, ... } of type `name` */
 	EX_CALL,  /* function call: name(args) */
 	EX_IF,    /* if cond then a else b (lhs=cond, rhs=then, els=else) */
 	/* unary (lhs) */
@@ -313,10 +336,21 @@ struct Expr {
 	int line;         /* source line (for EX_CALL diagnostics) */
 	long ival;        /* EX_INT */
 	char name[64];    /* EX_VAR (bound name) / EX_CALL (callee) */
-	Expr *lhs, *rhs;  /* operands (unary uses lhs; EX_IF: lhs=cond, rhs=then) */
+	Expr *lhs, *rhs;  /* operands (unary uses lhs; EX_IF: lhs=cond, rhs=then; EX_FIELD: lhs=base) */
 	Expr *els;        /* EX_IF: else branch */
 	Expr **args;      /* EX_CALL argument expressions */
 	int nargs;
+	/* EX_FIELD: the record type and the field's byte offset, both resolved by the
+	 * typecheck pass (parse leaves rec NULL). */
+	DataDecl *rec;
+	int foff;
+	/* EX_RECORD: the field initializers as written (`fnames[i]: fvals[i]`), plus,
+	 * after typecheck, `ford` — the value expressions reordered into declaration
+	 * order (one per record field). `name` holds the record type name. */
+	char (*fnames)[64];
+	Expr **fvals;
+	int nfields;
+	Expr **ford;
 };
 
 static Expr *new_expr(ExprKind kind) {
@@ -349,16 +383,38 @@ static Stmt *new_stmt(StmtKind kind) {
 	return s;
 }
 
-/* A local binding. `word` is 1 for an Int (usable in the integer expression
- * grammar); M0 locals are always Int. `mutable` is 1 for `let` (reassignable),
- * 0 for `const`. */
+/* A local binding. `type` is the bound value's type (Int, or a record for a
+ * `data`-typed `const`). `mutable` is 1 for `let` (reassignable), 0 for `const`;
+ * record bindings are always `const` in M0. For a record binding parse leaves
+ * `type.rec` NULL — the typecheck pass fills it once the type name is resolved. */
 typedef struct {
 	char name[64];
-	int word;
+	Type type;
 	int mutable;
 } Binding;
 
 #define MAX_PARAMS 32
+#define MAX_FIELDS 64
+
+/* A `data` record declaration: `data Name = { Int f0, Int f1, ... }`. M0 fields
+ * are all Int (4 bytes), laid out in declaration order, so field i sits at byte
+ * offset i*4 and the record occupies nfields*4 bytes. */
+struct DataDecl {
+	char name[64];
+	char fields[MAX_FIELDS][64];
+	int nfields;
+};
+
+/* The byte offset / size for the all-Int M0 record layout. */
+static int data_size(const DataDecl *d) { return d->nfields * 4; }
+
+/* Index of a field by name, or -1 if the record has no such field. */
+static int data_field_index(const DataDecl *d, const char *name) {
+	for (int i = 0; i < d->nfields; i++)
+		if (strcmp(d->fields[i], name) == 0)
+			return i;
+	return -1;
+}
 
 /* A top-level function: `[pub] const name = (params) [Int] -> body`. All M0
  * functions return Int (word). `locals` accrues during parsing for name
@@ -373,8 +429,11 @@ typedef struct {
 	Stmt *body;
 } Func;
 
-/* The whole program: a set of functions, one of which is `pub const main`. */
+/* The whole program: a set of `data` declarations and a set of functions, one of
+ * which is `pub const main`. */
 typedef struct {
+	DataDecl **datas;
+	int ndatas, cap_datas;
 	Func **funcs;
 	int nfuncs, cap_funcs;
 } Program;
@@ -402,6 +461,23 @@ static void prog_add_func(Program *prog, Func *f) {
 	prog->funcs[prog->nfuncs++] = f;
 }
 
+static DataDecl *prog_find_data(Program *prog, const char *name) {
+	for (int i = 0; i < prog->ndatas; i++)
+		if (strcmp(prog->datas[i]->name, name) == 0)
+			return prog->datas[i];
+	return NULL;
+}
+
+static void prog_add_data(Program *prog, DataDecl *d) {
+	if (prog->ndatas == prog->cap_datas) {
+		prog->cap_datas = prog->cap_datas ? prog->cap_datas * 2 : 8;
+		prog->datas = realloc(prog->datas, prog->cap_datas * sizeof *prog->datas);
+		if (!prog->datas)
+			die(0, "out of memory");
+	}
+	prog->datas[prog->ndatas++] = d;
+}
+
 /* How a name resolves in a function's scope. */
 typedef enum {
 	R_NONE,  /* undefined */
@@ -410,24 +486,27 @@ typedef enum {
 	R_LET,   /* a `let` local (reassignable) */
 } Resolution;
 
-/* Resolve a name (params first, then locals) and set *word to whether it is an
- * Int (usable in the integer expression grammar). */
-static Resolution resolve_name(Func *fn, const char *name, int *word) {
+/* Resolve a name (params first, then locals) and set *ty to its type. A word
+ * param is Int; a pointer param is TY_PTR (argv/envp — not usable as an Int). */
+static Resolution resolve_name(Func *fn, const char *name, Type *ty) {
 	for (int i = 0; i < fn->nparams; i++)
 		if (strcmp(fn->params[i].name, name) == 0) {
-			*word = fn->params[i].kind == PK_WORD;
+			ty->kind = fn->params[i].kind == PK_WORD ? TY_INT : TY_PTR;
+			ty->rec = NULL;
 			return R_PARAM;
 		}
 	for (int i = 0; i < fn->nlocals; i++)
 		if (strcmp(fn->locals[i].name, name) == 0) {
-			*word = fn->locals[i].word;
+			*ty = fn->locals[i].type;
 			return fn->locals[i].mutable ? R_LET : R_CONST;
 		}
 	return R_NONE;
 }
 
-/* Record a new local (always Int/word in M0). Caller has checked for a clash. */
-static void func_add_local(Func *fn, const char *name, int mutable) {
+/* Record a new local with the given type. Caller has checked for a clash. For a
+ * record local parse passes {TY_RECORD, NULL}; the typecheck pass backfills rec
+ * (see resolve_record_binding). */
+static void func_add_local(Func *fn, const char *name, int mutable, Type ty) {
 	if (fn->nlocals == fn->cap_locals) {
 		fn->cap_locals = fn->cap_locals ? fn->cap_locals * 2 : 16;
 		fn->locals = realloc(fn->locals, fn->cap_locals * sizeof *fn->locals);
@@ -436,7 +515,7 @@ static void func_add_local(Func *fn, const char *name, int mutable) {
 	}
 	Binding *b = &fn->locals[fn->nlocals++];
 	snprintf(b->name, sizeof b->name, "%s", name);
-	b->word = 1;
+	b->type = ty;
 	b->mutable = mutable;
 }
 
@@ -595,26 +674,50 @@ static Expr *parse_primary(Parser *p, Func *fn) {
 			return e;
 		}
 		Expr *e = new_expr(EX_VAR);
+		e->line = line;
 		tok_copy(t, e->name, sizeof e->name);
-		int word;
-		if (resolve_name(fn, e->name, &word) == R_NONE)
+		Type ty;
+		if (resolve_name(fn, e->name, &ty) == R_NONE)
 			die(line, "unknown name (M0 expressions use integers, parameters, locals, and calls)");
-		if (!word)
-			die(line, "M0 expressions can only use Int values (e.g. argc)");
+		/* A record value is legal here only as the base of a field access; a
+		 * pointer never. Both are caught in the typecheck pass, which knows the
+		 * surrounding context, so parse just records the reference. */
 		return e;
 	}
 	die(t->line, "expected an integer, a name, or `(`");
 	return NULL; /* unreachable; die() exits */
 }
 
-/* unary = ("-" | "~" | "!") unary | primary   (right-associative prefix ops) */
+/* postfix = primary { "." field_name }
+ * A `.field` reads a record field. The base is any primary (an M0 record base is
+ * a record-typed name); the field's type and offset are resolved in typecheck. */
+static Expr *parse_postfix(Parser *p, Func *fn) {
+	Expr *e = parse_primary(p, fn);
+	while (peek(p)->kind == TK_DOT) {
+		advance(p);
+		Token *f = peek(p);
+		if (f->kind != TK_IDENT || is_type_ident(f))
+			die(f->line, "expected a field name after `.`");
+		if (f->text[f->len - 1] == '!')
+			die(f->line, "M0 does not support `!` in a field name");
+		Expr *fe = new_expr(EX_FIELD);
+		fe->line = f->line;
+		fe->lhs = e;
+		tok_copy(f, fe->name, sizeof fe->name);
+		advance(p);
+		e = fe;
+	}
+	return e;
+}
+
+/* unary = ("-" | "~" | "!") unary | postfix   (right-associative prefix ops) */
 static Expr *parse_unary(Parser *p, Func *fn) {
 	ExprKind op;
 	switch (peek(p)->kind) {
 	case TK_MINUS: op = EX_NEG; break;
 	case TK_TILDE: op = EX_BNOT; break;
 	case TK_BANG: op = EX_LNOT; break;
-	default: return parse_primary(p, fn);
+	default: return parse_postfix(p, fn);
 	}
 	advance(p);
 	Expr *e = new_expr(op);
@@ -765,6 +868,46 @@ static Expr *parse_expr(Parser *p, Func *fn) {
 	return parse_or(p, fn);
 }
 
+/* data_literal = "{" [ field_init { "," field_init } ] "}"
+ * field_init   = field_name ":" expr       (M0: explicit only — no puns, no trailing comma)
+ * Builds an EX_RECORD carrying the annotated type name in `name`; the typecheck
+ * pass binds it to a `data` declaration and checks the fields cover it exactly.
+ * The literal stays on one line in M0 (no interior newlines), like a data decl. */
+static Expr *parse_data_literal(Parser *p, Func *fn, const char *typename, int line) {
+	expect(p, TK_LBRACE, "expected `{` (a record is built with a data literal)");
+	Expr *e = new_expr(EX_RECORD);
+	e->line = line;
+	snprintf(e->name, sizeof e->name, "%s", typename);
+	int cap = 0;
+	if (peek(p)->kind != TK_RBRACE)
+		for (;;) {
+			Token *f = peek(p);
+			if (f->kind != TK_IDENT || is_type_ident(f))
+				die(f->line, "expected a field name in the data literal");
+			if (f->text[f->len - 1] == '!')
+				die(f->line, "M0 does not support `!` in a field name");
+			if (e->nfields == cap) {
+				cap = cap ? cap * 2 : 4;
+				e->fnames = realloc(e->fnames, cap * sizeof *e->fnames);
+				e->fvals = realloc(e->fvals, cap * sizeof *e->fvals);
+				if (!e->fnames || !e->fvals)
+					die(0, "out of memory");
+			}
+			tok_copy(f, e->fnames[e->nfields], sizeof e->fnames[e->nfields]);
+			advance(p);
+			expect(p, TK_COLON, "expected `:` (M0 data literals are `field: value`)");
+			e->fvals[e->nfields] = parse_expr(p, fn);
+			e->nfields++;
+			if (peek(p)->kind == TK_COMMA) {
+				advance(p);
+				continue;
+			}
+			break;
+		}
+	expect(p, TK_RBRACE, "expected `}`");
+	return e;
+}
+
 /* statement  = local_decl | assign | return_stmt
  * local_decl = ("const" | "let") [ "Int" ] var_name "=" expr
  * assign     = var_name "=" expr           (target must be a `let` local)
@@ -777,12 +920,21 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 	if (is_ident(t, "const") || is_ident(t, "let")) {
 		int mutable = is_ident(t, "let");
 		advance(p);
-		Token *tt = peek(p); /* optional `Int` type annotation */
-		if (is_type_ident(tt) || tt->kind == TK_STAR) {
-			if (is_ident(tt, "Int"))
+		/* Optional type annotation: `Int` (a word local) or a record type name (a
+		 * `data`-typed local). A pointer annotation has no M0 local use. */
+		int is_record = 0;
+		char rectype[64] = {0};
+		Token *tt = peek(p);
+		if (tt->kind == TK_STAR)
+			die(tt->line, "M0 locals are `Int` or a record type, not a pointer");
+		if (is_type_ident(tt)) {
+			if (is_ident(tt, "Int")) {
 				advance(p);
-			else
-				die(tt->line, "M0 locals must be Int");
+			} else {
+				tok_copy(tt, rectype, sizeof rectype);
+				is_record = 1;
+				advance(p);
+			}
 		}
 		Token *name = peek(p);
 		if (name->kind != TK_IDENT || is_type_ident(name))
@@ -792,12 +944,28 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 		Stmt *s = new_stmt(ST_LOCAL);
 		tok_copy(name, s->name, sizeof s->name);
 		advance(p);
-		int word;
-		if (resolve_name(fn, s->name, &word) != R_NONE)
+		Type ty;
+		if (resolve_name(fn, s->name, &ty) != R_NONE)
 			die(name->line, "name already defined (no shadowing in M0)");
 		expect(p, TK_EQ, "expected `=`");
-		s->expr = parse_expr(p, fn); /* initializer: name not yet in scope */
-		func_add_local(fn, s->name, mutable);
+		if (is_record) {
+			/* A record local is built from a data literal and is immutable in M0
+			 * (field mutation is a later increment). Its rec is bound in typecheck. */
+			if (mutable)
+				die(name->line, "M0 records are immutable (declare with `const`, not `let`)");
+			s->expr = parse_data_literal(p, fn, rectype, name->line);
+			Type rt = {TY_RECORD, NULL};
+			func_add_local(fn, s->name, 0, rt);
+		} else {
+			/* A `{` initializer with no type annotation is an attempted record
+			 * literal (M0 requires the annotation to know the record's type). */
+			if (peek(p)->kind == TK_LBRACE)
+				die(peek(p)->line,
+				    "a record binding needs a type annotation, e.g. `const Point p = { x: 1 }`");
+			s->expr = parse_expr(p, fn); /* initializer: name not yet in scope */
+			Type it = {TY_INT, NULL};
+			func_add_local(fn, s->name, mutable, it);
+		}
 		return s;
 	}
 	if (is_ident(t, "return")) {
@@ -815,8 +983,8 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 		tok_copy(t, s->name, sizeof s->name);
 		advance(p);
 		expect(p, TK_EQ, "expected `=` (M0 statements are const/let, a reassignment, or return)");
-		int word;
-		switch (resolve_name(fn, s->name, &word)) {
+		Type ty;
+		switch (resolve_name(fn, s->name, &ty)) {
 		case R_NONE: die(t->line, "unknown name (assign to a declared `let` local)");
 		case R_PARAM: die(t->line, "cannot reassign a parameter");
 		case R_CONST: die(t->line, "cannot reassign a `const` binding (declare it with `let`)");
@@ -925,11 +1093,77 @@ static Func *parse_func(Parser *p, Program *prog) {
 	return fn;
 }
 
-/* module = { declaration } — one per line; exactly one is `pub const main`. */
+/* data_decl   = "data" type_name "=" record_body
+ * record_body = "{" [ field_decl { "," field_decl } [ "," ] ] "}"
+ * field_decl  = "Int" var_name
+ * M0 records are a flat set of Int fields on one line (no generics, spread,
+ * defaults, non-Int/nested fields, or interior newlines — all later increments),
+ * with at least one field so the record is never zero-sized. */
+static DataDecl *parse_data_decl(Parser *p, Program *prog) {
+	advance(p); /* `data` */
+	Token *nm = peek(p);
+	if (!is_type_ident(nm))
+		die(nm->line, "expected a PascalCase type name after `data`");
+	if (nm->text[nm->len - 1] == '!')
+		die(nm->line, "M0 does not support `!` in a type name");
+	DataDecl *d = xmalloc(sizeof *d);
+	memset(d, 0, sizeof *d);
+	tok_copy(nm, d->name, sizeof d->name);
+	advance(p);
+	if (peek(p)->kind == TK_LBRACKET)
+		die(peek(p)->line, "M0 data types are not generic");
+	if (prog_find_data(prog, d->name))
+		die(nm->line, "data type already defined");
+	expect(p, TK_EQ, "expected `=`");
+	if (peek(p)->kind != TK_LBRACE)
+		die(peek(p)->line, "M0 `data` must have a record body `{ Int field, ... }`");
+	advance(p); /* `{` */
+	if (peek(p)->kind != TK_RBRACE)
+		for (;;) {
+			Token *ty = peek(p);
+			if (ty->kind == TK_DOT)
+				die(ty->line, "M0 records do not support `...` spread");
+			if (!is_ident(ty, "Int"))
+				die(ty->line, "M0 record fields must be `Int`");
+			advance(p);
+			Token *f = peek(p);
+			if (f->kind != TK_IDENT || is_type_ident(f))
+				die(f->line, "expected a field name");
+			if (f->text[f->len - 1] == '!')
+				die(f->line, "M0 does not support `!` in a field name");
+			char fname[64];
+			tok_copy(f, fname, sizeof fname);
+			advance(p);
+			if (peek(p)->kind == TK_EQ)
+				die(peek(p)->line, "M0 record fields do not support defaults");
+			if (data_field_index(d, fname) >= 0)
+				die(f->line, "duplicate field name");
+			if (d->nfields == MAX_FIELDS)
+				die(f->line, "too many fields");
+			snprintf(d->fields[d->nfields++], sizeof d->fields[0], "%s", fname);
+			if (peek(p)->kind == TK_COMMA) {
+				advance(p);
+				if (peek(p)->kind == TK_RBRACE) /* trailing comma */
+					break;
+				continue;
+			}
+			break;
+		}
+	expect(p, TK_RBRACE, "expected `}`");
+	if (d->nfields == 0)
+		die(nm->line, "M0 records need at least one field");
+	return d;
+}
+
+/* module = { declaration } — one per line; exactly one is `pub const main`. A
+ * declaration is a `data` record type or a `[pub] const` function. */
 static void parse(Parser *p, Program *prog) {
 	skip_newlines(p);
 	while (peek(p)->kind != TK_EOF) {
-		prog_add_func(prog, parse_func(p, prog));
+		if (is_ident(peek(p), "data"))
+			prog_add_data(prog, parse_data_decl(p, prog));
+		else
+			prog_add_func(prog, parse_func(p, prog));
 		if (peek(p)->kind != TK_EOF) {
 			expect(p, TK_NEWLINE, "expected a newline between declarations");
 			skip_newlines(p);
@@ -944,13 +1178,44 @@ static void parse(Parser *p, Program *prog) {
 		die(0, "main takes at most 3 parameters (argc, argv, envp)");
 }
 
-/* After parsing, check every call: the callee exists, the arity matches, and its
- * parameters are Int (M0 passes only Int arguments). Runs over the whole program
- * so forward references and recursion resolve. */
-static void check_expr(Program *prog, Expr *e) {
-	if (!e)
-		return;
-	if (e->kind == EX_CALL) {
+/* ------------------------------------------------------------- typecheck - */
+
+static Type typeof_expr(Program *prog, Func *fn, Expr *e);
+
+/* Require that `e` yields an Int. A record is legal only as a field-access base
+ * and a pointer never, so wherever an Int is expected this rejects them both. */
+static void expect_int(Program *prog, Func *fn, Expr *e) {
+	if (typeof_expr(prog, fn, e).kind != TY_INT)
+		die(e->line, "expected an Int value (a record is used only via field access in M0)");
+}
+
+/* Compute and validate the type of an expression, resolving field accesses and
+ * calls against the whole program (so forward references and recursion work).
+ * Field accesses are annotated in place (rec, foff) for emit. */
+static Type typeof_expr(Program *prog, Func *fn, Expr *e) {
+	switch (e->kind) {
+	case EX_INT:
+		return (Type){TY_INT, NULL};
+	case EX_VAR: {
+		Type ty;
+		if (resolve_name(fn, e->name, &ty) == R_NONE)
+			die(e->line, "unknown name");
+		return ty;
+	}
+	case EX_FIELD: {
+		Type base = typeof_expr(prog, fn, e->lhs);
+		if (base.kind != TY_RECORD)
+			die(e->line, "field access `.` needs a record value on the left");
+		int idx = data_field_index(base.rec, e->name);
+		if (idx < 0)
+			die(e->line, "this data type has no such field");
+		e->rec = base.rec;
+		e->foff = idx * 4; /* all M0 fields are 4-byte Int */
+		return (Type){TY_INT, NULL};
+	}
+	case EX_RECORD:
+		die(e->line, "a record literal may only initialize a record-typed binding");
+	case EX_CALL: {
 		Func *callee = prog_find_func(prog, e->name);
 		if (!callee)
 			die(e->line, "call to an unknown function");
@@ -966,18 +1231,85 @@ static void check_expr(Program *prog, Expr *e) {
 		for (int i = 0; i < callee->nparams; i++)
 			if (callee->params[i].kind != PK_WORD)
 				die(e->line, "M0 calls pass only Int arguments");
+		for (int i = 0; i < e->nargs; i++)
+			expect_int(prog, fn, e->args[i]);
+		return (Type){TY_INT, NULL};
 	}
-	for (int i = 0; i < e->nargs; i++)
-		check_expr(prog, e->args[i]);
-	check_expr(prog, e->lhs);
-	check_expr(prog, e->rhs);
-	check_expr(prog, e->els);
+	case EX_IF:
+		expect_int(prog, fn, e->lhs); /* condition */
+		expect_int(prog, fn, e->rhs); /* then — M0 if-branches are Int */
+		expect_int(prog, fn, e->els); /* else */
+		return (Type){TY_INT, NULL};
+	case EX_NEG:
+	case EX_BNOT:
+	case EX_LNOT:
+		expect_int(prog, fn, e->lhs);
+		return (Type){TY_INT, NULL};
+	case EX_ADD: case EX_SUB: case EX_MUL: case EX_DIV: case EX_REM:
+	case EX_BOR: case EX_BXOR: case EX_BAND: case EX_SHL: case EX_SHR:
+	case EX_EQ: case EX_NE: case EX_LT: case EX_GT: case EX_LE: case EX_GE:
+	case EX_AND: case EX_OR:
+		expect_int(prog, fn, e->lhs);
+		expect_int(prog, fn, e->rhs);
+		return (Type){TY_INT, NULL};
+	}
+	die(e->line, "internal: unhandled expression kind in typecheck");
 }
 
-static void validate_calls(Program *prog) {
+/* Bind an EX_RECORD data literal to its `data` declaration: check the fields
+ * cover it exactly (each declared field set once, no unknowns, none missing),
+ * type-check the values, reorder them into declaration order (`ford`), and
+ * backfill the local's record type so later field accesses resolve. */
+static void resolve_record_binding(Program *prog, Func *fn, Stmt *s) {
+	Expr *e = s->expr; /* EX_RECORD; e->name is the annotated type name */
+	DataDecl *d = prog_find_data(prog, e->name);
+	if (!d)
+		die(e->line, "unknown data type");
+	e->rec = d;
+	e->ford = xmalloc((size_t)d->nfields * sizeof *e->ford);
+	for (int i = 0; i < d->nfields; i++)
+		e->ford[i] = NULL;
+	for (int k = 0; k < e->nfields; k++) {
+		int idx = data_field_index(d, e->fnames[k]);
+		if (idx < 0)
+			die(e->line, "no such field on this data type");
+		if (e->ford[idx])
+			die(e->line, "field set more than once in the data literal");
+		expect_int(prog, fn, e->fvals[k]);
+		e->ford[idx] = e->fvals[k];
+	}
+	for (int i = 0; i < d->nfields; i++)
+		if (!e->ford[i])
+			die(e->line, "data literal is missing a field");
+	for (int i = 0; i < fn->nlocals; i++)
+		if (strcmp(fn->locals[i].name, s->name) == 0) {
+			fn->locals[i].type.rec = d;
+			break;
+		}
+}
+
+/* Type-check one function's body in source order, so a record binding's type is
+ * resolved before any later statement reads its fields. */
+static void check_func(Program *prog, Func *fn) {
+	for (Stmt *s = fn->body; s; s = s->next) {
+		switch (s->kind) {
+		case ST_LOCAL:
+			if (s->expr->kind == EX_RECORD)
+				resolve_record_binding(prog, fn, s);
+			else
+				expect_int(prog, fn, s->expr);
+			break;
+		case ST_ASSIGN: /* target is a `let` word local; value is Int */
+		case ST_RETURN: /* M0 functions return Int */
+			expect_int(prog, fn, s->expr);
+			break;
+		}
+	}
+}
+
+static void typecheck(Program *prog) {
 	for (int i = 0; i < prog->nfuncs; i++)
-		for (Stmt *s = prog->funcs[i]->body; s; s = s->next)
-			check_expr(prog, s->expr);
+		check_func(prog, prog->funcs[i]);
 }
 
 /* ------------------------------------------------------------- emit QBE - */
@@ -1018,9 +1350,10 @@ typedef struct {
  * inlined — QBE accepts them as instruction operands.
  *
  * Names live in stack slots (`%s_<name>`), so a variable reference is a `loadw`.
- * The distinct `%s_` / `%u_` / `%tN` / `%ifN` / `%lgN` prefixes (slot / incoming
- * param / temp / if-result / logical-result) mean a user name can never collide
- * with a compiler value. */
+ * A record local's storage is the slot `%r_<name>` (a field read is a `loadw` at
+ * the field's offset). The distinct `%s_` / `%r_` / `%u_` / `%tN` / `%ifN` /
+ * `%lgN` prefixes (word slot / record storage / incoming param / temp / if-result
+ * / logical-result) mean a user name can never collide with a compiler value. */
 static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 	switch (e->kind) {
 	case EX_INT:
@@ -1032,6 +1365,27 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		snprintf(dst, cap, "%%t%d", t);
 		return;
 	}
+	case EX_FIELD: {
+		/* Read a record field. The base is a record-typed local whose storage is
+		 * the slot `%r_<name>`; the field sits at byte offset e->foff. (M0 field
+		 * bases are always a name — record-returning exprs are a later increment.) */
+		if (e->lhs->kind != EX_VAR)
+			die(e->line, "internal: M0 field base is not a name");
+		if (e->foff == 0) {
+			int t = ex->tmp++;
+			fprintf(out, "\t%%t%d =w loadw %%r_%s\n", t, e->lhs->name);
+			snprintf(dst, cap, "%%t%d", t);
+		} else {
+			int a = ex->tmp++;
+			fprintf(out, "\t%%t%d =l add %%r_%s, %d\n", a, e->lhs->name, e->foff);
+			int t = ex->tmp++;
+			fprintf(out, "\t%%t%d =w loadw %%t%d\n", t, a);
+			snprintf(dst, cap, "%%t%d", t);
+		}
+		return;
+	}
+	case EX_RECORD:
+		die(e->line, "internal: record literal in expression position");
 	case EX_CALL: {
 		/* Evaluate each argument into its own temp, then call. All M0 values are
 		 * word; the callee symbol is the bare function name ($<name>). */
@@ -1179,9 +1533,27 @@ static void emit_func(FILE *out, const Func *fn) {
 		char v[96];
 		switch (s->kind) {
 		case ST_LOCAL:
-			fprintf(out, "\t%%s_%s =l alloc4 4\n", s->name);
-			emit_expr(out, s->expr, &ex, v, sizeof v);
-			fprintf(out, "\tstorew %s, %%s_%s\n", v, s->name);
+			if (s->expr->kind == EX_RECORD) {
+				/* A record local: reserve its storage (`%r_<name>`) and store each
+				 * field's value at its offset, in declaration order (ford). */
+				DataDecl *d = s->expr->rec;
+				fprintf(out, "\t%%r_%s =l alloc4 %d\n", s->name, data_size(d));
+				for (int fi = 0; fi < d->nfields; fi++) {
+					char fv[96];
+					emit_expr(out, s->expr->ford[fi], &ex, fv, sizeof fv);
+					if (fi == 0) {
+						fprintf(out, "\tstorew %s, %%r_%s\n", fv, s->name);
+					} else {
+						int a = ex.tmp++;
+						fprintf(out, "\t%%t%d =l add %%r_%s, %d\n", a, s->name, fi * 4);
+						fprintf(out, "\tstorew %s, %%t%d\n", fv, a);
+					}
+				}
+			} else {
+				fprintf(out, "\t%%s_%s =l alloc4 4\n", s->name);
+				emit_expr(out, s->expr, &ex, v, sizeof v);
+				fprintf(out, "\tstorew %s, %%s_%s\n", v, s->name);
+			}
 			break;
 		case ST_ASSIGN:
 			emit_expr(out, s->expr, &ex, v, sizeof v);
@@ -1317,7 +1689,7 @@ int main(int argc, char **argv) {
 	ps.toks = lx.toks;
 	Program prog = {0};
 	parse(&ps, &prog);
-	validate_calls(&prog);
+	typecheck(&prog);
 
 	/* Default artifact: ./out/<stem>. */
 	char *stem = stem_of(input);
