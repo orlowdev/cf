@@ -363,16 +363,20 @@ static Expr *new_expr(ExprKind kind) {
 /* A statement in a block body: a local binding (`const`/`let` name = expr) or
  * the terminal `return expr`. Statements form a linked list in source order. */
 typedef enum {
-	ST_LOCAL,  /* const/let binding: declare + initialize */
-	ST_ASSIGN, /* reassign an existing `let` local */
+	ST_LOCAL,       /* const/let binding: declare + initialize */
+	ST_ASSIGN,      /* reassign an existing `let` word local */
+	ST_FIELD_ASSIGN,/* mutate a field of a `let` record local: name.field = expr */
 	ST_RETURN,
 } StmtKind;
 
 typedef struct Stmt Stmt;
 struct Stmt {
 	StmtKind kind;
-	char name[64]; /* ST_LOCAL/ST_ASSIGN: the target name */
-	Expr *expr;    /* ST_LOCAL/ST_ASSIGN: the value; ST_RETURN: returned value */
+	int line;       /* source line of the statement (for diagnostics) */
+	char name[64];  /* ST_LOCAL/ST_ASSIGN/ST_FIELD_ASSIGN: the target name */
+	char field[64]; /* ST_FIELD_ASSIGN: the mutated field */
+	int foff;       /* ST_FIELD_ASSIGN: the field's byte offset (filled by typecheck) */
+	Expr *expr;     /* ST_LOCAL/ST_ASSIGN/ST_FIELD_ASSIGN: the value; ST_RETURN: returned */
 	Stmt *next;
 };
 
@@ -949,13 +953,11 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 			die(name->line, "name already defined (no shadowing in M0)");
 		expect(p, TK_EQ, "expected `=`");
 		if (is_record) {
-			/* A record local is built from a data literal and is immutable in M0
-			 * (field mutation is a later increment). Its rec is bound in typecheck. */
-			if (mutable)
-				die(name->line, "M0 records are immutable (declare with `const`, not `let`)");
+			/* A record local is built from a data literal; a `let` record's fields
+			 * may later be mutated (`p.x = 5`). Its rec is bound in typecheck. */
 			s->expr = parse_data_literal(p, fn, rectype, name->line);
 			Type rt = {TY_RECORD, NULL};
-			func_add_local(fn, s->name, 0, rt);
+			func_add_local(fn, s->name, mutable, rt);
 		} else {
 			/* A `{` initializer with no type annotation is an attempted record
 			 * literal (M0 requires the annotation to know the record's type). */
@@ -975,13 +977,34 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 		*saw_return = 1;
 		return s;
 	}
-	/* Otherwise a bare name leads an assignment: `name = expr`. */
+	/* Otherwise a bare name leads an assignment: `name = expr` (reassign a `let`
+	 * word local) or `name.field = expr` (mutate a `let` record's field). */
 	if (t->kind == TK_IDENT && !is_type_ident(t)) {
 		if (t->text[t->len - 1] == '!')
 			die(t->line, "M0 does not support `!` in a name here");
-		Stmt *s = new_stmt(ST_ASSIGN);
-		tok_copy(t, s->name, sizeof s->name);
+		char target[64];
+		tok_copy(t, target, sizeof target);
 		advance(p);
+		if (peek(p)->kind == TK_DOT) {
+			/* Field mutation: `name.field = expr`. The target must be a mutable
+			 * record; the field and offset are resolved in typecheck. */
+			advance(p);
+			Token *f = peek(p);
+			if (f->kind != TK_IDENT || is_type_ident(f))
+				die(f->line, "expected a field name after `.`");
+			if (f->text[f->len - 1] == '!')
+				die(f->line, "M0 does not support `!` in a field name");
+			Stmt *s = new_stmt(ST_FIELD_ASSIGN);
+			s->line = t->line;
+			snprintf(s->name, sizeof s->name, "%s", target);
+			tok_copy(f, s->field, sizeof s->field);
+			advance(p);
+			expect(p, TK_EQ, "expected `=`");
+			s->expr = parse_expr(p, fn);
+			return s;
+		}
+		Stmt *s = new_stmt(ST_ASSIGN);
+		snprintf(s->name, sizeof s->name, "%s", target);
 		expect(p, TK_EQ, "expected `=` (M0 statements are const/let, a reassignment, or return)");
 		Type ty;
 		switch (resolve_name(fn, s->name, &ty)) {
@@ -990,6 +1013,11 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 		case R_CONST: die(t->line, "cannot reassign a `const` binding (declare it with `let`)");
 		case R_LET: break; /* ok */
 		}
+		/* A whole-record `let` cannot be reassigned as a unit (only a word can);
+		 * mutate its fields with `.`. (Aggregate copy-binding is a later concern —
+		 * memory_model §6 requires an explicit copy.) */
+		if (ty.kind != TY_INT)
+			die(t->line, "cannot assign to a whole record (mutate a field with `.`)");
 		s->expr = parse_expr(p, fn);
 		return s;
 	}
@@ -1301,6 +1329,26 @@ static void check_func(Program *prog, Func *fn) {
 			else
 				expect_int(prog, fn, s->expr);
 			break;
+		case ST_FIELD_ASSIGN: {
+			/* `name.field = expr` — target must be a mutable (`let`) record local,
+			 * the field must exist, and the value is Int. */
+			Type ty;
+			Resolution r = resolve_name(fn, s->name, &ty);
+			if (r == R_NONE)
+				die(s->line, "unknown name (mutate a declared record local)");
+			if (ty.kind != TY_RECORD)
+				die(s->line, "field assignment `.` needs a record on the left");
+			if (r == R_PARAM)
+				die(s->line, "cannot mutate a parameter's field");
+			if (r == R_CONST)
+				die(s->line, "cannot mutate a `const` record's field (declare it with `let`)");
+			int idx = data_field_index(ty.rec, s->field);
+			if (idx < 0)
+				die(s->line, "this data type has no such field");
+			s->foff = idx * 4;
+			expect_int(prog, fn, s->expr);
+			break;
+		}
 		case ST_ASSIGN: /* target is a `let` word local; value is Int */
 		case ST_RETURN: /* M0 functions return Int */
 			expect_int(prog, fn, s->expr);
@@ -1563,6 +1611,18 @@ static void emit_func(FILE *out, const Func *fn) {
 		case ST_ASSIGN:
 			emit_expr(out, s->expr, &ex, v, sizeof v);
 			fprintf(out, "\tstorew %s, %%s_%s\n", v, s->name);
+			break;
+		case ST_FIELD_ASSIGN:
+			/* Mutate a record field: store the value through the record's arena
+			 * pointer (`%r_<name>`) at the field's offset. */
+			emit_expr(out, s->expr, &ex, v, sizeof v);
+			if (s->foff == 0) {
+				fprintf(out, "\tstorew %s, %%r_%s\n", v, s->name);
+			} else {
+				int a = ex.tmp++;
+				fprintf(out, "\t%%t%d =l add %%r_%s, %d\n", a, s->name, s->foff);
+				fprintf(out, "\tstorew %s, %%t%d\n", v, a);
+			}
 			break;
 		case ST_RETURN:
 			emit_expr(out, s->expr, &ex, v, sizeof v);
