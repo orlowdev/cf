@@ -602,7 +602,10 @@ typedef struct {
 	DataDecl *ret_rec;      /* resolved record return type (typecheck) */
 	Binding *locals;
 	int nlocals, cap_locals;
-	Stmt *body;
+	Stmt *body;             /* the statement/expression body — NULL for an asm function */
+	int is_asm;             /* 1 if the body is an `asm "..."` block (see asm_body) */
+	Token *asm_body;        /* is_asm: the asm string token, whose segments are emitted
+	                         * verbatim (with `${param}` → arg register) into the .s */
 } Func;
 
 /* The whole program: a set of `data` declarations and a set of functions, one of
@@ -1362,6 +1365,8 @@ static Func *parse_func(Parser *p, Program *prog) {
 	    strcmp(fn->name, "cf_top") == 0 || strcmp(fn->name, "cf_limit") == 0 ||
 	    strcmp(fn->name, "cf_oom") == 0 || strcmp(fn->name, "cf_mmap_fail") == 0)
 		die(name->line, "that name is reserved for the runtime");
+	if (strcmp(fn->name, "asm") == 0)
+		die(name->line, "`asm` is a reserved keyword");
 	if (prog_find_func(prog, fn->name))
 		die(name->line, "function already defined");
 	advance(p);
@@ -1388,9 +1393,11 @@ static Func *parse_func(Parser *p, Program *prog) {
 	/* Optional return type: `Int` (a word) or a record type (returned by pointer;
 	 * resolved to a decl in typecheck). A pointer return type has no M0 use. */
 	Token *rt = peek(p);
+	int has_ret = 0; /* whether a return type was written (mandatory for an asm fn) */
 	if (rt->kind == TK_STAR)
 		die(rt->line, "M0 functions return `Int` or a record, not a pointer");
 	if (is_type_ident(rt)) {
+		has_ret = 1;
 		if (is_ident(rt, "Int")) {
 			advance(p);
 		} else {
@@ -1404,6 +1411,32 @@ static Func *parse_func(Parser *p, Program *prog) {
 		}
 	}
 	expect(p, TK_ARROW, "expected `->`");
+	/* `asm` right after `->` opens an asm-bodied function (ebnf § Assembly): a naked
+	 * function whose verbatim assembly is the floor beneath the compiler (syscalls
+	 * etc.). The body is an ordinary string (multiline, `${param}` interpolation);
+	 * it is emitted straight to the .s, never lowered through QBE.
+	 *
+	 * cfcc narrowings (throwaway; cf0.cf must not inherit — it takes the full § Assembly
+	 * surface): only `${param}` interpolates (the spec's `${CONST}` comptime-constant
+	 * form is unsupported — no comptime constants yet); the `${param}`→register mapping
+	 * is arm64-only and always names the 64-bit `x<i>` (cf0 needs per-target selection
+	 * and per-type width); there is no `Void` return type (an effect-only asm fn must
+	 * borrow `Int`); and `asm` is reserved only as a function name / after `->`, not
+	 * globally. The return type IS required, matching the spec (no C! body to infer). */
+	if (is_ident(peek(p), "asm")) {
+		advance(p);
+		Token *body = peek(p);
+		if (body->kind != TK_STR)
+			die(body->line, "expected a string after `asm`");
+		if (!has_ret)
+			die(name->line, "an asm function must declare its return type");
+		if (fn->nparams > 8)
+			die(name->line, "an asm function takes at most 8 parameters (the arm64 arg registers)");
+		fn->is_asm = 1;
+		fn->asm_body = body;
+		advance(p);
+		return fn;
+	}
 	fn->body = parse_body(p, fn);
 	return fn;
 }
@@ -1493,6 +1526,8 @@ static void parse(Parser *p, Program *prog) {
 		die(0, "main takes at most 3 parameters (argc, argv, envp)");
 	if (m->ret_type_name[0])
 		die(0, "`main` must return Int (its value is the exit code)");
+	if (m->is_asm)
+		die(0, "`main` cannot be an asm function");
 }
 
 /* ------------------------------------------------------------- typecheck - */
@@ -2315,6 +2350,43 @@ static void emit_runtime(FILE *out) {
 	fprintf(out, "\tsvc #0x80\n");
 }
 
+/* Emit one asm-bodied function verbatim into the assembly output (ebnf § Assembly):
+ * `.globl` so the QBE-lowered callers can `bl` it, then the body's segments with
+ * each `${param}` replaced by the register that parameter occupies. arm64's C ABI
+ * puts argument i in x<i> (parse capped nparams at 8), and the function is naked —
+ * no prologue — so at the first instruction the arg registers already hold the
+ * args and the body supplies its own `ret`. A `${name}` that is not a parameter is
+ * rejected (cfcc has no comptime constants for `${CONST}` yet). */
+static void emit_asm_func(FILE *out, const Func *fn) {
+	Token *b = fn->asm_body;
+	fprintf(out, ".globl _%s\n", fn->name);
+	fprintf(out, ".p2align 2\n");
+	fprintf(out, "_%s:", fn->name);
+	for (int i = 0; i < b->nsegs; i++) {
+		StrSeg *sg = &b->segs[i];
+		if (sg->kind == SEG_LIT) {
+			fwrite(sg->lit, 1, (size_t)sg->litlen, out);
+		} else { /* SEG_INTERP: ${param} → its argument register x<index> */
+			int idx = -1;
+			for (int j = 0; j < fn->nparams; j++)
+				if (strcmp(fn->params[j].name, sg->name) == 0) { idx = j; break; }
+			if (idx < 0)
+				die(b->line, "asm `${...}` must name a parameter "
+				             "(M0 has no comptime constants in asm bodies yet)");
+			fprintf(out, "x%d", idx);
+		}
+	}
+	fprintf(out, "\n"); /* separate the body from the next symbol */
+}
+
+/* Emit every asm function into the runtime .s, beside `_start` and the arena
+ * trampolines — not through QBE, which has no `svc`/asm path. */
+static void emit_asm_funcs(FILE *out, Program *prog) {
+	for (int i = 0; i < prog->nfuncs; i++)
+		if (prog->funcs[i]->is_asm)
+			emit_asm_func(out, prog->funcs[i]);
+}
+
 /* --------------------------------------------------------------- driver - */
 
 static void run(char *const argv[]) {
@@ -2460,13 +2532,15 @@ int main(int argc, char **argv) {
 		collect_strlits_stmt(prog.funcs[i]->body);
 	emit_string_data(f); /* string-literal data defs, ahead of the functions that ref them */
 	for (int i = 0; i < prog.nfuncs; i++)
-		emit_func(f, prog.funcs[i]);
+		if (!prog.funcs[i]->is_asm) /* asm functions bypass QBE — emitted to the .s below */
+			emit_func(f, prog.funcs[i]);
 	fclose(f);
 
 	f = fopen(g_rt_s, "wb");
 	if (!f)
 		die(0, "cannot write runtime asm");
 	emit_runtime(f);
+	emit_asm_funcs(f, &prog); /* user asm functions, verbatim, beside the runtime */
 	fclose(f);
 
 	/* qbe: IL -> arm64_apple assembly. */
