@@ -85,6 +85,7 @@ typedef enum {
 	TK_NEWLINE,
 	TK_IDENT, /* includes keywords; disambiguated in the parser */
 	TK_INT,
+	TK_STR,   /* "..." string literal (decoded bytes in Token.sval/slen) */
 	TK_LPAREN,
 	TK_RPAREN,
 	TK_LBRACE,
@@ -124,6 +125,8 @@ typedef struct {
 	const char *text; /* into the source buffer; not NUL-terminated */
 	int len;
 	long ival; /* for TK_INT */
+	char *sval; /* for TK_STR: the decoded bytes (escapes resolved), heap-owned */
+	int slen;   /* for TK_STR: the decoded byte count (may embed NULs) */
 } Token;
 
 typedef struct {
@@ -177,6 +180,56 @@ static void lex(Lexer *lx) {
 		if (c == '#') { /* comment to end of line */
 			while (s[lx->pos] && s[lx->pos] != '\n')
 				lx->pos++;
+			continue;
+		}
+		if (c == '"') {
+			/* "..." — a string literal; decode escapes into a heap buffer.
+			 *
+			 * Reduced subset of ebnf § Strings (cfcc is throwaway; cf0.cf must NOT
+			 * inherit these narrowings — it has to accept the full grammar per
+			 * seed_subset §4): a literal must close on its own line (the ratified
+			 * grammar allows raw newlines to span lines), there is no `${…}`
+			 * interpolation, and the escape set is the provisional `\n \t \r \0 \\ \"`
+			 * (the grammar's structural `\$` is not accepted — no interpolation to
+			 * escape here). Length/`.len` and the {bytes*,len} header are likewise
+			 * provisional, re-pinned at the M6/M9 representation gate. */
+			size_t start = lx->pos;
+			int startline = lx->line;
+			lx->pos++; /* opening quote */
+			/* The decoded bytes are never longer than the source span, so one
+			 * malloc of the remaining-source length is always enough. */
+			char *buf = xmalloc(strlen(s + lx->pos) + 1);
+			int n = 0;
+			for (;;) {
+				int ch = (unsigned char)s[lx->pos];
+				if (ch == '\0' || ch == '\n')
+					die(startline, "unterminated string literal");
+				if (ch == '"') {
+					lx->pos++; /* closing quote */
+					break;
+				}
+				if (ch == '\\') {
+					int e = (unsigned char)s[lx->pos + 1];
+					char d;
+					switch (e) {
+					case 'n':  d = '\n'; break;
+					case 't':  d = '\t'; break;
+					case 'r':  d = '\r'; break;
+					case '0':  d = '\0'; break;
+					case '\\': d = '\\'; break;
+					case '"':  d = '"';  break;
+					default: die(lx->line, "unknown string escape (M0 allows \\n \\t \\r \\0 \\\\ \\\")");
+					}
+					buf[n++] = d;
+					lx->pos += 2;
+					continue;
+				}
+				buf[n++] = (char)ch;
+				lx->pos++;
+			}
+			push_tok(lx, TK_STR, s + start, (int)(lx->pos - start), 0);
+			lx->toks[lx->ntoks - 1].sval = buf;
+			lx->toks[lx->ntoks - 1].slen = n;
 			continue;
 		}
 		if (isdigit(c)) {
@@ -273,6 +326,7 @@ typedef enum {
 	TY_INT,    /* Int — a word */
 	TY_PTR,    /* *T  — an opaque pointer (a long; not usable in Int expressions) */
 	TY_RECORD, /* a `data` record type (see rec) */
+	TY_STR,    /* Str — an `l` pointer to a {bytes*, len} header; not an Int */
 } TypeKind;
 
 typedef struct {
@@ -304,6 +358,7 @@ typedef struct {
  * multiplicative). */
 typedef enum {
 	EX_INT,   /* integer literal (ival) */
+	EX_STR,   /* string literal (sval/slen; strid names its module data) */
 	EX_VAR,   /* reference to a bound name (param or local; any type) */
 	EX_FIELD, /* record field access: base.name (lhs=base record expr) */
 	EX_RECORD,/* record construction: a data literal { f: v, ... } of type `name` */
@@ -340,6 +395,9 @@ struct Expr {
 	ExprKind kind;
 	int line;         /* source line (for EX_CALL diagnostics) */
 	long ival;        /* EX_INT */
+	char *sval;       /* EX_STR: decoded bytes (heap-owned; may embed NULs) */
+	int slen;         /* EX_STR: decoded byte count */
+	int strid;        /* EX_STR: index into the module's string table (emit) */
 	char name[64];    /* EX_VAR (bound name) / EX_CALL (callee) */
 	Expr *lhs, *rhs;  /* operands (unary uses lhs; EX_IF: lhs=cond, rhs=then; EX_FIELD: lhs=base) */
 	Expr *els;        /* EX_IF: else branch */
@@ -686,6 +744,14 @@ static Expr *parse_primary(Parser *p, Func *fn) {
 			die(t->line, "integer literal out of range (M0 supports 0..2147483647)");
 		Expr *e = new_expr(EX_INT);
 		e->ival = t->ival;
+		return e;
+	}
+	if (t->kind == TK_STR) {
+		advance(p);
+		Expr *e = new_expr(EX_STR);
+		e->line = t->line;
+		e->sval = t->sval;
+		e->slen = t->slen;
 		return e;
 	}
 	if (t->kind == TK_LPAREN) {
@@ -1350,7 +1416,8 @@ static Type func_ret_type(const Func *fn);
  * and a pointer never, so wherever an Int is expected this rejects them both. */
 static void expect_int(Program *prog, Func *fn, Expr *e) {
 	if (typeof_expr(prog, fn, e).kind != TY_INT)
-		die(e->line, "expected an Int value (a record is used only via field access in M0)");
+		die(e->line, "expected an Int value (a record is used only via field access, "
+		             "and a string only via `.len`, in M0)");
 }
 
 /* Compute and validate the type of an expression, resolving field accesses and
@@ -1361,6 +1428,8 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 	switch (e->kind) {
 	case EX_INT:
 		return (Type){TY_INT, NULL};
+	case EX_STR:
+		return (Type){TY_STR, NULL};
 	case EX_VAR: {
 		Type ty;
 		if (resolve_name(fn, e->name, &ty) == R_NONE)
@@ -1369,6 +1438,12 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 	}
 	case EX_FIELD: {
 		Type base = typeof_expr(prog, fn, e->lhs);
+		if (base.kind == TY_STR) {
+			/* A string exposes exactly one field: `.len`, its byte count (an Int). */
+			if (strcmp(e->name, "len") != 0)
+				die(e->line, "a string has only the `.len` field");
+			return (Type){TY_INT, NULL};
+		}
 		if (base.kind != TY_RECORD)
 			die(e->line, "field access `.` needs a record value on the left");
 		int idx = data_field_index(base.rec, e->name);
@@ -1640,6 +1715,64 @@ typedef struct {
 	int loop_depth;
 } Emit;
 
+/* The module's string table: every EX_STR literal, assigned a stable index
+ * (`Expr.strid`) by a pre-emit walk. Each becomes two module data defs — the raw
+ * NUL-terminated bytes and a `{bytes*, len}` header — emitted by emit_string_data
+ * ahead of the functions; a Str value is a pointer to its header. (Provisional
+ * throwaway layout, like the record layout — not the cf0 string representation.) */
+static Expr **g_strlits;
+static int g_nstrlits, g_cap_strlits;
+
+static void register_strlit(Expr *e) {
+	if (g_nstrlits == g_cap_strlits) {
+		g_cap_strlits = g_cap_strlits ? g_cap_strlits * 2 : 16;
+		g_strlits = realloc(g_strlits, g_cap_strlits * sizeof *g_strlits);
+		if (!g_strlits)
+			die(0, "out of memory");
+	}
+	e->strid = g_nstrlits;
+	g_strlits[g_nstrlits++] = e;
+}
+
+/* Walk an expression (and its sub-expressions) registering every string literal,
+ * so each gets a module-unique data slot before emit. Mirrors assign_expr_slots. */
+static void collect_strlits_expr(Expr *e) {
+	if (!e)
+		return;
+	if (e->kind == EX_STR)
+		register_strlit(e);
+	collect_strlits_expr(e->lhs);
+	collect_strlits_expr(e->rhs);
+	collect_strlits_expr(e->els);
+	for (int i = 0; i < e->nargs; i++)
+		collect_strlits_expr(e->args[i]);
+	for (int i = 0; i < e->nfields; i++)
+		collect_strlits_expr(e->fvals[i]);
+}
+
+static void collect_strlits_stmt(Stmt *list) {
+	for (Stmt *s = list; s; s = s->next) {
+		collect_strlits_expr(s->expr);
+		if (s->kind == ST_LOOP)
+			collect_strlits_stmt(s->body);
+	}
+}
+
+/* Emit each string literal as two module data defs: the bytes (emitted one
+ * numeric byte at a time so any content — quotes, NULs, newlines — is safe in the
+ * IL) with a trailing NUL, and a `{bytes*, len}` header the Str value points at.
+ * `len` reads the length word at offset 8 of the header. */
+static void emit_string_data(FILE *out) {
+	for (int i = 0; i < g_nstrlits; i++) {
+		Expr *e = g_strlits[i];
+		fprintf(out, "data $cfstr_bytes_%d = { ", i);
+		for (int j = 0; j < e->slen; j++)
+			fprintf(out, "b %d, ", (unsigned char)e->sval[j]);
+		fprintf(out, "b 0 }\n");
+		fprintf(out, "data $cfstr_%d = { l $cfstr_bytes_%d, w %d }\n", i, i, e->slen);
+	}
+}
+
 /* Emit the code that computes `e` into a fresh word temp, writing the operand
  * that names its value (a literal or a `%tN` temp) into `dst`. Constants are
  * inlined — QBE accepts them as instruction operands.
@@ -1655,6 +1788,14 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 	case EX_INT:
 		snprintf(dst, cap, "%ld", e->ival);
 		return;
+	case EX_STR: {
+		/* A Str value is a pointer to its header; materialize the address into a temp
+		 * so it is a plain `l` operand wherever used (a call argument, `len`, …). */
+		int t = ex->tmp++;
+		fprintf(out, "\t%%t%d =l copy $cfstr_%d\n", t, e->strid);
+		snprintf(dst, cap, "%%t%d", t);
+		return;
+	}
 	case EX_VAR: {
 		/* A record-valued name is an arena pointer (`%r_<name>`), used directly as
 		 * an operand (e.g. a call argument); a word name is a `loadw` from its slot. */
@@ -1668,6 +1809,18 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		return;
 	}
 	case EX_FIELD: {
+		/* `s.len` — the length word sits at offset 8 of the string header. The base is
+		 * any Str expression (a literal in this brick), so emit it and load. */
+		if (e->lhs->rtype.kind == TY_STR) {
+			char s[96];
+			emit_expr(out, e->lhs, ex, s, sizeof s);
+			int a = ex->tmp++;
+			fprintf(out, "\t%%t%d =l add %s, 8\n", a, s);
+			int r = ex->tmp++;
+			fprintf(out, "\t%%t%d =w loadw %%t%d\n", r, a);
+			snprintf(dst, cap, "%%t%d", r);
+			return;
+		}
 		/* Read a record field. The base is a record-typed name — a local or a
 		 * parameter — whose base pointer is `%r_<name>`; the field sits at byte
 		 * offset e->foff. (M0 field bases are always a name; a field of a call result
@@ -2215,6 +2368,9 @@ int main(int argc, char **argv) {
 	if (!f)
 		die(0, "cannot write QBE IL");
 	emit_runtime_qbe(f); /* the arena allocator + bump cursor, ahead of the user code */
+	for (int i = 0; i < prog.nfuncs; i++)
+		collect_strlits_stmt(prog.funcs[i]->body);
+	emit_string_data(f); /* string-literal data defs, ahead of the functions that ref them */
 	for (int i = 0; i < prog.nfuncs; i++)
 		emit_func(f, prog.funcs[i]);
 	fclose(f);
