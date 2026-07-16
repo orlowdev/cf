@@ -183,16 +183,14 @@ static void lex(Lexer *lx) {
 			continue;
 		}
 		if (c == '"') {
-			/* "..." — a string literal; decode escapes into a heap buffer.
-			 *
-			 * Reduced subset of ebnf § Strings (cfcc is throwaway; cf0.cf must NOT
-			 * inherit these narrowings — it has to accept the full grammar per
-			 * seed_subset §4): a literal must close on its own line (the ratified
-			 * grammar allows raw newlines to span lines), there is no `${…}`
-			 * interpolation, and the escape set is the provisional `\n \t \r \0 \\ \"`
-			 * (the grammar's structural `\$` is not accepted — no interpolation to
-			 * escape here). Length/`.len` and the {bytes*,len} header are likewise
-			 * provisional, re-pinned at the M6/M9 representation gate. */
+			/* "..." — a string literal; decode escapes into a heap buffer. Per ebnf
+			 * § Strings a literal MAY span multiple lines — a raw newline is part of
+			 * the content — so only EOF terminates an unclosed string. (Still a reduced
+			 * subset of the grammar, disclaimed for the throwaway cfcc; cf0.cf must not
+			 * inherit these narrowings: `${…}` interpolation is not yet lexed, the
+			 * escape set is the provisional `\n \t \r \0 \\ \"` — the structural `\$`
+			 * is not accepted yet — and the {bytes*,len} header / `.len` are
+			 * provisional, re-pinned at the M6/M9 representation gate.) */
 			size_t start = lx->pos;
 			int startline = lx->line;
 			lx->pos++; /* opening quote */
@@ -202,11 +200,17 @@ static void lex(Lexer *lx) {
 			int n = 0;
 			for (;;) {
 				int ch = (unsigned char)s[lx->pos];
-				if (ch == '\0' || ch == '\n')
+				if (ch == '\0')
 					die(startline, "unterminated string literal");
 				if (ch == '"') {
 					lx->pos++; /* closing quote */
 					break;
+				}
+				if (ch == '\n') { /* a raw newline is literal content; keep line count */
+					buf[n++] = '\n';
+					lx->pos++;
+					lx->line++;
+					continue;
 				}
 				if (ch == '\\') {
 					int e = (unsigned char)s[lx->pos + 1];
