@@ -119,14 +119,29 @@ typedef enum {
 	TK_ARROW, /* -> */
 } TokKind;
 
+/* A string breaks into segments: literal byte-runs and `${name}` interpolations,
+ * in source order (ebnf § Strings). A plain string is a single SEG_LIT. cfcc
+ * restricts interpolation content to a bare identifier — enough for asm bodies'
+ * `${param}`/`${CONST}` — a disclaimed narrowing of the grammar's `${ expression }`. */
+typedef enum { SEG_LIT, SEG_INTERP } StrSegKind;
+typedef struct {
+	StrSegKind kind;
+	char *lit;   /* SEG_LIT: decoded bytes (heap-owned; may embed NULs) */
+	int litlen;
+	char name[64]; /* SEG_INTERP: the interpolated bare name */
+} StrSeg;
+
 typedef struct {
 	TokKind kind;
 	int line;
 	const char *text; /* into the source buffer; not NUL-terminated */
 	int len;
 	long ival; /* for TK_INT */
-	char *sval; /* for TK_STR: the decoded bytes (escapes resolved), heap-owned */
-	int slen;   /* for TK_STR: the decoded byte count (may embed NULs) */
+	char *sval; /* for TK_STR w/o interpolation: the full decoded bytes, heap-owned */
+	int slen;   /* for TK_STR w/o interpolation: the decoded byte count (may embed NULs) */
+	StrSeg *segs;   /* for TK_STR: the segment list (literal runs + interpolations) */
+	int nsegs;
+	int has_interp; /* for TK_STR: 1 if any segment is a `${…}` interpolation */
 } Token;
 
 typedef struct {
@@ -156,6 +171,32 @@ static int ident_char(int c) {
 	return isalnum(c) || c == '_';
 }
 
+/* Append a string segment (growing the array), returning it for the caller to
+ * fill. Used only while lexing a string literal into its literal/interp pieces. */
+static StrSeg *push_seg(StrSeg **segs, int *nsegs, int *cap) {
+	if (*nsegs == *cap) {
+		*cap = *cap ? *cap * 2 : 4;
+		*segs = realloc(*segs, (size_t)*cap * sizeof **segs);
+		if (!*segs)
+			die(0, "out of memory");
+	}
+	StrSeg *sg = &(*segs)[(*nsegs)++];
+	memset(sg, 0, sizeof *sg);
+	return sg;
+}
+
+/* Flush the pending literal run `buf[0..n]` into a SEG_LIT (copying it, since buf
+ * is reused for the next run). An empty run still produces a segment so segments
+ * strictly alternate lit/interp/lit — simplifying later substitution. */
+static void flush_lit(StrSeg **segs, int *nsegs, int *cap, const char *buf, int n) {
+	StrSeg *sg = push_seg(segs, nsegs, cap);
+	sg->kind = SEG_LIT;
+	sg->lit = xmalloc((size_t)n + 1);
+	memcpy(sg->lit, buf, (size_t)n);
+	sg->lit[n] = '\0';
+	sg->litlen = n;
+}
+
 /* A trailing '!' joins a var_name unless it opens '!=' (see ebnf Identifiers).
  * The tracer bullet has no '!' names yet, but the rule is cheap to honour so
  * the lexer already reads `alloc!` as one token. */
@@ -183,21 +224,28 @@ static void lex(Lexer *lx) {
 			continue;
 		}
 		if (c == '"') {
-			/* "..." — a string literal; decode escapes into a heap buffer. Per ebnf
-			 * § Strings a literal MAY span multiple lines — a raw newline is part of
-			 * the content — so only EOF terminates an unclosed string. (Still a reduced
-			 * subset of the grammar, disclaimed for the throwaway cfcc; cf0.cf must not
-			 * inherit these narrowings: `${…}` interpolation is not yet lexed, the
-			 * escape set is the provisional `\n \t \r \0 \\ \"` — the structural `\$`
-			 * is not accepted yet — and the {bytes*,len} header / `.len` are
-			 * provisional, re-pinned at the M6/M9 representation gate.) */
+			/* "..." — a string literal, lexed into segments: literal byte-runs and
+			 * `${name}` interpolations (ebnf § Strings). Per the grammar a literal MAY
+			 * span multiple lines — a raw newline is content — so only EOF terminates
+			 * an unclosed string. `${` opens an interpolation; a lone `$` (not before
+			 * `{`) is literal, and `\$` forces a literal `$`.
+			 *
+			 * cfcc narrowings (throwaway; cf0.cf must not inherit — it takes the full
+			 * grammar): interpolation content is a bare identifier only (the grammar
+			 * allows any `${ expression }`); the escape set is the provisional
+			 * `\n \t \r \0 \\ \" \$`; and the {bytes*,len} header / `.len` are
+			 * provisional, re-pinned at the M6/M9 representation gate. Whether an
+			 * interpolated string is usable (asm body) or a deferred error (an ordinary
+			 * value) is decided later, by the parser. */
 			size_t start = lx->pos;
 			int startline = lx->line;
 			lx->pos++; /* opening quote */
-			/* The decoded bytes are never longer than the source span, so one
-			 * malloc of the remaining-source length is always enough. */
+			/* The decoded bytes of any one literal run are never longer than the
+			 * remaining source, so one malloc of that length is always enough. */
 			char *buf = xmalloc(strlen(s + lx->pos) + 1);
 			int n = 0;
+			StrSeg *segs = NULL;
+			int nsegs = 0, capsegs = 0, has_interp = 0;
 			for (;;) {
 				int ch = (unsigned char)s[lx->pos];
 				if (ch == '\0')
@@ -222,18 +270,49 @@ static void lex(Lexer *lx) {
 					case '0':  d = '\0'; break;
 					case '\\': d = '\\'; break;
 					case '"':  d = '"';  break;
-					default: die(lx->line, "unknown string escape (M0 allows \\n \\t \\r \\0 \\\\ \\\")");
+					case '$':  d = '$';  break;
+					default: die(lx->line, "unknown string escape (M0 allows \\n \\t \\r \\0 \\\\ \\\" \\$)");
 					}
 					buf[n++] = d;
 					lx->pos += 2;
 					continue;
 				}
+				if (ch == '$' && s[lx->pos + 1] == '{') {
+					/* `${name}` — flush the pending literal run, then read a bare name. */
+					flush_lit(&segs, &nsegs, &capsegs, buf, n);
+					n = 0;
+					has_interp = 1;
+					lx->pos += 2; /* past `${` */
+					StrSeg *sg = push_seg(&segs, &nsegs, &capsegs);
+					sg->kind = SEG_INTERP;
+					int nl = 0;
+					while (ident_char((unsigned char)s[lx->pos])) {
+						if (nl >= (int)sizeof sg->name - 1)
+							die(lx->line, "interpolation name too long");
+						sg->name[nl++] = s[lx->pos++];
+					}
+					sg->name[nl] = '\0';
+					if (nl == 0)
+						die(lx->line, "empty `${}` interpolation");
+					if (s[lx->pos] != '}')
+						die(lx->line, "M0 interpolation must be a bare name: `${name}`");
+					lx->pos++; /* past `}` */
+					continue;
+				}
+				/* a lone `$` (not `${`) is a literal byte, like any other char */
 				buf[n++] = (char)ch;
 				lx->pos++;
 			}
+			flush_lit(&segs, &nsegs, &capsegs, buf, n); /* final literal run */
 			push_tok(lx, TK_STR, s + start, (int)(lx->pos - start), 0);
-			lx->toks[lx->ntoks - 1].sval = buf;
-			lx->toks[lx->ntoks - 1].slen = n;
+			Token *tk = &lx->toks[lx->ntoks - 1];
+			tk->segs = segs;
+			tk->nsegs = nsegs;
+			tk->has_interp = has_interp;
+			if (!has_interp) { /* a plain string is one SEG_LIT — the whole content */
+				tk->sval = segs[0].lit;
+				tk->slen = segs[0].litlen;
+			}
 			continue;
 		}
 		if (isdigit(c)) {
@@ -751,6 +830,11 @@ static Expr *parse_primary(Parser *p, Func *fn) {
 		return e;
 	}
 	if (t->kind == TK_STR) {
+		/* A `${…}` interpolation builds a value at runtime — deferred in M0 (the
+		 * `"${s}"` string-copy path lands with runtime interpolation). Interpolation is
+		 * currently meaningful only inside an `asm` body, handled where that is parsed. */
+		if (t->has_interp)
+			die(t->line, "runtime string interpolation is not supported yet");
 		advance(p);
 		Expr *e = new_expr(EX_STR);
 		e->line = t->line;
