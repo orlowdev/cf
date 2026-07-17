@@ -22,7 +22,7 @@ Per [[order_of_compilation.md]] §4 the type gate owns, and this spec defines:
 - **`const`/immutability and lvalue checks** — the type-level half of the ownership
   rules whose runtime meaning is in [[memory_model.md]] §6 (§9 TBD);
 - **aggregate-literal kind** resolution — array vs tuple vs record (§7);
-- **`match` exhaustiveness** (§8, partly TBD).
+- **`match` exhaustiveness** (§8.3).
 
 It runs **before every desugar**, because all desugars are type-directed: a desugar
 never guesses what a form means. Its annotations are read downstream by the effect
@@ -115,7 +115,7 @@ Two **IEEE-754** floating-point types:
   that precision; `-Infinity` is unary `-`. (A bare `const x = Infinity` is legal —
   `x : Infinity` — unlike a bare numeric literal, since `Infinity` is a real type.)
   To *match* the exceptional cases, the std offers the opt-in
-  `FpClass = { Finite(Float64), PosInfinity, NegInfinity, NaN }` union and a
+  `FpClass = { Finite = Float64, PosInfinity, NegInfinity, NaN }` union and a
   `classify` function — so no plain float op is forced to return a union.
 
 ### 2.3 The other primitives
@@ -216,8 +216,8 @@ converting an already-typed `Int` value to a `Uint8` does.
   sign-/zero-extension, integer↔float rounding, and reinterpretation are thereby
   always visible at the call site (this is what the throwaway cfcc's implicit
   `extsw` widening got wrong).
-- **Pointer/integer** conversions (a `*[Uint8]` address as a `Uint`, for the
-  syscall floor) are likewise explicit — **(TBD)** with pointer typing in §6.
+- **Pointer/integer** conversions (a `*[Uint8]` address as a `Uarch`, for the
+  syscall floor) are likewise explicit — see the pointer typing in §6.4.
 
 **The cast is a constructor call `T(x)`** — the same "construction is application"
 form defined in §6. Converting a value `x` to a type `T` is applying `T`'s
@@ -593,19 +593,60 @@ comptime, §5.4) and as a **value type** (a param/field of union type accepts an
 member and recovers which one with `match`, at runtime via the tag). **Constraints
 are unions** — a bound *is* a membership check; there is no separate trait system.
 
-Much of the member model is still **(TBD)** here: compose-over ("resolve-or-create")
-resolution, member-to-union subtyping and union-subset subtyping, tag+payload vs
-all-tag-only representation (an all-tag-only union lowers to an integer),
-`match` exhaustiveness and narrowing. What *is* fixed:
+### 8.1 The member model — resolve-or-create
 
-### 8.1 `match` resolves as early as the information allows
+A union body lists members; each is one of ([[ebnf.md]]):
 
-`match` dispatches on which member a value is. When the member is **known at
-comptime** — a monomorphized generic whose `'T` is now a concrete type — the match
-is a **comptime type-switch**: only the matching arm survives, the rest are pruned
-(dead code), and the dispatch has **zero runtime cost**. When the value is a genuine
-**runtime** union (a tag + payload), it dispatches on the tag at runtime. Same
-construct, resolved at compile time where it can be:
+- **A bare type** — *resolve-or-create*: if the name already denotes a type in scope
+  (a primitive, an imported type, a declared `data`/`union`), the union **composes
+  over** it and that existing type *is* the member (`Uint8` in `Uint`, `Float32` in
+  `Float`). If the name denotes nothing, it is a fresh **nullary** member — a pure tag
+  with no payload (`Nothing`, `Nil`).
+- **A named member `Name = <rhs>`**, where `<rhs>` is a **struct body** `{ … }` (a
+  payload record, `IntLit = { Int32 value }`), a **type** (the named way to compose
+  over — `Wrap = Int32`), or a **literal** (a **singleton** — `Semicolon = ";"`, a
+  tag recoverable as that constant).
+- **A member spread** `...Other` splices another union's members (§A) — how
+  `Number = { ...Int, ...Uint, ...Float }` is built.
+
+Members are **first-class types**: a member is reached bare (`Nothing`) or qualified
+(`Maybe.Nothing`), and `A.X` and `B.X` stay distinct when `X` sits in both. You
+**import the union, not its members**. Generic params on the union head flow into the
+members (`Maybe['Value]` gives `Just['Value]`). A member is **constructed by
+application** (§6.6), its payload shaped by how it was declared (§7.3): `Maybe.Just(1)`
+(a one-tuple payload), `Node.IntLit({ value: 5 })` (a named payload), `Nothing`
+(nullary — the bare tag, no application).
+
+### 8.2 Subtyping
+
+The union relation is what §5.5 rules 2–3 name, made precise:
+
+- **A member is a subtype of its union** — `Int8 <: Int`, `Bool.True <: Bool` — and
+  directly of a union that splices it in by spread (`Int8 <: Number`, since `...Int`
+  flattens `Int8` into `Number`'s members).
+- **A union is a subtype of a union whose members are a superset** — `Int <: Number`
+  (every member of `Int` is a member of `Number`), so an `Int`-typed value or bound
+  satisfies a `Number` one.
+
+There is no other coercion (no numeric/width subtyping among the concrete leaves,
+§5.5). Using a member value *as* its union may attach the discriminant tag (§8.4);
+for an all-tag-only union the value already *is* the tag.
+
+### 8.3 `match` — dispatch, narrowing, exhaustiveness
+
+A `match` inspects which member the scrutinee is. Each arm is a member `type_pattern`
+that **narrows** the scrutinee to that member and binds its payload (`Node.IntLit(v)
+-> …` binds `v` to an `IntLit`'s payload).
+
+- **Exhaustiveness** is checked by the type gate ([[order_of_compilation.md]]): a
+  `match` on a union must cover **every** member, or carry a catch-all — a
+  non-exhaustive match without one is a compile error.
+- **Resolution is as early as the information allows.** When the member is **known at
+  comptime** — a monomorphized generic whose `'T` is now concrete — the match is a
+  **comptime type-switch**: only the matching arm survives, the rest are pruned, at
+  **zero runtime cost**. When the scrutinee is a genuine **runtime** union (tag +
+  payload), it dispatches on the tag. One construct, resolved at compile time where it
+  can be:
 
 ```
 pub const describe = [Int 'T]('T a, 'T b) 'T -> match a {   # 'T bound by the Int union
@@ -615,7 +656,30 @@ pub const describe = [Int 'T]('T a, 'T b) 'T -> match a {   # 'T bound by the In
 }
 ```
 
-### 8.2 The standard numeric and boolean unions
+### 8.4 Representation
+
+- **An all-tag-only union** — every member nullary or a literal singleton, no
+  payload — lowers to a plain **integer** (the tag). `Bool`, and AST-kind unions like
+  `NodeKind`/`TokKind`, cost exactly a small int.
+- **A union with any payload member** is a **tag + payload aggregate**: a discriminant
+  plus the payload, sized to `tag + max(member payload)`, arena-allocated and passed
+  by pointer like a record ([[memory_model.md]]). The payload is a tuple or named
+  record (§7); member→union subsumption writes the tag.
+- The **exact byte layout** (tag width, alignment, payload packing, niche
+  optimizations) is the aggregate-representation gate (M6/M9); this spec fixes the
+  *shape* (all-tag → int, else tag+payload) and the typing, not the bytes.
+
+### 8.5 Constraints are unions
+
+A generic bound `[U 'T]` requires the type argument to be a **member of the union
+`U`** (§5.4) — bound satisfaction *is* union membership, checked at instantiation.
+There is no separate trait, typeclass, or interface system: to say "any number, any
+non-negative integer, any of these three shapes," you name the union of them.
+`[Number 'T]`, `[NonNegativeInteger 'V]`, and a user's `[Drawable 'S]` are the one
+mechanism. As a **bound** a union is comptime (it drives monomorphization); as a
+**value type** it is runtime (tag dispatch) — the same union, used two ways.
+
+### 8.6 The standard numeric and boolean unions
 
 The union system offers two ways to give a union its members: **declare them inline**
 (reachable only through the union), or **declare each type separately and reuse it**
@@ -642,7 +706,7 @@ pub union Bool   = { False, True }                      # two nullary singleton 
   ordinary union. `true`/`false` are literal sugar for `Bool.True`/`Bool.False`; `if`
   / `&&` / `match` on a `Bool` are union dispatch (which is why there is no
   truthiness, §5.6).
-- The float exceptional-value union `FpClass = { Finite(Float64), PosInfinity,
+- The float exceptional-value union `FpClass = { Finite = Float64, PosInfinity,
   NegInfinity, NaN }` (§2.2) is the opt-in matchable view over a raw-IEEE float, via
   `classify`. It composes over the `NaN` singleton type directly and splits the
   `Infinity` singleton by sign into its `PosInfinity`/`NegInfinity` arms.
