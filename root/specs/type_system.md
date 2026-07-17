@@ -392,6 +392,22 @@ Ordering `< <= > >=` is defined **only on the twelve numeric types** (other type
 including `Str`, support only `==`/`!=`); on floats it is the IEEE **partial** order
 (every comparison with `NaN` is false). Both yield `Bool`.
 
+For the cases that need a *reflexive, total* comparison over floats — hash keys,
+sorted containers, dedup — the standard library provides **`total_eq`** and
+**`total_cmp`**, which compare the underlying bits (NaN a fixed value, `-0.0` and
+`+0.0` distinguished), mirroring Rust's `f64::total_cmp`. They work on any type,
+recursing field-wise, so a float-bearing aggregate can still key a map. The rule is:
+IEEE `==` for arithmetic-style comparison, `total_*` when a container needs a total
+order. This is a std surface, not a type rule — the type gate only fixes that bare
+`==` on floats is the IEEE one.
+
+**`==` on a function-typed value is a compile error.** Function equality is
+undecidable (two functions are equal only if they agree on every input), and cf
+functions are comptime-first-class and erased at specialize, so there is no runtime
+function value to compare. Runtime polymorphism is *union + `match`*, not
+function-pointers; if a pointer ever names a callable, that is pointer identity
+(§4/§6.4), a separate question, not function-value `==`.
+
 **Logical.** `&&`, `||`, and unary `!` take `Bool` operands and yield `Bool`
 ([[ebnf.md]]); `&&`/`||` short-circuit. There is no truthiness — a non-`Bool` is not
 an implicit condition, in an `if` or a logical operator.
