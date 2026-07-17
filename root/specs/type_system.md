@@ -8,8 +8,8 @@ the `!` allocation effect). In the pipeline of [[order_of_compilation.md]] it is
 phase 3, `Typecheck & bind` — a **gate**: it annotates the tree and rejects the
 ill-typed, and transforms nothing (the `.cf` before and after is identical).
 
-Status: design in progress. Written in steps — sections marked **(TBD)** are
-placeholders to be filled in later rounds and are not yet ratified.
+Status: design in progress. A full first draft — every section is now written
+(§1–§9); it is not yet ratified.
 
 ## 1. What the type gate owns
 
@@ -20,7 +20,7 @@ Per [[order_of_compilation.md]] §4 the type gate owns, and this spec defines:
 - the **casing rule** — a `type_name` is PascalCase, a `var_name` snake_case
   ([[ebnf.md]]); types and values never collide because they are lexically split;
 - **`const`/immutability and lvalue checks** — the type-level half of the ownership
-  rules whose runtime meaning is in [[memory_model.md]] §6 (§9 TBD);
+  rules whose runtime meaning is in [[memory_model.md]] §6 (§9);
 - **aggregate-literal** typing — the array fixed-vs-dynamic choice and
   record-literal typing (tuple-vs-array is now syntactic, §7);
 - **`match` exhaustiveness** (§8.3).
@@ -820,12 +820,115 @@ pub union Bool   = { False, True }                      # two nullary singleton 
   `classify`. It composes over the `NaN` singleton type directly and splits the
   `Infinity` singleton by sign into its `PosInfinity`/`NegInfinity` arms.
 
-## 9. comptime-known-ness and ownership interactions (TBD)
+## 9. comptime-known-ness and ownership interactions
 
-How the type system surfaces comptime-known values (array sizes `[n 'T]`, comptime
-parameters) for specialize, and the type-level half of the mutability/ownership
-rules ([[memory_model.md]] §6): transitivity through aggregates, the no-second-bind
-rule, `copy`/`copy_deep`.
+Two of the gate's obligations reach past pure type-checking into the arcs
+downstream, yet both are still **annotate-and-reject** duties — the gate transforms
+nothing (§1). It classifies **comptime-known-ness** so that specialize has a
+well-defined worklist (§9.1), and it enforces the **type-level half** of the
+mutability/ownership rules whose runtime meaning is [[memory_model.md]] §6 (§9.2).
+The region-level half — no-dangling — needs concrete node identities and is *not*
+this gate's; it waits for the memory arc (§9.2, last paragraph).
+
+### 9.1 comptime-known-ness
+
+Some type-forming positions demand a value fixed before runtime. The gate
+classifies every expression as **comptime-known or not**, rejects a runtime value
+where a comptime one is required, and marks the comptime-known ones so specialize
+knows which to evaluate ([[order_of_compilation.md]], Specialize —
+"comptime-for-instantiation"). It **classifies; it does not evaluate** (evaluation
+is specialize's, or fold's) — it only certifies that a value *will* be available.
+
+Comptime-known is a small closure over syntax and bindings:
+
+- a **literal** — any scalar (§3), or an aggregate literal all of whose parts are
+  comptime-known;
+- a **`const` binding whose initializer is comptime-known**, transitively. `const`
+  is not *automatically* comptime — `const x = read_line()` is runtime-immutable but
+  not comptime-known; `const x = 4` is both. Comptime-known-ness follows the value,
+  not the `const` keyword;
+- a **comptime value parameter** in scope — the `n` of `[n 'T]` is comptime *by
+  declaration*, a specialization axis, even though its concrete value is unknown
+  until specialize mints the instance;
+- a **type** (every type is comptime — §5.4, §8.5) and a call to a comptime function
+  on comptime-known arguments.
+
+A `let` binding, a runtime parameter, and anything derived from one are **not**
+comptime-known. Three positions require the property:
+
+1. **A fixed-array length `N` in `[N T]`** (§6.2). `[4 Int32]` and `[n 'T]` are
+   *types* only because `4`/`n` are comptime-known; `[len xs]` with a `let len` is
+   not a type — either the length is comptime, or the array is the dynamic `[T]`.
+   This is exactly the fixed-vs-dynamic decision the gate owns (§1, §7.2).
+2. **A type argument** — explicit `f[Int32](…)` or inferred `f(…)` (§5.4). A type is
+   comptime by nature, so this is automatic; the gate's duty is only that an
+   *inferred* `'T` resolve to a concrete type, never a runtime value.
+3. **A comptime value argument** — where a callee declares `[n 'T]`, the caller's
+   `n` argument must be comptime-known (§5.4), carried to specialize as part of the
+   key `(fn, type-args, value-args, capture-env)` ([[order_of_compilation.md]]).
+
+Where the gate cannot certify the property for such a slot, it is a **type error at
+the definition or call site** — the same "spell it out or it fails" discipline as
+inference (§5.4), never a deferred per-instantiation error (§8.5).
+
+The classification also underwrites the **comptime type-switch** (§8.3, §8.5): a
+`match` whose scrutinee's member is comptime-known — a monomorphized `'T` now
+concrete — resolves at compile time to the one surviving arm at zero runtime cost.
+The gate marks the scrutinee comptime-known; specialize does the pruning.
+
+### 9.2 Mutability and ownership at the type level
+
+[[memory_model.md]] §6 gives the runtime meaning of `let`/`const`, pointers, and
+by-value views. Its **static half is this gate's** — the `const`/immutability and
+lvalue checks of §1. The gate enforces four rules; every one is annotate-and-reject,
+none rewrites the tree.
+
+**Mutability is a property of the binding, not the type** ([[memory_model.md]]). The
+gate carries a `let`/`const` attribute on each binding and lvalue, *separate from its
+type* — `Point` is one type whether its home is `let` or `const`. The attribute is
+**transitive through aggregates**: a `.field` or `[i]` reached from a `const`
+aggregate is const, from a `let` is let, all the way down — `const` recursively
+immutable, `let` recursively mutable, with no per-field `mut` markers to reconcile.
+
+**Write-capability of a pointer is inferred, then checked at the call site.** There
+are no `mut` annotations ([[memory_model.md]]). The gate infers from a `*T`
+parameter's body whether it **writes** through the pointer, and checks each argument
+against that verdict: a writing body demands the `&` of a `let` aggregate; passing a
+`const`'s pointer is a type error. Two structural restrictions fall out and are
+enforced here:
+
+- **No `*Scalar`** — `*Int32`, `*Uint8`, … are not types (§6.4). A pointer's
+  referent is always an aggregate; a scalar is passed by value, or lives as a field
+  of a pointed-to aggregate.
+- **No `&` of a `const`** — `&c` on a `const` is an error, so a `*T` argument is
+  always the address of a `let` aggregate: exactly the writable case.
+
+**The no-second-bind rule.** Binding an **aggregate** to a second variable — `const
+y = x` or `let y = x` where `x` is an aggregate — is a type error: that would be a
+borrow, and C! has none ([[memory_model.md]]). A **scalar** rebinds freely (it is a
+by-value copy). To get your own instance of an aggregate, `copy` it.
+
+**By-value is a read-only view; `copy`/`copy_deep` make it writable.** A by-value
+parameter — and any by-value binding — is a **read-only view** regardless of the
+caller's `let`/`const`; the gate treats it as const for lvalue purposes. To mutate,
+take your own instance:
+
+- **`copy x`** — a **shallow** copy: a fresh instance of `x`'s own node.
+- **`copy_deep x`** — a **recursive** copy, following pointers into the owned
+  sub-aggregates as well.
+
+Both are **type-preserving** (`copy x : T` and `copy_deep x : T` for `x : T`); they
+differ only in how much is duplicated. The result is writable when its home is a
+`let`, because **rehoming adopts the destination's rule** ([[memory_model.md]]): a
+value moved into a `const` aggregate becomes const, into a `let` aggregate becomes
+let. The gate re-derives the mutability attribute from the destination home, never
+from the source.
+
+Finally, the **region-level** half of ownership — the no-dangling / region-outlives
+check — is **not** this gate's. It needs concrete node identities and runs in the
+memory arc, before duplication ([[order_of_compilation.md]], Memory;
+[[memory_model.md]] §6). The type gate settles **mutability and lvalue legality**;
+the memory arc settles **lifetime**.
 
 ## Appendix A. ebnf reconciliation
 
