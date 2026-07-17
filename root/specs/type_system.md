@@ -146,7 +146,7 @@ Two **IEEE-754** floating-point types:
 `Unit`/`()` — the zero-element tuple — is a first-class value type (bindable,
 storable, an element or payload, a type argument); it falls out of the
 parenthesis/tuple grammar (§6.1). It is the payload of a nullary union member
-(`Nothing`) and the return of a unit-returning function.
+(`Maybe.Nothing`) and the return of a unit-returning function.
 
 ## 3. Literal typing
 
@@ -216,8 +216,12 @@ converting an already-typed `Int` value to a `Uint8` does.
   sign-/zero-extension, integer↔float rounding, and reinterpretation are thereby
   always visible at the call site (this is what the throwaway cfcc's implicit
   `extsw` widening got wrong).
-- **Pointer/integer** conversions (a `*[Uint8]` address as a `Uarch`, for the
-  syscall floor) are likewise explicit — see the pointer typing in §6.4.
+- **No pointer↔integer conversion, and no pointer arithmetic.** A `*T` is never
+  turned into a `Uarch` and back — that would let a pointer wander off its aggregate
+  and escape the node/region guarantees of [[memory_model.md]]. Pointers are used only
+  through `.field`/`[i]` (auto-deref), created with `&`, and passed as `*T`; a raw
+  address is visible only inside an `asm` function (the floor), where a syscall reads
+  it straight from the register (§6.4).
 
 **The cast is a constructor call `T(x)`** — the same "construction is application"
 form defined in §6. Converting a value `x` to a type `T` is applying `T`'s
@@ -301,7 +305,7 @@ implicit conversion:
   is an explicit conversion (§4). No least-upper-bound is searched for.
 
 An **else-less `if`** does not unify two branches; its value is a `Maybe` of the
-`then` branch's type (`Just` when the branch runs, `Nothing` otherwise) — a
+`then` branch's type (`Maybe.Just` when the branch runs, `Maybe.Nothing` otherwise) — a
 type-system rule from [[ebnf.md]], and the language's canonical way to turn a guarded
 computation into a recoverable value (§5.6).
 
@@ -364,7 +368,7 @@ supplies it, never the core operators: `wrapping_*` / `saturating_*` for explici
 integer intent, and `checked_*` (`checked_add`, `checked_div`, …) returning an
 `Either` whose `Left` names the condition (overflow, divide-by-zero, non-finite).
 A guard also recovers a specific case — an else-less `if` yields a `Maybe`
-(`if b != 0 then a / b` is `Nothing` when `b` is zero, `Just(a / b)` otherwise). The
+(`if b != 0 then a / b` is `Maybe.Nothing` when `b` is zero, `Maybe.Just(a / b)` otherwise). The
 `checked_*`/`wrapping_*` families are a standard-library surface, not new type rules.
 
 **Comparison.** Equality `==`/`!=` is **structural**: scalars by value, aggregates
@@ -456,8 +460,10 @@ parenthesized-tuple shape.
 - **`*T`** — a pointer. Per [[memory_model.md]] §6, pointers point **only to
   aggregates**, **only into a `let`**, and **one level deep**; there is no
   `*Scalar` (no `*Int32`), and no whole-value dereference (`.field` and `[i]`
-  auto-dereference). A `*T` is a pointer-width address at runtime but is **not** a
-  `Uarch` — moving between them is an explicit conversion (§4).
+  auto-dereference). A `*T` is a pointer-width address at runtime, but there is **no
+  `*T`↔integer conversion and no pointer arithmetic** (§4) — a pointer can only reach
+  its aggregate's fields/elements, never a computed address, so it can never escape
+  the node it belongs to. The raw address is exposed only inside the `asm` floor.
 - **`&T`** — a reference: the operator that hands a `let` aggregate to a `*T`
   parameter. `&c` on a `const` is an error (no by-reference of an immutable).
 
@@ -507,7 +513,7 @@ Maybe.Nothing            # a nullary member — payload (), no application neede
   rule a function whose every allocation escapes is colorless, so no constructor
   ever carries `!`, and `const Point p = Point(1, 2)` needs none either.
 - **The payload is a tuple.** A record's fields, a union member's payload, and a
-  call's arguments are all the one argument-tuple shape: `Just(1)` is a member over
+  call's arguments are all the one argument-tuple shape: `Maybe.Just(1)` is a member over
   the one-tuple `(1)` (≅ `1`), `Node(l, v, r)` over `(l, v, r)`. Union payload
   storage is therefore tuple storage — the tag plus the payload tuple's layout
   (§8) — with no per-member-shape special case. This is a *semantic/surface*
@@ -609,13 +615,23 @@ A union body lists members; each is one of ([[ebnf.md]]):
 - **A member spread** `...Other` splices another union's members (§A) — how
   `Number = { ...Int, ...Uint, ...Float }` is built.
 
-Members are **first-class types**: a member is reached bare (`Nothing`) or qualified
-(`Maybe.Nothing`), and `A.X` and `B.X` stay distinct when `X` sits in both. You
-**import the union, not its members**. Generic params on the union head flow into the
-members (`Maybe['Value]` gives `Just['Value]`). A member is **constructed by
-application** (§6.6), its payload shaped by how it was declared (§7.3): `Maybe.Just(1)`
-(a one-tuple payload), `Node.IntLit({ value: 5 })` (a named payload), `Nothing`
-(nullary — the bare tag, no application).
+Members are **first-class types**, but *how you reach one depends on how it was
+declared* — you **import the union, not its members**:
+
+- A **compose-over member** is a standalone type the union only references, so it is
+  reached **on its own** (`Int8`, `Float32` — you are naming the independent type,
+  which happens to also be a member), and redundantly as `Uint.Uint8`.
+- An **inline-declared member** — a nullary tag or a `Name = …` payload/type/singleton
+  (`Just`, `Nothing`, `Left`, `Right`, `IntLit`) — exists **only within its union** and
+  is reached **only qualified**: `Maybe.Just`, `Either.Left`, `Node.IntLit`. There is no
+  bare `Just` or `Nothing`. This keeps the namespace clean (`Just` alone is meaningless;
+  `Maybe.Just` is not) and keeps `A.X` and `B.X` distinct when `X` sits in both.
+
+Generic params on the union head flow into the members (`Maybe['Value]` gives
+`Maybe.Just['Value]`). A member is **constructed by application** (§6.6), its payload
+shaped by how it was declared (§7.3): `Maybe.Just(1)` (a one-tuple payload),
+`Node.IntLit({ value: 5 })` (a named payload), `Maybe.Nothing` (nullary — the bare
+tag, no application).
 
 ### 8.2 Subtyping
 
@@ -785,3 +801,12 @@ grammar surface it touches.
     `pub intrinsic type Infinity`). Today `intrinsic_decl` is function-only
     (snake_case name, no `type` keyword); it gains a `type`-keyword, `type_name`,
     constructor-signature-RHS form. (§2.1, §2.2)
+16. **Inline union members are qualified-only.** ebnf's union section shows a member
+    reached bare (`None`); §8.1 restricts bare access to **compose-over** members
+    (standalone types like `Int8`) — an **inline-declared** member (`Just`, `Nothing`,
+    `Left`, `Right`, a payload/singleton) is reachable only through its union
+    (`Maybe.Just`). The bare-`None` example becomes `Maybe.Nothing`. (§8.1)
+17. **No `*T`↔integer conversion / no pointer arithmetic** — not an ebnf *grammar*
+    change (memory_model already forbids pointer arithmetic), but this spec drops the
+    "explicit pointer/integer conversion" it had briefly implied; raw addresses live
+    only in the `asm` floor. (§4, §6.4)
