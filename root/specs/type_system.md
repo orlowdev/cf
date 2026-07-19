@@ -8,8 +8,10 @@ the `!` allocation effect). In the pipeline of [[order_of_compilation.md]] it is
 phase 3, `Typecheck & bind` — a **gate**: it annotates the tree and rejects the
 ill-typed, and transforms nothing (the `.cf` before and after is identical).
 
-Status: design in progress. A full first draft — every section is now written
-(§1–§9); it is not yet ratified.
+Status: complete draft — **not yet ratified**. All sections (§1–§9) are written, and
+their decisions have been propagated into the sibling specs ([[ebnf.md]],
+[[order_of_compilation.md]], [[memory_model.md]]); a few sub-points remain open
+(flagged inline). A final ratification pass is pending.
 
 ## 1. What the type gate owns
 
@@ -58,7 +60,8 @@ with four fixed widths plus a pointer-width member:
   cf0's sole target `arm64-apple-darwin`), the types for addresses, sizes, and
   counts. `Arch` is a *distinct type* from `Int64` even where they share a
   representation (like Rust's `isize` vs `i64`): pointer-width is a semantic
-  property, not "64", so a move between them is an explicit conversion (§4).
+  property, not "64", so a move between them is an explicit conversion (§4). `Arch`
+  is also the **default type of an unannotated integer literal** (§3).
 - **`Int`/`Uint` are the *unions*, not concrete types.** `Int` is the std union of
   all signed widths, `Uint` of all unsigned, defined in §8:
   `Int = { Int8, Int16, Int32, Int64, Arch }` and likewise `Uint`. They are the
@@ -108,6 +111,7 @@ Two **IEEE-754** floating-point types:
   `Float32` and `Float64`, or between a float and any integer, is an explicit
   conversion (§4) — never implicit. Like the integers, **`Float` is the *union***
   `{ Float32, Float64 }` (§8) — the generic bound "any float", not a concrete type.
+  `Float64` is the **default type of an unannotated float literal** (§3).
 - **Signed.** Unary `-` applies.
 - A **float literal** is decimal with a point (`3.14`) ([[ebnf.md]] Numbers) and,
   like an integer literal, takes its concrete float type from context (§3).
@@ -180,23 +184,40 @@ write(1, buf, n)         # a literal argument takes the parameter's type
 
 - **Range check.** The literal must fit the expected type's range, checked at
   comptime; `256` where a `Uint8` is expected, or a negative into an unsigned, is
-  a compile error.
-- **No expected type is an error.** When nothing supplies a numeric expected type —
-  an unannotated `const x = 5`, or a bare literal expression with no typed
-  context — the literal is rejected: it must be annotated (`const Int32 x = 5`) or
-  reached through a typed context. There is no default integer type.
+  a compile error. The check is **per literal against its adopted type** — comptime
+  *arithmetic* over already-typed literals is not re-range-checked; it wraps like any
+  other overflow (§2.1, §5.6), so `const Uint8 x = 200 + 100` is `44`, not an error.
+- **Default type when none is supplied.** A bare literal with no annotation and no
+  typed context takes a **default concrete type**: an integer literal is `Arch` (the
+  machine word — §2.1), a float literal is `Float64`. So `const x = 5` is `Arch` and
+  `const x = 3.14` is `Float64`. Every *other* width is user-specified — you annotate
+  (`const Int32 x = 5`) or reach a typed context only when you want a non-default
+  width. This is the Go model (word-size int, double float): the defaults exist so
+  untyped arithmetic, counters, and indices need no ceremony, while a deliberate
+  width is always one annotation away.
+- **A numeric *union* expected type resolves to the same default member.** When the
+  only expected type is a numeric union — `Int`, `Number`, `Float` — the literal
+  cannot pick a width from the union (its members each have their own representation),
+  so it takes the **default concrete member**: an integer → `Arch`, a float →
+  `Float64`. `const Number n = 5` is the `Arch` member and the value is a plain
+  `Arch`, **never a runtime `Number` union** (a union value would not be operable
+  without a `match`, §8.5). Subsuming an *already-typed* value into a union
+  (`let Number n = int8_val`) is the separate member→union rule of §5.5, unaffected.
 - **Propagation through operators.** An expected type propagates into the operands
   of arithmetic over untyped literals (`const Int8 y = 5 + 3` types both `5` and
   `3`, and the result, as `Int8`); a literal combined with an already-typed value
-  takes that value's type. The full propagation/unification mechanics are §5.2/§5.6;
-  the rule here is only that a literal never invents its own type.
+  takes that value's type; two untyped literals with no expected type each take the
+  default (`Arch`/`Float64`). The full propagation/unification mechanics are
+  §5.2/§5.6; the rule here is only that a literal never invents a *non-default* type.
 
-A **float literal** (`3.14` — decimal with a point) follows the same rule: untyped
-until a context supplies `Float32` or `Float64`, then a value of that type, subject
-to the same "no expected type is an error" and range checks. An **integer literal
-(no point) may also take a float expected type** — `const Float64 x = 5` is `5.0`,
-an exact float value — since a literal has no intrinsic width; a **float literal
-never takes an integer type** (a point means a real).
+A **float literal** (`3.14` — decimal with a point) follows the same rules: it takes
+`Float32` or `Float64` from context, or **`Float64`** by default (above), subject to
+the range check. A non-representable decimal (`0.1`) **rounds to the nearest value**
+of its float type — ordinary floating-point rounding, not an error; only an
+out-of-*range* magnitude is rejected. An **integer literal (no point) may also take a
+float expected type** — `const Float64 x = 5` is `5.0`, exact for a representable
+integer — since a literal has no intrinsic width; a **float literal never takes an
+integer type** (a point means a real).
 
 ### 3.2 Other scalar literals
 
@@ -278,9 +299,13 @@ A type annotation is required exactly where a type cannot be synthesized:
 - **Function return types** are inferred from the body and so may be omitted. (An
   `asm`/`intrinsic` has no body, so its return type is mandatory — [[ebnf.md]].)
 - **`const`/`let` locals** may omit the type iff the initializer **synthesizes** a
-  concrete type: `const p = make_point()` infers `Point`; but `const x = 5` (a bare
-  literal — §3), `const xs = []` (an empty aggregate), or any initializer that only
-  *checks against* an expected type without producing one, requires an annotation.
+  concrete type: `const p = make_point()` infers `Point`, and `const x = 5`
+  synthesizes its default `Arch` (§3). But `const xs = []` (an empty aggregate with
+  no element type), or any initializer that only *checks against* an expected type
+  without producing one, still requires an annotation. A member construction infers the
+**precise member type** — `let m = Maybe.Just(1)` gives `m : Maybe[Arch].Just` (§8.1);
+to hold the whole union — e.g. so a `let` may be reassigned across members — annotate
+it (`let Maybe[Arch] m = Maybe.Just(1)`), which widens by subtyping.
 
 ### 5.2 Expected-type propagation (checking)
 
@@ -297,8 +322,8 @@ When a form supplies an expected type, it is pushed inward:
 - into a **call's generic arguments** (§5.4).
 
 Where no expected type is supplied, a form must synthesize its own; a numeric
-literal that reaches neither an annotation nor a typed neighbour is an error (§3) —
-there is no default numeric type.
+literal that reaches neither an annotation nor a typed neighbour synthesizes its
+**default** — `Arch` for an integer, `Float64` for a float (§3).
 
 ### 5.3 Unifying branches and match arms
 
@@ -311,17 +336,24 @@ implicit conversion:
   [[ebnf.md]] — or a diverging call) is subsumed: the result is the other
   branch's type. `if c then 1 else break` has whatever type the context gives `1`
   (say `Int32`).
-- When the context **expects a union**, branches whose types are **members** of
-  that union combine to the union (member-to-union subtyping, §8) — this is the
-  only widening, and it only happens toward an expected union, never invented.
+- **Members of a single common union combine to that union.** Two branches whose
+  types are members (or precise member types) of the **same one** union join to it —
+  `Maybe[Arch].Just` and `Maybe[Arch].Nothing` combine to `Maybe[Arch]` — with **no
+  expected type needed and no search**, because a member's home union is unique enough
+  to name the join (member→union subtyping, §8). When the members belong to **several**
+  unions (a compose-over leaf like `Int8`, in both `Int` and `Number`) the join is
+  ambiguous, so it happens only toward an **expected** union (annotation/param/return),
+  never invented.
 - Branches of **different, unrelated types** — including two different numeric
   types (`Int32` vs `Int64`) — do **not** combine; it is a type error, and the fix
   is an explicit conversion (§4). No least-upper-bound is searched for.
 
 An **else-less `if`** has no second branch to unify, so it yields **`Unit`**: the
 `then` branch runs for effect when the condition holds, and the whole expression is
-`()` either way. (It does *not* wrap the branch in a `Maybe` — that overhead bought
-nothing; a value you want to keep uses a full `if`/`else` or a `match`.)
+`()` either way. The `then` branch **may have any type** — its value is discarded —
+so `if c then compute()` is well-formed whatever `compute()` returns. (It does *not*
+wrap the branch in a `Maybe` — that overhead bought nothing; a value you want to keep
+uses a full `if`/`else` or a `match`.)
 
 ### 5.4 Generic type-argument inference
 
@@ -329,9 +361,12 @@ A call may give type arguments explicitly (`max[Int32](a, b)`) or leave them to 
 **inferred** from the value arguments (`max(a, b)`) ([[ebnf.md]]). Inference unifies
 each parameter's declared type (which mentions the callee's type variables `'T`)
 against the corresponding argument's synthesized type, and binds each `'T` to the
-type it matched. If the arguments leave a type variable **unconstrained or
-contradictory**, inference fails and the call must spell the argument out
-explicitly. A comptime value parameter (`[n 'T]` size) is likewise fixed here from
+type it matched. When several arguments bind the **same** `'T`, their synthesized
+types must be **identical** — inference does not join them to a common union even
+when one is a member of the other (`Int8` and `Int` do not merge to `Int`), so the
+type stays uniform and unification never searches a lattice (§5.5). If the arguments
+leave a type variable **unconstrained or contradictory** (a non-uniform binding is
+contradictory), inference fails and the call must spell the argument out explicitly. A comptime value parameter (`[n 'T]` size) is likewise fixed here from
 an explicit argument or the context, and carried to specialize
 ([[order_of_compilation.md]]). Whether an inferred type argument **satisfies its
 bound** — a bound is a `union` membership check — is §8.
@@ -349,7 +384,12 @@ The subtyping relation has only these forms:
 There is **no `Top`/`Any`** supertype, and **no numeric or width subtyping among the
 concrete types** — no `Int8 <: Int64`, no `signed <: unsigned`, no
 `Float32 <: Float64`. Every type not related by the rules above is invariant, and any
-move between two such types is an explicit conversion (§4). This is the closure of
+move between two such types is an explicit conversion (§4). In particular **function
+types are invariant** in both domain and codomain — `(A) B` relates to `(A') B'` only
+when `A ≡ A'` and `B ≡ B'`, with no contravariant-domain/covariant-codomain rule. So
+`() Never` is *not* a subtype of `() R`: `Never <: R` is a rule about **values**, not
+one that flows through a function's return position, and a diverging function is not
+silently usable where a returning one is expected. This is the closure of
 "no implicit conversions among concretes": unification (§5.3, §5.4) never has to
 search a lattice — the only widening is toward an *expected* union.
 
@@ -360,7 +400,8 @@ require **both operands to be the same type** — a numeric type for arithmetic,
 integer type for bitwise — and yield that type. There is no implicit conversion
 between operands: `a + b` with `a: Int32` and `b: Int64` is an error. An untyped
 literal operand adopts the other operand's type; two untyped literals stay untyped
-and take the expression's expected type (error if none — §3). Unary `-` requires a
+and take the expression's expected type, or their default `Arch`/`Float64` if none
+(§3). Unary `-` requires a
 signed operand (§2.1), `~` an integer, both yielding the operand's type.
 
 **Numeric operations never trap.** A wrong value is the developer's responsibility,
@@ -395,7 +436,8 @@ including `Str`, support only `==`/`!=`); on floats it is the IEEE **partial** o
 For the cases that need a *reflexive, total* comparison over floats — hash keys,
 sorted containers, dedup — the standard library provides **`total_eq`** and
 **`total_cmp`**, which compare the underlying bits (NaN a fixed value, `-0.0` and
-`+0.0` distinguished), mirroring Rust's `f64::total_cmp`. They work on any type,
+`+0.0` distinguished), mirroring Rust's `f64::total_cmp`. They work on any type
+**without a function-typed field** (the function-`==` ban below is transitive),
 recursing field-wise, so a float-bearing aggregate can still key a map. The rule is:
 IEEE `==` for arithmetic-style comparison, `total_*` when a container needs a total
 order. This is a std surface, not a type rule — the type gate only fixes that bare
@@ -406,7 +448,10 @@ undecidable (two functions are equal only if they agree on every input), and cf
 functions are comptime-first-class and erased at specialize, so there is no runtime
 function value to compare. Runtime polymorphism is *union + `match`*, not
 function-pointers; if a pointer ever names a callable, that is pointer identity
-(§4/§6.4), a separate question, not function-value `==`.
+(§4/§6.4), a separate question, not function-value `==`. The ban is **transitive**:
+`==` (and `total_eq`/`total_cmp`) on any aggregate that transitively contains a
+function-typed field is rejected too, since structural recursion would reach a field
+with no equality.
 
 **Logical.** `&&`, `||`, and unary `!` take `Bool` operands and yield `Bool`
 ([[ebnf.md]]); `&&`/`||` short-circuit. There is no truthiness — a non-`Bool` is not
@@ -420,13 +465,13 @@ uniform way a value of any type comes into being — **construction is applicati
 
 > **Note.** Several forms here revise the ratified grammar of [[ebnf.md]]
 > (tuple/unit syntax, the cast, construction-as-application, dropping the prefix
-> record literal). Every such change is listed in the ebnf-reconciliation appendix
-> (§A) for one coordinated grammar pass; the semantics are fixed here.
+> record literal); those revisions have been propagated into [[ebnf.md]] directly
+> (see Reconciliation status). The semantics are fixed here.
 
 ### 6.1 Parentheses: tuples, unit, and the argument shape
 
 A **tuple** is a positional, heterogeneous product, written with parentheses:
-`(a, b)`, `(Int, Str)`. Parentheses — not brackets — because a tuple is the same
+`(a, b)`, `(Int32, Str)`. Parentheses — not brackets — because a tuple is the same
 shape as an argument list and a function domain (§6.3), and one glyph serves all
 three.
 
@@ -455,7 +500,7 @@ Brackets build the homogeneous, indexable sequence types:
 
 - **`[T]`** — a **dynamic array** of `T`: runtime length, bounds-checked indexing,
   iterable. Its empty value is `[]`.
-- **`[N T]`** — a **fixed array** of comptime length `N` (`[4 Int]`, or `[n 'T]`
+- **`[N T]`** — a **fixed array** of comptime length `N` (`[4 Int32]`, or `[n 'T]`
   with a comptime value parameter): comptime length, bounds-checked indexing,
   iterable. A fixed array is a homogeneous tuple, but a distinct type — its length
   is in the type, and it iterates, where a tuple is accessed only at comptime
@@ -586,12 +631,16 @@ else from the expected element type (§3). The **kind** follows the context:
 
 - a **fixed** expected type `[N T]`, or **no annotation at all** → a **fixed array**
   `[n T]` of the literal's own comptime-known length (the length is right there in
-  the literal); with `[N T]`, that length must equal `N`. The element type still
-  needs a source (§3);
-- a **dynamic** expected type `[T]`, or the empty literal `[]`, or a literal that
-  flows into a growing binding → a **dynamic array** `[T]`.
+  the literal); with `[N T]`, that length must equal `N`. The element type comes from
+  the elements, or their default (`Arch`/`Float64`, §3) when they are untyped
+  literals — so `const xs = [1, 2, 3]` is now a well-formed `[3 Arch]`;
+- a **dynamic** expected type `[T]`, the empty literal `[]` **with no fixed expected
+  type**, or a literal that flows into a growing binding → a **dynamic array** `[T]`.
+  An explicit `[N T]` context always wins over the `[]`-is-dynamic default: `[]`
+  checked against `[0 T]` is the fixed empty array, not a dynamic one.
 
-So `[1, 2, 3]` is `[3 T]` (fixed) unless a `[T]` context or growth makes it dynamic.
+So `[1, 2, 3]` is `[3 Arch]` (fixed) unless a `[T]` context or growth makes it
+dynamic.
 
 ### 7.3 Record construction and data-literal typing
 
@@ -624,8 +673,9 @@ way the annotation sugar `const Point p = <payload>` is `Point(<payload>)` (§6.
   field's declared type (a literal adopts it, §3). **Puns** (`{ x }` ≡ `{ x: x }`)
   and **defaults** (a field with a `= default` in its declaration may be omitted) are
   per [[ebnf.md]]. A **value-level spread** (`{ ...other, z: 3 }` splices another
-  record's fields; later entries win on a collision) is a grammar addition (§A) —
-  ebnf currently has spread only in a record *declaration* and in bracket aggregates.
+  record's fields; later entries win on a collision) — per [[ebnf.md]]'s `data_literal`
+  value spread, distinct from the record-*declaration* spread and the bracket-aggregate
+  spread.
   **Positional-record** fields are filled by position, like any tuple.
 
 ## 8. Unions, subtyping, and constraints
@@ -646,15 +696,18 @@ A union body lists members; each is one of ([[ebnf.md]]):
   (a primitive, an imported type, a declared `data`/`union`), the union **composes
   over** it and that existing type *is* the member (`Uint8` in `Uint`, `Float32` in
   `Float`). If the name denotes nothing, it is a fresh **nullary** member — a pure tag
-  with no payload (`Nothing`, `Nil`).
+  with no payload (`Nothing`, `Nil`). This resolution is **deliberately
+  scope-sensitive**: a bare member name that matches a type in scope composes over it,
+  and importing such a name is an explicit act — the compose-over is intended, not a
+  trap to warn about.
 - **A payload member**, whose payload mirrors a record declaration (§7.3): a
   **positional** `Name(T1, …, Tn)` (`Just('Value)`, `IntLit(Int32)`) or a **named**
-  `Name = { field: type, … }` (`IntLit = { Int32 value }`). Constructed and matched by
+  `Name = { type field, … }` (`IntLit = { Int32 value }`). Constructed and matched by
   the matching shape (`Maybe.Just(1)` / `Node.IntLit({ value: 5 })`).
 - **A named compose-over or singleton `Name = <rhs>`** — `<rhs>` a **type** (`Wrap =
   Int32`) or a **literal** (a **singleton**, `Semicolon = ";"`, a tag recoverable as
   that constant).
-- **A member spread** `...Other` splices another union's members (§A) — how
+- **A member spread** `...Other` splices another union's members ([[ebnf.md]]) — how
   `Number = { ...Int, ...Uint, ...Float }` is built.
 
 ```
@@ -671,8 +724,17 @@ declared* — you **import the union, not its members**:
 - An **inline-declared member** — a nullary tag or a `Name = …` payload/type/singleton
   (`Just`, `Nothing`, `Left`, `Right`, `IntLit`) — exists **only within its union** and
   is reached **only qualified**: `Maybe.Just`, `Either.Left`, `Node.IntLit`. There is no
-  bare `Just` or `Nothing`. This keeps the namespace clean (`Just` alone is meaningless;
-  `Maybe.Just` is not) and keeps `A.X` and `B.X` distinct when `X` sits in both.
+  bare `Just` or `Nothing`, in value **or** type position. This keeps the namespace
+  clean (`Just` alone is meaningless; `Maybe.Just` is not) and keeps `A.X` and `B.X`
+  distinct when `X` sits in both.
+
+Either kind is a **first-class type usable anywhere a type is** — a param, field,
+return, binding annotation, or type argument — a compose-over member bare (`Int8`), an
+inline member only qualified (`Maybe[Int32].Just`, `Node.IntLit`). Because an inline
+member is **bound to its union**, `Maybe.Nothing` and a different union's `Nothing` are
+**distinct types** and case names never collide across unions — the case-name space is
+the union's, not the module's. (A member value is still obtained by construction or by
+`match` narrowing, never by a bare downcast — §8.3.)
 
 **Generic placement is composable** — put the type parameter where the intent needs
 it. A parameter on the **union head** flows into every member that uses it —
@@ -684,17 +746,28 @@ link, §8.4). The two are the same mechanism; a member may carry its own generic
 exactly as a standalone type would. A member *can* be extracted into a standalone
 type when a design wants it (`type Just['Value] = ('Value)` composed over by
 `Maybe`) — but `Maybe`'s and `Either`'s members are deliberately **not** extracted:
-they stay inline, reachable only as `Maybe.Just` / `Either.Left` (§8.6).
+they stay inline, reachable only as `Maybe.Just` / `Either.Left` (the qualified-only
+rule above).
 
 A member is **constructed by application** (§6.6): `Maybe.Just(1)`,
 `Node.IntLit({ value: 5 })`, `Maybe.Nothing` (nullary — no application).
 
-A member-constructor expression **synthesizes its union type, not the member** —
-`Maybe.Just(1) : Maybe[Int32]`, not `Maybe.Just[Int32]`. This is what lets branches
-that build *different* members of one union unify with no annotation: `match x { A ->
-Maybe.Just(1), B -> Maybe.Nothing }` has type `Maybe[Int32]` (each arm synthesizes
-`Maybe[Int32]`, so §5.3's same-type rule combines them). A member type appears on its
-own only in a `match` `type_pattern` (§8.3), where it narrows.
+A member-constructor expression **synthesizes the precise member type** —
+`Maybe.Just(1) : Maybe[Arch].Just` (the `1` taking its default, §3) — because the
+member is statically known at the construction site: the value is exactly that case,
+carries no tag, and **widens to its union** (`Maybe[Arch]`) by member→union subtyping
+(§8.2) wherever a union is expected (an annotation, param, return, or unification
+against a sibling member). This is what lets a signature state a *precise* result —
+`f() Maybe[Int32].Just` returns **only** `Just`, never `Nothing` — and lets the
+compiler carry that exact case through for codegen (no tag, no dispatch). It also
+still lets sibling-member branches unify with no annotation:
+`match x { A -> Maybe.Just(1), B -> Maybe.Nothing }` is `Maybe[Arch]` — the two
+precise member types `Maybe[Arch].Just` and `Maybe[Arch].Nothing` join to their
+**single common union** with no lattice search, since each lives only in `Maybe`
+(§5.3). The member-type spelling carries the container's instantiation:
+**`Maybe[Int32].Just`** (the parameter sits on `Maybe`), or **`Tree.Node[Int32]`**
+when it sits on the member instead — the type argument goes where the parameter was
+declared, so `Maybe.Just[Int32]` is *not* the spelling.
 
 ### 8.2 Subtyping
 
@@ -709,19 +782,39 @@ The union relation is what §5.5 rules 2–3 name, made precise:
 
 There is no other coercion (no numeric/width subtyping among the concrete leaves,
 §5.5). Using a member value *as* its union may attach the discriminant tag (§8.4);
-for an all-tag-only union the value already *is* the tag.
+for an all-tag-only union the value already *is* the tag. **Union→superunion
+subsumption stays a no-op** (`Int <: Number` re-uses the value, no re-tag) because
+the representation gate encodes a shared member's tag identically in both unions
+(§8.4) — the type system requires that consistency and defers the encoding.
 
 ### 8.3 `match` — dispatch, narrowing, exhaustiveness
 
 A `match` inspects which member the scrutinee is. Each arm is a member `type_pattern`
-that **narrows** the scrutinee to that member and binds its payload — `Node.IntLit(v)
--> …` binds `v` to an `IntLit`'s payload. For a **compose-over** member the payload
-*is the value itself* (`Int.Int8(v)` binds `v` to the `Int8`, since a compose-over
-member is not a wrapper — §8.1).
+**qualified by the scrutinee's union** that **narrows** the scrutinee to that member
+and binds its payload — `Node.IntLit(v) -> …` binds `v` to an `IntLit`'s payload. Two
+rules make the frame explicit:
+
+- **Arms may only name members of the scrutinee's own union.** Matching an `Int` offers
+  exactly `Int`'s five members; a `Number`, all twelve. The scrutinee's static union
+  *is* the frame, so the checker never searches for which union a member belongs to —
+  the type already says. (This is why sibling-member unification needs no lattice
+  search, §5.3.)
+- **The container qualifier is required** — `Int.Int32(x)`, never bare `Int32(x)`,
+  and when matching a `Number` it is `Number.Int32` — so the syntax names the member
+  *as a case of that union*, not as any-int. Narrowing binds the **precise member
+  type**: in the arm the scrutinee *is* that member.
+
+For a **compose-over** member the payload *is the value itself* (`Int.Int8(v)` binds
+`v` to the `Int8`, since a compose-over member is not a wrapper — §8.1); for an
+inline payload member it is the declared payload (`Node.IntLit(v)` binds the payload).
 
 - **Exhaustiveness** is checked by the type gate ([[order_of_compilation.md]]): a
-  `match` on a union must cover **every** member, or carry a catch-all — a
-  non-exhaustive match without one is a compile error.
+  `match` on a union must cover **every** member, or carry a **catch-all — the
+  wildcard `_`** ([[ebnf.md]]); a non-exhaustive match without one is a compile error,
+  and an arm made unreachable by an earlier `_` is likewise rejected. (The `...` in
+  the examples below is elision of the remaining member arms, not a catch-all.) Under
+  the comptime type-switch a `_` is allowed and simply pruned when a concrete `'T`
+  makes it unreachable.
 - **Resolution is as early as the information allows.** The two modes share the
   syntax but not the mechanism. When the member is **known at comptime** — a
   monomorphized generic whose `'T` is now concrete — the match is a **comptime
@@ -748,6 +841,11 @@ pub const describe = [Int 'T]('T a, 'T b) 'T -> match a {   # 'T bound by the In
   geometry and passed by pointer like a record ([[memory_model.md]] — placement is
   the geometry's, not necessarily an arena). The payload is a tuple or named record
   (§7); member→union subsumption writes the tag.
+- **A pointer to an all-tag-only union is illegal.** Since such a union *is* a scalar
+  integer (above), `*Bool` / `*NodeKind` would be a `*Scalar`, which §6.4 forbids —
+  only a **payload-bearing** union (a tag+payload aggregate) can be a pointer's
+  referent, as in the recursive `*Node` case below. The type gate rejects `*U` for an
+  all-tag-only `U`.
 - **Recursive unions are legal** — the AST case. Because a payload union is an
   aggregate (tag+payload), a member may hold a **pointer to its own union**
   (`BinOp = { *Node left, *Node right }` in a `union Node`). A *by-value* self-reference
@@ -756,7 +854,12 @@ pub const describe = [Int 'T]('T a, 'T b) 'T -> match a {   # 'T bound by the In
   `*Node`, never an inline `Node` of unbounded size.
 - The **exact byte layout** (tag width, alignment, payload packing, niche
   optimizations) is the aggregate-representation gate (M6/M9); this spec fixes the
-  *shape* (all-tag → int, else tag+payload) and the typing, not the bytes.
+  *shape* (all-tag → int, else tag+payload) and the typing, not the bytes. That gate
+  also assigns tags **consistently across sub/superset unions** — a shared member's
+  discriminant has the same encoding in the sub- and super-union (`Number`'s tag for
+  `Int8` equals `Int`'s) — so that union→superunion subsumption (`Int <: Number`,
+  §8.2) is a no-op reinterpret rather than a re-tag. The type system fixes that
+  *requirement*; the gate owns the bytes.
 
 ### 8.5 Constraints are unions
 
@@ -774,10 +877,10 @@ define `+`, `.field`, etc. across its members — so the body **matches on `'T` 
 narrow to a concrete member**, then operates on that member's own type:
 
 ```
-pub const negate = [Number 'T]('T x) 'T -> match x {
-  Int.Int8(v)  -> -v,      # here v is an Int8; -v is Int8 arithmetic
-  Float.Float32(v) -> -v,  # here v is a Float32
-  ...
+pub const negate = [Number 'T]('T x) 'T -> match x {   # scrutinee's union is Number
+  Number.Int8(v)    -> -v,   # here v is an Int8; -v is Int8 arithmetic
+  Number.Float32(v) -> -v,   # here v is a Float32
+  ...                        # qualified by Number — the arms name Number's members
 }
 ```
 
@@ -837,7 +940,9 @@ classifies every expression as **comptime-known or not**, rejects a runtime valu
 where a comptime one is required, and marks the comptime-known ones so specialize
 knows which to evaluate ([[order_of_compilation.md]], Specialize —
 "comptime-for-instantiation"). It **classifies; it does not evaluate** (evaluation
-is specialize's, or fold's) — it only certifies that a value *will* be available.
+is specialize's, or fold's) — it only certifies that a value *will* be available. A
+comptime computation that diverges or cycles is therefore not the gate's to catch;
+specialize's termination guard is ([[order_of_compilation.md]]).
 
 Comptime-known is a small closure over syntax and bindings:
 
@@ -850,8 +955,12 @@ Comptime-known is a small closure over syntax and bindings:
 - a **comptime value parameter** in scope — the `n` of `[n 'T]` is comptime *by
   declaration*, a specialization axis, even though its concrete value is unknown
   until specialize mints the instance;
-- a **type** (every type is comptime — §5.4, §8.5) and a call to a comptime function
-  on comptime-known arguments.
+- a **type** (every type is comptime — §5.4, §8.5), and a **call whose callee and
+  arguments are all comptime-known** — C! has no comptime/runtime function split
+  ([[order_of_compilation.md]]), so a function applied to comptime-known arguments
+  yields a comptime-known result, evaluated at specialize (under its termination
+  guard), never here. There is no `comptime` marker on a function; comptime-known-ness
+  is a property of the call, not a declared category.
 
 A `let` binding, a runtime parameter, and anything derived from one are **not**
 comptime-known. Three positions require the property:
@@ -894,7 +1003,12 @@ immutable, `let` recursively mutable, with no per-field `mut` markers to reconci
 are no `mut` annotations ([[memory_model.md]]). The gate infers from a `*T`
 parameter's body whether it **writes** through the pointer, and checks each argument
 against that verdict: a writing body demands the `&` of a `let` aggregate; passing a
-`const`'s pointer is a type error. Two structural restrictions fall out and are
+`const`'s pointer is a type error. The write-verdict for each `*T` parameter is a
+**derived part of the function's interface** — computed from its body, including the
+verdicts of any callee it forwards the pointer to, and available at every call site.
+It is a binding/effect-level property carried alongside the signature and computed
+bottom-up over the call graph; §5's read-a-signature-locally guarantee is about
+*type* inference and is untouched. Two structural restrictions fall out and are
 enforced here:
 
 - **No `*Scalar`** — `*Int32`, `*Uint8`, … are not types (§6.4). A pointer's
@@ -911,18 +1025,22 @@ by-value copy). To get your own instance of an aggregate, `copy` it.
 **By-value is a read-only view; `copy`/`copy_deep` make it writable.** A by-value
 parameter — and any by-value binding — is a **read-only view** regardless of the
 caller's `let`/`const`; the gate treats it as const for lvalue purposes. To mutate,
-take your own instance:
-
-- **`copy x`** — a **shallow** copy: a fresh instance of `x`'s own node.
-- **`copy_deep x`** — a **recursive** copy, following pointers into the owned
-  sub-aggregates as well.
-
-Both are **type-preserving** (`copy x : T` and `copy_deep x : T` for `x : T`); they
-differ only in how much is duplicated. The result is writable when its home is a
+take your own instance with **`copy`** or **`copy_deep`**, which the gate types as a
+**fresh, writable instance** of the same type (`copy x : T`, `copy_deep x : T` for
+`x : T` — both are identity on the type). The result is writable when its home is a
 `let`, because **rehoming adopts the destination's rule** ([[memory_model.md]]): a
 value moved into a `const` aggregate becomes const, into a `let` aggregate becomes
 let. The gate re-derives the mutability attribute from the destination home, never
 from the source.
+
+**What `copy` versus `copy_deep` actually duplicate — and how each treats a pointer
+field — is [[memory_model.md]]'s to define, not the type gate's.** The distinction is
+a runtime copying *depth*, invisible to typing. It carries an ownership hazard the
+type gate only points at: a copy that duplicated a *pointer field* rather than its
+referent would leave the copy aliasing the source's owned sub-aggregate — reopening
+the very sharing the no-second-bind rule forbids. Pinning the depth-and-pointer
+semantics of `copy` (and whether `copy` is even legal on a pointer-bearing aggregate)
+is an **open [[memory_model.md]] question**, flagged here and resolved there.
 
 Finally, the **region-level** half of ownership — the no-dangling / region-outlives
 check — is **not** this gate's. It needs concrete node identities and runs in the
@@ -930,113 +1048,11 @@ memory arc, before duplication ([[order_of_compilation.md]], Memory;
 [[memory_model.md]] §6). The type gate settles **mutability and lvalue legality**;
 the memory arc settles **lifetime**.
 
-## Appendix A. ebnf reconciliation
+## Appendix. Reconciliation status
 
-This spec settles several decisions that revise the ratified grammar of
-[[ebnf.md]]. They are collected here so the grammar is amended in **one coordinated
-pass** (piecemeal edits would leave the grammar transiently inconsistent), rather
-than as this spec is drafted. Each item names the semantics (fixed here) and the
-grammar surface it touches.
-
-1. **Tuples move from brackets to parentheses.** `[T1, …, Tn]` → `(T1, …, Tn)`;
-   tuple *values* likewise `(a, b)`. `bracket_type`/`aggregate` lose the `tuple`
-   arm; `[…]` becomes arrays only (`array`, `fixed_array`). The `type` production
-   **gains a paren-tuple arm**, and `func_type` is no longer "a `(` at type position
-   always starts a func_type" (ebnf's current rule) — a paren group is a **tuple type**
-   unless a return type follows (`(A, B)` tuple vs `(A, B) R` function); the same
-   one-token lookahead governs `data_body`. The **pattern** grammar follows too: a
-   `(…)` destructuring pattern (tuples/positional records) forks from the `[…]`
-   `array_pattern` — `pattern`/`array_pattern`/`destructure_decl` gain the paren form.
-   (§6.1, §6.2, §6.3, §7.1)
-2. **Unit is `()`, not `[]`.** The empty tuple / terminal type is `()`; `[]` is now
-   the empty *dynamic array* value. (§6.1)
-3. **A one-tuple is its element** (`(e) ≅ e`) — grouping-parentheses and one-tuples
-   coincide, so no separate one-tuple form and no trailing-comma rule. (§6.1)
-4. **Unit `()` is named `Unit`** (replacing `Void`) — the "returns nothing"
-   spelling; not a distinct type. Every `Void` in the grammar/examples becomes
-   `Unit` / `()`. (§2.3, §6.3)
-5. **Construction is application `T(...)`.** Add `type_name` as a callee (a
-   construction expression); the parenthesized argument list is the payload tuple.
-   Casing keeps it unambiguous (PascalCase callee = construction, snake_case =
-   call); **type application stays `T[...]`** (brackets), value construction `T(...)`
-   (parens). (§6.5, §6.6)
-6. **A bare brace literal in value position no longer means "typed record."**
-   Construction is `T(…)` (or the annotated sugar `const T x = …`), so the
-   annotation-driven `const Point p = { … }` becomes `Point({ … })` and the
-   union-member juxtaposition `Node.IntLit { … }` becomes `Node.IntLit({ … })`.
-   (ebnf has no `Point { … }` prefix form to remove — plain records are annotation-
-   driven today; the change is that a `{ … }` in value position is now only a
-   *payload*, typed by an enclosing `T(…)`.) (§6.6, §7.3)
-7. **Ascription is sugar for construction:** `const T x = v` ⟶ `const x = T(v)`. A
-   `var_decl`'s leading type is a desugar, not an independent typing act. (§4, §6.6)
-8. **The cast is `T(x)`** (no new `as`/intrinsic form); narrowing truncates
-   (a comptime-known out-of-range narrowing **folds** to its truncated value, like
-   comptime overflow — not a compile error), the `checked`-style guaranteed
-   conversion is a module function returning `Either`. (§4)
-9. **`Maybe`/`Either` for `Option`:** rename `Option`→`Maybe`, `Some`→`Just`,
-   `None`→`Nothing`, and **add** `Either`/`Left`/`Right` (ebnf has no `Result` to
-   replace). These are library unions; ebnf's `Option`/`Some`/`None` references are
-   renamed — **and this ripples into [[order_of_compilation.md]]'s desugar catalog**,
-   which also names `Option`/`Some`/`None`. **The else-less-`if` rule changes**: ebnf
-   (and order_of) desugar `if c then v` → `Option`; this spec makes it yield **`Unit`**
-   (§5.3) — the branch runs for effect, no wrapping. (§3/§5.3; details in §8)
-10. **Bare-literal bindings** (`const z = 4`, unannotated `[1, 2, 3]`) that ebnf
-    marks "ok — inferred from value": reconcile with §3/§5.1 (a literal needs an
-    inference source; `const z = 4` with none requires an annotation). Either amend
-    those examples or supply a source (e.g. `main`'s `Int`-return convention already
-    types `() -> 0`). (§3, §5.1)
-11. **`Int`/`Uint`/`Float` become unions; the pointer-width concretes are `Arch`/
-    `Uarch`.** The old concrete `Int`/`Uint` (pointer-width) are renamed `Arch`/
-    `Uarch`, and `Int`/`Uint`/`Float`/`Number` are the std constraint-unions (§2.1,
-    §2.2, §8). **Every concrete `Int`/`Uint` in the grammar/examples** (`Int argc`,
-    `data Point = { Int x }`, `Int fd`, the exit code, …) becomes a concrete width —
-    `Arch` (or `Int32`/`Uint32`) — since a bare `Int`/`Uint` is now a *union*. This
-    is the largest single ripple; a bare `Int` field/param would otherwise mean a
-    runtime any-integer union. (§2.1)
-12. **`Infinity`/`NaN`** are `pub intrinsic type` singletons (§2.2); the ebnf's
-    `PositiveInteger`/`NonNegativeInteger` constraint-unions align with the §8
-    numeric-union scheme (members are the concrete widths). (§2.1, §2.2, §8)
-13. **Union bodies gain member spread.** `union Number = { ...Int, ...Uint, ...Float }`
-    splices another union's members. `union_body`/`union_member` add a `...named_type`
-    form (today `union_member` has no spread). (§8.1)
-14. **Data literals gain a value-level spread.** `{ ...other, z: 3 }` in a `data_literal`
-    (a value), distinct from the existing record-*declaration* spread `...named_type`
-    and the bracket-`aggregate` spread. `field_init` (or `data_literal`) adds the
-    `...expression` element. (§7.3)
-15. **`intrinsic type` — a type-valued intrinsic carrying its constructor.**
-    `pub intrinsic type Uint8 = (Number value) -> Uint8` (and the nullary
-    `pub intrinsic type Infinity`). Today `intrinsic_decl` is function-only
-    (snake_case name, no `type` keyword); it gains a `type`-keyword, `type_name`,
-    constructor-signature-RHS form. (§2.1, §2.2)
-16. **Inline union members are qualified-only.** ebnf's union section shows a member
-    reached bare (`None`); §8.1 restricts bare access to **compose-over** members
-    (standalone types like `Int8`) — an **inline-declared** member (`Just`, `Nothing`,
-    `Left`, `Right`, a payload/singleton) is reachable only through its union
-    (`Maybe.Just`). The bare-`None` example becomes `Maybe.Nothing`. (§8.1)
-17. **No `*T`↔integer conversion / no pointer arithmetic** — not an ebnf *grammar*
-    change (memory_model makes pointer arithmetic inexpressible already), but this
-    spec drops the "explicit pointer/integer conversion" it had briefly implied; raw
-    addresses live only in the `asm` floor. (§4, §6.4)
-18. **A union member may have a positional payload `Name(T1, …, Tn)`.** ebnf's
-    `union_member` allows a struct-body / type / literal payload but no positional
-    tuple; `Just('Value)` / `IntLit(Int32)` add it (mirroring positional records,
-    §7.3), constructed by application `Maybe.Just(1)`. (§8.1)
-19. **Qualified member paths in value and pattern position.** `Maybe.Just(1)` (value)
-    and `Int.Int8(v)` / `Node.IntLit(p)` (a `type_pattern`) require `member_access`
-    (`Type.PascalMember`) to be wired into `primary`/`postfix` and into `type_pattern`
-    — today `primary` admits no `type_name` callee and `type_pattern`'s head is an
-    unqualified `named_type`. (§6.6, §8.1, §8.3)
-20. **A union member may carry its own generic params.** `union Tree = { *Tree,
-    Node['Value]('Value) }` puts the parameter on the member, not the head; ebnf's
-    `union_member` has no `generic_params` and states only head-level params "flow
-    into" members. `union_member` gains an optional `generic_params` before its
-    payload, and construction gains member-level type application `Tree.Node[Int32](x)`
-    (inferred where possible). (§8.1)
-21. **Union payload placement is the ambient geometry's, not "arena."** ebnf's union
-    Representation aside calls a tag+payload union "arena-allocated"; §8.4 defers
-    placement to [[geometry_lowering.md]] (payload sits under whatever geometry owns
-    the value). Drop the "arena" claim from ebnf's aside. (§8.4)
-22. **`aggregate-literal kind` loses the tuple axis.** [[order_of_compilation.md]] §4
-    lists the type gate resolving "fixed vs tuple vs dynamic"; with tuples now
-    syntactic `(…)` (item 1) the gate resolves only array fixed-vs-dynamic and
-    record-literal typing — "tuple" drops from that ownership sentence. (§1, §7)
+The decisions in this spec that revised the ratified [[ebnf.md]],
+[[order_of_compilation.md]], and [[memory_model.md]] have been **propagated into those
+documents in place** (2026-07); each now stands on its own with no dependency on this
+appendix. The former Appendix A (24 grammar items) and Appendix B (3 pipeline items)
+were a working catalogue for that one coordinated pass and are **retired** now that it
+is applied — the itemized change record lives in git history.
