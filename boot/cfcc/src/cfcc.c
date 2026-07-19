@@ -416,6 +416,10 @@ typedef enum {
 	            * floor's register/count type. cfcc has it only as a parameter/return/
 	            * argument value (no Uarch locals or arithmetic yet); the union `Uint` is
 	            * not modeled (no unions in cfcc). */
+	TY_BUF,    /* a `[N Uint8]` fixed byte buffer — an `l` pointer to N arena bytes, the
+	            * writable buffer `read` fills. Named by a local; decays to a `*[Uint8]`
+	            * where a pointer/Uarch is expected. Throwaway: no indexing/bounds, no
+	            * length value (cf0's `[N Uint8]` is a real array). */
 } TypeKind;
 
 typedef struct {
@@ -545,8 +549,10 @@ struct Stmt {
 	char field[64];     /* ST_FIELD_ASSIGN: the mutated field */
 	char type_name[64]; /* ST_LOCAL: the record type annotation (empty = a word local) */
 	int foff;           /* ST_FIELD_ASSIGN: the field's byte offset (filled by typecheck) */
-	Expr *expr;         /* ST_LOCAL/ST_ASSIGN/ST_FIELD_ASSIGN: value; ST_RETURN: returned;
-	                     * ST_BREAK/ST_CONTINUE: the guard condition, or NULL if bare */
+	int bufsize;        /* ST_LOCAL: >0 ⇒ a `[N Uint8]` byte-buffer local of N bytes
+	                     * (arena-allocated, no initializer); 0 otherwise */
+	Expr *expr;         /* ST_LOCAL/ST_ASSIGN/ST_FIELD_ASSIGN: value (NULL for a buffer
+	                     * local); ST_RETURN: returned; ST_BREAK/ST_CONTINUE: guard or NULL */
 	Stmt *body;         /* ST_LOOP: the loop body statement list */
 	Stmt *next;
 };
@@ -1154,12 +1160,29 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 		advance(p);
 		/* Optional type annotation: `Int` (a word local) or a record type name (a
 		 * `data`-typed local). A pointer annotation has no M0 local use. */
-		int is_record = 0, is_str = 0;
+		int is_record = 0, is_str = 0, is_buf = 0, bufsize = 0;
 		char rectype[64] = {0};
 		Token *tt = peek(p);
 		if (tt->kind == TK_STAR)
-			die(tt->line, "M0 locals are `Int`, `Str`, or a record type, not a pointer");
-		if (is_type_ident(tt)) {
+			die(tt->line, "M0 locals are `Int`, `Str`, a `[N Uint8]` buffer, or a record type, not a pointer");
+		if (tt->kind == TK_LBRACKET) {
+			/* `[N Uint8]` — a fixed byte buffer: N arena bytes, no initializer, the
+			 * writable target `read` fills. Throwaway (no indexing/bounds); cf0's
+			 * `[N Uint8]` is a real fixed array. */
+			advance(p); /* [ */
+			Token *nt = peek(p);
+			if (nt->kind != TK_INT || nt->ival <= 0)
+				die(nt->line, "a byte buffer needs a positive comptime length, e.g. `[16 Uint8]`");
+			if (nt->ival > INT32_MAX)
+				die(nt->line, "byte buffer too large");
+			bufsize = (int)nt->ival;
+			advance(p);
+			if (!is_ident(peek(p), "Uint8"))
+				die(peek(p)->line, "M0 byte buffers hold `Uint8` (e.g. `[16 Uint8]`)");
+			advance(p);
+			expect(p, TK_RBRACKET, "expected `]` to close the `[N Uint8]` buffer type");
+			is_buf = 1;
+		} else if (is_type_ident(tt)) {
 			if (is_ident(tt, "Int")) {
 				advance(p);
 			} else if (is_ident(tt, "Str")) {
@@ -1185,6 +1208,16 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 		Type ty;
 		if (resolve_name(fn, s->name, &ty) != R_NONE)
 			die(name->line, "name already defined (no shadowing in M0)");
+		if (is_buf) {
+			/* A byte buffer has no initializer: `let [N Uint8] name`. Its N arena bytes
+			 * are allocated at emit; the local names the base `*[Uint8]` pointer. */
+			if (peek(p)->kind == TK_EQ)
+				die(peek(p)->line, "a `[N Uint8]` buffer has no initializer (`read` fills it)");
+			s->bufsize = bufsize;
+			Type bt = {TY_BUF, NULL};
+			func_add_local(fn, s->name, mutable, bt);
+			return s;
+		}
 		expect(p, TK_EQ, "expected `=`");
 		if (is_record) {
 			/* A record local's initializer is a data literal (`{ … }`) or a
@@ -1664,12 +1697,12 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 					die(e->line, "argument type mismatch (record type differs)");
 				break;
 			case PK_UARCH:
-				if (at.kind != TY_UARCH && at.kind != TY_INT && at.kind != TY_PTR)
-					die(e->line, "argument type mismatch (a Uarch parameter expects a Uarch, Int, or pointer)");
+				if (at.kind != TY_UARCH && at.kind != TY_INT && at.kind != TY_PTR && at.kind != TY_BUF)
+					die(e->line, "argument type mismatch (a Uarch parameter expects a Uarch, Int, pointer, or buffer)");
 				break;
 			case PK_LONG:
-				if (at.kind != TY_PTR)
-					die(e->line, "argument type mismatch (a pointer parameter expects a pointer, e.g. `s.bytes`)");
+				if (at.kind != TY_PTR && at.kind != TY_BUF)
+					die(e->line, "argument type mismatch (a pointer parameter expects a pointer or `[N Uint8]` buffer, e.g. `s.bytes`)");
 				break;
 			}
 		}
@@ -1773,6 +1806,8 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 	for (Stmt *s = list; s; s = s->next) {
 		switch (s->kind) {
 		case ST_LOCAL:
+			if (s->bufsize)                                   /* a `[N Uint8]` buffer: no initializer */
+				break;
 			if (strcmp(s->type_name, "Str") == 0) {           /* a `const Str` local */
 				if (typeof_expr(prog, fn, s->expr).kind != TY_STR)
 					die(s->line, "internal: Str local initializer is not a string");
@@ -2005,9 +2040,9 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		return;
 	}
 	case EX_VAR: {
-		/* A record-valued name is an arena pointer (`%r_<name>`), used directly as
-		 * an operand (e.g. a call argument); a word name is a `loadw` from its slot. */
-		if (e->rtype.kind == TY_RECORD) {
+		/* A record or byte-buffer name is an arena pointer (`%r_<name>`), used directly
+		 * as an operand (e.g. a call argument); a word name is a `loadw` from its slot. */
+		if (e->rtype.kind == TY_RECORD || e->rtype.kind == TY_BUF) {
 			snprintf(dst, cap, "%%r_%s", e->name);
 			return;
 		}
@@ -2215,6 +2250,12 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 		char v[96];
 		switch (s->kind) {
 		case ST_LOCAL:
+			if (s->bufsize) {
+				/* A `[N Uint8]` byte buffer: bump-allocate N arena bytes; the local
+				 * (`%r_<name>`) names the base `*[Uint8]` pointer, uninitialized. */
+				fprintf(out, "\t%%r_%s =l call $cf_alloc(w %d)\n", s->name, s->bufsize);
+				break;
+			}
 			if (s->expr->kind == EX_RECORD) {
 				/* A record local lives in the arena: bump-allocate its storage
 				 * (`%r_<name>` = the returned pointer) and store each field's value at
