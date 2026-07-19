@@ -196,13 +196,20 @@ write(1, buf, n)         # a literal argument takes the parameter's type
   untyped arithmetic, counters, and indices need no ceremony, while a deliberate
   width is always one annotation away.
 - **A numeric *union* expected type resolves to the same default member.** When the
-  only expected type is a numeric union — `Int`, `Number`, `Float` — the literal
-  cannot pick a width from the union (its members each have their own representation),
-  so it takes the **default concrete member**: an integer → `Arch`, a float →
-  `Float64`. `const Number n = 5` is the `Arch` member and the value is a plain
-  `Arch`, **never a runtime `Number` union** (a union value would not be operable
-  without a `match`, §8.5). Subsuming an *already-typed* value into a union
-  (`let Number n = int8_val`) is the separate member→union rule of §5.5, unaffected.
+  only expected type is a numeric union — `Int`, `Uint`, `Number`, `Float` — the
+  literal cannot pick a width from the union (its members each have their own
+  representation), so it takes the **default concrete member**, chosen so it is always
+  a member of *that* union: a signed or `Number` integer → `Arch`, an integer whose
+  union is the unsigned family `Uint` → `Uarch`, a float → `Float64` (`Arch ∈ Int,
+  Number`; `Uarch ∈ Uint`; `Float64 ∈ Float`). `const Number n = 5` resolves the
+  literal to its `Arch` member and the binding's value **is** that plain `Arch`;
+  default resolution never fabricates a runtime union box out of thin air, so a literal
+  is operable at its default width without a `match`. Where such a member *later*
+  reaches a genuinely union-typed position — a `Number` parameter, a `Number`-annotated
+  binding, a `match` scrutinee — it is subsumed into the union by the ordinary
+  member→union rule (§5.5) and the **tag is attached at that boundary**, exactly as for
+  an already-typed value (`let Number n = int8_val`). It only pays for a tag when it
+  actually crosses into a union slot.
 - **Propagation through operators.** An expected type propagates into the operands
   of arithmetic over untyped literals (`const Int8 y = 5 + 3` types both `5` and
   `3`, and the result, as `Int8`); a literal combined with an already-typed value
@@ -340,7 +347,10 @@ implicit conversion:
   types are members (or precise member types) of the **same one** union join to it —
   `Maybe[Arch].Just` and `Maybe[Arch].Nothing` combine to `Maybe[Arch]` — with **no
   expected type needed and no search**, because a member's home union is unique enough
-  to name the join (member→union subtyping, §8). When the members belong to **several**
+  to name the join (member→union subtyping, §8). A payload-free member carrying a free
+  type parameter (`Maybe.Nothing` synthesizes `Maybe[?].Nothing`) takes that parameter
+  from the constrained sibling in the same join — `Maybe[Arch]` from a `Maybe[Arch].Just`
+  branch — which is unifying the one union's own argument, not a lattice search. When the members belong to **several**
   unions (a compose-over leaf like `Int8`, in both `Int` and `Number`) the join is
   ambiguous, so it happens only toward an **expected** union (annotation/param/return),
   never invented.
@@ -391,7 +401,10 @@ when `A ≡ A'` and `B ≡ B'`, with no contravariant-domain/covariant-codomain 
 one that flows through a function's return position, and a diverging function is not
 silently usable where a returning one is expected. This is the closure of
 "no implicit conversions among concretes": unification (§5.3, §5.4) never has to
-search a lattice — the only widening is toward an *expected* union.
+*search* a lattice. Widening happens in only two forms, neither a search — toward an
+**expected** union (annotation/param/return), and the join of branches that are all
+members of a **single** common union, whose unique home union names the target directly
+(§5.3); branches spanning several unions widen only toward an expected union.
 
 ### 5.6 Operators and their types
 
@@ -487,9 +500,12 @@ three.
 Parentheses play two roles by position, exactly as elsewhere: in **expression**
 position `(…)` is grouping / a tuple value; in **binding/pattern** position `(…)` is
 a positional destructuring pattern (`const (a, b) = pair`). A bare name binds the
-whole value; a parenthesized pattern pulls elements out by position. (Whether a
-pattern shorter than the tuple binds a prefix or must match the arity exactly is a
-destructuring rule, deferred to the pattern section.)
+whole value; a parenthesized pattern pulls elements out by position. Destructuring is
+**sugar for positional element extraction** — `const (a, b) = pair` desugars to
+`const a = pair[0]` and `const b = pair[1]` (the comptime positional index of §6.2/§7.3)
+— so there is no separate arity rule: each name resolves to one comptime tuple index, an
+index past the tuple's arity is the ordinary comptime out-of-range error, and extra
+trailing elements are simply left unbound.
 
 Brackets are now **arrays only** (§6.2), which removes the old overload where `[…]`
 meant tuple, fixed array, or dynamic array depending on content.
@@ -531,8 +547,12 @@ parenthesized-tuple shape.
 - A function **value** (lambda) still writes `(params) [Ret] -> body`; its return
   type is inferred from the body and usually omitted (§5.1). Only `asm`/`intrinsic`
   functions, which have no body, must write the return type.
-- Higher order composes: `*(Int32) Int32` a pointer to a function, `[(Int32) Int32]`
-  an array of them, `Map[Str, (Int32) Int32]` a generic over one.
+- Function types **compose in type position** — `Map[Str, (Int32) Int32]` names a
+  comptime mapping whose value type is a function, and a generic bound `'F` may be a
+  function type. But there is **no runtime function pointer** — no `*(Int32) Int32`:
+  functions are comptime-first-class and erased at specialize (§5.6), and §6.4 admits
+  no pointer to a non-aggregate, so a function type is used at comptime (type argument,
+  bound, comptime container), never as a runtime pointer referent.
 
 ### 6.4 Pointers and references
 
@@ -668,7 +688,8 @@ way the annotation sugar `const Point p = <payload>` is `Point(<payload>)` (§6.
   named-tuple alias), the
   value is **structural** and comptime-erased. A payload literal with **no** type
   source is an error, like a bare numeric literal (§3) — a record is never anonymous
-  (and a bare `(1, 2)` with no type is just the tuple `(Int32, Int32)`, not a `Point`).
+  (and a bare `(1, 2)` with no type is just the tuple `(Arch, Arch)` by the default
+  rule of §3, not a `Point`).
 - **Named-record fields** are order-independent; each value is checked against its
   field's declared type (a literal adopts it, §3). **Puns** (`{ x }` ≡ `{ x: x }`)
   and **defaults** (a field with a `= default` in its declaration may be omitted) are
@@ -831,6 +852,13 @@ pub const describe = [Int 'T]('T a, 'T b) 'T -> match a {   # 'T bound by the In
 }
 ```
 
+Because the scrutinee **is** `'T`, matching an arm refines `'T` *itself* to that arm's
+member for the arm's body: in `Int.Int8` the gate reads `'T ≡ Int8`, so the other
+`'T`-typed binding `b` is also `Int8` and `v + b` is `Int8 + Int8`. This is what lets
+the body be checked **once, at the definition site** — the surviving arm in each
+monomorphization is the one whose member equals `'T`, so no per-instantiation error is
+deferred.
+
 ### 8.4 Representation
 
 - **An all-tag-only union** — every member nullary or a literal singleton, no
@@ -877,18 +905,22 @@ define `+`, `.field`, etc. across its members — so the body **matches on `'T` 
 narrow to a concrete member**, then operates on that member's own type:
 
 ```
-pub const negate = [Number 'T]('T x) 'T -> match x {   # scrutinee's union is Number
-  Number.Int8(v)    -> -v,   # here v is an Int8; -v is Int8 arithmetic
-  Number.Float32(v) -> -v,   # here v is a Float32
-  ...                        # qualified by Number — the arms name Number's members
+pub const negate = [Int 'T]('T x) 'T -> match x {   # scrutinee's union is Int (signed)
+  Int.Int8(v)  -> -v,   # here v is an Int8; -v is Int8 arithmetic
+  Int.Int64(v) -> -v,   # here v is an Int64
+  ...                   # qualified by Int — the arms name Int's members
 }
 ```
 
-Each arm is checked **once**, against the type it narrows to — so the body is
-checked at the definition site (no "does every member support `-`" rule, and no
-deferred per-instantiation errors: a function's signature stays its readable
-interface, §5). Trying to write `x + y` directly on a `Number`-bounded `'T` is a type
-error — narrow first.
+The bound is `Int`, not `Number`, on purpose: unary `-` is undefined on the unsigned
+leaves (§2.1), so a `Number` bound could not be negated in every arm. **A bound is
+exactly the set of members whose own operations the body uses** — narrowing to a
+member you cannot operate on is the mistake the bound prevents. Each arm is then
+checked **once**, against the type it narrows to — so the body is checked at the
+definition site (no "does every member support `-`" rule, and no deferred
+per-instantiation errors: a function's signature stays its readable interface, §5).
+Trying to write `x + y` directly on an `Int`-bounded `'T` is a type error — narrow
+first.
 
 ### 8.6 The standard numeric and boolean unions
 

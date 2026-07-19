@@ -93,7 +93,7 @@ hand-written geometries otherwise.
   `on_ret`, `on_alloc_ret`, `on_rehome`) return the *same logical value* of the
   *same type*. They may relocate its bytes; they may never change what it is.
   This is what lets a hook transparently wrap an expression —
-  `arena.on_alloc(node_0, [1, 2, 3])` is still an `[Int]`.
+  `arena.on_alloc(node_0, [1, 2, 3])` is still a `[3 Arch]`.
 - **Closure law.** `on_ret`'s argument is the **entire reachable closure** of the
   return value, not just its head — anything the return points at escapes with
   it. This mirrors the escape analysis that computes `!` (see [[memory_model.md]],
