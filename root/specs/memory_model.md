@@ -258,7 +258,7 @@ comptime region-outlives check replace them.
 **Pointers point only to aggregates, and only into a `let`.** Two restrictions
 keep the pointer story minimal:
 
-- **No pointers to scalars.** There is no `*Int`, `*Uint8`, etc. A scalar is
+- **No pointers to scalars.** There is no `*Int32`, `*Uint8`, etc. A scalar is
   always passed by value (a read-only view); to "mutate a scalar" you return the
   new value, or the scalar is a **field of an aggregate** you pass by `*T`. All
   mutable shared state therefore lives in aggregates.

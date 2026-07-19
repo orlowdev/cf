@@ -123,8 +123,9 @@ flat, unique name.
 
 Binds every name and checks types. This gate owns: type inference and checking;
 the casing rule (PascalCase types, snake_case values); `const`/immutability and
-lvalue checks; **aggregate-literal kind** resolution (fixed vs tuple vs dynamic —
-see [[ebnf.md]], Aggregate Literals); and **`match` exhaustiveness**. It annotates
+lvalue checks; **aggregate-literal kind** resolution (array fixed vs dynamic, plus
+record-literal typing — tuples are now syntactic `(…)`; see [[ebnf.md]], Aggregate
+Literals); and **`match` exhaustiveness**. It annotates
 the tree and rejects the ill-typed; it changes nothing, so it is a gate, not an
 arc. All _later_ desugars are type-directed, which is exactly why the type gate
 runs before them — a desugar never has to guess what a form means.
@@ -327,7 +328,7 @@ Everything the `desugared` arc rewrites, and the two forms held back for emit.
 | pipe tap `x \|> defer f`                   | `defer f(x)`                                                      |
 | field pun `{ value }`                      | `{ value: value }`                                                |
 | string interpolation `"${e}"`              | builder calls (allocates → colors `!`)                            |
-| else-less `if c then v`                    | `Option` — `Some(v)` / `None`                                     |
+| else-less `if c then v`                    | `if c then v else ()` (the `then` runs for effect; yields `Unit`) |
 | `for x in xs body`                         | an indexed `loop`                                                 |
 | record spread `...Identifiable`            | the spliced fields, in place                                      |
 | named-tuple splat (`type X = { … }` param) | its fields, positionally                                          |

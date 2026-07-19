@@ -62,59 +62,71 @@ See the mangling scheme in [[order_of_compilation.md]].)
 
 ## Types
 
-A `type` is recursive — every form composes with every other (`*[Int]` is a
-pointer to an array, `Map[Str, [Int]]` a generic over a nested array).
+A `type` is recursive — every form composes with every other (`*[Int32]` is a
+pointer to an array, `Map[Str, [Int32]]` a generic over a nested array).
 
 ```ebnf
-type = pointer | reference | bracket_type | named_type | type_var | func_type ;
+type = pointer | bracket_type | named_type | member_access | type_var | tuple_type | func_type ;
+                                                                     (* member_access as a type = a qualified member type: Maybe[Int32].Just (§ Union Types) *)
 
-named_type   = type_name , [ "[" , type , { "," , type } , "]" ] ;   (* Int  |  List[Int]  |  Map[Str, Int] *)
-pointer      = "*" , type ;                                          (* *Int *)
-reference    = "&" , type ;                                          (* &Int *)
+named_type    = type_name , [ "[" , type , { "," , type } , "]" ] ;  (* Int32  |  List[Int32]  |  Map[Str, Int32] *)
+pointer       = "*" , type ;                                         (* *Point — points only to aggregates, never a scalar *)
 
-func_type    = "(" , [ type , { "," , type } ] , ")" , type ;        (* (Int, Int) Int — param types then return; no names, no "->" *)
+tuple_type   = "(" , [ type , { "," , type } ] , ")" ;               (* () unit  |  (Int32, Bool) — paren product, no trailing return type *)
+func_type    = "(" , [ type , { "," , type } ] , ")" , type ;        (* (Int32, Int32) Int32 — domain tuple then return; no names, no "->" *)
 
-bracket_type = "[" , [ fixed_array | tuple | array ] , "]" ;         (* [] = unit (empty tuple) *)
-array        = type ;                                                (* [Int]        — single type *)
-fixed_array  = ( integer | var_name ) , type ;                       (* [4 Int], [n 'T]  — size then type *)
-tuple        = type , "," , type , { "," , type } ;                  (* [Int, Bool]  — at least two types *)
+bracket_type = "[" , [ fixed_array | array ] , "]" ;                 (* [] = empty dynamic array *)
+array        = type ;                                                (* [Int32]      — single type *)
+fixed_array  = ( integer | var_name ) , type ;                       (* [4 Int32], [n 'T]  — size then type *)
 
 type_var     = "'" , type_name ;                                     (* 'Value       — generic type variable *)
 ```
 
-Disambiguation inside `[ ]` (all three share the brackets):
+Disambiguation inside `[ ]` (both bracket forms share the brackets):
 
-- **empty** `[]` → the **unit** type (a zero-element tuple; no values)
+- **empty** `[]` → the **empty dynamic array** value (a zero-element array; the
+  **unit** type is `()`, below)
 - leading **integer** or **lowercase value name** → `fixed_array` (its size; a
   type never starts with a digit, and every type form starts uppercase, `'`,
-  `*`, `&`, or `[` — so a lowercase leading token is a comptime size like the
+  `*`, `&`, `[`, or `(` — so a lowercase leading token is a comptime size like the
   `n` of `[n 'T]`)
 - a single type → `array`
-- two or more comma-separated types → `tuple`
 
 A **generic** is told apart from a `bracket_type` by the `type_name` that
 precedes the `[`; the bracket forms open _with_ `[`.
 
+A **tuple type** is a parenthesized, comma-separated list of types — `(Int32,
+Bool)`, the positional product — sharing the parentheses of an argument list and a
+function domain. The empty `()` is the **unit** type; a one-element `(T)` is just
+`T` (a one-tuple is its element), so parens double as grouping with nothing to
+disambiguate.
+
 A **function type** is `(param types) return` — the parameter types in parens,
 then the return type, with **no names and no `->`** (that arrow belongs to a
-lambda _value_, not its type). A `(` at type position always starts a `func_type`;
-parens have no grouping role in a type, so there is nothing else it could be. The
-return type is **mandatory** — as with an `intrinsic`, nothing is implied; a
-function returning nothing writes `Void`. Because the return is itself a `type`,
-higher-order types nest naturally: `(Int) (Int) Int` is a function returning a
-function, `((Int) Int, Int) Int` takes a function as its first parameter.
+lambda _value_, not its type). A `(` at type position opens a **tuple type**
+unless a **return type follows** the matching `)`, which makes it a `func_type` —
+one token of lookahead after the `)` decides (`(A, B)` is a tuple, `(A, B) R` a
+function). The return type is **mandatory** in a function type — as with an
+`intrinsic`, nothing is implied; a function returning nothing writes `Unit` (or
+`()`). Because the return is itself a `type`, higher-order types nest naturally:
+`(Int32) (Int32) Int32` is a function returning a function, `((Int32) Int32,
+Int32) Int32` takes a function as its first parameter.
+
+> **Note.** There is no `&T` *type*. `&` is the **address-of operator** on a `let`
+> aggregate value (Expressions, `unary`), producing a `*T` to pass to a `*T`
+> parameter (see [[memory_model.md]]); the only pointer *type* is `*T`.
 
 ```
-type Sum      = (Int, Int) Int          (* names a function type *)
-type Predicate['T] = ('T) Bool          (* generic function type *)
-type Thunk    = () Void                  (* no params, returns nothing *)
-type Higher   = (Int) (Int) Int          (* returns a function *)
+type Sum      = (Int32, Int32) Int32     (* names a function type *)
+type Predicate['T] = ('T) Bool           (* generic function type *)
+type Thunk    = () Unit                   (* no params, returns nothing *)
+type Higher   = (Int32) (Int32) Int32     (* returns a function *)
 ```
 
 A `func_type` is an ordinary `type`, so it composes everywhere one is expected —
-a `*(Int) Int` pointer-to-function, an `[(Int) Int]` array of them, a
-`Map[Str, (Int) Int]` generic argument, or a `let`/`const`/`param`/field
-annotation. Given `type Sum = (Int, Int) Int`, a value of that type is a lambda
+a `*(Int32) Int32` pointer-to-function, an `[(Int32) Int32]` array of them, a
+`Map[Str, (Int32) Int32]` generic argument, or a `let`/`const`/`param`/field
+annotation. Given `type Sum = (Int32, Int32) Int32`, a value of that type is a lambda
 whose parameter types come **from the annotation**, so they may be left off:
 
 ```
@@ -180,44 +192,50 @@ bool = "true" | "false" ;
 
 ## Aggregate Literals
 
-Arrays, fixed arrays, and tuples share one literal — a bracketed, comma-separated
-list of values. The concrete kind is a **type** decision resolved by inference or
+Arrays and fixed arrays share one **bracket** literal — a `[…]` comma-separated
+list of values; **tuples** are the **paren** literal `(…)` (see Types). The array's
+concrete kind (fixed vs dynamic) is a **type** decision resolved by inference or
 annotation, not by the parser:
 
-- all elements the same type → fixed array (`[1, 2, 3]` → `[3 Int]`)
-- elements of differing types → tuple (`[1, true]` → `[Int, Bool]`)
+- all elements the same type, or no annotation → fixed array (`[1, 2, 3]` → `[3 Arch]`)
 - empty (`[]`) or an explicit `[Type]` annotation → dynamic array
 
+A **tuple** is written with parentheses and is heterogeneous — each position keeps
+its own type (`(1, true)` → `(Arch, Bool)`).
+
 The three kinds are genuinely distinct — the difference is **iterability and how
-they may be indexed**. All use the same `[n]` bracket access syntax (tuples have
-no separate `.n` form):
+they may be indexed**. Arrays use the `[n]` bracket access; a tuple uses the same
+bracket but only at a comptime position (tuples have no separate `.n` form):
 
 | kind                | length   | element types | `xs[n]` index                                   | iterable |
 | ------------------- | -------- | ------------- | ----------------------------------------------- | -------- |
 | fixed array `[N T]` | comptime | homogeneous   | runtime `n` (bounds-checked)                    | yes      |
-| tuple `[T1..Tn]`    | comptime | per-position  | **comptime `n` only** (exact per-position type) | no       |
+| tuple `(T1..Tn)`    | comptime | per-position  | **comptime `n` only** (exact per-position type) | no       |
 | dynamic array `[T]` | runtime  | homogeneous   | runtime `n` (bounds-checked)                    | yes      |
 
-So `[2 Int]` (iterable homogeneous buffer) and `[Int, Int]` (positional record) are
-**different types**. A same-typed literal infers to a fixed array; annotate
-`[Int, Int]` to get the tuple instead. Restricting tuple indexing to comptime
-integers keeps heterogeneous access statically typed with no union type required.
+So `[2 Int32]` (iterable homogeneous buffer) and `(Int32, Int32)` (positional
+product) are **different types** with **different syntax** — brackets for the
+array, parentheses for the tuple. Restricting tuple indexing to comptime integers
+keeps heterogeneous access statically typed with no union type required.
 These access rules are semantics and will be formalized in the type-system spec;
-the grammar here only defines the literal.
+the grammar here only defines the literals.
 
 ```ebnf
-aggregate      = "[" , [ agg_element , { "," , agg_element } ] , "]" ;   (* [], [1, 2, 3], [1, true], [...x, 4, 5] *)
+aggregate      = "[" , [ agg_element , { "," , agg_element } ] , "]" ;   (* [], [1, 2, 3], [...x, 4, 5] — arrays only *)
 agg_element    = spread_element | expression ;                           (* elements are expressions: 1, x, a + 1, f(y) *)
 spread_element = "..." , expression ;                                    (* ...x — splice another aggregate's elements *)
+
+tuple          = "(" , [ tuple_element , { "," , tuple_element } ] , ")" ;   (* () unit, (e) grouping, (1, true), (...t, 4) *)
+tuple_element  = spread_element | expression ;                               (* an element or a spread *)
 ```
 
 An element may be a **spread** `...expr`, which splices the elements of another
-aggregate in place: `const y = [...x, 4, 5]`. It mirrors the record `spread`, but
-one tier down — record spread splices a _type_'s fields (`...named_type`), an
-aggregate spread splices a _value_'s elements (`...expression`). How it resolves
-follows the kind (see the table above): for a **tuple** it is a comptime desugar
-(`[...x, 4, 5]` → `[1, 2, 3, 4, 5]`), for a **fixed array** a runtime concat into
-a fresh buffer.
+aggregate in place: `const y = [...x, 4, 5]` (array) or `const t = (...x, 4, 5)`
+(tuple). It mirrors the record `spread`, but one tier down — record spread splices
+a _type_'s fields (`...named_type`), an aggregate spread splices a _value_'s
+elements (`...expression`). How it resolves follows the kind (see the table
+above): for a **tuple** it is a comptime desugar (`(...x, 4, 5)` → `(1, 2, 3, 4,
+5)`), for a **fixed array** a runtime concat into a fresh buffer.
 
 For a **dynamic array** the _binding_ decides between growing in place and
 copying — the one spread form covers both:
@@ -233,7 +251,7 @@ copying — the one spread form covers both:
   plain clone) or with trailing elements.
 
 `e` here is any element the array's type admits — a scalar, a `data` literal
-(`[...xs, { x: 1, y: 2 }]`), or a constructed union member (`[...xs, U.Lit { v: 5 }]`).
+(`[...xs, { x: 1, y: 2 }]`), or a constructed union member (`[...xs, U.Lit({ v: 5 })]`).
 That in-place-vs-copy split, and which element forms a given array accepts, are
 semantics; the grammar only admits `...expr` as an element.
 
@@ -246,9 +264,11 @@ allowed; there is no trailing comma. It constructs an instance of a `data` type
 (see Data & Type Declarations).
 
 ```ebnf
-data_literal = "{" , [ field_init , { "," , field_init } ] , "}" ;
+data_literal = "{" , [ field_entry , { "," , field_entry } ] , "}" ;
+field_entry  = field_init | field_spread ;
 field_init   = var_name , ":" , expression       (* explicit: x: 0, x: a, x: f(y) *)
              | var_name ;                         (* pun: { value } ≡ { value: value } *)
+field_spread = "..." , expression ;              (* ...other — splice another record VALUE's fields; later entries win *)
 ```
 
 A field may be written as a **pun** — a bare `var_name` with no `:`, which is
@@ -257,6 +277,13 @@ same name). So with `const value = 1`, the literal `{ value }` means
 `{ value: value }`. Parsing forks on a single-token peek after the name: a `:`
 begins an explicit `field_init`, anything else (`,` or `}`) is a pun.
 
+A field entry may also be a **value-level spread** `...expr`, which splices another
+record _value_'s fields into this literal in place (`{ ...other, z: 3 }`); on a
+name collision, later entries win. This is the value-tier echo of the record
+_declaration_ spread `...named_type` (Data & Type Declarations, which splices a
+_type_'s fields) and of the aggregate spread `...expression` — same `...`, one tier
+per plane.
+
 A `{ … }` opens either a **`data_literal`** or a **`block`** — blocks are values
 too (see Blocks as Values under Expressions). In **statement** position (a
 function body after `->`, a nested block) it is always a `block`. In **value**
@@ -264,6 +291,7 @@ position the two overlap, so a two-token peek past the `{` forks them:
 
 - `}` immediately → the empty `data_literal` (`{}`).
 - a `var_name` then `:`, `,`, or `}` → `data_literal` (an explicit field or a pun).
+- `...` → `data_literal` (a value-level `field_spread`).
 - anything else → `block` — a statement keyword (`const`, `let`, `return`, `<-`),
   or a `var_name` that continues as a statement rather than a field (`x = …`,
   `x.f = …`, `x + 1`, `f(x)`), or any other expression-leading token.
@@ -286,31 +314,33 @@ data_body    = record_body | type ;                       (* a record shape, or 
 
 record_body  = "{" , [ record_entry , { "," , record_entry } , [ "," ] ] , "}" ;
 record_entry = field_decl | spread ;
-field_decl   = type , var_name , [ "=" , expression ] ;   (* type-first; default optional: Int x = 0 *)
+field_decl   = type , var_name , [ "=" , expression ] ;   (* type-first; default optional: Int32 x = 0 *)
 spread       = "..." , named_type ;                       (* ...Identifiable — splice another record's fields *)
 ```
 
 The type name is PascalCase and may be generic (`Box['Value]`); `generic_params`
 is the same head as a lambda's (see Functions). The `=` is required. The body
 forks on its first token: a `{` opens a `record_body` — fields written
-**type-first** (`Int x`, the exact shape of a `param`) — and anything else is an
-ordinary `type`: a named type (`Int`), a positional bracket type (`[Int, Bool]`,
-`['Value]`), the unit `[]`, or a type variable (`'Value`).
+**type-first** (`Int32 x`, the exact shape of a `param`) — and anything else is an
+ordinary `type`: a named type (`Int32`), a positional tuple type (`(Int32, Bool)`),
+the unit `()`, or a type variable (`'Value`). A leading `(` opens a tuple (or a
+function type, if a return type follows the `)`), by the same one-token lookahead
+as at type position.
 
 Examples:
 
 ```
-data Point = { Int x, Int y, }          (* record shape; trailing comma optional *)
+data Point = { Int32 x, Int32 y, }      (* record shape; trailing comma optional *)
 data Box['Value] = { 'Value value }     (* generic record *)
-data Some['Value] = 'Value              (* newtype over one value — holds exactly one *)
-data None = []                          (* unit — no payload *)
+data Wrap['Value] = 'Value              (* newtype over one value — holds exactly one *)
+data Empty = ()                         (* unit — no payload *)
 data Meters = Uint32                    (* nominal alias of a built-in *)
 
-data Point = { Int x = 0, Int y = 0 }   (* field defaults *)
+data Point = { Int32 x = 0, Int32 y = 0 }    (* field defaults *)
 data Identifiable = { Str id }
 data User = { ...Identifiable, Str email }   (* desugars to { Str id, Str email } *)
 
-type ServerOptions = { Int port, Str host }  (* comptime named tuple *)
+type ServerOptions = { Int32 port, Str host }  (* comptime named tuple *)
 type Id = Uint64                             (* comptime type alias *)
 ```
 
@@ -320,7 +350,7 @@ lives:
 - **`data`** is a **nominal runtime type** — the name is preserved at run time and
   is distinct from its body even when the two share a shape (`data Meters =
 Uint32` is not itself an `Uint32`). This is the sense in which everything is
-  data: `Int` is already a `data`-like runtime type, and `data` just names new
+  data: `Int32` is already a `data`-like runtime type, and `data` just names new
   ones. It carries only shape, no methods or behaviour — the reason the keyword
   is `data`, not `struct`. A record-bodied `data` is built with a data literal
   (`{ x: 0, y: 0 }`); a bracket-bodied one with an aggregate, and so on per its
@@ -337,7 +367,7 @@ Uint32` is not itself an `Uint32`). This is the sense in which everything is
   is exactly
 
   ```
-  const listen = (Int port, Str host, Handler handler) -> {}
+  const listen = (Int32 port, Str host, Handler handler) -> {}
   ```
 
   Ordering is significant (fields expand in order); the count is not fixed by any
@@ -348,7 +378,7 @@ Uint32` is not itself an `Uint32`). This is the sense in which everything is
 Two amendments ride on `record_entry`, so they apply to a `record_body` under
 either keyword (and are meaningless on a non-record body):
 
-- **Field defaults** (`Int x = 0`) — a field may carry `= expression`, the value
+- **Field defaults** (`Int32 x = 0`) — a field may carry `= expression`, the value
   used when a construction omits it. The inner `=` is unambiguous: it sits after
   a `field_decl` inside the braces, distinct from the declaration's own `=`
   before the body. Whether the default must be comptime, and how a data literal
@@ -357,12 +387,12 @@ either keyword (and are meaningless on a non-record body):
   named type, which splices that type's fields into this one **in place**. So
   `data User = { ...Identifiable, Str email }` desugars to `{ Str id, Str email }`.
   Position is preserved; field-name collisions and the spread source's own
-  defaults are semantic concerns. The target is a `named_type`, so `...Box[Int]`
+  defaults are semantic concerns. The target is a `named_type`, so `...Box[Int32]`
   parses.
 
 Both are top-level declarations (`declaration`, see Visibility), so either may be
 `pub`. A `record_body` is only a top-level `data`/`type` body — it is not yet a
-`type`, so it cannot nest inside one (`[{ Int x }]`); that widening can come
+`type`, so it cannot nest inside one (`[{ Int32 x }]`); that widening can come
 later.
 
 ## Union Types
@@ -375,43 +405,69 @@ _any_ member and recovers which one with `match` — but you never instantiate t
 union itself; you instantiate a member. There is no runtime `Node`, only an
 `IntLit`-or-`BinOp`-or-… that a `Node`-typed slot can hold.
 
-A union member takes one of two forms, along independent axes:
+A union member takes one of a few forms, along independent axes:
 
 - **Bare `type`** — _resolve-or-create_: if the name already denotes a type in scope (a
   built-in, an imported type, a declared `data`/`union`) the union **composes over** it
   (`Uint8` in `PositiveInteger` below); if it denotes nothing, it is a fresh **nullary**
   member — a pure tag (`Nil`).
 - **Named `Name = <rhs>`** — declare member `Name` and **assign** it, mirroring a `data`
-  declaration's `=`. The right-hand side is a struct body (`IntLit = { Int value }`, a
-  payload record), a type (`Wrap = Int`, the _named_ way to compose over a type), or a
+  declaration's `=`. The right-hand side is a struct body (`IntLit = { Int32 value }`, a
+  payload record), a type (`Wrap = Int32`, the _named_ way to compose over a type), or a
   **literal** (`Semicolon = ";"`, a **singleton**).
+- **Positional payload `Name(T1, …, Tn)`** — a member carrying a positional tuple payload
+  (`Just('Value)`, `IntLit(Int32)`), the union counterpart of a positional record;
+  constructed by application (`Maybe.Just(1)`).
+- **Member spread `...Other`** — splice another union's members in place (`...Int` in
+  `Number`), the value-union echo of a record's `...named_type` field spread.
 
-These are orthogonal — a union freely mixes bare-resolved, bare-nullary, and named members.
-So `union U = { A = { … }, B }` is exactly `data A = { … }`, a nullary `B`, and a union over
-`{ A, B }`: the declaration is its members' definition site. A member is a first-class type
-reached bare (`None`) or through its union (`Option.None`). The qualified path is not a
-separate namespace — it is a path _to the same type_ — but it earns its keep two ways: it
-disambiguates when short member names collide across unions (`NodeKind.Let` vs `Kw.Let`), and
-it lets the module system export a whole union and reach its members through it. **You import
-the union, not its members**, and `A.X` and `B.X` stay distinct when `X` sits in both.
+A member may also carry its **own `generic_params`**, placing the type parameter on the
+member rather than the union head — `Node['Value]('Value)` in an otherwise-concrete union.
+
+These are orthogonal — a union freely mixes bare-resolved, bare-nullary, named, and positional
+members. So `union U = { A = { … }, B }` is exactly `data A = { … }`, a nullary `B`, and a
+union over `{ A, B }`: the declaration is its members' definition site.
+
+A member is a first-class type, but **how you reach it depends on how it was declared** — you
+**import the union, not its members**:
+
+- A **compose-over** member (a standalone type the union merely references, like `Uint8`) is
+  reached **on its own** (`Uint8` — you are naming the independent type, which happens to
+  also be a member), and redundantly qualified (`PositiveInteger.Uint8`).
+- An **inline-declared** member — a nullary tag or a `Name = …` / `Name(…)` payload
+  (`Node.Nil`, `Maybe.Nothing`, `Node.IntLit`) — exists **only within its union** and is reached
+  **only qualified** (`Maybe.Nothing`, `NodeKind.IntLit`). There is no bare inline member.
+
+The qualified path is not a separate namespace — it is a path _to the same type_ — but it
+earns its keep two ways: it disambiguates when short member names collide across unions
+(`NodeKind.Let` vs `Kw.Let`), and it lets the module system export a whole union and reach its
+members through it. `A.X` and `B.X` stay distinct when `X` sits in both.
 
 **Representation.** A member value is `tag ++ payload`. **Nullary** and **literal** members
 carry no payload — they are just their tag (a literal member's spelling is a compile-time
-constant recoverable from the tag). A **typed** member (a struct body or an assigned type) is
-`tag + payload`, sized to `tag + max(member payload)`. A union whose members are _all_ tag-only
-lowers to a plain integer (this is how `NodeKind`, `Kw`, `TokKind` work today); a union with any
-payload member is a tag+payload aggregate, arena-allocated and passed by pointer like a `data`
-record. In value position a member (`Nil`, `Token.Semicolon`) is its **tag** — what `match`
-dispatches on and what a union-typed slot holds; a literal member's literal is _additionally_
-available as its constant.
+constant recoverable from the tag). A **typed** member (a struct body, a positional payload,
+or an assigned type) is `tag + payload`, sized to `tag + max(member payload)`. A union whose
+members are _all_ tag-only lowers to a plain integer (this is how `NodeKind`, `Kw`, `TokKind`
+work today); a union with any payload member is a tag+payload aggregate, **placed under the
+ambient geometry** and passed by pointer like a `data` record. In value position a member
+(`Node.Nil`, `Token.Semicolon`) is its **tag** — what `match` dispatches on and what a union-typed
+slot holds; a literal member's literal is _additionally_ available as its constant.
 
 ```ebnf
-union_decl    = "union" , type_name , [ generic_params ] , "=" , union_body ;
-union_body    = "{" , union_member , { "," , union_member } , [ "," ] , "}" ;
-union_member  = member_name , "=" , ( struct_body | type | literal )   (* named: payload record / typed payload / literal singleton *)
-              | type ;                                                   (* bare: compose over an existing type, else a fresh nullary tag *)
-struct_body   = "{" , field , { "," , field } , [ "," ] , "}" ;
-member_access = type_name , "." , member_name ;   (* a path to the member type; its tag in value position *)
+union_decl     = "union" , type_name , [ generic_params ] , "=" , union_body ;
+union_body     = "{" , union_member , { "," , union_member } , [ "," ] , "}" ;
+union_member   = member_name , [ generic_params ] , member_payload   (* named/payload member; may carry its own generics *)
+               | member_spread                                        (* ...Other — splice another union's members *)
+               | type ;                                               (* bare: compose over an existing type, else a fresh nullary tag *)
+member_payload = "(" , [ type , { "," , type } ] , ")"               (* positional tuple payload: Just('Value), IntLit(Int32) *)
+               | "=" , ( struct_body | type | literal ) ;            (* = struct body / typed payload / literal singleton *)
+member_spread  = "..." , named_type ;                               (* member-level spread; mirrors a record's field spread *)
+struct_body    = "{" , field_decl , { "," , field_decl } , [ "," ] , "}" ;
+member_name    = type_name ;                                        (* a member is PascalCase, like any type *)
+member_access  = named_type , "." , member_name , [ "[" , type , { "," , type } , "]" ] ;
+                 (* a qualified member: Maybe.Just (value callee/pattern), Maybe[Int32].Just (a member TYPE),
+                    Tree.Node[Int32] (member-level generic — args go where the parameter was declared).
+                    Usable as a type (in `type`), as a construction callee (`primary`), and as a `type_pattern` head. *)
 ```
 
 Examples:
@@ -419,45 +475,56 @@ Examples:
 ```
 union PositiveInteger = { Uint8, Uint16, Uint32, Uint64 }   (* bare → compose over built-ins *)
 
+union Maybe['Value]  = { Just('Value), Nothing }            (* positional payload + inline nullary *)
+union Either['L, 'R] = { Left('L), Right('R) }
+union Number = { ...Int, ...Uint, ...Float }                (* member spread: splice other unions' members *)
+
 union Node = {
-  IntLit = { Int value },
-  BinOp  = { NodeRef left, NodeRef right, Int op },
+  IntLit = { Int32 value },
+  BinOp  = { NodeRef left, NodeRef right, Int32 op },
   Nil,                                              (* fresh nullary tag *)
 }
 
 union Token = {
   Semicolon = ";",                                  (* literal singleton *)
   Plus      = "+",
-  Ident     = { Int start, Int len },               (* payload record *)
+  Ident     = { Int32 start, Int32 len },           (* payload record *)
 }
 ```
 
-`generic_params` on the union head (`Option['Value]`) flow into its members. Like the
-other type declarations a union may be `pub` (see Visibility) and joins `declaration`.
+`generic_params` on the union head (`Maybe['Value]`) flow into every member that uses them;
+alternatively a **member** may carry its own `generic_params` (`Node['Value]('Value)`), leaving
+the union un-parameterized. Like the other type declarations a union may be `pub` (see
+Visibility) and joins `declaration`.
 
-**Instantiation** is per member, mirroring `data`'s two forms — annotated or
-constructor-expression:
+**Instantiation** is per member, by **construction** — construction is application (see
+Expressions): apply the member to its payload. A member's qualified name is **both a
+construction callee and a first-class type** — usable anywhere a type is (param, field,
+return, binding annotation, type argument), written qualified (`Maybe[Int32].Just`,
+`Node.IntLit`):
 
 ```
-let Node.IntLit n = { value: 5 }
-let n = Node.IntLit { value: 5 }
+let n = Node.IntLit({ value: 5 })          (* construct: apply the member to its payload; n : Node.IntLit *)
+let Node n = Node.IntLit({ value: 5 })     (* annotating with the union WIDENS the precise member to Node *)
 ```
 
-A nullary member is written bare or qualified and is just its tag (`Nil`, `Node.Nil`).
-There is no `let Node n = { … }` — no bare-union value exists to build; a `Node`-typed
-slot only ever holds a member produced this way.
+A member-constructor synthesizes the **precise member type** (`n : Node.IntLit`), which
+**widens to the union `Node`** by member→union subtyping only where a union is expected — an
+annotation, param, return, or unification against a sibling member (see the type-system spec,
+§8). A nullary member is written **qualified** and is just its tag (`Node.Nil`,
+`Maybe.Nothing`). There is no bare-union literal `Node { … }` — a `Node`-typed slot is always
+filled by a member (constructed, or narrowed via `match`).
 
-**Narrowing** — recovering which member a value is — is done with `match` (see Pattern
-Matching). An arm is a member `type_pattern`: the member name, then a parenthesized
-sub-pattern for its payload (binding the whole payload, or a `{ … }` record pattern
-destructuring its fields) — the same `Some(x)` / `Point({ x, y })` form every variant uses,
-no union-only syntax:
+**Narrowing** — recovering which member a union *value* is — is done with `match` (see Pattern
+Matching). An arm is a member `type_pattern`: the member name **qualified by the scrutinee's
+union**, then a parenthesized sub-pattern for its payload (binding the whole payload, or a
+`{ … }` record pattern destructuring its fields) — `Maybe.Just(x)`, `Shape.Point({ x, y })`:
 
 ```
 match n {
   Node.IntLit(v)      -> v.value,
   Node.BinOp({ op })  -> op,
-  Nil                 -> 0,
+  Node.Nil            -> 0,
   _                   -> -1,
 }
 ```
@@ -466,7 +533,7 @@ match n {
 
 ```ebnf
 number = float | integer ;
-value  = number | string | bool | aggregate | data_literal | function ;
+value  = number | string | bool | aggregate | tuple | data_literal | function ;
 ```
 
 ## Expressions
@@ -477,7 +544,8 @@ binding: logical **or** (`||`), logical **and** (`&&`), **comparison**
 **shift** (`<< >>`), **additive** (`+ -`), **multiplicative** (`* / %`), prefix
 **unary** (`-` negate, `&` address-of, `~` bitwise-not, `!` logical-not — no
 dereference), postfix **accessors** (`.field`, `[n]`), and **primary** (a
-reference, a literal, or a parenthesized expression). Bitwise ops sit below
+reference, a construction callee (`Point`, `Maybe.Just`), a literal, or a
+parenthesized/tuple expression). Bitwise ops sit below
 arithmetic (Rust's ordering), so `(a + b) & mask` reads as intended without
 parentheses; comparison sits below bitwise, so `a & b == c` is `(a & b) == c` — no
 C footgun; and logical operators sit below comparison, so `a == b && c > d` is
@@ -504,12 +572,12 @@ unary          = defer_expr | { "-" | "&" | "~" | "!" } , postfix ;   (* defer t
 postfix        = primary , { field_access | index_access | type_apply | call } ;
 field_access   = "." , var_name ;
 index_access   = "[" , ( integer | var_name ) , "]" ;                               (* xs[8], xs[i] — array/tuple index *)
-type_apply     = type_args ;                                                        (* f[Int] — partial type application, no call *)
-call           = [ type_args ] , "(" , [ argument , { "," , argument } ] , ")" ;   (* f(x)  |  max[Int](a, b) *)
-type_args      = "[" , type_arg , { "," , type_arg } , "]" ;                        (* explicit generics: [Int], [8, Int] *)
-type_arg       = type | expression ;                                                (* Int (type)  |  8 (comptime value) *)
+type_apply     = type_args ;                                                        (* f[Int32] — partial type application, no call *)
+call           = [ type_args ] , "(" , [ argument , { "," , argument } ] , ")" ;   (* f(x)  |  max[Int32](a, b) *)
+type_args      = "[" , type_arg , { "," , type_arg } , "]" ;                        (* explicit generics: [Int32], [8, Int32] *)
+type_arg       = type | expression ;                                                (* Int32 (type)  |  8 (comptime value) *)
 argument       = expression ;
-primary        = var_name | value | block | "(" , expression , ")" ;   (* a block is a value too — see Blocks as Values; forks from a data_literal by a two-token peek *)
+primary        = var_name | type_name | member_access | value | block ;   (* type_name/member_access = a construction callee (Point, Maybe.Just); a block is a value too; a grouped/tuple ( … ) is the `tuple` value *)
 ```
 
 Each tier binds tighter than the one above and is left-associative, so
@@ -563,7 +631,22 @@ comptime **integer literal** (`t[0]`).
 A **call** `(…)` is a postfix accessor like `.field` and `[n]`, so it chains and
 binds as tightly: `f()[0].x` is `((f())[0]).x`, and `&p.read()` is `&((p.read()))`.
 The callee is whatever the postfix chain resolves to — a name, an accessed field,
-or a parenthesized lambda.
+a parenthesized lambda, or a **type** (a construction callee).
+
+**Construction is application.** A value of a named or scalar type is produced by
+**applying that type's constructor** — a `type_name` (or qualified `member_access`)
+in callee position: `Point(1, 2)` builds a positional record, `Person({ name: n })`
+a named one, `Maybe.Just(1)` a union member, and `Uint8(0)` a scalar. Because the
+callee is a **type** (PascalCase) rather than a value (snake_case), the casing alone
+tells a construction apart from an ordinary call. A **cast** is the same form over a
+value — `Uint16(Uint8(1))`. Type application stays in brackets (`Vector[Uint8]` the
+_type_), value construction in parens (`Vector(xs)` the _value_), and the two
+compose (`Tree.Node[Int32](x)`). Whether the payload is a tuple `T(a, b)` or a data
+literal `T({ f: v })` follows the type's declaration; these are type-system rules,
+the grammar only admits the application. An **annotation is the same construction** —
+`const Point p = { x: 0, y: 0 }` is `const p = Point({ x: 0, y: 0 })`, so a bare
+`{ … }` in value position is a _payload_, typed by the enclosing `T(…)` or the
+annotation, never a standalone typed record.
 
 **`.field` auto-dereferences a pointer.** There is no `->` operator and no
 dereference `*` — `.` is the only field selector, so on a `*T` it reaches through
@@ -574,22 +657,22 @@ always lands on the field — there is no multi-level deref to spell out. `&p.x`
 `&(p.x)`, the address of the field, not of `p`.
 
 A call may carry **explicit type arguments** in a `[…]` right before its `(`:
-`max[Int](a, b)`, `zeros[8, Int]()`. A `[…]` in a postfix chain forks by a
+`max[Int32](a, b)`, `zeros[8, Int32]()`. A `[…]` in a postfix chain forks by a
 single-token lookahead past the matching `]`, then — if needed — by the receiver:
 
-- **`(` follows** the `]` → the `[…]` is a call's **`type_args`** (`max[Int](a, b)`).
+- **`(` follows** the `]` → the `[…]` is a call's **`type_args`** (`max[Int32](a, b)`).
 - **no `(` follows**, contents **type-level** (a `type`, a `'T`, or several
   comma-separated `type_arg`s) → a standalone **`type_apply`** — an array is never
   indexed by a type, so this can only be partial type application
-  (`my_complicated_fn[Int]`).
+  (`my_complicated_fn[Int32]`).
 - **no `(` follows**, contents a **single `integer` or `var_name`** → either an
   `index_access` or a `type_apply`, resolved by the **receiver's type**: an array
   or tuple indexes (`xs[8]`), a function applies it as a comptime type argument
   (`f[8]`). Syntactically identical; the compiler knows which from the receiver.
 
 So `xs[8]` indexes, `xs[8](y)` applies type arg `8` then calls, and
-`my_complicated_fn[Int]` applies just the type. Each `type_arg` is a concrete
-`type` (`Int`) or a comptime `expression` value (`8`); which slots are types vs.
+`my_complicated_fn[Int32]` applies just the type. Each `type_arg` is a concrete
+`type` (`Int32`) or a comptime `expression` value (`8`); which slots are types vs.
 values follows the callee's `generic_params`, a semantic check. Explicit args are
 optional — `max(a, b)` infers them.
 
@@ -597,9 +680,9 @@ optional — `max(a, b)` infers them.
 arguments than a function takes yields a function of the rest, left to right.
 
 ```
-const my_complicated_fn = ['Type]('Type a, Int b, Str c, Bool y) -> {}
+const my_complicated_fn = ['Type]('Type a, Int32 b, Str c, Bool y) -> {}
 
-const my_int_complicated_fn = my_complicated_fn[Int]         (* apply only the type *)
+const my_int_complicated_fn = my_complicated_fn[Int32]       (* apply only the type *)
 const applied_one           = my_complicated_fn(1)           (* one value arg *)
 const applied_multiple      = my_complicated_fn(1, 2, "yes") (* three value args *)
 const result                = applied_multiple(true)         (* fill the last, run it *)
@@ -608,7 +691,7 @@ const result                = applied_multiple(true)         (* fill the last, r
 The grammar already permits any argument count in a `call` and a bare
 `type_apply`; that an under-full application yields a function rather than an
 error is the semantic rule, and it is what lets `3 |> sum(2)` (see the pipe,
-below) fill the last parameter — `sum(2)` is `(Int b) -> sum(2, b)`.
+below) fill the last parameter — `sum(2)` is `(Int32 b) -> sum(2, b)`.
 
 The **pipe** `|>` threads a value into a function: `x |> f` is exactly `f(x)`. It
 is left-associative and binds looser than every arithmetic and logical operator
@@ -631,11 +714,11 @@ argument (`x |> str.trim_start` = `str.trim_start(x)`); for an under-applied cal
 it fills the parameter still missing after **partial application** — given
 
 ```
-const sum = (Int a, Int b) -> a + b
+const sum = (Int32 a, Int32 b) -> a + b
 const result = 3 |> sum(2)     (* sum(2) partially applies a = 2; the pipe fills b = 3 → 5 *)
 ```
 
-`sum(2)` is `(Int b) -> sum(2, b)`, so `3 |> sum(2)` is `sum(2, 3)`. That the right
+`sum(2)` is `(Int32 b) -> sum(2, b)`, so `3 |> sum(2)` is `sum(2, 3)`. That the right
 resolves to something callable is a semantic rule.
 
 **`defer`** is a universal **tapping expression**. `defer f(x)` schedules the call
@@ -710,13 +793,13 @@ var_decl   = let_decl | const_decl | destructure_decl ;   (* destructure_decl: s
 Examples:
 
 ```
-let Int x = 1
+let Int32 x = 1
 const Uint8 the_number = 4
-let Int y              (* ok — let with type, value optional *)
+let Int32 y            (* ok — let with type, value optional *)
 let x = 1              (* ok — type inferred from value *)
 const z = 4           (* ok — type inferred from value *)
 let x                 (* invalid — no type and no value to infer from *)
-const Int z           (* invalid — const must have a value *)
+const Int32 z         (* invalid — const must have a value *)
 ```
 
 ## Assignment
@@ -765,7 +848,7 @@ a + b = 3             (* invalid — target is not an lvalue (semantic) *)
 
 A function is **not its own declaration form** — it is a `function` value (a
 lambda) bound by an ordinary `let`/`const`. A function is thus just a value that
-happens to be callable; `const add = (Int a, Int b) Int -> { return a + b }`
+happens to be callable; `const add = (Int32 a, Int32 b) Int32 -> { return a + b }`
 reuses `const_decl` wholesale. The lambda is
 `[generics] (params) [return] -> body`. The `!` that may end the _name_ is the
 allocation-effect marker (see Identifiers and the memory model), part of the
@@ -774,13 +857,13 @@ binding's name — not of the lambda.
 ```ebnf
 function       = [ generic_params ] , param_list , [ type ] , "->" , ( block | expression | asm_block ) ;   (* asm_block: see Assembly *)
 
-generic_params = "[" , generic_param , { "," , generic_param } , "]" ;   (* ['T] | ['K, 'V] | [Uint n, 'T] | [NonNegativeInteger 'V] *)
+generic_params = "[" , generic_param , { "," , generic_param } , "]" ;   (* ['T] | ['K, 'V] | [Uarch n, 'T] | [NonNegativeInteger 'V] *)
 generic_param  = type_var                                          (* 'T                    — unbounded type variable *)
                | type , type_var                                   (* NonNegativeInteger 'V — type variable bounded by a union *)
-               | type , var_name ;                                 (* Uint n                — comptime value param *)
+               | type , var_name ;                                 (* Uarch n               — comptime value param *)
 
 param_list     = "(" , [ param , { "," , param } ] , ")" ;
-param          = [ type ] , var_name | type , record_pattern ;   (* Int x  |  x (type inferred/annotated)  |  ServerOptions { port, host } *)
+param          = [ type ] , var_name | type , record_pattern ;   (* Int32 x  |  x (type inferred/annotated)  |  ServerOptions { port, host } *)
 
 block          = "{" , { statement } , "}" ;
 statement      = var_decl | return_stmt | yield_stmt | assign_stmt | expression ;   (* (temporary) — widened further with more control flow *)
@@ -791,23 +874,23 @@ yield_stmt     = "<-" , expression ;                           (* yields a block
 Examples:
 
 ```
-const sum = (Int a, Int b) -> a + b                  (* single-line body: implicit return *)
-const sum2 = (Int a, Int b) -> {                     (* block body: explicit return *)
+const sum = (Int32 a, Int32 b) -> a + b              (* single-line body: implicit return *)
+const sum2 = (Int32 a, Int32 b) -> {                 (* block body: explicit return *)
   return a + b
 }
-const add = (Int a, Int b) Int -> { return a + b }   (* explicit return type *)
+const add = (Int32 a, Int32 b) Int32 -> { return a + b }   (* explicit return type *)
 const noop = () -> {}                                 (* no params, inferred/none *)
 const alloc! = () -> {                                (* ! name: allocates residue *)
   const Point p = { x: 0, y: 0 }
   return p.x
 }
 const f = ['MyArg] ('MyArg a, 'MyArg b) 'MyArg -> {}  (* type var declared with ' *)
-const zeros = [Uint n, 'T] () [n 'T] -> { }           (* value param n + type param 'T *)
+const zeros = [Uarch n, 'T] () [n 'T] -> { }          (* value param n + type param 'T *)
 const Sum sum = (a, b) -> a + b                       (* bare params: types come from the Sum annotation *)
 
 alloc!() in arena                                     (* call with in clause *)
-f[Int](1, 2)                                          (* explicit type arg: no ' on Int *)
-zeros[8, Int]()                                       (* comptime value + type arg *)
+f[Int32](1, 2)                                        (* explicit type arg: no ' on Int32 *)
+zeros[8, Int32]()                                     (* comptime value + type arg *)
 f(1, 2)                                                (* same call, type arg inferred *)
 ```
 
@@ -815,22 +898,22 @@ Points:
 
 - **A param's type may be omitted** when it can be supplied from elsewhere —
   chiefly a function-type annotation on the binding (`const Sum sum = (a, b) -> …`,
-  where `Sum = (Int, Int) Int` types `a` and `b`). A bare param is a lone
-  `var_name`; a typed one leads with a `type` (`Int x`) — cased apart the usual
+  where `Sum = (Int32, Int32) Int32` types `a` and `b`). A bare param is a lone
+  `var_name`; a typed one leads with a `type` (`Int32 x`) — cased apart the usual
   way, since a type starts uppercase, `'`, `*`, `&`, or `[` and a value name
   lowercase. A `record_pattern` param still requires its type (`ServerOptions { … }`).
   That every bare param's type is actually derivable is a semantic check; the
   grammar only permits the omission.
-- **Return type sits between the params and the arrow** (`(Int x) Int -> …`).
-  Omit it (`(Int x) -> …`) to infer it from the body — or for a function that
+- **Return type sits between the params and the arrow** (`(Int32 x) Int32 -> …`).
+  Omit it (`(Int32 x) -> …`) to infer it from the body — or for a function that
   returns nothing. The `->` always immediately precedes the body.
 - **The body is a `block` or a single `expression`.** `-> a + b` is a
   single-line body whose value is the implicit return; `-> { … }` is a braced
-  block that returns via `return`. So `(Int a, Int b) -> a + b` and
-  `(Int a, Int b) -> { return a + b }` are the same function.
+  block that returns via `return`. So `(Int32 a, Int32 b) -> a + b` and
+  `(Int32 a, Int32 b) -> { return a + b }` are the same function.
 - **A leading `[` opens `generic_params`, not an `aggregate`, when its contents
-  are type-level** — a type variable (`'T`) or a `Type name` pair (`Uint n`).
-  Neither is a valid `value`, so `['T]`, `[Uint n]`, and `[Uint n, 'T]` can only
+  are type-level** — a type variable (`'T`) or a `Type name` pair (`Uarch n`).
+  Neither is a valid `value`, so `['T]`, `[Uarch n]`, and `[Uarch n, 'T]` can only
   be a generic head, whereas `[1, 2]` (values) is an aggregate. A generic head
   is always followed by the lambda's `(param_list)`, which confirms it.
 - **A `{` right after `->` always opens a `block`, never a data literal.**
@@ -839,17 +922,18 @@ Points:
   literal must be parenthesized — `-> ({ x: 0 })`. Inside a block, `{…}` in value
   position forks between a `data_literal` and a value `block` by the two-token
   peek (see Data Literals).
-- **`(` opens a lambda vs. a group by lookahead to `->`.** In value position a
+- **`(` opens a lambda vs. a tuple by lookahead to `->`.** In value position a
   `(` begins a `function`'s `param_list` iff the matching `)` (with an optional
-  return `type`) is followed by `->`; otherwise it opens a parenthesized
-  `(expression)`. The bodies also differ — a `param` is `type var_name` (two
-  tokens, no operator), which is not a valid expression — but the `->` is the
-  decisive signal. Empty `()` is never a group (a group needs an inner
-  expression), so it is always a zero-arg `param_list`.
+  return `type`) is followed by `->`; otherwise it opens a `tuple` value — the
+  grouped `(expression)` (a one-tuple ≅ its element) or a genuine product
+  `(a, b)`. The bodies also differ — a `param` is `type var_name` (two tokens, no
+  operator), which is not a valid expression — but the `->` is the decisive signal.
+  Empty `()` followed by `->` is a zero-arg `param_list`; standing alone it is the
+  unit value.
 - **Generics.** A `generic_param` is a **type variable** `'T` (a bare
   `type_var`), a **bounded type variable** `Union 'V` (a `type` before the tick),
   or a **comptime value param** `Type name` (same shape as an ordinary `param`,
-  e.g. `Uint n`) — a bare `'T` binds an unconstrained type, `Union 'V` binds a
+  e.g. `Uarch n`) — a bare `'T` binds an unconstrained type, `Union 'V` binds a
   type constrained to a union's members, and a `Type name` binds a comptime
   value. The three never collide: a leading `'` is the bare `type_var`; after a
   leading `type`, a `'` starts a bounded `type_var` and a lowercase name a value
@@ -858,7 +942,7 @@ Points:
   `fixed_array` size — `[n 'T]`). The tick lives **only on the accepting side** —
   the definition, where it both introduces the variable and tells it apart from a
   concrete type. At the providing side (a call's explicit `type_args`) you pass a
-  concrete type with no tick: `f[Int]`, never `f['Int]`.
+  concrete type with no tick: `f[Int32]`, never `f['Int32]`.
 - **Constraints are unions.** A bound like `[NonNegativeInteger 'Value]` requires
   the argument type to be a member of that union — there is no separate trait
   system; a `union` _is_ the constraint. That the bounding `type` must be a union
@@ -866,7 +950,7 @@ Points:
   type arguments at the call site live in the expression grammar (see
   Expressions).
 
-Calls (`f(x)`, `max[Int](a, b)`) and the `in` clause live in the expression
+Calls (`f(x)`, `max[Int32](a, b)`) and the `in` clause live in the expression
 grammar (see Expressions), since a call is a postfix accessor and `in` a
 low-binding operator; only the lambda and its body are defined here.
 
@@ -883,12 +967,22 @@ The shape reuses the binding skeleton one-for-one — swap `const` for
 what the `->` would have.
 
 ```ebnf
-intrinsic_decl = "intrinsic" , var_name , "=" , intrinsic_sig ;
-intrinsic_sig  = [ generic_params ] , param_list , type ;   (* lambda signature, no "->" body — the compiler supplies it *)
+intrinsic_decl  = "intrinsic" , var_name , "=" , intrinsic_sig                  (* value intrinsic *)
+               | "intrinsic" , "type" , type_name , [ "=" , constructor_sig ] ;  (* type-valued intrinsic + its constructor; nullary form omits "=" *)
+intrinsic_sig   = [ generic_params ] , param_list , type ;   (* lambda signature, no "->" body — the compiler supplies it *)
+constructor_sig = param_list , "->" , type ;                 (* a type's constructor: (Number value) -> Uint8 *)
 ```
 
+An `intrinsic` also names a **type the compiler supplies** — an `intrinsic type`
+whose optional `= constructor_sig` gives the type its cast/construction signature
+(`pub intrinsic type Uint8 = (Number value) -> Uint8`), and whose nullary form
+(no `=`) is a bare compiler singleton (`pub intrinsic type Infinity`). The name is
+PascalCase (a `type_name`), and — unlike a value intrinsic — the constructor RHS
+does carry the `->`, since it spells a constructor's shape rather than a bare
+signature.
+
 The **return type is mandatory** — there is no body to infer from, and nothing
-is implied. A void intrinsic states it (`Void`); the type is never omitted.
+is implied. A unit-returning intrinsic states it (`Unit`); the type is never omitted.
 Everything else mirrors a lambda: optional `generic_params`, a `param_list`
 whose params carry their types, and the `!` allocation marker rides the name
 (`copy!`) when the intrinsic allocates. `pub` exports it like any declaration,
@@ -898,13 +992,16 @@ An intrinsic is a **top-level** form only — it appears in `declaration`, never
 `statement`; there are no local intrinsics.
 
 ```
-pub intrinsic sizeof   = ['T]() Uint                         (* generic, returns a count *)
-pub intrinsic popcount = (Uint x) Uint
-pub intrinsic copy!    = ['T](*'T dst, *'T src, Uint n) Void (* allocates; return stated *)
-intrinsic fence        = () Void                             (* module-private *)
+pub intrinsic sizeof   = ['T]() Uarch                        (* generic, returns a count *)
+pub intrinsic popcount = (Uarch x) Uarch
+pub intrinsic copy!    = ['T](*'T dst, *'T src, Uarch n) Unit (* allocates; return stated *)
+intrinsic fence        = () Unit                             (* module-private *)
 
-pub intrinsic bad      = (Uint x)                            (* invalid — return type required *)
-pub intrinsic worse    = (Uint x) Uint -> x                  (* invalid — intrinsics take no body *)
+pub intrinsic type Uint8 = (Number value) -> Uint8          (* a width type carrying its cast constructor *)
+pub intrinsic type Infinity                                 (* nullary compiler singleton — no constructor *)
+
+pub intrinsic bad      = (Uarch x)                           (* invalid — return type required *)
+pub intrinsic worse    = (Uarch x) Uarch -> x               (* invalid — intrinsics take no body *)
 ```
 
 ## Assembly
@@ -943,7 +1040,7 @@ scratch.
 Rules (semantic, the grammar only places the form):
 
 - **Return type is mandatory**, as with an `intrinsic` — there is no C! body to
-  infer from. A void asm function writes `Void`.
+  infer from. A unit-returning asm function writes `Unit`.
 - **Parameters occupy the target's C-ABI argument registers**, in order, reached
   by `${param}`; the **return value is left in the return register** (arm64:
   `x0..x7` in, `x0` out). The function is **naked** — no prologue/epilogue, so at
@@ -961,8 +1058,8 @@ substitution), beside the QBE-lowered functions — not through QBE, which has n
 `svc`/syscall instruction and no inline-asm path.
 
 ```
-pub const syscall6 = (Uint num, Uint a0, Uint a1, Uint a2,
-                      Uint a3, Uint a4, Uint a5) Uint -> asm "
+pub const syscall6 = (Uarch num, Uarch a0, Uarch a1, Uarch a2,
+                      Uarch a3, Uarch a4, Uarch a5) Uarch -> asm "
     mov x16, ${num}
     mov x0,  ${a0}
     mov x1,  ${a1}
@@ -974,7 +1071,7 @@ pub const syscall6 = (Uint num, Uint a0, Uint a1, Uint a2,
     ret
 "
 
-pub const write = (Int fd, *[Uint8] buf, Uint n) Uint ->    (* ordinary C! atop it *)
+pub const write = (Arch fd, *[Uint8] buf, Uarch n) Uarch ->  (* ordinary C! atop it *)
   syscall6(4, fd, buf, n, 0, 0, 0)
 ```
 
@@ -1028,9 +1125,10 @@ Points:
   binding or assignment right-hand side**. This is a semantic well-formedness
   rule — the grammar admits the block; the checker rejects it.
 - **`else` is optional, and its absence changes the type, not the grammar.** With
-  both branches the value is their common type; with only `then`, the value is an
-  `Option` — `Some(v)` when the branch runs, `None` when the condition is false
-  (`if false then 1` is `None`). This wrapping is a type-system rule.
+  both branches the value is their common type; with only `then`, the value is
+  **`Unit`** — the `then` branch runs for effect and the whole expression is `()`
+  whether or not the condition holds (no wrapping; the `then` value is discarded).
+  This is a type-system rule.
 - **`else if` needs no special rule.** A branch is an `expression` and an
   `expression` may itself be an `if_expr`, so `if a then 1 else if b then 2 else 3`
   chains for free.
@@ -1054,10 +1152,10 @@ or_pattern    = match_pattern , { "|" , match_pattern } ;    (* alternatives —
 match_pattern = "_"                                          (* wildcard — matches anything *)
               | literal                                      (* 1, "one", true *)
               | var_name                                     (* binding — matches anything, names it *)
-              | type_pattern                                 (* Some(x), None, Point({ x, y }) *)
+              | type_pattern                                 (* Maybe.Just(x), Maybe.Nothing, Shape.Point({ x, y }) *)
               | record_pattern                               (* { x, y } — by field, see Destructuring *)
               | array_pattern ;                              (* [a, b] — positional, see Destructuring *)
-type_pattern  = named_type , [ "(" , match_pattern , { "," , match_pattern } , ")" ] ;
+type_pattern  = ( named_type | member_access ) , [ "(" , match_pattern , { "," , match_pattern } , ")" ] ;   (* head may be a qualified member *)
 literal       = number | string | bool ;
 ```
 
@@ -1065,9 +1163,9 @@ Examples:
 
 ```
 const num = match v {
-  Some(1) -> 1 + 1,        (* variant with a literal payload; single-line body *)
-  Some(x) -> { <- x },     (* variant binding its payload; block body *)
-  None    -> 1,
+  Maybe.Just(1) -> 1 + 1,        (* variant with a literal payload; single-line body *)
+  Maybe.Just(x) -> { <- x },     (* variant binding its payload; block body *)
+  Maybe.Nothing -> 1,
 }
 
 const value_is = match v {
@@ -1076,10 +1174,10 @@ const value_is = match v {
   _ -> "many",             (* wildcard catch-all *)
 }
 
-const area = match v {
-  Point({ x, y }) -> x + y,     (* record payload destructured by field *)
-  Circle(r)       -> r,         (* single payload bound *)
-  Rect({ w, h })  -> w * h,
+const area = match v {          (* v : Shape — arms are qualified by that union *)
+  Shape.Point({ x, y }) -> x + y,   (* record payload destructured by field *)
+  Shape.Circle(r)       -> r,       (* single payload bound *)
+  Shape.Rect({ w, h })  -> w * h,
 }
 ```
 
@@ -1089,26 +1187,31 @@ Points:
   wildcard; a number/string/`true`/`false` is a `literal`; a lowercase name is a
   **binding** (matches anything, names it); an uppercase name is a `type_pattern`;
   a `{` opens a `record_pattern` and a `[` an `array_pattern` (both from
-  Destructuring). A `type_pattern` is a member type (`None`) optionally followed
-  by a parenthesized sub-pattern for its payload. A member may be named **bare**
-  (`Some`, `None`) or **qualified** through its union (`Option.Some`,
-  `NodeKind.IntLit`) — the qualified form disambiguates when the same short name
-  lives in more than one union (see Union Types).
+  Destructuring). A `type_pattern`'s head is a member type, optionally followed by
+  a parenthesized sub-pattern for its payload. **In a match arm the head names a
+  member of the scrutinee's own union, qualified by that union** — `Int.Int32`,
+  `Shape.Circle`, `Maybe.Just`, `Number.Int8` — **never bare**, even for a compose-over
+  member: the arm names the member *as a case of the matched union*, which frames
+  exhaustiveness and keeps the checker from searching for which union a member belongs
+  to. (Bare naming of a compose-over member — `Int8`, `Point` — is for type and value
+  position; in a `type_pattern` the union qualifier is required. This is also what
+  keeps a short name that lives in more than one union unambiguous — see Union Types.)
 - **Or-patterns** — `p0 | p1 | …` matches when the scrutinee matches _any_ of the
-  alternatives, so one arm can cover several cases (`Sat | Sun -> …`,
+  alternatives, so one arm can cover several cases (`Weekday.Sat | Weekday.Sun -> …`,
   `NodeKind.IndexField | NodeKind.LocalIndexField -> …`). The separator is a single
   `|`, not `||`: a pattern is never an expression, so `|` in pattern position is
   unambiguously alternation, never bitwise-or (which only exists in expressions).
 - **Payload sub-patterns recurse**, so any `match_pattern` may sit inside the
-  parens: a literal (`Some(1)`), a binding (`Some(x)`, `Circle(r)`), or a
-  destructuring pattern (`Point({ x, y })`, `Rect({ w, h })`) that pulls the
+  parens: a literal (`Maybe.Just(1)`), a binding (`Maybe.Just(x)`, `Shape.Circle(r)`), or a
+  destructuring pattern (`Shape.Point({ x, y })`, `Shape.Rect({ w, h })`) that pulls the
   payload's fields apart by name. The parenthesized list is positional; a
   `record_pattern` inside it is non-exhaustive as usual (name only the fields you
   want). Deeper nesting composes the same way.
 - **Arms are ordered; the first match wins.** Put specific patterns before
   general ones and a `_` (or a bare binding) last. Whether a `match` must be
-  **exhaustive** — cover every union member or carry a catch-all — is a semantic
-  rule, as is rejecting arms made unreachable by an earlier catch-all. Guards (an
+  **exhaustive** — cover every member of the **scrutinee's union** or carry a
+  catch-all — is a semantic rule, as is rejecting arms made unreachable by an earlier
+  catch-all and rejecting an arm that names a member outside the scrutinee's union. Guards (an
   `if` condition on an arm) are a later addition.
 - **`match` yields a value**, so it composes like any expression and is a
   top-level alternative of `expression` (parenthesize to nest inside an
@@ -1137,13 +1240,13 @@ const num = loop outer {
   }
 }
 
-const [Int] xs = [1, 2, 3]
-let   [Int] evens = []
+const [Int32] xs = [1, 2, 3]
+let   [Int32] evens = []
 for i in xs {
-  if i % 2 == 0 then array.push(i, *evens)
+  if i % 2 == 0 then array.push(i, &evens)
 }
 
-for i in xs if i % 2 == 0 then array.push(i, *evens)   (* one-line: body is a single expression *)
+for i in xs if i % 2 == 0 then array.push(i, &evens)   (* one-line: body is a single expression *)
 
 const two = for i in xs if i == 2 then i else 2        (* for is an expression *)
 const two = for i in xs {
@@ -1189,9 +1292,10 @@ ordinary single binding.
 ```ebnf
 destructure_decl = ( "let" | "const" ) , pattern , "=" , expression ;
 
-pattern        = record_pattern | array_pattern ;
+pattern        = record_pattern | array_pattern | tuple_pattern ;
 record_pattern = "{" , var_name , { "," , var_name } , [ "," ] , "}" ;   (* by field name *)
-array_pattern  = "[" , pattern_elem , { "," , pattern_elem } , [ "," ] , "]" ;
+array_pattern  = "[" , pattern_elem , { "," , pattern_elem } , [ "," ] , "]" ;   (* arrays — by position *)
+tuple_pattern  = "(" , pattern_elem , { "," , pattern_elem } , [ "," ] , ")" ;   (* tuples / positional records — by position *)
 pattern_elem   = var_name | skip ;                                       (* bind, or skip *)
 skip           = "_" , { dec_digit } ;                                   (* _ skips one, _3 skips three *)
 ```
@@ -1208,17 +1312,18 @@ let   { x }    = p        (* let too; non-exhaustive — y simply not bound *)
 Extraction need not be exhaustive — a field left out of the pattern is just not
 bound. Field names only; no renaming yet.
 
-**Array patterns** (positional tuples, fixed and dynamic arrays) match by
-position. A `skip` drops elements without binding: bare `_` skips one, `_n` skips
-`n`. Because `_` and `_2` begin with `_` (not a lowercase letter) they are not
+**Array patterns** (fixed and dynamic arrays) and **tuple patterns** (tuples and
+positional records) match by position — arrays in `[…]`, tuples in `(…)`, matching
+the value syntax. A `skip` drops elements without binding: bare `_` skips one, `_n`
+skips `n`. Because `_` and `_2` begin with `_` (not a lowercase letter) they are not
 `var_name`s, so there is no clash with a binding.
 
 ```
-const tuple      = [1, true]
-const farr       = [1, 2, 3]
-const [Int] darr = [1, 2, 3]
+const tuple        = (1, true)
+const farr         = [1, 2, 3]
+const [Int32] darr = [1, 2, 3]
 
-const [n, b]      = tuple    (* n = tuple[0], b = tuple[1] *)
+const (n, b)      = tuple    (* n = tuple[0], b = tuple[1] *)
 const [_, a, b]   = farr     (* skip farr[0]; a = farr[1], b = farr[2] *)
 const [_2, three] = darr     (* skip two; three = darr[2] *)
 ```
@@ -1229,10 +1334,14 @@ Nested patterns and a rest element are later widenings.
 
 **Disambiguation in a decl.** After `let`/`const`, a leading `{` can only begin a
 `record_pattern` — no `type` starts with `{`. A leading `[` forks against a
-bracket `type` (`const [Int] darr = …`): scan past the matching `]` — a `=` next
+bracket `type` (`const [Int32] darr = …`): scan past the matching `]` — a `=` next
 means the `[…]` was an `array_pattern`; a `var_name` next means it was the decl's
-`type` and the name follows. A pattern's `{…}`/`[…]` sits in LHS position, so it
-is never read as a `data_literal` or `aggregate` (those are values, on the RHS).
+`type` and the name follows. A leading `(` forks the same way against a tuple /
+function `type`: a `=` after the matching `)` means the `(…)` was a `tuple_pattern`;
+a `var_name` (or a return `type` then a `var_name`) means it was the decl's `type`
+and the name follows. A pattern's `{…}`/`[…]`/`(…)` sits in LHS position, so it is
+never read as a `data_literal`, `aggregate`, or `tuple` value (those are values, on
+the RHS).
 
 **At the argument level**, a `param` may carry a `record_pattern` in place of its
 name — `(ServerOptions { port, host }, Point p)`. This is legal **only for a
@@ -1304,8 +1413,8 @@ values** (`let`/`const`, and thus functions, which are `const`-bound lambdas):
 ```
 pub const x = 1        (* exported — importable *)
 const y = 2            (* module-private *)
-pub data Point = { Int x, Int y }
-pub type ServerOptions = { Int port, Str host }
+pub data Point = { Int32 x, Int32 y }
+pub type ServerOptions = { Int32 port, Str host }
 ```
 
 `pub` lives only on this top-level `declaration`; a `var_decl` used as a
@@ -1368,14 +1477,14 @@ it without a call.
   whether or not the body allocates. The entry is `main`, full stop. (Allocation
   still happens inside, in the page geometry below — the name just carries no
   signal no one consumes.)
-- **Signature.** The entry returns an `Int` exit code and takes the process
+- **Signature.** The entry returns an `Arch` exit code and takes the process
   arguments and environment. All three are **optional by arity** — the runtime
   supplies as many as the signature declares:
 
   ```
   pub const main = () -> 0                                       # no args
-  pub const main = (Int argc, *[Str] argv) -> { return 0 }       # argc + argv
-  pub const main = (Int argc, *[Str] argv, *[Str] envp) -> {     # + environment
+  pub const main = (Arch argc, *[Str] argv) -> { return 0 }      # argc + argv
+  pub const main = (Arch argc, *[Str] argv, *[Str] envp) -> {    # + environment
     return 0
   }
   ```
