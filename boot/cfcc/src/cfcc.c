@@ -404,12 +404,18 @@ typedef struct {
  * carries a pointer to its declaration, which fixes its fields and layout; the
  * pointer is filled in by the typecheck pass (parse leaves it NULL). */
 typedef struct DataDecl DataDecl;
+struct Func; /* forward: an EX_CALL caches its resolved callee for emit */
 
 typedef enum {
 	TY_INT,    /* Int — a word */
 	TY_PTR,    /* *T  — an opaque pointer (a long; not usable in Int expressions) */
 	TY_RECORD, /* a `data` record type (see rec) */
 	TY_STR,    /* Str — an `l` pointer to a {bytes*, len} header; not an Int */
+	TY_UARCH,  /* Uarch — a register-width (pointer-width) unsigned integer, an `l`.
+	            * The concrete pointer-width unsigned leaf (type_system §2): the syscall
+	            * floor's register/count type. cfcc has it only as a parameter/return/
+	            * argument value (no Uarch locals or arithmetic yet); the union `Uint` is
+	            * not modeled (no unions in cfcc). */
 } TypeKind;
 
 typedef struct {
@@ -421,9 +427,10 @@ typedef struct {
  * or a long (a pointer, e.g. *[Str] argv/envp). darwin hands these to _start in
  * x0/x1/x2, which forwards them unchanged, so QBE reads them as ordinary args. */
 typedef enum {
-	PK_WORD,   /* Int  -> w (argc) */
-	PK_LONG,   /* *T   -> l (argv, envp) — an opaque pointer, never dereferenced */
+	PK_WORD,   /* Int   -> w (argc) */
+	PK_LONG,   /* *T    -> l (argv, envp, `*[Uint8]` buffers) — an opaque pointer */
 	PK_RECORD, /* a record type -> l (a pointer to the caller's arena record) */
+	PK_UARCH,  /* Uarch -> l (a register-width unsigned integer; see TY_UARCH) */
 } ParamKind;
 
 typedef struct {
@@ -505,6 +512,9 @@ struct Expr {
 	 * Assigned per function before emit (assign_stmt_slots) and allocated once in the
 	 * entry block, so an if/logical inside a loop does not `alloc4` each iteration. */
 	int slot;
+	/* EX_CALL: the resolved callee, cached by typecheck so emit can read each
+	 * parameter's kind (to pick the argument register width and widen an Int→Uarch). */
+	struct Func *callee;
 };
 
 static Expr *new_expr(ExprKind kind) {
@@ -524,6 +534,7 @@ typedef enum {
 	ST_LOOP,        /* loop { body } — infinite loop statement */
 	ST_BREAK,       /* break (bare) or `if cond then break` (guard in expr) */
 	ST_CONTINUE,    /* continue (bare) or `if cond then continue` (guard in expr) */
+	ST_EXPR,        /* an expression evaluated for effect (a call), result discarded */
 } StmtKind;
 
 typedef struct Stmt Stmt;
@@ -592,12 +603,12 @@ static int data_field_index(const DataDecl *d, const char *name) {
  * returns Int (word) unless `ret_type_name` names a record type, in which case it
  * returns that record by pointer (`ret_rec`, resolved in typecheck). `locals`
  * accrues during parsing for name resolution within this function. */
-typedef struct {
+typedef struct Func {
 	char name[64];
 	int is_pub;
 	Param params[MAX_PARAMS];
 	int nparams;
-	char ret_type_name[64]; /* empty = Int; else a record return type */
+	char ret_type_name[64]; /* empty = Int; "Uarch" = Uarch; else a record return type */
 	int ret_line;           /* source line of the return type (for diagnostics) */
 	DataDecl *ret_rec;      /* resolved record return type (typecheck) */
 	Binding *locals;
@@ -675,6 +686,7 @@ static Resolution resolve_name(Func *fn, const char *name, Type *ty) {
 			case PK_WORD:   ty->kind = TY_INT;    ty->rec = NULL; break;
 			case PK_RECORD: ty->kind = TY_RECORD; ty->rec = fn->params[i].rec; break;
 			case PK_LONG:   ty->kind = TY_PTR;    ty->rec = NULL; break;
+			case PK_UARCH:  ty->kind = TY_UARCH;  ty->rec = NULL; break;
 			}
 			return R_PARAM;
 		}
@@ -764,6 +776,13 @@ static void parse_param_type(Parser *p, Param *out) {
 		out->kind = PK_WORD;
 		return;
 	}
+	if (is_ident(t, "Uarch")) {
+		advance(p);
+		out->kind = PK_UARCH;
+		return;
+	}
+	if (is_ident(t, "Str")) /* Str params await a later brick (Str is a local-only type in M0) */
+		die(t->line, "M0 has no Str parameters yet (pass `*[Uint8]` + a `Uarch` length)");
 	if (t->kind == TK_STAR) {
 		advance(p);
 		Token *u = peek(p);
@@ -1135,14 +1154,19 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 		advance(p);
 		/* Optional type annotation: `Int` (a word local) or a record type name (a
 		 * `data`-typed local). A pointer annotation has no M0 local use. */
-		int is_record = 0;
+		int is_record = 0, is_str = 0;
 		char rectype[64] = {0};
 		Token *tt = peek(p);
 		if (tt->kind == TK_STAR)
-			die(tt->line, "M0 locals are `Int` or a record type, not a pointer");
+			die(tt->line, "M0 locals are `Int`, `Str`, or a record type, not a pointer");
 		if (is_type_ident(tt)) {
 			if (is_ident(tt, "Int")) {
 				advance(p);
+			} else if (is_ident(tt, "Str")) {
+				is_str = 1;
+				advance(p);
+			} else if (is_ident(tt, "Uarch")) {
+				die(tt->line, "M0 has no `Uarch` locals (Uarch is a parameter/return type)");
 			} else {
 				tok_copy(tt, rectype, sizeof rectype);
 				is_record = 1;
@@ -1176,6 +1200,20 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 				s->expr = parse_expr(p, fn);
 			Type rt = {TY_RECORD, NULL};
 			func_add_local(fn, s->name, mutable, rt);
+		} else if (is_str) {
+			/* `const Str name = "literal"` — a Str local binds a string literal only.
+			 * No `let Str` (M0 has no Str reassignment) and no `const Str t = other`
+			 * (an aggregate copy: memory_model §6 wants an explicit copy — and the owner's
+			 * rule is that a string copy is `const Str t = "${s}"`, deferred with runtime
+			 * interpolation). Marked with type_name "Str" for typecheck/emit. */
+			if (mutable)
+				die(name->line, "a Str local must be `const` (M0 has no Str reassignment)");
+			s->expr = parse_expr(p, fn);
+			if (s->expr->kind != EX_STR)
+				die(name->line, "a Str local binds a string literal only (M0 has no Str copy or interpolation yet)");
+			snprintf(s->type_name, sizeof s->type_name, "Str");
+			Type st = {TY_STR, NULL};
+			func_add_local(fn, s->name, mutable, st);
 		} else {
 			/* A `{` initializer with no type annotation is an attempted record
 			 * literal (M0 requires the annotation to know the record's type). */
@@ -1251,6 +1289,15 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 	if (t->kind == TK_IDENT && !is_type_ident(t)) {
 		if (t->text[t->len - 1] == '!')
 			die(t->line, "M0 does not support `!` in a name here");
+		/* A name immediately followed by `(` is a call statement — invoked for its
+		 * effect (e.g. `write(...)`), its result discarded. Parsed as a full expression
+		 * (which builds the EX_CALL), so args and nesting work as anywhere else. */
+		if (p->toks[p->pos + 1].kind == TK_LPAREN) {
+			Stmt *s = new_stmt(ST_EXPR);
+			s->line = t->line;
+			s->expr = parse_expr(p, fn);
+			return s;
+		}
 		char target[64];
 		tok_copy(t, target, sizeof target);
 		advance(p);
@@ -1562,10 +1609,15 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 	case EX_FIELD: {
 		Type base = typeof_expr(prog, fn, e->lhs);
 		if (base.kind == TY_STR) {
-			/* A string exposes exactly one field: `.len`, its byte count (an Int). */
-			if (strcmp(e->name, "len") != 0)
-				die(e->line, "a string has only the `.len` field");
-			return (Type){TY_INT, NULL};
+			/* A string exposes two fields: `.len`, its byte count (an Int), and
+			 * `.bytes`, the pointer to its UTF-8 bytes (`*[Uint8]`, an opaque pointer)
+			 * — enough to hand a buffer + length to `write`. (Both are provisional
+			 * cfcc surface over the throwaway {bytes*,len} header; cf0's Str API differs.) */
+			if (strcmp(e->name, "len") == 0)
+				return (Type){TY_INT, NULL};
+			if (strcmp(e->name, "bytes") == 0)
+				return (Type){TY_PTR, NULL};
+			die(e->line, "a string has only the `.len` and `.bytes` fields");
 		}
 		if (base.kind != TY_RECORD)
 			die(e->line, "field access `.` needs a record value on the left");
@@ -1591,25 +1643,38 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 			die(e->line, "too many arguments");
 		if (e->nargs < callee->nparams)
 			die(e->line, "too few arguments (partial application is not supported yet)");
-		/* Each argument's type must match the parameter: Int for a word param, the
-		 * same record type for a record param. (A pointer param — only `*T` — is not
-		 * expressible as an argument in M0.) */
+		/* Each argument's type must match the parameter. A `Uarch` parameter is the
+		 * register-width syscall type: it accepts a `Uarch`; an `Int`, which cfcc widens
+		 * to register width here (a throwaway coercion — cf0 spells an explicit `Uarch(x)`
+		 * cast, type_system §4); or a pointer, which already occupies a full register and
+		 * rides it bare (no conversion — cf0 passes `*[Uint8]` into the syscall register
+		 * directly too, type_system §6.4; there is no pointer↔integer cast). */
 		for (int i = 0; i < callee->nparams; i++) {
 			Param *pm = &callee->params[i];
 			Type at = typeof_expr(prog, fn, e->args[i]);
-			if (pm->kind == PK_WORD) {
+			switch (pm->kind) {
+			case PK_WORD:
 				if (at.kind != TY_INT)
 					die(e->line, "argument type mismatch (a word parameter expects an Int)");
-			} else if (pm->kind == PK_RECORD) {
+				break;
+			case PK_RECORD:
 				if (at.kind != TY_RECORD)
 					die(e->line, "argument type mismatch (a record parameter expects a record)");
 				if (at.rec != pm->rec)
 					die(e->line, "argument type mismatch (record type differs)");
-			} else {
-				die(e->line, "M0 cannot pass a pointer argument");
+				break;
+			case PK_UARCH:
+				if (at.kind != TY_UARCH && at.kind != TY_INT && at.kind != TY_PTR)
+					die(e->line, "argument type mismatch (a Uarch parameter expects a Uarch, Int, or pointer)");
+				break;
+			case PK_LONG:
+				if (at.kind != TY_PTR)
+					die(e->line, "argument type mismatch (a pointer parameter expects a pointer, e.g. `s.bytes`)");
+				break;
 			}
 		}
-		return func_ret_type(callee); /* Int, or a record returned by pointer */
+		e->callee = callee; /* cached for emit (per-arg register width, Int→Uarch widen) */
+		return func_ret_type(callee); /* Int, Uarch, or a record returned by pointer */
 	}
 	case EX_IF:
 		expect_int(prog, fn, e->lhs); /* condition */
@@ -1642,6 +1707,8 @@ static Type typeof_expr(Program *prog, Func *fn, Expr *e) {
 
 /* A function's declared return type: a record (returned by pointer) or Int. */
 static Type func_ret_type(const Func *fn) {
+	if (strcmp(fn->ret_type_name, "Uarch") == 0)
+		return (Type){TY_UARCH, NULL};
 	if (fn->ret_type_name[0])
 		return (Type){TY_RECORD, fn->ret_rec};
 	return (Type){TY_INT, NULL};
@@ -1706,7 +1773,10 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 	for (Stmt *s = list; s; s = s->next) {
 		switch (s->kind) {
 		case ST_LOCAL:
-			if (s->type_name[0]) { /* a record binding (annotated with a record type) */
+			if (strcmp(s->type_name, "Str") == 0) {           /* a `const Str` local */
+				if (typeof_expr(prog, fn, s->expr).kind != TY_STR)
+					die(s->line, "internal: Str local initializer is not a string");
+			} else if (s->type_name[0]) { /* a record binding (annotated with a record type) */
 				if (s->expr->kind == EX_RECORD)
 					resolve_record_binding(prog, fn, s);      /* { … } literal */
 				else
@@ -1753,6 +1823,12 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 				Type et = typeof_expr(prog, fn, s->expr);
 				if (et.kind != TY_RECORD || et.rec != rt.rec)
 					die(s->expr->line, "returned value does not match the record return type");
+			} else if (rt.kind == TY_UARCH) {
+				/* A Uarch return accepts a Uarch, or an Int/pointer widened to register
+				 * width (the same call-site coercion as a Uarch parameter). */
+				Type et = typeof_expr(prog, fn, s->expr);
+				if (et.kind != TY_UARCH && et.kind != TY_INT && et.kind != TY_PTR)
+					die(s->expr->line, "a Uarch function returns a Uarch, Int, or pointer value");
 			} else {
 				expect_int(prog, fn, s->expr);
 			}
@@ -1765,6 +1841,13 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 		case ST_CONTINUE:
 			if (s->expr) /* guarded: `if <cond> then break/continue` */
 				expect_int(prog, fn, s->expr);
+			break;
+		case ST_EXPR:
+			/* A call evaluated for effect: type it (validates the callee/args); the
+			 * result, whatever its type, is discarded. */
+			if (s->expr->kind != EX_CALL)
+				die(s->line, "an expression statement must be a call");
+			typeof_expr(prog, fn, s->expr);
 			break;
 		}
 	}
@@ -1787,7 +1870,7 @@ static void resolve_signatures(Program *prog) {
 					die(fn->params[j].line, "a parameter names an unknown data type");
 				fn->params[j].rec = d;
 			}
-		if (fn->ret_type_name[0]) {
+		if (fn->ret_type_name[0] && strcmp(fn->ret_type_name, "Uarch") != 0) {
 			DataDecl *d = prog_find_data(prog, fn->ret_type_name);
 			if (!d)
 				die(fn->ret_line, "a return type names an unknown data type");
@@ -1836,6 +1919,8 @@ typedef struct {
 	int lbl;
 	int loops[MAX_LOOP_DEPTH]; /* label ids of enclosing loops (innermost last) */
 	int loop_depth;
+	int ret_uarch; /* 1 if the current function returns Uarch (an `l`) — a returned
+	                * Int value is widened to `l` before `ret`. */
 } Emit;
 
 /* The module's string table: every EX_STR literal, assigned a stable index
@@ -1926,6 +2011,19 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 			snprintf(dst, cap, "%%r_%s", e->name);
 			return;
 		}
+		if (e->rtype.kind == TY_PTR || e->rtype.kind == TY_UARCH) {
+			/* A pointer (`*[Uint8]` buffer) or Uarch value is, in M0, always an
+			 * immutable `l` parameter — reference its incoming temp directly (no slot). */
+			snprintf(dst, cap, "%%u_%s", e->name);
+			return;
+		}
+		if (e->rtype.kind == TY_STR) {
+			/* A Str local: load its header pointer from its `l` slot. */
+			int t = ex->tmp++;
+			fprintf(out, "\t%%t%d =l loadl %%s_%s\n", t, e->name);
+			snprintf(dst, cap, "%%t%d", t);
+			return;
+		}
 		int t = ex->tmp++;
 		fprintf(out, "\t%%t%d =w loadw %%s_%s\n", t, e->name);
 		snprintf(dst, cap, "%%t%d", t);
@@ -1937,6 +2035,14 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		if (e->lhs->rtype.kind == TY_STR) {
 			char s[96];
 			emit_expr(out, e->lhs, ex, s, sizeof s);
+			if (strcmp(e->name, "bytes") == 0) {
+				/* `.bytes` — the byte pointer at offset 0 of the header (an `l`). */
+				int r = ex->tmp++;
+				fprintf(out, "\t%%t%d =l loadl %s\n", r, s);
+				snprintf(dst, cap, "%%t%d", r);
+				return;
+			}
+			/* `.len` — the length word sits at offset 8 of the string header. */
 			int a = ex->tmp++;
 			fprintf(out, "\t%%t%d =l add %s, 8\n", a, s);
 			int r = ex->tmp++;
@@ -1966,22 +2072,36 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 	case EX_RECORD:
 		die(e->line, "internal: record literal in expression position");
 	case EX_CALL: {
-		/* Evaluate each argument into its own temp, then call. A record argument is
-		 * passed by pointer (`l`); a word argument as `w`. The callee symbol is the
-		 * bare function name ($<name>); the result is a word (M0 returns Int). */
-		int argt[MAX_PARAMS], argrec[MAX_PARAMS];
+		/* Evaluate each argument into its own temp, then call. Each argument's register
+		 * width follows the *parameter* kind (word param → `w`; record/pointer/Uarch → `l`),
+		 * and an Int passed to a Uarch parameter is widened `w`→`l`. The callee symbol is
+		 * the bare function name ($<name>); the result width follows the return type. */
+		int argt[MAX_PARAMS];
+		char argw[MAX_PARAMS];
 		for (int i = 0; i < e->nargs; i++) {
 			char op[96];
 			emit_expr(out, e->args[i], ex, op, sizeof op);
-			argrec[i] = e->args[i]->rtype.kind == TY_RECORD;
-			argt[i] = ex->tmp++;
-			fprintf(out, "\t%%t%d =%s copy %s\n", argt[i], argrec[i] ? "l" : "w", op);
+			ParamKind pk = e->callee->params[i].kind;
+			if (pk == PK_UARCH && e->args[i]->rtype.kind == TY_INT) {
+				/* Widen an Int to register width for a Uarch parameter (throwaway cfcc
+				 * coercion; cf0 spells an explicit `Uarch(x)`). Sign-extend to match
+				 * cfcc's signed Int — the syscall args here are small and non-negative. */
+				int w = ex->tmp++;
+				fprintf(out, "\t%%t%d =w copy %s\n", w, op);
+				argt[i] = ex->tmp++;
+				fprintf(out, "\t%%t%d =l extsw %%t%d\n", argt[i], w);
+				argw[i] = 'l';
+			} else {
+				argw[i] = (pk == PK_WORD) ? 'w' : 'l';
+				argt[i] = ex->tmp++;
+				fprintf(out, "\t%%t%d =%c copy %s\n", argt[i], argw[i], op);
+			}
 		}
 		int r = ex->tmp++;
-		const char *rty = e->rtype.kind == TY_RECORD ? "l" : "w"; /* record → pointer */
+		const char *rty = e->rtype.kind == TY_INT ? "w" : "l"; /* Uarch/record/ptr → l */
 		fprintf(out, "\t%%t%d =%s call $%s(", r, rty, e->name);
 		for (int i = 0; i < e->nargs; i++)
-			fprintf(out, "%s%s %%t%d", i ? ", " : "", argrec[i] ? "l" : "w", argt[i]);
+			fprintf(out, "%s%c %%t%d", i ? ", " : "", argw[i], argt[i]);
 		fprintf(out, ")\n");
 		snprintf(dst, cap, "%%t%d", r);
 		return;
@@ -2117,6 +2237,11 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 				 * fresh arena pointer as this local's storage (a move, no copy). */
 				emit_expr(out, s->expr, ex, v, sizeof v);
 				fprintf(out, "\t%%r_%s =l copy %s\n", s->name, v);
+			} else if (s->expr->rtype.kind == TY_STR) {
+				/* A Str local holds its header pointer in an `l` slot (reserved in the
+				 * entry block); store the literal's static header address into it. */
+				emit_expr(out, s->expr, ex, v, sizeof v);
+				fprintf(out, "\tstorel %s, %%s_%s\n", v, s->name);
 			} else {
 				/* A word local: its slot was reserved in the entry block (see
 				 * emit_func); the binding just stores the initial value. */
@@ -2142,7 +2267,17 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 			break;
 		case ST_RETURN:
 			emit_expr(out, s->expr, ex, v, sizeof v);
-			fprintf(out, "\tret %s\n", v);
+			if (ex->ret_uarch && s->expr->rtype.kind == TY_INT) {
+				/* Uarch function returning an Int: widen `w`→`l` so the `ret` operand
+				 * matches the declared `l` return (a bare `w` temp would be ill-typed). */
+				int w = ex->tmp++;
+				fprintf(out, "\t%%t%d =w copy %s\n", w, v);
+				int l = ex->tmp++;
+				fprintf(out, "\t%%t%d =l extsw %%t%d\n", l, w);
+				fprintf(out, "\tret %%t%d\n", l);
+			} else {
+				fprintf(out, "\tret %s\n", v);
+			}
 			break;
 		case ST_LOOP: {
 			/* @ltop<id>: body ; jmp @ltop<id> (back-edge) ; @lend<id>: fall-through.
@@ -2181,6 +2316,10 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 			}
 			break;
 		}
+		case ST_EXPR:
+			/* Evaluate the call for effect; its result temp is simply not used. */
+			emit_expr(out, s->expr, ex, v, sizeof v);
+			break;
 		}
 	}
 }
@@ -2216,7 +2355,7 @@ static void emit_func(FILE *out, const Func *fn) {
 	 * return type lowers to `l` (a pointer to the arena record); Int is `w`. No page
 	 * node is threaded yet: a non-allocating body carries none (M0). */
 	int is_main = strcmp(fn->name, "main") == 0;
-	const char *retty = func_ret_type(fn).kind == TY_RECORD ? "l" : "w";
+	const char *retty = func_ret_type(fn).kind == TY_INT ? "w" : "l"; /* Uarch/record → l */
 	fprintf(out, "%sfunction %s $%s(", is_main ? "export " : "", retty, fn->name);
 	for (int i = 0; i < fn->nparams; i++)
 		fprintf(out, "%s%s %%u_%s", i ? ", " : "",
@@ -2243,9 +2382,12 @@ static void emit_func(FILE *out, const Func *fn) {
 	 * its `let` (which may sit inside a loop; a QBE `alloc4` per iteration is an
 	 * `alloca` that would overflow the stack). The `let` then only stores. Flat
 	 * scoping makes this sound: each name has exactly one slot for the whole body. */
-	for (int i = 0; i < fn->nlocals; i++)
+	for (int i = 0; i < fn->nlocals; i++) {
 		if (fn->locals[i].type.kind == TY_INT)
 			fprintf(out, "\t%%s_%s =l alloc4 4\n", fn->locals[i].name);
+		else if (fn->locals[i].type.kind == TY_STR) /* holds an `l` header pointer */
+			fprintf(out, "\t%%s_%s =l alloc8 8\n", fn->locals[i].name);
+	}
 
 	/* Likewise reserve every if/logical merge slot once here, not at each
 	 * evaluation (which may recur inside a loop). */
@@ -2255,6 +2397,7 @@ static void emit_func(FILE *out, const Func *fn) {
 		fprintf(out, "\t%%m%d =l alloc4 4\n", i);
 
 	Emit ex = {0};
+	ex.ret_uarch = func_ret_type(fn).kind == TY_UARCH;
 	emit_stmts(out, fn->body, &ex);
 	fprintf(out, "}\n");
 }
