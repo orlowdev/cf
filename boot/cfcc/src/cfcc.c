@@ -530,6 +530,8 @@ typedef struct {
 	 * bare/or-pattern arm, else the member's arity. */
 	char binds[MAX_ARM_ALTS][64];
 	int bind_ids[MAX_ARM_ALTS];
+	int bind_word[MAX_ARM_ALTS]; /* 1 = the bound payload field is word-repr (Int/tag-only union),
+	                              * 0 = pointer-repr (record/boxed union); set in typecheck */
 	int nbinds;
 	Expr *body;
 	int line;
@@ -652,12 +654,23 @@ typedef struct {
 #define MAX_FIELDS 64
 #define MAX_LOOP_DEPTH 64 /* cap on statically-nested loops (bounds Emit.loops[]) */
 
-/* A `data` record declaration: `data Name = { Int f0, Int f1, ... }`. M0 fields
- * are all Int (4 bytes), laid out in declaration order, so field i sits at byte
- * offset i*4 and the record occupies nfields*4 bytes. */
+/* A `data` record declaration: `data Name = { Int f0, Point f1, ... }`. A field is
+ * an `Int` or an aggregate (a `data` record / a `union`) type (G3a). Fields are laid
+ * out in declaration order in UNIFORM 8-byte slots: field i sits at byte offset i*8
+ * and the record occupies nfields*8 bytes. An Int field stores a word in the low 4
+ * bytes of its slot; an aggregate field stores an 8-byte arena pointer (a record or
+ * boxed-union VALUE is represented as a pointer in cfcc, so an aggregate field is an
+ * implicit pointer — this incidentally permits pointer-recursive shapes like a linked
+ * list; the explicit `*T` pointer-field syntax and its escape/identity semantics stay
+ * deferred). ⚠ cf0 must NOT inherit this bare-aggregate implicit pointer: type_system §8.4
+ * spells a recursive self-link as an EXPLICIT `*Node` (inline-by-value `T` and pointer `*T`
+ * are distinct field forms there); cfcc collapses them into one implicit pointer as a
+ * genesis shortcut. ⚠ THROWAWAY layout: the uniform 8-byte slot wastes space and the real
+ * inline-vs-boxed field decision belongs to the M6/M9 representation gate. */
 struct DataDecl {
 	char name[64];
 	char fields[MAX_FIELDS][64];
+	char field_types[MAX_FIELDS][64]; /* per-field type name: "Int" or an aggregate type name */
 	int nfields;
 };
 
@@ -666,20 +679,28 @@ struct DataDecl {
 /* A `union Name = { A, B, C }` declaration. M1.1 handles ALL-nullary members — a pure
  * enum: each member is a fresh tag, and the union lowers to a plain integer tag
  * (type_system §8.4; seed_subset §7). The member names are stored qualified-only
- * (reached as `Name.Member`). Payload members (`M(T)`, `M = { … }`, `M = literal`) and
- * compose-over/spread members are later bricks.
+ * (reached as `Name.Member`). A member may carry a positional payload of Int and/or
+ * aggregate (record/union) fields (G3a); struct-body `M = { … }`/literal members and
+ * compose-over/spread members are later bricks. A payload member whose field is its own
+ * union is an implicit-pointer recursive union (§8.4 sanctions recursive unions), same
+ * throwaway implicit-pointer treatment as a record field (see DataDecl).
  * ⚠ THROWAWAY layout (like the record/Str layouts): member i gets tag i by declaration
- * order, and a boxed union is `[tag:w @0][Int field @4+i*4]`, size 4+maxarity*4. type_system
- * §8.4 fixes only the *shape* (all-tag→int, else tag+payload aggregate) and hands the actual
- * tag assignment, tag width, field offsets/packing, and cross-sub/superset consistency to the
- * M6/M9 representation gate — cf0 must not inherit these specific bytes or 0..n-by-order tags. */
+ * order, and a boxed union is `[tag @0][field @8+i*8]` in UNIFORM 8-byte slots (a word
+ * field in the low half of its slot, an aggregate field an 8-byte pointer), size
+ * 8+maxarity*8. type_system §8.4 fixes only the *shape* (all-tag→int, else tag+payload
+ * aggregate) and hands the actual tag assignment, tag width, field offsets/packing, and
+ * cross-sub/superset consistency to the M6/M9 representation gate — cf0 must not inherit
+ * these specific bytes, the uniform-8 slotting, or the 0..n-by-order tags. */
 struct UnionDecl {
 	char name[64];
 	char members[MAX_UNION_MEMBERS][64];
-	int arity[MAX_UNION_MEMBERS]; /* positional Int-payload field count per member (0 = nullary) */
+	int arity[MAX_UNION_MEMBERS]; /* positional payload field count per member (0 = nullary) */
+	/* Per-member, per-field payload type name: "Int" or an aggregate (record/union) type
+	 * (G3a — a member may carry aggregate payloads, incl. its own union → a boxed tree). */
+	char payload_types[MAX_UNION_MEMBERS][MAX_ARM_ALTS][64];
 	int nmembers;
 	int has_payload; /* 1 if any member carries a payload → a boxed tag+payload union */
-	int size;        /* boxed-union aggregate size: 4 (tag) + max member arity * 4 */
+	int size;        /* boxed-union aggregate size, UNIFORM 8-byte slots: 8 (tag) + max arity * 8 */
 };
 
 /* Tag (0-based declaration index) of a member by name, or -1 if the union has none. */
@@ -707,8 +728,11 @@ static int param_is_word(const Param *p) {
 	return p->kind == PK_WORD || (p->kind == PK_UNION && !p->uni->has_payload);
 }
 
-/* The byte offset / size for the all-Int M0 record layout. */
-static int data_size(const DataDecl *d) { return d->nfields * 4; }
+/* Record layout — uniform 8-byte slots (G3a): field i at byte offset i*8, size nfields*8.
+ * A boxed union puts its tag in the first slot, so payload field i sits at 8 + i*8. */
+static int data_size(const DataDecl *d) { return d->nfields * 8; }
+static int data_field_offset(int idx) { return idx * 8; }
+static int union_payload_offset(int fieldidx) { return 8 + fieldidx * 8; }
 
 /* Index of a field by name, or -1 if the record has no such field. */
 static int data_field_index(const DataDecl *d, const char *name) {
@@ -742,7 +766,7 @@ typedef struct Func {
 	/* Match-arm payload bindings currently in scope (a stack, pushed/popped around each
 	 * binding arm's body during typecheck; nested matches nest). `next_bind_id` mints a
 	 * per-function unique storage id (`%pb<id>`). */
-	struct { char name[64]; int id; } abinds[64];
+	struct { char name[64]; int id; Type type; } abinds[64];
 	int nabinds;
 	int next_bind_id;
 	Stmt *body;             /* the statement/expression body — NULL for an asm function */
@@ -827,6 +851,31 @@ static void prog_add_union(Program *prog, UnionDecl *u) {
 	prog->unions[prog->nunions++] = u;
 }
 
+/* Resolve a concrete field/payload type name to a Type (G3a): "Int" or an aggregate
+ * (a `data` record or a `union`). A record and a boxed union are pointer-repr; an Int
+ * and a tag-only union are word-repr (see type_is_word). Dies if the name is unknown. */
+static Type resolve_member_type(Program *prog, const char *name, int line) {
+	if (strcmp(name, "Int") == 0)
+		return (Type){TY_INT, NULL, NULL};
+	UnionDecl *u = prog_find_union(prog, name);
+	if (u)
+		return (Type){TY_UNION, NULL, u};
+	DataDecl *d = prog_find_data(prog, name);
+	if (d)
+		return (Type){TY_RECORD, d, NULL};
+	char msg[128];
+	snprintf(msg, sizeof msg, "unknown field/payload type `%s`", name);
+	die(line, msg);
+}
+
+/* The Type of record field `idx` / union member `tag` payload field `fieldidx`. */
+static Type data_field_type(Program *prog, const DataDecl *d, int idx) {
+	return resolve_member_type(prog, d->field_types[idx], 0);
+}
+static Type union_payload_type(Program *prog, const UnionDecl *u, int tag, int fieldidx) {
+	return resolve_member_type(prog, u->payload_types[tag][fieldidx], 0);
+}
+
 /* How a name resolves in a function's scope. */
 typedef enum {
 	R_NONE,  /* undefined */
@@ -866,6 +915,17 @@ static int find_active_bind(Func *fn, const char *name) {
 	for (int i = fn->nabinds - 1; i >= 0; i--)
 		if (strcmp(fn->abinds[i].name, name) == 0)
 			return fn->abinds[i].id;
+	return -1;
+}
+
+/* Like find_active_bind, but also yields the binding's type (set at typecheck time,
+ * when the payload field type is known). Used by typeof_expr to type a bound name. */
+static int find_active_bind_type(Func *fn, const char *name, Type *ty) {
+	for (int i = fn->nabinds - 1; i >= 0; i--)
+		if (strcmp(fn->abinds[i].name, name) == 0) {
+			*ty = fn->abinds[i].type;
+			return fn->abinds[i].id;
+		}
 	return -1;
 }
 
@@ -1939,12 +1999,37 @@ static Func *parse_func(Parser *p, Program *prog) {
 	return fn;
 }
 
+/* Parse a field/payload type (G3a) into `out`: `Int` or an aggregate (a `data` record
+ * or a `union`) type name. The name is validated (declared) later, so forward and
+ * mutually-recursive references resolve. Generic type variables (`'T`) and generic
+ * applications (`Box[Int]`) are a later brick (G3b), rejected here with a clear message;
+ * so are pointers, buffers, Uarch and Str (not field/payload types in cfcc). */
+static void parse_member_type(Parser *p, char *out, size_t cap) {
+	Token *t = peek(p);
+	if (t->kind == TK_STAR)
+		die(t->line, "a field/payload type is `Int` or a record/union type, not a pointer");
+	if (t->kind == TK_LBRACKET)
+		die(t->line, "a field/payload type is `Int` or a record/union type, not an array/buffer");
+	if (is_tyvar(t))
+		die(t->line, "a generic field/payload type variable is a later brick (G3b)");
+	if (!is_type_ident(t))
+		die(t->line, "a field/payload type is `Int` or a record/union type name");
+	if (t->text[t->len - 1] == '!')
+		die(t->line, "M0 does not support `!` in a type name");
+	if (is_ident(t, "Uarch") || is_ident(t, "Str"))
+		die(t->line, "a field/payload type is `Int` or a record/union type (not Uarch/Str)");
+	tok_copy(t, out, cap);
+	advance(p);
+	if (peek(p)->kind == TK_LBRACKET)
+		die(peek(p)->line, "a generic type application in a field/payload is a later brick (G3b)");
+}
+
 /* data_decl   = "data" type_name "=" record_body
  * record_body = "{" [ field_decl { "," field_decl } [ "," ] ] "}"
- * field_decl  = "Int" var_name
- * M0 records are a flat set of Int fields on one line (no generics, spread,
- * defaults, non-Int/nested fields, or interior newlines — all later increments),
- * with at least one field so the record is never zero-sized. */
+ * field_decl  = member_type var_name
+ * A record is a flat set of fields on one line (no generics, spread, defaults, or
+ * interior newlines — all later increments), with at least one field so the record is
+ * never zero-sized. A field is an `Int` or an aggregate (record/union) type (G3a). */
 static DataDecl *parse_data_decl(Parser *p, Program *prog) {
 	advance(p); /* `data` */
 	Token *nm = peek(p);
@@ -1969,9 +2054,8 @@ static DataDecl *parse_data_decl(Parser *p, Program *prog) {
 			Token *ty = peek(p);
 			if (ty->kind == TK_DOT)
 				die(ty->line, "M0 records do not support `...` spread");
-			if (!is_ident(ty, "Int"))
-				die(ty->line, "M0 record fields must be `Int`");
-			advance(p);
+			char ftype[64];
+			parse_member_type(p, ftype, sizeof ftype);
 			Token *f = peek(p);
 			if (f->kind != TK_IDENT || is_type_ident(f))
 				die(f->line, "expected a field name");
@@ -1986,7 +2070,9 @@ static DataDecl *parse_data_decl(Parser *p, Program *prog) {
 				die(f->line, "duplicate field name");
 			if (d->nfields == MAX_FIELDS)
 				die(f->line, "too many fields");
-			snprintf(d->fields[d->nfields++], sizeof d->fields[0], "%s", fname);
+			snprintf(d->field_types[d->nfields], sizeof d->field_types[0], "%s", ftype);
+			snprintf(d->fields[d->nfields], sizeof d->fields[0], "%s", fname);
+			d->nfields++;
 			if (peek(p)->kind == TK_COMMA) {
 				advance(p);
 				if (peek(p)->kind == TK_RBRACE) /* trailing comma */
@@ -2038,23 +2124,26 @@ static UnionDecl *parse_union_decl(Parser *p, Program *prog) {
 			char mname[64];
 			tok_copy(m, mname, sizeof mname);
 			advance(p);
-			/* Optional positional Int payload: `Member(Int, Int, …)`. No parens = a
-			 * nullary tag. (Struct-body `= { … }`/literal payloads, and non-Int payload
-			 * types, are later bricks.) */
+			/* Cap the member count BEFORE the payload loop writes payload_types[nmembers][…]
+			 * (and arity[nmembers] below), so a 65th member cannot overrun the row array. */
+			if (u->nmembers == MAX_UNION_MEMBERS)
+				die(m->line, "too many union members");
+			/* Optional positional payload: `Member(Int, Point, …)`. No parens = a nullary
+			 * tag. Each payload field is an `Int` or an aggregate (record/union) type (G3a).
+			 * (Struct-body `= { … }`/literal payloads are later bricks.) */
 			int arity = 0;
 			if (peek(p)->kind == TK_LPAREN) {
 				advance(p); /* ( */
 				if (peek(p)->kind == TK_RPAREN)
 					die(peek(p)->line, "an empty payload `()` — write a nullary member as just its name");
 				for (;;) {
-					Token *ft = peek(p);
-					if (!is_ident(ft, "Int"))
-						die(ft->line, "M1.2a union payload fields must be `Int` (other payload types are later bricks)");
-					advance(p);
 					/* Capped at MAX_ARM_ALTS so any declarable member is bindable in a
 					 * match arm (which holds up to MAX_ARM_ALTS binding names). */
 					if (arity == MAX_ARM_ALTS)
-						die(ft->line, "a union member has at most 16 payload fields (M1)");
+						die(peek(p)->line, "a union member has at most 16 payload fields (M1)");
+					char pt[64];
+					parse_member_type(p, pt, sizeof pt);
+					snprintf(u->payload_types[u->nmembers][arity], sizeof u->payload_types[0][0], "%s", pt);
 					arity++;
 					if (peek(p)->kind == TK_COMMA) {
 						advance(p);
@@ -2072,8 +2161,6 @@ static UnionDecl *parse_union_decl(Parser *p, Program *prog) {
 				die(m->line, "M1.2a does not support compose-over members (a bare member naming an existing type)");
 			if (union_member_tag(u, mname) >= 0)
 				die(m->line, "duplicate union member");
-			if (u->nmembers == MAX_UNION_MEMBERS)
-				die(m->line, "too many union members");
 			u->arity[u->nmembers] = arity;
 			snprintf(u->members[u->nmembers++], sizeof u->members[0], "%s", mname);
 			skip_newlines(p);
@@ -2098,7 +2185,7 @@ static UnionDecl *parse_union_decl(Parser *p, Program *prog) {
 		if (u->arity[i] > maxarity)
 			maxarity = u->arity[i];
 	}
-	u->size = 4 + maxarity * 4;
+	u->size = 8 + maxarity * 8;
 	return u;
 }
 
@@ -2427,6 +2514,39 @@ static void expect_int(Program *prog, Func *fn, Expr *e) {
 		             "and a string only via `.len`, in M0)");
 }
 
+/* Check that value `val` matches an expected field/payload type `want` (G3a). An Int
+ * field wants an Int; a record field wants that record — and NOT a bare record variable,
+ * whose arena pointer the field would alias (an aggregate copy needs an explicit `copy`,
+ * memory_model §6; a `union` value is immutable so aliasing it is sound). */
+static void check_member_value(Program *prog, Func *fn, Expr *val, Type want, int line) {
+	Type at = typeof_expr(prog, fn, val);
+	if (want.kind == TY_INT) {
+		if (at.kind != TY_INT)
+			die(line, "expected an Int value for this field/payload");
+	} else if (want.kind == TY_RECORD) {
+		if (at.kind != TY_RECORD || at.rec != want.rec)
+			die(line, "field/payload type mismatch (record type differs)");
+		/* A record field/payload must be a FRESH value. Only a record-returning call (or a
+		 * data literal) allocates one; a bare variable, a field access (`rec.p`), a match/if
+		 * result, etc. would alias existing MUTABLE record storage — memory_model §6 forbids
+		 * a second binding without an explicit `copy`. Allowlist the fresh producers rather
+		 * than blocklisting one form, so newly-reachable alias shapes stay closed. */
+		if (val->kind != EX_CALL && val->kind != EX_RECORD)
+			die(line, "a record field/payload must be a fresh value (a record-returning call), "
+			          "not an alias of existing storage (an aggregate copy needs an explicit copy — not in M0)");
+	} else if (want.kind == TY_UNION) {
+		if (at.kind != TY_UNION || at.uni != want.uni)
+			die(line, "field/payload type mismatch (union type differs)");
+		/* A union value may be a bare variable here — cfcc unions are IMMUTABLE (no union
+		 * field-mutation path), so aliasing one is unobservable and sound. ⚠ THROWAWAY: cf0
+		 * must NOT inherit this — it rehomes/copies an aggregate payload like any aggregate
+		 * (memory_model §6); the bare-union-var alias is a genesis shortcut leaning on M0
+		 * union immutability. */
+	} else {
+		die(line, "unsupported field/payload type");
+	}
+}
+
 /* Compute and validate the type of an expression, resolving field accesses and
  * calls against the whole program (so forward references and recursion work).
  * Field accesses are annotated in place (rec, foff) for emit. The public entry is
@@ -2440,11 +2560,12 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 	case EX_VAR: {
 		/* A match-arm payload binding shadows params/locals; its value is an Int read
 		 * from the `%pb<id>` storage temp (loaded at the arm block). */
-		int bid = find_active_bind(fn, e->name);
+		Type bt;
+		int bid = find_active_bind_type(fn, e->name, &bt);
 		if (bid >= 0) {
 			e->is_bind = 1;
 			e->bind_id = bid;
-			return (Type){TY_INT, NULL, NULL};
+			return bt; /* Int for a word payload; a record/union type for an aggregate payload */
 		}
 		Type ty;
 		if (resolve_name(fn, e->name, &ty) == R_NONE)
@@ -2470,8 +2591,8 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		if (idx < 0)
 			die(e->line, "this data type has no such field");
 		e->rec = base.rec;
-		e->foff = idx * 4; /* all M0 fields are 4-byte Int */
-		return (Type){TY_INT, NULL, NULL};
+		e->foff = data_field_offset(idx);
+		return data_field_type(prog, base.rec, idx); /* Int or an aggregate field type */
 	}
 	case EX_RECORD:
 		die(e->line, "a record literal may only initialize a record-typed binding");
@@ -2540,7 +2661,7 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		if (e->nargs != u->arity[tag])
 			die(e->line, "union member payload arity mismatch");
 		for (int i = 0; i < e->nargs; i++)
-			expect_int(prog, fn, e->args[i]); /* M1.2a payloads are Int */
+			check_member_value(prog, fn, e->args[i], union_payload_type(prog, u, tag, i), e->line);
 		e->uni = u;
 		e->ival = tag; /* the member's tag */
 		return (Type){TY_UNION, NULL, u};
@@ -2584,6 +2705,10 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 					if (a->nbinds != u->arity[tag])
 						die(a->line, "payload pattern arity does not match the member");
 					for (int b = 0; b < a->nbinds; b++) {
+						/* A payload field's type (Int or an aggregate) sets the bound name's
+						 * type and repr — a word (Int/tag-only union) or a pointer. */
+						Type pt = union_payload_type(prog, u, tag, b);
+						a->bind_word[b] = type_is_word(pt);
 						if (strcmp(a->binds[b], "_") == 0) {
 							a->bind_ids[b] = -1;
 							continue;
@@ -2597,6 +2722,7 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 						a->bind_ids[b] = id;
 						snprintf(fn->abinds[fn->nabinds].name, sizeof fn->abinds[0].name, "%s", a->binds[b]);
 						fn->abinds[fn->nabinds].id = id;
+						fn->abinds[fn->nabinds].type = pt;
 						fn->nabinds++;
 					}
 				}
@@ -2703,7 +2829,7 @@ static void resolve_record_binding(Program *prog, Func *fn, Stmt *s) {
 			die(e->line, "no such field on this data type");
 		if (e->ford[idx])
 			die(e->line, "field set more than once in the data literal");
-		expect_int(prog, fn, e->fvals[k]);
+		check_member_value(prog, fn, e->fvals[k], data_field_type(prog, d, idx), e->line);
 		e->ford[idx] = e->fvals[k];
 	}
 	for (int i = 0; i < d->nfields; i++)
@@ -2720,8 +2846,13 @@ static void resolve_record_expr_binding(Program *prog, Func *fn, Stmt *s) {
 	DataDecl *d = prog_find_data(prog, s->type_name);
 	if (!d)
 		die(s->line, "unknown data type");
-	if (s->expr->kind == EX_VAR)
-		die(s->line, "cannot bind a record from another record (an aggregate copy needs an explicit copy — not in M0)");
+	/* Only a record-returning call produces a fresh record in expression position; a bare
+	 * variable OR a field access (`rec.p`, now that a field may be a record) would alias
+	 * existing storage — an aggregate copy needs an explicit copy (memory_model §6). (A data
+	 * literal takes the resolve_record_binding path.) */
+	if (s->expr->kind != EX_CALL)
+		die(s->line, "a record binding's initializer must be a fresh record (a record-returning call); "
+		             "aliasing existing record storage needs an explicit copy — not in M0");
 	Type it = typeof_expr(prog, fn, s->expr);
 	if (it.kind != TY_RECORD || it.rec != d)
 		die(s->line, "initializer type does not match the record binding");
@@ -2773,8 +2904,8 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 			int idx = data_field_index(ty.rec, s->field);
 			if (idx < 0)
 				die(s->line, "this data type has no such field");
-			s->foff = idx * 4;
-			expect_int(prog, fn, s->expr);
+			s->foff = data_field_offset(idx);
+			check_member_value(prog, fn, s->expr, data_field_type(prog, ty.rec, idx), s->line);
 			break;
 		}
 		case ST_ASSIGN: /* target is a `let` word local; value is Int */
@@ -2872,6 +3003,19 @@ static void resolve_signatures(Program *prog) {
 
 static void typecheck(Program *prog) {
 	resolve_signatures(prog);
+	/* Every field/payload type must name Int or a declared aggregate (G3a). Validate up
+	 * front so an unused bad field type is still an error, and forward/mutual refs resolve. */
+	for (int i = 0; i < prog->ndatas; i++) {
+		DataDecl *d = prog->datas[i];
+		for (int j = 0; j < d->nfields; j++)
+			resolve_member_type(prog, d->field_types[j], 0);
+	}
+	for (int i = 0; i < prog->nunions; i++) {
+		UnionDecl *u = prog->unions[i];
+		for (int m = 0; m < u->nmembers; m++)
+			for (int j = 0; j < u->arity[m]; j++)
+				resolve_member_type(prog, u->payload_types[m][j], 0);
+	}
 	for (int i = 0; i < prog->nfuncs; i++)
 		if (prog->funcs[i]->ntyparams == 0) /* skip generic templates (only clones checked) */
 			check_func(prog, prog->funcs[i]);
@@ -3052,23 +3196,27 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 			snprintf(dst, cap, "%%t%d", r);
 			return;
 		}
-		/* Read a record field. The base is a record-typed name — a local or a
-		 * parameter — whose base pointer is `%r_<name>`; the field sits at byte
-		 * offset e->foff. (M0 field bases are always a name; a field of a call result
-		 * is reached by binding it to a local first — record-returning exprs are 2b.) */
-		if (e->lhs->kind != EX_VAR)
-			die(e->line, "internal: M0 field base is not a name");
+		/* Read a record field. Emit the base to its pointer operand (a record VAR is
+		 * `%r_<name>`, a bound aggregate payload is `%pb<id>`, a record-returning call or a
+		 * chained field access is a temp), add the field offset, then load a word (an Int
+		 * or tag-only union field) or an 8-byte pointer (an aggregate field — itself a
+		 * record/boxed-union value). This handles any base, so nested `a.b.c` works. */
+		char base[96];
+		emit_expr(out, e->lhs, ex, base, sizeof base);
+		char addr[96];
 		if (e->foff == 0) {
-			int t = ex->tmp++;
-			fprintf(out, "\t%%t%d =w loadw %%r_%s\n", t, e->lhs->name);
-			snprintf(dst, cap, "%%t%d", t);
+			snprintf(addr, sizeof addr, "%s", base);
 		} else {
 			int a = ex->tmp++;
-			fprintf(out, "\t%%t%d =l add %%r_%s, %d\n", a, e->lhs->name, e->foff);
-			int t = ex->tmp++;
-			fprintf(out, "\t%%t%d =w loadw %%t%d\n", t, a);
-			snprintf(dst, cap, "%%t%d", t);
+			fprintf(out, "\t%%t%d =l add %s, %d\n", a, base, e->foff);
+			snprintf(addr, sizeof addr, "%%t%d", a);
 		}
+		int t = ex->tmp++;
+		if (type_is_word(e->rtype))
+			fprintf(out, "\t%%t%d =w loadw %s\n", t, addr);
+		else
+			fprintf(out, "\t%%t%d =l loadl %s\n", t, addr);
+		snprintf(dst, cap, "%%t%d", t);
 		return;
 	}
 	case EX_RECORD:
@@ -3116,16 +3264,20 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 			return;
 		}
 		/* A boxed union member: bump-allocate the tag+payload aggregate, store the tag
-		 * at offset 0 and each Int payload field at 4 + i*4. Yields the arena pointer. */
+		 * at offset 0 and each payload field at 8 + i*8 (word or pointer). Yields the arena pointer. */
 		int p = ex->tmp++;
 		fprintf(out, "\t%%t%d =l call $cf_alloc(w %d)\n", p, e->uni->size);
-		fprintf(out, "\tstorew %ld, %%t%d\n", e->ival, p);
+		fprintf(out, "\tstorew %ld, %%t%d\n", e->ival, p); /* tag in the first slot */
 		for (int i = 0; i < e->nargs; i++) {
 			char a[96];
 			emit_expr(out, e->args[i], ex, a, sizeof a);
 			int fa = ex->tmp++;
-			fprintf(out, "\t%%t%d =l add %%t%d, %d\n", fa, p, 4 + i * 4);
-			fprintf(out, "\tstorew %s, %%t%d\n", a, fa);
+			fprintf(out, "\t%%t%d =l add %%t%d, %d\n", fa, p, union_payload_offset(i));
+			/* An Int/tag-only-union payload is a word; a record/boxed-union payload is a pointer. */
+			if (type_is_word(e->args[i]->rtype))
+				fprintf(out, "\tstorew %s, %%t%d\n", a, fa);
+			else
+				fprintf(out, "\tstorel %s, %%t%d\n", a, fa);
 		}
 		snprintf(dst, cap, "%%t%d", p);
 		return;
@@ -3169,13 +3321,17 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 					fprintf(out, "\tjnz %%t%d, @marm%d, @mnext%d\n", c, hit, nxt);
 					fprintf(out, "@marm%d\n", hit);
 					/* Load each bound payload field into its `%pb<id>` temp (the scrutinee
-					 * `sc` is the boxed union's pointer; field b is at 4 + b*4). */
+					 * `sc` is the boxed union's pointer; field b sits at 8 + b*8). */
 					for (int bi = 0; bi < a->nbinds; bi++) {
 						if (a->bind_ids[bi] < 0) /* `_` */
 							continue;
 						int addr = ex->tmp++;
-						fprintf(out, "\t%%t%d =l add %s, %d\n", addr, sc, 4 + bi * 4);
-						fprintf(out, "\t%%pb%d =w loadw %%t%d\n", a->bind_ids[bi], addr);
+						fprintf(out, "\t%%t%d =l add %s, %d\n", addr, sc, union_payload_offset(bi));
+						/* Load a word (Int/tag-only union) or an 8-byte pointer (aggregate). */
+						if (a->bind_word[bi])
+							fprintf(out, "\t%%pb%d =w loadw %%t%d\n", a->bind_ids[bi], addr);
+						else
+							fprintf(out, "\t%%pb%d =l loadl %%t%d\n", a->bind_ids[bi], addr);
 					}
 					char b[96];
 					emit_expr(out, a->body, ex, b, sizeof b);
@@ -3325,12 +3481,14 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 				for (int fi = 0; fi < d->nfields; fi++) {
 					char fv[96];
 					emit_expr(out, s->expr->ford[fi], ex, fv, sizeof fv);
+					/* An Int/tag-only-union field stores a word; an aggregate field a pointer. */
+					const char *st = type_is_word(s->expr->ford[fi]->rtype) ? "storew" : "storel";
 					if (fi == 0) {
-						fprintf(out, "\tstorew %s, %%r_%s\n", fv, s->name);
+						fprintf(out, "\t%s %s, %%r_%s\n", st, fv, s->name);
 					} else {
 						int a = ex->tmp++;
-						fprintf(out, "\t%%t%d =l add %%r_%s, %d\n", a, s->name, fi * 4);
-						fprintf(out, "\tstorew %s, %%t%d\n", fv, a);
+						fprintf(out, "\t%%t%d =l add %%r_%s, %d\n", a, s->name, data_field_offset(fi));
+						fprintf(out, "\t%s %s, %%t%d\n", st, fv, a);
 					}
 				}
 			} else if (s->expr->rtype.kind == TY_RECORD ||
@@ -3360,11 +3518,11 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 			 * (`%r_<name>`) at the field's offset. */
 			emit_expr(out, s->expr, ex, v, sizeof v);
 			if (s->foff == 0) {
-				fprintf(out, "\tstorew %s, %%r_%s\n", v, s->name);
+				fprintf(out, "\t%s %s, %%r_%s\n", type_is_word(s->expr->rtype) ? "storew" : "storel", v, s->name);
 			} else {
 				int a = ex->tmp++;
 				fprintf(out, "\t%%t%d =l add %%r_%s, %d\n", a, s->name, s->foff);
-				fprintf(out, "\tstorew %s, %%t%d\n", v, a);
+				fprintf(out, "\t%s %s, %%t%d\n", type_is_word(s->expr->rtype) ? "storew" : "storel", v, a);
 			}
 			break;
 		case ST_RETURN:
