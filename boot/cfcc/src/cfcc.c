@@ -677,6 +677,7 @@ struct DataDecl {
 	/* Generic type parameters (`data Pair['A,'B]`): ntyparams > 0 = a TEMPLATE, never laid
 	 * out or emitted — cloned + substituted per concrete type-argument tuple (G3b). */
 	char typarams[MAX_TYPARAMS][64];
+	char bounds[MAX_TYPARAMS][64]; /* per-typaram generic bound (a union name), or "" = unbounded */
 	int ntyparams;
 };
 
@@ -702,6 +703,7 @@ struct UnionDecl {
 	char base_name[64];   /* the un-mangled template name (== name for a non-generic decl);
 	                       * a match arm qualifies members by this (`Maybe.Just`, not the mangle) */
 	char typarams[MAX_TYPARAMS][64]; /* generic type parameters; ntyparams > 0 = a TEMPLATE */
+	char bounds[MAX_TYPARAMS][64];   /* per-typaram generic bound (a union name), or "" = unbounded */
 	int ntyparams;
 	char members[MAX_UNION_MEMBERS][64];
 	int arity[MAX_UNION_MEMBERS]; /* positional payload field count per member (0 = nullary) */
@@ -764,6 +766,7 @@ typedef struct Func {
 	 * tuple by the monomorphization pass. A `'T` appears as a type-name string ("'T") in a
 	 * param/return/local annotation; specialization substitutes it with a concrete type. */
 	char typarams[MAX_TYPARAMS][64];
+	char bounds[MAX_TYPARAMS][64]; /* per-typaram generic bound (a union name), or "" = unbounded */
 	int ntyparams;
 	Param params[MAX_PARAMS];
 	int nparams;
@@ -1867,6 +1870,21 @@ static Stmt *parse_body(Parser *p, Func *fn) {
 	return parse_stmt_seq(p, fn, 1, b->line);
 }
 
+/* Parse an optional generic bound preceding a type variable in a `generic_param`:
+ * `Union 'T` (ebnf `generic_param = type_var | type , type_var`). A leading PascalCase
+ * name is the bound; a leading tick means unbounded. Writes the bound name into `bound`
+ * ("" when unbounded). The bound must name a *union* (type_system §8.5), checked later
+ * against the whole program by check_bound_satisfied — here we only lex the name.
+ * ⚠ cfcc restricts the bound `type` to a bare union NAME; cf0 admits any `type` (incl. a
+ *   generic union application) before the tick. */
+static void parse_optional_bound(Parser *p, char *bound, size_t cap) {
+	bound[0] = '\0';
+	if (is_type_ident(peek(p))) { /* a PascalCase name before the tick — a bound */
+		tok_copy(peek(p), bound, cap);
+		advance(p);
+	}
+}
+
 /* declaration = [ "pub" ] "const" var_name "=" "(" [ param { "," param } ] ")"
  *               [ "Int" ] "->" body
  * All M0 functions return Int. Params resolve within the function only. */
@@ -1905,12 +1923,16 @@ static Func *parse_func(Parser *p, Program *prog) {
 	if (peek(p)->kind == TK_LBRACKET) {
 		advance(p); /* [ */
 		for (;;) {
+			char bound[64];
+			parse_optional_bound(p, bound, sizeof bound); /* optional `Union 'T` bound */
 			Token *tv = peek(p);
 			if (!is_tyvar(tv))
-				die(tv->line, "expected a type variable (e.g. `'T`) in the generic parameter list");
+				die(tv->line, bound[0] ? "expected a type variable (e.g. `'T`) after the bound"
+				                       : "expected a type variable (e.g. `'T`) in the generic parameter list");
 			if (fn->ntyparams == MAX_TYPARAMS)
 				die(tv->line, "too many type parameters");
 			tok_copy(tv, fn->typarams[fn->ntyparams], sizeof fn->typarams[0]);
+			snprintf(fn->bounds[fn->ntyparams], sizeof fn->bounds[0], "%s", bound);
 			for (int j = 0; j < fn->ntyparams; j++)
 				if (strcmp(fn->typarams[j], fn->typarams[fn->ntyparams]) == 0)
 					die(tv->line, "duplicate type parameter");
@@ -2079,24 +2101,29 @@ static void parse_member_type(Parser *p, char *out, size_t cap) {
 		die(t->line, "a field/payload type is `Int`, an aggregate, or `'T` (not Uarch/Str)");
 }
 
-/* Parse an optional generic type-parameter list `['A, 'B, …]` into typarams/ntyparams.
- * Shared by `data` and `union` declarations (functions inline their own copy).
+/* Parse an optional generic type-parameter list `['A, Union 'B, …]` into
+ * typarams/bounds/ntyparams. Shared by `data` and `union` declarations (functions inline
+ * their own copy). A `generic_param` is a bare `'T` (unbounded) or `Union 'T` (bounded).
  * ⚠ cf0 must NOT inherit two narrowings here (same family as the function-generics ones):
- * (1) parameters are UNBOUNDED bare `'T` only — ebnf's `generic_param` also admits a bound
- *     (`Union 'V`), which cf0 restores (a bound = union membership, type_system §8.5);
+ * (1) a bound is a bare union NAME only — ebnf's `generic_param` admits any `type` before
+ *     the tick (incl. a generic union application), which cf0 restores (type_system §8.5);
  * (2) `MAX_TYPARAMS` is a throwaway fixed cap, not a language limit. */
-static void parse_typaram_list(Parser *p, char typarams[][64], int *ntyparams) {
+static void parse_typaram_list(Parser *p, char typarams[][64], char bounds[][64], int *ntyparams) {
 	*ntyparams = 0;
 	if (peek(p)->kind != TK_LBRACKET)
 		return;
 	advance(p); /* [ */
 	for (;;) {
+		char bound[64];
+		parse_optional_bound(p, bound, sizeof bound); /* optional `Union 'T` bound */
 		Token *tv = peek(p);
 		if (!is_tyvar(tv))
-			die(tv->line, "expected a type variable (e.g. `'T`) in the generic parameter list");
+			die(tv->line, bound[0] ? "expected a type variable (e.g. `'T`) after the bound"
+			                       : "expected a type variable (e.g. `'T`) in the generic parameter list");
 		if (*ntyparams == MAX_TYPARAMS)
 			die(tv->line, "too many type parameters");
 		tok_copy(tv, typarams[*ntyparams], 64);
+		snprintf(bounds[*ntyparams], 64, "%s", bound);
 		for (int j = 0; j < *ntyparams; j++)
 			if (strcmp(typarams[j], typarams[*ntyparams]) == 0)
 				die(tv->line, "duplicate type parameter");
@@ -2151,7 +2178,7 @@ static DataDecl *parse_data_decl(Parser *p, Program *prog) {
 	advance(p);
 	if (prog_find_data(prog, d->name) || prog_find_union(prog, d->name))
 		die(nm->line, "type already defined");
-	parse_typaram_list(p, d->typarams, &d->ntyparams); /* optional `['A, 'B]` (generic data, G3b) */
+	parse_typaram_list(p, d->typarams, d->bounds, &d->ntyparams); /* optional `['A, Union 'B]` (generic data, G3b) */
 	expect(p, TK_EQ, "expected `=`");
 	if (peek(p)->kind != TK_LBRACE)
 		die(peek(p)->line, "M0 `data` must have a record body `{ Int field, ... }`");
@@ -2217,7 +2244,7 @@ static UnionDecl *parse_union_decl(Parser *p, Program *prog) {
 	advance(p);
 	if (prog_find_union(prog, u->name) || prog_find_data(prog, u->name))
 		die(nm->line, "type already defined");
-	parse_typaram_list(p, u->typarams, &u->ntyparams); /* optional `['V]` (generic union, G3b) */
+	parse_typaram_list(p, u->typarams, u->bounds, &u->ntyparams); /* optional `['V, Union 'W]` (generic union, G3b) */
 	expect(p, TK_EQ, "expected `=`");
 	expect(p, TK_LBRACE, "expected `{` (a union body is `{ Member, ... }`)");
 	skip_newlines(p);
@@ -2538,6 +2565,32 @@ static void reclassify_param(Param *p, const char *concrete, int line) {
  * depth — an over-long name is a clean error, never an overflow) are genesis-only limits. */
 static void concretize_name(Program *prog, char *name, int line); /* forward (mutual) */
 
+/* Enforce a generic bound (type_system §8.5) at instantiation. `bound` is "" (unbounded)
+ * or the union named in `[Union 'T]`; `arg` is the concrete type-argument name. A bound
+ * must name a declared *union* ("constraints are unions") and — since cfcc has no
+ * compose-over unions (no member types) — the only type that reflexively satisfies it is
+ * the union itself, so bound satisfaction is `arg == bound`. Consistent with cfcc's
+ * per-instantiation checking: an unused template's bound is not checked (its body is not
+ * typechecked either). ⚠ cf0 does real union-membership + sub-union subsumption (§8.2);
+ * this reflexive-only rule is the disclaimed genesis narrowing.
+ * ⚠ cf0 must NOT inherit a second narrowing: cfcc has no std numeric unions (§8.6) —
+ *   `Int`/`Uarch`/`Str`/`Uint8` are builtins and `Uint`/`Float`/`Number` are absent — so the
+ *   spec's canonical bounds `[Int 'T]`/`[Number 'T]` are NOT valid bounds here (they error
+ *   "not a union"). cf0 restores Int/Uint/Float/Number as unions and accepts those bounds. */
+static void check_bound_satisfied(Program *prog, const char *bound, const char *arg, int line) {
+	if (bound[0] == '\0')
+		return; /* unbounded `'T` — any type argument */
+	char msg[320];
+	if (!prog_find_union(prog, bound)) {
+		snprintf(msg, sizeof msg, "a generic bound must name a union type (`%s` is not a union)", bound);
+		die(line, msg);
+	}
+	if (strcmp(arg, bound) != 0) {
+		snprintf(msg, sizeof msg, "type argument `%s` does not satisfy the bound `%s`", arg, bound);
+		die(line, msg);
+	}
+}
+
 static void instantiate_type(Program *prog, const char *mangled, int line) {
 	if (prog_find_data(prog, mangled) || prog_find_union(prog, mangled))
 		return; /* already instantiated (dedup / register-before-concretize recursion guard) */
@@ -2566,6 +2619,8 @@ static void instantiate_type(Program *prog, const char *mangled, int line) {
 	if (dt && dt->ntyparams > 0) {
 		if (arity != dt->ntyparams)
 			die(line, "wrong number of type arguments for this generic data type");
+		for (int k = 0; k < arity; k++)
+			check_bound_satisfied(prog, dt->bounds[k], args[k], line);
 		if (strlen(mangled) >= sizeof dt->name)
 			die(line, "instantiated type name too long");
 		DataDecl *c = xmalloc(sizeof *c);
@@ -2584,6 +2639,8 @@ static void instantiate_type(Program *prog, const char *mangled, int line) {
 	} else if (ut && ut->ntyparams > 0) {
 		if (arity != ut->ntyparams)
 			die(line, "wrong number of type arguments for this generic union type");
+		for (int k = 0; k < arity; k++)
+			check_bound_satisfied(prog, ut->bounds[k], args[k], line);
 		if (strlen(mangled) >= sizeof ut->name)
 			die(line, "instantiated type name too long");
 		UnionDecl *c = xmalloc(sizeof *c);
@@ -2649,6 +2706,8 @@ static void concretize_signature(Program *prog, Func *fn) {
 static Func *instantiate(Program *prog, Func *tmpl, char typeargs[][64], int nargs, int line) {
 	if (nargs != tmpl->ntyparams)
 		die(line, "wrong number of type arguments for this generic function");
+	for (int i = 0; i < nargs; i++)
+		check_bound_satisfied(prog, tmpl->bounds[i], typeargs[i], line);
 	/* Mangle `name.Arg.Arg…` — a `.` can't occur in a cfcc identifier, so a clone name
 	 * can never collide with a user function (throwaway scheme; see the section note). */
 	char mangled[256];
