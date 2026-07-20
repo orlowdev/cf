@@ -497,14 +497,17 @@ typedef enum {
 
 typedef struct Expr Expr;
 
-/* One arm of a `match`. A tag-only arm names a member of the scrutinee's union
- * (`is_wild` = 0, `member` set, `tag` resolved in typecheck) or is the `_` wildcard
- * (`is_wild` = 1). `body` is the arm's value expression. */
+#define MAX_ARM_ALTS 16
+
+/* One arm of a `match`. Either the `_` wildcard (`is_wild`) or an or-pattern of one
+ * or more member alternatives (`A | B | …`), all qualified by the scrutinee's union
+ * (`qual`). Each alternative names a member; its tag is resolved in typecheck. */
 typedef struct {
-	char qual[64];   /* the written union qualifier: `Union` in `Union.Member` */
-	char member[64];
+	char qual[64];   /* the written union qualifier (shared by all alternatives) */
+	char members[MAX_ARM_ALTS][64];
+	int tags[MAX_ARM_ALTS]; /* per-alternative member tag, resolved in typecheck */
+	int nalts;
 	int is_wild;
-	int tag;    /* member tag (declaration index), resolved in typecheck */
 	Expr *body;
 	int line;
 } MatchArm;
@@ -1207,10 +1210,11 @@ static Expr *parse_if(Parser *p, Func *fn) {
 }
 
 /* match_expr = "match" expr "{" match_arm { "," match_arm } [ "," ] "}"
- * match_arm  = ( "_" | Union "." Member ) "->" expr
- * An expression, like `if` (arms yield values that unify). M1.1 arms are tag-only:
- * a `_` wildcard or a member of the scrutinee's union, qualified (`Color.Red`) — no
- * payload sub-pattern, no literal/binding patterns, no or-patterns (later bricks).
+ * match_arm  = ( "_" | or_pattern ) "->" expr
+ * or_pattern = member { "|" member }      member = Union "." Member
+ * An expression, like `if` (arms yield values that unify). M1 arms are tag-only: a `_`
+ * wildcard, or an or-pattern of one-or-more members of the scrutinee's union, each
+ * qualified (`Color.Red`) — no payload sub-pattern, no literal/binding patterns yet.
  * Interior newlines allowed so arms may span lines. Exhaustiveness + arm typing are
  * checked in the typecheck pass. */
 static Expr *parse_match(Parser *p, Func *fn) {
@@ -1230,20 +1234,41 @@ static Expr *parse_match(Parser *p, Func *fn) {
 		if (is_ident(pt, "_")) {
 			arm.is_wild = 1;
 			advance(p);
+			if (peek(p)->kind == TK_PIPE)
+				die(peek(p)->line, "`_` is a standalone wildcard, not an or-pattern alternative");
 		} else if (is_type_ident(pt)) {
-			/* `Union.Member` — the head is qualified by the scrutinee's union. */
-			tok_copy(pt, arm.qual, sizeof arm.qual);
-			advance(p);
-			expect(p, TK_DOT, "a match arm names a member qualified by its union (`Union.Member`)");
-			Token *mt = peek(p);
-			if (!is_type_ident(mt))
-				die(mt->line, "expected a PascalCase member name after `.`");
-			tok_copy(mt, arm.member, sizeof arm.member);
-			advance(p);
-			if (peek(p)->kind == TK_LPAREN)
-				die(peek(p)->line, "M1.1 match arms are tag-only (no payload binding yet)");
+			/* An or-pattern of one or more `Union.Member` alternatives (`A | B | …`),
+			 * all qualified by the scrutinee's union. */
+			for (;;) {
+				Token *qt = peek(p);
+				if (!is_type_ident(qt))
+					die(qt->line, "expected a `Union.Member` pattern");
+				char q[64];
+				tok_copy(qt, q, sizeof q);
+				advance(p);
+				expect(p, TK_DOT, "a match arm names a member qualified by its union (`Union.Member`)");
+				Token *mt = peek(p);
+				if (!is_type_ident(mt))
+					die(mt->line, "expected a PascalCase member name after `.`");
+				if (arm.nalts == 0)
+					snprintf(arm.qual, sizeof arm.qual, "%s", q);
+				else if (strcmp(q, arm.qual) != 0)
+					die(qt->line, "or-pattern alternatives must all be qualified by the same union");
+				if (arm.nalts == MAX_ARM_ALTS)
+					die(mt->line, "too many or-pattern alternatives");
+				tok_copy(mt, arm.members[arm.nalts], sizeof arm.members[0]);
+				arm.nalts++;
+				advance(p);
+				if (peek(p)->kind == TK_LPAREN)
+					die(peek(p)->line, "M1 match arms are tag-only (no payload binding yet)");
+				if (peek(p)->kind == TK_PIPE) {
+					advance(p);
+					continue;
+				}
+				break;
+			}
 		} else {
-			die(pt->line, "a match arm is `Union.Member` or `_` (M1.1: no literal/binding patterns yet)");
+			die(pt->line, "a match arm is `Union.Member` (or `A | B`) or `_` (M1: no literal/binding patterns yet)");
 		}
 		expect(p, TK_ARROW, "expected `->`");
 		arm.body = parse_expr(p, fn);
@@ -1986,13 +2011,15 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 			} else {
 				if (strcmp(a->qual, u->name) != 0)
 					die(a->line, "a match arm must name a member of the scrutinee's union, qualified by it");
-				int tag = union_member_tag(u, a->member);
-				if (tag < 0)
-					die(a->line, "this union has no such member");
-				if (covered[tag])
-					die(a->line, "duplicate match arm for this member");
-				covered[tag] = 1;
-				a->tag = tag;
+				for (int k = 0; k < a->nalts; k++) {
+					int tag = union_member_tag(u, a->members[k]);
+					if (tag < 0)
+						die(a->line, "this union has no such member");
+					if (covered[tag])
+						die(a->line, "duplicate match arm for this member");
+					covered[tag] = 1;
+					a->tags[k] = tag;
+				}
 			}
 			/* Arm bodies unify to one type — an Int or a tag-only union (both a word);
 			 * that type is the match's value type, so a `match` can yield either. */
@@ -2510,16 +2537,28 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 			MatchArm *a = &e->arms[i];
 			if (a->is_wild)
 				continue;
-			int hit = ex->lbl++, nxt = ex->lbl++;
-			int c = ex->tmp++;
-			fprintf(out, "\t%%t%d =w ceqw %%t%d, %d\n", c, tagt, a->tag);
-			fprintf(out, "\tjnz %%t%d, @marm%d, @mnext%d\n", c, hit, nxt);
-			fprintf(out, "@marm%d\n", hit);
-			char b[96];
-			emit_expr(out, a->body, ex, b, sizeof b);
-			fprintf(out, "\tstorew %s, %%m%d\n", b, e->slot);
-			fprintf(out, "\tjmp @mend%d\n", id);
-			fprintf(out, "@mnext%d\n", nxt); /* falls into the next test, or the default */
+			/* An or-pattern (`A | B | …`) tests each alternative tag in turn; any hit
+			 * jumps to the shared body block, and only when none matches does control
+			 * fall through to the next arm. */
+			int hit = ex->lbl++;
+			for (int k = 0; k < a->nalts; k++) {
+				int c = ex->tmp++;
+				fprintf(out, "\t%%t%d =w ceqw %%t%d, %d\n", c, tagt, a->tags[k]);
+				if (k + 1 < a->nalts) {
+					int altx = ex->lbl++;
+					fprintf(out, "\tjnz %%t%d, @marm%d, @malt%d\n", c, hit, altx);
+					fprintf(out, "@malt%d\n", altx); /* next alternative's test */
+				} else {
+					int nxt = ex->lbl++;
+					fprintf(out, "\tjnz %%t%d, @marm%d, @mnext%d\n", c, hit, nxt);
+					fprintf(out, "@marm%d\n", hit);
+					char b[96];
+					emit_expr(out, a->body, ex, b, sizeof b);
+					fprintf(out, "\tstorew %s, %%m%d\n", b, e->slot);
+					fprintf(out, "\tjmp @mend%d\n", id);
+					fprintf(out, "@mnext%d\n", nxt); /* falls into the next arm, or the default */
+				}
+			}
 		}
 		if (wild >= 0) {
 			char b[96];
