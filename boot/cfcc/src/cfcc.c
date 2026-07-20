@@ -404,6 +404,7 @@ typedef struct {
  * carries a pointer to its declaration, which fixes its fields and layout; the
  * pointer is filled in by the typecheck pass (parse leaves it NULL). */
 typedef struct DataDecl DataDecl;
+typedef struct UnionDecl UnionDecl;
 struct Func; /* forward: an EX_CALL caches its resolved callee for emit */
 
 typedef enum {
@@ -420,11 +421,16 @@ typedef enum {
 	            * writable buffer `read` fills. Named by a local; decays to a `*[Uint8]`
 	            * where a pointer/Uarch is expected. Throwaway: no indexing/bounds, no
 	            * length value (cf0's `[N Uint8]` is a real array). */
+	TY_UNION,  /* a `union` type. M1.1 handles ALL-nullary (tag-only) unions only, which
+	            * lower to a plain integer tag (type_system §8.4) — so a union value is a
+	            * `w`, stored/read like an Int; the union identity (for match) is `uni`.
+	            * Payload unions (tag+aggregate) are a later brick. */
 } TypeKind;
 
 typedef struct {
 	TypeKind kind;
-	DataDecl *rec; /* TY_RECORD: the record's declaration */
+	DataDecl *rec;  /* TY_RECORD: the record's declaration */
+	UnionDecl *uni; /* TY_UNION: the union's declaration */
 } Type;
 
 /* The entry ABI kinds an M0 `main` parameter can take: a word (Int, e.g. argc)
@@ -457,6 +463,8 @@ typedef enum {
 	EX_FIELD, /* record field access: base.name (lhs=base record expr) */
 	EX_RECORD,/* record construction: a data literal { f: v, ... } of type `name` */
 	EX_CALL,  /* function call: name(args) */
+	EX_UMEMBER,/* union member value: Union.Member — a tag-only member's tag (uni, ival=tag) */
+	EX_MATCH, /* match scrut { arms } — compare-chain tag dispatch (lhs=scrut, arms/narms) */
 	EX_IF,    /* if cond then a else b (lhs=cond, rhs=then, els=else) */
 	/* unary (lhs) */
 	EX_NEG,   /* - negate */
@@ -485,6 +493,19 @@ typedef enum {
 } ExprKind;
 
 typedef struct Expr Expr;
+
+/* One arm of a `match`. A tag-only arm names a member of the scrutinee's union
+ * (`is_wild` = 0, `member` set, `tag` resolved in typecheck) or is the `_` wildcard
+ * (`is_wild` = 1). `body` is the arm's value expression. */
+typedef struct {
+	char qual[64];   /* the written union qualifier: `Union` in `Union.Member` */
+	char member[64];
+	int is_wild;
+	int tag;    /* member tag (declaration index), resolved in typecheck */
+	Expr *body;
+	int line;
+} MatchArm;
+
 struct Expr {
 	ExprKind kind;
 	int line;         /* source line (for EX_CALL diagnostics) */
@@ -519,6 +540,13 @@ struct Expr {
 	/* EX_CALL: the resolved callee, cached by typecheck so emit can read each
 	 * parameter's kind (to pick the argument register width and widen an Int→Uarch). */
 	struct Func *callee;
+	/* EX_UMEMBER: `Union.Member`. `name` holds the union type name, `mem` the member
+	 * name (parse); typecheck resolves `uni` and sets `ival` to the member's tag.
+	 * EX_MATCH: `lhs` is the scrutinee; `uni` its union; `arms`/`narms` the arms. */
+	char mem[64];
+	UnionDecl *uni;
+	MatchArm *arms;
+	int narms;
 };
 
 static Expr *new_expr(ExprKind kind) {
@@ -594,6 +622,30 @@ struct DataDecl {
 	int nfields;
 };
 
+#define MAX_UNION_MEMBERS 64
+
+/* A `union Name = { A, B, C }` declaration. M1.1 handles ALL-nullary members — a pure
+ * enum: each member is a fresh tag, and the union lowers to a plain integer tag
+ * (type_system §8.4; seed_subset §7). The member names are stored qualified-only
+ * (reached as `Name.Member`). Payload members (`M(T)`, `M = { … }`, `M = literal`) and
+ * compose-over/spread members are later bricks.
+ * ⚠ THROWAWAY tag *values*: member i gets tag i by declaration order. type_system §8.4
+ * hands actual tag assignment (and cross-sub/superset-union consistency) to the M6/M9
+ * representation gate — cf0 must not treat 0..n-by-order as a stable encoding. */
+struct UnionDecl {
+	char name[64];
+	char members[MAX_UNION_MEMBERS][64];
+	int nmembers;
+};
+
+/* Tag (0-based declaration index) of a member by name, or -1 if the union has none. */
+static int union_member_tag(const UnionDecl *u, const char *name) {
+	for (int i = 0; i < u->nmembers; i++)
+		if (strcmp(u->members[i], name) == 0)
+			return i;
+	return -1;
+}
+
 /* The byte offset / size for the all-Int M0 record layout. */
 static int data_size(const DataDecl *d) { return d->nfields * 4; }
 
@@ -630,6 +682,8 @@ typedef struct Func {
 typedef struct {
 	DataDecl **datas;
 	int ndatas, cap_datas;
+	UnionDecl **unions;
+	int nunions, cap_unions;
 	Func **funcs;
 	int nfuncs, cap_funcs;
 } Program;
@@ -674,6 +728,23 @@ static void prog_add_data(Program *prog, DataDecl *d) {
 	prog->datas[prog->ndatas++] = d;
 }
 
+static UnionDecl *prog_find_union(Program *prog, const char *name) {
+	for (int i = 0; i < prog->nunions; i++)
+		if (strcmp(prog->unions[i]->name, name) == 0)
+			return prog->unions[i];
+	return NULL;
+}
+
+static void prog_add_union(Program *prog, UnionDecl *u) {
+	if (prog->nunions == prog->cap_unions) {
+		prog->cap_unions = prog->cap_unions ? prog->cap_unions * 2 : 8;
+		prog->unions = realloc(prog->unions, prog->cap_unions * sizeof *prog->unions);
+		if (!prog->unions)
+			die(0, "out of memory");
+	}
+	prog->unions[prog->nunions++] = u;
+}
+
 /* How a name resolves in a function's scope. */
 typedef enum {
 	R_NONE,  /* undefined */
@@ -705,7 +776,7 @@ static Resolution resolve_name(Func *fn, const char *name, Type *ty) {
 }
 
 /* Record a new local with the given type. Caller has checked for a clash. For a
- * record local parse passes {TY_RECORD, NULL}; the typecheck pass backfills rec
+ * record local parse passes {TY_RECORD, NULL, NULL}; the typecheck pass backfills rec
  * (see resolve_record_binding). */
 static void func_add_local(Func *fn, const char *name, int mutable, Type ty) {
 	if (fn->nlocals == fn->cap_locals) {
@@ -766,6 +837,14 @@ static void tok_copy(Token *t, char *buf, size_t cap) {
 /* True if an identifier names a type (PascalCase — leading uppercase). */
 static int is_type_ident(Token *t) {
 	return t->kind == TK_IDENT && t->len > 0 && t->text[0] >= 'A' && t->text[0] <= 'Z';
+}
+
+/* True if `name` is a built-in type keyword cfcc knows. A bare union member of this
+ * name would be a *compose-over* (the union carrying that type's value), which M1.1
+ * does not implement — so it is rejected rather than minted as a fresh nullary tag. */
+static int is_builtin_type_name(const char *name) {
+	return strcmp(name, "Int") == 0 || strcmp(name, "Uarch") == 0 ||
+	       strcmp(name, "Str") == 0 || strcmp(name, "Uint8") == 0;
 }
 
 /* Consume a parameter's type and classify it. M0 param types are `Int` (a word),
@@ -880,6 +959,9 @@ static Expr *parse_primary(Parser *p, Func *fn) {
 		if (is_ident(t, "if"))
 			die(t->line, "an `if` expression must stand alone or be parenthesized "
 			             "(e.g. `1 + (if c then a else b)`)");
+		if (is_ident(t, "match"))
+			die(t->line, "a `match` expression must stand alone or be parenthesized "
+			             "(e.g. `1 + (match x { ... })`)");
 		if (t->text[t->len - 1] == '!')
 			die(t->line, "M0 does not support `!` in a name here");
 		int line = t->line;
@@ -917,6 +999,27 @@ static Expr *parse_primary(Parser *p, Func *fn) {
 		/* A record value is legal here only as the base of a field access; a
 		 * pointer never. Both are caught in the typecheck pass, which knows the
 		 * surrounding context, so parse just records the reference. */
+		return e;
+	}
+	if (t->kind == TK_IDENT && is_type_ident(t)) {
+		/* A PascalCase name in value position is a union member value `Union.Member`
+		 * (M1.1: tag-only — the member's tag). A bare type name is not itself a value. */
+		if (t->text[t->len - 1] == '!')
+			die(t->line, "M0 does not support `!` in a type name");
+		if (p->toks[p->pos + 1].kind != TK_DOT)
+			die(t->line, "a bare type name is not a value (a union value is written `Union.Member`)");
+		Expr *e = new_expr(EX_UMEMBER);
+		e->line = t->line;
+		tok_copy(t, e->name, sizeof e->name); /* union type name */
+		advance(p); /* Type */
+		advance(p); /* . */
+		Token *mt = peek(p);
+		if (!is_type_ident(mt))
+			die(mt->line, "expected a PascalCase member name after `.`");
+		tok_copy(mt, e->mem, sizeof e->mem);
+		advance(p);
+		if (peek(p)->kind == TK_LPAREN)
+			die(peek(p)->line, "M1.1 union members are tag-only (no payload construction yet)");
 		return e;
 	}
 	die(t->line, "expected an integer, a name, or `(`");
@@ -1097,9 +1200,73 @@ static Expr *parse_if(Parser *p, Func *fn) {
 	return e;
 }
 
+/* match_expr = "match" expr "{" match_arm { "," match_arm } [ "," ] "}"
+ * match_arm  = ( "_" | Union "." Member ) "->" expr
+ * An expression, like `if` (arms yield values that unify). M1.1 arms are tag-only:
+ * a `_` wildcard or a member of the scrutinee's union, qualified (`Color.Red`) — no
+ * payload sub-pattern, no literal/binding patterns, no or-patterns (later bricks).
+ * Interior newlines allowed so arms may span lines. Exhaustiveness + arm typing are
+ * checked in the typecheck pass. */
+static Expr *parse_match(Parser *p, Func *fn) {
+	Token *kw = peek(p);
+	advance(p); /* `match` */
+	Expr *e = new_expr(EX_MATCH);
+	e->line = kw->line;
+	e->lhs = parse_expr(p, fn); /* scrutinee */
+	expect(p, TK_LBRACE, "expected `{` to open the match arms");
+	skip_newlines(p);
+	int cap = 0;
+	while (peek(p)->kind != TK_RBRACE) {
+		MatchArm arm;
+		memset(&arm, 0, sizeof arm);
+		Token *pt = peek(p);
+		arm.line = pt->line;
+		if (is_ident(pt, "_")) {
+			arm.is_wild = 1;
+			advance(p);
+		} else if (is_type_ident(pt)) {
+			/* `Union.Member` — the head is qualified by the scrutinee's union. */
+			tok_copy(pt, arm.qual, sizeof arm.qual);
+			advance(p);
+			expect(p, TK_DOT, "a match arm names a member qualified by its union (`Union.Member`)");
+			Token *mt = peek(p);
+			if (!is_type_ident(mt))
+				die(mt->line, "expected a PascalCase member name after `.`");
+			tok_copy(mt, arm.member, sizeof arm.member);
+			advance(p);
+			if (peek(p)->kind == TK_LPAREN)
+				die(peek(p)->line, "M1.1 match arms are tag-only (no payload binding yet)");
+		} else {
+			die(pt->line, "a match arm is `Union.Member` or `_` (M1.1: no literal/binding patterns yet)");
+		}
+		expect(p, TK_ARROW, "expected `->`");
+		arm.body = parse_expr(p, fn);
+		if (e->narms == cap) {
+			cap = cap ? cap * 2 : 4;
+			e->arms = realloc(e->arms, cap * sizeof *e->arms);
+			if (!e->arms)
+				die(0, "out of memory");
+		}
+		e->arms[e->narms++] = arm;
+		skip_newlines(p);
+		if (peek(p)->kind == TK_COMMA) {
+			advance(p);
+			skip_newlines(p);
+			continue;
+		}
+		break;
+	}
+	expect(p, TK_RBRACE, "expected `}` to close the match arms");
+	if (e->narms == 0)
+		die(e->line, "a match needs at least one arm");
+	return e;
+}
+
 static Expr *parse_expr(Parser *p, Func *fn) {
 	if (is_ident(peek(p), "if"))
 		return parse_if(p, fn);
+	if (is_ident(peek(p), "match"))
+		return parse_match(p, fn);
 	return parse_or(p, fn);
 }
 
@@ -1214,7 +1381,7 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 			if (peek(p)->kind == TK_EQ)
 				die(peek(p)->line, "a `[N Uint8]` buffer has no initializer (`read` fills it)");
 			s->bufsize = bufsize;
-			Type bt = {TY_BUF, NULL};
+			Type bt = {TY_BUF, NULL, NULL};
 			func_add_local(fn, s->name, mutable, bt);
 			return s;
 		}
@@ -1231,7 +1398,7 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 				s->expr = parse_data_literal(p, fn, rectype, name->line);
 			else
 				s->expr = parse_expr(p, fn);
-			Type rt = {TY_RECORD, NULL};
+			Type rt = {TY_RECORD, NULL, NULL};
 			func_add_local(fn, s->name, mutable, rt);
 		} else if (is_str) {
 			/* `const Str name = "literal"` — a Str local binds a string literal only.
@@ -1245,7 +1412,7 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 			if (s->expr->kind != EX_STR)
 				die(name->line, "a Str local binds a string literal only (M0 has no Str copy or interpolation yet)");
 			snprintf(s->type_name, sizeof s->type_name, "Str");
-			Type st = {TY_STR, NULL};
+			Type st = {TY_STR, NULL, NULL};
 			func_add_local(fn, s->name, mutable, st);
 		} else {
 			/* A `{` initializer with no type annotation is an attempted record
@@ -1254,7 +1421,7 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 				die(peek(p)->line,
 				    "a record binding needs a type annotation, e.g. `const Point p = { x: 1 }`");
 			s->expr = parse_expr(p, fn); /* initializer: name not yet in scope */
-			Type it = {TY_INT, NULL};
+			Type it = {TY_INT, NULL, NULL};
 			func_add_local(fn, s->name, mutable, it);
 		}
 		return s;
@@ -1540,8 +1707,8 @@ static DataDecl *parse_data_decl(Parser *p, Program *prog) {
 	advance(p);
 	if (peek(p)->kind == TK_LBRACKET)
 		die(peek(p)->line, "M0 data types are not generic");
-	if (prog_find_data(prog, d->name))
-		die(nm->line, "data type already defined");
+	if (prog_find_data(prog, d->name) || prog_find_union(prog, d->name))
+		die(nm->line, "type already defined");
 	expect(p, TK_EQ, "expected `=`");
 	if (peek(p)->kind != TK_LBRACE)
 		die(peek(p)->line, "M0 `data` must have a record body `{ Int field, ... }`");
@@ -1583,13 +1750,79 @@ static DataDecl *parse_data_decl(Parser *p, Program *prog) {
 	return d;
 }
 
+/* union_decl = "union" type_name "=" "{" member { "," member } [ "," ] "}"
+ * M1.1 unions are TAG-ONLY: every member is a fresh PascalCase nullary tag, numbered
+ * by declaration order (member i → tag i), and the union lowers to a plain integer tag
+ * (ebnf Union Types; type_system §8.4; seed_subset §7). Interior newlines are allowed
+ * so a union may span lines (the idiomatic AST-node form). Payload members (`M(T)`,
+ * `M = { … }`, `M = literal`), compose-over/spread members, and generics are later
+ * bricks — each rejected with a clear message. */
+static UnionDecl *parse_union_decl(Parser *p, Program *prog) {
+	advance(p); /* `union` */
+	Token *nm = peek(p);
+	if (!is_type_ident(nm))
+		die(nm->line, "expected a PascalCase type name after `union`");
+	if (nm->text[nm->len - 1] == '!')
+		die(nm->line, "M0 does not support `!` in a type name");
+	UnionDecl *u = xmalloc(sizeof *u);
+	memset(u, 0, sizeof *u);
+	tok_copy(nm, u->name, sizeof u->name);
+	advance(p);
+	if (peek(p)->kind == TK_LBRACKET)
+		die(peek(p)->line, "M1.1 unions are not generic");
+	if (prog_find_union(prog, u->name) || prog_find_data(prog, u->name))
+		die(nm->line, "type already defined");
+	expect(p, TK_EQ, "expected `=`");
+	expect(p, TK_LBRACE, "expected `{` (a union body is `{ Member, ... }`)");
+	skip_newlines(p);
+	if (peek(p)->kind != TK_RBRACE)
+		for (;;) {
+			Token *m = peek(p);
+			if (m->kind == TK_DOT)
+				die(m->line, "M1.1 unions do not support `...` member spread");
+			if (!is_type_ident(m))
+				die(m->line, "a union member is a PascalCase name");
+			if (m->text[m->len - 1] == '!')
+				die(m->line, "M0 does not support `!` in a member name");
+			char mname[64];
+			tok_copy(m, mname, sizeof mname);
+			advance(p);
+			if (peek(p)->kind == TK_LPAREN)
+				die(peek(p)->line, "M1.1 union members are tag-only (a positional payload is a later brick)");
+			if (peek(p)->kind == TK_EQ)
+				die(peek(p)->line, "M1.1 union members are tag-only (a `= payload`/literal member is a later brick)");
+			if (is_builtin_type_name(mname) || prog_find_data(prog, mname) || prog_find_union(prog, mname))
+				die(m->line, "M1.1 does not support compose-over members (a member naming an existing type)");
+			if (union_member_tag(u, mname) >= 0)
+				die(m->line, "duplicate union member");
+			if (u->nmembers == MAX_UNION_MEMBERS)
+				die(m->line, "too many union members");
+			snprintf(u->members[u->nmembers++], sizeof u->members[0], "%s", mname);
+			skip_newlines(p);
+			if (peek(p)->kind == TK_COMMA) {
+				advance(p);
+				skip_newlines(p);
+				if (peek(p)->kind == TK_RBRACE) /* trailing comma */
+					break;
+				continue;
+			}
+			break;
+		}
+	expect(p, TK_RBRACE, "expected `}`");
+	if (u->nmembers == 0)
+		die(nm->line, "a union needs at least one member");
+	return u;
+}
+
 /* module = { declaration } — one per line; exactly one is `pub const main`. A
- * declaration is a `data` record type or a `[pub] const` function. */
+ * declaration is a `data` record, a `union`, or a `[pub] const` function. */
 static void parse(Parser *p, Program *prog) {
 	skip_newlines(p);
 	while (peek(p)->kind != TK_EOF) {
 		if (is_ident(peek(p), "data"))
 			prog_add_data(prog, parse_data_decl(p, prog));
+		else if (is_ident(peek(p), "union"))
+			prog_add_union(prog, parse_union_decl(p, prog));
 		else
 			prog_add_func(prog, parse_func(p, prog));
 		if (peek(p)->kind != TK_EOF) {
@@ -1630,9 +1863,9 @@ static void expect_int(Program *prog, Func *fn, Expr *e) {
 static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 	switch (e->kind) {
 	case EX_INT:
-		return (Type){TY_INT, NULL};
+		return (Type){TY_INT, NULL, NULL};
 	case EX_STR:
-		return (Type){TY_STR, NULL};
+		return (Type){TY_STR, NULL, NULL};
 	case EX_VAR: {
 		Type ty;
 		if (resolve_name(fn, e->name, &ty) == R_NONE)
@@ -1647,9 +1880,9 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 			 * — enough to hand a buffer + length to `write`. (Both are provisional
 			 * cfcc surface over the throwaway {bytes*,len} header; cf0's Str API differs.) */
 			if (strcmp(e->name, "len") == 0)
-				return (Type){TY_INT, NULL};
+				return (Type){TY_INT, NULL, NULL};
 			if (strcmp(e->name, "bytes") == 0)
-				return (Type){TY_PTR, NULL};
+				return (Type){TY_PTR, NULL, NULL};
 			die(e->line, "a string has only the `.len` and `.bytes` fields");
 		}
 		if (base.kind != TY_RECORD)
@@ -1659,7 +1892,7 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 			die(e->line, "this data type has no such field");
 		e->rec = base.rec;
 		e->foff = idx * 4; /* all M0 fields are 4-byte Int */
-		return (Type){TY_INT, NULL};
+		return (Type){TY_INT, NULL, NULL};
 	}
 	case EX_RECORD:
 		die(e->line, "a record literal may only initialize a record-typed binding");
@@ -1709,23 +1942,73 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		e->callee = callee; /* cached for emit (per-arg register width, Int→Uarch widen) */
 		return func_ret_type(callee); /* Int, Uarch, or a record returned by pointer */
 	}
+	case EX_UMEMBER: {
+		/* `Union.Member` — a tag-only member value is its tag (an integer). */
+		UnionDecl *u = prog_find_union(prog, e->name);
+		if (!u)
+			die(e->line, "unknown union type");
+		int tag = union_member_tag(u, e->mem);
+		if (tag < 0)
+			die(e->line, "this union has no such member");
+		e->uni = u;
+		e->ival = tag; /* the member's runtime value (its tag) */
+		return (Type){TY_UNION, NULL, u};
+	}
+	case EX_MATCH: {
+		/* Compare-chain over a union scrutinee's tag (seed_subset §7). Each arm names a
+		 * member of the scrutinee's union (qualified) or is `_`; arm bodies are Int
+		 * (M1.1) and unify to the match's type. Exhaustiveness: cover every member or
+		 * carry a `_`. */
+		Type st = typeof_expr(prog, fn, e->lhs);
+		if (st.kind != TY_UNION)
+			die(e->line, "M1.1 `match` requires a union scrutinee");
+		UnionDecl *u = st.uni;
+		e->uni = u;
+		int covered[MAX_UNION_MEMBERS] = {0};
+		int has_wild = 0;
+		for (int i = 0; i < e->narms; i++) {
+			MatchArm *a = &e->arms[i];
+			if (has_wild)
+				die(a->line, "unreachable match arm after `_`");
+			if (a->is_wild) {
+				has_wild = 1;
+				expect_int(prog, fn, a->body);
+				continue;
+			}
+			if (strcmp(a->qual, u->name) != 0)
+				die(a->line, "a match arm must name a member of the scrutinee's union, qualified by it");
+			int tag = union_member_tag(u, a->member);
+			if (tag < 0)
+				die(a->line, "this union has no such member");
+			if (covered[tag])
+				die(a->line, "duplicate match arm for this member");
+			covered[tag] = 1;
+			a->tag = tag;
+			expect_int(prog, fn, a->body);
+		}
+		if (!has_wild)
+			for (int i = 0; i < u->nmembers; i++)
+				if (!covered[i])
+					die(e->line, "non-exhaustive match (cover every union member or add a `_` arm)");
+		return (Type){TY_INT, NULL, NULL};
+	}
 	case EX_IF:
 		expect_int(prog, fn, e->lhs); /* condition */
 		expect_int(prog, fn, e->rhs); /* then — M0 if-branches are Int */
 		expect_int(prog, fn, e->els); /* else */
-		return (Type){TY_INT, NULL};
+		return (Type){TY_INT, NULL, NULL};
 	case EX_NEG:
 	case EX_BNOT:
 	case EX_LNOT:
 		expect_int(prog, fn, e->lhs);
-		return (Type){TY_INT, NULL};
+		return (Type){TY_INT, NULL, NULL};
 	case EX_ADD: case EX_SUB: case EX_MUL: case EX_DIV: case EX_REM:
 	case EX_BOR: case EX_BXOR: case EX_BAND: case EX_SHL: case EX_SHR:
 	case EX_EQ: case EX_NE: case EX_LT: case EX_GT: case EX_LE: case EX_GE:
 	case EX_AND: case EX_OR:
 		expect_int(prog, fn, e->lhs);
 		expect_int(prog, fn, e->rhs);
-		return (Type){TY_INT, NULL};
+		return (Type){TY_INT, NULL, NULL};
 	}
 	die(e->line, "internal: unhandled expression kind in typecheck");
 }
@@ -1741,10 +2024,10 @@ static Type typeof_expr(Program *prog, Func *fn, Expr *e) {
 /* A function's declared return type: a record (returned by pointer) or Int. */
 static Type func_ret_type(const Func *fn) {
 	if (strcmp(fn->ret_type_name, "Uarch") == 0)
-		return (Type){TY_UARCH, NULL};
+		return (Type){TY_UARCH, NULL, NULL};
 	if (fn->ret_type_name[0])
-		return (Type){TY_RECORD, fn->ret_rec};
-	return (Type){TY_INT, NULL};
+		return (Type){TY_RECORD, fn->ret_rec, NULL};
+	return (Type){TY_INT, NULL, NULL};
 }
 
 /* Backfill a record local's declaration so later field accesses resolve. */
@@ -1752,6 +2035,19 @@ static void set_local_rec(Func *fn, const char *name, DataDecl *d) {
 	for (int i = 0; i < fn->nlocals; i++)
 		if (strcmp(fn->locals[i].name, name) == 0) {
 			fn->locals[i].type.rec = d;
+			return;
+		}
+}
+
+/* Retype a local (parsed provisionally as a nominal `TY_RECORD`) to the union it was
+ * annotated with — a tag-only union value is a word, so this only carries the union
+ * identity for `match`. */
+static void set_local_union(Func *fn, const char *name, UnionDecl *u) {
+	for (int i = 0; i < fn->nlocals; i++)
+		if (strcmp(fn->locals[i].name, name) == 0) {
+			fn->locals[i].type.kind = TY_UNION;
+			fn->locals[i].type.rec = NULL;
+			fn->locals[i].type.uni = u;
 			return;
 		}
 }
@@ -1811,6 +2107,15 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 			if (strcmp(s->type_name, "Str") == 0) {           /* a `const Str` local */
 				if (typeof_expr(prog, fn, s->expr).kind != TY_STR)
 					die(s->line, "internal: Str local initializer is not a string");
+			} else if (prog_find_union(prog, s->type_name)) { /* a union binding */
+				/* `const Color c = Color.Red` — the annotation names a union; the
+				 * initializer must be a value of that union (a member, or another
+				 * union var — a tag-only union is a word, so a copy is harmless). */
+				UnionDecl *u = prog_find_union(prog, s->type_name);
+				Type it = typeof_expr(prog, fn, s->expr);
+				if (it.kind != TY_UNION || it.uni != u)
+					die(s->line, "initializer type does not match the union binding");
+				set_local_union(fn, s->name, u);
 			} else if (s->type_name[0]) { /* a record binding (annotated with a record type) */
 				if (s->expr->kind == EX_RECORD)
 					resolve_record_binding(prog, fn, s);      /* { … } literal */
@@ -1900,12 +2205,16 @@ static void resolve_signatures(Program *prog) {
 		Func *fn = prog->funcs[i];
 		for (int j = 0; j < fn->nparams; j++)
 			if (fn->params[j].kind == PK_RECORD) {
+				if (prog_find_union(prog, fn->params[j].type_name))
+					die(fn->params[j].line, "M1.1 does not support union parameters yet (use a union local + `match`)");
 				DataDecl *d = prog_find_data(prog, fn->params[j].type_name);
 				if (!d)
 					die(fn->params[j].line, "a parameter names an unknown data type");
 				fn->params[j].rec = d;
 			}
 		if (fn->ret_type_name[0] && strcmp(fn->ret_type_name, "Uarch") != 0) {
+			if (prog_find_union(prog, fn->ret_type_name))
+				die(fn->ret_line, "M1.1 does not support union return types yet");
 			DataDecl *d = prog_find_data(prog, fn->ret_type_name);
 			if (!d)
 				die(fn->ret_line, "a return type names an unknown data type");
@@ -1991,6 +2300,8 @@ static void collect_strlits_expr(Expr *e) {
 		collect_strlits_expr(e->args[i]);
 	for (int i = 0; i < e->nfields; i++)
 		collect_strlits_expr(e->fvals[i]);
+	for (int i = 0; i < e->narms; i++) /* EX_MATCH arm bodies */
+		collect_strlits_expr(e->arms[i].body);
 }
 
 static void collect_strlits_stmt(Stmt *list) {
@@ -2138,6 +2449,55 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		for (int i = 0; i < e->nargs; i++)
 			fprintf(out, "%s%c %%t%d", i ? ", " : "", argw[i], argt[i]);
 		fprintf(out, ")\n");
+		snprintf(dst, cap, "%%t%d", r);
+		return;
+	}
+	case EX_UMEMBER:
+		/* A tag-only union member value IS its tag — a word constant. */
+		snprintf(dst, cap, "%ld", e->ival);
+		return;
+	case EX_MATCH: {
+		/* Compare-chain over the scrutinee's tag (seed_subset §7): a linear ladder of
+		 * `ceqw tag, <k>` tests. Each member arm's block stores its value into the
+		 * entry-block merge slot `%m<slot>` and jumps to @mend; the `_` arm (or, for an
+		 * exhaustive match, an unreachable fallback) is the ladder's fall-through. Arm
+		 * results merge through the slot exactly like `if`. */
+		int id = ex->lbl++;
+		char sc[96];
+		emit_expr(out, e->lhs, ex, sc, sizeof sc); /* the scrutinee's tag (a word) */
+		int tagt = ex->tmp++;
+		fprintf(out, "\t%%t%d =w copy %s\n", tagt, sc);
+		int wild = -1;
+		for (int i = 0; i < e->narms; i++)
+			if (e->arms[i].is_wild) { wild = i; break; }
+		for (int i = 0; i < e->narms; i++) {
+			MatchArm *a = &e->arms[i];
+			if (a->is_wild)
+				continue;
+			int hit = ex->lbl++, nxt = ex->lbl++;
+			int c = ex->tmp++;
+			fprintf(out, "\t%%t%d =w ceqw %%t%d, %d\n", c, tagt, a->tag);
+			fprintf(out, "\tjnz %%t%d, @marm%d, @mnext%d\n", c, hit, nxt);
+			fprintf(out, "@marm%d\n", hit);
+			char b[96];
+			emit_expr(out, a->body, ex, b, sizeof b);
+			fprintf(out, "\tstorew %s, %%m%d\n", b, e->slot);
+			fprintf(out, "\tjmp @mend%d\n", id);
+			fprintf(out, "@mnext%d\n", nxt); /* falls into the next test, or the default */
+		}
+		if (wild >= 0) {
+			char b[96];
+			emit_expr(out, e->arms[wild].body, ex, b, sizeof b);
+			fprintf(out, "\tstorew %s, %%m%d\n", b, e->slot);
+		} else {
+			/* Exhaustive: the fall-through is unreachable for a valid value; store a
+			 * defined 0 so the block has a terminator either way. */
+			fprintf(out, "\tstorew 0, %%m%d\n", e->slot);
+		}
+		fprintf(out, "\tjmp @mend%d\n", id);
+		fprintf(out, "@mend%d\n", id);
+		int r = ex->tmp++;
+		fprintf(out, "\t%%t%d =w loadw %%m%d\n", r, e->slot);
 		snprintf(dst, cap, "%%t%d", r);
 		return;
 	}
@@ -2371,7 +2731,7 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 static void assign_expr_slots(Expr *e, int *n) {
 	if (!e)
 		return;
-	if (e->kind == EX_IF || e->kind == EX_AND || e->kind == EX_OR)
+	if (e->kind == EX_IF || e->kind == EX_AND || e->kind == EX_OR || e->kind == EX_MATCH)
 		e->slot = (*n)++;
 	assign_expr_slots(e->lhs, n);
 	assign_expr_slots(e->rhs, n);
@@ -2380,6 +2740,8 @@ static void assign_expr_slots(Expr *e, int *n) {
 		assign_expr_slots(e->args[i], n);
 	for (int i = 0; i < e->nfields; i++) /* EX_RECORD field-init values */
 		assign_expr_slots(e->fvals[i], n);
+	for (int i = 0; i < e->narms; i++) /* EX_MATCH arm bodies */
+		assign_expr_slots(e->arms[i].body, n);
 }
 
 static void assign_stmt_slots(Stmt *list, int *n) {
@@ -2424,7 +2786,8 @@ static void emit_func(FILE *out, const Func *fn) {
 	 * `alloca` that would overflow the stack). The `let` then only stores. Flat
 	 * scoping makes this sound: each name has exactly one slot for the whole body. */
 	for (int i = 0; i < fn->nlocals; i++) {
-		if (fn->locals[i].type.kind == TY_INT)
+		/* A tag-only union is a word tag, so it shares the Int word-slot path. */
+		if (fn->locals[i].type.kind == TY_INT || fn->locals[i].type.kind == TY_UNION)
 			fprintf(out, "\t%%s_%s =l alloc4 4\n", fn->locals[i].name);
 		else if (fn->locals[i].type.kind == TY_STR) /* holds an `l` header pointer */
 			fprintf(out, "\t%%s_%s =l alloc8 8\n", fn->locals[i].name);
