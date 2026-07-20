@@ -337,6 +337,18 @@ static void lex(Lexer *lx) {
 			push_tok(lx, TK_IDENT, s + start, (int)(lx->pos - start), 0);
 			continue;
 		}
+		if (c == '\'') {
+			/* A type variable: `'T` — an apostrophe followed by an identifier. Lexed as
+			 * one TK_IDENT whose text starts with `'` (ebnf: `type_var = "'" ident`). */
+			size_t start = lx->pos;
+			lx->pos++; /* the apostrophe */
+			if (!(isalpha((unsigned char)s[lx->pos]) || s[lx->pos] == '_'))
+				die(lx->line, "expected an identifier after `'` (a type variable, e.g. `'T`)");
+			while (ident_char((unsigned char)s[lx->pos]))
+				lx->pos++;
+			push_tok(lx, TK_IDENT, s + start, (int)(lx->pos - start), 0);
+			continue;
+		}
 		if (c == '-' && s[lx->pos + 1] == '>') {
 			push_tok(lx, TK_ARROW, s + lx->pos, 2, 0);
 			lx->pos += 2;
@@ -443,6 +455,9 @@ typedef enum {
 	PK_UARCH,  /* Uarch -> l (a register-width unsigned integer; see TY_UARCH) */
 	PK_UNION,  /* a tag-only union -> w (the tag). Parsed as PK_RECORD, reclassified in
 	            * resolve_signatures once the name is known to be a union. */
+	PK_VAR,    /* a generic type-variable param (`'T x`) in a template. Never emitted —
+	            * the monomorphization pass substitutes it with a concrete kind per
+	            * instantiation. `type_name` holds the type-variable name (`'T`). */
 } ParamKind;
 
 typedef struct {
@@ -498,6 +513,7 @@ typedef enum {
 typedef struct Expr Expr;
 
 #define MAX_ARM_ALTS 16
+#define MAX_TYPARAMS 8
 
 /* One arm of a `match`. Either the `_` wildcard (`is_wild`) or an or-pattern of one
  * or more member alternatives (`A | B | …`), all qualified by the scrutinee's union
@@ -564,6 +580,10 @@ struct Expr {
 	 * (not a param/local) — emit reads its value from the `%pb<bind_id>` storage temp. */
 	int is_bind;
 	int bind_id;
+	/* EX_CALL: explicit type arguments `f[Int, Point](…)`. The monomorphization pass
+	 * uses them to select the instantiation, then rewrites `name` to the mangled clone. */
+	char typeargs[MAX_TYPARAMS][64];
+	int ntypeargs;
 };
 
 static Expr *new_expr(ExprKind kind) {
@@ -703,9 +723,15 @@ static int data_field_index(const DataDecl *d, const char *name) {
 typedef struct Func {
 	char name[64];
 	int is_pub;
+	/* Generic type parameters (`'T`, `'U`): a function with ntyparams > 0 is a generic
+	 * TEMPLATE — not emitted directly, but cloned + specialized per concrete type-argument
+	 * tuple by the monomorphization pass. A `'T` appears as a type-name string ("'T") in a
+	 * param/return/local annotation; specialization substitutes it with a concrete type. */
+	char typarams[MAX_TYPARAMS][64];
+	int ntyparams;
 	Param params[MAX_PARAMS];
 	int nparams;
-	char ret_type_name[64]; /* empty = Int; "Uarch" = Uarch; else a record/union return */
+	char ret_type_name[64]; /* empty = Int; "Uarch" = Uarch; else a record/union/'T return */
 	int ret_line;           /* source line of the return type (for diagnostics) */
 	DataDecl *ret_rec;      /* resolved record return type (typecheck) */
 	UnionDecl *ret_uni;     /* resolved union return type (typecheck) */
@@ -733,6 +759,14 @@ typedef struct {
 	Func **funcs;
 	int nfuncs, cap_funcs;
 } Program;
+
+/* Index of a type variable among a function's generic parameters, or -1. */
+static int func_typaram_index(const Func *fn, const char *name) {
+	for (int i = 0; i < fn->ntyparams; i++)
+		if (strcmp(fn->typarams[i], name) == 0)
+			return i;
+	return -1;
+}
 
 static Func *new_func(void) {
 	Func *f = xmalloc(sizeof *f);
@@ -812,6 +846,7 @@ static Resolution resolve_name(Func *fn, const char *name, Type *ty) {
 			case PK_LONG:   ty->kind = TY_PTR;    ty->rec = NULL; break;
 			case PK_UARCH:  ty->kind = TY_UARCH;  ty->rec = NULL; break;
 			case PK_UNION:  ty->kind = TY_UNION;  ty->rec = NULL; ty->uni = fn->params[i].uni; break;
+			case PK_VAR:    ty->kind = TY_INT;    ty->rec = NULL; break; /* template body parse only; type is ignored (re-typed per instantiation) */
 			}
 			return R_PARAM;
 		}
@@ -896,6 +931,12 @@ static int is_type_ident(Token *t) {
 	return t->kind == TK_IDENT && t->len > 0 && t->text[0] >= 'A' && t->text[0] <= 'Z';
 }
 
+/* True if a token is a type variable — `'T` (lexed as an ident whose text starts with
+ * an apostrophe). Type variables name a function's generic parameters. */
+static int is_tyvar(Token *t) {
+	return t->kind == TK_IDENT && t->len > 0 && t->text[0] == '\'';
+}
+
 /* True if `name` is a built-in type keyword cfcc knows. A bare union member of this
  * name would be a *compose-over* (the union carrying that type's value), which M1.1
  * does not implement — so it is rejected rather than minted as a fresh nullary tag. */
@@ -947,6 +988,12 @@ static void parse_param_type(Parser *p, Param *out) {
 		out->kind = PK_LONG;
 		return;
 	}
+	if (is_tyvar(t)) { /* a generic type variable (`'T`) — resolved at specialization */
+		tok_copy(t, out->type_name, sizeof out->type_name);
+		out->kind = PK_VAR;
+		advance(p);
+		return;
+	}
 	if (is_type_ident(t)) { /* a record type name (PascalCase, non-Int) */
 		if (t->text[t->len - 1] == '!')
 			die(t->line, "M0 does not support `!` in a type name");
@@ -957,7 +1004,7 @@ static void parse_param_type(Parser *p, Param *out) {
 			die(peek(p)->line, "M0 record types are not generic");
 		return;
 	}
-	die(t->line, "a parameter type must be `Int`, a record type, or a pointer type (e.g. `*[Str]`)");
+	die(t->line, "a parameter type must be `Int`, `Uarch`, a record/union type, a type variable (`'T`), or a pointer type (e.g. `*[Str]`)");
 }
 
 /* param = type var_name  (typed; M0 params always carry their type). */
@@ -1023,11 +1070,34 @@ static Expr *parse_primary(Parser *p, Func *fn) {
 			die(t->line, "M0 does not support `!` in a name here");
 		int line = t->line;
 		advance(p); /* `t` still points at the name token (stable in the array) */
-		if (peek(p)->kind == TK_LPAREN) {
-			advance(p);
+		if (peek(p)->kind == TK_LBRACKET || peek(p)->kind == TK_LPAREN) {
 			Expr *e = new_expr(EX_CALL);
 			e->line = line;
 			tok_copy(t, e->name, sizeof e->name);
+			/* Optional explicit type arguments `f[Int, Point](…)`. A type argument is a
+			 * type name (Int/Uarch/Str/record/union) or, when the caller is itself
+			 * generic, one of its type variables (`'T`, substituted at specialization). */
+			if (peek(p)->kind == TK_LBRACKET) {
+				advance(p); /* [ */
+				for (;;) {
+					Token *ta = peek(p);
+					if (!is_tyvar(ta) && !is_type_ident(ta))
+						die(ta->line, "expected a type argument (a type name or `'T`)");
+					if (ta->text[ta->len - 1] == '!')
+						die(ta->line, "M0 does not support `!` in a type name");
+					if (e->ntypeargs == MAX_TYPARAMS)
+						die(ta->line, "too many type arguments");
+					tok_copy(ta, e->typeargs[e->ntypeargs++], sizeof e->typeargs[0]);
+					advance(p);
+					if (peek(p)->kind == TK_COMMA) {
+						advance(p);
+						continue;
+					}
+					break;
+				}
+				expect(p, TK_RBRACKET, "expected `]` to close the type arguments");
+			}
+			expect(p, TK_LPAREN, "expected `(` for the call arguments");
 			int cap = 0;
 			if (peek(p)->kind != TK_RPAREN)
 				for (;;) {
@@ -1628,10 +1698,10 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 	if (t->kind == TK_IDENT && !is_type_ident(t)) {
 		if (t->text[t->len - 1] == '!')
 			die(t->line, "M0 does not support `!` in a name here");
-		/* A name immediately followed by `(` is a call statement — invoked for its
-		 * effect (e.g. `write(...)`), its result discarded. Parsed as a full expression
-		 * (which builds the EX_CALL), so args and nesting work as anywhere else. */
-		if (p->toks[p->pos + 1].kind == TK_LPAREN) {
+		/* A name immediately followed by `(` — or `[` for a generic call `f[Int](…)` —
+		 * is a call statement, invoked for its effect (e.g. `write(...)`), its result
+		 * discarded. Parsed as a full expression (which builds the EX_CALL). */
+		if (p->toks[p->pos + 1].kind == TK_LPAREN || p->toks[p->pos + 1].kind == TK_LBRACKET) {
 			Stmt *s = new_stmt(ST_EXPR);
 			s->line = t->line;
 			s->expr = parse_expr(p, fn);
@@ -1758,6 +1828,31 @@ static Func *parse_func(Parser *p, Program *prog) {
 	advance(p);
 	expect(p, TK_EQ, "expected `=`");
 
+	/* Optional generic type parameters: `['T, 'U]` before the value parameters. A
+	 * function with type parameters is a generic template (monomorphized per use). */
+	if (peek(p)->kind == TK_LBRACKET) {
+		advance(p); /* [ */
+		for (;;) {
+			Token *tv = peek(p);
+			if (!is_tyvar(tv))
+				die(tv->line, "expected a type variable (e.g. `'T`) in the generic parameter list");
+			if (fn->ntyparams == MAX_TYPARAMS)
+				die(tv->line, "too many type parameters");
+			tok_copy(tv, fn->typarams[fn->ntyparams], sizeof fn->typarams[0]);
+			for (int j = 0; j < fn->ntyparams; j++)
+				if (strcmp(fn->typarams[j], fn->typarams[fn->ntyparams]) == 0)
+					die(tv->line, "duplicate type parameter");
+			fn->ntyparams++;
+			advance(p);
+			if (peek(p)->kind == TK_COMMA) {
+				advance(p);
+				continue;
+			}
+			break;
+		}
+		expect(p, TK_RBRACKET, "expected `]` to close the type parameters");
+	}
+
 	expect(p, TK_LPAREN, "expected `(`");
 	if (peek(p)->kind != TK_RPAREN)
 		for (;;) {
@@ -1782,7 +1877,12 @@ static Func *parse_func(Parser *p, Program *prog) {
 	int has_ret = 0; /* whether a return type was written (mandatory for an asm fn) */
 	if (rt->kind == TK_STAR)
 		die(rt->line, "M0 functions return `Int` or a record, not a pointer");
-	if (is_type_ident(rt)) {
+	if (is_tyvar(rt)) { /* a generic return type `'T` — resolved at specialization */
+		has_ret = 1;
+		tok_copy(rt, fn->ret_type_name, sizeof fn->ret_type_name);
+		fn->ret_line = rt->line;
+		advance(p);
+	} else if (is_type_ident(rt)) {
 		has_ret = 1;
 		if (is_ident(rt, "Int")) {
 			advance(p);
@@ -1818,11 +1918,20 @@ static Func *parse_func(Parser *p, Program *prog) {
 			die(name->line, "an asm function must declare its return type");
 		if (fn->nparams > 8)
 			die(name->line, "an asm function takes at most 8 parameters (the arm64 arg registers)");
+		if (fn->ntyparams > 0)
+			die(name->line, "an asm function cannot be generic");
 		fn->is_asm = 1;
 		fn->asm_body = body;
 		advance(p);
 		return fn;
 	}
+	/* Every type variable used in a signature must be a declared type parameter (this
+	 * also rejects a bare `'T` in a non-generic function). */
+	for (int i = 0; i < fn->nparams; i++)
+		if (fn->params[i].kind == PK_VAR && func_typaram_index(fn, fn->params[i].type_name) < 0)
+			die(fn->params[i].line, "unknown type variable (not in the generic parameter list)");
+	if (fn->ret_type_name[0] == '\'' && func_typaram_index(fn, fn->ret_type_name) < 0)
+		die(fn->ret_line, "unknown type variable in the return type");
 	fn->body = parse_body(p, fn);
 	return fn;
 }
@@ -2017,6 +2126,219 @@ static void parse(Parser *p, Program *prog) {
 		die(0, "`main` must return Int (its value is the exit code)");
 	if (m->is_asm)
 		die(0, "`main` cannot be an asm function");
+	if (m->ntyparams > 0)
+		die(0, "`main` cannot be generic");
+}
+
+/* ---------------------------------------------------------- monomorphize - */
+
+/* Generic functions are specialized by whole-program monomorphization (the spec's
+ * `specialized` arc). ⚠ TWO throwaway degeneracies cf0.cf must NOT inherit:
+ * (1) cfcc has **no generic bounds** and typechecks each specialized clone's body
+ *     **per instantiation** — an invalid operation on `'T` surfaces at the *use*
+ *     (`inc[Box]`), not the definition. The ratified type system (type_system §8.5/§8.4)
+ *     makes a bound a `union` membership (`[U 'T]`), leaves an unbounded `'T`
+ *     non-operable (narrow by `match` first), and checks the body **once at the
+ *     definition site** — no deferred per-instantiation errors. cf0 does that.
+ * (2) The mangled instantiation name is an ad-hoc `name.Arg…` scheme (below), not the
+ *     flatten-and-mangle arc; cf0 owns real specialization names. */
+
+/* Deep-copy an expression tree so a generic instantiation gets its own nodes (fresh
+ * typecheck/emit annotations). Resolved fields (rtype, callee, slot, …) are NULL/0 in
+ * the un-typechecked template, so a plain struct copy carries the right initial state. */
+static Expr *clone_expr(Expr *e) {
+	if (!e)
+		return NULL;
+	Expr *c = xmalloc(sizeof *c);
+	*c = *e;
+	c->lhs = clone_expr(e->lhs);
+	c->rhs = clone_expr(e->rhs);
+	c->els = clone_expr(e->els);
+	if (e->nargs) {
+		c->args = xmalloc((size_t)e->nargs * sizeof *c->args);
+		for (int i = 0; i < e->nargs; i++)
+			c->args[i] = clone_expr(e->args[i]);
+	}
+	if (e->nfields) { /* EX_RECORD */
+		c->fnames = xmalloc((size_t)e->nfields * sizeof *c->fnames);
+		memcpy(c->fnames, e->fnames, (size_t)e->nfields * sizeof *c->fnames);
+		c->fvals = xmalloc((size_t)e->nfields * sizeof *c->fvals);
+		for (int i = 0; i < e->nfields; i++)
+			c->fvals[i] = clone_expr(e->fvals[i]);
+	}
+	c->ford = NULL; /* rebuilt by typecheck */
+	if (e->narms) { /* EX_MATCH */
+		c->arms = xmalloc((size_t)e->narms * sizeof *c->arms);
+		memcpy(c->arms, e->arms, (size_t)e->narms * sizeof *c->arms);
+		for (int i = 0; i < e->narms; i++)
+			c->arms[i].body = clone_expr(e->arms[i].body);
+	}
+	if (e->kind == EX_STR && e->sval) {
+		c->sval = xmalloc((size_t)e->slen + 1);
+		memcpy(c->sval, e->sval, (size_t)e->slen);
+		c->sval[e->slen] = '\0';
+	}
+	return c;
+}
+
+static Stmt *clone_stmt(Stmt *s) {
+	if (!s)
+		return NULL;
+	Stmt *c = xmalloc(sizeof *c);
+	*c = *s;
+	c->expr = clone_expr(s->expr);
+	c->body = clone_stmt(s->body);
+	c->next = clone_stmt(s->next);
+	return c;
+}
+
+/* Substitute a template's type variables with the instantiation's concrete type names
+ * in a cloned body — the only place a `'T` survives into an expression is an EX_CALL's
+ * explicit type arguments (e.g. `id['T](x)` inside a generic body becomes `id[Int]`). */
+static void subst_expr(Expr *e, Func *tmpl, char typeargs[][64]) {
+	if (!e)
+		return;
+	if (e->kind == EX_CALL)
+		for (int i = 0; i < e->ntypeargs; i++) {
+			int idx = func_typaram_index(tmpl, e->typeargs[i]);
+			if (idx >= 0)
+				snprintf(e->typeargs[i], sizeof e->typeargs[0], "%s", typeargs[idx]);
+		}
+	subst_expr(e->lhs, tmpl, typeargs);
+	subst_expr(e->rhs, tmpl, typeargs);
+	subst_expr(e->els, tmpl, typeargs);
+	for (int i = 0; i < e->nargs; i++)
+		subst_expr(e->args[i], tmpl, typeargs);
+	for (int i = 0; i < e->nfields; i++)
+		subst_expr(e->fvals[i], tmpl, typeargs);
+	for (int i = 0; i < e->narms; i++)
+		subst_expr(e->arms[i].body, tmpl, typeargs);
+}
+
+static void subst_stmts(Stmt *s, Func *tmpl, char typeargs[][64]) {
+	for (; s; s = s->next) {
+		subst_expr(s->expr, tmpl, typeargs);
+		subst_stmts(s->body, tmpl, typeargs);
+	}
+}
+
+/* Reclassify a `'T` parameter to the concrete kind of its type argument. A record or
+ * union name stays PK_RECORD (resolve_signatures reclassifies a union to PK_UNION). */
+static void reclassify_param(Param *p, const char *concrete, int line) {
+	if (strcmp(concrete, "Int") == 0) {
+		p->kind = PK_WORD;
+	} else if (strcmp(concrete, "Uarch") == 0) {
+		p->kind = PK_UARCH;
+	} else if (strcmp(concrete, "Str") == 0) {
+		die(line, "a type argument of `Str` is not supported (M0 has no Str parameters)");
+	} else if (concrete[0] == '\'') {
+		die(line, "internal: unsubstituted type variable in a type argument");
+	} else {
+		p->kind = PK_RECORD; /* a record or union name; resolved in resolve_signatures */
+		snprintf(p->type_name, sizeof p->type_name, "%s", concrete);
+	}
+}
+
+/* Create (or reuse) the specialization of a generic template for a concrete type-arg
+ * tuple: clone it, substitute `'T`, mangle the name (`id.Int`), and add it to the
+ * program. The clone is a concrete function typechecked/emitted like any other. */
+static Func *instantiate(Program *prog, Func *tmpl, char typeargs[][64], int nargs, int line) {
+	if (nargs != tmpl->ntyparams)
+		die(line, "wrong number of type arguments for this generic function");
+	/* Mangle `name.Arg.Arg…` — a `.` can't occur in a cfcc identifier, so a clone name
+	 * can never collide with a user function (throwaway scheme; see the section note). */
+	char mangled[256];
+	int n = snprintf(mangled, sizeof mangled, "%s", tmpl->name);
+	for (int i = 0; i < nargs; i++) {
+		if (n < 0 || (size_t)n >= sizeof mangled) /* guard BEFORE the next write */
+			die(line, "instantiation name too long");
+		n += snprintf(mangled + n, sizeof mangled - (size_t)n, ".%s", typeargs[i]);
+	}
+	if (n < 0 || (size_t)n >= sizeof ((Func *)0)->name) /* the mangled name must fit Func.name */
+		die(line, "instantiation name too long");
+	Func *ex = prog_find_func(prog, mangled);
+	if (ex)
+		return ex;
+	Func *c = new_func();
+	*c = *tmpl; /* params array (by value), ret fields, flags */
+	snprintf(c->name, sizeof c->name, "%s", mangled);
+	c->ntyparams = 0;
+	c->is_pub = 0;
+	c->nabinds = 0;
+	c->next_bind_id = 0;
+	c->ret_rec = NULL;
+	c->ret_uni = NULL;
+	if (tmpl->nlocals) {
+		c->locals = xmalloc((size_t)tmpl->cap_locals * sizeof *c->locals);
+		memcpy(c->locals, tmpl->locals, (size_t)tmpl->nlocals * sizeof *c->locals);
+	} else {
+		c->locals = NULL;
+		c->cap_locals = 0;
+	}
+	c->body = clone_stmt(tmpl->body);
+	for (int i = 0; i < c->nparams; i++)
+		if (c->params[i].kind == PK_VAR) {
+			int idx = func_typaram_index(tmpl, c->params[i].type_name);
+			reclassify_param(&c->params[i], typeargs[idx], line);
+		}
+	if (c->ret_type_name[0] == '\'') {
+		int idx = func_typaram_index(tmpl, c->ret_type_name);
+		const char *concrete = typeargs[idx];
+		/* empty ret_type_name means Int (cfcc's convention). */
+		snprintf(c->ret_type_name, sizeof c->ret_type_name, "%s",
+		         strcmp(concrete, "Int") == 0 ? "" : concrete);
+	}
+	subst_stmts(c->body, tmpl, typeargs);
+	prog_add_func(prog, c);
+	return c;
+}
+
+/* Walk a concrete function's body: every call to a generic template is specialized and
+ * the call rewritten to the mangled concrete name. Because instantiations are appended
+ * to prog->funcs and the driver loop below revisits them, this reaches a fixpoint. */
+static void monomorph_expr(Program *prog, Expr *e) {
+	if (!e)
+		return;
+	if (e->kind == EX_CALL) {
+		Func *callee = prog_find_func(prog, e->name);
+		if (callee && callee->ntyparams > 0) {
+			if (e->ntypeargs == 0)
+				die(e->line, "a generic call needs explicit type arguments, e.g. `f[Int](x)` (inference is a later brick)");
+			Func *inst = instantiate(prog, callee, e->typeargs, e->ntypeargs, e->line);
+			snprintf(e->name, sizeof e->name, "%s", inst->name);
+			e->ntypeargs = 0; /* now a concrete call */
+		} else if (e->ntypeargs > 0) {
+			die(e->line, "type arguments given to a non-generic function");
+		}
+	}
+	monomorph_expr(prog, e->lhs);
+	monomorph_expr(prog, e->rhs);
+	monomorph_expr(prog, e->els);
+	for (int i = 0; i < e->nargs; i++)
+		monomorph_expr(prog, e->args[i]);
+	for (int i = 0; i < e->nfields; i++)
+		monomorph_expr(prog, e->fvals[i]);
+	for (int i = 0; i < e->narms; i++)
+		monomorph_expr(prog, e->arms[i].body);
+}
+
+static void monomorph_stmts(Program *prog, Stmt *s) {
+	for (; s; s = s->next) {
+		monomorph_expr(prog, s->expr);
+		monomorph_stmts(prog, s->body);
+	}
+}
+
+/* Specialize the whole program from its concrete functions. prog->nfuncs grows as
+ * instantiations are appended; the loop revisits them, so transitive generic calls
+ * are reached. Templates (ntyparams > 0) are skipped here and by every later pass. */
+static void monomorphize(Program *prog) {
+	for (int i = 0; i < prog->nfuncs; i++) {
+		Func *fn = prog->funcs[i];
+		if (fn->ntyparams > 0 || fn->is_asm)
+			continue;
+		monomorph_stmts(prog, fn->body);
+	}
 }
 
 /* ------------------------------------------------------------- typecheck - */
@@ -2124,6 +2446,9 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 			case PK_UNION:
 				if (at.kind != TY_UNION || at.uni != pm->uni)
 					die(e->line, "argument type mismatch (union type differs)");
+				break;
+			case PK_VAR:
+				die(e->line, "internal: call to an unspecialized generic function");
 				break;
 			}
 		}
@@ -2441,6 +2766,8 @@ static void check_func(Program *prog, Func *fn) {
 static void resolve_signatures(Program *prog) {
 	for (int i = 0; i < prog->nfuncs; i++) {
 		Func *fn = prog->funcs[i];
+		if (fn->ntyparams > 0) /* a generic template — only its instantiations resolve */
+			continue;
 		for (int j = 0; j < fn->nparams; j++)
 			if (fn->params[j].kind == PK_RECORD) {
 				/* A nominal-typed param naming a union is reclassified to PK_UNION
@@ -2473,7 +2800,8 @@ static void resolve_signatures(Program *prog) {
 static void typecheck(Program *prog) {
 	resolve_signatures(prog);
 	for (int i = 0; i < prog->nfuncs; i++)
-		check_func(prog, prog->funcs[i]);
+		if (prog->funcs[i]->ntyparams == 0) /* skip generic templates (only clones checked) */
+			check_func(prog, prog->funcs[i]);
 }
 
 /* ------------------------------------------------------------- emit QBE - */
@@ -3377,6 +3705,7 @@ int main(int argc, char **argv) {
 	ps.toks = lx.toks;
 	Program prog = {0};
 	parse(&ps, &prog);
+	monomorphize(&prog); /* specialize generic calls before the concrete passes */
 	typecheck(&prog);
 
 	/* Default artifact: ./out/<stem>. */
@@ -3418,10 +3747,11 @@ int main(int argc, char **argv) {
 		die(0, "cannot write QBE IL");
 	emit_runtime_qbe(f); /* the arena allocator + bump cursor, ahead of the user code */
 	for (int i = 0; i < prog.nfuncs; i++)
-		collect_strlits_stmt(prog.funcs[i]->body);
+		if (prog.funcs[i]->ntyparams == 0) /* skip generic templates (only clones emit) */
+			collect_strlits_stmt(prog.funcs[i]->body);
 	emit_string_data(f); /* string-literal data defs, ahead of the functions that ref them */
 	for (int i = 0; i < prog.nfuncs; i++)
-		if (!prog.funcs[i]->is_asm) /* asm functions bypass QBE — emitted to the .s below */
+		if (!prog.funcs[i]->is_asm && prog.funcs[i]->ntyparams == 0) /* asm/templates bypass QBE */
 			emit_func(f, prog.funcs[i]);
 	fclose(f);
 
