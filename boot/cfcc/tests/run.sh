@@ -37,6 +37,8 @@ for cf in "$here"/[0-9]*.cf; do
 	name=$(basename "$cf")
 	expect=$(sed -n 's/^# *expect: *//p' "$cf" | head -1)
 	args=$(sed -n 's/^# *args: *//p' "$cf" | head -1)
+	# Optional extra flags for the cfcc compile invocation (e.g. `--libc dynamic`).
+	cflags=$(sed -n 's/^# *cflags: *//p' "$cf" | head -1)
 	out="$work/${name%.cf}"
 
 	if [ -z "$expect" ]; then
@@ -46,7 +48,8 @@ for cf in "$here"/[0-9]*.cf; do
 	fi
 
 	if [ "$expect" = "error" ]; then
-		if "$cfcc" c -o "$out" "$cf" >/dev/null 2>&1; then
+		# shellcheck disable=SC2086
+		if "$cfcc" c $cflags -o "$out" "$cf" >/dev/null 2>&1; then
 			echo "FAIL $name (expected a compile error, but it compiled)"
 			fail=$((fail + 1))
 		else
@@ -57,7 +60,8 @@ for cf in "$here"/[0-9]*.cf; do
 	fi
 
 	want=${expect#exit }
-	if ! "$cfcc" c -o "$out" "$cf" >/dev/null 2>&1; then
+	# shellcheck disable=SC2086
+	if ! "$cfcc" c $cflags -o "$out" "$cf" >/dev/null 2>&1; then
 		echo "FAIL $name (did not compile; expected exit $want)"
 		fail=$((fail + 1))
 		continue

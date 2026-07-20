@@ -2459,6 +2459,17 @@ static void emit_runtime_qbe(FILE *out) {
 	fprintf(out, "export data $cf_limit = { l 0 }\n");
 	fprintf(out, "function l $cf_alloc(w %%n) {\n");
 	fprintf(out, "@start\n");
+	/* Lazily mint the root page on the first allocation: if the cursor is unset
+	 * (cf_limit == 0) call the asm `cf_arena_init` (which mmaps + seeds it). This
+	 * makes the arena work in BOTH link modes — the freestanding `_start` and the
+	 * hosted C runtime both reach `main` without pre-mapping anything. */
+	fprintf(out, "\t%%lim0 =l loadl $cf_limit\n");
+	fprintf(out, "\t%%uninit =w ceql %%lim0, 0\n");
+	fprintf(out, "\tjnz %%uninit, @init, @ready\n");
+	fprintf(out, "@init\n");
+	fprintf(out, "\tcall $cf_arena_init()\n");
+	fprintf(out, "\tjmp @ready\n");
+	fprintf(out, "@ready\n");
 	fprintf(out, "\t%%r7 =w add %%n, 7\n");
 	fprintf(out, "\t%%ra =w and %%r7, -8\n");      /* round the request up to 8 bytes */
 	fprintf(out, "\t%%sz =l extuw %%ra\n");
@@ -2488,15 +2499,19 @@ static void emit_runtime_qbe(FILE *out) {
  * x0/x1/x2 under LC_MAIN; the mmap clobbers the arg registers, so they are parked
  * in x19-x21 (which the kernel preserves across `svc`) and restored before the
  * call. main then receives them by arity, exactly as before. */
-static void emit_runtime(FILE *out) {
+/* The mode-independent asm floor: `cf_arena_init` mints the root page — one 64 MiB
+ * anonymous mmap (degenerate vs the spec's remap-on-limit page: overflow just traps)
+ * — and seeds the bump cursor (cf_top=base, cf_limit=base+size). It is a leaf function
+ * (no `bl`), called lazily from `cf_alloc` on the first allocation, so the arena comes
+ * up the same way whether the freestanding `_start` or the hosted C runtime reaches
+ * `main`. `cf_mmap_fail`/`cf_oom` exit with distinct nonzero codes via raw `svc` (an
+ * error path — a raw exit is fine in either link mode). SYS_mmap=197, SYS_exit=1. */
+static void emit_runtime_common(FILE *out) {
 	fprintf(out, ".text\n");
-	fprintf(out, ".globl _start\n");
+	fprintf(out, ".globl _cf_arena_init\n");
 	fprintf(out, ".globl _cf_oom\n");
 	fprintf(out, ".p2align 2\n");
-	fprintf(out, "_start:\n");
-	fprintf(out, "\tmov x19, x0\n");        /* park argc/argv/envp across the mmap */
-	fprintf(out, "\tmov x20, x1\n");
-	fprintf(out, "\tmov x21, x2\n");
+	fprintf(out, "_cf_arena_init:\n");
 	/* mmap(NULL, 64 MiB, PROT_READ|PROT_WRITE, MAP_ANON|MAP_PRIVATE, -1, 0) */
 	fprintf(out, "\tmov x0, #0\n");
 	fprintf(out, "\tmov x1, #0x4000000\n"); /* 64 MiB */
@@ -2516,13 +2531,7 @@ static void emit_runtime(FILE *out) {
 	fprintf(out, "\tadrp x10, _cf_limit@PAGE\n");
 	fprintf(out, "\tadd x10, x10, _cf_limit@PAGEOFF\n");
 	fprintf(out, "\tstr x11, [x10]\n");
-	/* restore argc/argv/envp and run main; exit with its Int return (x0) */
-	fprintf(out, "\tmov x0, x19\n");
-	fprintf(out, "\tmov x1, x20\n");
-	fprintf(out, "\tmov x2, x21\n");
-	fprintf(out, "\tbl _main\n");
-	fprintf(out, "\tmov x16, #1\n");        /* SYS_exit */
-	fprintf(out, "\tsvc #0x80\n");
+	fprintf(out, "\tret\n");
 	/* mmap failure and arena overflow: exit with distinct nonzero codes. */
 	fprintf(out, "_cf_mmap_fail:\n");
 	fprintf(out, "\tmov x0, #71\n");
@@ -2531,6 +2540,20 @@ static void emit_runtime(FILE *out) {
 	fprintf(out, "_cf_oom:\n");
 	fprintf(out, "\tmov x0, #70\n");
 	fprintf(out, "\tmov x16, #1\n");
+	fprintf(out, "\tsvc #0x80\n");
+}
+
+/* The freestanding entry (`--libc none` only). arm64 darwin hands argc/argv/envp in
+ * x0/x1/x2 at LC_MAIN entry; with the arena now lazy there is nothing to set up, so
+ * `_start` forwards those registers straight into `main` and exits with its Int
+ * return. In `--libc dynamic` this is omitted — the C runtime's own `_start` calls
+ * `_main` with the same argc/argv/envp ABI. */
+static void emit_start(FILE *out) {
+	fprintf(out, ".globl _start\n");
+	fprintf(out, ".p2align 2\n");
+	fprintf(out, "_start:\n");
+	fprintf(out, "\tbl _main\n");          /* argc/argv/envp already in x0/x1/x2 */
+	fprintf(out, "\tmov x16, #1\n");        /* SYS_exit with main's Int return (x0) */
 	fprintf(out, "\tsvc #0x80\n");
 }
 
@@ -2623,8 +2646,12 @@ static char *stem_of(const char *path) {
 	return s;
 }
 
+/* Link mode (`--libc`, cf_cli §4). `static` is a compile error on darwin (Apple has
+ * no static libSystem), so cfcc models only the two darwin-valid modes. */
+typedef enum { LIBC_NONE, LIBC_DYNAMIC } LinkMode;
+
 static void usage(void) {
-	fprintf(stderr, "usage: cfcc c [-o <path>] <file.cf>\n");
+	fprintf(stderr, "usage: cfcc c [-o <path>] [--libc none|dynamic] <file.cf>\n");
 	exit(2);
 }
 
@@ -2632,15 +2659,25 @@ int main(int argc, char **argv) {
 	const char *cmd = NULL;
 	const char *input = NULL;
 	const char *output = NULL;
+	LinkMode libc = LIBC_NONE; /* default: freestanding (cf_cli §4) */
 
 	/* cfcc mirrors the slice of the `cf` CLI that cf0 borrows: the `compile`
-	 * command (alias `c`) and `-o` only (cf_cli §9). A subcommand is required —
+	 * command (alias `c`), `-o`, and `--libc` (cf_cli §9). A subcommand is required —
 	 * cfcc is a subset of `cf`, so invocation reads the same: `cfcc c file.cf`. */
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--output") == 0) {
 			if (++i >= argc)
 				usage();
 			output = argv[i];
+		} else if (strcmp(argv[i], "--libc") == 0) {
+			/* `--libc <mode>`; a valueless `--libc` (no following mode) means
+			 * `dynamic` (cf_cli §4). `static` is a darwin compile error. */
+			const char *mode = (i + 1 < argc) ? argv[i + 1] : NULL;
+			if (mode && strcmp(mode, "none") == 0)            { libc = LIBC_NONE; i++; }
+			else if (mode && strcmp(mode, "dynamic") == 0)    { libc = LIBC_DYNAMIC; i++; }
+			else if (mode && strcmp(mode, "static") == 0)
+				die(0, "`--libc static` is not supported on darwin (Apple has no static libSystem)");
+			else /* valueless --libc */                       libc = LIBC_DYNAMIC;
 		} else if (argv[i][0] == '-' && argv[i][1] != '\0') {
 			fprintf(stderr, "cfcc: unknown flag `%s`\n", argv[i]);
 			usage();
@@ -2723,7 +2760,9 @@ int main(int argc, char **argv) {
 	f = fopen(g_rt_s, "wb");
 	if (!f)
 		die(0, "cannot write runtime asm");
-	emit_runtime(f);
+	emit_runtime_common(f);           /* arena init + error handlers (both link modes) */
+	if (libc == LIBC_NONE)
+		emit_start(f);            /* freestanding entry; hosted uses the C runtime's */
 	emit_asm_funcs(f, &prog); /* user asm functions, verbatim, beside the runtime */
 	fclose(f);
 
@@ -2732,18 +2771,27 @@ int main(int argc, char **argv) {
 		char *av[] = {(char *)CF_QBE, "-t", "arm64_apple", "-o", g_main_s, g_qbe_il, NULL};
 		run(av);
 	}
-	/* cc: assemble + link freestanding, entry at _start.
+	/* cc: assemble + link, by `--libc` mode (cf_cli §4).
 	 *
-	 * `-nostdlib` drops the C startup and default libs — the binary uses no
-	 * libc: `_start` reaches the kernel through raw `svc`. But darwin's linker
-	 * refuses a dynamic Mach-O with no libSystem load command ("must link with
-	 * libSystem.dylib"), so `-lSystem` is added back solely to satisfy the
-	 * loader. No libSystem symbol is referenced; this is the darwin cost of
-	 * `--libc none` that seed_subset §3 anticipates. */
+	 * `none` (freestanding): `-nostdlib` drops the C startup and default libs — the
+	 * binary uses no libc; our `_start` reaches the kernel through raw `svc`. But
+	 * darwin's linker refuses a dynamic Mach-O with no libSystem load command ("must
+	 * link with libSystem.dylib"), so `-lSystem` is added back solely to satisfy the
+	 * loader. No libSystem symbol is referenced (seed_subset §3).
+	 *
+	 * `dynamic` (hosted): the default link — the C runtime is linked, its own `_start`
+	 * calls our exported `main` (`_main`) with the same argc/argv/envp ABI, and C
+	 * externs become available. We emit no `_start` of our own (it would clash). The
+	 * arena still comes up via the lazy `cf_arena_init` on the first allocation. */
 	{
-		char *av[] = {"cc", "-nostdlib", "-lSystem", "-Wl,-e,_start", "-o", outpath,
-		              g_rt_s, g_main_s, NULL};
-		run(av);
+		if (libc == LIBC_NONE) {
+			char *av[] = {"cc", "-nostdlib", "-lSystem", "-Wl,-e,_start", "-o", outpath,
+			              g_rt_s, g_main_s, NULL};
+			run(av);
+		} else { /* LIBC_DYNAMIC */
+			char *av[] = {"cc", "-o", outpath, g_rt_s, g_main_s, NULL};
+			run(av);
+		}
 	}
 	/* No explicit codesign: darwin's `ld` ad-hoc-signs arm64 output by default
 	 * (flags: adhoc,linker-signed) and the binary execs as-is, so the trusted
