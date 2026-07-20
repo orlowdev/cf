@@ -668,10 +668,16 @@ typedef struct {
  * genesis shortcut. ⚠ THROWAWAY layout: the uniform 8-byte slot wastes space and the real
  * inline-vs-boxed field decision belongs to the M6/M9 representation gate. */
 struct DataDecl {
-	char name[64];
+	char name[64];        /* the concrete (possibly mangled, e.g. `Box.1.Int`) type name */
+	char base_name[64];   /* the un-mangled template name (== name for a non-generic decl) */
 	char fields[MAX_FIELDS][64];
-	char field_types[MAX_FIELDS][64]; /* per-field type name: "Int" or an aggregate type name */
+	char field_types[MAX_FIELDS][64]; /* per-field type name: "Int", an aggregate name, a `'T`,
+	                                   * or a mangled application (concretized in monomorphize) */
 	int nfields;
+	/* Generic type parameters (`data Pair['A,'B]`): ntyparams > 0 = a TEMPLATE, never laid
+	 * out or emitted — cloned + substituted per concrete type-argument tuple (G3b). */
+	char typarams[MAX_TYPARAMS][64];
+	int ntyparams;
 };
 
 #define MAX_UNION_MEMBERS 64
@@ -692,7 +698,11 @@ struct DataDecl {
  * cross-sub/superset consistency to the M6/M9 representation gate — cf0 must not inherit
  * these specific bytes, the uniform-8 slotting, or the 0..n-by-order tags. */
 struct UnionDecl {
-	char name[64];
+	char name[64];        /* the concrete (possibly mangled, e.g. `Maybe.1.Int`) type name */
+	char base_name[64];   /* the un-mangled template name (== name for a non-generic decl);
+	                       * a match arm qualifies members by this (`Maybe.Just`, not the mangle) */
+	char typarams[MAX_TYPARAMS][64]; /* generic type parameters; ntyparams > 0 = a TEMPLATE */
+	int ntyparams;
 	char members[MAX_UNION_MEMBERS][64];
 	int arity[MAX_UNION_MEMBERS]; /* positional payload field count per member (0 = nullary) */
 	/* Per-member, per-field payload type name: "Int" or an aggregate (record/union) type
@@ -1008,6 +1018,11 @@ static int is_builtin_type_name(const char *name) {
 	       strcmp(name, "Str") == 0 || strcmp(name, "Uint8") == 0;
 }
 
+/* Type-reference helpers (G3b) — defined further down, forward-declared here as the type
+ * positions that use them (params, union values, locals, returns) come first. */
+static void parse_type_arg(Parser *p, char *out, size_t cap);
+static void check_tyvars_declared(const char *mangled, char typarams[][64], int ntp, int line);
+
 /* Consume a parameter's type and classify it. M0 param types are `Int` (a word),
  * a record type (a long — a pointer to the caller's arena record; the type name is
  * stashed and resolved to a decl in typecheck), or a pointer type like `*[Str]` (a
@@ -1057,14 +1072,9 @@ static void parse_param_type(Parser *p, Param *out) {
 		advance(p);
 		return;
 	}
-	if (is_type_ident(t)) { /* a record type name (PascalCase, non-Int) */
-		if (t->text[t->len - 1] == '!')
-			die(t->line, "M0 does not support `!` in a type name");
-		tok_copy(t, out->type_name, sizeof out->type_name);
-		out->kind = PK_RECORD;
-		advance(p);
-		if (peek(p)->kind == TK_LBRACKET)
-			die(peek(p)->line, "M0 record types are not generic");
+	if (is_type_ident(t)) { /* a record/union type, or a generic application `Box[Int]` (G3b) */
+		parse_type_arg(p, out->type_name, sizeof out->type_name);
+		out->kind = PK_RECORD; /* resolve_signatures reclassifies a union to PK_UNION */
 		return;
 	}
 	die(t->line, "a parameter type must be `Int`, `Uarch`, a record/union type, a type variable (`'T`), or a pointer type (e.g. `*[Str]`)");
@@ -1194,16 +1204,16 @@ static Expr *parse_primary(Parser *p, Func *fn) {
 		return e;
 	}
 	if (t->kind == TK_IDENT && is_type_ident(t)) {
-		/* A PascalCase name in value position is a union member value `Union.Member`
-		 * (M1.1: tag-only — the member's tag). A bare type name is not itself a value. */
+		/* A PascalCase name in value position is a union member value `Union.Member` or
+		 * `Union[Args].Member` (G3b: a generic union is applied before the member is
+		 * selected). A bare type name is not itself a value. */
 		if (t->text[t->len - 1] == '!')
 			die(t->line, "M0 does not support `!` in a type name");
-		if (p->toks[p->pos + 1].kind != TK_DOT)
-			die(t->line, "a bare type name is not a value (a union value is written `Union.Member`)");
 		Expr *e = new_expr(EX_UMEMBER);
 		e->line = t->line;
-		tok_copy(t, e->name, sizeof e->name); /* union type name */
-		advance(p); /* Type */
+		parse_type_arg(p, e->name, sizeof e->name); /* union type name (mangled if generic) */
+		if (peek(p)->kind != TK_DOT)
+			die(t->line, "a bare type name is not a value (a union value is written `Union.Member`)");
 		advance(p); /* . */
 		Token *mt = peek(p);
 		if (!is_type_ident(mt))
@@ -1629,10 +1639,9 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 				advance(p);
 			} else if (is_ident(tt, "Uarch")) {
 				die(tt->line, "M0 has no `Uarch` locals (Uarch is a parameter/return type)");
-			} else {
-				tok_copy(tt, rectype, sizeof rectype);
+			} else { /* a record/union type, or a generic application `Box[Int]` (G3b) */
+				parse_type_arg(p, rectype, sizeof rectype);
 				is_record = 1;
-				advance(p);
 			}
 		}
 		Token *name = peek(p);
@@ -1949,14 +1958,9 @@ static Func *parse_func(Parser *p, Program *prog) {
 		has_ret = 1;
 		if (is_ident(rt, "Int")) {
 			advance(p);
-		} else {
-			if (rt->text[rt->len - 1] == '!')
-				die(rt->line, "M0 does not support `!` in a type name");
-			tok_copy(rt, fn->ret_type_name, sizeof fn->ret_type_name);
+		} else { /* Uarch, a record/union type, or a generic application `Box[Int]` (G3b) */
 			fn->ret_line = rt->line;
-			advance(p);
-			if (peek(p)->kind == TK_LBRACKET)
-				die(peek(p)->line, "M0 record types are not generic");
+			parse_type_arg(p, fn->ret_type_name, sizeof fn->ret_type_name);
 		}
 	}
 	expect(p, TK_ARROW, "expected `->`");
@@ -1988,40 +1992,143 @@ static Func *parse_func(Parser *p, Program *prog) {
 		advance(p);
 		return fn;
 	}
-	/* Every type variable used in a signature must be a declared type parameter (this
-	 * also rejects a bare `'T` in a non-generic function). */
+	/* Every type variable used in a signature — a bare `'T` param/return or one nested in a
+	 * generic application like `Box['T]` — must be a declared type parameter. */
 	for (int i = 0; i < fn->nparams; i++)
-		if (fn->params[i].kind == PK_VAR && func_typaram_index(fn, fn->params[i].type_name) < 0)
-			die(fn->params[i].line, "unknown type variable (not in the generic parameter list)");
-	if (fn->ret_type_name[0] == '\'' && func_typaram_index(fn, fn->ret_type_name) < 0)
-		die(fn->ret_line, "unknown type variable in the return type");
+		check_tyvars_declared(fn->params[i].type_name, fn->typarams, fn->ntyparams, fn->params[i].line);
+	check_tyvars_declared(fn->ret_type_name, fn->typarams, fn->ntyparams, fn->ret_line);
 	fn->body = parse_body(p, fn);
 	return fn;
 }
 
-/* Parse a field/payload type (G3a) into `out`: `Int` or an aggregate (a `data` record
- * or a `union`) type name. The name is validated (declared) later, so forward and
- * mutually-recursive references resolve. Generic type variables (`'T`) and generic
- * applications (`Box[Int]`) are a later brick (G3b), rejected here with a clear message;
- * so are pointers, buffers, Uarch and Str (not field/payload types in cfcc). */
+/* True if `s` is a non-empty run of decimal digits — a mangled-name arity marker. */
+static int is_all_digits(const char *s) {
+	if (!*s)
+		return 0;
+	for (const char *c = s; *c; c++)
+		if (!isdigit((unsigned char)*c))
+			return 0;
+	return 1;
+}
+
+/* Parse one type reference (a field/payload/param/return/local aggregate type, or a
+ * type argument inside `[…]`) into its canonical mangled name in `out` (G3b):
+ *   - a leaf — `Int`, a record/union type name, or a type variable `'T` — verbatim;
+ *   - a generic application `Name[a, b, …]` mangled arity-prefixed as
+ *     `Name "." nargs { "." <mangled arg> }`, e.g. `Box[Int]`→`Box.1.Int`,
+ *     `Pair[Box[Int], 'B]`→`Pair.2.Box.1.Int.'B`.
+ * The scheme is unambiguous — type names are PascalCase or `'T`, arity markers are digits
+ * — so instantiate_type decodes it. `'T` variables are validated against the enclosing
+ * declaration's type parameters once the whole declaration is parsed. */
+static void parse_type_arg(Parser *p, char *out, size_t cap) {
+	Token *t = peek(p);
+	if (is_tyvar(t)) { /* a type variable `'T` */
+		tok_copy(t, out, cap);
+		advance(p);
+		return;
+	}
+	if (!is_type_ident(t))
+		die(t->line, "expected a type (a type name or `'T`)");
+	if (t->text[t->len - 1] == '!')
+		die(t->line, "M0 does not support `!` in a type name");
+	char base[64];
+	tok_copy(t, base, sizeof base);
+	advance(p);
+	if (peek(p)->kind != TK_LBRACKET) { /* a leaf type */
+		if ((size_t)snprintf(out, cap, "%s", base) >= cap)
+			die(t->line, "type name too long");
+		return;
+	}
+	advance(p); /* [ */
+	char args[MAX_TYPARAMS][256];
+	int n = 0;
+	for (;;) {
+		if (n == MAX_TYPARAMS)
+			die(peek(p)->line, "too many type arguments");
+		parse_type_arg(p, args[n++], sizeof args[0]);
+		if (peek(p)->kind == TK_COMMA) {
+			advance(p);
+			continue;
+		}
+		break;
+	}
+	expect(p, TK_RBRACKET, "expected `]` to close the type arguments");
+	int off = snprintf(out, cap, "%s.%d", base, n);
+	if (off < 0 || (size_t)off >= cap)
+		die(t->line, "type name too long");
+	for (int k = 0; k < n; k++) {
+		int w = snprintf(out + off, cap - (size_t)off, ".%s", args[k]);
+		if (w < 0 || (size_t)(off + w) >= cap)
+			die(t->line, "type name too long");
+		off += w;
+	}
+}
+
+/* Parse a field/payload type into `out`: `Int`, an aggregate (record/union) type, a type
+ * variable `'T`, or a generic application `Box[Int]` (all via parse_type_arg). Pointers,
+ * buffers, Uarch and Str are not field/payload types. The name is resolved (and any `'T`
+ * validated) later, so forward and mutually-recursive references work. */
 static void parse_member_type(Parser *p, char *out, size_t cap) {
 	Token *t = peek(p);
 	if (t->kind == TK_STAR)
-		die(t->line, "a field/payload type is `Int` or a record/union type, not a pointer");
+		die(t->line, "a field/payload type is `Int`, an aggregate, or `'T`, not a pointer");
 	if (t->kind == TK_LBRACKET)
-		die(t->line, "a field/payload type is `Int` or a record/union type, not an array/buffer");
-	if (is_tyvar(t))
-		die(t->line, "a generic field/payload type variable is a later brick (G3b)");
-	if (!is_type_ident(t))
-		die(t->line, "a field/payload type is `Int` or a record/union type name");
-	if (t->text[t->len - 1] == '!')
-		die(t->line, "M0 does not support `!` in a type name");
-	if (is_ident(t, "Uarch") || is_ident(t, "Str"))
-		die(t->line, "a field/payload type is `Int` or a record/union type (not Uarch/Str)");
-	tok_copy(t, out, cap);
-	advance(p);
-	if (peek(p)->kind == TK_LBRACKET)
-		die(peek(p)->line, "a generic type application in a field/payload is a later brick (G3b)");
+		die(t->line, "a field/payload type is `Int`, an aggregate, or `'T`, not an array/buffer");
+	parse_type_arg(p, out, cap);
+	if (strcmp(out, "Uarch") == 0 || strcmp(out, "Str") == 0)
+		die(t->line, "a field/payload type is `Int`, an aggregate, or `'T` (not Uarch/Str)");
+}
+
+/* Parse an optional generic type-parameter list `['A, 'B, …]` into typarams/ntyparams.
+ * Shared by `data` and `union` declarations (functions inline their own copy).
+ * ⚠ cf0 must NOT inherit two narrowings here (same family as the function-generics ones):
+ * (1) parameters are UNBOUNDED bare `'T` only — ebnf's `generic_param` also admits a bound
+ *     (`Union 'V`), which cf0 restores (a bound = union membership, type_system §8.5);
+ * (2) `MAX_TYPARAMS` is a throwaway fixed cap, not a language limit. */
+static void parse_typaram_list(Parser *p, char typarams[][64], int *ntyparams) {
+	*ntyparams = 0;
+	if (peek(p)->kind != TK_LBRACKET)
+		return;
+	advance(p); /* [ */
+	for (;;) {
+		Token *tv = peek(p);
+		if (!is_tyvar(tv))
+			die(tv->line, "expected a type variable (e.g. `'T`) in the generic parameter list");
+		if (*ntyparams == MAX_TYPARAMS)
+			die(tv->line, "too many type parameters");
+		tok_copy(tv, typarams[*ntyparams], 64);
+		for (int j = 0; j < *ntyparams; j++)
+			if (strcmp(typarams[j], typarams[*ntyparams]) == 0)
+				die(tv->line, "duplicate type parameter");
+		(*ntyparams)++;
+		advance(p);
+		if (peek(p)->kind == TK_COMMA) {
+			advance(p);
+			continue;
+		}
+		break;
+	}
+	expect(p, TK_RBRACKET, "expected `]` to close the type parameters");
+}
+
+/* Validate that every type variable (a `'T` element) in a mangled type string is declared
+ * among `typarams` — catches a stray `'T` in a non-generic declaration or an undeclared one. */
+static void check_tyvars_declared(const char *mangled, char typarams[][64], int ntp, int line) {
+	char buf[512];
+	if ((size_t)snprintf(buf, sizeof buf, "%s", mangled) >= sizeof buf)
+		die(line, "type name too long");
+	for (char *tok = strtok(buf, "."); tok; tok = strtok(NULL, ".")) {
+		if (tok[0] != '\'')
+			continue;
+		int found = 0;
+		for (int i = 0; i < ntp; i++)
+			if (strcmp(typarams[i], tok) == 0) {
+				found = 1;
+				break;
+			}
+		if (!found)
+			die(line, "unknown type variable (not in the declaration's type parameters)");
+	}
 }
 
 /* data_decl   = "data" type_name "=" record_body
@@ -2040,11 +2147,11 @@ static DataDecl *parse_data_decl(Parser *p, Program *prog) {
 	DataDecl *d = xmalloc(sizeof *d);
 	memset(d, 0, sizeof *d);
 	tok_copy(nm, d->name, sizeof d->name);
+	snprintf(d->base_name, sizeof d->base_name, "%s", d->name);
 	advance(p);
-	if (peek(p)->kind == TK_LBRACKET)
-		die(peek(p)->line, "M0 data types are not generic");
 	if (prog_find_data(prog, d->name) || prog_find_union(prog, d->name))
 		die(nm->line, "type already defined");
+	parse_typaram_list(p, d->typarams, &d->ntyparams); /* optional `['A, 'B]` (generic data, G3b) */
 	expect(p, TK_EQ, "expected `=`");
 	if (peek(p)->kind != TK_LBRACE)
 		die(peek(p)->line, "M0 `data` must have a record body `{ Int field, ... }`");
@@ -2084,6 +2191,8 @@ static DataDecl *parse_data_decl(Parser *p, Program *prog) {
 	expect(p, TK_RBRACE, "expected `}`");
 	if (d->nfields == 0)
 		die(nm->line, "M0 records need at least one field");
+	for (int i = 0; i < d->nfields; i++) /* every `'T` field must name a declared type parameter */
+		check_tyvars_declared(d->field_types[i], d->typarams, d->ntyparams, nm->line);
 	return d;
 }
 
@@ -2104,11 +2213,11 @@ static UnionDecl *parse_union_decl(Parser *p, Program *prog) {
 	UnionDecl *u = xmalloc(sizeof *u);
 	memset(u, 0, sizeof *u);
 	tok_copy(nm, u->name, sizeof u->name);
+	snprintf(u->base_name, sizeof u->base_name, "%s", u->name);
 	advance(p);
-	if (peek(p)->kind == TK_LBRACKET)
-		die(peek(p)->line, "M1.1 unions are not generic");
 	if (prog_find_union(prog, u->name) || prog_find_data(prog, u->name))
 		die(nm->line, "type already defined");
+	parse_typaram_list(p, u->typarams, &u->ntyparams); /* optional `['V]` (generic union, G3b) */
 	expect(p, TK_EQ, "expected `=`");
 	expect(p, TK_LBRACE, "expected `{` (a union body is `{ Member, ... }`)");
 	skip_newlines(p);
@@ -2186,6 +2295,9 @@ static UnionDecl *parse_union_decl(Parser *p, Program *prog) {
 			maxarity = u->arity[i];
 	}
 	u->size = 8 + maxarity * 8;
+	for (int i = 0; i < u->nmembers; i++) /* every `'T` payload must name a declared type parameter */
+		for (int j = 0; j < u->arity[i]; j++)
+			check_tyvars_declared(u->payload_types[i][j], u->typarams, u->ntyparams, nm->line);
 	return u;
 }
 
@@ -2282,33 +2394,117 @@ static Stmt *clone_stmt(Stmt *s) {
 	return c;
 }
 
-/* Substitute a template's type variables with the instantiation's concrete type names
- * in a cloned body — the only place a `'T` survives into an expression is an EX_CALL's
- * explicit type arguments (e.g. `id['T](x)` inside a generic body becomes `id[Int]`). */
-static void subst_expr(Expr *e, Func *tmpl, char typeargs[][64]) {
+/* ---- mangled type names (G3b) ------------------------------------------------
+ * A generic type application `Box[Int]` is carried as an arity-prefixed mangled name
+ * `Box.1.Int` (parse_type_arg). These helpers split, span, and join such names, and
+ * substitute a template's type params inside one. */
+
+typedef struct { char *el[128]; int n; } Mangle;
+
+/* Split a mangled name into its '.'-separated elements (copied into `buf`). */
+static void mangle_split(const char *name, Mangle *m, char *buf, size_t bufcap) {
+	if ((size_t)snprintf(buf, bufcap, "%s", name) >= bufcap)
+		die(0, "type name too long");
+	m->n = 0;
+	for (char *tok = strtok(buf, "."); tok; tok = strtok(NULL, ".")) {
+		if (m->n == (int)(sizeof m->el / sizeof m->el[0]))
+			die(0, "type name too deeply nested");
+		m->el[m->n++] = tok;
+	}
+}
+
+/* Index just past the one complete mangled type starting at element `start` (a base name,
+ * optionally an arity digit and that many nested types). */
+static int mangle_span(const Mangle *m, int start) {
+	int i = start + 1; /* base name */
+	if (i < m->n && is_all_digits(m->el[i])) {
+		int arity = atoi(m->el[i]);
+		i++;
+		for (int k = 0; k < arity; k++)
+			i = mangle_span(m, i);
+	}
+	return i;
+}
+
+/* Join elements [a, b) with '.' into `out`. */
+static void mangle_join(const Mangle *m, int a, int b, char *out, size_t cap) {
+	int off = 0;
+	for (int i = a; i < b; i++) {
+		int w = snprintf(out + off, cap - (size_t)off, "%s%s", i > a ? "." : "", m->el[i]);
+		if (w < 0 || (size_t)(off + w) >= cap)
+			die(0, "type name too long");
+		off += w;
+	}
+}
+
+/* Substitute type params with concrete arg names in a mangled type string: an element
+ * equal to a type param `'T` becomes the matching `args[k]` (itself possibly a mangled
+ * name); other elements (base names, arity digits) pass through unchanged. */
+static void subst_mangled(char *dst, size_t cap, const char *src,
+                          char typarams[][64], char args[][256], int ntp) {
+	char buf[512];
+	Mangle m;
+	mangle_split(src, &m, buf, sizeof buf);
+	int off = 0;
+	for (int i = 0; i < m.n; i++) {
+		const char *piece = m.el[i];
+		for (int k = 0; k < ntp; k++)
+			if (strcmp(m.el[i], typarams[k]) == 0) {
+				piece = args[k];
+				break;
+			}
+		int w = snprintf(dst + off, cap - (size_t)off, "%s%s", i > 0 ? "." : "", piece);
+		if (w < 0 || (size_t)(off + w) >= cap)
+			die(0, "type name too long");
+		off += w;
+	}
+}
+
+/* Substitute a template's type variables with the instantiation's concrete type names in a
+ * cloned body. A `'T` survives into an expression as an EX_CALL's explicit type arguments
+ * (`id['T](x)`) and as the type name of a generic record literal / union member value
+ * (`Box['T]` / `Maybe['T].Just`) — all rewritten to the concrete instantiation. */
+static void subst_expr(Expr *e, Func *tmpl, char targs[][256]) {
 	if (!e)
 		return;
 	if (e->kind == EX_CALL)
 		for (int i = 0; i < e->ntypeargs; i++) {
 			int idx = func_typaram_index(tmpl, e->typeargs[i]);
-			if (idx >= 0)
-				snprintf(e->typeargs[i], sizeof e->typeargs[0], "%s", typeargs[idx]);
+			if (idx >= 0) {
+				if (strlen(targs[idx]) >= sizeof e->typeargs[0])
+					die(e->line, "type argument name too long");
+				snprintf(e->typeargs[i], sizeof e->typeargs[0], "%s", targs[idx]);
+			}
 		}
-	subst_expr(e->lhs, tmpl, typeargs);
-	subst_expr(e->rhs, tmpl, typeargs);
-	subst_expr(e->els, tmpl, typeargs);
+	if ((e->kind == EX_RECORD || e->kind == EX_UMEMBER) && strchr(e->name, '\'')) {
+		char sub[256];
+		subst_mangled(sub, sizeof sub, e->name, tmpl->typarams, targs, tmpl->ntyparams);
+		if (strlen(sub) >= sizeof e->name)
+			die(e->line, "type name too long");
+		snprintf(e->name, sizeof e->name, "%s", sub);
+	}
+	subst_expr(e->lhs, tmpl, targs);
+	subst_expr(e->rhs, tmpl, targs);
+	subst_expr(e->els, tmpl, targs);
 	for (int i = 0; i < e->nargs; i++)
-		subst_expr(e->args[i], tmpl, typeargs);
+		subst_expr(e->args[i], tmpl, targs);
 	for (int i = 0; i < e->nfields; i++)
-		subst_expr(e->fvals[i], tmpl, typeargs);
+		subst_expr(e->fvals[i], tmpl, targs);
 	for (int i = 0; i < e->narms; i++)
-		subst_expr(e->arms[i].body, tmpl, typeargs);
+		subst_expr(e->arms[i].body, tmpl, targs);
 }
 
-static void subst_stmts(Stmt *s, Func *tmpl, char typeargs[][64]) {
+static void subst_stmts(Stmt *s, Func *tmpl, char targs[][256]) {
 	for (; s; s = s->next) {
-		subst_expr(s->expr, tmpl, typeargs);
-		subst_stmts(s->body, tmpl, typeargs);
+		if (s->kind == ST_LOCAL && s->type_name[0] && strchr(s->type_name, '\'')) {
+			char sub[256];
+			subst_mangled(sub, sizeof sub, s->type_name, tmpl->typarams, targs, tmpl->ntyparams);
+			if (strlen(sub) >= sizeof s->type_name)
+				die(s->line, "type name too long");
+			snprintf(s->type_name, sizeof s->type_name, "%s", sub);
+		}
+		subst_expr(s->expr, tmpl, targs);
+		subst_stmts(s->body, tmpl, targs);
 	}
 }
 
@@ -2327,6 +2523,124 @@ static void reclassify_param(Param *p, const char *concrete, int line) {
 		p->kind = PK_RECORD; /* a record or union name; resolved in resolve_signatures */
 		snprintf(p->type_name, sizeof p->type_name, "%s", concrete);
 	}
+}
+
+/* ---- generic TYPE instantiation (G3b) ----------------------------------------
+ * A generic `data`/`union` template (ntyparams > 0) is monomorphized like a generic
+ * function: each use `Box[Int]` names a concrete instantiation whose mangled name is the
+ * arity-prefixed string parse_type_arg produced (`Box.1.Int`). concretize_name ensures the
+ * instantiation exists; instantiate_type clones the template, substitutes its type params
+ * in every field/payload type, registers it under the mangled name BEFORE concretizing
+ * those fields (so a self-referential generic union — a pointer-recursive `List['T]` — finds
+ * itself and terminates), then concretizes each field/payload in turn. ⚠ THROWAWAY, like the
+ * function monomorphizer: cf0 owns real specialization names and definition-site checking. The
+ * arity-prefixed mangle and the fixed 64-char instance-name cap (which bounds generic nesting
+ * depth — an over-long name is a clean error, never an overflow) are genesis-only limits. */
+static void concretize_name(Program *prog, char *name, int line); /* forward (mutual) */
+
+static void instantiate_type(Program *prog, const char *mangled, int line) {
+	if (prog_find_data(prog, mangled) || prog_find_union(prog, mangled))
+		return; /* already instantiated (dedup / register-before-concretize recursion guard) */
+	char buf[512];
+	Mangle m;
+	mangle_split(mangled, &m, buf, sizeof buf);
+	if (m.n < 2 || !is_all_digits(m.el[1]))
+		die(line, "malformed generic type application");
+	const char *base = m.el[0];
+	int arity = atoi(m.el[1]);
+	if (arity > MAX_TYPARAMS)
+		die(line, "too many type arguments");
+	/* Extract each argument's mangled substring and ensure nested applications exist first. */
+	char args[MAX_TYPARAMS][256];
+	int idx = 2;
+	for (int k = 0; k < arity; k++) {
+		int end = mangle_span(&m, idx);
+		mangle_join(&m, idx, end, args[k], sizeof args[0]);
+		idx = end;
+		concretize_name(prog, args[k], line);
+	}
+	if (idx != m.n) /* the arity's spans must consume the whole name (defensive) */
+		die(line, "malformed generic type application");
+	DataDecl *dt = prog_find_data(prog, base);
+	UnionDecl *ut = prog_find_union(prog, base);
+	if (dt && dt->ntyparams > 0) {
+		if (arity != dt->ntyparams)
+			die(line, "wrong number of type arguments for this generic data type");
+		if (strlen(mangled) >= sizeof dt->name)
+			die(line, "instantiated type name too long");
+		DataDecl *c = xmalloc(sizeof *c);
+		*c = *dt; /* copies fields/field_types/base_name by value */
+		snprintf(c->name, sizeof c->name, "%s", mangled);
+		c->ntyparams = 0;
+		prog_add_data(prog, c); /* register BEFORE concretizing fields (recursion guard) */
+		for (int i = 0; i < c->nfields; i++) {
+			char sub[256];
+			subst_mangled(sub, sizeof sub, dt->field_types[i], dt->typarams, args, arity);
+			if (strlen(sub) >= sizeof c->field_types[0])
+				die(line, "field type name too long");
+			snprintf(c->field_types[i], sizeof c->field_types[0], "%s", sub);
+			concretize_name(prog, c->field_types[i], line);
+		}
+	} else if (ut && ut->ntyparams > 0) {
+		if (arity != ut->ntyparams)
+			die(line, "wrong number of type arguments for this generic union type");
+		if (strlen(mangled) >= sizeof ut->name)
+			die(line, "instantiated type name too long");
+		UnionDecl *c = xmalloc(sizeof *c);
+		*c = *ut;
+		snprintf(c->name, sizeof c->name, "%s", mangled);
+		c->ntyparams = 0;
+		prog_add_union(prog, c); /* register BEFORE concretizing payloads (recursion guard) */
+		for (int mi = 0; mi < c->nmembers; mi++)
+			for (int j = 0; j < c->arity[mi]; j++) {
+				char sub[256];
+				subst_mangled(sub, sizeof sub, ut->payload_types[mi][j], ut->typarams, args, arity);
+				if (strlen(sub) >= sizeof c->payload_types[0][0])
+					die(line, "payload type name too long");
+				snprintf(c->payload_types[mi][j], sizeof c->payload_types[0][0], "%s", sub);
+				concretize_name(prog, c->payload_types[mi][j], line);
+			}
+	} else if (dt || ut) {
+		die(line, "type arguments given to a non-generic type");
+	} else {
+		die(line, "unknown generic type");
+	}
+}
+
+/* Ensure a concrete (post-substitution) type name is usable: instantiate a generic
+ * application, error on a generic template used without arguments or a stray `'T`; a plain
+ * concrete/leaf name is left for resolve_member_type/resolve_signatures to validate. */
+static void concretize_name(Program *prog, char *name, int line) {
+	if (name[0] == '\0' || strcmp(name, "Int") == 0 ||
+	    strcmp(name, "Uarch") == 0 || strcmp(name, "Str") == 0)
+		return;
+	if (name[0] == '\'')
+		die(line, "internal: unsubstituted type variable in a concrete context");
+	if (strchr(name, '.')) { /* a generic application */
+		instantiate_type(prog, name, line);
+		return;
+	}
+	/* ⚠ cfcc requires EXPLICIT type arguments at every generic-type use, INCLUDING a value
+	 * construction (`Maybe[Int].Just(5)`, not `Maybe.Just(5)`) — constructor-argument
+	 * inference is deferred. cf0 must NOT inherit this: type_system §8.1/§5.1 infer the member
+	 * at the construction site (`Maybe.Just(1) : Maybe[Arch].Just`), and seed_subset §4 keeps
+	 * generics-with-inference in full. cfcc infers args for a function CALL (shallow path) but
+	 * demands them for a construction — a genesis narrowing that rejects, never miscompiles. */
+	DataDecl *d = prog_find_data(prog, name);
+	if (d && d->ntyparams > 0)
+		die(line, "generic data type used without type arguments (write `Name[Int]`)");
+	UnionDecl *u = prog_find_union(prog, name);
+	if (u && u->ntyparams > 0)
+		die(line, "generic union type used without type arguments (write `Name[Int]`)");
+}
+
+/* Concretize a concrete function's parameter and return type applications. */
+static void concretize_signature(Program *prog, Func *fn) {
+	for (int i = 0; i < fn->nparams; i++)
+		if (fn->params[i].kind == PK_RECORD)
+			concretize_name(prog, fn->params[i].type_name, fn->params[i].line);
+	if (fn->ret_type_name[0])
+		concretize_name(prog, fn->ret_type_name, fn->ret_line);
 }
 
 /* Create (or reuse) the specialization of a generic template for a concrete type-arg
@@ -2366,19 +2680,33 @@ static Func *instantiate(Program *prog, Func *tmpl, char typeargs[][64], int nar
 		c->cap_locals = 0;
 	}
 	c->body = clone_stmt(tmpl->body);
-	for (int i = 0; i < c->nparams; i++)
+	/* Widen the type args to the mangled-name buffer width for substitution. */
+	char targs[MAX_TYPARAMS][256];
+	for (int i = 0; i < nargs; i++)
+		snprintf(targs[i], sizeof targs[0], "%s", typeargs[i]);
+	for (int i = 0; i < c->nparams; i++) {
 		if (c->params[i].kind == PK_VAR) {
 			int idx = func_typaram_index(tmpl, c->params[i].type_name);
 			reclassify_param(&c->params[i], typeargs[idx], line);
+		} else if (c->params[i].kind == PK_RECORD && strchr(c->params[i].type_name, '\'')) {
+			/* a generic-application param like `Box['T]` → substitute its type args */
+			char sub[256];
+			subst_mangled(sub, sizeof sub, c->params[i].type_name, tmpl->typarams, targs, tmpl->ntyparams);
+			if (strlen(sub) >= sizeof c->params[i].type_name)
+				die(line, "parameter type name too long");
+			snprintf(c->params[i].type_name, sizeof c->params[i].type_name, "%s", sub);
 		}
-	if (c->ret_type_name[0] == '\'') {
-		int idx = func_typaram_index(tmpl, c->ret_type_name);
-		const char *concrete = typeargs[idx];
-		/* empty ret_type_name means Int (cfcc's convention). */
-		snprintf(c->ret_type_name, sizeof c->ret_type_name, "%s",
-		         strcmp(concrete, "Int") == 0 ? "" : concrete);
 	}
-	subst_stmts(c->body, tmpl, typeargs);
+	if (c->ret_type_name[0] && strchr(c->ret_type_name, '\'')) {
+		char sub[256];
+		subst_mangled(sub, sizeof sub, c->ret_type_name, tmpl->typarams, targs, tmpl->ntyparams);
+		if (strcmp(sub, "Int") == 0) /* a bare `'T` return resolving to Int → empty (cfcc convention) */
+			sub[0] = '\0';
+		if (strlen(sub) >= sizeof c->ret_type_name)
+			die(line, "return type name too long");
+		snprintf(c->ret_type_name, sizeof c->ret_type_name, "%s", sub);
+	}
+	subst_stmts(c->body, tmpl, targs);
 	prog_add_func(prog, c);
 	return c;
 }
@@ -2442,6 +2770,10 @@ static void monomorph_expr(Program *prog, Func *fn, Expr *e) {
 		monomorph_expr(prog, fn, e->fvals[i]);
 	for (int i = 0; i < e->narms; i++)
 		monomorph_expr(prog, fn, e->arms[i].body);
+	/* A generic record literal (`Box[Int]{…}`) or union member value (`Maybe[Int].Just`)
+	 * names a type application — instantiate it. */
+	if (e->kind == EX_RECORD || e->kind == EX_UMEMBER)
+		concretize_name(prog, e->name, e->line);
 	if (e->kind != EX_CALL)
 		return;
 	Func *callee = prog_find_func(prog, e->name);
@@ -2484,20 +2816,41 @@ static void monomorph_expr(Program *prog, Func *fn, Expr *e) {
 
 static void monomorph_stmts(Program *prog, Func *fn, Stmt *s) {
 	for (; s; s = s->next) {
+		if (s->kind == ST_LOCAL && s->type_name[0]) /* a local's generic-type annotation */
+			concretize_name(prog, s->type_name, s->line);
 		monomorph_expr(prog, fn, s->expr);
 		monomorph_stmts(prog, fn, s->body);
 	}
 }
 
-/* Specialize the whole program from its concrete functions. prog->nfuncs grows as
- * instantiations are appended; the loop revisits them, so transitive generic calls
- * are reached. Templates (ntyparams > 0) are skipped here and by every later pass. */
+/* Specialize the whole program from its concrete functions and types. prog->nfuncs and
+ * prog->ndatas/nunions grow as instantiations are appended; each loop revisits them, so
+ * transitive generic uses are reached (a type instance is fully concretized on creation, so
+ * revisiting it is idempotent). Templates (ntyparams > 0) are skipped here and by every
+ * later pass. */
 static void monomorphize(Program *prog) {
 	for (int i = 0; i < prog->nfuncs; i++) {
 		Func *fn = prog->funcs[i];
-		if (fn->ntyparams > 0 || fn->is_asm)
+		if (fn->ntyparams > 0)
 			continue;
-		monomorph_stmts(prog, fn, fn->body);
+		concretize_signature(prog, fn);          /* param/return type applications */
+		if (!fn->is_asm)
+			monomorph_stmts(prog, fn, fn->body); /* generic calls + local/literal type apps */
+	}
+	for (int i = 0; i < prog->ndatas; i++) {
+		if (prog->datas[i]->ntyparams > 0)
+			continue;
+		DataDecl *d = prog->datas[i];
+		for (int j = 0; j < d->nfields; j++)
+			concretize_name(prog, d->field_types[j], 0);
+	}
+	for (int i = 0; i < prog->nunions; i++) {
+		if (prog->unions[i]->ntyparams > 0)
+			continue;
+		UnionDecl *u = prog->unions[i];
+		for (int m = 0; m < u->nmembers; m++)
+			for (int j = 0; j < u->arity[m]; j++)
+				concretize_name(prog, u->payload_types[m][j], 0);
 	}
 }
 
@@ -2687,7 +3040,9 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 			if (a->is_wild) {
 				has_wild = 1;
 			} else {
-				if (strcmp(a->qual, u->name) != 0)
+				/* Arms qualify members by the union's base (template) name — `Maybe.Just`,
+				 * not the mangled instance name `Maybe.1.Int` (type_system §8.3). */
+				if (strcmp(a->qual, u->base_name) != 0)
 					die(a->line, "a match arm must name a member of the scrutinee's union, qualified by it");
 				for (int k = 0; k < a->nalts; k++) {
 					int tag = union_member_tag(u, a->members[k]);
@@ -3007,11 +3362,15 @@ static void typecheck(Program *prog) {
 	 * front so an unused bad field type is still an error, and forward/mutual refs resolve. */
 	for (int i = 0; i < prog->ndatas; i++) {
 		DataDecl *d = prog->datas[i];
+		if (d->ntyparams > 0) /* a generic template — only its instantiations are laid out */
+			continue;
 		for (int j = 0; j < d->nfields; j++)
 			resolve_member_type(prog, d->field_types[j], 0);
 	}
 	for (int i = 0; i < prog->nunions; i++) {
 		UnionDecl *u = prog->unions[i];
+		if (u->ntyparams > 0)
+			continue;
 		for (int m = 0; m < u->nmembers; m++)
 			for (int j = 0; j < u->arity[m]; j++)
 				resolve_member_type(prog, u->payload_types[m][j], 0);
