@@ -441,14 +441,17 @@ typedef enum {
 	PK_LONG,   /* *T    -> l (argv, envp, `*[Uint8]` buffers) — an opaque pointer */
 	PK_RECORD, /* a record type -> l (a pointer to the caller's arena record) */
 	PK_UARCH,  /* Uarch -> l (a register-width unsigned integer; see TY_UARCH) */
+	PK_UNION,  /* a tag-only union -> w (the tag). Parsed as PK_RECORD, reclassified in
+	            * resolve_signatures once the name is known to be a union. */
 } ParamKind;
 
 typedef struct {
 	char name[64];
 	ParamKind kind;
 	int line;           /* source line of the type (for diagnostics) */
-	char type_name[64]; /* PK_RECORD: the record type name (resolved in typecheck) */
+	char type_name[64]; /* PK_RECORD/PK_UNION: the nominal type name (resolved later) */
 	DataDecl *rec;      /* PK_RECORD: the resolved declaration */
+	UnionDecl *uni;     /* PK_UNION: the resolved declaration */
 } Param;
 
 /* Expression AST. M0 expressions are word-valued: literals, references to a
@@ -666,9 +669,10 @@ typedef struct Func {
 	int is_pub;
 	Param params[MAX_PARAMS];
 	int nparams;
-	char ret_type_name[64]; /* empty = Int; "Uarch" = Uarch; else a record return type */
+	char ret_type_name[64]; /* empty = Int; "Uarch" = Uarch; else a record/union return */
 	int ret_line;           /* source line of the return type (for diagnostics) */
 	DataDecl *ret_rec;      /* resolved record return type (typecheck) */
+	UnionDecl *ret_uni;     /* resolved union return type (typecheck) */
 	Binding *locals;
 	int nlocals, cap_locals;
 	Stmt *body;             /* the statement/expression body — NULL for an asm function */
@@ -759,11 +763,13 @@ typedef enum {
 static Resolution resolve_name(Func *fn, const char *name, Type *ty) {
 	for (int i = 0; i < fn->nparams; i++)
 		if (strcmp(fn->params[i].name, name) == 0) {
+			ty->uni = NULL;
 			switch (fn->params[i].kind) {
 			case PK_WORD:   ty->kind = TY_INT;    ty->rec = NULL; break;
 			case PK_RECORD: ty->kind = TY_RECORD; ty->rec = fn->params[i].rec; break;
 			case PK_LONG:   ty->kind = TY_PTR;    ty->rec = NULL; break;
 			case PK_UARCH:  ty->kind = TY_UARCH;  ty->rec = NULL; break;
+			case PK_UNION:  ty->kind = TY_UNION;  ty->rec = NULL; ty->uni = fn->params[i].uni; break;
 			}
 			return R_PARAM;
 		}
@@ -1937,6 +1943,10 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 				if (at.kind != TY_PTR && at.kind != TY_BUF)
 					die(e->line, "argument type mismatch (a pointer parameter expects a pointer or `[N Uint8]` buffer, e.g. `s.bytes`)");
 				break;
+			case PK_UNION:
+				if (at.kind != TY_UNION || at.uni != pm->uni)
+					die(e->line, "argument type mismatch (union type differs)");
+				break;
 			}
 		}
 		e->callee = callee; /* cached for emit (per-arg register width, Int→Uarch widen) */
@@ -1965,32 +1975,42 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		UnionDecl *u = st.uni;
 		e->uni = u;
 		int covered[MAX_UNION_MEMBERS] = {0};
-		int has_wild = 0;
+		int has_wild = 0, have_rt = 0;
+		Type rt = {TY_INT, NULL, NULL}; /* the arms' common (result) type */
 		for (int i = 0; i < e->narms; i++) {
 			MatchArm *a = &e->arms[i];
 			if (has_wild)
 				die(a->line, "unreachable match arm after `_`");
 			if (a->is_wild) {
 				has_wild = 1;
-				expect_int(prog, fn, a->body);
-				continue;
+			} else {
+				if (strcmp(a->qual, u->name) != 0)
+					die(a->line, "a match arm must name a member of the scrutinee's union, qualified by it");
+				int tag = union_member_tag(u, a->member);
+				if (tag < 0)
+					die(a->line, "this union has no such member");
+				if (covered[tag])
+					die(a->line, "duplicate match arm for this member");
+				covered[tag] = 1;
+				a->tag = tag;
 			}
-			if (strcmp(a->qual, u->name) != 0)
-				die(a->line, "a match arm must name a member of the scrutinee's union, qualified by it");
-			int tag = union_member_tag(u, a->member);
-			if (tag < 0)
-				die(a->line, "this union has no such member");
-			if (covered[tag])
-				die(a->line, "duplicate match arm for this member");
-			covered[tag] = 1;
-			a->tag = tag;
-			expect_int(prog, fn, a->body);
+			/* Arm bodies unify to one type — an Int or a tag-only union (both a word);
+			 * that type is the match's value type, so a `match` can yield either. */
+			Type bt = typeof_expr(prog, fn, a->body);
+			if (bt.kind != TY_INT && bt.kind != TY_UNION)
+				die(a->line, "a match arm yields an Int or a tag-only union (M1)");
+			if (!have_rt) {
+				rt = bt;
+				have_rt = 1;
+			} else if (bt.kind != rt.kind || (rt.kind == TY_UNION && bt.uni != rt.uni)) {
+				die(a->line, "match arms must all yield the same type");
+			}
 		}
 		if (!has_wild)
 			for (int i = 0; i < u->nmembers; i++)
 				if (!covered[i])
 					die(e->line, "non-exhaustive match (cover every union member or add a `_` arm)");
-		return (Type){TY_INT, NULL, NULL};
+		return rt;
 	}
 	case EX_IF:
 		expect_int(prog, fn, e->lhs); /* condition */
@@ -2025,6 +2045,8 @@ static Type typeof_expr(Program *prog, Func *fn, Expr *e) {
 static Type func_ret_type(const Func *fn) {
 	if (strcmp(fn->ret_type_name, "Uarch") == 0)
 		return (Type){TY_UARCH, NULL, NULL};
+	if (fn->ret_uni)
+		return (Type){TY_UNION, NULL, fn->ret_uni};
 	if (fn->ret_type_name[0])
 		return (Type){TY_RECORD, fn->ret_rec, NULL};
 	return (Type){TY_INT, NULL, NULL};
@@ -2169,6 +2191,10 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 				Type et = typeof_expr(prog, fn, s->expr);
 				if (et.kind != TY_UARCH && et.kind != TY_INT && et.kind != TY_PTR)
 					die(s->expr->line, "a Uarch function returns a Uarch, Int, or pointer value");
+			} else if (rt.kind == TY_UNION) {
+				Type et = typeof_expr(prog, fn, s->expr);
+				if (et.kind != TY_UNION || et.uni != rt.uni)
+					die(s->expr->line, "returned value does not match the union return type");
 			} else {
 				expect_int(prog, fn, s->expr);
 			}
@@ -2205,20 +2231,29 @@ static void resolve_signatures(Program *prog) {
 		Func *fn = prog->funcs[i];
 		for (int j = 0; j < fn->nparams; j++)
 			if (fn->params[j].kind == PK_RECORD) {
-				if (prog_find_union(prog, fn->params[j].type_name))
-					die(fn->params[j].line, "M1.1 does not support union parameters yet (use a union local + `match`)");
+				/* A nominal-typed param naming a union is reclassified to PK_UNION
+				 * (tag-only → a word); otherwise it must name a `data` record. */
+				UnionDecl *u = prog_find_union(prog, fn->params[j].type_name);
+				if (u) {
+					fn->params[j].kind = PK_UNION;
+					fn->params[j].uni = u;
+					continue;
+				}
 				DataDecl *d = prog_find_data(prog, fn->params[j].type_name);
 				if (!d)
 					die(fn->params[j].line, "a parameter names an unknown data type");
 				fn->params[j].rec = d;
 			}
 		if (fn->ret_type_name[0] && strcmp(fn->ret_type_name, "Uarch") != 0) {
-			if (prog_find_union(prog, fn->ret_type_name))
-				die(fn->ret_line, "M1.1 does not support union return types yet");
-			DataDecl *d = prog_find_data(prog, fn->ret_type_name);
-			if (!d)
-				die(fn->ret_line, "a return type names an unknown data type");
-			fn->ret_rec = d;
+			UnionDecl *u = prog_find_union(prog, fn->ret_type_name);
+			if (u) {
+				fn->ret_uni = u;
+			} else {
+				DataDecl *d = prog_find_data(prog, fn->ret_type_name);
+				if (!d)
+					die(fn->ret_line, "a return type names an unknown data type");
+				fn->ret_rec = d;
+			}
 		}
 	}
 }
@@ -2438,13 +2473,14 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 				fprintf(out, "\t%%t%d =l extsw %%t%d\n", argt[i], w);
 				argw[i] = 'l';
 			} else {
-				argw[i] = (pk == PK_WORD) ? 'w' : 'l';
+				argw[i] = (pk == PK_WORD || pk == PK_UNION) ? 'w' : 'l';
 				argt[i] = ex->tmp++;
 				fprintf(out, "\t%%t%d =%c copy %s\n", argt[i], argw[i], op);
 			}
 		}
 		int r = ex->tmp++;
-		const char *rty = e->rtype.kind == TY_INT ? "w" : "l"; /* Uarch/record/ptr → l */
+		/* A tag-only union result, like an Int, is a word; record/ptr/Uarch are `l`. */
+		const char *rty = (e->rtype.kind == TY_INT || e->rtype.kind == TY_UNION) ? "w" : "l";
 		fprintf(out, "\t%%t%d =%s call $%s(", r, rty, e->name);
 		for (int i = 0; i < e->nargs; i++)
 			fprintf(out, "%s%c %%t%d", i ? ", " : "", argw[i], argt[i]);
@@ -2758,11 +2794,13 @@ static void emit_func(FILE *out, const Func *fn) {
 	 * return type lowers to `l` (a pointer to the arena record); Int is `w`. No page
 	 * node is threaded yet: a non-allocating body carries none (M0). */
 	int is_main = strcmp(fn->name, "main") == 0;
-	const char *retty = func_ret_type(fn).kind == TY_INT ? "w" : "l"; /* Uarch/record → l */
+	Type frt = func_ret_type(fn);
+	const char *retty = (frt.kind == TY_INT || frt.kind == TY_UNION) ? "w" : "l"; /* tag-only union → w */
 	fprintf(out, "%sfunction %s $%s(", is_main ? "export " : "", retty, fn->name);
 	for (int i = 0; i < fn->nparams; i++)
 		fprintf(out, "%s%s %%u_%s", i ? ", " : "",
-		        fn->params[i].kind == PK_WORD ? "w" : "l", fn->params[i].name);
+		        (fn->params[i].kind == PK_WORD || fn->params[i].kind == PK_UNION) ? "w" : "l",
+		        fn->params[i].name);
 	fprintf(out, ") {\n");
 	fprintf(out, "@start\n");
 
@@ -2773,7 +2811,8 @@ static void emit_func(FILE *out, const Func *fn) {
 	 * argv/envp) are never referenced, so they get no slot. */
 	for (int i = 0; i < fn->nparams; i++) {
 		const char *n = fn->params[i].name;
-		if (fn->params[i].kind == PK_WORD) {
+		/* A tag-only union param is a word tag — spill it to a word slot like an Int. */
+		if (fn->params[i].kind == PK_WORD || fn->params[i].kind == PK_UNION) {
 			fprintf(out, "\t%%s_%s =l alloc4 4\n", n);
 			fprintf(out, "\tstorew %%u_%s, %%s_%s\n", n, n);
 		} else if (fn->params[i].kind == PK_RECORD) {
