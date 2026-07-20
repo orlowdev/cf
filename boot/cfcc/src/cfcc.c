@@ -508,6 +508,13 @@ typedef struct {
 	int tags[MAX_ARM_ALTS]; /* per-alternative member tag, resolved in typecheck */
 	int nalts;
 	int is_wild;
+	/* Payload binding (single-member arms only): `Node.IntLit(v)` binds `v` to payload
+	 * field 0. `binds[i]` is the name (or "_" to ignore field i); `bind_ids[i]` the
+	 * per-function storage id (`%pb<id>`), assigned in typecheck; `nbinds` = 0 for a
+	 * bare/or-pattern arm, else the member's arity. */
+	char binds[MAX_ARM_ALTS][64];
+	int bind_ids[MAX_ARM_ALTS];
+	int nbinds;
 	Expr *body;
 	int line;
 } MatchArm;
@@ -553,6 +560,10 @@ struct Expr {
 	UnionDecl *uni;
 	MatchArm *arms;
 	int narms;
+	/* EX_VAR: set by typecheck when the name resolves to a match-arm payload binding
+	 * (not a param/local) — emit reads its value from the `%pb<bind_id>` storage temp. */
+	int is_bind;
+	int bind_id;
 };
 
 static Expr *new_expr(ExprKind kind) {
@@ -700,6 +711,12 @@ typedef struct Func {
 	UnionDecl *ret_uni;     /* resolved union return type (typecheck) */
 	Binding *locals;
 	int nlocals, cap_locals;
+	/* Match-arm payload bindings currently in scope (a stack, pushed/popped around each
+	 * binding arm's body during typecheck; nested matches nest). `next_bind_id` mints a
+	 * per-function unique storage id (`%pb<id>`). */
+	struct { char name[64]; int id; } abinds[64];
+	int nabinds;
+	int next_bind_id;
 	Stmt *body;             /* the statement/expression body — NULL for an asm function */
 	int is_asm;             /* 1 if the body is an `asm "..."` block (see asm_body) */
 	Token *asm_body;        /* is_asm: the asm string token, whose segments are emitted
@@ -804,6 +821,15 @@ static Resolution resolve_name(Func *fn, const char *name, Type *ty) {
 			return fn->locals[i].mutable ? R_LET : R_CONST;
 		}
 	return R_NONE;
+}
+
+/* If `name` is a match-arm payload binding currently in scope, return its storage id
+ * (`%pb<id>`); else -1. Innermost binding wins, so a binding shadows an outer name. */
+static int find_active_bind(Func *fn, const char *name) {
+	for (int i = fn->nabinds - 1; i >= 0; i--)
+		if (strcmp(fn->abinds[i].name, name) == 0)
+			return fn->abinds[i].id;
+	return -1;
 }
 
 /* Record a new local with the given type. Caller has checked for a clash. For a
@@ -1025,7 +1051,9 @@ static Expr *parse_primary(Parser *p, Func *fn) {
 		e->line = line;
 		tok_copy(t, e->name, sizeof e->name);
 		Type ty;
-		if (resolve_name(fn, e->name, &ty) == R_NONE)
+		/* A match-arm payload binding (in scope during the arm body's parse) resolves
+		 * too — its type and storage are settled in typecheck. */
+		if (resolve_name(fn, e->name, &ty) == R_NONE && find_active_bind(fn, e->name) < 0)
 			die(line, "unknown name (M0 expressions use integers, parameters, locals, and calls)");
 		/* A record value is legal here only as the base of a field access; a
 		 * pointer never. Both are caught in the typecheck pass, which knows the
@@ -1278,8 +1306,9 @@ static Expr *parse_match(Parser *p, Func *fn) {
 			if (peek(p)->kind == TK_PIPE)
 				die(peek(p)->line, "`_` is a standalone wildcard, not an or-pattern alternative");
 		} else if (is_type_ident(pt)) {
-			/* An or-pattern of one or more `Union.Member` alternatives (`A | B | …`),
-			 * all qualified by the scrutinee's union. */
+			/* A member arm: `Union.Member`, then either a payload sub-pattern `(binds)`
+			 * (a single-member binding arm) or an or-pattern `| Union.Member …` (no
+			 * binds), all alternatives qualified by the scrutinee's union. */
 			for (;;) {
 				Token *qt = peek(p);
 				if (!is_type_ident(qt))
@@ -1300,8 +1329,33 @@ static Expr *parse_match(Parser *p, Func *fn) {
 				tok_copy(mt, arm.members[arm.nalts], sizeof arm.members[0]);
 				arm.nalts++;
 				advance(p);
-				if (peek(p)->kind == TK_LPAREN)
-					die(peek(p)->line, "M1 match arms are tag-only (no payload binding yet)");
+				if (peek(p)->kind == TK_LPAREN) {
+					/* Payload sub-pattern: bind lowercase names (or `_`) positionally.
+					 * Only on a single member — an or-pattern arm cannot bind. */
+					if (arm.nalts > 1)
+						die(peek(p)->line, "a payload sub-pattern binds only on a single member, not an or-pattern");
+					advance(p); /* ( */
+					if (peek(p)->kind == TK_RPAREN)
+						die(peek(p)->line, "an empty payload pattern `()` — omit the parens to match the tag only");
+					for (;;) {
+						Token *bt = peek(p);
+						if (!is_ident(bt, "_") && (bt->kind != TK_IDENT || is_type_ident(bt)))
+							die(bt->line, "a payload pattern binds lowercase names or `_` (literal/nested patterns are a later brick)");
+						if (bt->text[bt->len - 1] == '!')
+							die(bt->line, "M0 does not support `!` in a binding name");
+						if (arm.nbinds == MAX_ARM_ALTS)
+							die(bt->line, "too many payload bindings");
+						tok_copy(bt, arm.binds[arm.nbinds++], sizeof arm.binds[0]);
+						advance(p);
+						if (peek(p)->kind == TK_COMMA) {
+							advance(p);
+							continue;
+						}
+						break;
+					}
+					expect(p, TK_RPAREN, "expected `)` to close the payload pattern");
+					break; /* binding arm — no or-pattern alternatives */
+				}
 				if (peek(p)->kind == TK_PIPE) {
 					advance(p);
 					continue;
@@ -1312,7 +1366,20 @@ static Expr *parse_match(Parser *p, Func *fn) {
 			die(pt->line, "a match arm is `Union.Member` (or `A | B`) or `_` (M1: no literal/binding patterns yet)");
 		}
 		expect(p, TK_ARROW, "expected `->`");
+		/* Put the arm's payload bindings in scope for the body's parse (parse resolves
+		 * variable names eagerly); ids are assigned in typecheck. Pop after the body. */
+		int saved_pb = fn->nabinds;
+		for (int b = 0; b < arm.nbinds; b++) {
+			if (strcmp(arm.binds[b], "_") == 0)
+				continue;
+			if (fn->nabinds == (int)(sizeof fn->abinds / sizeof fn->abinds[0]))
+				die(arm.line, "too many active payload bindings");
+			snprintf(fn->abinds[fn->nabinds].name, sizeof fn->abinds[0].name, "%s", arm.binds[b]);
+			fn->abinds[fn->nabinds].id = 0; /* placeholder; typecheck assigns the real id */
+			fn->nabinds++;
+		}
 		arm.body = parse_expr(p, fn);
+		fn->nabinds = saved_pb;
 		if (e->narms == cap) {
 			cap = cap ? cap * 2 : 4;
 			e->arms = realloc(e->arms, cap * sizeof *e->arms);
@@ -1872,8 +1939,10 @@ static UnionDecl *parse_union_decl(Parser *p, Program *prog) {
 					if (!is_ident(ft, "Int"))
 						die(ft->line, "M1.2a union payload fields must be `Int` (other payload types are later bricks)");
 					advance(p);
-					if (arity == MAX_FIELDS)
-						die(ft->line, "too many payload fields");
+					/* Capped at MAX_ARM_ALTS so any declarable member is bindable in a
+					 * match arm (which holds up to MAX_ARM_ALTS binding names). */
+					if (arity == MAX_ARM_ALTS)
+						die(ft->line, "a union member has at most 16 payload fields (M1)");
 					arity++;
 					if (peek(p)->kind == TK_COMMA) {
 						advance(p);
@@ -1974,6 +2043,14 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 	case EX_STR:
 		return (Type){TY_STR, NULL, NULL};
 	case EX_VAR: {
+		/* A match-arm payload binding shadows params/locals; its value is an Int read
+		 * from the `%pb<id>` storage temp (loaded at the arm block). */
+		int bid = find_active_bind(fn, e->name);
+		if (bid >= 0) {
+			e->is_bind = 1;
+			e->bind_id = bid;
+			return (Type){TY_INT, NULL, NULL};
+		}
 		Type ty;
 		if (resolve_name(fn, e->name, &ty) == R_NONE)
 			die(e->line, "unknown name");
@@ -2087,6 +2164,7 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 			MatchArm *a = &e->arms[i];
 			if (has_wild)
 				die(a->line, "unreachable match arm after `_`");
+			int saved_abinds = fn->nabinds; /* arm-scoped bindings pop after the body */
 			if (a->is_wild) {
 				has_wild = 1;
 			} else {
@@ -2100,6 +2178,29 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 						die(a->line, "duplicate match arm for this member");
 					covered[tag] = 1;
 					a->tags[k] = tag;
+				}
+				/* A payload sub-pattern (single-member arm) binds each field to an Int
+				 * scoped to this arm's body; `_` ignores a field. */
+				if (a->nbinds > 0) {
+					int tag = a->tags[0];
+					if (a->nbinds != u->arity[tag])
+						die(a->line, "payload pattern arity does not match the member");
+					for (int b = 0; b < a->nbinds; b++) {
+						if (strcmp(a->binds[b], "_") == 0) {
+							a->bind_ids[b] = -1;
+							continue;
+						}
+						for (int j = 0; j < b; j++)
+							if (strcmp(a->binds[j], a->binds[b]) == 0)
+								die(a->line, "duplicate payload binding name");
+						if (fn->nabinds == (int)(sizeof fn->abinds / sizeof fn->abinds[0]))
+							die(a->line, "too many active payload bindings");
+						int id = fn->next_bind_id++;
+						a->bind_ids[b] = id;
+						snprintf(fn->abinds[fn->nabinds].name, sizeof fn->abinds[0].name, "%s", a->binds[b]);
+						fn->abinds[fn->nabinds].id = id;
+						fn->nabinds++;
+					}
 				}
 			}
 			/* Arm bodies unify to one type — an Int or a tag-only union (both a word);
@@ -2115,6 +2216,7 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 			} else if (bt.kind != rt.kind || (rt.kind == TY_UNION && bt.uni != rt.uni)) {
 				die(a->line, "match arms must all yield the same type");
 			}
+			fn->nabinds = saved_abinds; /* pop this arm's bindings */
 		}
 		if (!has_wild)
 			for (int i = 0; i < u->nmembers; i++)
@@ -2496,6 +2598,12 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		return;
 	}
 	case EX_VAR: {
+		/* A match-arm payload binding is an Int value held in its `%pb<id>` temp
+		 * (loaded at the arm block). */
+		if (e->is_bind) {
+			snprintf(dst, cap, "%%pb%d", e->bind_id);
+			return;
+		}
 		/* A record, byte-buffer, or boxed (payload) union name is an arena pointer
 		 * (`%r_<name>`), used directly as an operand; a word name (Int or tag-only
 		 * union) is a `loadw` from its slot. */
@@ -2659,6 +2767,15 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 					int nxt = ex->lbl++;
 					fprintf(out, "\tjnz %%t%d, @marm%d, @mnext%d\n", c, hit, nxt);
 					fprintf(out, "@marm%d\n", hit);
+					/* Load each bound payload field into its `%pb<id>` temp (the scrutinee
+					 * `sc` is the boxed union's pointer; field b is at 4 + b*4). */
+					for (int bi = 0; bi < a->nbinds; bi++) {
+						if (a->bind_ids[bi] < 0) /* `_` */
+							continue;
+						int addr = ex->tmp++;
+						fprintf(out, "\t%%t%d =l add %s, %d\n", addr, sc, 4 + bi * 4);
+						fprintf(out, "\t%%pb%d =w loadw %%t%d\n", a->bind_ids[bi], addr);
+					}
 					char b[96];
 					emit_expr(out, a->body, ex, b, sizeof b);
 					fprintf(out, "\tstorew %s, %%m%d\n", b, e->slot);
