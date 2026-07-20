@@ -644,6 +644,8 @@ typedef struct {
 	char name[64];
 	Type type;
 	int mutable;
+	char type_name[64]; /* the declared nominal type name (record/union/Str); empty for a
+	                     * word (Int) local. Available pre-typecheck for generic inference. */
 } Binding;
 
 #define MAX_PARAMS 32
@@ -870,7 +872,7 @@ static int find_active_bind(Func *fn, const char *name) {
 /* Record a new local with the given type. Caller has checked for a clash. For a
  * record local parse passes {TY_RECORD, NULL, NULL}; the typecheck pass backfills rec
  * (see resolve_record_binding). */
-static void func_add_local(Func *fn, const char *name, int mutable, Type ty) {
+static void func_add_local(Func *fn, const char *name, int mutable, Type ty, const char *type_name) {
 	if (fn->nlocals == fn->cap_locals) {
 		fn->cap_locals = fn->cap_locals ? fn->cap_locals * 2 : 16;
 		fn->locals = realloc(fn->locals, fn->cap_locals * sizeof *fn->locals);
@@ -881,6 +883,7 @@ static void func_add_local(Func *fn, const char *name, int mutable, Type ty) {
 	snprintf(b->name, sizeof b->name, "%s", name);
 	b->type = ty;
 	b->mutable = mutable;
+	snprintf(b->type_name, sizeof b->type_name, "%s", type_name ? type_name : "");
 }
 
 static Token *peek(Parser *p) {
@@ -1591,7 +1594,7 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 				die(peek(p)->line, "a `[N Uint8]` buffer has no initializer (`read` fills it)");
 			s->bufsize = bufsize;
 			Type bt = {TY_BUF, NULL, NULL};
-			func_add_local(fn, s->name, mutable, bt);
+			func_add_local(fn, s->name, mutable, bt, "");
 			return s;
 		}
 		expect(p, TK_EQ, "expected `=`");
@@ -1608,7 +1611,7 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 			else
 				s->expr = parse_expr(p, fn);
 			Type rt = {TY_RECORD, NULL, NULL};
-			func_add_local(fn, s->name, mutable, rt);
+			func_add_local(fn, s->name, mutable, rt, rectype);
 		} else if (is_str) {
 			/* `const Str name = "literal"` — a Str local binds a string literal only.
 			 * No `let Str` (M0 has no Str reassignment) and no `const Str t = other`
@@ -1622,7 +1625,7 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 				die(name->line, "a Str local binds a string literal only (M0 has no Str copy or interpolation yet)");
 			snprintf(s->type_name, sizeof s->type_name, "Str");
 			Type st = {TY_STR, NULL, NULL};
-			func_add_local(fn, s->name, mutable, st);
+			func_add_local(fn, s->name, mutable, st, "Str");
 		} else {
 			/* A `{` initializer with no type annotation is an attempted record
 			 * literal (M0 requires the annotation to know the record's type). */
@@ -1631,7 +1634,7 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 				    "a record binding needs a type annotation, e.g. `const Point p = { x: 1 }`");
 			s->expr = parse_expr(p, fn); /* initializer: name not yet in scope */
 			Type it = {TY_INT, NULL, NULL};
-			func_add_local(fn, s->name, mutable, it);
+			func_add_local(fn, s->name, mutable, it, "");
 		}
 		return s;
 	}
@@ -2293,39 +2296,109 @@ static Func *instantiate(Program *prog, Func *tmpl, char typeargs[][64], int nar
 	return c;
 }
 
-/* Walk a concrete function's body: every call to a generic template is specialized and
- * the call rewritten to the mangled concrete name. Because instantiations are appended
- * to prog->funcs and the driver loop below revisits them, this reaches a fixpoint. */
-static void monomorph_expr(Program *prog, Expr *e) {
-	if (!e)
-		return;
-	if (e->kind == EX_CALL) {
-		Func *callee = prog_find_func(prog, e->name);
-		if (callee && callee->ntyparams > 0) {
-			if (e->ntypeargs == 0)
-				die(e->line, "a generic call needs explicit type arguments, e.g. `f[Int](x)` (inference is a later brick)");
-			Func *inst = instantiate(prog, callee, e->typeargs, e->ntypeargs, e->line);
-			snprintf(e->name, sizeof e->name, "%s", inst->name);
-			e->ntypeargs = 0; /* now a concrete call */
-		} else if (e->ntypeargs > 0) {
-			die(e->line, "type arguments given to a non-generic function");
-		}
+/* A best-effort type NAME for an argument expression, used to infer a generic's type
+ * arguments before typecheck. Returns "Int"/"Uarch"/a record-or-union name, or "" when
+ * cfcc can't determine it cheaply (the caller then asks for an explicit type argument).
+ * (This is a pre-typecheck shortcut, not the full type system — a wrong guess is caught
+ * as a per-instantiation typecheck error.) */
+static const char *shallow_type_name(Program *prog, Func *fn, Expr *e) {
+	switch (e->kind) {
+	case EX_INT:
+		return "Int";
+	case EX_UMEMBER:
+		return e->name; /* the union type name */
+	case EX_VAR:
+		for (int i = 0; i < fn->nparams; i++)
+			if (strcmp(fn->params[i].name, e->name) == 0) {
+				switch (fn->params[i].kind) {
+				case PK_WORD:   return "Int";
+				case PK_UARCH:  return "Uarch";
+				case PK_RECORD:
+				case PK_UNION:
+				case PK_VAR:    return fn->params[i].type_name;
+				case PK_LONG:   return ""; /* a pointer — no simple type name */
+				}
+			}
+		for (int i = 0; i < fn->nlocals; i++)
+			if (strcmp(fn->locals[i].name, e->name) == 0)
+				return fn->locals[i].type.kind == TY_INT ? "Int" : fn->locals[i].type_name;
+		return "";
+	case EX_CALL: {
+		Func *c = prog_find_func(prog, e->name);
+		if (!c || c->ntyparams > 0) /* unknown, or an unspecialized generic */
+			return "";
+		if (strcmp(c->ret_type_name, "Uarch") == 0)
+			return "Uarch";
+		return c->ret_type_name[0] ? c->ret_type_name : "Int";
 	}
-	monomorph_expr(prog, e->lhs);
-	monomorph_expr(prog, e->rhs);
-	monomorph_expr(prog, e->els);
-	for (int i = 0; i < e->nargs; i++)
-		monomorph_expr(prog, e->args[i]);
-	for (int i = 0; i < e->nfields; i++)
-		monomorph_expr(prog, e->fvals[i]);
-	for (int i = 0; i < e->narms; i++)
-		monomorph_expr(prog, e->arms[i].body);
+	default:
+		/* arithmetic/comparison/logical/field — Int in the common case; a genuine
+		 * mismatch surfaces later as a per-instantiation error. */
+		return "Int";
+	}
 }
 
-static void monomorph_stmts(Program *prog, Stmt *s) {
+/* Walk a concrete function's body and specialize every call to a generic template —
+ * children first, so a nested generic call is resolved (its return type known) before an
+ * enclosing call infers from it. Type arguments come from the explicit `[…]` list or are
+ * inferred from the argument types. The call is rewritten to the mangled concrete name;
+ * appended instantiations are revisited by the driver loop → a fixpoint. */
+static void monomorph_expr(Program *prog, Func *fn, Expr *e) {
+	if (!e)
+		return;
+	monomorph_expr(prog, fn, e->lhs);
+	monomorph_expr(prog, fn, e->rhs);
+	monomorph_expr(prog, fn, e->els);
+	for (int i = 0; i < e->nargs; i++)
+		monomorph_expr(prog, fn, e->args[i]);
+	for (int i = 0; i < e->nfields; i++)
+		monomorph_expr(prog, fn, e->fvals[i]);
+	for (int i = 0; i < e->narms; i++)
+		monomorph_expr(prog, fn, e->arms[i].body);
+	if (e->kind != EX_CALL)
+		return;
+	Func *callee = prog_find_func(prog, e->name);
+	if (!callee || callee->ntyparams == 0) {
+		if (e->ntypeargs > 0)
+			die(e->line, "type arguments given to a non-generic function");
+		return;
+	}
+	char args[MAX_TYPARAMS][64];
+	int ntargs = e->ntypeargs;
+	if (ntargs > 0) {
+		for (int i = 0; i < ntargs; i++)
+			snprintf(args[i], sizeof args[0], "%s", e->typeargs[i]);
+	} else {
+		/* Infer each type parameter from the argument in a `'T` position. */
+		int found[MAX_TYPARAMS] = {0};
+		for (int pi = 0; pi < callee->nparams; pi++) {
+			if (callee->params[pi].kind != PK_VAR || pi >= e->nargs)
+				continue;
+			int tp = func_typaram_index(callee, callee->params[pi].type_name);
+			if (tp < 0)
+				continue;
+			const char *at = shallow_type_name(prog, fn, e->args[pi]);
+			if (!at[0])
+				die(e->line, "cannot infer the type argument — write it explicitly, e.g. `f[Int](...)`");
+			if (found[tp] && strcmp(args[tp], at) != 0)
+				die(e->line, "conflicting inferred type arguments");
+			snprintf(args[tp], sizeof args[0], "%s", at);
+			found[tp] = 1;
+		}
+		for (int t = 0; t < callee->ntyparams; t++)
+			if (!found[t])
+				die(e->line, "cannot infer a type argument (not fixed by any parameter) — write it explicitly");
+		ntargs = callee->ntyparams;
+	}
+	Func *inst = instantiate(prog, callee, args, ntargs, e->line);
+	snprintf(e->name, sizeof e->name, "%s", inst->name);
+	e->ntypeargs = 0; /* now a concrete call */
+}
+
+static void monomorph_stmts(Program *prog, Func *fn, Stmt *s) {
 	for (; s; s = s->next) {
-		monomorph_expr(prog, s->expr);
-		monomorph_stmts(prog, s->body);
+		monomorph_expr(prog, fn, s->expr);
+		monomorph_stmts(prog, fn, s->body);
 	}
 }
 
@@ -2337,7 +2410,7 @@ static void monomorphize(Program *prog) {
 		Func *fn = prog->funcs[i];
 		if (fn->ntyparams > 0 || fn->is_asm)
 			continue;
-		monomorph_stmts(prog, fn->body);
+		monomorph_stmts(prog, fn, fn->body);
 	}
 }
 
