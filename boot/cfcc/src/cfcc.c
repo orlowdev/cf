@@ -635,13 +635,18 @@ struct DataDecl {
  * (type_system §8.4; seed_subset §7). The member names are stored qualified-only
  * (reached as `Name.Member`). Payload members (`M(T)`, `M = { … }`, `M = literal`) and
  * compose-over/spread members are later bricks.
- * ⚠ THROWAWAY tag *values*: member i gets tag i by declaration order. type_system §8.4
- * hands actual tag assignment (and cross-sub/superset-union consistency) to the M6/M9
- * representation gate — cf0 must not treat 0..n-by-order as a stable encoding. */
+ * ⚠ THROWAWAY layout (like the record/Str layouts): member i gets tag i by declaration
+ * order, and a boxed union is `[tag:w @0][Int field @4+i*4]`, size 4+maxarity*4. type_system
+ * §8.4 fixes only the *shape* (all-tag→int, else tag+payload aggregate) and hands the actual
+ * tag assignment, tag width, field offsets/packing, and cross-sub/superset consistency to the
+ * M6/M9 representation gate — cf0 must not inherit these specific bytes or 0..n-by-order tags. */
 struct UnionDecl {
 	char name[64];
 	char members[MAX_UNION_MEMBERS][64];
+	int arity[MAX_UNION_MEMBERS]; /* positional Int-payload field count per member (0 = nullary) */
 	int nmembers;
+	int has_payload; /* 1 if any member carries a payload → a boxed tag+payload union */
+	int size;        /* boxed-union aggregate size: 4 (tag) + max member arity * 4 */
 };
 
 /* Tag (0-based declaration index) of a member by name, or -1 if the union has none. */
@@ -650,6 +655,23 @@ static int union_member_tag(const UnionDecl *u, const char *name) {
 		if (strcmp(u->members[i], name) == 0)
 			return i;
 	return -1;
+}
+
+/* True if a value of type `t` is word-sized (a QBE `w`): an Int, or a TAG-ONLY union
+ * (a plain tag). A boxed (payload) union is a pointer to an arena aggregate — an `l`,
+ * handled like a `data` record — as are records/pointers/Uarch/Str/buffers. */
+static int type_is_word(Type t) {
+	if (t.kind == TY_INT)
+		return 1;
+	if (t.kind == TY_UNION)
+		return !t.uni->has_payload;
+	return 0;
+}
+
+/* True if a parameter is passed in a word register: a word Int, or a tag-only union.
+ * A boxed (payload) union is passed by pointer, like a record. */
+static int param_is_word(const Param *p) {
+	return p->kind == PK_WORD || (p->kind == PK_UNION && !p->uni->has_payload);
 }
 
 /* The byte offset / size for the all-Int M0 record layout. */
@@ -1027,8 +1049,27 @@ static Expr *parse_primary(Parser *p, Func *fn) {
 			die(mt->line, "expected a PascalCase member name after `.`");
 		tok_copy(mt, e->mem, sizeof e->mem);
 		advance(p);
-		if (peek(p)->kind == TK_LPAREN)
-			die(peek(p)->line, "M1.1 union members are tag-only (no payload construction yet)");
+		/* An optional payload: `Union.Member(arg, …)` — construction is application. */
+		if (peek(p)->kind == TK_LPAREN) {
+			advance(p); /* ( */
+			int cap = 0;
+			if (peek(p)->kind != TK_RPAREN)
+				for (;;) {
+					if (e->nargs == cap) {
+						cap = cap ? cap * 2 : 4;
+						e->args = realloc(e->args, cap * sizeof *e->args);
+						if (!e->args)
+							die(0, "out of memory");
+					}
+					e->args[e->nargs++] = parse_expr(p, fn);
+					if (peek(p)->kind == TK_COMMA) {
+						advance(p);
+						continue;
+					}
+					break;
+				}
+			expect(p, TK_RPAREN, "expected `)` to close the payload");
+		}
 		return e;
 	}
 	die(t->line, "expected an integer, a name, or `(`");
@@ -1818,16 +1859,41 @@ static UnionDecl *parse_union_decl(Parser *p, Program *prog) {
 			char mname[64];
 			tok_copy(m, mname, sizeof mname);
 			advance(p);
-			if (peek(p)->kind == TK_LPAREN)
-				die(peek(p)->line, "M1.1 union members are tag-only (a positional payload is a later brick)");
+			/* Optional positional Int payload: `Member(Int, Int, …)`. No parens = a
+			 * nullary tag. (Struct-body `= { … }`/literal payloads, and non-Int payload
+			 * types, are later bricks.) */
+			int arity = 0;
+			if (peek(p)->kind == TK_LPAREN) {
+				advance(p); /* ( */
+				if (peek(p)->kind == TK_RPAREN)
+					die(peek(p)->line, "an empty payload `()` — write a nullary member as just its name");
+				for (;;) {
+					Token *ft = peek(p);
+					if (!is_ident(ft, "Int"))
+						die(ft->line, "M1.2a union payload fields must be `Int` (other payload types are later bricks)");
+					advance(p);
+					if (arity == MAX_FIELDS)
+						die(ft->line, "too many payload fields");
+					arity++;
+					if (peek(p)->kind == TK_COMMA) {
+						advance(p);
+						continue;
+					}
+					break;
+				}
+				expect(p, TK_RPAREN, "expected `)` to close the payload");
+			}
 			if (peek(p)->kind == TK_EQ)
-				die(peek(p)->line, "M1.1 union members are tag-only (a `= payload`/literal member is a later brick)");
-			if (is_builtin_type_name(mname) || prog_find_data(prog, mname) || prog_find_union(prog, mname))
-				die(m->line, "M1.1 does not support compose-over members (a member naming an existing type)");
+				die(peek(p)->line, "M1.2a union members are positional-payload or nullary (a `= struct`/literal member is a later brick)");
+			/* Compose-over applies only to a BARE member (no payload); a payload member
+			 * `Foo(Int)` is a named case, not a compose-over of type `Foo`. */
+			if (arity == 0 && (is_builtin_type_name(mname) || prog_find_data(prog, mname) || prog_find_union(prog, mname)))
+				die(m->line, "M1.2a does not support compose-over members (a bare member naming an existing type)");
 			if (union_member_tag(u, mname) >= 0)
 				die(m->line, "duplicate union member");
 			if (u->nmembers == MAX_UNION_MEMBERS)
 				die(m->line, "too many union members");
+			u->arity[u->nmembers] = arity;
 			snprintf(u->members[u->nmembers++], sizeof u->members[0], "%s", mname);
 			skip_newlines(p);
 			if (peek(p)->kind == TK_COMMA) {
@@ -1842,6 +1908,16 @@ static UnionDecl *parse_union_decl(Parser *p, Program *prog) {
 	expect(p, TK_RBRACE, "expected `}`");
 	if (u->nmembers == 0)
 		die(nm->line, "a union needs at least one member");
+	/* A union with any payload member is a boxed tag+payload aggregate (type_system
+	 * §8.4): tag (4) + max member payload. An all-nullary union stays a plain tag. */
+	int maxarity = 0;
+	for (int i = 0; i < u->nmembers; i++) {
+		if (u->arity[i] > 0)
+			u->has_payload = 1;
+		if (u->arity[i] > maxarity)
+			maxarity = u->arity[i];
+	}
+	u->size = 4 + maxarity * 4;
 	return u;
 }
 
@@ -1978,15 +2054,20 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		return func_ret_type(callee); /* Int, Uarch, or a record returned by pointer */
 	}
 	case EX_UMEMBER: {
-		/* `Union.Member` — a tag-only member value is its tag (an integer). */
+		/* `Union.Member(payload…)` — construct a member. A tag-only member's value is
+		 * its tag; a payload member's is a boxed tag+payload aggregate. */
 		UnionDecl *u = prog_find_union(prog, e->name);
 		if (!u)
 			die(e->line, "unknown union type");
 		int tag = union_member_tag(u, e->mem);
 		if (tag < 0)
 			die(e->line, "this union has no such member");
+		if (e->nargs != u->arity[tag])
+			die(e->line, "union member payload arity mismatch");
+		for (int i = 0; i < e->nargs; i++)
+			expect_int(prog, fn, e->args[i]); /* M1.2a payloads are Int */
 		e->uni = u;
-		e->ival = tag; /* the member's runtime value (its tag) */
+		e->ival = tag; /* the member's tag */
 		return (Type){TY_UNION, NULL, u};
 	}
 	case EX_MATCH: {
@@ -2022,10 +2103,12 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 				}
 			}
 			/* Arm bodies unify to one type — an Int or a tag-only union (both a word);
-			 * that type is the match's value type, so a `match` can yield either. */
+			 * that type is the match's value type, so a `match` can yield either. The
+			 * scrutinee may still be a boxed (payload) union — a match yielding a boxed
+			 * union (which the word merge slot can't hold) is a later brick. */
 			Type bt = typeof_expr(prog, fn, a->body);
-			if (bt.kind != TY_INT && bt.kind != TY_UNION)
-				die(a->line, "a match arm yields an Int or a tag-only union (M1)");
+			if (!type_is_word(bt))
+				die(a->line, "a match arm yields an Int or a tag-only union (a boxed-union result is a later brick)");
 			if (!have_rt) {
 				rt = bt;
 				have_rt = 1;
@@ -2413,9 +2496,11 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		return;
 	}
 	case EX_VAR: {
-		/* A record or byte-buffer name is an arena pointer (`%r_<name>`), used directly
-		 * as an operand (e.g. a call argument); a word name is a `loadw` from its slot. */
-		if (e->rtype.kind == TY_RECORD || e->rtype.kind == TY_BUF) {
+		/* A record, byte-buffer, or boxed (payload) union name is an arena pointer
+		 * (`%r_<name>`), used directly as an operand; a word name (Int or tag-only
+		 * union) is a `loadw` from its slot. */
+		if (e->rtype.kind == TY_RECORD || e->rtype.kind == TY_BUF ||
+		    (e->rtype.kind == TY_UNION && e->rtype.uni->has_payload)) {
 			snprintf(dst, cap, "%%r_%s", e->name);
 			return;
 		}
@@ -2500,14 +2585,14 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 				fprintf(out, "\t%%t%d =l extsw %%t%d\n", argt[i], w);
 				argw[i] = 'l';
 			} else {
-				argw[i] = (pk == PK_WORD || pk == PK_UNION) ? 'w' : 'l';
+				argw[i] = param_is_word(&e->callee->params[i]) ? 'w' : 'l';
 				argt[i] = ex->tmp++;
 				fprintf(out, "\t%%t%d =%c copy %s\n", argt[i], argw[i], op);
 			}
 		}
 		int r = ex->tmp++;
-		/* A tag-only union result, like an Int, is a word; record/ptr/Uarch are `l`. */
-		const char *rty = (e->rtype.kind == TY_INT || e->rtype.kind == TY_UNION) ? "w" : "l";
+		/* An Int or tag-only union result is a word; record/ptr/Uarch/boxed-union are `l`. */
+		const char *rty = type_is_word(e->rtype) ? "w" : "l";
 		fprintf(out, "\t%%t%d =%s call $%s(", r, rty, e->name);
 		for (int i = 0; i < e->nargs; i++)
 			fprintf(out, "%s%c %%t%d", i ? ", " : "", argw[i], argt[i]);
@@ -2515,10 +2600,27 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		snprintf(dst, cap, "%%t%d", r);
 		return;
 	}
-	case EX_UMEMBER:
+	case EX_UMEMBER: {
 		/* A tag-only union member value IS its tag — a word constant. */
-		snprintf(dst, cap, "%ld", e->ival);
+		if (!e->uni->has_payload) {
+			snprintf(dst, cap, "%ld", e->ival);
+			return;
+		}
+		/* A boxed union member: bump-allocate the tag+payload aggregate, store the tag
+		 * at offset 0 and each Int payload field at 4 + i*4. Yields the arena pointer. */
+		int p = ex->tmp++;
+		fprintf(out, "\t%%t%d =l call $cf_alloc(w %d)\n", p, e->uni->size);
+		fprintf(out, "\tstorew %ld, %%t%d\n", e->ival, p);
+		for (int i = 0; i < e->nargs; i++) {
+			char a[96];
+			emit_expr(out, e->args[i], ex, a, sizeof a);
+			int fa = ex->tmp++;
+			fprintf(out, "\t%%t%d =l add %%t%d, %d\n", fa, p, 4 + i * 4);
+			fprintf(out, "\tstorew %s, %%t%d\n", a, fa);
+		}
+		snprintf(dst, cap, "%%t%d", p);
 		return;
+	}
 	case EX_MATCH: {
 		/* Compare-chain over the scrutinee's tag (seed_subset §7): a linear ladder of
 		 * `ceqw tag, <k>` tests. Each member arm's block stores its value into the
@@ -2527,9 +2629,14 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		 * results merge through the slot exactly like `if`. */
 		int id = ex->lbl++;
 		char sc[96];
-		emit_expr(out, e->lhs, ex, sc, sizeof sc); /* the scrutinee's tag (a word) */
+		emit_expr(out, e->lhs, ex, sc, sizeof sc);
 		int tagt = ex->tmp++;
-		fprintf(out, "\t%%t%d =w copy %s\n", tagt, sc);
+		/* The tag: a tag-only union value IS the tag; a boxed union is a pointer whose
+		 * tag sits at offset 0. */
+		if (e->uni->has_payload)
+			fprintf(out, "\t%%t%d =w loadw %s\n", tagt, sc);
+		else
+			fprintf(out, "\t%%t%d =w copy %s\n", tagt, sc);
 		int wild = -1;
 		for (int i = 0; i < e->narms; i++)
 			if (e->arms[i].is_wild) { wild = i; break; }
@@ -2708,9 +2815,10 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 						fprintf(out, "\tstorew %s, %%t%d\n", fv, a);
 					}
 				}
-			} else if (s->expr->rtype.kind == TY_RECORD) {
-				/* A record local bound to a record-valued call: adopt the callee's
-				 * fresh arena pointer as this local's storage (a move, no copy). */
+			} else if (s->expr->rtype.kind == TY_RECORD ||
+			           (s->expr->rtype.kind == TY_UNION && s->expr->rtype.uni->has_payload)) {
+				/* A record or boxed-union local: adopt the initializer's fresh arena
+				 * pointer as this local's storage (a move, no copy). */
 				emit_expr(out, s->expr, ex, v, sizeof v);
 				fprintf(out, "\t%%r_%s =l copy %s\n", s->name, v);
 			} else if (s->expr->rtype.kind == TY_STR) {
@@ -2834,12 +2942,11 @@ static void emit_func(FILE *out, const Func *fn) {
 	 * node is threaded yet: a non-allocating body carries none (M0). */
 	int is_main = strcmp(fn->name, "main") == 0;
 	Type frt = func_ret_type(fn);
-	const char *retty = (frt.kind == TY_INT || frt.kind == TY_UNION) ? "w" : "l"; /* tag-only union → w */
+	const char *retty = type_is_word(frt) ? "w" : "l"; /* Int/tag-only union → w; else l */
 	fprintf(out, "%sfunction %s $%s(", is_main ? "export " : "", retty, fn->name);
 	for (int i = 0; i < fn->nparams; i++)
 		fprintf(out, "%s%s %%u_%s", i ? ", " : "",
-		        (fn->params[i].kind == PK_WORD || fn->params[i].kind == PK_UNION) ? "w" : "l",
-		        fn->params[i].name);
+		        param_is_word(&fn->params[i]) ? "w" : "l", fn->params[i].name);
 	fprintf(out, ") {\n");
 	fprintf(out, "@start\n");
 
@@ -2850,11 +2957,13 @@ static void emit_func(FILE *out, const Func *fn) {
 	 * argv/envp) are never referenced, so they get no slot. */
 	for (int i = 0; i < fn->nparams; i++) {
 		const char *n = fn->params[i].name;
-		/* A tag-only union param is a word tag — spill it to a word slot like an Int. */
-		if (fn->params[i].kind == PK_WORD || fn->params[i].kind == PK_UNION) {
+		/* A word param (Int or tag-only union tag) spills to a word slot; a record or
+		 * boxed-union param arrives as an arena pointer, copied into its `%r_` form. */
+		if (param_is_word(&fn->params[i])) {
 			fprintf(out, "\t%%s_%s =l alloc4 4\n", n);
 			fprintf(out, "\tstorew %%u_%s, %%s_%s\n", n, n);
-		} else if (fn->params[i].kind == PK_RECORD) {
+		} else if (fn->params[i].kind == PK_RECORD ||
+		           (fn->params[i].kind == PK_UNION && fn->params[i].uni->has_payload)) {
 			fprintf(out, "\t%%r_%s =l copy %%u_%s\n", n, n);
 		}
 	}
@@ -2864,8 +2973,9 @@ static void emit_func(FILE *out, const Func *fn) {
 	 * `alloca` that would overflow the stack). The `let` then only stores. Flat
 	 * scoping makes this sound: each name has exactly one slot for the whole body. */
 	for (int i = 0; i < fn->nlocals; i++) {
-		/* A tag-only union is a word tag, so it shares the Int word-slot path. */
-		if (fn->locals[i].type.kind == TY_INT || fn->locals[i].type.kind == TY_UNION)
+		/* An Int or tag-only union shares the word-slot path; a boxed union (like a
+		 * record) needs no slot — it lives in the arena via its `%r_` pointer. */
+		if (type_is_word(fn->locals[i].type))
 			fprintf(out, "\t%%s_%s =l alloc4 4\n", fn->locals[i].name);
 		else if (fn->locals[i].type.kind == TY_STR) /* holds an `l` header pointer */
 			fprintf(out, "\t%%s_%s =l alloc8 8\n", fn->locals[i].name);
