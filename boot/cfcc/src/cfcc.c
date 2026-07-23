@@ -445,6 +445,7 @@ typedef struct {
 	Token *toks;
 	size_t pos;
 	int loop_depth; /* how many loops enclose the statement being parsed */
+	int in_defer;   /* 1 while parsing a `defer { … }` block body (no nested defer/return) */
 } Parser;
 
 /* The type of a value. M0 has three: `Int` (a word), an opaque pointer (`*T` —
@@ -643,6 +644,8 @@ typedef enum {
 	ST_BREAK,       /* break (bare) or `if cond then break` (guard in expr) */
 	ST_CONTINUE,    /* continue (bare) or `if cond then continue` (guard in expr) */
 	ST_EXPR,        /* an expression evaluated for effect (a call), result discarded */
+	ST_DEFER,       /* defer <call> | defer { block } — schedule a cleanup to run at scope
+	                 * exit, LIFO. `expr` holds the call (call form); `body` the block form. */
 } StmtKind;
 
 typedef struct Stmt Stmt;
@@ -658,8 +661,10 @@ struct Stmt {
 	char bufsize_name[64]; /* ST_LOCAL: a `[n Uint8]` buffer whose length is a comptime
 	                        * value parameter (`n`); resolved to `bufsize` at instantiation */
 	Expr *expr;         /* ST_LOCAL/ST_ASSIGN/ST_FIELD_ASSIGN: value (NULL for a buffer
-	                     * local); ST_RETURN: returned; ST_BREAK/ST_CONTINUE: guard or NULL */
-	Stmt *body;         /* ST_LOOP: the loop body statement list */
+	                     * local); ST_RETURN: returned; ST_BREAK/ST_CONTINUE: guard or NULL;
+	                     * ST_DEFER: the scheduled call (call form; NULL for the block form) */
+	Stmt *body;         /* ST_LOOP: the loop body statement list; ST_DEFER: the block form's
+	                     * body (NULL for the call form) */
 	Stmt *next;
 };
 
@@ -692,6 +697,7 @@ typedef struct {
 #define MAX_PARAMS 32
 #define MAX_FIELDS 64
 #define MAX_LOOP_DEPTH 64 /* cap on statically-nested loops (bounds Emit.loops[]) */
+#define MAX_DEFERS 64     /* cap on `defer`s per function (bounds Emit.defers[]) */
 
 /* A `data` record declaration: `data Name = { Int f0, Point f1, ... }`. A field is
  * an `Int` or an aggregate (a `data` record / a `union`) type (G3a). Fields are laid
@@ -1895,6 +1901,8 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 		return s;
 	}
 	if (is_ident(t, "return")) {
+		if (p->in_defer)
+			die(t->line, "a `defer` block cannot `return` (it runs at scope exit, after the return value is fixed)");
 		advance(p);
 		Stmt *s = new_stmt(ST_RETURN);
 		s->line = t->line;
@@ -1950,6 +1958,43 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 		Stmt *s = new_stmt(is_break ? ST_BREAK : ST_CONTINUE);
 		s->line = t->line;
 		s->expr = cond; /* guarded */
+		return s;
+	}
+	if (is_ident(t, "defer")) {
+		/* defer = "defer" ( postfix-call | block ) — schedule a cleanup to run at
+		 * scope exit in LIFO order (ebnf § pipe/defer). cfcc implements the two
+		 * STATEMENT forms only: `defer f(x)` (a call, its result discarded) and
+		 * `defer { … }` (a block). The value/tapping form (`const a = defer f(g())`)
+		 * and the pipe tap (`x |> defer f`) — where `defer` yields its tapped argument —
+		 * are not lowered here; cf0 restores the full expression form. cfcc scopes defer
+		 * to a function's top level: the deferred code fires at every `return`, so a defer
+		 * inside a loop (a dynamic, per-iteration count) or nested in another defer is
+		 * rejected. Arguments/statements are evaluated at fire time (scope exit), reading
+		 * the current local values — cf0 snapshots them at the defer point per the spec. */
+		advance(p);
+		if (p->loop_depth != 0)
+			die(t->line, "M0 allows `defer` only at a function's top level, not inside a loop");
+		if (p->in_defer)
+			die(t->line, "M0 does not allow `defer` nested inside a `defer` block");
+		Stmt *s = new_stmt(ST_DEFER);
+		s->line = t->line;
+		if (peek(p)->kind == TK_LBRACE) {
+			advance(p); /* consume `{` */
+			p->in_defer = 1;
+			s->body = parse_stmt_seq(p, fn, 0, t->line); /* no required `return` */
+			p->in_defer = 0;
+		} else {
+			/* The call form: a bare function name followed by an argument list (or a
+			 * generic application `f[Int](…)`). Anything else is not a schedulable call. */
+			Token *nt = peek(p);
+			if (nt->kind != TK_IDENT || is_type_ident(nt) ||
+			    (p->toks[p->pos + 1].kind != TK_LPAREN && p->toks[p->pos + 1].kind != TK_LBRACKET))
+				die(t->line, "a `defer` schedules a function call (`defer f(x)`) or a block (`defer { … }`)");
+			Expr *e = parse_postfix(p, fn);
+			if (e->kind != EX_CALL)
+				die(t->line, "a `defer` target must be a function call");
+			s->expr = e;
+		}
 		return s;
 	}
 	/* Otherwise a bare name leads an assignment: `name = expr` (reassign a `let`
@@ -3695,6 +3740,14 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 				die(s->line, "an expression statement must be a call");
 			typeof_expr(prog, fn, s->expr);
 			break;
+		case ST_DEFER:
+			/* Validate the scheduled work (the call's callee/args, or the block's
+			 * statements); any result is discarded when it fires at scope exit. */
+			if (s->expr)
+				typeof_expr(prog, fn, s->expr);
+			else
+				check_stmts(prog, fn, s->body);
+			break;
 		}
 	}
 }
@@ -3800,6 +3853,8 @@ typedef struct {
 	int loop_depth;
 	int ret_uarch; /* 1 if the current function returns Uarch (an `l`) — a returned
 	                * Int value is widened to `l` before `ret`. */
+	Stmt *defers[MAX_DEFERS]; /* pending `defer`s in source order; fired LIFO at each `return` */
+	int ndefers;
 } Emit;
 
 /* The module's string table: every EX_STR literal, assigned a stable index
@@ -3842,7 +3897,7 @@ static void collect_strlits_expr(Expr *e) {
 static void collect_strlits_stmt(Stmt *list) {
 	for (Stmt *s = list; s; s = s->next) {
 		collect_strlits_expr(s->expr);
-		if (s->kind == ST_LOOP)
+		if (s->kind == ST_LOOP || s->kind == ST_DEFER) /* ST_DEFER: the block form's body */
 			collect_strlits_stmt(s->body);
 	}
 }
@@ -4222,6 +4277,8 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
  * stack slots (`%s_<name>`). A `loop` becomes a header block with a back-edge; a
  * `break`/`continue` (bare, or guarded by `if <cond> then …`) jumps to the nearest
  * loop's end/top label. */
+static void emit_defers(FILE *out, Emit *ex); /* forward: fired at each ST_RETURN */
+
 static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 	for (Stmt *s = list; s; s = s->next) {
 		char v[96];
@@ -4287,6 +4344,11 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 			}
 			break;
 		case ST_RETURN:
+			/* Capture the return value first, then fire pending `defer`s (LIFO) before
+			 * the `ret`: the returned word is already snapshotted into a temp, so a defer
+			 * cannot change it, while a returned arena pointer stays live so a defer's
+			 * mutations through it are visible to the caller (geometry_lowering's
+			 * scope-exit model). */
 			emit_expr(out, s->expr, ex, v, sizeof v);
 			if (ex->ret_uarch && s->expr->rtype.kind == TY_INT) {
 				/* Uarch function returning an Int: widen `w`→`l` so the `ret` operand
@@ -4295,8 +4357,10 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 				fprintf(out, "\t%%t%d =w copy %s\n", w, v);
 				int l = ex->tmp++;
 				fprintf(out, "\t%%t%d =l extsw %%t%d\n", l, w);
+				emit_defers(out, ex);
 				fprintf(out, "\tret %%t%d\n", l);
 			} else {
+				emit_defers(out, ex);
 				fprintf(out, "\tret %s\n", v);
 			}
 			break;
@@ -4341,6 +4405,29 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 			/* Evaluate the call for effect; its result temp is simply not used. */
 			emit_expr(out, s->expr, ex, v, sizeof v);
 			break;
+		case ST_DEFER:
+			/* Schedule: record the defer; nothing is emitted here. It fires at each
+			 * later `return` (emit_defers). A defer only appears at the function's top
+			 * level, walked in source order, so the pending list grows monotonically and
+			 * every reachable `return` sees exactly the defers that precede it. */
+			if (ex->ndefers >= MAX_DEFERS)
+				die(s->line, "too many `defer`s in one function");
+			ex->defers[ex->ndefers++] = s;
+			break;
+		}
+	}
+}
+
+/* Fire the pending `defer`s in LIFO order — last scheduled runs first (ebnf § defer).
+ * A call form re-emits its call (result discarded); a block form re-emits its body. */
+static void emit_defers(FILE *out, Emit *ex) {
+	for (int i = ex->ndefers - 1; i >= 0; i--) {
+		Stmt *d = ex->defers[i];
+		if (d->expr) {
+			char v[96];
+			emit_expr(out, d->expr, ex, v, sizeof v);
+		} else {
+			emit_stmts(out, d->body, ex);
 		}
 	}
 }
@@ -4367,7 +4454,7 @@ static void assign_expr_slots(Expr *e, int *n) {
 static void assign_stmt_slots(Stmt *list, int *n) {
 	for (Stmt *s = list; s; s = s->next) {
 		assign_expr_slots(s->expr, n);
-		if (s->kind == ST_LOOP)
+		if (s->kind == ST_LOOP || s->kind == ST_DEFER) /* ST_DEFER: the block form's body */
 			assign_stmt_slots(s->body, n);
 	}
 }
