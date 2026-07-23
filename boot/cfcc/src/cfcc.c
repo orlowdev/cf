@@ -479,6 +479,11 @@ typedef enum {
 	            * lower to a plain integer tag (type_system §8.4) — so a union value is a
 	            * `w`, stored/read like an Int; the union identity (for match) is `uni`.
 	            * Payload unions (tag+aggregate) are a later brick. */
+	TY_FN,     /* a function VALUE: `(Int, …) Int` — a capture-free callable, lowered to an
+	            * `l` code pointer (memory_model §7: capture-free values stay runtime-dispatched).
+	            * Its Int-arity rides on the Expr (`fn_arity`), not here. cfcc restricts function
+	            * types to all-`Int` params and an `Int` return; a CAPTURING closure has no
+	            * runtime value and is a later (specialization) brick. */
 } TypeKind;
 
 typedef struct {
@@ -509,6 +514,10 @@ typedef enum {
 	            * param) — used as the `%r_<name>` base directly, but MUTABLE: the closure may
 	            * assign its fields, and the enclosing scope sees the change. `rec`/`type_name`
 	            * carry the record type, resolved in resolve_signatures. */
+	PK_FN,     /* a function-VALUE parameter: `(Int, …) Int f` — a higher-order function's
+	            * callable argument, an `l` code pointer. Called indirectly inside the body;
+	            * the caller passes a capture-free function's address. `fn_arity` is its Int
+	            * parameter count. */
 } ParamKind;
 
 typedef struct {
@@ -518,6 +527,7 @@ typedef struct {
 	char type_name[64]; /* PK_RECORD/PK_UNION: the nominal type name (resolved later) */
 	DataDecl *rec;      /* PK_RECORD: the resolved declaration */
 	UnionDecl *uni;     /* PK_UNION: the resolved declaration */
+	int fn_arity;       /* PK_FN: the function type's Int-parameter count */
 } Param;
 
 /* Expression AST. M0 expressions are word-valued: literals, references to a
@@ -644,6 +654,13 @@ struct Expr {
 	/* EX_CALL: set once this call to a local closure has been rewritten to target the
 	 * lifted function (its captures prepended as arguments) — so typecheck does it once. */
 	int closure_call;
+	/* EX_VAR: a bare name that resolves to a function VALUE (a top-level function or a
+	 * capture-free closure), not a local/param — legal only as a `(…) Int` argument.
+	 * typecheck rewrites `name` to the emit symbol (a closure's lifted name). EX_CALL:
+	 * `indirect` marks a call through a PK_FN parameter (an indirect call). */
+	int is_fnref;
+	int indirect;
+	int fn_arity; /* EX_VAR of TY_FN: the function value's Int-parameter count (for arg checks) */
 };
 
 static Expr *new_expr(ExprKind kind) {
@@ -1012,6 +1029,7 @@ static Resolution resolve_name(Func *fn, const char *name, Type *ty) {
 			case PK_VAR:     ty->kind = TY_INT;    ty->rec = NULL; break; /* template body parse only; type is ignored (re-typed per instantiation) */
 			case PK_CAPTURE: ty->kind = TY_INT;    ty->rec = NULL; return R_LET; /* a by-ref word: readable AND writable */
 			case PK_CAPTURE_REC: ty->kind = TY_RECORD; ty->rec = fn->params[i].rec; return R_LET; /* a by-ref record: fields mutable */
+			case PK_FN:      ty->kind = TY_FN; ty->rec = NULL; break; /* a function value (arity on the Param) */
 			}
 			return R_PARAM;
 		}
@@ -1161,6 +1179,32 @@ static void check_tyvars_declared(const char *mangled, char typarams[][64], int 
 static void parse_param_type(Parser *p, Param *out) {
 	Token *t = peek(p);
 	out->line = t->line;
+	if (t->kind == TK_LPAREN) {
+		/* A function type `(Int, …) Int` — a higher-order function's callable parameter.
+		 * cfcc restricts it to all-`Int` params and an `Int` return (enough for HOFs over
+		 * Int; cf0 takes the full function-type grammar). */
+		advance(p); /* ( */
+		int arity = 0;
+		if (peek(p)->kind != TK_RPAREN)
+			for (;;) {
+				if (!is_ident(peek(p), "Int"))
+					die(peek(p)->line, "a function-type parameter takes `Int` arguments in M0 (e.g. `(Int) Int`)");
+				advance(p);
+				arity++;
+				if (peek(p)->kind == TK_COMMA) {
+					advance(p);
+					continue;
+				}
+				break;
+			}
+		expect(p, TK_RPAREN, "expected `)` to close the function-type parameters");
+		if (!is_ident(peek(p), "Int"))
+			die(peek(p)->line, "a function type needs a return type; M0 supports `Int` (e.g. `(Int) Int`)");
+		advance(p); /* Int (return) */
+		out->kind = PK_FN;
+		out->fn_arity = arity;
+		return;
+	}
 	if (is_ident(t, "Int")) {
 		advance(p);
 		out->kind = PK_WORD;
@@ -1356,9 +1400,12 @@ static Expr *parse_primary(Parser *p, Func *fn) {
 		 * body (never typechecked/emitted) and is folded to its literal in each clone. */
 		if (resolve_name(fn, e->name, &ty) == R_NONE && find_active_bind(fn, e->name) < 0 &&
 		    func_valparam_index(fn, e->name) < 0) {
-			if (func_find_closure(fn, e->name) >= 0)
-				die(line, "a closure is not a first-class value in M0 — it can only be called (`f(...)`)");
-			die(line, "unknown name (M0 expressions use integers, parameters, locals, and calls)");
+			/* A bare name that is a closure or a top-level function is a function VALUE
+			 * (a fnref) — legal only as a `(…) Int` argument; typecheck validates that. */
+			if (func_find_closure(fn, e->name) >= 0 || prog_find_func(p->prog, e->name))
+				e->is_fnref = 1;
+			else
+				die(line, "unknown name (M0 expressions use integers, parameters, locals, and calls)");
 		}
 		/* A record value is legal here only as the base of a field access; a
 		 * pointer never. Both are caught in the typecheck pass, which knows the
@@ -3424,6 +3471,7 @@ static const char *shallow_type_name(Program *prog, Func *fn, Expr *e) {
 				case PK_LONG:    return ""; /* a pointer — no simple type name */
 				case PK_CAPTURE: return "Int"; /* a captured word */
 				case PK_CAPTURE_REC: return fn->params[i].type_name; /* a captured record */
+				case PK_FN: return ""; /* a function value — no simple nominal type name */
 				}
 			}
 		for (int i = 0; i < fn->nlocals; i++)
@@ -3621,6 +3669,34 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 	case EX_STR:
 		return (Type){TY_STR, NULL, NULL};
 	case EX_VAR: {
+		/* A function reference (a bare top-level function or capture-free closure name):
+		 * a function VALUE, valid only as a `(…) Int` argument. Resolve it to its emit
+		 * symbol and Int-arity; a capturing closure has no runtime value (memory_model §7),
+		 * and cfcc function values are all-`Int` → `Int`. */
+		if (e->is_fnref) {
+			int ci = func_find_closure(fn, e->name);
+			Func *g;
+			if (ci >= 0) {
+				if (fn->closures[ci].ncaps != 0)
+					die(e->line, "a capturing closure has no runtime value — it cannot be passed as a "
+					             "function argument yet (only capture-free functions can)");
+				g = fn->closures[ci].lifted;
+			} else {
+				g = prog_find_func(prog, e->name);
+				if (!g)
+					die(e->line, "unknown name");
+				if (g->ntyparams > 0)
+					die(e->line, "a generic function cannot be passed as a value (instantiate it first)");
+			}
+			for (int i = 0; i < g->nparams; i++)
+				if (g->params[i].kind != PK_WORD)
+					die(e->line, "a function value must take only `Int` parameters (M0)");
+			if (g->ret_type_name[0])
+				die(e->line, "a function value must return `Int` (M0)");
+			snprintf(e->name, sizeof e->name, "%s", g->name); /* the emit symbol ($<name>) */
+			e->fn_arity = g->nparams;
+			return (Type){TY_FN, NULL, NULL};
+		}
 		/* A match-arm payload binding shadows params/locals; its value is an Int read
 		 * from the `%pb<id>` storage temp (loaded at the arm block). */
 		Type bt;
@@ -3631,8 +3707,13 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 			return bt; /* Int for a word payload; a record/union type for an aggregate payload */
 		}
 		Type ty;
-		if (resolve_name(fn, e->name, &ty) == R_NONE)
+		Resolution r = resolve_name(fn, e->name, &ty);
+		if (r == R_NONE)
 			die(e->line, "unknown name");
+		if (ty.kind == TY_FN) /* a function-value parameter used as a value — carry its arity */
+			for (int i = 0; i < fn->nparams; i++)
+				if (fn->params[i].kind == PK_FN && strcmp(fn->params[i].name, e->name) == 0)
+					e->fn_arity = fn->params[i].fn_arity;
 		return ty;
 	}
 	case EX_FIELD: {
@@ -3660,6 +3741,24 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 	case EX_RECORD:
 		die(e->line, "a record literal may only initialize a record-typed binding");
 	case EX_CALL: {
+		/* A call whose "callee" is a function-VALUE parameter (`f(x)` where `f` is a
+		 * `(…) Int` param) is an INDIRECT call through the code pointer. Its arguments are
+		 * Int and it returns Int; the arity is the function type's. */
+		{
+			Type pty;
+			if (resolve_name(fn, e->name, &pty) == R_PARAM && pty.kind == TY_FN) {
+				int arity = 0;
+				for (int i = 0; i < fn->nparams; i++)
+					if (fn->params[i].kind == PK_FN && strcmp(fn->params[i].name, e->name) == 0)
+						arity = fn->params[i].fn_arity;
+				if (e->nargs != arity)
+					die(e->line, "wrong number of arguments to a function value");
+				for (int i = 0; i < e->nargs; i++)
+					expect_int(prog, fn, e->args[i]);
+				e->indirect = 1;
+				return (Type){TY_INT, NULL, NULL};
+			}
+		}
 		/* A call to a closure bound in this function rewrites to a call of its lifted
 		 * top-level function, prepending each captured variable (by name) as a leading
 		 * argument. Those match the lifted function's PK_CAPTURE parameters, whose emit
@@ -3740,6 +3839,13 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 				/* A prepended record capture: the enclosing record, passed by pointer. */
 				if (at.kind != TY_RECORD || at.rec != pm->rec)
 					die(e->line, "internal: closure record capture type mismatch");
+				break;
+			case PK_FN:
+				/* A higher-order argument: a function value of matching Int-arity. */
+				if (at.kind != TY_FN)
+					die(e->line, "argument type mismatch (a function-type parameter expects a function value, e.g. a bare function name)");
+				if (e->args[i]->fn_arity != pm->fn_arity)
+					die(e->line, "argument type mismatch (the function value has the wrong number of parameters)");
 				break;
 			}
 		}
@@ -4303,6 +4409,19 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		return;
 	}
 	case EX_VAR: {
+		/* A function reference: materialize the callee's code address ($<symbol>) into an
+		 * `l` temp (typecheck rewrote `name` to the emit symbol). A function-VALUE parameter
+		 * (a PK_FN param, TY_FN) is its incoming `%u_<name>` pointer, used directly. */
+		if (e->is_fnref) {
+			int t = ex->tmp++;
+			fprintf(out, "\t%%t%d =l copy $%s\n", t, e->name);
+			snprintf(dst, cap, "%%t%d", t);
+			return;
+		}
+		if (e->rtype.kind == TY_FN) {
+			snprintf(dst, cap, "%%u_%s", e->name);
+			return;
+		}
 		/* A match-arm payload binding is an Int value held in its `%pb<id>` temp
 		 * (loaded at the arm block). */
 		if (e->is_bind) {
@@ -4388,6 +4507,24 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 	case EX_RECORD:
 		die(e->line, "internal: record literal in expression position");
 	case EX_CALL: {
+		/* An INDIRECT call through a function-value parameter (`f(x)`): the callee is the
+		 * `%u_<name>` code pointer; all args and the result are Int (`w`). */
+		if (e->indirect) {
+			int it[MAX_PARAMS];
+			for (int i = 0; i < e->nargs; i++) {
+				char op[96];
+				emit_expr(out, e->args[i], ex, op, sizeof op);
+				it[i] = ex->tmp++;
+				fprintf(out, "\t%%t%d =w copy %s\n", it[i], op);
+			}
+			int r = ex->tmp++;
+			fprintf(out, "\t%%t%d =w call %%u_%s(", r, e->name);
+			for (int i = 0; i < e->nargs; i++)
+				fprintf(out, "%sw %%t%d", i ? ", " : "", it[i]);
+			fprintf(out, ")\n");
+			snprintf(dst, cap, "%%t%d", r);
+			return;
+		}
 		/* Evaluate each argument into its own temp, then call. Each argument's register
 		 * width follows the *parameter* kind (word param → `w`; record/pointer/Uarch → `l`),
 		 * and an Int passed to a Uarch parameter is widened `w`→`l`. The callee symbol is
