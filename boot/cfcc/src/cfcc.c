@@ -1147,21 +1147,28 @@ static Type resolve_member_type(Program *prog, const char *name, int line) {
 		return (Type){TY_INT, NULL, NULL, 0, NULL};
 	if (name[0] == '(') {
 		/* A tuple field/payload type stored as `(T0,T1,…)` (parse_member_type): split the
-		 * element names on `,` and intern the shape. */
+		 * element names on TOP-LEVEL commas (a comma inside a nested `(…)` stays part of the
+		 * element) and intern the shape. */
 		char names[MAX_FIELDS][64];
-		int n = 0, k = 0;
-		for (const char *s = name + 1; *s && *s != ')'; s++) {
-			if (*s == ',') {
+		int n = 0, k = 0, depth = 0;
+		for (const char *s = name + 1; *s; s++) {
+			if (*s == '(') {
+				depth++;
+			} else if (*s == ')') {
+				if (depth == 0)
+					break; /* the outer close */
+				depth--;
+			} else if (*s == ',' && depth == 0) {
 				names[n][k] = '\0';
 				n++;
 				k = 0;
 				if (n == MAX_FIELDS)
 					die(line, "tuple type has too many elements");
-			} else {
-				if (k == 63)
-					die(line, "tuple element type name too long");
-				names[n][k++] = *s;
+				continue;
 			}
+			if (k == 63)
+				die(line, "tuple element type name too long");
+			names[n][k++] = *s;
 		}
 		names[n][k] = '\0';
 		n++;
@@ -1189,10 +1196,12 @@ static TupleDecl *resolve_tuple_shape(Program *prog, char names[][64], int n, in
 			elems[j] = (Type){TY_INT, NULL, NULL, 0, NULL};
 		} else if (strcmp(tn, "Str") == 0) {
 			elems[j] = (Type){TY_STR, NULL, NULL, 0, NULL};
+		} else if (tn[0] == '(') { /* a nested tuple element `(A,B)` */
+			elems[j] = resolve_member_type(prog, tn, line);
 		} else {
 			DataDecl *d = prog_find_data(prog, tn);
 			if (!d)
-				die(line, "a tuple element is Int, Str, or a record type");
+				die(line, "a tuple element is Int, Str, a record, or a nested tuple");
 			elems[j] = (Type){TY_RECORD, d, NULL, 0, NULL};
 		}
 	}
@@ -1372,6 +1381,7 @@ static int is_builtin_type_name(const char *name) {
 /* Type-reference helpers (G3b) — defined further down, forward-declared here as the type
  * positions that use them (params, union values, locals, returns) come first. */
 static void parse_type_arg(Parser *p, char *out, size_t cap);
+static void parse_tuple_elem_type(Parser *p, char *out, size_t cap); /* forward: nested tuple types */
 static void check_tyvars_declared(const char *mangled, char typarams[][64], int ntp, int line);
 
 /* Consume a parameter's type and classify it. M0 param types are `Int` (a word),
@@ -1410,18 +1420,13 @@ static void parse_param_type(Parser *p, Param *out) {
 			int cap = 4;
 			out->tuple_types = xmalloc(cap * sizeof *out->tuple_types);
 			for (;;) {
-				Token *et = peek(p);
-				if (is_tyvar(et))
-					die(et->line, "a generic element in a tuple parameter is a later brick");
-				if (!is_type_ident(et))
-					die(et->line, "a tuple parameter lists element types (`(Int, Str) p`)");
 				if (out->tuple_n == cap) {
 					cap *= 2;
 					out->tuple_types = realloc(out->tuple_types, cap * sizeof *out->tuple_types);
 					if (!out->tuple_types)
 						die(0, "out of memory");
 				}
-				parse_type_arg(p, out->tuple_types[out->tuple_n++], sizeof out->tuple_types[0]);
+				parse_tuple_elem_type(p, out->tuple_types[out->tuple_n++], sizeof out->tuple_types[0]);
 				if (peek(p)->kind == TK_COMMA) {
 					advance(p);
 					continue;
@@ -2554,12 +2559,9 @@ static int parse_return_type(Parser *p, Func *fn) {
 		fn->ret_line = rt->line;
 		advance(p); /* ( */
 		for (;;) {
-			Token *et = peek(p);
-			if (!is_type_ident(et))
-				die(et->line, "a tuple return type lists element types (`(Int, Str)`)");
 			if (fn->ret_tuple_n == MAX_FIELDS)
-				die(et->line, "tuple return type has too many elements");
-			parse_type_arg(p, fn->ret_tuple_types[fn->ret_tuple_n++], sizeof fn->ret_tuple_types[0]);
+				die(peek(p)->line, "tuple return type has too many elements");
+			parse_tuple_elem_type(p, fn->ret_tuple_types[fn->ret_tuple_n++], sizeof fn->ret_tuple_types[0]);
 			if (peek(p)->kind == TK_COMMA) {
 				advance(p);
 				continue;
@@ -3416,37 +3418,23 @@ static void parse_type_arg(Parser *p, char *out, size_t cap) {
 	}
 }
 
-/* Parse a field/payload type into `out`: `Int`, an aggregate (record/union) type, a type
- * variable `'T`, or a generic application `Box[Int]` (all via parse_type_arg). Pointers,
- * buffers, Uarch and Str are not field/payload types. The name is resolved (and any `'T`
- * validated) later, so forward and mutually-recursive references work. */
-static void parse_member_type(Parser *p, char *out, size_t cap) {
+/* Parse ONE tuple element type into a canonical string: a simple leaf/aggregate name (via
+ * parse_type_arg, e.g. `Int`, `Str`, `Point`) or a NESTED tuple `(T0,T1,…)` — recursively,
+ * so `((Int,Int),Int)` round-trips. A generic `'T` element is a later brick. */
+static void parse_tuple_elem_type(Parser *p, char *out, size_t cap) {
 	Token *t = peek(p);
-	if (t->kind == TK_STAR)
-		die(t->line, "a field/payload type is `Int`, an aggregate, or `'T`, not a pointer");
-	if (t->kind == TK_LBRACKET)
-		die(t->line, "a field/payload type is `Int`, an aggregate, or `'T`, not an array/buffer");
 	if (t->kind == TK_LPAREN) {
-		/* A tuple field/payload type `(T0, …)`. Stored canonically as `(T0,T1,…)` (no spaces);
-		 * resolve_member_type interns it. Elements are Int, Str, or a record type (brick 1) —
-		 * a generic `'T` element or a nested tuple is a later brick. The `(…)` form has no `.`,
-		 * so it passes opaquely through the generic mangle/concretize machinery. */
 		advance(p); /* ( */
+		if ((size_t)1 >= cap)
+			die(t->line, "tuple type too long");
 		int off = 0, n = 0;
-		off += snprintf(out + off, cap - (size_t)off, "(");
+		out[off++] = '(';
 		for (;;) {
-			Token *et = peek(p);
-			if (et->kind == TK_LPAREN)
-				die(et->line, "a nested tuple element type is a later brick");
-			if (is_tyvar(et))
-				die(et->line, "a generic element in a tuple field type is a later brick");
-			if (!is_type_ident(et))
-				die(et->line, "a tuple field type lists element types (`(Int, Str)`)");
-			char el[64];
-			parse_type_arg(p, el, sizeof el);
+			char el[128];
+			parse_tuple_elem_type(p, el, sizeof el);
 			int w = snprintf(out + off, cap - (size_t)off, "%s%s", n ? "," : "", el);
-			if (w < 0 || (size_t)(off + w) >= cap)
-				die(et->line, "tuple field type too long");
+			if (w < 0 || (size_t)(off + w) + 1 >= cap)
+				die(t->line, "tuple type too long");
 			off += w;
 			n++;
 			if (peek(p)->kind == TK_COMMA) {
@@ -3455,13 +3443,35 @@ static void parse_member_type(Parser *p, char *out, size_t cap) {
 			}
 			break;
 		}
-		expect(p, TK_RPAREN, "expected `)` to close the tuple field type");
+		expect(p, TK_RPAREN, "expected `)` to close the tuple type");
 		if (n < 2)
 			die(t->line, "a tuple type needs at least two elements");
-		if ((size_t)(off + 1) >= cap)
-			die(t->line, "tuple field type too long");
 		out[off++] = ')';
 		out[off] = '\0';
+		return;
+	}
+	if (is_tyvar(t))
+		die(t->line, "a generic element in a tuple type is a later brick");
+	if (!is_type_ident(t))
+		die(t->line, "a tuple type lists element types (`(Int, Str)`)");
+	parse_type_arg(p, out, cap);
+}
+
+/* Parse a field/payload type into `out`: `Int`, an aggregate (record/union) type, a tuple
+ * `(T0, …)`, a type variable `'T`, or a generic application `Box[Int]`. Pointers, buffers,
+ * Uarch and Str are not field/payload types (but Str/tuples ARE valid tuple ELEMENTS). The
+ * name is resolved (and any `'T` validated) later, so forward/mutual references work. */
+static void parse_member_type(Parser *p, char *out, size_t cap) {
+	Token *t = peek(p);
+	if (t->kind == TK_STAR)
+		die(t->line, "a field/payload type is `Int`, an aggregate, or `'T`, not a pointer");
+	if (t->kind == TK_LBRACKET)
+		die(t->line, "a field/payload type is `Int`, an aggregate, or `'T`, not an array/buffer");
+	if (t->kind == TK_LPAREN) {
+		/* A tuple field/payload type `(T0, …)`, stored canonically as `(T0,T1,…)` (no spaces);
+		 * resolve_member_type interns it. Elements may themselves be tuples (nested). The `(…)`
+		 * form has no `.`, so it passes opaquely through the generic mangle/concretize machinery. */
+		parse_tuple_elem_type(p, out, cap);
 		return;
 	}
 	parse_type_arg(p, out, cap);
@@ -4862,15 +4872,16 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 				continue;
 			}
 			Type et = typeof_expr(prog, fn, e->args[i]);
-			if (type_is_word(et) || et.kind == TY_STR) {
-				/* Int, a tag-only union (a word), or an immutable Str literal — no alias risk. */
+			if (type_is_word(et) || et.kind == TY_STR || et.kind == TY_TUPLE) {
+				/* Int / a tag-only union (a word), an immutable Str, or a nested tuple (also
+				 * immutable, so its pointer may ride in unchanged) — no alias/freshness risk. */
 			} else if (et.kind == TY_RECORD) {
 				if (e->args[i]->kind != EX_CALL && e->args[i]->kind != EX_RECORD)
 					die(e->args[i]->line, "a record tuple element must be a fresh value (a record-"
 					                      "returning call or literal), not an alias of existing storage");
 			} else {
-				die(e->args[i]->line, "a tuple element is an Int, Str, or record value in cfcc "
-				                      "(array/tuple/union/pointer elements are a later brick)");
+				die(e->args[i]->line, "a tuple element is an Int, Str, record, or tuple value in cfcc "
+				                      "(array/union/pointer elements are a later brick)");
 			}
 			if (n == MAX_FIELDS)
 				die(e->line, "tuple has too many elements");
@@ -5436,9 +5447,15 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 						die(s->line, "a record position binds `const` (a `let` would alias the "
 						             "tuple's storage mutably — not allowed without a copy)");
 					set_local_record_type(fn, s->name, it.rec);
+				} else if (it.kind == TY_TUPLE) {
+					/* a nested-tuple position — an immutable aggregate, so a `const` alias is
+					 * sound (same argument as a record position). */
+					if (is_let)
+						die(s->line, "a nested-tuple position binds `const`");
+					set_local_tuple(fn, s->name, it.tup);
 				} else {
-					die(s->line, "cfcc binds an Int, Str, or record position from an index "
-					             "(array/tuple/union positions are a later brick)");
+					die(s->line, "cfcc binds an Int, Str, record, or tuple position from an index "
+					             "(array/union positions are a later brick)");
 				}
 			} else {
 				/* Any other initializer: an Int (a word local), or a TUPLE-valued expression
