@@ -2928,9 +2928,11 @@ static DataDecl *parse_data_decl(Parser *p, Program *prog) {
  * M1.1 unions are TAG-ONLY: every member is a fresh PascalCase nullary tag, numbered
  * by declaration order (member i → tag i), and the union lowers to a plain integer tag
  * (ebnf Union Types; type_system §8.4; seed_subset §7). Interior newlines are allowed
- * so a union may span lines (the idiomatic AST-node form). Payload members (`M(T)`,
- * `M = { … }`, `M = literal`), compose-over/spread members, and generics are later
- * bricks — each rejected with a clear message. */
+ * so a union may span lines (the idiomatic AST-node form). Payload members (`M(T)`) and
+ * generics are handled; member spread `...Other` splices another union's members (a
+ * parse-time member-copy — see the loop). Struct-body `M = { … }`/literal members and
+ * compose-over members (a bare member naming an existing type) stay later bricks — each
+ * rejected with a clear message. */
 static UnionDecl *parse_union_decl(Parser *p, Program *prog) {
 	advance(p); /* `union` */
 	Token *nm = peek(p);
@@ -2952,8 +2954,60 @@ static UnionDecl *parse_union_decl(Parser *p, Program *prog) {
 	if (peek(p)->kind != TK_RBRACE)
 		for (;;) {
 			Token *m = peek(p);
-			if (m->kind == TK_ELLIPSIS)
-				die(m->line, "M1 unions do not support `...` member spread yet");
+			if (m->kind == TK_ELLIPSIS) {
+				/* Union member spread `...Small` — splice another union's members in
+				 * place (ebnf member_spread; the value-union echo of a record's field
+				 * spread). A parse-time member-copy: append the source union's members
+				 * (name + arity + payload types); tags follow declaration order.
+				 * ⚠ THROWAWAY narrowings (cf0 must NOT inherit): (1) the source must be an
+				 * already-declared CONCRETE union (no generic application `...Small[T]`, no
+				 * un-applied template) appearing textually BEFORE this decl (parse-time
+				 * `prog_find_union` — cf0 resolves order-independently in a later Resolve
+				 * arc); (2) a member-name collision is a hard error; (3) cfcc splices member
+				 * DECLARATIONS only — Big and Small stay DISTINCT union types with
+				 * independent tags and NO subsumption (a Small value is not a Big value),
+				 * whereas cf0's `...Small` participates in union-subset subtyping (§8.2) with
+				 * cross-sub/superset tag consistency owned by the M6/M9 representation gate;
+				 * (4) cfcc's source carries only inline tag/payload members — it has no
+				 * compose-over members, so the fuller `...Int`-style numeric-union spread is
+				 * out of reach. */
+				advance(p); /* `...` */
+				Token *src = peek(p);
+				if (!is_type_ident(src))
+					die(src->line, "expected a union type name after `...`");
+				char sname[64];
+				tok_copy(src, sname, sizeof sname);
+				advance(p);
+				if (peek(p)->kind == TK_LBRACKET)
+					die(peek(p)->line, "M1 cannot spread a generic application (`...Name[...]`) yet — spread a concrete union");
+				if (prog_find_data(prog, sname))
+					die(src->line, "member spread source must be a union, not a record");
+				UnionDecl *su = prog_find_union(prog, sname);
+				if (!su)
+					die(src->line, "member spread source union is not declared (declare it before this union)");
+				if (su->ntyparams > 0)
+					die(src->line, "cannot spread a generic union template — spread a concrete union");
+				for (int i = 0; i < su->nmembers; i++) {
+					if (union_member_tag(u, su->members[i]) >= 0)
+						die(src->line, "duplicate union member from spread");
+					if (u->nmembers == MAX_UNION_MEMBERS)
+						die(src->line, "too many union members");
+					u->arity[u->nmembers] = su->arity[i];
+					for (int j = 0; j < su->arity[i]; j++)
+						snprintf(u->payload_types[u->nmembers][j], sizeof u->payload_types[0][0], "%s", su->payload_types[i][j]);
+					snprintf(u->members[u->nmembers], sizeof u->members[0], "%s", su->members[i]);
+					u->nmembers++;
+				}
+				skip_newlines(p);
+				if (peek(p)->kind == TK_COMMA) {
+					advance(p);
+					skip_newlines(p);
+					if (peek(p)->kind == TK_RBRACE) /* trailing comma */
+						break;
+					continue;
+				}
+				break;
+			}
 			if (!is_type_ident(m))
 				die(m->line, "a union member is a PascalCase name");
 			if (m->text[m->len - 1] == '!')
