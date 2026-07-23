@@ -2054,8 +2054,18 @@ static Expr *parse_data_literal(Parser *p, Func *fn, const char *typename, int l
 			}
 			tok_copy(f, e->fnames[e->nfields], sizeof e->fnames[e->nfields]);
 			advance(p);
-			expect(p, TK_COLON, "expected `:` (M0 data literals are `field: value`)");
-			e->fvals[e->nfields] = parse_expr(p, fn);
+			if (peek(p)->kind == TK_COLON) {
+				advance(p);
+				e->fvals[e->nfields] = parse_expr(p, fn);
+			} else {
+				/* Field PUN `{ x }` = `{ x: x }` — the field value is the in-scope
+				 * variable of the same name (ebnf field_init pun). Synthesize the
+				 * `EX_VAR`; it resolves like any name reference in typecheck. */
+				Expr *pv = new_expr(EX_VAR);
+				pv->line = f->line;
+				tok_copy(f, pv->name, sizeof pv->name);
+				e->fvals[e->nfields] = pv;
+			}
 			e->nfields++;
 			if (peek(p)->kind == TK_COMMA) {
 				advance(p);
