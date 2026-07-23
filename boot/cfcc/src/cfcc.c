@@ -131,6 +131,7 @@ typedef enum {
 	TK_SHREQ,     /* >>= */
 	TK_ARROW, /* -> */
 	TK_PIPEGT, /* |> pipe: `x |> f` ≡ `f(x)` (ebnf § pipe) */
+	TK_YIELD, /* <- yield: `<- v` yields a block/loop value (ebnf § Control Flow) */
 } TokKind;
 
 /* A string breaks into segments: literal byte-runs and `${name}` interpolations,
@@ -427,6 +428,10 @@ static void lex(Lexer *lx) {
 			if (n == '<' && s[lx->pos + 2] == '=') { push_tok(lx, TK_SHLEQ, s + lx->pos, 3, 0); lx->pos += 3; }
 			else if (n == '<') { push_tok(lx, TK_SHL, s + lx->pos, 2, 0); lx->pos += 2; }
 			else if (n == '=') { push_tok(lx, TK_LE, s + lx->pos, 2, 0); lx->pos += 2; }
+			/* `<-` is the yield lead (ebnf § Control Flow): it only ever begins a yield
+			 * statement, never a comparison, so a greedy two-char lex is unambiguous —
+			 * `a < -b` is written with a space (or parens) and reads as `a`, `<`, `-b`. */
+			else if (n == '-') { push_tok(lx, TK_YIELD, s + lx->pos, 2, 0); lx->pos += 2; }
 			else { push_tok(lx, TK_LT, s + lx->pos, 1, 0); lx->pos++; }
 			continue;
 		case '>':
@@ -452,10 +457,15 @@ static void lex(Lexer *lx) {
 
 typedef struct Program Program; /* forward: the Parser references the program it builds */
 
+#define MAX_LOOP_DEPTH 64 /* cap on statically-nested loops (bounds Parser/Emit loop stacks) */
+
 typedef struct {
 	Token *toks;
 	size_t pos;
 	int loop_depth; /* how many loops enclose the statement being parsed */
+	char loop_val[MAX_LOOP_DEPTH]; /* per-depth: 1 if the enclosing loop yields a value (a
+	                                * `loop` in value position), so `<-` is legal and a bare
+	                                * `break` is not; 0 for a statement `loop`/`for` */
 	int in_defer;   /* 1 while parsing a `defer { … }` block body (no nested defer/return) */
 	int in_closure; /* 1 while parsing a closure body (no nested closures in v1) */
 	int for_id;     /* monotonic id minting each `for` loop's hidden counter-local name */
@@ -572,6 +582,10 @@ typedef enum {
 	EX_UMEMBER,/* union member value: Union.Member — a tag-only member's tag (uni, ival=tag) */
 	EX_MATCH, /* match scrut { arms } — compare-chain tag dispatch (lhs=scrut, arms/narms) */
 	EX_IF,    /* if cond then a else b (lhs=cond, rhs=then, els=else) */
+	EX_LOOP,  /* loop { body } in VALUE position — an infinite loop that yields a value via
+	           * `<- v` (a break-with-value). `loop_body` is the body statement list; `slot`
+	           * the entry-block merge slot the yields store into. A statement `loop` (for
+	           * effect, no value) stays an ST_LOOP; this is the expression form. */
 	EX_DEFER, /* defer <call> — a tapping expression: schedules lhs (an EX_CALL) at scope
 	           * exit (LIFO) and evaluates to the call's tapped argument (its last positional
 	           * arg). `x |> defer f` builds this too (the pipe fills the tapped slot). */
@@ -660,10 +674,14 @@ struct Expr {
 	 * tell a record value (an `l` arena pointer — passed/returned by pointer) from a
 	 * word. */
 	Type rtype;
-	/* EX_IF/EX_AND/EX_OR: id of the 4-byte stack slot that merges the branch values.
-	 * Assigned per function before emit (assign_stmt_slots) and allocated once in the
-	 * entry block, so an if/logical inside a loop does not `alloc4` each iteration. */
+	/* EX_IF/EX_AND/EX_OR/EX_MATCH/EX_LOOP: id of the 4-byte stack slot that merges the
+	 * branch/yield values. Assigned per function before emit (assign_stmt_slots) and
+	 * allocated once in the entry block, so an if/logical/loop inside a loop does not
+	 * `alloc4` each iteration. */
 	int slot;
+	/* EX_LOOP: the loop body statement list (an expression carrying statements — the only
+	 * such shape in cfcc; its `<- v` yields break the loop with a value). */
+	struct Stmt *loop_body;
 	/* EX_CALL: the resolved callee, cached by typecheck so emit can read each
 	 * parameter's kind (to pick the argument register width and widen an Int→Uarch). */
 	struct Func *callee;
@@ -716,6 +734,9 @@ typedef enum {
 	                 * `body` = the loop body. Desugared in emit to a counter loop. */
 	ST_BREAK,       /* break (bare) or `if cond then break` (guard in expr) */
 	ST_CONTINUE,    /* continue (bare) or `if cond then continue` (guard in expr) */
+	ST_YIELD,       /* `<- v` (bare) or `if cond then <- v` (guard in expr) — inside a
+	                 * value-yielding loop it breaks the loop with value `yval`. `expr`
+	                 * holds the optional guard (as for break/continue); `yval` the value. */
 	ST_EXPR,        /* an expression evaluated for effect (a call), result discarded */
 	ST_DEFER,       /* defer <call> | defer { block } — schedule a cleanup to run at scope
 	                 * exit, LIFO. `expr` holds the call (call form); `body` the block form. */
@@ -741,14 +762,16 @@ struct Stmt {
 	                     * ST_DEFER: the scheduled call (call form; NULL for the block form) */
 	Stmt *body;         /* ST_LOOP: the loop body statement list; ST_DEFER: the block form's
 	                     * body (NULL for the call form) */
+	Expr *yval;         /* ST_YIELD: the yielded value (`<- yval`); `expr` carries the
+	                     * optional guard, mirroring break/continue */
 	Stmt *next;
 };
 
 /* A statement diverges (ends its block unconditionally): a `return`, or a bare
- * `break`/`continue`. A guarded break/continue and a loop fall through. */
+ * `break`/`continue`/`<-`. A guarded break/continue/yield and a loop fall through. */
 static int stmt_is_terminal(const Stmt *s) {
 	return s->kind == ST_RETURN ||
-	       ((s->kind == ST_BREAK || s->kind == ST_CONTINUE) && !s->expr);
+	       ((s->kind == ST_BREAK || s->kind == ST_CONTINUE || s->kind == ST_YIELD) && !s->expr);
 }
 
 static Stmt *new_stmt(StmtKind kind) {
@@ -772,7 +795,6 @@ typedef struct {
 
 #define MAX_PARAMS 32
 #define MAX_FIELDS 64
-#define MAX_LOOP_DEPTH 64 /* cap on statically-nested loops (bounds Emit.loops[]) */
 #define MAX_DEFERS 64     /* cap on `defer`s per function (bounds Emit.defers[]) */
 #define MAX_CLOSURES 64   /* cap on closures declared in one function (bounds Func.closures[]) */
 
@@ -1330,6 +1352,7 @@ static void parse_paren_params(Parser *p, Func *fn) {
 
 static Expr *parse_expr(Parser *p, Func *fn); /* forward */
 static Expr *parse_data_literal(Parser *p, Func *fn, const char *typename, int line); /* forward */
+static Stmt *parse_stmt_seq(Parser *p, Func *fn, int require_return, int open_line); /* forward: EX_LOOP body */
 
 /* Disambiguate `name[…]`: a generic call `f[Type](args)` vs an array index `xs[i]`.
  * Assumes the current token is `[`; returns 1 iff the matching `]` is immediately
@@ -1425,6 +1448,24 @@ static Expr *parse_primary(Parser *p, Func *fn) {
 		advance(p);
 		Expr *e = parse_expr(p, fn);
 		expect(p, TK_RPAREN, "expected `)`");
+		return e;
+	}
+	if (is_ident(t, "loop")) {
+		/* `loop { … }` in VALUE position (a binding/return right-hand side, or an operand):
+		 * an infinite loop that yields a value via `<- v`. Unlike an `if`/`match` expression,
+		 * a loop is brace-delimited, so it needs no parenthesization to disambiguate. The
+		 * body is parsed like a statement loop but flagged value-yielding, so `<-` is legal
+		 * and a bare `break` is not (a value loop exits by yielding). */
+		advance(p); /* `loop` */
+		if (p->loop_depth >= MAX_LOOP_DEPTH)
+			die(t->line, "loops nested too deep");
+		expect(p, TK_LBRACE, "expected `{` (a loop body is a block)");
+		Expr *e = new_expr(EX_LOOP);
+		e->line = t->line;
+		p->loop_val[p->loop_depth] = 1;
+		p->loop_depth++;
+		e->loop_body = parse_stmt_seq(p, fn, 0, t->line); /* no required `return` */
+		p->loop_depth--;
 		return e;
 	}
 	if (t->kind == TK_IDENT && !is_type_ident(t)) {
@@ -2195,6 +2236,7 @@ static void collect_captures_expr(Func *cl, Expr *e, Capture *caps, int *ncaps) 
 		collect_captures_expr(cl, e->spread, caps, ncaps);
 	for (int i = 0; i < e->narms; i++)
 		collect_captures_expr(cl, e->arms[i].body, caps, ncaps);
+	collect_captures_stmt(cl, e->loop_body, caps, ncaps); /* EX_LOOP body (NULL otherwise) */
 }
 
 static void collect_captures_stmt(Func *cl, Stmt *s, Capture *caps, int *ncaps) {
@@ -2202,6 +2244,7 @@ static void collect_captures_stmt(Func *cl, Stmt *s, Capture *caps, int *ncaps) 
 		if (s->kind == ST_ASSIGN || s->kind == ST_FIELD_ASSIGN)
 			note_capture(cl, s->name, 1, s->line, caps, ncaps); /* a write target is a capture too */
 		collect_captures_expr(cl, s->expr, caps, ncaps);
+		collect_captures_expr(cl, s->yval, caps, ncaps); /* ST_YIELD value (NULL otherwise) */
 		collect_captures_stmt(cl, s->body, caps, ncaps); /* loop / defer-block bodies */
 	}
 }
@@ -2505,6 +2548,7 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 		expect(p, TK_LBRACE, "expected `{` (a loop body is a block)");
 		Stmt *s = new_stmt(ST_LOOP);
 		s->line = t->line;
+		p->loop_val[p->loop_depth] = 0; /* a statement loop yields no value */
 		p->loop_depth++;
 		s->body = parse_stmt_seq(p, fn, 0, t->line); /* no required `return` */
 		p->loop_depth--;
@@ -2549,6 +2593,7 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 		if (p->loop_depth >= MAX_LOOP_DEPTH)
 			die(t->line, "loops nested too deep");
 		expect(p, TK_LBRACE, "expected `{` (a `for` body is a block)");
+		p->loop_val[p->loop_depth] = 0; /* a statement `for` yields no value */
 		p->loop_depth++;
 		s->body = parse_stmt_seq(p, fn, 0, t->line); /* no required `return` */
 		p->loop_depth--;
@@ -2560,26 +2605,58 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 		if (p->loop_depth == 0)
 			die(t->line, is_break ? "`break` is only valid inside a loop"
 			                      : "`continue` is only valid inside a loop");
+		if (is_break && p->loop_val[p->loop_depth - 1])
+			die(t->line, "a value-yielding loop exits by yielding a value: `<- v`, not a bare `break`");
 		Stmt *s = new_stmt(is_break ? ST_BREAK : ST_CONTINUE);
 		s->line = t->line; /* bare — no guard, no label in M0 */
 		return s;
 	}
+	if (peek(p)->kind == TK_YIELD) {
+		/* `<- v` — yield a value from the enclosing value-loop (a break-with-value). Terminal,
+		 * like `break`. Legal only when the nearest loop yields a value (a `loop` in value
+		 * position); a statement `loop`/`for` has no slot to yield into. */
+		advance(p); /* `<-` */
+		if (p->loop_depth == 0 || !p->loop_val[p->loop_depth - 1])
+			die(t->line, "`<- v` yields a loop's value, so it needs a value-yielding loop "
+			             "(a `loop` in value position); a statement `loop`/`for` has no value");
+		Stmt *s = new_stmt(ST_YIELD);
+		s->line = t->line;
+		s->yval = parse_expr(p, fn);
+		return s;
+	}
 	if (is_ident(t, "if")) {
-		/* In statement position `if` guards a loop control: `if <cond> then break`
-		 * or `if <cond> then continue` (the value-`if` is an expression — it appears
-		 * on a binding/return right-hand side, never as a bare statement). */
+		/* In statement position `if` guards a loop control: `if <cond> then break`,
+		 * `if <cond> then continue`, or `if <cond> then <- v` (a guarded value-yield).
+		 * The value-`if` is an expression — it appears on a binding/return right-hand
+		 * side, never as a bare statement. */
 		advance(p);
 		Expr *cond = parse_expr(p, fn);
 		if (!is_ident(peek(p), "then"))
 			die(peek(p)->line, "expected `then`");
 		advance(p);
+		if (peek(p)->kind == TK_YIELD) {
+			/* `if <cond> then <- v` — a guarded yield: exit the value-loop with `v` when
+			 * the guard holds, else fall through. Not terminal (the guard may be false). */
+			int yline = peek(p)->line;
+			advance(p); /* `<-` */
+			if (p->loop_depth == 0 || !p->loop_val[p->loop_depth - 1])
+				die(yline, "`<- v` yields a loop's value, so it needs a value-yielding loop "
+				           "(a `loop` in value position); a statement `loop`/`for` has no value");
+			Stmt *s = new_stmt(ST_YIELD);
+			s->line = t->line;
+			s->expr = cond;                /* guard */
+			s->yval = parse_expr(p, fn);   /* yielded value */
+			return s;
+		}
 		Token *ctl = peek(p);
 		int is_break = is_ident(ctl, "break");
 		if (!is_break && !is_ident(ctl, "continue"))
-			die(ctl->line, "a statement-position `if` guards a `break` or `continue`");
+			die(ctl->line, "a statement-position `if` guards a `break`, `continue`, or `<- v`");
 		advance(p);
 		if (p->loop_depth == 0)
 			die(ctl->line, "`break`/`continue` is only valid inside a loop");
+		if (is_break && p->loop_val[p->loop_depth - 1])
+			die(ctl->line, "a value-yielding loop exits by yielding a value: `<- v`, not a bare `break`");
 		Stmt *s = new_stmt(is_break ? ST_BREAK : ST_CONTINUE);
 		s->line = t->line;
 		s->expr = cond; /* guarded */
@@ -3346,6 +3423,7 @@ static void parse(Parser *p, Program *prog) {
 /* Deep-copy an expression tree so a generic instantiation gets its own nodes (fresh
  * typecheck/emit annotations). Resolved fields (rtype, callee, slot, …) are NULL/0 in
  * the un-typechecked template, so a plain struct copy carries the right initial state. */
+static Stmt *clone_stmt(Stmt *s); /* forward: EX_LOOP body */
 static Expr *clone_expr(Expr *e) {
 	if (!e)
 		return NULL;
@@ -3379,6 +3457,7 @@ static Expr *clone_expr(Expr *e) {
 		memcpy(c->sval, e->sval, (size_t)e->slen);
 		c->sval[e->slen] = '\0';
 	}
+	c->loop_body = clone_stmt(e->loop_body); /* EX_LOOP body (NULL otherwise) */
 	return c;
 }
 
@@ -3388,6 +3467,7 @@ static Stmt *clone_stmt(Stmt *s) {
 	Stmt *c = xmalloc(sizeof *c);
 	*c = *s;
 	c->expr = clone_expr(s->expr);
+	c->yval = clone_expr(s->yval); /* ST_YIELD value (NULL otherwise) */
 	c->body = clone_stmt(s->body);
 	c->next = clone_stmt(s->next);
 	return c;
@@ -3463,6 +3543,7 @@ static void subst_mangled(char *dst, size_t cap, const char *src,
  * cloned body. A `'T` survives into an expression as an EX_CALL's explicit type arguments
  * (`id['T](x)`) and as the type name of a generic record literal / union member value
  * (`Box['T]` / `Maybe['T].Just`) — all rewritten to the concrete instantiation. */
+static void subst_stmts(Stmt *s, Func *tmpl, char targs[][256]); /* forward: EX_LOOP body */
 static void subst_expr(Expr *e, Func *tmpl, char targs[][256]) {
 	if (!e)
 		return;
@@ -3493,6 +3574,7 @@ static void subst_expr(Expr *e, Func *tmpl, char targs[][256]) {
 		subst_expr(e->spread, tmpl, targs);
 	for (int i = 0; i < e->narms; i++)
 		subst_expr(e->arms[i].body, tmpl, targs);
+	subst_stmts(e->loop_body, tmpl, targs); /* EX_LOOP body (NULL otherwise) */
 }
 
 static void subst_stmts(Stmt *s, Func *tmpl, char targs[][256]) {
@@ -3505,6 +3587,7 @@ static void subst_stmts(Stmt *s, Func *tmpl, char targs[][256]) {
 			snprintf(s->type_name, sizeof s->type_name, "%s", sub);
 		}
 		subst_expr(s->expr, tmpl, targs);
+		subst_expr(s->yval, tmpl, targs); /* ST_YIELD value (NULL otherwise) */
 		subst_stmts(s->body, tmpl, targs);
 	}
 }
@@ -3513,6 +3596,7 @@ static void subst_stmts(Stmt *s, Func *tmpl, char targs[][256]) {
  * value-param name folds to its concrete integer literal, so the specialized body carries
  * no runtime type variable (type_system §9.1 — a value param is comptime-by-declaration).
  * `names[i]` is the value-param name (`n`), `vals[i]` its concrete value. */
+static void subst_value_stmts(Stmt *s, char names[][64], long *vals, int nv); /* forward: EX_LOOP body */
 static void subst_value_expr(Expr *e, char names[][64], long *vals, int nv) {
 	if (!e)
 		return;
@@ -3534,6 +3618,7 @@ static void subst_value_expr(Expr *e, char names[][64], long *vals, int nv) {
 		subst_value_expr(e->spread, names, vals, nv);
 	for (int i = 0; i < e->narms; i++)
 		subst_value_expr(e->arms[i].body, names, vals, nv);
+	subst_value_stmts(e->loop_body, names, vals, nv); /* EX_LOOP body (NULL otherwise) */
 }
 
 static void subst_value_stmts(Stmt *s, char names[][64], long *vals, int nv) {
@@ -3551,6 +3636,7 @@ static void subst_value_stmts(Stmt *s, char names[][64], long *vals, int nv) {
 					break;
 				}
 		subst_value_expr(s->expr, names, vals, nv);
+		subst_value_expr(s->yval, names, vals, nv); /* ST_YIELD value (NULL otherwise) */
 		subst_value_stmts(s->body, names, vals, nv);
 	}
 }
@@ -3854,9 +3940,11 @@ static const char *shallow_type_name(Program *prog, Func *fn, Expr *e) {
  * enclosing call infers from it. Type arguments come from the explicit `[…]` list or are
  * inferred from the argument types. The call is rewritten to the mangled concrete name;
  * appended instantiations are revisited by the driver loop → a fixpoint. */
+static void monomorph_stmts(Program *prog, Func *fn, Stmt *s); /* forward: EX_LOOP body */
 static void monomorph_expr(Program *prog, Func *fn, Expr *e) {
 	if (!e)
 		return;
+	monomorph_stmts(prog, fn, e->loop_body); /* EX_LOOP body (NULL otherwise) */
 	monomorph_expr(prog, fn, e->lhs);
 	monomorph_expr(prog, fn, e->rhs);
 	monomorph_expr(prog, fn, e->els);
@@ -3935,6 +4023,7 @@ static void monomorph_stmts(Program *prog, Func *fn, Stmt *s) {
 		if (s->kind == ST_LOCAL && s->type_name[0]) /* a local's generic-type annotation */
 			concretize_name(prog, s->type_name, s->line);
 		monomorph_expr(prog, fn, s->expr);
+		monomorph_expr(prog, fn, s->yval); /* ST_YIELD value (NULL otherwise) */
 		monomorph_stmts(prog, fn, s->body);
 	}
 }
@@ -4127,11 +4216,13 @@ static void specialize_calls_expr(Program *prog, Func *fn, Expr *e) {
 		specialize_calls_expr(prog, fn, e->spread);
 	for (int i = 0; i < e->narms; i++)
 		specialize_calls_expr(prog, fn, e->arms[i].body);
+	specialize_calls_stmt(prog, fn, e->loop_body); /* EX_LOOP body (NULL otherwise) */
 }
 
 static void specialize_calls_stmt(Program *prog, Func *fn, Stmt *s) {
 	for (; s; s = s->next) {
 		specialize_calls_expr(prog, fn, s->expr);
+		specialize_calls_expr(prog, fn, s->yval); /* ST_YIELD value (NULL otherwise) */
 		specialize_calls_stmt(prog, fn, s->body); /* loop / defer-block bodies */
 	}
 }
@@ -4192,6 +4283,18 @@ static void check_member_value(Program *prog, Func *fn, Expr *val, Type want, in
 	} else {
 		die(line, "unsupported field/payload type");
 	}
+}
+
+static void check_stmts(Program *prog, Func *fn, Stmt *list); /* forward: EX_LOOP body */
+
+/* A value loop must actually yield: scan its own body for a `<- v`. Yields target the
+ * nearest loop, so a yield inside a NESTED loop belongs to that loop, not this one —
+ * only the loop's own direct statements count (guarded yields are ST_YIELD nodes too). */
+static int loop_body_yields(const Stmt *body) {
+	for (const Stmt *s = body; s; s = s->next)
+		if (s->kind == ST_YIELD)
+			return 1;
+	return 0;
 }
 
 /* Compute and validate the type of an expression, resolving field accesses and
@@ -4544,6 +4647,16 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		expect_int(prog, fn, e->rhs); /* then — M0 if-branches are Int */
 		expect_int(prog, fn, e->els); /* else */
 		return (Type){TY_INT, NULL, NULL, 0};
+	case EX_LOOP:
+		/* A value-yielding `loop`: check its body (each `<- v` yields an Int — validated
+		 * per-statement in check_stmts), and require at least one yield so the loop has a
+		 * value. M0 merges yields through a word slot, so a loop yields an Int (like an
+		 * if-expression); a record/aggregate yield is out of reach, same limitation. */
+		check_stmts(prog, fn, e->loop_body);
+		if (!loop_body_yields(e->loop_body))
+			die(e->line, "a value-yielding `loop` must reach a `<- v` (add a yield, or use a "
+			             "statement `loop` if no value is needed)");
+		return (Type){TY_INT, NULL, NULL, 0};
 	case EX_DEFER: {
 		/* A `defer` tap: type its call (validates callee/args, caches the call's and
 		 * each arg's rtype for emit), then yield the *tapped argument* — the call's last
@@ -4850,6 +4963,13 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 			if (s->expr) /* guarded: `if <cond> then break/continue` */
 				expect_int(prog, fn, s->expr);
 			break;
+		case ST_YIELD:
+			/* `<- v` (or `if <cond> then <- v`): the guard, when present, and the yielded
+			 * value are both Int (the loop merges yields through a word slot, § EX_LOOP). */
+			if (s->expr) /* guard */
+				expect_int(prog, fn, s->expr);
+			expect_int(prog, fn, s->yval);
+			break;
 		case ST_EXPR:
 			/* A call or a `defer` tap evaluated for effect: type it (validates the
 			 * callee/args and, for a defer, schedules it); the tapped/result value,
@@ -4988,6 +5108,8 @@ typedef struct {
 	int tmp;
 	int lbl;
 	int loops[MAX_LOOP_DEPTH]; /* label ids of enclosing loops (innermost last) */
+	int loop_slots[MAX_LOOP_DEPTH]; /* per enclosing loop: the EX_LOOP merge slot a `<- v`
+	                                 * stores into, or -1 for a statement loop/for (no value) */
 	int loop_depth;
 	int ret_uarch; /* 1 if the current function returns Uarch (an `l`) — a returned
 	                * Int value is widened to `l` before `ret`. */
@@ -5020,11 +5142,13 @@ static void register_strlit(Expr *e) {
 
 /* Walk an expression (and its sub-expressions) registering every string literal,
  * so each gets a module-unique data slot before emit. Mirrors assign_expr_slots. */
+static void collect_strlits_stmt(Stmt *list); /* forward: EX_LOOP body */
 static void collect_strlits_expr(Expr *e) {
 	if (!e)
 		return;
 	if (e->kind == EX_STR)
 		register_strlit(e);
+	collect_strlits_stmt(e->loop_body); /* EX_LOOP body (NULL otherwise) */
 	collect_strlits_expr(e->lhs);
 	collect_strlits_expr(e->rhs);
 	collect_strlits_expr(e->els);
@@ -5041,6 +5165,7 @@ static void collect_strlits_expr(Expr *e) {
 static void collect_strlits_stmt(Stmt *list) {
 	for (Stmt *s = list; s; s = s->next) {
 		collect_strlits_expr(s->expr);
+		collect_strlits_expr(s->yval); /* ST_YIELD value (NULL otherwise) */
 		if (s->kind == ST_LOOP || s->kind == ST_FOR || s->kind == ST_DEFER) /* bodies with statements */
 			collect_strlits_stmt(s->body);
 	}
@@ -5071,6 +5196,7 @@ static void emit_string_data(FILE *out) {
  * / `%u_` / `%tN` / `%mN` prefixes (word slot / record pointer / incoming param /
  * temp / if-and-logical merge slot) mean a user name can never collide with a
  * compiler value. */
+static void emit_stmts(FILE *out, Stmt *list, Emit *ex); /* forward: EX_LOOP body */
 static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 	switch (e->kind) {
 	case EX_INT:
@@ -5482,6 +5608,30 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		snprintf(dst, cap, "%%t%d", r);
 		return;
 	}
+	case EX_LOOP: {
+		/* A value-yielding loop: like the statement loop (@ltop back-edge, @lend exit), but
+		 * each `<- v` stores `v` into the merge slot `%m<slot>` and jumps to @lend; the value
+		 * is then loaded there. @lend is reached ONLY through those yields (never fall-through),
+		 * so the slot is always stored before the load. The loop is pushed on the label/slot
+		 * stacks so break/continue/yield inside reach it. */
+		int id = ex->lbl++;
+		ex->loops[ex->loop_depth] = id;
+		ex->loop_slots[ex->loop_depth] = e->slot;
+		ex->loop_depth++;
+		fprintf(out, "@ltop%d\n", id);
+		emit_stmts(out, e->loop_body, ex);
+		ex->loop_depth--;
+		Stmt *tail = e->loop_body;
+		while (tail && tail->next)
+			tail = tail->next;
+		if (!tail || !stmt_is_terminal(tail)) /* body can fall through → loop back */
+			fprintf(out, "\tjmp @ltop%d\n", id);
+		fprintf(out, "@lend%d\n", id);
+		int r = ex->tmp++;
+		fprintf(out, "\t%%t%d =w loadw %%m%d\n", r, e->slot);
+		snprintf(dst, cap, "%%t%d", r);
+		return;
+	}
 	case EX_AND:
 	case EX_OR: {
 		/* Short-circuit, reusing the entry-block merge slot `%m<slot>`. Evaluate lhs;
@@ -5676,6 +5826,7 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 			 * body does not itself end in a divergence (a bare break/continue/return,
 			 * which already closed the block); otherwise it would be orphaned. */
 			int id = ex->lbl++;
+			ex->loop_slots[ex->loop_depth] = -1; /* a statement loop yields no value */
 			ex->loops[ex->loop_depth++] = id;
 			fprintf(out, "@ltop%d\n", id);
 			emit_stmts(out, s->body, ex);
@@ -5698,6 +5849,7 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 			int id = ex->lbl++;
 			int N = s->expr->rtype.alen;
 			fprintf(out, "\tstorew -1, %%s_%s\n", s->field);       /* counter = -1 */
+			ex->loop_slots[ex->loop_depth] = -1; /* a statement `for` yields no value */
 			ex->loops[ex->loop_depth++] = id;
 			fprintf(out, "@ltop%d\n", id);
 			int c = ex->tmp++;
@@ -5749,6 +5901,30 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 			}
 			break;
 		}
+		case ST_YIELD: {
+			/* `<- v` — store `v` into the nearest value-loop's merge slot and jump to its
+			 * @lend. A guard (`if <cond> then <- v`) branches over the store/jump; a bare
+			 * yield just does it (and is terminal, so nothing follows in its block). */
+			int id = ex->loops[ex->loop_depth - 1];
+			int slot = ex->loop_slots[ex->loop_depth - 1];
+			char vv[96];
+			if (s->expr) { /* guarded */
+				char c[96];
+				emit_expr(out, s->expr, ex, c, sizeof c);
+				int g = ex->lbl++;
+				fprintf(out, "\tjnz %s, @ydo%d, @yskip%d\n", c, g, g);
+				fprintf(out, "@ydo%d\n", g);
+				emit_expr(out, s->yval, ex, vv, sizeof vv);
+				fprintf(out, "\tstorew %s, %%m%d\n", vv, slot);
+				fprintf(out, "\tjmp @lend%d\n", id);
+				fprintf(out, "@yskip%d\n", g);
+			} else {
+				emit_expr(out, s->yval, ex, vv, sizeof vv);
+				fprintf(out, "\tstorew %s, %%m%d\n", vv, slot);
+				fprintf(out, "\tjmp @lend%d\n", id);
+			}
+			break;
+		}
 		case ST_EXPR:
 			/* Evaluate the call for effect; its result temp is simply not used. */
 			emit_expr(out, s->expr, ex, v, sizeof v);
@@ -5794,10 +5970,12 @@ static void emit_defers(FILE *out, Emit *ex) {
 /* Give each if/logical expression a distinct merge-slot id, counting them in *n,
  * so emit_func can reserve all merge slots once in the entry block (see Expr.slot).
  * Walks the whole body, including loop bodies and nested sub-expressions. */
+static void assign_stmt_slots(Stmt *list, int *n); /* forward: EX_LOOP body */
 static void assign_expr_slots(Expr *e, int *n) {
 	if (!e)
 		return;
-	if (e->kind == EX_IF || e->kind == EX_AND || e->kind == EX_OR || e->kind == EX_MATCH)
+	if (e->kind == EX_IF || e->kind == EX_AND || e->kind == EX_OR || e->kind == EX_MATCH ||
+	    e->kind == EX_LOOP) /* EX_LOOP merges its `<- v` yields through a slot, like an if */
 		e->slot = (*n)++;
 	assign_expr_slots(e->lhs, n);
 	assign_expr_slots(e->rhs, n);
@@ -5810,11 +5988,13 @@ static void assign_expr_slots(Expr *e, int *n) {
 		assign_expr_slots(e->spread, n);
 	for (int i = 0; i < e->narms; i++) /* EX_MATCH arm bodies */
 		assign_expr_slots(e->arms[i].body, n);
+	assign_stmt_slots(e->loop_body, n); /* EX_LOOP body (NULL otherwise) */
 }
 
 static void assign_stmt_slots(Stmt *list, int *n) {
 	for (Stmt *s = list; s; s = s->next) {
 		assign_expr_slots(s->expr, n);
+		assign_expr_slots(s->yval, n); /* ST_YIELD value (NULL otherwise) */
 		if (s->kind == ST_LOOP || s->kind == ST_FOR || s->kind == ST_DEFER) /* bodies with statements */
 			assign_stmt_slots(s->body, n);
 	}
