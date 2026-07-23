@@ -72,8 +72,8 @@ type = pointer | bracket_type | named_type | member_access | type_var | tuple_ty
 named_type    = type_name , [ "[" , type , { "," , type } , "]" ] ;  (* Int32  |  List[Int32]  |  Map[Str, Int32] *)
 pointer       = "*" , type ;                                         (* *Point — points only to aggregates, never a scalar *)
 
-tuple_type   = "(" , [ type , { "," , type } ] , ")" ;               (* () unit  |  (Int32, Bool) — paren product, no trailing return type *)
-func_type    = "(" , [ type , { "," , type } ] , ")" , type ;        (* (Int32, Int32) Int32 — domain tuple then return; no names, no "->" *)
+tuple_type   = "(" , [ type , { "," , type } ] , ")" ;               (* () unit  |  (Int32, Bool) — paren product, no "->" return *)
+func_type    = "(" , [ type , { "," , type } ] , ")" , "->" , type ; (* (Int32, Int32) -> Int32 — domain, "->", return; no names *)
 
 bracket_type = "[" , [ fixed_array | array ] , "]" ;                 (* [] = empty dynamic array *)
 array        = type ;                                                (* [Int32]      — single type *)
@@ -101,32 +101,35 @@ function domain. The empty `()` is the **unit** type; a one-element `(T)` is jus
 `T` (a one-tuple is its element), so parens double as grouping with nothing to
 disambiguate.
 
-A **function type** is `(param types) return` — the parameter types in parens,
-then the return type, with **no names and no `->`** (that arrow belongs to a
-lambda _value_, not its type). A `(` at type position opens a **tuple type**
-unless a **return type follows** the matching `)`, which makes it a `func_type` —
-one token of lookahead after the `)` decides (`(A, B)` is a tuple, `(A, B) R` a
-function). The return type is **mandatory** in a function type — as with an
-`intrinsic`, nothing is implied; a function returning nothing writes `Unit` (or
-`()`). Because the return is itself a `type`, higher-order types nest naturally:
-`(Int32) (Int32) Int32` is a function returning a function, `((Int32) Int32,
-Int32) Int32` takes a function as its first parameter.
+A **function type** is `(param types) -> return` — the parameter types in parens,
+then `->`, then the return type, with **no parameter names**. The `->` is the same
+arrow a lambda value uses (Functions): it reads "maps to / yields", and a *type*
+yields its **return type** where a *value* yields its **body** — one meaning, two
+levels. A `(` at type position opens a **tuple type** unless **`->` follows** the
+matching `)`, which makes it a `func_type` — one token of lookahead after the `)`
+decides (`(A, B)` is a tuple, `(A, B) -> R` a function). The return type is
+**mandatory** in a function type — as with an `intrinsic`, nothing is implied; a
+function returning nothing writes `Unit` (or `()`). Because the return is itself a
+`type`, higher-order types nest — a function that **returns a function**
+parenthesizes the inner one (so the reader never has to guess how a chain of `->`
+associates): `(Int32) -> ((Int32) -> Int32)`; `((Int32) -> Int32, Int32) -> Int32`
+takes a function as its first parameter.
 
 > **Note.** There is no `&T` *type*. `&` is the **address-of operator** on a `let`
 > aggregate value (Expressions, `unary`), producing a `*T` to pass to a `*T`
 > parameter (see [[memory_model.md]]); the only pointer *type* is `*T`.
 
 ```
-type Sum      = (Int32, Int32) Int32     (* names a function type *)
-type Predicate['T] = ('T) Bool           (* generic function type *)
-type Thunk    = () Unit                   (* no params, returns nothing *)
-type Higher   = (Int32) (Int32) Int32     (* returns a function *)
+type Sum      = (Int32, Int32) -> Int32     (* names a function type *)
+type Predicate['T] = ('T) -> Bool           (* generic function type *)
+type Thunk    = () -> Unit                   (* no params, returns nothing *)
+type Higher   = (Int32) -> ((Int32) -> Int32)  (* returns a function — inner parenthesized *)
 ```
 
 A `func_type` is an ordinary `type`, so it composes everywhere one is expected —
-a `*(Int32) Int32` pointer-to-function, an `[(Int32) Int32]` array of them, a
-`Map[Str, (Int32) Int32]` generic argument, or a `let`/`const`/`param`/field
-annotation. Given `type Sum = (Int32, Int32) Int32`, a value of that type is a lambda
+a `*((Int32) -> Int32)` pointer-to-function, an `[(Int32) -> Int32]` array of them, a
+`Map[Str, (Int32) -> Int32]` generic argument, or a `let`/`const`/`param`/field
+annotation. Given `type Sum = (Int32, Int32) -> Int32`, a value of that type is a lambda
 whose parameter types come **from the annotation**, so they may be left off:
 
 ```
@@ -324,7 +327,7 @@ forks on its first token: a `{` opens a `record_body` — fields written
 **type-first** (`Int32 x`, the exact shape of a `param`) — and anything else is an
 ordinary `type`: a named type (`Int32`), a positional tuple type (`(Int32, Bool)`),
 the unit `()`, or a type variable (`'Value`). A leading `(` opens a tuple (or a
-function type, if a return type follows the `)`), by the same one-token lookahead
+function type, if `->` follows the `)`), by the same one-token lookahead
 as at type position.
 
 Examples:
@@ -848,14 +851,19 @@ a + b = 3             (* invalid — target is not an lvalue (semantic) *)
 
 A function is **not its own declaration form** — it is a `function` value (a
 lambda) bound by an ordinary `let`/`const`. A function is thus just a value that
-happens to be callable; `const add = (Int32 a, Int32 b) Int32 -> { return a + b }`
+happens to be callable; `const add = (Int32 a, Int32 b): Int32 -> { return a + b }`
 reuses `const_decl` wholesale. The lambda is
-`[generics] (params) [return] -> body`. The `!` that may end the _name_ is the
+`[generics] (params) [":" return] -> body`. The `->` **yields the body** (a value),
+exactly as the function *type*'s `->` yields its return type; when a lambda states
+its return type explicitly, that type is set off with a **colon** before the arrow
+(`(a): Int32 -> …`), so the single `->` never has to mean two things at once. The
+return type is usually inferred and omitted; state it (via `:`) where inference
+can't reach or where you want it documented. The `!` that may end the _name_ is the
 allocation-effect marker (see Identifiers and the memory model), part of the
 binding's name — not of the lambda.
 
 ```ebnf
-function       = [ generic_params ] , param_list , [ type ] , "->" , ( block | expression | asm_block ) ;   (* asm_block: see Assembly *)
+function       = [ generic_params ] , param_list , [ ":" , type ] , "->" , ( block | expression | asm_block ) ;   (* ":" return set off from the "->" body; asm_block: see Assembly *)
 
 generic_params = "[" , generic_param , { "," , generic_param } , "]" ;   (* ['T] | ['K, 'V] | [Uarch n, 'T] | [NonNegativeInteger 'V] *)
 generic_param  = type_var                                          (* 'T                    — unbounded type variable *)
@@ -878,14 +886,14 @@ const sum = (Int32 a, Int32 b) -> a + b              (* single-line body: implic
 const sum2 = (Int32 a, Int32 b) -> {                 (* block body: explicit return *)
   return a + b
 }
-const add = (Int32 a, Int32 b) Int32 -> { return a + b }   (* explicit return type *)
+const add = (Int32 a, Int32 b): Int32 -> { return a + b }  (* explicit return type, set off with ":" *)
 const noop = () -> {}                                 (* no params, inferred/none *)
 const alloc! = () -> {                                (* ! name: allocates residue *)
   const Point p = { x: 0, y: 0 }
   return p.x
 }
-const f = ['MyArg] ('MyArg a, 'MyArg b) 'MyArg -> {}  (* type var declared with ' *)
-const zeros = [Uarch n, 'T] () [n 'T] -> { }          (* value param n + type param 'T *)
+const f = ['MyArg] ('MyArg a, 'MyArg b): 'MyArg -> {} (* type var declared with ' *)
+const zeros = [Uarch n, 'T] (): [n 'T] -> { }         (* value param n + type param 'T *)
 const Sum sum = (a, b) -> a + b                       (* bare params: types come from the Sum annotation *)
 
 alloc!() in arena                                     (* call with in clause *)
@@ -898,15 +906,16 @@ Points:
 
 - **A param's type may be omitted** when it can be supplied from elsewhere —
   chiefly a function-type annotation on the binding (`const Sum sum = (a, b) -> …`,
-  where `Sum = (Int32, Int32) Int32` types `a` and `b`). A bare param is a lone
+  where `Sum = (Int32, Int32) -> Int32` types `a` and `b`). A bare param is a lone
   `var_name`; a typed one leads with a `type` (`Int32 x`) — cased apart the usual
   way, since a type starts uppercase, `'`, `*`, `&`, or `[` and a value name
   lowercase. A `record_pattern` param still requires its type (`ServerOptions { … }`).
   That every bare param's type is actually derivable is a semantic check; the
   grammar only permits the omission.
-- **Return type sits between the params and the arrow** (`(Int32 x) Int32 -> …`).
-  Omit it (`(Int32 x) -> …`) to infer it from the body — or for a function that
-  returns nothing. The `->` always immediately precedes the body.
+- **A stated return type is set off with `:` between the params and the arrow**
+  (`(Int32 x): Int32 -> …`). Omit it (`(Int32 x) -> …`) to infer it from the body —
+  or for a function that returns nothing. The `->` always immediately precedes the
+  body; the `:` return keeps it from colliding with the function *type*'s `->`.
 - **The body is a `block` or a single `expression`.** `-> a + b` is a
   single-line body whose value is the implicit return; `-> { … }` is a braced
   block that returns via `return`. So `(Int32 a, Int32 b) -> a + b` and
@@ -963,23 +972,22 @@ declaration is that floor. Users **see** them: they are ordinary top-level
 bindings that read like any function, minus the body.
 
 The shape reuses the binding skeleton one-for-one — swap `const` for
-`intrinsic`, keep the lambda signature, drop the `-> body`. The compiler fills
-what the `->` would have.
+`intrinsic` and give a **function-type signature** (`(params) -> return`) with no
+`-> body` after it. The compiler supplies the body.
 
 ```ebnf
 intrinsic_decl  = "intrinsic" , var_name , "=" , intrinsic_sig                  (* value intrinsic *)
                | "intrinsic" , "type" , type_name , [ "=" , constructor_sig ] ;  (* type-valued intrinsic + its constructor; nullary form omits "=" *)
-intrinsic_sig   = [ generic_params ] , param_list , type ;   (* lambda signature, no "->" body — the compiler supplies it *)
-constructor_sig = param_list , "->" , type ;                 (* a type's constructor: (Number value) -> Uint8 *)
+intrinsic_sig   = [ generic_params ] , param_list , "->" , type ;   (* a function-type signature, no body — the compiler supplies it *)
+constructor_sig = param_list , "->" , type ;                        (* a type's constructor: (Number value) -> Uint8 *)
 ```
 
 An `intrinsic` also names a **type the compiler supplies** — an `intrinsic type`
 whose optional `= constructor_sig` gives the type its cast/construction signature
 (`pub intrinsic type Uint8 = (Number value) -> Uint8`), and whose nullary form
 (no `=`) is a bare compiler singleton (`pub intrinsic type Infinity`). The name is
-PascalCase (a `type_name`), and — unlike a value intrinsic — the constructor RHS
-does carry the `->`, since it spells a constructor's shape rather than a bare
-signature.
+PascalCase (a `type_name`); the constructor RHS is an ordinary function-type
+signature (`(Number value) -> Uint8`), just like a value intrinsic's.
 
 The **return type is mandatory** — there is no body to infer from, and nothing
 is implied. A unit-returning intrinsic states it (`Unit`); the type is never omitted.
@@ -992,16 +1000,16 @@ An intrinsic is a **top-level** form only — it appears in `declaration`, never
 `statement`; there are no local intrinsics.
 
 ```
-pub intrinsic sizeof   = ['T]() Uarch                        (* generic, returns a count *)
-pub intrinsic popcount = (Uarch x) Uarch
-pub intrinsic copy!    = ['T](*'T dst, *'T src, Uarch n) Unit (* allocates; return stated *)
-intrinsic fence        = () Unit                             (* module-private *)
+pub intrinsic sizeof   = ['T]() -> Uarch                      (* generic, returns a count *)
+pub intrinsic popcount = (Uarch x) -> Uarch
+pub intrinsic copy!    = ['T](*'T dst, *'T src, Uarch n) -> Unit (* allocates; return stated *)
+intrinsic fence        = () -> Unit                           (* module-private *)
 
 pub intrinsic type Uint8 = (Number value) -> Uint8          (* a width type carrying its cast constructor *)
 pub intrinsic type Infinity                                 (* nullary compiler singleton — no constructor *)
 
-pub intrinsic bad      = (Uarch x)                           (* invalid — return type required *)
-pub intrinsic worse    = (Uarch x) Uarch -> x               (* invalid — intrinsics take no body *)
+pub intrinsic bad      = (Uarch x)                           (* invalid — return type required (needs `-> T`) *)
+pub intrinsic worse    = (Uarch x) -> Uarch -> x            (* invalid — the trailing `-> x` is a body; intrinsics take none *)
 ```
 
 ## Assembly
@@ -1059,7 +1067,7 @@ substitution), beside the QBE-lowered functions — not through QBE, which has n
 
 ```
 pub const syscall6 = (Uarch num, Uarch a0, Uarch a1, Uarch a2,
-                      Uarch a3, Uarch a4, Uarch a5) Uarch -> asm "
+                      Uarch a3, Uarch a4, Uarch a5): Uarch -> asm "
     mov x16, ${num}
     mov x0,  ${a0}
     mov x1,  ${a1}
@@ -1071,7 +1079,7 @@ pub const syscall6 = (Uarch num, Uarch a0, Uarch a1, Uarch a2,
     ret
 "
 
-pub const write = (Arch fd, *[Uint8] buf, Uarch n) Uarch ->  (* ordinary C! atop it *)
+pub const write = (Arch fd, *[Uint8] buf, Uarch n): Uarch ->  (* ordinary C! atop it *)
   syscall6(4, fd, buf, n, 0, 0, 0)
 ```
 

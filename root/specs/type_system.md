@@ -539,17 +539,18 @@ A function type is a **domain tuple followed by a return type**: `(A, B) R` — 
 applies `f` to the tuple `(a, b)`, so the function type and the call site share the
 parenthesized-tuple shape.
 
-- The **return type is mandatory in a function *type*** and is whatever follows the
-  domain group; a following type ⇒ function, none ⇒ the parentheses were just a
-  tuple (one token of lookahead after the `)`). A nullary function is `() R`
-  (domain unit); a unit-returning function is `(A) ()` — or `(A) Unit`, the
-  readable name (§2.3), to avoid the `() ()` reading.
-- A function **value** (lambda) still writes `(params) [Ret] -> body`; its return
-  type is inferred from the body and usually omitted (§5.1). Only `asm`/`intrinsic`
+- The **return type is mandatory in a function *type*** and follows a `->` after the
+  domain group; a following `->` ⇒ function, none ⇒ the parentheses were just a
+  tuple (one token of lookahead after the `)`). A nullary function is `() -> R`
+  (domain unit); a unit-returning function is `(A) -> ()` — or `(A) -> Unit`, the
+  readable name (§2.3).
+- A function **value** (lambda) still writes `(params) [: Ret] -> body`; its return
+  type is inferred from the body and usually omitted (§5.1), and — when stated — set
+  off with a colon so the `->` is unambiguously the body. Only `asm`/`intrinsic`
   functions, which have no body, must write the return type.
-- Function types **compose in type position** — `Map[Str, (Int32) Int32]` names a
+- Function types **compose in type position** — `Map[Str, (Int32) -> Int32]` names a
   comptime mapping whose value type is a function, and a generic bound `'F` may be a
-  function type. But there is **no runtime function pointer** — no `*(Int32) Int32`:
+  function type. But there is **no runtime function pointer** — no `*((Int32) -> Int32)`:
   functions are comptime-first-class and erased at specialize (§5.6), and §6.4 admits
   no pointer to a non-aggregate, so a function type is used at comptime (type argument,
   bound, comptime container), never as a runtime pointer referent.
