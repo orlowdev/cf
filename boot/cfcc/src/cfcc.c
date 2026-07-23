@@ -481,6 +481,7 @@ typedef enum {
 	EX_FIELD, /* record field access: base.name (lhs=base record expr) */
 	EX_RECORD,/* record construction: a data literal { f: v, ... } of type `name` */
 	EX_CALL,  /* function call: name(args) */
+	EX_CAST,  /* numeric cast Int(x)/Uarch(x) — a scalar conversion (lhs=operand, name=target type) */
 	EX_UMEMBER,/* union member value: Union.Member — a tag-only member's tag (uni, ival=tag) */
 	EX_MATCH, /* match scrut { arms } — compare-chain tag dispatch (lhs=scrut, arms/narms) */
 	EX_IF,    /* if cond then a else b (lhs=cond, rhs=then, els=else) */
@@ -1207,6 +1208,27 @@ static Expr *parse_primary(Parser *p, Func *fn) {
 		return e;
 	}
 	if (t->kind == TK_IDENT && is_type_ident(t)) {
+		/* A scalar type name applied to an argument is a numeric cast `Int(x)`/`Uarch(x)`
+		 * — "the cast is the constructor call `T(x)`" (type_system §4). cfcc has exactly
+		 * two scalar integer types, so a widen `Uarch(Int)` (sign-extend, exact) and a
+		 * narrow `Int(Uarch)` (truncate the low word) are the only casts. The written cast
+		 * licenses the loss, so no diagnostic — unlike cfcc's disclaimed *implicit* Int→Uarch
+		 * widening at call args, this is the spec-faithful explicit form cf0 keeps.
+		 * ⚠ cf0 must NOT inherit: cfcc REJECTS a narrowing under annotation (`const Int w =
+		 * <Uarch>`, via expect_int), forcing this explicit cast; type_system §4 instead treats
+		 * `const T x = v` as sugar for `const x = T(v)` and WARNS rather than forbids — cf0
+		 * should warn, not reject. */
+		if ((is_ident(t, "Int") || is_ident(t, "Uarch")) &&
+		    p->toks[p->pos + 1].kind == TK_LPAREN) {
+			Expr *e = new_expr(EX_CAST);
+			e->line = t->line;
+			tok_copy(t, e->name, sizeof e->name); /* target type: "Int" or "Uarch" */
+			advance(p); /* type name */
+			advance(p); /* ( */
+			e->lhs = parse_expr(p, fn);
+			expect(p, TK_RPAREN, "expected `)` to close the cast");
+			return e;
+		}
 		/* A PascalCase name in value position is a union member value `Union.Member` or
 		 * `Union[Args].Member` (G3b: a generic union is applied before the member is
 		 * selected). A bare type name is not itself a value. */
@@ -3162,6 +3184,14 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 					die(e->line, "non-exhaustive match (cover every union member or add a `_` arm)");
 		return rt;
 	}
+	case EX_CAST: {
+		/* A numeric cast converts between the two scalar integer types; its operand must
+		 * itself be a scalar (no pointer↔integer conversion, type_system §4). */
+		Type at = typeof_expr(prog, fn, e->lhs);
+		if (at.kind != TY_INT && at.kind != TY_UARCH)
+			die(e->line, "a numeric cast `Int(x)`/`Uarch(x)` takes a scalar integer value");
+		return (Type){strcmp(e->name, "Uarch") == 0 ? TY_UARCH : TY_INT, NULL, NULL};
+	}
 	case EX_IF:
 		expect_int(prog, fn, e->lhs); /* condition */
 		expect_int(prog, fn, e->rhs); /* then — M0 if-branches are Int */
@@ -3672,6 +3702,24 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		for (int i = 0; i < e->nargs; i++)
 			fprintf(out, "%s%c %%t%d", i ? ", " : "", argw[i], argt[i]);
 		fprintf(out, ")\n");
+		snprintf(dst, cap, "%%t%d", r);
+		return;
+	}
+	case EX_CAST: {
+		/* Convert a scalar between word (`Int`) and register-width (`Uarch`) form. Widen
+		 * `Uarch(w)` = sign-extend `extsw` (exact); narrow `Int(l)` = `w copy` (truncates
+		 * the low word, verified). An Int→Int / Uarch→Uarch cast is an identity copy. */
+		char op[96];
+		emit_expr(out, e->lhs, ex, op, sizeof op);
+		int src_word = e->lhs->rtype.kind == TY_INT;
+		int dst_word = e->rtype.kind == TY_INT;
+		int r = ex->tmp++;
+		if (dst_word == src_word)
+			fprintf(out, "\t%%t%d =%c copy %s\n", r, dst_word ? 'w' : 'l', op);
+		else if (dst_word) /* Uarch → Int: truncate */
+			fprintf(out, "\t%%t%d =w copy %s\n", r, op);
+		else /* Int → Uarch: sign-extend to register width */
+			fprintf(out, "\t%%t%d =l extsw %s\n", r, op);
 		snprintf(dst, cap, "%%t%d", r);
 		return;
 	}
