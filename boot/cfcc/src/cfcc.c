@@ -661,6 +661,7 @@ struct Expr {
 	int is_fnref;
 	int indirect;
 	int fn_arity; /* EX_VAR of TY_FN: the function value's Int-parameter count (for arg checks) */
+	int hof_specialized; /* EX_CALL: this HOF call has been specialized for its capturing-closure args */
 };
 
 static Expr *new_expr(ExprKind kind) {
@@ -3614,6 +3615,181 @@ static void monomorphize(Program *prog) {
 	}
 }
 
+/* ---- fake-closure specialization (HOF v2) ------------------------------------
+ * A capturing closure has no runtime value (memory_model §7), so when one is passed
+ * to a higher-order function it cannot ride a code pointer like a capture-free value
+ * (HOF v1). Instead the callee is SPECIALIZED per closure: a clone of the HOF whose
+ * function-value parameter is replaced by leading hidden parameters carrying the
+ * closure's captures, and whose `f(…)` calls retarget to the closure's lifted body.
+ * The call site drops the closure argument and threads the captures' addresses. This
+ * runs as its own pass on pristine (un-typechecked) bodies, before typecheck. */
+
+/* Specialize `callee` for the capturing-closure arguments of call `e` (made in `fn`).
+ * Rewrites `e` in place (retargets to the clone, threads capture args). A no-op when no
+ * argument is a capturing closure — those stay v1 function pointers. */
+static void specialize_hof(Program *prog, Func *fn, Expr *e, Func *callee) {
+	if (e->nargs != callee->nparams)
+		return; /* arity error — let typecheck report it */
+	int spec[MAX_PARAMS];       /* per param: fn->closures index of a capturing-closure arg, else -1 */
+	int any = 0;
+	for (int i = 0; i < callee->nparams; i++) {
+		spec[i] = -1;
+		if (callee->params[i].kind != PK_FN || e->args[i]->kind != EX_VAR)
+			continue;
+		int ci = func_find_closure(fn, e->args[i]->name);
+		if (ci >= 0 && fn->closures[ci].ncaps > 0) { /* a CAPTURING closure — capture-free stays a pointer */
+			/* Validate the closure's signature against the function-type parameter, here
+			 * where the error can point at the call (the specialized clone would otherwise
+			 * fail deeper, with a confusing message). */
+			Func *lifted = fn->closures[ci].lifted;
+			int nc = fn->closures[ci].ncaps;
+			if (lifted->nparams - nc != callee->params[i].fn_arity)
+				die(e->line, "the closure has the wrong number of parameters for this function-type argument");
+			for (int j = nc; j < lifted->nparams; j++)
+				if (lifted->params[j].kind != PK_WORD)
+					die(e->line, "a closure passed as a function value must take only `Int` parameters (M0)");
+			if (lifted->ret_type_name[0])
+				die(e->line, "a closure passed as a function value must return `Int` (M0)");
+			spec[i] = ci;
+			any = 1;
+		}
+	}
+	if (!any)
+		return;
+
+	/* Clone name: <callee>$<lifted-closure per specialized param>. */
+	char key[256];
+	int n = snprintf(key, sizeof key, "%s", callee->name);
+	for (int i = 0; i < callee->nparams; i++)
+		if (spec[i] >= 0) {
+			if (n < 0 || (size_t)n >= sizeof key)
+				die(e->line, "HOF specialization name too long");
+			n += snprintf(key + n, sizeof key - (size_t)n, "$%s", fn->closures[spec[i]].lifted->name);
+		}
+	if (n < 0 || (size_t)n >= sizeof ((Func *)0)->name)
+		die(e->line, "HOF specialization name too long");
+
+	Func *clone = prog_find_func(prog, key);
+	if (!clone) {
+		clone = new_func();
+		*clone = *callee; /* params/closures arrays (by value), ret fields, flags */
+		snprintf(clone->name, sizeof clone->name, "%s", key);
+		clone->is_pub = 0;
+		clone->nabinds = 0;
+		clone->next_bind_id = 0;
+		clone->ret_rec = NULL;
+		clone->ret_uni = NULL;
+		if (callee->nlocals) {
+			clone->locals = xmalloc((size_t)callee->cap_locals * sizeof *clone->locals);
+			memcpy(clone->locals, callee->locals, (size_t)callee->nlocals * sizeof *clone->locals);
+		} else {
+			clone->locals = NULL;
+			clone->cap_locals = 0;
+		}
+		clone->body = clone_stmt(callee->body);
+		/* Rebuild params: [each specialized closure's captures, renamed uniquely] ++
+		 * [callee params minus the specialized PK_FN ones]. Register the specialized
+		 * function parameter as a closure binding so its `f(…)` calls retarget. */
+		Param np[MAX_PARAMS];
+		int nn = 0, capctr = 0;
+		for (int i = 0; i < callee->nparams; i++) {
+			if (spec[i] < 0)
+				continue;
+			Func *lifted = fn->closures[spec[i]].lifted;
+			int ncaps = fn->closures[spec[i]].ncaps;
+			if (clone->nclosures >= MAX_CLOSURES)
+				die(e->line, "too many specialized closures");
+			int k = clone->nclosures++;
+			snprintf(clone->closures[k].name, sizeof clone->closures[k].name, "%s", callee->params[i].name);
+			clone->closures[k].lifted = lifted;
+			clone->closures[k].ncaps = ncaps;
+			for (int j = 0; j < ncaps; j++) {
+				if (nn >= MAX_PARAMS)
+					die(e->line, "too many threaded captures after specialization");
+				np[nn] = lifted->params[j]; /* PK_CAPTURE/PK_CAPTURE_REC, kind+type_name copied */
+				snprintf(np[nn].name, sizeof np[nn].name, "__hcap%d", capctr);
+				snprintf(clone->closures[k].caps[j], 64, "__hcap%d", capctr);
+				capctr++;
+				nn++;
+			}
+		}
+		for (int i = 0; i < callee->nparams; i++)
+			if (spec[i] < 0) {
+				if (nn >= MAX_PARAMS)
+					die(e->line, "too many parameters after specialization");
+				np[nn++] = callee->params[i];
+			}
+		clone->nparams = nn;
+		memcpy(clone->params, np, sizeof(Param) * (size_t)nn);
+		prog_add_func(prog, clone);
+	}
+
+	/* Retarget the call: [each specialized closure's capture variables] ++ [kept args]. */
+	int total = 0;
+	for (int i = 0; i < callee->nparams; i++)
+		total += spec[i] >= 0 ? fn->closures[spec[i]].ncaps : 1;
+	Expr **na = xmalloc((size_t)total * sizeof *na);
+	int idx = 0;
+	for (int i = 0; i < callee->nparams; i++)
+		if (spec[i] >= 0)
+			for (int j = 0; j < fn->closures[spec[i]].ncaps; j++) {
+				Expr *cv = new_expr(EX_VAR);
+				cv->line = e->line;
+				snprintf(cv->name, sizeof cv->name, "%s", fn->closures[spec[i]].caps[j]);
+				na[idx++] = cv;
+			}
+	for (int i = 0; i < callee->nparams; i++)
+		if (spec[i] < 0)
+			na[idx++] = e->args[i];
+	e->args = na;
+	e->nargs = total;
+	snprintf(e->name, sizeof e->name, "%s", clone->name);
+	e->hof_specialized = 1;
+}
+
+static void specialize_calls_stmt(Program *prog, Func *fn, Stmt *s);
+
+static void specialize_calls_expr(Program *prog, Func *fn, Expr *e) {
+	if (!e)
+		return;
+	if (e->kind == EX_CALL && !e->hof_specialized) {
+		Func *callee = prog_find_func(prog, e->name);
+		if (callee && callee->ntyparams == 0)
+			for (int i = 0; i < callee->nparams; i++)
+				if (callee->params[i].kind == PK_FN) {
+					specialize_hof(prog, fn, e, callee);
+					break;
+				}
+	}
+	specialize_calls_expr(prog, fn, e->lhs);
+	specialize_calls_expr(prog, fn, e->rhs);
+	specialize_calls_expr(prog, fn, e->els);
+	for (int i = 0; i < e->nargs; i++)
+		specialize_calls_expr(prog, fn, e->args[i]);
+	for (int i = 0; i < e->nfields; i++)
+		specialize_calls_expr(prog, fn, e->fvals[i]);
+	for (int i = 0; i < e->narms; i++)
+		specialize_calls_expr(prog, fn, e->arms[i].body);
+}
+
+static void specialize_calls_stmt(Program *prog, Func *fn, Stmt *s) {
+	for (; s; s = s->next) {
+		specialize_calls_expr(prog, fn, s->expr);
+		specialize_calls_stmt(prog, fn, s->body); /* loop / defer-block bodies */
+	}
+}
+
+/* Specialize every higher-order call in the program. Clones append to prog->funcs and are
+ * reached by the growing loop bound, so a specialized clone that itself passes a captured
+ * closure onward (a HOF calling a HOF) is specialized in turn (the fake-closure fixpoint). */
+static void specialize_hofs(Program *prog) {
+	for (int i = 0; i < prog->nfuncs; i++) {
+		Func *fn = prog->funcs[i];
+		if (fn->ntyparams == 0 && !fn->is_asm)
+			specialize_calls_stmt(prog, fn, fn->body);
+	}
+}
+
 /* ------------------------------------------------------------- typecheck - */
 
 static Type typeof_expr(Program *prog, Func *fn, Expr *e);
@@ -5369,6 +5545,7 @@ int main(int argc, char **argv) {
 	Program prog = {0};
 	parse(&ps, &prog);
 	monomorphize(&prog); /* specialize generic calls before the concrete passes */
+	specialize_hofs(&prog); /* fake-closure specialization: capturing closures → hidden params */
 	typecheck(&prog);
 
 	/* Default artifact: ./out/<stem>. */
