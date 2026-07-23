@@ -562,6 +562,9 @@ typedef enum {
 	            * callable argument, an `l` code pointer. Called indirectly inside the body;
 	            * the caller passes a capture-free function's address. `fn_arity` is its Int
 	            * parameter count. */
+	PK_TUPLE,  /* a tuple parameter `(T0, …) name` -> l (a pointer to the caller's arena tuple,
+	            * like a record). Read-only in the body, indexed at comptime `name[k]`. Its shape
+	            * rides on `tup` (resolved from `tuple_types`/`tuple_n` in resolve_signatures). */
 } ParamKind;
 
 typedef struct {
@@ -572,6 +575,11 @@ typedef struct {
 	DataDecl *rec;      /* PK_RECORD: the resolved declaration */
 	UnionDecl *uni;     /* PK_UNION: the resolved declaration */
 	int fn_arity;       /* PK_FN: the function type's Int-parameter count */
+	/* PK_TUPLE: the element type NAMES (heap array, shared read-only on a generic clone) and
+	 * count, interned to `tup` in resolve_signatures. */
+	char (*tuple_types)[64];
+	int tuple_n;
+	TupleDecl *tup;
 } Param;
 
 /* Expression AST. M0 expressions are word-valued: literals, references to a
@@ -1143,6 +1151,27 @@ static Type resolve_member_type(Program *prog, const char *name, int line) {
 	die(line, msg);
 }
 
+/* Resolve a tuple shape from its element type NAMES and intern it. Elements are Int, Str,
+ * or a record type (cfcc brick 1 — matching a tuple value's elements). Shared by tuple
+ * parameter and tuple return-type resolution. */
+static TupleDecl *resolve_tuple_shape(Program *prog, char names[][64], int n, int line) {
+	Type elems[MAX_FIELDS];
+	for (int j = 0; j < n; j++) {
+		const char *tn = names[j];
+		if (strcmp(tn, "Int") == 0) {
+			elems[j] = (Type){TY_INT, NULL, NULL, 0, NULL};
+		} else if (strcmp(tn, "Str") == 0) {
+			elems[j] = (Type){TY_STR, NULL, NULL, 0, NULL};
+		} else {
+			DataDecl *d = prog_find_data(prog, tn);
+			if (!d)
+				die(line, "a tuple element is Int, Str, or a record type");
+			elems[j] = (Type){TY_RECORD, d, NULL, 0, NULL};
+		}
+	}
+	return prog_intern_tuple(prog, elems, n);
+}
+
 /* The Type of record field `idx` / union member `tag` payload field `fieldidx`. */
 static Type data_field_type(Program *prog, const DataDecl *d, int idx) {
 	return resolve_member_type(prog, d->field_types[idx], 0);
@@ -1166,6 +1195,7 @@ static Resolution resolve_name(Func *fn, const char *name, Type *ty) {
 	for (int i = 0; i < fn->nparams; i++)
 		if (strcmp(fn->params[i].name, name) == 0) {
 			ty->uni = NULL;
+			ty->tup = NULL;
 			switch (fn->params[i].kind) {
 			case PK_WORD:    ty->kind = TY_INT;    ty->rec = NULL; break;
 			case PK_RECORD:  ty->kind = TY_RECORD; ty->rec = fn->params[i].rec; break;
@@ -1176,6 +1206,7 @@ static Resolution resolve_name(Func *fn, const char *name, Type *ty) {
 			case PK_CAPTURE: ty->kind = TY_INT;    ty->rec = NULL; return R_LET; /* a by-ref word: readable AND writable */
 			case PK_CAPTURE_REC: ty->kind = TY_RECORD; ty->rec = fn->params[i].rec; return R_LET; /* a by-ref record: fields mutable */
 			case PK_FN:      ty->kind = TY_FN; ty->rec = NULL; break; /* a function value (arity on the Param) */
+			case PK_TUPLE:   ty->kind = TY_TUPLE; ty->rec = NULL; ty->tup = fn->params[i].tup; break; /* by pointer, read-only */
 			}
 			return R_PARAM;
 		}
@@ -1326,6 +1357,56 @@ static void parse_param_type(Parser *p, Param *out) {
 	Token *t = peek(p);
 	out->line = t->line;
 	if (t->kind == TK_LPAREN) {
+		/* A leading `(` at type position opens EITHER a function type `(Int, …) -> Int` OR a
+		 * tuple type `(T0, …)` — the `->` after the matching `)` decides (ebnf § Types). Scan
+		 * the balanced parens and peek past the close for `->`. */
+		int is_fn = 0;
+		{
+			int depth = 0;
+			for (size_t i = p->pos;; i++) {
+				TokKind k = p->toks[i].kind;
+				if (k == TK_EOF)
+					die(t->line, "unterminated `(` in a parameter type");
+				if (k == TK_LPAREN) {
+					depth++;
+				} else if (k == TK_RPAREN && --depth == 0) {
+					is_fn = p->toks[i + 1].kind == TK_ARROW;
+					break;
+				}
+			}
+		}
+		if (!is_fn) {
+			/* A tuple parameter type `(T0, …, Tn-1)` — a heterogeneous product passed by
+			 * pointer (like a record). Elements are Int, Str, or a record type (brick 1);
+			 * resolved + interned in resolve_signatures. */
+			advance(p); /* ( */
+			int cap = 4;
+			out->tuple_types = xmalloc(cap * sizeof *out->tuple_types);
+			for (;;) {
+				Token *et = peek(p);
+				if (is_tyvar(et))
+					die(et->line, "a generic element in a tuple parameter is a later brick");
+				if (!is_type_ident(et))
+					die(et->line, "a tuple parameter lists element types (`(Int, Str) p`)");
+				if (out->tuple_n == cap) {
+					cap *= 2;
+					out->tuple_types = realloc(out->tuple_types, cap * sizeof *out->tuple_types);
+					if (!out->tuple_types)
+						die(0, "out of memory");
+				}
+				parse_type_arg(p, out->tuple_types[out->tuple_n++], sizeof out->tuple_types[0]);
+				if (peek(p)->kind == TK_COMMA) {
+					advance(p);
+					continue;
+				}
+				break;
+			}
+			expect(p, TK_RPAREN, "expected `)` to close the tuple parameter type");
+			if (out->tuple_n < 2)
+				die(t->line, "a tuple type needs at least two elements");
+			out->kind = PK_TUPLE;
+			return;
+		}
 		/* A function type `(Int, …) -> Int` — a higher-order function's callable parameter.
 		 * The `->` separates the return type (as in a bare function type); cfcc restricts it
 		 * to all-`Int` params and an `Int` return (enough for HOFs over Int; cf0 takes the
@@ -4166,6 +4247,7 @@ static const char *shallow_type_name(Program *prog, Func *fn, Expr *e) {
 				case PK_CAPTURE: return "Int"; /* a captured word */
 				case PK_CAPTURE_REC: return fn->params[i].type_name; /* a captured record */
 				case PK_FN: return ""; /* a function value — no simple nominal type name */
+				case PK_TUPLE: return ""; /* a structural tuple — no nominal name to infer from */
 				}
 			}
 		for (int i = 0; i < fn->nlocals; i++)
@@ -4820,6 +4902,15 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 				if (e->args[i]->fn_arity != pm->fn_arity)
 					die(e->line, "argument type mismatch (the function value has the wrong number of parameters)");
 				break;
+			case PK_TUPLE:
+				/* A tuple argument: a tuple of the SAME shape, passed by pointer. cfcc tuples
+				 * are immutable and the parameter is read-only, so aliasing the caller's tuple
+				 * is sound (no freshness rule, unlike a mutable record field). */
+				if (at.kind != TY_TUPLE)
+					die(e->line, "argument type mismatch (a tuple parameter expects a tuple)");
+				if (!types_equal(at, (Type){TY_TUPLE, NULL, NULL, 0, pm->tup}))
+					die(e->line, "argument type mismatch (tuple shape differs)");
+				break;
 			}
 		}
 		e->callee = callee; /* cached for emit (per-arg register width, Int→Uarch widen) */
@@ -5406,25 +5497,12 @@ static void resolve_signatures(Program *prog) {
 				fn->ret_rec = d;
 			}
 		}
-		if (fn->ret_tuple_n > 0) {
-			/* A tuple return type: resolve each element name (Int/Str/record) to a Type and
-			 * intern the shape, so a returned tuple is checked against it structurally. */
-			Type elems[MAX_FIELDS];
-			for (int j = 0; j < fn->ret_tuple_n; j++) {
-				const char *tn = fn->ret_tuple_types[j];
-				if (strcmp(tn, "Int") == 0) {
-					elems[j] = (Type){TY_INT, NULL, NULL, 0, NULL};
-				} else if (strcmp(tn, "Str") == 0) {
-					elems[j] = (Type){TY_STR, NULL, NULL, 0, NULL};
-				} else {
-					DataDecl *d = prog_find_data(prog, tn);
-					if (!d)
-						die(fn->ret_line, "a tuple return element is Int, Str, or a record type");
-					elems[j] = (Type){TY_RECORD, d, NULL, 0, NULL};
-				}
-			}
-			fn->ret_tup = prog_intern_tuple(prog, elems, fn->ret_tuple_n);
-		}
+		if (fn->ret_tuple_n > 0) /* a tuple return type: resolve + intern its shape */
+			fn->ret_tup = resolve_tuple_shape(prog, fn->ret_tuple_types, fn->ret_tuple_n, fn->ret_line);
+		for (int j = 0; j < fn->nparams; j++) /* a tuple parameter: resolve + intern its shape */
+			if (fn->params[j].kind == PK_TUPLE)
+				fn->params[j].tup = resolve_tuple_shape(prog, fn->params[j].tuple_types,
+				                                         fn->params[j].tuple_n, fn->params[j].line);
 	}
 }
 
@@ -6460,10 +6538,11 @@ static void emit_func(FILE *out, const Func *fn) {
 			fprintf(out, "\t%%s_%s =l alloc4 4\n", n);
 			fprintf(out, "\tstorew %%u_%s, %%s_%s\n", n, n);
 		} else if (fn->params[i].kind == PK_RECORD || fn->params[i].kind == PK_CAPTURE_REC ||
+		           fn->params[i].kind == PK_TUPLE ||
 		           (fn->params[i].kind == PK_UNION && fn->params[i].uni->has_payload)) {
-			/* A record, captured-record, or boxed-union param arrives as an arena pointer,
-			 * copied into the `%r_<name>` form field access uses. A captured record aliases
-			 * the enclosing scope's storage, so field writes there are visible to it. */
+			/* A record, captured-record, tuple, or boxed-union param arrives as an arena
+			 * pointer, copied into the `%r_<name>` form field/index access uses. A captured
+			 * record aliases the enclosing scope's storage, so field writes there are visible. */
 			fprintf(out, "\t%%r_%s =l copy %%u_%s\n", n, n);
 		}
 	}
