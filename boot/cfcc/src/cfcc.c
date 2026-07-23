@@ -1537,11 +1537,31 @@ static Expr *parse_primary(Parser *p, Func *fn) {
 			expect(p, TK_RPAREN, "expected `)` to close the cast");
 			return e;
 		}
-		/* A PascalCase name in value position is a union member value `Union.Member` or
-		 * `Union[Args].Member` (G3b: a generic union is applied before the member is
-		 * selected). A bare type name is not itself a value. */
 		if (t->text[t->len - 1] == '!')
 			die(t->line, "M0 does not support `!` in a type name");
+		/* A record type name applied to a `{ … }` payload is record CONSTRUCTION —
+		 * `Point({ x: 1, y: 2 })` — construction-is-application (type_system §6.6/§7.3;
+		 * the construction mirrors the named-field declaration). The bare context-typed
+		 * `{ … }` literal is sugar for exactly this. A PascalCase name directly followed by
+		 * `(` (no `.`, not a scalar cast) can only be this — a union value needs `Union.Member`,
+		 * a cast is Int/Uarch. ⚠ cf0 must NOT inherit: cfcc has only named-field records, so
+		 * the payload is a `{ … }` record literal — positional `Point(1, 2)` (from a tuple decl
+		 * `data Point = (Int, Int)`) needs tuples, which cfcc lacks (a later brick). Generic
+		 * `Box[Int]({ … })` is deferred too (use the sugar `const Box[Int] b = { … }`). */
+		if (p->toks[p->pos + 1].kind == TK_LPAREN) {
+			char rname[64];
+			tok_copy(t, rname, sizeof rname); /* the record type name */
+			advance(p); /* type name */
+			advance(p); /* ( */
+			if (peek(p)->kind != TK_LBRACE)
+				die(peek(p)->line, "record construction takes a `{ … }` payload, e.g. `Point({ x: 1, y: 2 })`");
+			Expr *e = parse_data_literal(p, fn, rname, t->line); /* EX_RECORD, name = rname */
+			expect(p, TK_RPAREN, "expected `)` to close the record construction");
+			return e;
+		}
+		/* Otherwise a PascalCase name in value position is a union member value
+		 * `Union.Member` or `Union[Args].Member` (G3b: a generic union is applied before
+		 * the member is selected). A bare type name is not itself a value. */
 		Expr *e = new_expr(EX_UMEMBER);
 		e->line = t->line;
 		parse_type_arg(p, e->name, sizeof e->name); /* union type name (mangled if generic) */
@@ -4131,6 +4151,7 @@ static void specialize_hofs(Program *prog) {
 
 static Type typeof_expr(Program *prog, Func *fn, Expr *e);
 static Type func_ret_type(const Func *fn);
+static void resolve_record_literal(Program *prog, Func *fn, Expr *e, DataDecl *d);
 
 /* Require that `e` yields an Int. A record is legal only as a field-access base
  * and a pointer never, so wherever an Int is expected this rejects them both. */
@@ -4281,6 +4302,17 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		return t;
 	}
 	case EX_RECORD:
+		if (e->name[0]) {
+			/* Explicit construction `Point({…})`: the literal names its own record type.
+			 * Resolve once (idempotent — typeof may be called repeatedly) and yield it. */
+			if (!e->rec) {
+				DataDecl *d = prog_find_data(prog, e->name);
+				if (!d)
+					die(e->line, "unknown record type in construction");
+				resolve_record_literal(prog, fn, e, d);
+			}
+			return e->rtype;
+		}
 		/* An unresolved bare `{…}` reached here with no type context to construct from —
 		 * the literal is sugar for `Type({…})`, and there is no `Type`. Only a record
 		 * binding annotation or a record return type supplies it. */
@@ -4567,6 +4599,17 @@ static void set_local_rec(Func *fn, const char *name, DataDecl *d) {
 		}
 }
 
+/* Retype a local (parsed provisionally as a word `Int`) to a record — for an inferred
+ * binding `const p = Point({…})` whose type comes from the constructor, not an annotation. */
+static void set_local_record_type(Func *fn, const char *name, DataDecl *d) {
+	for (int i = 0; i < fn->nlocals; i++)
+		if (strcmp(fn->locals[i].name, name) == 0) {
+			fn->locals[i].type = (Type){TY_RECORD, d, NULL, 0};
+			snprintf(fn->locals[i].type_name, sizeof fn->locals[i].type_name, "%s", d->name);
+			return;
+		}
+}
+
 /* Retype a local (parsed provisionally as a nominal `TY_RECORD`) to the union it was
  * annotated with — a tag-only union value is a word, so this only carries the union
  * identity for `match`. */
@@ -4646,10 +4689,13 @@ static void resolve_record_literal(Program *prog, Func *fn, Expr *e, DataDecl *d
 /* The annotated binding path: `const Point p = { … }`. The literal's type is named by
  * the annotation (e->name); resolve it, then backfill the local's record type. */
 static void resolve_record_binding(Program *prog, Func *fn, Stmt *s) {
-	Expr *e = s->expr; /* EX_RECORD; e->name is the literal's type name (from the annotation) */
-	/* A parenthesized literal `const Point p = ({…})` reaches here as an UNANNOTATED
-	 * literal (name==""); fall back to the binding's annotation so it resolves like the
-	 * bare `const Point p = {…}` form rather than dying "unknown data type". */
+	Expr *e = s->expr; /* EX_RECORD; e->name is the literal's own type name, or "" */
+	/* A bare/parenthesized literal `const Point p = {…}` / `= ({…})` reaches here
+	 * UNANNOTATED (name==""); fall back to the binding's annotation. An explicit
+	 * construction `const Point p = Point({…})` carries its own name, which must then
+	 * agree with the annotation. */
+	if (e->name[0] && s->type_name[0] && strcmp(e->name, s->type_name) != 0)
+		die(e->line, "constructed record type does not match the binding annotation");
 	const char *tn = e->name[0] ? e->name : s->type_name;
 	DataDecl *d = prog_find_data(prog, tn);
 	if (!d)
@@ -4717,6 +4763,11 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 				Type it = typeof_expr(prog, fn, s->expr); /* checks each element is Int; sets alen */
 				if (it.alen != dt.alen)
 					die(s->line, "array literal length does not match the `[N Int]` annotation");
+			} else if (s->expr->kind == EX_RECORD && s->expr->name[0]) {
+				/* `const p = Point({…})` — an explicit construction infers the record type
+				 * from the constructor (no annotation needed; the local was parsed as a word). */
+				Type it = typeof_expr(prog, fn, s->expr);
+				set_local_record_type(fn, s->name, it.rec);
 			} else {
 				expect_int(prog, fn, s->expr);                /* a word local */
 			}
@@ -4751,9 +4802,11 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 			 * another call's result), which the arena keeps alive past the frame. */
 			Type rt = func_ret_type(fn);
 			if (rt.kind == TY_RECORD) {
-				if (s->expr->kind == EX_RECORD) {
-					/* A directly-returned record literal (`-> ({…})`) adopts the return
-					 * type. A fresh arena alloc that escapes via return — copy-free, sound. */
+				if (s->expr->kind == EX_RECORD && !s->expr->name[0]) {
+					/* An UNANNOTATED directly-returned literal (`-> ({…})`) adopts the
+					 * return type (the sugar for `RetType({…})`). A fresh arena alloc that
+					 * escapes via return — copy-free, sound. An explicit `Point({…})` (name
+					 * set) instead types normally below and must match the return type. */
 					resolve_record_literal(prog, fn, s->expr, rt.rec);
 					break;
 				}
