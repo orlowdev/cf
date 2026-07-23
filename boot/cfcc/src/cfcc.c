@@ -1140,9 +1140,33 @@ static void prog_add_union(Program *prog, UnionDecl *u) {
 /* Resolve a concrete field/payload type name to a Type (G3a): "Int" or an aggregate
  * (a `data` record or a `union`). A record and a boxed union are pointer-repr; an Int
  * and a tag-only union are word-repr (see type_is_word). Dies if the name is unknown. */
+static TupleDecl *resolve_tuple_shape(Program *prog, char names[][64], int n, int line); /* forward */
+
 static Type resolve_member_type(Program *prog, const char *name, int line) {
 	if (strcmp(name, "Int") == 0)
 		return (Type){TY_INT, NULL, NULL, 0, NULL};
+	if (name[0] == '(') {
+		/* A tuple field/payload type stored as `(T0,T1,…)` (parse_member_type): split the
+		 * element names on `,` and intern the shape. */
+		char names[MAX_FIELDS][64];
+		int n = 0, k = 0;
+		for (const char *s = name + 1; *s && *s != ')'; s++) {
+			if (*s == ',') {
+				names[n][k] = '\0';
+				n++;
+				k = 0;
+				if (n == MAX_FIELDS)
+					die(line, "tuple type has too many elements");
+			} else {
+				if (k == 63)
+					die(line, "tuple element type name too long");
+				names[n][k++] = *s;
+			}
+		}
+		names[n][k] = '\0';
+		n++;
+		return (Type){TY_TUPLE, NULL, NULL, 0, resolve_tuple_shape(prog, names, n, line)};
+	}
 	UnionDecl *u = prog_find_union(prog, name);
 	if (u)
 		return (Type){TY_UNION, NULL, u, 0, NULL};
@@ -3402,6 +3426,44 @@ static void parse_member_type(Parser *p, char *out, size_t cap) {
 		die(t->line, "a field/payload type is `Int`, an aggregate, or `'T`, not a pointer");
 	if (t->kind == TK_LBRACKET)
 		die(t->line, "a field/payload type is `Int`, an aggregate, or `'T`, not an array/buffer");
+	if (t->kind == TK_LPAREN) {
+		/* A tuple field/payload type `(T0, …)`. Stored canonically as `(T0,T1,…)` (no spaces);
+		 * resolve_member_type interns it. Elements are Int, Str, or a record type (brick 1) —
+		 * a generic `'T` element or a nested tuple is a later brick. The `(…)` form has no `.`,
+		 * so it passes opaquely through the generic mangle/concretize machinery. */
+		advance(p); /* ( */
+		int off = 0, n = 0;
+		off += snprintf(out + off, cap - (size_t)off, "(");
+		for (;;) {
+			Token *et = peek(p);
+			if (et->kind == TK_LPAREN)
+				die(et->line, "a nested tuple element type is a later brick");
+			if (is_tyvar(et))
+				die(et->line, "a generic element in a tuple field type is a later brick");
+			if (!is_type_ident(et))
+				die(et->line, "a tuple field type lists element types (`(Int, Str)`)");
+			char el[64];
+			parse_type_arg(p, el, sizeof el);
+			int w = snprintf(out + off, cap - (size_t)off, "%s%s", n ? "," : "", el);
+			if (w < 0 || (size_t)(off + w) >= cap)
+				die(et->line, "tuple field type too long");
+			off += w;
+			n++;
+			if (peek(p)->kind == TK_COMMA) {
+				advance(p);
+				continue;
+			}
+			break;
+		}
+		expect(p, TK_RPAREN, "expected `)` to close the tuple field type");
+		if (n < 2)
+			die(t->line, "a tuple type needs at least two elements");
+		if ((size_t)(off + 1) >= cap)
+			die(t->line, "tuple field type too long");
+		out[off++] = ')';
+		out[off] = '\0';
+		return;
+	}
 	parse_type_arg(p, out, cap);
 	if (strcmp(out, "Uarch") == 0 || strcmp(out, "Str") == 0)
 		die(t->line, "a field/payload type is `Int`, an aggregate, or `'T` (not Uarch/Str)");
@@ -4636,6 +4698,11 @@ static void check_member_value(Program *prog, Func *fn, Expr *val, Type want, in
 		 * must NOT inherit this — it rehomes/copies an aggregate payload like any aggregate
 		 * (memory_model §6); the bare-union-var alias is a genesis shortcut leaning on M0
 		 * union immutability. */
+	} else if (want.kind == TY_TUPLE) {
+		/* A tuple field/payload of a matching shape. A tuple is immutable, so a bare tuple
+		 * variable may alias here (like a union) — no freshness rule needed. */
+		if (at.kind != TY_TUPLE || !types_equal(at, want))
+			die(line, "field/payload type mismatch (tuple shape differs)");
 	} else {
 		die(line, "unsupported field/payload type");
 	}
