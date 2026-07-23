@@ -458,6 +458,7 @@ typedef struct {
 	int loop_depth; /* how many loops enclose the statement being parsed */
 	int in_defer;   /* 1 while parsing a `defer { … }` block body (no nested defer/return) */
 	int in_closure; /* 1 while parsing a closure body (no nested closures in v1) */
+	int for_id;     /* monotonic id minting each `for` loop's hidden counter-local name */
 	Program *prog;  /* the program under construction — lets a closure binding append its
 	                 * lifted top-level function (set by the top-level parse loop) */
 } Parser;
@@ -709,6 +710,10 @@ typedef enum {
 	ST_FIELD_ASSIGN,/* mutate a field of a `let` record local: name.field = expr */
 	ST_RETURN,
 	ST_LOOP,        /* loop { body } — infinite loop statement */
+	ST_FOR,         /* for <var> in <array> { body } — iterate a fixed array (statement-only).
+	                 * `name` = the loop variable (a const Int local), `field` = the hidden
+	                 * counter local's name, `expr` = the iterable (a `[N Int]` variable),
+	                 * `body` = the loop body. Desugared in emit to a counter loop. */
 	ST_BREAK,       /* break (bare) or `if cond then break` (guard in expr) */
 	ST_CONTINUE,    /* continue (bare) or `if cond then continue` (guard in expr) */
 	ST_EXPR,        /* an expression evaluated for effect (a call), result discarded */
@@ -2462,6 +2467,50 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 		expect(p, TK_LBRACE, "expected `{` (a loop body is a block)");
 		Stmt *s = new_stmt(ST_LOOP);
 		s->line = t->line;
+		p->loop_depth++;
+		s->body = parse_stmt_seq(p, fn, 0, t->line); /* no required `return` */
+		p->loop_depth--;
+		return s;
+	}
+	if (is_ident(t, "for")) {
+		/* for <var> in <array> { body } — iterate a fixed array (ebnf § Loops). cfcc's
+		 * `for` is STATEMENT-ONLY (like `loop`): no `<-` value yield, and the body is a
+		 * block, not the one-line expression form. break/continue steer it (continue
+		 * advances to the next element). ⚠ cf0 must NOT inherit: the iterable is a bare
+		 * `[N Int]` variable (the full grammar iterates any expression / any iterable),
+		 * the loop var is FUNCTION-scoped not loop-scoped (cfcc's flat scope — reusing a
+		 * name across sibling `for`s collides, AND the var stays readable AFTER the loop,
+		 * which cf0's loop-scoped binding rejects), and there is no value/one-line form. */
+		advance(p);
+		Token *vt = peek(p);
+		if (vt->kind != TK_IDENT || is_type_ident(vt))
+			die(vt->line, "expected a loop variable name after `for`");
+		if (vt->text[vt->len - 1] == '!')
+			die(vt->line, "M0 does not support `!` in a name");
+		char varname[64];
+		tok_copy(vt, varname, sizeof varname);
+		advance(p);
+		if (!is_ident(peek(p), "in"))
+			die(peek(p)->line, "expected `in` after the `for` variable (`for x in xs`)");
+		advance(p); /* in */
+		Stmt *s = new_stmt(ST_FOR);
+		s->line = t->line;
+		snprintf(s->name, sizeof s->name, "%s", varname);
+		s->expr = parse_expr(p, fn); /* the iterable — a bare array variable in cfcc */
+		if (s->expr->kind != EX_VAR)
+			die(s->line, "M1 `for` iterates a bare array variable (`for x in xs`)");
+		/* The loop var is a const Int local; a hidden counter local carries the index.
+		 * Both are word locals (their `%s_` slots are hoisted to the entry block). */
+		Type ti = {TY_INT, NULL, NULL, 0};
+		Type tmp;
+		if (resolve_name(fn, varname, &tmp) != R_NONE || func_find_closure(fn, varname) >= 0)
+			die(vt->line, "name already defined (no shadowing in M0)");
+		func_add_local(fn, varname, 0, ti, "");        /* const Int loop variable */
+		snprintf(s->field, sizeof s->field, "for.i%d", p->for_id++); /* hidden counter name (`.` = untypeable) */
+		func_add_local(fn, s->field, 1, ti, "");       /* let Int hidden counter */
+		if (p->loop_depth >= MAX_LOOP_DEPTH)
+			die(t->line, "loops nested too deep");
+		expect(p, TK_LBRACE, "expected `{` (a `for` body is a block)");
 		p->loop_depth++;
 		s->body = parse_stmt_seq(p, fn, 0, t->line); /* no required `return` */
 		p->loop_depth--;
@@ -4682,6 +4731,15 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 		case ST_LOOP:
 			check_stmts(prog, fn, s->body);
 			break;
+		case ST_FOR: {
+			/* The iterable must be a fixed array; the loop var is Int (already declared).
+			 * Then check the body. */
+			Type it = typeof_expr(prog, fn, s->expr);
+			if (it.kind != TY_ARRAY)
+				die(s->line, "`for … in` needs a fixed-array value (M1: a `[N Int]` variable)");
+			check_stmts(prog, fn, s->body);
+			break;
+		}
 		case ST_BREAK:
 		case ST_CONTINUE:
 			if (s->expr) /* guarded: `if <cond> then break/continue` */
@@ -4878,7 +4936,7 @@ static void collect_strlits_expr(Expr *e) {
 static void collect_strlits_stmt(Stmt *list) {
 	for (Stmt *s = list; s; s = s->next) {
 		collect_strlits_expr(s->expr);
-		if (s->kind == ST_LOOP || s->kind == ST_DEFER) /* ST_DEFER: the block form's body */
+		if (s->kind == ST_LOOP || s->kind == ST_FOR || s->kind == ST_DEFER) /* bodies with statements */
 			collect_strlits_stmt(s->body);
 	}
 }
@@ -5504,6 +5562,48 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 			fprintf(out, "@lend%d\n", id);
 			break;
 		}
+		case ST_FOR: {
+			/* `for x in xs { body }` desugared to a counter loop. The counter starts at
+			 * -1 and is incremented at @ltop, so `continue` (which jumps to @ltop via the
+			 * shared loop-label stack) advances to the next element, and the first entry
+			 * lands on element 0 — no separate increment label needed, so break/continue
+			 * reuse the ordinary @ltop/@lend targets. The length N is the array's comptime
+			 * `alen`; the base is the array pointer (`%r_xs`). No bounds check. */
+			int id = ex->lbl++;
+			int N = s->expr->rtype.alen;
+			fprintf(out, "\tstorew -1, %%s_%s\n", s->field);       /* counter = -1 */
+			ex->loops[ex->loop_depth++] = id;
+			fprintf(out, "@ltop%d\n", id);
+			int c = ex->tmp++;
+			fprintf(out, "\t%%t%d =w loadw %%s_%s\n", c, s->field);
+			int c1 = ex->tmp++;
+			fprintf(out, "\t%%t%d =w add %%t%d, 1\n", c1, c);      /* ++counter */
+			fprintf(out, "\tstorew %%t%d, %%s_%s\n", c1, s->field);
+			int done = ex->tmp++;
+			fprintf(out, "\t%%t%d =w csgew %%t%d, %d\n", done, c1, N); /* counter >= N ? */
+			fprintf(out, "\tjnz %%t%d, @lend%d, @lbody%d\n", done, id, id);
+			fprintf(out, "@lbody%d\n", id);
+			char base[96];
+			emit_expr(out, s->expr, ex, base, sizeof base);        /* %r_xs */
+			int ext = ex->tmp++;
+			fprintf(out, "\t%%t%d =l extsw %%t%d\n", ext, c1);
+			int off = ex->tmp++;
+			fprintf(out, "\t%%t%d =l mul %%t%d, 8\n", off, ext);
+			int addr = ex->tmp++;
+			fprintf(out, "\t%%t%d =l add %s, %%t%d\n", addr, base, off);
+			int elem = ex->tmp++;
+			fprintf(out, "\t%%t%d =w loadw %%t%d\n", elem, addr);
+			fprintf(out, "\tstorew %%t%d, %%s_%s\n", elem, s->name); /* bind the loop var */
+			emit_stmts(out, s->body, ex);
+			ex->loop_depth--;
+			Stmt *ftail = s->body;
+			while (ftail && ftail->next)
+				ftail = ftail->next;
+			if (!ftail || !stmt_is_terminal(ftail)) /* body falls through → next iteration */
+				fprintf(out, "\tjmp @ltop%d\n", id);
+			fprintf(out, "@lend%d\n", id);
+			break;
+		}
 		case ST_BREAK:
 		case ST_CONTINUE: {
 			/* Jump to the nearest loop's end (break) or top (continue). A guard
@@ -5589,7 +5689,7 @@ static void assign_expr_slots(Expr *e, int *n) {
 static void assign_stmt_slots(Stmt *list, int *n) {
 	for (Stmt *s = list; s; s = s->next) {
 		assign_expr_slots(s->expr, n);
-		if (s->kind == ST_LOOP || s->kind == ST_DEFER) /* ST_DEFER: the block form's body */
+		if (s->kind == ST_LOOP || s->kind == ST_FOR || s->kind == ST_DEFER) /* bodies with statements */
 			assign_stmt_slots(s->body, n);
 	}
 }
