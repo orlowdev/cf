@@ -1329,6 +1329,7 @@ static void parse_paren_params(Parser *p, Func *fn) {
 }
 
 static Expr *parse_expr(Parser *p, Func *fn); /* forward */
+static Expr *parse_data_literal(Parser *p, Func *fn, const char *typename, int line); /* forward */
 
 /* Disambiguate `name[…]`: a generic call `f[Type](args)` vs an array index `xs[i]`.
  * Assumes the current token is `[`; returns 1 iff the matching `]` is immediately
@@ -1412,6 +1413,13 @@ static Expr *parse_primary(Parser *p, Func *fn) {
 		}
 		expect(p, TK_RBRACKET, "expected `]` to close the array literal");
 		return e;
+	}
+	if (t->kind == TK_LBRACE) {
+		/* A record literal in EXPRESSION position (`({ x: a, y: b })`), unannotated: its
+		 * record type comes from context — the function's return type for a directly-
+		 * returned literal `-> ({…})`. Field-checked + typed against that context in
+		 * typecheck; a bare `{…}` with no record context is a typecheck error. */
+		return parse_data_literal(p, fn, "", t->line);
 	}
 	if (t->kind == TK_LPAREN) {
 		advance(p);
@@ -2449,11 +2457,11 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 		advance(p);
 		Stmt *s = new_stmt(ST_RETURN);
 		s->line = t->line;
-		/* Returning a bare record literal is not lowered yet — bind it to a local
-		 * first, then return the local. */
+		/* A bare `return { … }` is ambiguous with a block; parenthesize it as a record
+		 * literal expression — `return ({ … })` (typed by the return annotation). */
 		if (peek(p)->kind == TK_LBRACE)
 			die(peek(p)->line,
-			    "M0 cannot return a record literal directly (bind it to a local, then return it)");
+			    "parenthesize a returned record literal: `return ({ … })` (a bare `{` reads as a block)");
 		s->expr = parse_expr(p, fn);
 		*saw_return = 1;
 		return s;
@@ -4562,12 +4570,21 @@ static void set_local_union(Func *fn, const char *name, UnionDecl *u) {
  * cover it exactly (each declared field set once, no unknowns, none missing),
  * type-check the values, reorder them into declaration order (`ford`), and
  * backfill the local's record type so later field accesses resolve. */
-static void resolve_record_binding(Program *prog, Func *fn, Stmt *s) {
-	Expr *e = s->expr; /* EX_RECORD; e->name is the annotated type name */
-	DataDecl *d = prog_find_data(prog, e->name);
-	if (!d)
-		die(e->line, "unknown data type");
+/* Resolve an EX_RECORD data literal against a KNOWN record type `d`: check the fields
+ * cover it exactly, type the values, reorder into declaration order (`ford`), resolve
+ * any value-level spread, and cache the literal's rtype. Shared by the annotated binding
+ * path (below) and a directly-returned literal `-> ({…})` (typed by the return type).
+ * ⚠ cf0 must NOT inherit: cfcc builds a record ONLY as a bare data literal `{…}` typed by
+ * an annotation/return context. type_system §6.6/§7.3 canonicalize "construction is
+ * application" — `Point({x:1,y:2})` (named) / `Point(1,2)` (positional) — with the bare
+ * `{…}` only a payload inside a `T(…)` application; cfcc has no `Point(…)` record
+ * construction at all (a pre-existing divergence this return-literal extends). And cfcc
+ * context-types a bare literal only in a binding or return position (§3/§5.2 propagate an
+ * expected type more generally, e.g. into call arguments). Both disclaimed as genesis
+ * narrowings; cf0 must at least PARSE `Point({…})` (seed_subset §4). */
+static void resolve_record_literal(Program *prog, Func *fn, Expr *e, DataDecl *d) {
 	e->rec = d;
+	e->rtype = (Type){TY_RECORD, d, NULL, 0};
 	e->ford = xmalloc((size_t)d->nfields * sizeof *e->ford);
 	for (int i = 0; i < d->nfields; i++)
 		e->ford[i] = NULL;
@@ -4609,6 +4626,20 @@ static void resolve_record_binding(Program *prog, Func *fn, Stmt *s) {
 	for (int i = 0; i < d->nfields; i++)
 		if (!e->ford[i])
 			die(e->line, "data literal is missing a field");
+}
+
+/* The annotated binding path: `const Point p = { … }`. The literal's type is named by
+ * the annotation (e->name); resolve it, then backfill the local's record type. */
+static void resolve_record_binding(Program *prog, Func *fn, Stmt *s) {
+	Expr *e = s->expr; /* EX_RECORD; e->name is the literal's type name (from the annotation) */
+	/* A parenthesized literal `const Point p = ({…})` reaches here as an UNANNOTATED
+	 * literal (name==""); fall back to the binding's annotation so it resolves like the
+	 * bare `const Point p = {…}` form rather than dying "unknown data type". */
+	const char *tn = e->name[0] ? e->name : s->type_name;
+	DataDecl *d = prog_find_data(prog, tn);
+	if (!d)
+		die(e->line, "unknown data type");
+	resolve_record_literal(prog, fn, e, d);
 	set_local_rec(fn, s->name, d);
 }
 
@@ -4705,6 +4736,12 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 			 * another call's result), which the arena keeps alive past the frame. */
 			Type rt = func_ret_type(fn);
 			if (rt.kind == TY_RECORD) {
+				if (s->expr->kind == EX_RECORD) {
+					/* A directly-returned record literal (`-> ({…})`) adopts the return
+					 * type. A fresh arena alloc that escapes via return — copy-free, sound. */
+					resolve_record_literal(prog, fn, s->expr, rt.rec);
+					break;
+				}
 				if (s->expr->kind == EX_VAR) {
 					Type vt;
 					if (resolve_name(fn, s->expr->name, &vt) == R_PARAM && vt.kind == TY_RECORD)
@@ -5100,8 +5137,29 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 	}
 	case EX_ARRAY:
 		die(e->line, "internal: array literal in expression position");
-	case EX_RECORD:
-		die(e->line, "internal: record literal in expression position");
+	case EX_RECORD: {
+		/* Construct a record in expression position (a directly-returned literal
+		 * `-> ({…})`): bump-allocate its storage, store each field at its offset (in
+		 * declaration order via `ford`), and yield the fresh arena pointer. Mirrors the
+		 * ST_LOCAL record construction, but into a temp rather than a named slot. */
+		DataDecl *d = e->rec;
+		int r = ex->tmp++;
+		fprintf(out, "\t%%t%d =l call $cf_alloc(w %d)\n", r, data_size(d));
+		for (int fi = 0; fi < d->nfields; fi++) {
+			char fv[96];
+			emit_expr(out, e->ford[fi], ex, fv, sizeof fv);
+			const char *st = type_is_word(e->ford[fi]->rtype) ? "storew" : "storel";
+			if (fi == 0) {
+				fprintf(out, "\t%s %s, %%t%d\n", st, fv, r);
+			} else {
+				int a = ex->tmp++;
+				fprintf(out, "\t%%t%d =l add %%t%d, %d\n", a, r, data_field_offset(fi));
+				fprintf(out, "\t%s %s, %%t%d\n", st, fv, a);
+			}
+		}
+		snprintf(dst, cap, "%%t%d", r);
+		return;
+	}
 	case EX_CALL: {
 		/* An INDIRECT call through a function-value parameter (`f(x)`): the callee is the
 		 * `%u_<name>` code pointer; all args and the result are Int (`w`). */
