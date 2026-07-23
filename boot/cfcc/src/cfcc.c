@@ -619,6 +619,8 @@ struct Stmt {
 	int foff;           /* ST_FIELD_ASSIGN: the field's byte offset (filled by typecheck) */
 	int bufsize;        /* ST_LOCAL: >0 ⇒ a `[N Uint8]` byte-buffer local of N bytes
 	                     * (arena-allocated, no initializer); 0 otherwise */
+	char bufsize_name[64]; /* ST_LOCAL: a `[n Uint8]` buffer whose length is a comptime
+	                        * value parameter (`n`); resolved to `bufsize` at instantiation */
 	Expr *expr;         /* ST_LOCAL/ST_ASSIGN/ST_FIELD_ASSIGN: value (NULL for a buffer
 	                     * local); ST_RETURN: returned; ST_BREAK/ST_CONTINUE: guard or NULL */
 	Stmt *body;         /* ST_LOOP: the loop body statement list */
@@ -768,6 +770,16 @@ typedef struct Func {
 	 * param/return/local annotation; specialization substitutes it with a concrete type. */
 	char typarams[MAX_TYPARAMS][64];
 	char bounds[MAX_TYPARAMS][64]; /* per-typaram generic bound (a union name), or "" = unbounded */
+	/* A generic slot is a *type* parameter (`'T`, valtype[i] == "") or a *comptime value*
+	 * parameter (`Uarch n` / `Int n`, valtype[i] naming its scalar type — type_system §9.1).
+	 * A value slot's name (`n`) sits in typarams[i] like a type-var name, so the positional
+	 * type-argument mapping and dedup are shared; monomorphization substitutes it with the
+	 * concrete integer (an `n` read folds to a literal, a `[n Uint8]` buffer size resolves).
+	 * ⚠ THROWAWAY: cfcc value params are Int/Uarch-typed and used only as a value or a
+	 * `[n Uint8]` buffer size; cf0 takes the full `[n 'T]` generic-fixed-array grammar.
+	 * A value ARGUMENT must be a bare integer literal (`f[8]()`); ebnf `type_arg = expression`
+	 * admits any comptime-known expression (a `const`, a comptime call) — cf0 restores that. */
+	char valtype[MAX_TYPARAMS][64];
 	int ntyparams;
 	Param params[MAX_PARAMS];
 	int nparams;
@@ -804,6 +816,15 @@ typedef struct {
 static int func_typaram_index(const Func *fn, const char *name) {
 	for (int i = 0; i < fn->ntyparams; i++)
 		if (strcmp(fn->typarams[i], name) == 0)
+			return i;
+	return -1;
+}
+
+/* Index of a comptime value parameter (`Uarch n`) by name among a function's generic
+ * parameters, or -1. A value slot is one whose valtype is set. */
+static int func_valparam_index(const Func *fn, const char *name) {
+	for (int i = 0; i < fn->ntyparams; i++)
+		if (fn->valtype[i][0] && strcmp(fn->typarams[i], name) == 0)
 			return i;
 	return -1;
 }
@@ -1158,12 +1179,17 @@ static Expr *parse_primary(Parser *p, Func *fn) {
 				advance(p); /* [ */
 				for (;;) {
 					Token *ta = peek(p);
-					if (!is_tyvar(ta) && !is_type_ident(ta))
-						die(ta->line, "expected a type argument (a type name or `'T`)");
-					if (ta->text[ta->len - 1] == '!')
-						die(ta->line, "M0 does not support `!` in a type name");
 					if (e->ntypeargs == MAX_TYPARAMS)
-						die(ta->line, "too many type arguments");
+						die(ta->line, "too many generic arguments");
+					if (ta->kind == TK_INT) { /* a comptime value argument `f[8](...)` */
+						if (ta->ival < 0)
+							die(ta->line, "a comptime value argument must be non-negative");
+					} else if (is_tyvar(ta) || is_type_ident(ta)) {
+						if (ta->text[ta->len - 1] == '!')
+							die(ta->line, "M0 does not support `!` in a type name");
+					} else {
+						die(ta->line, "expected a generic argument (a type name, `'T`, or a comptime value)");
+					}
 					tok_copy(ta, e->typeargs[e->ntypeargs++], sizeof e->typeargs[0]);
 					advance(p);
 					if (peek(p)->kind == TK_COMMA) {
@@ -1172,7 +1198,7 @@ static Expr *parse_primary(Parser *p, Func *fn) {
 					}
 					break;
 				}
-				expect(p, TK_RBRACKET, "expected `]` to close the type arguments");
+				expect(p, TK_RBRACKET, "expected `]` to close the generic arguments");
 			}
 			expect(p, TK_LPAREN, "expected `(` for the call arguments");
 			int cap = 0;
@@ -1199,8 +1225,11 @@ static Expr *parse_primary(Parser *p, Func *fn) {
 		tok_copy(t, e->name, sizeof e->name);
 		Type ty;
 		/* A match-arm payload binding (in scope during the arm body's parse) resolves
-		 * too — its type and storage are settled in typecheck. */
-		if (resolve_name(fn, e->name, &ty) == R_NONE && find_active_bind(fn, e->name) < 0)
+		 * too — its type and storage are settled in typecheck. A comptime value parameter
+		 * (`n`) resolves here as well; it survives as an EX_VAR only inside the template
+		 * body (never typechecked/emitted) and is folded to its literal in each clone. */
+		if (resolve_name(fn, e->name, &ty) == R_NONE && find_active_bind(fn, e->name) < 0 &&
+		    func_valparam_index(fn, e->name) < 0)
 			die(line, "unknown name (M0 expressions use integers, parameters, locals, and calls)");
 		/* A record value is legal here only as the base of a field access; a
 		 * pointer never. Both are caught in the typecheck pass, which knows the
@@ -1635,6 +1664,7 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 		/* Optional type annotation: `Int` (a word local) or a record type name (a
 		 * `data`-typed local). A pointer annotation has no M0 local use. */
 		int is_record = 0, is_str = 0, is_buf = 0, bufsize = 0;
+		char bufsize_name[64] = {0}; /* a `[n Uint8]` buffer sized by a comptime value param */
 		char rectype[64] = {0};
 		Token *tt = peek(p);
 		if (tt->kind == TK_STAR)
@@ -1645,12 +1675,24 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 			 * `[N Uint8]` is a real fixed array. */
 			advance(p); /* [ */
 			Token *nt = peek(p);
-			if (nt->kind != TK_INT || nt->ival <= 0)
-				die(nt->line, "a byte buffer needs a positive comptime length, e.g. `[16 Uint8]`");
-			if (nt->ival > INT32_MAX)
-				die(nt->line, "byte buffer too large");
-			bufsize = (int)nt->ival;
-			advance(p);
+			if (nt->kind == TK_INT) {
+				if (nt->ival <= 0)
+					die(nt->line, "a byte buffer needs a positive comptime length, e.g. `[16 Uint8]`");
+				if (nt->ival > INT32_MAX)
+					die(nt->line, "byte buffer too large");
+				bufsize = (int)nt->ival;
+				advance(p);
+			} else { /* a comptime value parameter (`[n Uint8]`) — resolved at instantiation */
+				char nm[64];
+				if (nt->kind != TK_IDENT || is_type_ident(nt))
+					die(nt->line, "a byte buffer needs a comptime length: a literal (`[16 Uint8]`) "
+					              "or a value parameter (`[n Uint8]`)");
+				tok_copy(nt, nm, sizeof nm);
+				if (func_valparam_index(fn, nm) < 0)
+					die(nt->line, "a byte buffer length must be a literal or a comptime value parameter");
+				snprintf(bufsize_name, sizeof bufsize_name, "%s", nm);
+				advance(p);
+			}
 			if (!is_ident(peek(p), "Uint8"))
 				die(peek(p)->line, "M0 byte buffers hold `Uint8` (e.g. `[16 Uint8]`)");
 			advance(p);
@@ -1687,6 +1729,7 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 			if (peek(p)->kind == TK_EQ)
 				die(peek(p)->line, "a `[N Uint8]` buffer has no initializer (`read` fills it)");
 			s->bufsize = bufsize;
+			snprintf(s->bufsize_name, sizeof s->bufsize_name, "%s", bufsize_name);
 			Type bt = {TY_BUF, NULL, NULL};
 			func_add_local(fn, s->name, mutable, bt, "");
 			return s;
@@ -1940,33 +1983,51 @@ static Func *parse_func(Parser *p, Program *prog) {
 	advance(p);
 	expect(p, TK_EQ, "expected `=`");
 
-	/* Optional generic type parameters: `['T, 'U]` before the value parameters. A
-	 * function with type parameters is a generic template (monomorphized per use). */
+	/* Optional generic parameters: `['T, 'U]` before the value parameters. A function
+	 * with generic parameters is a template (monomorphized per use). A generic parameter
+	 * is a type variable `'T`, a bounded type variable `Union 'T`, or a comptime *value*
+	 * parameter `Type name` (`Uarch n`, type_system §9.1). A leading PascalCase name is a
+	 * bound when a `'T` follows and the value param's type when a lowercase name follows. */
 	if (peek(p)->kind == TK_LBRACKET) {
 		advance(p); /* [ */
 		for (;;) {
-			char bound[64];
-			parse_optional_bound(p, bound, sizeof bound); /* optional `Union 'T` bound */
-			Token *tv = peek(p);
-			if (!is_tyvar(tv))
-				die(tv->line, bound[0] ? "expected a type variable (e.g. `'T`) after the bound"
-				                       : "expected a type variable (e.g. `'T`) in the generic parameter list");
+			char lead[64];
+			parse_optional_bound(p, lead, sizeof lead); /* a type-var bound OR a value-param type */
+			Token *nx = peek(p);
 			if (fn->ntyparams == MAX_TYPARAMS)
-				die(tv->line, "too many type parameters");
-			tok_copy(tv, fn->typarams[fn->ntyparams], sizeof fn->typarams[0]);
-			snprintf(fn->bounds[fn->ntyparams], sizeof fn->bounds[0], "%s", bound);
+				die(nx->line, "too many generic parameters");
+			if (is_tyvar(nx)) { /* `'T` or `Union 'T` */
+				tok_copy(nx, fn->typarams[fn->ntyparams], sizeof fn->typarams[0]);
+				snprintf(fn->bounds[fn->ntyparams], sizeof fn->bounds[0], "%s", lead);
+				fn->valtype[fn->ntyparams][0] = '\0';
+				advance(p);
+			} else if (lead[0] && nx->kind == TK_IDENT && !is_type_ident(nx)) {
+				/* a comptime value parameter `Type name`; cfcc carries it as an integer
+				 * literal, so its type must be `Int` or `Uarch`. */
+				if (strcmp(lead, "Int") != 0 && strcmp(lead, "Uarch") != 0)
+					die(nx->line, "a comptime value parameter must be typed `Int` or `Uarch`");
+				if (nx->text[nx->len - 1] == '!')
+					die(nx->line, "M0 does not support `!` in a value parameter name");
+				tok_copy(nx, fn->typarams[fn->ntyparams], sizeof fn->typarams[0]);
+				fn->bounds[fn->ntyparams][0] = '\0';
+				snprintf(fn->valtype[fn->ntyparams], sizeof fn->valtype[0], "%s", lead);
+				advance(p);
+			} else {
+				die(nx->line, lead[0]
+				    ? "expected a type variable (`'T`) or a value parameter name after the type"
+				    : "expected a type variable (`'T`) or a value parameter (`Uarch n`)");
+			}
 			for (int j = 0; j < fn->ntyparams; j++)
 				if (strcmp(fn->typarams[j], fn->typarams[fn->ntyparams]) == 0)
-					die(tv->line, "duplicate type parameter");
+					die(nx->line, "duplicate generic parameter");
 			fn->ntyparams++;
-			advance(p);
 			if (peek(p)->kind == TK_COMMA) {
 				advance(p);
 				continue;
 			}
 			break;
 		}
-		expect(p, TK_RBRACKET, "expected `]` to close the type parameters");
+		expect(p, TK_RBRACKET, "expected `]` to close the generic parameters");
 	}
 
 	expect(p, TK_LPAREN, "expected `(`");
@@ -2096,7 +2157,7 @@ static void parse_type_arg(Parser *p, char *out, size_t cap) {
 		}
 		break;
 	}
-	expect(p, TK_RBRACKET, "expected `]` to close the type arguments");
+	expect(p, TK_RBRACKET, "expected `]` to close the generic arguments");
 	int off = snprintf(out, cap, "%s.%d", base, n);
 	if (off < 0 || (size_t)off >= cap)
 		die(t->line, "type name too long");
@@ -2557,6 +2618,50 @@ static void subst_stmts(Stmt *s, Func *tmpl, char targs[][256]) {
 	}
 }
 
+/* Substitute comptime value parameters (`[Uarch n]`) in a cloned body: every read of a
+ * value-param name folds to its concrete integer literal, so the specialized body carries
+ * no runtime type variable (type_system §9.1 — a value param is comptime-by-declaration).
+ * `names[i]` is the value-param name (`n`), `vals[i]` its concrete value. */
+static void subst_value_expr(Expr *e, char names[][64], long *vals, int nv) {
+	if (!e)
+		return;
+	if (e->kind == EX_VAR)
+		for (int i = 0; i < nv; i++)
+			if (strcmp(e->name, names[i]) == 0) {
+				e->kind = EX_INT; /* fold the read to its comptime literal */
+				e->ival = vals[i];
+				break;
+			}
+	subst_value_expr(e->lhs, names, vals, nv);
+	subst_value_expr(e->rhs, names, vals, nv);
+	subst_value_expr(e->els, names, vals, nv);
+	for (int i = 0; i < e->nargs; i++)
+		subst_value_expr(e->args[i], names, vals, nv);
+	for (int i = 0; i < e->nfields; i++)
+		subst_value_expr(e->fvals[i], names, vals, nv);
+	for (int i = 0; i < e->narms; i++)
+		subst_value_expr(e->arms[i].body, names, vals, nv);
+}
+
+static void subst_value_stmts(Stmt *s, char names[][64], long *vals, int nv) {
+	for (; s; s = s->next) {
+		/* A `[n Uint8]` buffer whose length is a value param resolves to a concrete size. */
+		if (s->kind == ST_LOCAL && s->bufsize_name[0])
+			for (int i = 0; i < nv; i++)
+				if (strcmp(s->bufsize_name, names[i]) == 0) {
+					if (vals[i] <= 0)
+						die(s->line, "a byte-buffer length must be positive");
+					if (vals[i] > INT32_MAX)
+						die(s->line, "byte buffer too large");
+					s->bufsize = (int)vals[i];
+					s->bufsize_name[0] = '\0';
+					break;
+				}
+		subst_value_expr(s->expr, names, vals, nv);
+		subst_value_stmts(s->body, names, vals, nv);
+	}
+}
+
 /* Reclassify a `'T` parameter to the concrete kind of its type argument. A record or
  * union name stays PK_RECORD (resolve_signatures reclassifies a union to PK_UNION). */
 static void reclassify_param(Param *p, const char *concrete, int line) {
@@ -2788,6 +2893,20 @@ static Func *instantiate(Program *prog, Func *tmpl, char typeargs[][64], int nar
 		snprintf(c->ret_type_name, sizeof c->ret_type_name, "%s", sub);
 	}
 	subst_stmts(c->body, tmpl, targs);
+	/* Fold each comptime value parameter to its concrete integer throughout the body. */
+	char vnames[MAX_TYPARAMS][64];
+	long vvals[MAX_TYPARAMS];
+	int nv = 0;
+	for (int i = 0; i < nargs; i++)
+		if (tmpl->valtype[i][0]) {
+			if (!is_all_digits(typeargs[i]))
+				die(line, "a comptime value parameter needs an integer value, not a type");
+			snprintf(vnames[nv], sizeof vnames[0], "%s", tmpl->typarams[i]);
+			vvals[nv] = strtol(typeargs[i], NULL, 10);
+			nv++;
+		}
+	if (nv)
+		subst_value_stmts(c->body, vnames, vvals, nv);
 	prog_add_func(prog, c);
 	return c;
 }
@@ -2863,11 +2982,29 @@ static void monomorph_expr(Program *prog, Func *fn, Expr *e) {
 			die(e->line, "type arguments given to a non-generic function");
 		return;
 	}
+	/* A comptime value parameter (`[Uarch n]`) can't be inferred from a runtime argument,
+	 * so a callee with any value param must be given explicit arguments. */
+	int has_valparam = 0;
+	for (int i = 0; i < callee->ntyparams; i++)
+		if (callee->valtype[i][0])
+			has_valparam = 1;
 	char args[MAX_TYPARAMS][64];
 	int ntargs = e->ntypeargs;
 	if (ntargs > 0) {
 		for (int i = 0; i < ntargs; i++)
 			snprintf(args[i], sizeof args[0], "%s", e->typeargs[i]);
+		/* Each slot must be filled by the right kind: a value param takes an integer
+		 * literal, a type param a type name (never a bare integer). */
+		for (int i = 0; i < ntargs && i < callee->ntyparams; i++) {
+			int slot_is_value = callee->valtype[i][0] != '\0';
+			if (slot_is_value && !is_all_digits(args[i]))
+				die(e->line, "this generic slot is a comptime value parameter; pass a value, not a type");
+			if (!slot_is_value && is_all_digits(args[i]))
+				die(e->line, "this generic slot is a type parameter; pass a type, not a value");
+		}
+	} else if (has_valparam) {
+		die(e->line, "this generic function has a comptime value parameter; "
+		             "call it with explicit arguments, e.g. `f[8, Int](...)`");
 	} else {
 		/* Infer each type parameter from the argument in a `'T` position. */
 		int found[MAX_TYPARAMS] = {0};
