@@ -597,6 +597,9 @@ typedef enum {
 	EX_TUPLE, /* tuple literal `(e0, e1, …)` (elements in args/nargs; type `(T0, …)` — heterogeneous).
 	           * Reuses the EX_ARRAY arg machinery (every tree walker already recurses `args[]`);
 	           * `rtype.tup` carries the interned shape, filled by typecheck. */
+	EX_SPREAD,/* a tuple-element spread `...src` (lhs=src, a tuple value). Appears ONLY as an
+	           * element of an EX_TUPLE; at typecheck/emit its src tuple's elements are spliced
+	           * in place (`(...t, x)` — a comptime desugar, ebnf § Aggregate Literals). */
 	EX_RECORD,/* record construction: a data literal { f: v, ... } of type `name` */
 	EX_CALL,  /* function call: name(args) */
 	EX_CAST,  /* numeric cast Int(x)/Uarch(x) — a scalar conversion (lhs=operand, name=target type) */
@@ -1614,18 +1617,27 @@ static Expr *parse_primary(Parser *p, Func *fn) {
 		return parse_data_literal(p, fn, "", t->line);
 	}
 	if (t->kind == TK_LPAREN) {
-		/* `(` opens either a grouped expression `(e)` or a tuple `(e0, e1, …)` — a comma
-		 * after the first element forks to the tuple (ebnf § Aggregate Literals: a one-tuple
-		 * `(e)` ≅ its element, so a lone element, even with a trailing comma, stays grouping).
-		 * An empty `()` is the unit value — not modeled in cfcc (no Unit type) yet. */
+		/* `(` opens either a grouped expression `(e)` or a tuple `(e0, e1, …)`. A comma after
+		 * the first element — OR a leading `...spread` — forks to the tuple (ebnf § Aggregate
+		 * Literals: a one-tuple `(e)` ≅ its element, so a lone plain element, even with a
+		 * trailing comma, stays grouping). An element may be a `...src` spread, splicing a
+		 * tuple's elements in place. An empty `()` is the unit value — not modeled yet. */
 		int line = t->line;
 		advance(p);
 		if (peek(p)->kind == TK_RPAREN)
 			die(peek(p)->line, "the unit value `()` is not supported yet");
-		if (peek(p)->kind == TK_ELLIPSIS)
-			die(peek(p)->line, "tuple spread `(...x, …)` is not supported yet");
-		Expr *first = parse_expr(p, fn);
-		if (peek(p)->kind != TK_COMMA) {
+		int first_spread = peek(p)->kind == TK_ELLIPSIS;
+		Expr *first;
+		if (first_spread) {
+			int sl = peek(p)->line;
+			advance(p); /* ... */
+			first = new_expr(EX_SPREAD);
+			first->line = sl;
+			first->lhs = parse_expr(p, fn);
+		} else {
+			first = parse_expr(p, fn);
+		}
+		if (!first_spread && peek(p)->kind != TK_COMMA) {
 			expect(p, TK_RPAREN, "expected `)`");
 			return first; /* a grouped expression */
 		}
@@ -1638,18 +1650,27 @@ static Expr *parse_primary(Parser *p, Func *fn) {
 			advance(p); /* , */
 			if (peek(p)->kind == TK_RPAREN) /* trailing comma */
 				break;
-			if (peek(p)->kind == TK_ELLIPSIS)
-				die(peek(p)->line, "tuple spread `(...x, …)` is not supported yet");
 			if (e->nargs == cap) {
 				cap *= 2;
 				e->args = realloc(e->args, cap * sizeof *e->args);
 				if (!e->args)
 					die(0, "out of memory");
 			}
-			e->args[e->nargs++] = parse_expr(p, fn);
+			if (peek(p)->kind == TK_ELLIPSIS) {
+				int sl = peek(p)->line;
+				advance(p); /* ... */
+				Expr *sp = new_expr(EX_SPREAD);
+				sp->line = sl;
+				sp->lhs = parse_expr(p, fn);
+				e->args[e->nargs++] = sp;
+			} else {
+				e->args[e->nargs++] = parse_expr(p, fn);
+			}
 		}
 		expect(p, TK_RPAREN, "expected `)` to close the tuple");
-		if (e->nargs < 2) /* `(e,)` — a one-tuple is just its element (grouping) */
+		/* `(e,)` — a lone plain element is just its element (grouping); a lone `(...t)` stays
+		 * a tuple (it spreads t's ≥2 elements). */
+		if (e->nargs == 1 && e->args[0]->kind != EX_SPREAD)
 			return e->args[0];
 		return e;
 	}
@@ -4752,15 +4773,27 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		return t;
 	}
 	case EX_TUPLE: {
-		/* A tuple literal `(e0, …, en-1)`: type each element and intern the shape. Brick 1
-		 * elements are Int, Str, or a FRESH record (a record-returning call or literal) — an
-		 * aggregate element takes over its arena storage, so aliasing an existing record is
-		 * rejected (the record-field freshness rule, memory_model §6). Array/tuple/union/
-		 * pointer elements are a later brick. */
+		/* A tuple literal `(e0, …, en-1)`: type each element and intern the shape. Elements are
+		 * Int, Str, or a FRESH record (a record-returning call or literal) — an aggregate
+		 * element takes over its arena storage, so aliasing an existing record is rejected (the
+		 * record-field freshness rule, memory_model §6). A `...src` spread splices the elements
+		 * of another tuple in place (a comptime desugar): its already-owned elements ride in as
+		 * pointer/word copies, no freshness needed. Array/union/pointer elements are a later brick. */
 		Type elems[MAX_FIELDS];
-		if (e->nargs > MAX_FIELDS)
-			die(e->line, "tuple has too many elements");
+		int n = 0;
 		for (int i = 0; i < e->nargs; i++) {
+			if (e->args[i]->kind == EX_SPREAD) {
+				Type st = typeof_expr(prog, fn, e->args[i]->lhs);
+				if (st.kind != TY_TUPLE)
+					die(e->args[i]->line, "a tuple spread `...x` splices a tuple value");
+				e->args[i]->rtype = st; /* cache for emit (its element widths/offsets) */
+				for (int j = 0; j < st.tup->nelem; j++) {
+					if (n == MAX_FIELDS)
+						die(e->line, "tuple has too many elements");
+					elems[n++] = st.tup->elems[j];
+				}
+				continue;
+			}
 			Type et = typeof_expr(prog, fn, e->args[i]);
 			if (type_is_word(et) || et.kind == TY_STR) {
 				/* Int, a tag-only union (a word), or an immutable Str literal — no alias risk. */
@@ -4772,12 +4805,18 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 				die(e->args[i]->line, "a tuple element is an Int, Str, or record value in cfcc "
 				                      "(array/tuple/union/pointer elements are a later brick)");
 			}
-			elems[i] = et;
+			if (n == MAX_FIELDS)
+				die(e->line, "tuple has too many elements");
+			elems[n++] = et;
 		}
+		if (n < 2)
+			die(e->line, "a tuple has at least two elements");
 		Type t = {TY_TUPLE, NULL, NULL, 0, NULL};
-		t.tup = prog_intern_tuple(prog, elems, e->nargs);
+		t.tup = prog_intern_tuple(prog, elems, n);
 		return t;
 	}
+	case EX_SPREAD:
+		die(e->line, "a spread `...x` is only valid as a tuple element");
 	case EX_RECORD:
 		if (e->name[0]) {
 			/* Explicit construction `Point({…})`: the literal names its own record type.
@@ -5828,26 +5867,49 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 	case EX_ARRAY:
 		die(e->line, "internal: array literal in expression position");
 	case EX_TUPLE: {
-		/* Construct a tuple in the arena: bump-allocate n uniform 8-byte slots and store each
-		 * element at slot i (a word Int/Str/tag-only element via storew/storel, an aggregate
-		 * element as its arena pointer). Yields the fresh base pointer. Mirrors EX_RECORD. */
+		/* Construct a tuple in the arena: bump-allocate its (comptime-known) slots and fill
+		 * them left to right. A plain element stores its value (word via storew, aggregate
+		 * pointer via storel). A `...src` spread copies each of src's elements out of src's
+		 * slots into the next output slots (a word/pointer copy per the src element's width).
+		 * The total arity comes from the interned shape (rtype.tup). Yields the base pointer. */
+		int N = e->rtype.tup->nelem;
 		int r = ex->tmp++;
-		fprintf(out, "\t%%t%d =l call $cf_alloc(w %d)\n", r, e->nargs * 8);
+		fprintf(out, "\t%%t%d =l call $cf_alloc(w %d)\n", r, N * 8);
+		int slot = 0;
 		for (int i = 0; i < e->nargs; i++) {
+			if (e->args[i]->kind == EX_SPREAD) {
+				char sp[96];
+				emit_expr(out, e->args[i]->lhs, ex, sp, sizeof sp); /* the src tuple pointer */
+				TupleDecl *stup = e->args[i]->rtype.tup;
+				for (int j = 0; j < stup->nelem; j++, slot++) {
+					int word = type_is_word(stup->elems[j]);
+					int ld = ex->tmp++;
+					if (j == 0)
+						fprintf(out, "\t%%t%d =%s %s %s\n", ld, word ? "w" : "l", word ? "loadw" : "loadl", sp);
+					else {
+						int sa = ex->tmp++;
+						fprintf(out, "\t%%t%d =l add %s, %d\n", sa, sp, j * 8);
+						fprintf(out, "\t%%t%d =%s %s %%t%d\n", ld, word ? "w" : "l", word ? "loadw" : "loadl", sa);
+					}
+					int da = ex->tmp++;
+					fprintf(out, "\t%%t%d =l add %%t%d, %d\n", da, r, slot * 8);
+					fprintf(out, "\t%s %%t%d, %%t%d\n", word ? "storew" : "storel", ld, da);
+				}
+				continue;
+			}
 			char ev[96];
 			emit_expr(out, e->args[i], ex, ev, sizeof ev);
 			const char *st = type_is_word(e->args[i]->rtype) ? "storew" : "storel";
-			if (i == 0) {
-				fprintf(out, "\t%s %s, %%t%d\n", st, ev, r);
-			} else {
-				int a = ex->tmp++;
-				fprintf(out, "\t%%t%d =l add %%t%d, %d\n", a, r, i * 8);
-				fprintf(out, "\t%s %s, %%t%d\n", st, ev, a);
-			}
+			int da = ex->tmp++;
+			fprintf(out, "\t%%t%d =l add %%t%d, %d\n", da, r, slot * 8);
+			fprintf(out, "\t%s %s, %%t%d\n", st, ev, da);
+			slot++;
 		}
 		snprintf(dst, cap, "%%t%d", r);
 		return;
 	}
+	case EX_SPREAD:
+		die(e->line, "internal: spread outside a tuple literal");
 	case EX_RECORD: {
 		/* Construct a record in expression position (a directly-returned literal
 		 * `-> ({…})`): bump-allocate its storage, store each field at its offset (in
