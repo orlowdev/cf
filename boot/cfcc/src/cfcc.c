@@ -94,6 +94,7 @@ typedef enum {
 	TK_RBRACKET,
 	TK_COMMA,
 	TK_DOT,     /* . — field access */
+	TK_ELLIPSIS,/* ... — spread (record field / member spread) */
 	TK_COLON,   /* : — data-literal field separator */
 	TK_STAR,    /* * — multiply, and pointer types */
 	TK_PLUS,
@@ -376,7 +377,15 @@ static void lex(Lexer *lx) {
 		case '[': push_tok(lx, TK_LBRACKET, s + lx->pos, 1, 0); lx->pos++; continue;
 		case ']': push_tok(lx, TK_RBRACKET, s + lx->pos, 1, 0); lx->pos++; continue;
 		case ',': push_tok(lx, TK_COMMA, s + lx->pos, 1, 0); lx->pos++; continue;
-		case '.': push_tok(lx, TK_DOT, s + lx->pos, 1, 0); lx->pos++; continue;
+		case '.':
+			if (n == '.' && s[lx->pos + 2] == '.') { /* `...` spread; `s` is NUL-terminated so [+2] is safe */
+				push_tok(lx, TK_ELLIPSIS, s + lx->pos, 3, 0);
+				lx->pos += 3;
+			} else {
+				push_tok(lx, TK_DOT, s + lx->pos, 1, 0);
+				lx->pos++;
+			}
+			continue;
 		case ':': push_tok(lx, TK_COLON, s + lx->pos, 1, 0); lx->pos++; continue;
 		case '*':
 			if (n == '=') { push_tok(lx, TK_STAREQ, s + lx->pos, 2, 0); lx->pos += 2; }
@@ -1904,6 +1913,8 @@ static Expr *parse_data_literal(Parser *p, Func *fn, const char *typename, int l
 	if (peek(p)->kind != TK_RBRACE)
 		for (;;) {
 			Token *f = peek(p);
+			if (f->kind == TK_ELLIPSIS)
+				die(f->line, "value-level record spread (`{ ...other, ... }`) is not supported yet");
 			if (f->kind != TK_IDENT || is_type_ident(f))
 				die(f->line, "expected a field name in the data literal");
 			if (f->text[f->len - 1] == '!')
@@ -2808,27 +2819,68 @@ static DataDecl *parse_data_decl(Parser *p, Program *prog) {
 	if (peek(p)->kind != TK_RBRACE)
 		for (;;) {
 			Token *ty = peek(p);
-			if (ty->kind == TK_DOT)
-				die(ty->line, "M0 records do not support `...` spread");
-			char ftype[64];
-			parse_member_type(p, ftype, sizeof ftype);
-			Token *f = peek(p);
-			if (f->kind != TK_IDENT || is_type_ident(f))
-				die(f->line, "expected a field name");
-			if (f->text[f->len - 1] == '!')
-				die(f->line, "M0 does not support `!` in a field name");
-			char fname[64];
-			tok_copy(f, fname, sizeof fname);
-			advance(p);
-			if (peek(p)->kind == TK_EQ)
-				die(peek(p)->line, "M0 record fields do not support defaults");
-			if (data_field_index(d, fname) >= 0)
-				die(f->line, "duplicate field name");
-			if (d->nfields == MAX_FIELDS)
-				die(f->line, "too many fields");
-			snprintf(d->field_types[d->nfields], sizeof d->field_types[0], "%s", ftype);
-			snprintf(d->fields[d->nfields], sizeof d->fields[0], "%s", fname);
-			d->nfields++;
+			if (ty->kind == TK_ELLIPSIS) {
+				/* Declaration-level record spread `...Base` — splice another record's
+				 * fields in place (ebnf: `data User = { ...Identifiable, Str email }`
+				 * desugars to `{ Str id, Str email }`). A comptime desugar resolved
+				 * here at parse time by copying the source's field name/type strings.
+				 * ⚠ THROWAWAY narrowings (cf0 must NOT inherit): the source must be an
+				 * already-declared CONCRETE record (no generic application `...Base[T]`,
+				 * no un-applied template) — the full grammar admits any `...named_type`,
+				 * incl. a generic application; the source must appear textually BEFORE
+				 * this decl (parse-time `prog_find_data` resolution) — cf0 resolves type
+				 * references order-independently in a later Resolve arc, so forward/
+				 * mutually-recursive spread sources are legal there; a name collision is
+				 * a hard error whereas the ratified rule leaves override ("later entries
+				 * win" for value spread; decl collisions a semantic concern) to a later
+				 * gate; and the source's own field DEFAULTS would be dropped by this copy
+				 * (moot now — cfcc rejects all field defaults — but a narrowing if they land). */
+				advance(p); /* `...` */
+				Token *src = peek(p);
+				if (!is_type_ident(src))
+					die(src->line, "expected a record type name after `...`");
+				char sname[64];
+				tok_copy(src, sname, sizeof sname);
+				advance(p);
+				if (peek(p)->kind == TK_LBRACKET)
+					die(peek(p)->line, "M1 cannot spread a generic application (`...Name[...]`) yet — spread a concrete record");
+				if (prog_find_union(prog, sname))
+					die(src->line, "spread source must be a record, not a union");
+				DataDecl *sd = prog_find_data(prog, sname);
+				if (!sd)
+					die(src->line, "spread source record is not declared (declare it before this record)");
+				if (sd->ntyparams > 0)
+					die(src->line, "cannot spread a generic record template — spread a concrete record");
+				for (int i = 0; i < sd->nfields; i++) {
+					if (data_field_index(d, sd->fields[i]) >= 0)
+						die(src->line, "duplicate field name from spread");
+					if (d->nfields == MAX_FIELDS)
+						die(src->line, "too many fields");
+					snprintf(d->field_types[d->nfields], sizeof d->field_types[0], "%s", sd->field_types[i]);
+					snprintf(d->fields[d->nfields], sizeof d->fields[0], "%s", sd->fields[i]);
+					d->nfields++;
+				}
+			} else {
+				char ftype[64];
+				parse_member_type(p, ftype, sizeof ftype);
+				Token *f = peek(p);
+				if (f->kind != TK_IDENT || is_type_ident(f))
+					die(f->line, "expected a field name");
+				if (f->text[f->len - 1] == '!')
+					die(f->line, "M0 does not support `!` in a field name");
+				char fname[64];
+				tok_copy(f, fname, sizeof fname);
+				advance(p);
+				if (peek(p)->kind == TK_EQ)
+					die(peek(p)->line, "M0 record fields do not support defaults");
+				if (data_field_index(d, fname) >= 0)
+					die(f->line, "duplicate field name");
+				if (d->nfields == MAX_FIELDS)
+					die(f->line, "too many fields");
+				snprintf(d->field_types[d->nfields], sizeof d->field_types[0], "%s", ftype);
+				snprintf(d->fields[d->nfields], sizeof d->fields[0], "%s", fname);
+				d->nfields++;
+			}
 			if (peek(p)->kind == TK_COMMA) {
 				advance(p);
 				if (peek(p)->kind == TK_RBRACE) /* trailing comma */
@@ -2873,8 +2925,8 @@ static UnionDecl *parse_union_decl(Parser *p, Program *prog) {
 	if (peek(p)->kind != TK_RBRACE)
 		for (;;) {
 			Token *m = peek(p);
-			if (m->kind == TK_DOT)
-				die(m->line, "M1.1 unions do not support `...` member spread");
+			if (m->kind == TK_ELLIPSIS)
+				die(m->line, "M1 unions do not support `...` member spread yet");
 			if (!is_type_ident(m))
 				die(m->line, "a union member is a PascalCase name");
 			if (m->text[m->len - 1] == '!')
