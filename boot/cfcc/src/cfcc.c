@@ -1180,15 +1180,16 @@ static void parse_param_type(Parser *p, Param *out) {
 	Token *t = peek(p);
 	out->line = t->line;
 	if (t->kind == TK_LPAREN) {
-		/* A function type `(Int, …) Int` — a higher-order function's callable parameter.
-		 * cfcc restricts it to all-`Int` params and an `Int` return (enough for HOFs over
-		 * Int; cf0 takes the full function-type grammar). */
+		/* A function type `(Int, …) -> Int` — a higher-order function's callable parameter.
+		 * The `->` separates the return type (as in a bare function type); cfcc restricts it
+		 * to all-`Int` params and an `Int` return (enough for HOFs over Int; cf0 takes the
+		 * full function-type grammar). */
 		advance(p); /* ( */
 		int arity = 0;
 		if (peek(p)->kind != TK_RPAREN)
 			for (;;) {
 				if (!is_ident(peek(p), "Int"))
-					die(peek(p)->line, "a function-type parameter takes `Int` arguments in M0 (e.g. `(Int) Int`)");
+					die(peek(p)->line, "a function-type parameter takes `Int` arguments in M0 (e.g. `(Int) -> Int`)");
 				advance(p);
 				arity++;
 				if (peek(p)->kind == TK_COMMA) {
@@ -1198,8 +1199,9 @@ static void parse_param_type(Parser *p, Param *out) {
 				break;
 			}
 		expect(p, TK_RPAREN, "expected `)` to close the function-type parameters");
+		expect(p, TK_ARROW, "a function type separates its return with `->` (e.g. `(Int) -> Int`)");
 		if (!is_ident(peek(p), "Int"))
-			die(peek(p)->line, "a function type needs a return type; M0 supports `Int` (e.g. `(Int) Int`)");
+			die(peek(p)->line, "a function type returns `Int` in M0 (e.g. `(Int) -> Int`)");
 		advance(p); /* Int (return) */
 		out->kind = PK_FN;
 		out->fn_arity = arity;
@@ -2073,7 +2075,34 @@ static void lift_closure(Parser *p, Func *encl, Func *cl, const char *localname,
 		snprintf(encl->closures[k].caps[i], 64, "%s", caps[i].name);
 }
 
-/* Parse a closure lambda (the `(params) [Ret] -> body` after `=`) and lift it, recording
+/* Parse an optional return-type annotation `: <type>` that sits between a parameter list
+ * and the `->` body arrow (ebnf § Functions). The arrow always introduces the body/value;
+ * the return type, when stated, is set off with a colon (`(a): Int -> …`), so `->` keeps a
+ * single meaning. Returns 1 if a return type was written. */
+static int parse_return_type(Parser *p, Func *fn) {
+	if (peek(p)->kind != TK_COLON)
+		return 0;
+	advance(p); /* : */
+	Token *rt = peek(p);
+	if (rt->kind == TK_STAR)
+		die(rt->line, "a function returns `Int` or a record, not a pointer");
+	if (is_tyvar(rt)) { /* a generic return type `'T` — resolved at specialization */
+		tok_copy(rt, fn->ret_type_name, sizeof fn->ret_type_name);
+		fn->ret_line = rt->line;
+		advance(p);
+	} else if (is_type_ident(rt)) {
+		fn->ret_line = rt->line;
+		if (is_ident(rt, "Int"))
+			advance(p);
+		else /* Uarch, a record/union type, or a generic application `Box[Int]` (G3b) */
+			parse_type_arg(p, fn->ret_type_name, sizeof fn->ret_type_name);
+	} else {
+		die(rt->line, "expected a return type after `:`");
+	}
+	return 1;
+}
+
+/* Parse a closure lambda (the `(params) [: Ret] -> body` after `=`) and lift it, recording
  * the binding under `localname` in the enclosing function `fn`. */
 static void parse_closure(Parser *p, Func *fn, const char *localname, int line) {
 	if (p->in_closure)
@@ -2081,17 +2110,7 @@ static void parse_closure(Parser *p, Func *fn, const char *localname, int line) 
 	Func *cl = new_func();
 	cl->parent = fn;
 	parse_paren_params(p, cl);
-	Token *rt = peek(p);
-	if (rt->kind == TK_STAR)
-		die(rt->line, "a closure returns `Int` or a record, not a pointer");
-	if (is_type_ident(rt)) {
-		if (is_ident(rt, "Int")) {
-			advance(p);
-		} else { /* Uarch, a record/union type, or a generic application */
-			cl->ret_line = rt->line;
-			parse_type_arg(p, cl->ret_type_name, sizeof cl->ret_type_name);
-		}
-	}
+	parse_return_type(p, cl); /* optional `: Ret` before the body arrow */
 	expect(p, TK_ARROW, "expected `->` (a closure body follows the parameters)");
 	p->in_closure = 1;
 	cl->body = parse_body(p, cl);
@@ -2584,27 +2603,10 @@ static Func *parse_func(Parser *p, Program *prog) {
 
 	parse_paren_params(p, fn);
 
-	/* Optional return type: `Int` (a word) or a record type (returned by pointer;
-	 * resolved to a decl in typecheck). A pointer return type has no M0 use. */
-	Token *rt = peek(p);
-	int has_ret = 0; /* whether a return type was written (mandatory for an asm fn) */
-	if (rt->kind == TK_STAR)
-		die(rt->line, "M0 functions return `Int` or a record, not a pointer");
-	if (is_tyvar(rt)) { /* a generic return type `'T` — resolved at specialization */
-		has_ret = 1;
-		tok_copy(rt, fn->ret_type_name, sizeof fn->ret_type_name);
-		fn->ret_line = rt->line;
-		advance(p);
-	} else if (is_type_ident(rt)) {
-		has_ret = 1;
-		if (is_ident(rt, "Int")) {
-			advance(p);
-		} else { /* Uarch, a record/union type, or a generic application `Box[Int]` (G3b) */
-			fn->ret_line = rt->line;
-			parse_type_arg(p, fn->ret_type_name, sizeof fn->ret_type_name);
-		}
-	}
-	expect(p, TK_ARROW, "expected `->`");
+	/* Optional return type `: <type>` — an `Int` (a word), `Uarch`, a record (returned by
+	 * pointer), or a generic `'T`, set off with a colon before the `->` body arrow. */
+	int has_ret = parse_return_type(p, fn); /* whether a return type was written (mandatory for an asm fn) */
+	expect(p, TK_ARROW, "expected `->` (a return type is written `: Type` before the arrow, e.g. `(Int a): Int -> …`)");
 	/* `asm` right after `->` opens an asm-bodied function (ebnf § Assembly): a naked
 	 * function whose verbatim assembly is the floor beneath the compiler (syscalls
 	 * etc.). The body is an ordinary string (multiline, `${param}` interpolation);
