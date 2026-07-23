@@ -954,6 +954,12 @@ typedef struct Func {
 	int ret_line;           /* source line of the return type (for diagnostics) */
 	DataDecl *ret_rec;      /* resolved record return type (typecheck) */
 	UnionDecl *ret_uni;     /* resolved union return type (typecheck) */
+	/* A tuple return type `(T0, …)` — structural, so it has no `ret_type_name`. Parse records
+	 * the element type NAMES (like a record's field_types); resolve_signatures interns them
+	 * into `ret_tup`. `ret_tuple_n > 0` is the "returns a tuple" flag. */
+	char ret_tuple_types[MAX_FIELDS][64];
+	int ret_tuple_n;
+	TupleDecl *ret_tup;
 	Binding *locals;
 	int nlocals, cap_locals;
 	/* Match-arm payload bindings currently in scope (a stack, pushed/popped around each
@@ -2415,6 +2421,30 @@ static int parse_return_type(Parser *p, Func *fn) {
 	Token *rt = peek(p);
 	if (rt->kind == TK_STAR)
 		die(rt->line, "a function returns `Int` or a record, not a pointer");
+	if (rt->kind == TK_LPAREN) {
+		/* A tuple return type `(T0, …, Tn-1)` — a function returning a heterogeneous product
+		 * (the multi-value return). Element types are Int, Str, or a record name (brick 1,
+		 * matching a tuple value's elements); resolved + interned in resolve_signatures. */
+		fn->ret_line = rt->line;
+		advance(p); /* ( */
+		for (;;) {
+			Token *et = peek(p);
+			if (!is_type_ident(et))
+				die(et->line, "a tuple return type lists element types (`(Int, Str)`)");
+			if (fn->ret_tuple_n == MAX_FIELDS)
+				die(et->line, "tuple return type has too many elements");
+			parse_type_arg(p, fn->ret_tuple_types[fn->ret_tuple_n++], sizeof fn->ret_tuple_types[0]);
+			if (peek(p)->kind == TK_COMMA) {
+				advance(p);
+				continue;
+			}
+			break;
+		}
+		expect(p, TK_RPAREN, "expected `)` to close the tuple return type");
+		if (fn->ret_tuple_n < 2)
+			die(rt->line, "a tuple return type needs at least two elements");
+		return 1;
+	}
 	if (is_tyvar(rt)) { /* a generic return type `'T` — resolved at specialization */
 		tok_copy(rt, fn->ret_type_name, sizeof fn->ret_type_name);
 		fn->ret_line = rt->line;
@@ -3621,7 +3651,7 @@ static void parse(Parser *p, Program *prog) {
 		die(0, "`main` must be `pub`");
 	if (m->nparams > 3)
 		die(0, "main takes at most 3 parameters (argc, argv, envp)");
-	if (m->ret_type_name[0])
+	if (m->ret_type_name[0] || m->ret_tuple_n)
 		die(0, "`main` must return Int (its value is the exit code)");
 	if (m->is_asm)
 		die(0, "`main` cannot be an asm function");
@@ -4345,6 +4375,7 @@ static void specialize_hof(Program *prog, Func *fn, Expr *e, Func *callee) {
 		clone->next_bind_id = 0;
 		clone->ret_rec = NULL;
 		clone->ret_uni = NULL;
+		clone->ret_tup = NULL; /* re-interned per instantiation from ret_tuple_types */
 		if (callee->nlocals) {
 			clone->locals = xmalloc((size_t)callee->cap_locals * sizeof *clone->locals);
 			memcpy(clone->locals, callee->locals, (size_t)callee->nlocals * sizeof *clone->locals);
@@ -4953,8 +4984,11 @@ static Type typeof_expr(Program *prog, Func *fn, Expr *e) {
 	return t;
 }
 
-/* A function's declared return type: a record (returned by pointer) or Int. */
+/* A function's declared return type: a tuple, record, or boxed union (all returned by
+ * pointer), a Uarch, or Int. */
 static Type func_ret_type(const Func *fn) {
+	if (fn->ret_tup)
+		return (Type){TY_TUPLE, NULL, NULL, 0, fn->ret_tup};
 	if (strcmp(fn->ret_type_name, "Uarch") == 0)
 		return (Type){TY_UARCH, NULL, NULL, 0, NULL};
 	if (fn->ret_uni)
@@ -5202,7 +5236,16 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 					             "position is reached by skipping it (`_`) and indexing `t[k]` (a later brick)");
 				}
 			} else {
-				expect_int(prog, fn, s->expr);                /* a word local */
+				/* Any other initializer: an Int (a word local), or a TUPLE-valued expression
+				 * — a tuple-returning call (`const t = divmod(a, b)`, the multi-value return)
+				 * or a tuple variable (an alias, sound since cfcc tuples are immutable). The
+				 * destructuring desugar's hidden temp takes this path for a call RHS. */
+				Type it = typeof_expr(prog, fn, s->expr);
+				if (it.kind == TY_TUPLE)
+					set_local_tuple(fn, s->name, it.tup);
+				else if (it.kind != TY_INT)
+					die(s->expr->line, "expected an Int value (a record is used only via field "
+					                   "access, and a string only via `.len`, in M0)");
 			}
 			break;
 		case ST_FIELD_ASSIGN: {
@@ -5261,6 +5304,15 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 				Type et = typeof_expr(prog, fn, s->expr);
 				if (et.kind != TY_UNION || et.uni != rt.uni)
 					die(s->expr->line, "returned value does not match the union return type");
+			} else if (rt.kind == TY_TUPLE) {
+				/* A tuple return: the returned value must be a tuple of the SAME shape (a
+				 * tuple literal, a tuple local, or another tuple-returning call). The tuple
+				 * lives in the arena, which outlives the frame, so its pointer escapes soundly
+				 * — and cfcc has no tuple parameters yet, so it cannot alias a caller's
+				 * argument (the record-return hazard). */
+				Type et = typeof_expr(prog, fn, s->expr);
+				if (et.kind != TY_TUPLE || !types_equal(et, rt))
+					die(s->expr->line, "returned value does not match the tuple return type");
 			} else {
 				expect_int(prog, fn, s->expr);
 			}
@@ -5353,6 +5405,25 @@ static void resolve_signatures(Program *prog) {
 					die(fn->ret_line, "a return type names an unknown data type");
 				fn->ret_rec = d;
 			}
+		}
+		if (fn->ret_tuple_n > 0) {
+			/* A tuple return type: resolve each element name (Int/Str/record) to a Type and
+			 * intern the shape, so a returned tuple is checked against it structurally. */
+			Type elems[MAX_FIELDS];
+			for (int j = 0; j < fn->ret_tuple_n; j++) {
+				const char *tn = fn->ret_tuple_types[j];
+				if (strcmp(tn, "Int") == 0) {
+					elems[j] = (Type){TY_INT, NULL, NULL, 0, NULL};
+				} else if (strcmp(tn, "Str") == 0) {
+					elems[j] = (Type){TY_STR, NULL, NULL, 0, NULL};
+				} else {
+					DataDecl *d = prog_find_data(prog, tn);
+					if (!d)
+						die(fn->ret_line, "a tuple return element is Int, Str, or a record type");
+					elems[j] = (Type){TY_RECORD, d, NULL, 0, NULL};
+				}
+			}
+			fn->ret_tup = prog_intern_tuple(prog, elems, fn->ret_tuple_n);
 		}
 	}
 }
