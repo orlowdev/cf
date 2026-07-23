@@ -129,6 +129,7 @@ typedef enum {
 	TK_SHLEQ,     /* <<= */
 	TK_SHREQ,     /* >>= */
 	TK_ARROW, /* -> */
+	TK_PIPEGT, /* |> pipe: `x |> f` ≡ `f(x)` (ebnf § pipe) */
 } TokKind;
 
 /* A string breaks into segments: literal byte-runs and `${name}` interpolations,
@@ -410,6 +411,7 @@ static void lex(Lexer *lx) {
 		case '|':
 			if (n == '|') { push_tok(lx, TK_OROR, s + lx->pos, 2, 0); lx->pos += 2; }
 			else if (n == '=') { push_tok(lx, TK_PIPEEQ, s + lx->pos, 2, 0); lx->pos += 2; }
+			else if (n == '>') { push_tok(lx, TK_PIPEGT, s + lx->pos, 2, 0); lx->pos += 2; }
 			else { push_tok(lx, TK_PIPE, s + lx->pos, 1, 0); lx->pos++; }
 			continue;
 		case '<':
@@ -1486,6 +1488,69 @@ static Expr *parse_or(Parser *p, Func *fn) {
 	return e;
 }
 
+/* Append `arg` as the final positional argument of an EX_CALL, growing its array
+ * by one. Used by the pipe: `x |> f(a, b)` threads `x` on as the last argument. */
+static void call_append_arg(Expr *call, Expr *arg) {
+	call->args = realloc(call->args, (call->nargs + 1) * sizeof *call->args);
+	if (!call->args)
+		die(0, "out of memory");
+	call->args[call->nargs++] = arg;
+}
+
+/* pipe_target — the right operand of `|>`. cfcc has no first-class functions or
+ * `defer`, so the only faithful target is a call form: a function name, optionally
+ * with type arguments and/or an under-applied argument list. `parse_postfix` already
+ * builds that EX_CALL when a `(` or `[` follows; a bare name (`x |> f`) has neither,
+ * so parse it here into a zero-argument EX_CALL (the pipe then supplies the one arg).
+ * A bare name can't go through parse_primary — that resolves it as a value and dies
+ * on a function name — so this is the one spot that admits it. */
+static Expr *parse_pipe_target(Parser *p, Func *fn) {
+	Token *t = peek(p);
+	if (t->kind != TK_IDENT || is_type_ident(t))
+		die(t->line, "a `|>` target must be a function name (optionally an under-applied call, e.g. `sum(2)`)");
+	if (is_ident(t, "defer"))
+		die(t->line, "M0 does not support `defer` pipe taps");
+	if (t->text[t->len - 1] == '!')
+		die(t->line, "M0 does not support `!` in a name here");
+	/* A `(` or `[` after the name → a normal call/type-application; let parse_postfix
+	 * build it (and reject a trailing `.field`, which is not a callable target). */
+	if (p->toks[p->pos + 1].kind == TK_LPAREN || p->toks[p->pos + 1].kind == TK_LBRACKET) {
+		Expr *e = parse_postfix(p, fn);
+		if (e->kind != EX_CALL)
+			die(t->line, "a `|>` target must resolve to a function call");
+		return e;
+	}
+	/* A bare name: build the zero-argument call the pipe will fill. */
+	Expr *e = new_expr(EX_CALL);
+	e->line = t->line;
+	tok_copy(t, e->name, sizeof e->name);
+	advance(p);
+	return e;
+}
+
+/* pipe = logical_or { "|>" pipe_target }   (left-associative; ebnf § pipe)
+ * `x |> f` ≡ `f(x)`: the left operand becomes the target call's final positional
+ * argument, so `3 |> sum(2)` is `sum(2, 3)`. A chain may continue on the next line
+ * with a leading `|>` — no statement begins with `|>`, so newlines followed by one
+ * are the continuation, never a terminator (they are consumed only in that case). */
+static Expr *parse_pipe(Parser *p, Func *fn) {
+	Expr *e = parse_or(p, fn);
+	for (;;) {
+		int save = p->pos;
+		skip_newlines(p);
+		if (peek(p)->kind != TK_PIPEGT) {
+			p->pos = save; /* the newlines terminate the statement, not a pipe */
+			break;
+		}
+		advance(p); /* |> */
+		skip_newlines(p); /* allow the target on the following line */
+		Expr *target = parse_pipe_target(p, fn);
+		call_append_arg(target, e);
+		e = target;
+	}
+	return e;
+}
+
 /* if_expr = "if" expr "then" expr "else" expr
  * An expression yielding a word: the condition is truthy when nonzero; both
  * branches are required (an else-less `if` yields an Option, which M0 lacks).
@@ -1637,7 +1702,7 @@ static Expr *parse_expr(Parser *p, Func *fn) {
 		return parse_if(p, fn);
 	if (is_ident(peek(p), "match"))
 		return parse_match(p, fn);
-	return parse_or(p, fn);
+	return parse_pipe(p, fn);
 }
 
 /* data_literal = "{" [ field_init { "," field_init } ] "}"
