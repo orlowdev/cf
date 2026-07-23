@@ -4281,7 +4281,11 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		return t;
 	}
 	case EX_RECORD:
-		die(e->line, "a record literal may only initialize a record-typed binding");
+		/* An unresolved bare `{…}` reached here with no type context to construct from —
+		 * the literal is sugar for `Type({…})`, and there is no `Type`. Only a record
+		 * binding annotation or a record return type supplies it. */
+		die(e->line, "cannot infer the record type to construct here (annotate the binding, "
+		             "or use it as a record return value)");
 	case EX_CALL: {
 		/* A call whose "callee" is a function-VALUE parameter (`f(x)` where `f` is a
 		 * `(…) Int` param) is an INDIRECT call through the code pointer. Its arguments are
@@ -4584,14 +4588,15 @@ static void set_local_union(Func *fn, const char *name, UnionDecl *u) {
  * cover it exactly, type the values, reorder into declaration order (`ford`), resolve
  * any value-level spread, and cache the literal's rtype. Shared by the annotated binding
  * path (below) and a directly-returned literal `-> ({…})` (typed by the return type).
- * ⚠ cf0 must NOT inherit: cfcc builds a record ONLY as a bare data literal `{…}` typed by
- * an annotation/return context. type_system §6.6/§7.3 canonicalize "construction is
- * application" — `Point({x:1,y:2})` (named) / `Point(1,2)` (positional) — with the bare
- * `{…}` only a payload inside a `T(…)` application; cfcc has no `Point(…)` record
- * construction at all (a pre-existing divergence this return-literal extends). And cfcc
- * context-types a bare literal only in a binding or return position (§3/§5.2 propagate an
- * expected type more generally, e.g. into call arguments). Both disclaimed as genesis
- * narrowings; cf0 must at least PARSE `Point({…})` (seed_subset §4). */
+ * OWNER MODEL (2026-07): a context-typed bare literal is SUGAR for construction-by-
+ * application — `-> ({ x, y })` ≡ `-> Point({ x: x, y: y })` — the value is built with the
+ * type constructor named by context (the return type / binding annotation), so a wrong or
+ * missing field here is a CONSTRUCTION error. This IS type_system §6.6/§7.3 "construction is
+ * application", NOT a divergence: cfcc lowers the sugar directly. cfcc simply does not yet
+ * expose the explicit `Type({…})` / `Type(1,2)` surface (cf0 does — and per seed_subset §4
+ * cf0 must PARSE it). ⚠ The one genesis narrowing: cfcc context-types a bare literal only in
+ * a binding/return position; §3/§5.2 propagate an expected type more generally (e.g. into a
+ * call argument), which cf0 restores. */
 static void resolve_record_literal(Program *prog, Func *fn, Expr *e, DataDecl *d) {
 	e->rec = d;
 	e->rtype = (Type){TY_RECORD, d, NULL, 0};
