@@ -116,6 +116,18 @@ typedef enum {
 	TK_ANDAND,  /* && logical, short-circuit */
 	TK_OROR,    /* || logical, short-circuit */
 	TK_EQ,
+	/* compound-assignment operators (`x op= y` is sugar for `x = x op y`) — one per
+	 * binary op: arithmetic then bitwise, mirroring ebnf § Assignment `assign_op`. */
+	TK_PLUSEQ,    /* += */
+	TK_MINUSEQ,   /* -= */
+	TK_STAREQ,    /* *= */
+	TK_SLASHEQ,   /* /= */
+	TK_PERCENTEQ, /* %= */
+	TK_AMPEQ,     /* &= */
+	TK_PIPEEQ,    /* |= */
+	TK_CARETEQ,   /* ^= */
+	TK_SHLEQ,     /* <<= */
+	TK_SHREQ,     /* >>= */
 	TK_ARROW, /* -> */
 } TokKind;
 
@@ -365,28 +377,50 @@ static void lex(Lexer *lx) {
 		case ',': push_tok(lx, TK_COMMA, s + lx->pos, 1, 0); lx->pos++; continue;
 		case '.': push_tok(lx, TK_DOT, s + lx->pos, 1, 0); lx->pos++; continue;
 		case ':': push_tok(lx, TK_COLON, s + lx->pos, 1, 0); lx->pos++; continue;
-		case '*': push_tok(lx, TK_STAR, s + lx->pos, 1, 0); lx->pos++; continue;
-		case '+': push_tok(lx, TK_PLUS, s + lx->pos, 1, 0); lx->pos++; continue;
-		case '-': push_tok(lx, TK_MINUS, s + lx->pos, 1, 0); lx->pos++; continue; /* -> handled above */
-		case '/': push_tok(lx, TK_SLASH, s + lx->pos, 1, 0); lx->pos++; continue;
-		case '%': push_tok(lx, TK_PERCENT, s + lx->pos, 1, 0); lx->pos++; continue;
-		case '^': push_tok(lx, TK_CARET, s + lx->pos, 1, 0); lx->pos++; continue;
+		case '*':
+			if (n == '=') { push_tok(lx, TK_STAREQ, s + lx->pos, 2, 0); lx->pos += 2; }
+			else { push_tok(lx, TK_STAR, s + lx->pos, 1, 0); lx->pos++; }
+			continue;
+		case '+':
+			if (n == '=') { push_tok(lx, TK_PLUSEQ, s + lx->pos, 2, 0); lx->pos += 2; }
+			else { push_tok(lx, TK_PLUS, s + lx->pos, 1, 0); lx->pos++; }
+			continue;
+		case '-': /* -> handled above */
+			if (n == '=') { push_tok(lx, TK_MINUSEQ, s + lx->pos, 2, 0); lx->pos += 2; }
+			else { push_tok(lx, TK_MINUS, s + lx->pos, 1, 0); lx->pos++; }
+			continue;
+		case '/':
+			if (n == '=') { push_tok(lx, TK_SLASHEQ, s + lx->pos, 2, 0); lx->pos += 2; }
+			else { push_tok(lx, TK_SLASH, s + lx->pos, 1, 0); lx->pos++; }
+			continue;
+		case '%':
+			if (n == '=') { push_tok(lx, TK_PERCENTEQ, s + lx->pos, 2, 0); lx->pos += 2; }
+			else { push_tok(lx, TK_PERCENT, s + lx->pos, 1, 0); lx->pos++; }
+			continue;
+		case '^':
+			if (n == '=') { push_tok(lx, TK_CARETEQ, s + lx->pos, 2, 0); lx->pos += 2; }
+			else { push_tok(lx, TK_CARET, s + lx->pos, 1, 0); lx->pos++; }
+			continue;
 		case '~': push_tok(lx, TK_TILDE, s + lx->pos, 1, 0); lx->pos++; continue;
 		case '&':
 			if (n == '&') { push_tok(lx, TK_ANDAND, s + lx->pos, 2, 0); lx->pos += 2; }
+			else if (n == '=') { push_tok(lx, TK_AMPEQ, s + lx->pos, 2, 0); lx->pos += 2; }
 			else { push_tok(lx, TK_AMP, s + lx->pos, 1, 0); lx->pos++; }
 			continue;
 		case '|':
 			if (n == '|') { push_tok(lx, TK_OROR, s + lx->pos, 2, 0); lx->pos += 2; }
+			else if (n == '=') { push_tok(lx, TK_PIPEEQ, s + lx->pos, 2, 0); lx->pos += 2; }
 			else { push_tok(lx, TK_PIPE, s + lx->pos, 1, 0); lx->pos++; }
 			continue;
 		case '<':
-			if (n == '<') { push_tok(lx, TK_SHL, s + lx->pos, 2, 0); lx->pos += 2; }
+			if (n == '<' && s[lx->pos + 2] == '=') { push_tok(lx, TK_SHLEQ, s + lx->pos, 3, 0); lx->pos += 3; }
+			else if (n == '<') { push_tok(lx, TK_SHL, s + lx->pos, 2, 0); lx->pos += 2; }
 			else if (n == '=') { push_tok(lx, TK_LE, s + lx->pos, 2, 0); lx->pos += 2; }
 			else { push_tok(lx, TK_LT, s + lx->pos, 1, 0); lx->pos++; }
 			continue;
 		case '>':
-			if (n == '>') { push_tok(lx, TK_SHR, s + lx->pos, 2, 0); lx->pos += 2; }
+			if (n == '>' && s[lx->pos + 2] == '=') { push_tok(lx, TK_SHREQ, s + lx->pos, 3, 0); lx->pos += 3; }
+			else if (n == '>') { push_tok(lx, TK_SHR, s + lx->pos, 2, 0); lx->pos += 2; }
 			else if (n == '=') { push_tok(lx, TK_GE, s + lx->pos, 2, 0); lx->pos += 2; }
 			else { push_tok(lx, TK_GT, s + lx->pos, 1, 0); lx->pos++; }
 			continue;
@@ -1648,6 +1682,26 @@ static Expr *parse_data_literal(Parser *p, Func *fn, const char *typename, int l
 
 static Stmt *parse_stmt_seq(Parser *p, Func *fn, int require_return, int open_line);
 
+/* If `k` is a compound-assignment token (`+=`, `<<=`, …), set `*op` to the binary
+ * op it desugars to and return 1; else return 0. `x op= y` is sugar for
+ * `x = x op y` (ebnf § Assignment). The compound set mirrors the binary ops
+ * one-for-one — no `&&=`/`||=` (short-circuit assign has no `Bool` payoff). */
+static int compound_assign_op(TokKind k, ExprKind *op) {
+	switch (k) {
+	case TK_PLUSEQ:    *op = EX_ADD;  return 1;
+	case TK_MINUSEQ:   *op = EX_SUB;  return 1;
+	case TK_STAREQ:    *op = EX_MUL;  return 1;
+	case TK_SLASHEQ:   *op = EX_DIV;  return 1;
+	case TK_PERCENTEQ: *op = EX_REM;  return 1;
+	case TK_AMPEQ:     *op = EX_BAND; return 1;
+	case TK_PIPEEQ:    *op = EX_BOR;  return 1;
+	case TK_CARETEQ:   *op = EX_BXOR; return 1;
+	case TK_SHLEQ:     *op = EX_SHL;  return 1;
+	case TK_SHREQ:     *op = EX_SHR;  return 1;
+	default: return 0;
+	}
+}
+
 /* statement  = local_decl | assign | return_stmt | loop | break | continue
  *            | "if" expr "then" ("break" | "continue")
  * local_decl = ("const" | "let") [ type ] var_name "=" (expr | data_literal)
@@ -1864,13 +1918,36 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 			snprintf(s->name, sizeof s->name, "%s", target);
 			tok_copy(f, s->field, sizeof s->field);
 			advance(p);
-			expect(p, TK_EQ, "expected `=`");
-			s->expr = parse_expr(p, fn);
+			ExprKind cop;
+			if (compound_assign_op(peek(p)->kind, &cop)) {
+				/* `p.f op= y` desugars to `p.f = p.f op y`. The target has no
+				 * side-effecting subexpression (a name + field), so re-reading it
+				 * once for the `op` matches "evaluated once for the target".
+				 * cf0 must NOT inherit this textual re-read: with a side-effecting
+				 * lvalue (`xs[i] op= y`), cf0 must evaluate the target *place* once
+				 * and reuse it. cfcc has only name/field targets, so it is sound here. */
+				int opline = peek(p)->line;
+				advance(p);
+				Expr *base = new_expr(EX_VAR);
+				base->line = t->line;
+				snprintf(base->name, sizeof base->name, "%s", target);
+				Expr *fld = new_expr(EX_FIELD);
+				fld->line = t->line;
+				fld->lhs = base;
+				snprintf(fld->name, sizeof fld->name, "%s", s->field);
+				Expr *bin = new_expr(cop);
+				bin->line = opline;
+				bin->lhs = fld;
+				bin->rhs = parse_expr(p, fn);
+				s->expr = bin;
+			} else {
+				expect(p, TK_EQ, "expected `=`");
+				s->expr = parse_expr(p, fn);
+			}
 			return s;
 		}
 		Stmt *s = new_stmt(ST_ASSIGN);
 		snprintf(s->name, sizeof s->name, "%s", target);
-		expect(p, TK_EQ, "expected `=` (M0 statements are const/let, a reassignment, or return)");
 		Type ty;
 		switch (resolve_name(fn, s->name, &ty)) {
 		case R_NONE: die(t->line, "unknown name (assign to a declared `let` local)");
@@ -1883,7 +1960,23 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 		 * memory_model §6 requires an explicit copy.) */
 		if (ty.kind != TY_INT)
 			die(t->line, "cannot assign to a whole record (mutate a field with `.`)");
-		s->expr = parse_expr(p, fn);
+		ExprKind cop;
+		if (compound_assign_op(peek(p)->kind, &cop)) {
+			/* `x op= y` desugars to `x = x op y` (x a plain `let` word local). */
+			int opline = peek(p)->line;
+			advance(p);
+			Expr *base = new_expr(EX_VAR);
+			base->line = t->line;
+			snprintf(base->name, sizeof base->name, "%s", target);
+			Expr *bin = new_expr(cop);
+			bin->line = opline;
+			bin->lhs = base;
+			bin->rhs = parse_expr(p, fn);
+			s->expr = bin;
+		} else {
+			expect(p, TK_EQ, "expected `=` (M0 statements are const/let, a reassignment, or return)");
+			s->expr = parse_expr(p, fn);
+		}
 		return s;
 	}
 	die(t->line, "expected `const`, `let`, `return`, or an assignment");
