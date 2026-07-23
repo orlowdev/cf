@@ -522,6 +522,9 @@ typedef enum {
 	EX_UMEMBER,/* union member value: Union.Member — a tag-only member's tag (uni, ival=tag) */
 	EX_MATCH, /* match scrut { arms } — compare-chain tag dispatch (lhs=scrut, arms/narms) */
 	EX_IF,    /* if cond then a else b (lhs=cond, rhs=then, els=else) */
+	EX_DEFER, /* defer <call> — a tapping expression: schedules lhs (an EX_CALL) at scope
+	           * exit (LIFO) and evaluates to the call's tapped argument (its last positional
+	           * arg). `x |> defer f` builds this too (the pipe fills the tapped slot). */
 	/* unary (lhs) */
 	EX_NEG,   /* - negate */
 	EX_BNOT,  /* ~ bitwise not */
@@ -1365,8 +1368,13 @@ static Expr *parse_postfix(Parser *p, Func *fn) {
 	return e;
 }
 
-/* unary = ("-" | "~" | "!") unary | postfix   (right-associative prefix ops) */
+static Expr *parse_defer_expr(Parser *p, Func *fn, int allow_bare); /* forward */
+
+/* unary = defer_expr | ("-" | "~" | "!") unary | postfix   (ebnf § unary)
+ * A `defer f(x)` tap is a prefix that composes anywhere a value does. */
 static Expr *parse_unary(Parser *p, Func *fn) {
+	if (is_ident(peek(p), "defer"))
+		return parse_defer_expr(p, fn, 0); /* prefix form needs a full call */
 	ExprKind op;
 	switch (peek(p)->kind) {
 	case TK_MINUS: op = EX_NEG; break;
@@ -1503,19 +1511,26 @@ static void call_append_arg(Expr *call, Expr *arg) {
 	call->args[call->nargs++] = arg;
 }
 
-/* pipe_target — the right operand of `|>`. cfcc has no first-class functions or
- * `defer`, so the only faithful target is a call form: a function name, optionally
- * with type arguments and/or an under-applied argument list. `parse_postfix` already
- * builds that EX_CALL when a `(` or `[` follows; a bare name (`x |> f`) has neither,
- * so parse it here into a zero-argument EX_CALL (the pipe then supplies the one arg).
- * A bare name can't go through parse_primary — that resolves it as a value and dies
- * on a function name — so this is the one spot that admits it. */
-static Expr *parse_pipe_target(Parser *p, Func *fn) {
+/* `defer` (in any position) is confined to a function's top level: the deferred
+ * work is scheduled statically, so a per-iteration count (inside a loop) or a defer
+ * nested in another `defer` block is rejected here. */
+static void check_defer_position(Parser *p, int line) {
+	if (p->loop_depth != 0)
+		die(line, "M0 allows `defer` only at a function's top level, not inside a loop");
+	if (p->in_defer)
+		die(line, "M0 does not allow `defer` nested inside a `defer` block");
+}
+
+/* Parse a callable reference to an EX_CALL: a function name optionally with type
+ * arguments and/or an under-applied argument list (`f`, `f(2)`, `f[Int](x)`).
+ * `parse_postfix` builds the EX_CALL when a `(` or `[` follows; a bare name has
+ * neither, so with `allow_bare` build a zero-argument EX_CALL the caller (a pipe, or
+ * a `defer` tap) fills. A bare name can't go through parse_primary — that resolves it
+ * as a value and dies on a function name — so this is the one spot that admits it. */
+static Expr *parse_callable(Parser *p, Func *fn, int allow_bare) {
 	Token *t = peek(p);
 	if (t->kind != TK_IDENT || is_type_ident(t))
-		die(t->line, "a `|>` target must be a function name (optionally an under-applied call, e.g. `sum(2)`)");
-	if (is_ident(t, "defer"))
-		die(t->line, "M0 does not support `defer` pipe taps");
+		die(t->line, "expected a function name (optionally an under-applied call, e.g. `sum(2)`)");
 	if (t->text[t->len - 1] == '!')
 		die(t->line, "M0 does not support `!` in a name here");
 	/* A `(` or `[` after the name → a normal call/type-application; let parse_postfix
@@ -1523,15 +1538,43 @@ static Expr *parse_pipe_target(Parser *p, Func *fn) {
 	if (p->toks[p->pos + 1].kind == TK_LPAREN || p->toks[p->pos + 1].kind == TK_LBRACKET) {
 		Expr *e = parse_postfix(p, fn);
 		if (e->kind != EX_CALL)
-			die(t->line, "a `|>` target must resolve to a function call");
+			die(t->line, "expected a function call");
 		return e;
 	}
-	/* A bare name: build the zero-argument call the pipe will fill. */
+	if (!allow_bare)
+		die(t->line, "a `defer` schedules a function call (`defer f(x)`) or a block (`defer { … }`)");
 	Expr *e = new_expr(EX_CALL);
 	e->line = t->line;
 	tok_copy(t, e->name, sizeof e->name);
 	advance(p);
 	return e;
+}
+
+/* defer_expr = "defer" postfix-call — the tapping expression (ebnf § defer). Builds an
+ * EX_DEFER over an EX_CALL: it schedules the call at scope exit and evaluates to the
+ * call's tapped argument. `allow_bare` is set only for a pipe target (`x |> defer f`),
+ * where the function is named bare and the pipe supplies the tapped argument; a prefix
+ * `defer f(x)` needs a full call. The block form `defer { … }` yields no value and is
+ * NOT handled here (it is a statement — see parse_stmt). */
+static Expr *parse_defer_expr(Parser *p, Func *fn, int allow_bare) {
+	Token *t = peek(p); /* `defer` */
+	check_defer_position(p, t->line);
+	advance(p);
+	if (peek(p)->kind == TK_LBRACE)
+		die(t->line, "a `defer { … }` block is a statement, not a value — write it on its own line");
+	Expr *e = new_expr(EX_DEFER);
+	e->line = t->line;
+	e->lhs = parse_callable(p, fn, allow_bare);
+	return e;
+}
+
+/* pipe_target — the right operand of `|>`: a callable (the common case) or a `defer`
+ * tap (`x |> defer f` ≡ `defer f(x)`; the pipe fills the tapped slot). A `defer` block
+ * is not a pipe target — it taps no value. */
+static Expr *parse_pipe_target(Parser *p, Func *fn) {
+	if (is_ident(peek(p), "defer"))
+		return parse_defer_expr(p, fn, 1); /* bare: the pipe supplies the tapped argument */
+	return parse_callable(p, fn, 1);
 }
 
 /* pipe = logical_or { "|>" pipe_target }   (left-associative; ebnf § pipe)
@@ -1551,7 +1594,9 @@ static Expr *parse_pipe(Parser *p, Func *fn) {
 		advance(p); /* |> */
 		skip_newlines(p); /* allow the target on the following line */
 		Expr *target = parse_pipe_target(p, fn);
-		call_append_arg(target, e);
+		/* `x |> defer f`: the pipe fills the tapped slot of the *deferred call*, and the
+		 * EX_DEFER (which forwards the tapped value) becomes the value flowing on. */
+		call_append_arg(target->kind == EX_DEFER ? target->lhs : target, e);
 		e = target;
 	}
 	return e;
@@ -1960,41 +2005,30 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 		s->expr = cond; /* guarded */
 		return s;
 	}
-	if (is_ident(t, "defer")) {
-		/* defer = "defer" ( postfix-call | block ) — schedule a cleanup to run at
-		 * scope exit in LIFO order (ebnf § pipe/defer). cfcc implements the two
-		 * STATEMENT forms only: `defer f(x)` (a call, its result discarded) and
-		 * `defer { … }` (a block). The value/tapping form (`const a = defer f(g())`)
-		 * and the pipe tap (`x |> defer f`) — where `defer` yields its tapped argument —
-		 * are not lowered here; cf0 restores the full expression form. cfcc scopes defer
-		 * to a function's top level: the deferred code fires at every `return`, so a defer
-		 * inside a loop (a dynamic, per-iteration count) or nested in another defer is
-		 * rejected. Arguments/statements are evaluated at fire time (scope exit), reading
-		 * the current local values — cf0 snapshots them at the defer point per the spec. */
-		advance(p);
-		if (p->loop_depth != 0)
-			die(t->line, "M0 allows `defer` only at a function's top level, not inside a loop");
-		if (p->in_defer)
-			die(t->line, "M0 does not allow `defer` nested inside a `defer` block");
+	if (is_ident(t, "defer") && p->toks[p->pos + 1].kind == TK_LBRACE) {
+		/* defer block — `defer { … }` schedules a whole block at scope exit (ebnf § defer).
+		 * It taps no value and yields nothing, so it is a statement (never a pipe target
+		 * or a value). The call/tap form `defer f(x)` is an expression (parse_defer_expr),
+		 * handled below as an expression statement. cfcc confines defer to a function's
+		 * top level: the deferred work fires at every `return`, LIFO, so a per-iteration
+		 * count (inside a loop) or a defer nested in another defer is rejected. */
+		check_defer_position(p, t->line);
+		advance(p); /* consume `defer` */
+		advance(p); /* consume `{` */
 		Stmt *s = new_stmt(ST_DEFER);
 		s->line = t->line;
-		if (peek(p)->kind == TK_LBRACE) {
-			advance(p); /* consume `{` */
-			p->in_defer = 1;
-			s->body = parse_stmt_seq(p, fn, 0, t->line); /* no required `return` */
-			p->in_defer = 0;
-		} else {
-			/* The call form: a bare function name followed by an argument list (or a
-			 * generic application `f[Int](…)`). Anything else is not a schedulable call. */
-			Token *nt = peek(p);
-			if (nt->kind != TK_IDENT || is_type_ident(nt) ||
-			    (p->toks[p->pos + 1].kind != TK_LPAREN && p->toks[p->pos + 1].kind != TK_LBRACKET))
-				die(t->line, "a `defer` schedules a function call (`defer f(x)`) or a block (`defer { … }`)");
-			Expr *e = parse_postfix(p, fn);
-			if (e->kind != EX_CALL)
-				die(t->line, "a `defer` target must be a function call");
-			s->expr = e;
-		}
+		p->in_defer = 1;
+		s->body = parse_stmt_seq(p, fn, 0, t->line); /* no required `return` */
+		p->in_defer = 0;
+		return s;
+	}
+	if (is_ident(t, "defer")) {
+		/* `defer f(x)` (or a pipe tap `x |> defer f`) on its own line: an
+		 * expression-statement whose tapped value is discarded. parse_expr reaches
+		 * parse_defer_expr via parse_unary and builds the EX_DEFER. */
+		Stmt *s = new_stmt(ST_EXPR);
+		s->line = t->line;
+		s->expr = parse_expr(p, fn);
 		return s;
 	}
 	/* Otherwise a bare name leads an assignment: `name = expr` (reassign a `let`
@@ -3537,6 +3571,17 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		expect_int(prog, fn, e->rhs); /* then — M0 if-branches are Int */
 		expect_int(prog, fn, e->els); /* else */
 		return (Type){TY_INT, NULL, NULL};
+	case EX_DEFER: {
+		/* A `defer` tap: type its call (validates callee/args, caches the call's and
+		 * each arg's rtype for emit), then yield the *tapped argument* — the call's last
+		 * positional argument, the value that passes through. The call needs at least one
+		 * argument to have a tapped value; a no-arg cleanup uses `defer { f() }`. */
+		typeof_expr(prog, fn, e->lhs);
+		if (e->lhs->nargs < 1)
+			die(e->line, "a `defer` call needs at least one argument — its last is the tapped "
+			             "value that passes through (use `defer { f() }` for a no-arg cleanup)");
+		return e->lhs->args[e->lhs->nargs - 1]->rtype;
+	}
 	case EX_NEG:
 	case EX_BNOT:
 	case EX_LNOT:
@@ -3630,16 +3675,19 @@ static void resolve_record_expr_binding(Program *prog, Func *fn, Stmt *s) {
 	DataDecl *d = prog_find_data(prog, s->type_name);
 	if (!d)
 		die(s->line, "unknown data type");
-	/* Only a record-returning call produces a fresh record in expression position; a bare
-	 * variable OR a field access (`rec.p`, now that a field may be a record) would alias
-	 * existing storage — an aggregate copy needs an explicit copy (memory_model §6). (A data
-	 * literal takes the resolve_record_binding path.) */
-	if (s->expr->kind != EX_CALL)
-		die(s->line, "a record binding's initializer must be a fresh record (a record-returning call); "
-		             "aliasing existing record storage needs an explicit copy — not in M0");
-	Type it = typeof_expr(prog, fn, s->expr);
+	Type it = typeof_expr(prog, fn, s->expr); /* validates the call/defer, sets nargs, rtype */
 	if (it.kind != TY_RECORD || it.rec != d)
 		die(s->line, "initializer type does not match the record binding");
+	/* Only a record-returning call produces a fresh record in expression position; a bare
+	 * variable OR a field access (`rec.p`, now that a field may be a record) would alias
+	 * existing storage — an aggregate copy needs an explicit copy (memory_model §6). A
+	 * `defer` tap forwards its tapped argument unchanged, so it is fresh exactly when that
+	 * argument is (`of(N) |> defer destroy` binds the fresh arena, schedules its teardown).
+	 * (A data literal takes the resolve_record_binding path.) */
+	Expr *fresh = s->expr->kind == EX_DEFER ? s->expr->lhs->args[s->expr->lhs->nargs - 1] : s->expr;
+	if (fresh->kind != EX_CALL)
+		die(s->line, "a record binding's initializer must be a fresh record (a record-returning call); "
+		             "aliasing existing record storage needs an explicit copy — not in M0");
 	set_local_rec(fn, s->name, d);
 }
 
@@ -3734,19 +3782,16 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 				expect_int(prog, fn, s->expr);
 			break;
 		case ST_EXPR:
-			/* A call evaluated for effect: type it (validates the callee/args); the
-			 * result, whatever its type, is discarded. */
-			if (s->expr->kind != EX_CALL)
-				die(s->line, "an expression statement must be a call");
+			/* A call or a `defer` tap evaluated for effect: type it (validates the
+			 * callee/args and, for a defer, schedules it); the tapped/result value,
+			 * whatever its type, is discarded. */
+			if (s->expr->kind != EX_CALL && s->expr->kind != EX_DEFER)
+				die(s->line, "an expression statement must be a call or a `defer`");
 			typeof_expr(prog, fn, s->expr);
 			break;
 		case ST_DEFER:
-			/* Validate the scheduled work (the call's callee/args, or the block's
-			 * statements); any result is discarded when it fires at scope exit. */
-			if (s->expr)
-				typeof_expr(prog, fn, s->expr);
-			else
-				check_stmts(prog, fn, s->body);
+			/* A `defer { … }` block: validate its statements. Fires at scope exit. */
+			check_stmts(prog, fn, s->body);
 			break;
 		}
 	}
@@ -3843,6 +3888,18 @@ static const char *binop(ExprKind k) {
 	}
 }
 
+/* One scheduled `defer`, fired at scope exit. Exactly one of `block`/`call` is set:
+ * a `defer { … }` block re-emits `block` at exit (reading locals live then), while a
+ * `defer f(x)` tap re-issues `call` with its arguments already snapshotted into the
+ * `args` temps (their widths in `argw`) at the point the defer was reached. */
+typedef struct {
+	Stmt *block;                 /* block form: the body to re-emit; NULL for the call form */
+	Expr *call;                  /* call form: the EX_CALL (callee name + return type) */
+	int nargs;
+	char args[MAX_PARAMS][64];   /* snapshotted argument operands (`%tN`) */
+	char argw[MAX_PARAMS];       /* each argument's register width ('w' or 'l') */
+} Defer;
+
 /* Per-function emit state: the next expression-temp and control-flow-label ids
  * (both function-scoped in QBE), plus a stack of enclosing loops' ids so `break`
  * and `continue` reach the nearest loop's end/top labels. */
@@ -3853,7 +3910,11 @@ typedef struct {
 	int loop_depth;
 	int ret_uarch; /* 1 if the current function returns Uarch (an `l`) — a returned
 	                * Int value is widened to `l` before `ret`. */
-	Stmt *defers[MAX_DEFERS]; /* pending `defer`s in source order; fired LIFO at each `return` */
+	/* Pending `defer`s in the order they are reached, fired LIFO at each `return`. A
+	 * block defer holds its body; a call/tap defer holds the callee and its arguments
+	 * SNAPSHOTTED at the defer point (evaluated once, into temps), so the scheduled call
+	 * sees the value that passed through, not a re-read at scope exit. */
+	Defer defers[MAX_DEFERS];
 	int ndefers;
 } Emit;
 
@@ -4053,6 +4114,42 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 			fprintf(out, "%s%c %%t%d", i ? ", " : "", argw[i], argt[i]);
 		fprintf(out, ")\n");
 		snprintf(dst, cap, "%%t%d", r);
+		return;
+	}
+	case EX_DEFER: {
+		/* A `defer f(x)` tap: SNAPSHOT the deferred call's arguments here (evaluate each
+		 * once, into a temp — the same per-arg width/Uarch-widen rules as EX_CALL), record
+		 * the call to fire at scope exit (emit_defers), and evaluate to the tapped argument
+		 * — the call's last snapshot. The snapshots are top-level temps, so they dominate
+		 * every later `return`; the tapped value passing through is exactly what the
+		 * scheduled call will receive (e.g. `const arena = of(N) |> defer destroy`). */
+		Expr *call = e->lhs;
+		if (ex->ndefers >= MAX_DEFERS)
+			die(e->line, "too many `defer`s in one function");
+		Defer *d = &ex->defers[ex->ndefers++];
+		d->block = NULL;
+		d->call = call;
+		d->nargs = call->nargs;
+		for (int i = 0; i < call->nargs; i++) {
+			char op[96];
+			emit_expr(out, call->args[i], ex, op, sizeof op);
+			ParamKind pk = call->callee->params[i].kind;
+			if (pk == PK_UARCH && call->args[i]->rtype.kind == TY_INT) {
+				int w = ex->tmp++;
+				fprintf(out, "\t%%t%d =w copy %s\n", w, op);
+				int t = ex->tmp++;
+				fprintf(out, "\t%%t%d =l extsw %%t%d\n", t, w);
+				snprintf(d->args[i], sizeof d->args[i], "%%t%d", t);
+				d->argw[i] = 'l';
+			} else {
+				d->argw[i] = param_is_word(&call->callee->params[i]) ? 'w' : 'l';
+				int t = ex->tmp++;
+				fprintf(out, "\t%%t%d =%c copy %s\n", t, d->argw[i], op);
+				snprintf(d->args[i], sizeof d->args[i], "%%t%d", t);
+			}
+		}
+		/* The tapped value is the last positional argument's snapshot. */
+		snprintf(dst, cap, "%s", d->args[call->nargs - 1]);
 		return;
 	}
 	case EX_CAST: {
@@ -4406,28 +4503,37 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 			emit_expr(out, s->expr, ex, v, sizeof v);
 			break;
 		case ST_DEFER:
-			/* Schedule: record the defer; nothing is emitted here. It fires at each
+			/* Schedule a `defer { … }` block; nothing is emitted here. It fires at each
 			 * later `return` (emit_defers). A defer only appears at the function's top
 			 * level, walked in source order, so the pending list grows monotonically and
-			 * every reachable `return` sees exactly the defers that precede it. */
+			 * every reachable `return` sees exactly the defers that precede it. (The
+			 * call/tap form registers itself when its EX_DEFER is emitted, above.) */
 			if (ex->ndefers >= MAX_DEFERS)
 				die(s->line, "too many `defer`s in one function");
-			ex->defers[ex->ndefers++] = s;
+			ex->defers[ex->ndefers].block = s->body;
+			ex->defers[ex->ndefers].call = NULL;
+			ex->ndefers++;
 			break;
 		}
 	}
 }
 
-/* Fire the pending `defer`s in LIFO order — last scheduled runs first (ebnf § defer).
- * A call form re-emits its call (result discarded); a block form re-emits its body. */
+/* Fire the pending `defer`s in LIFO order — last reached runs first (ebnf § defer).
+ * A block re-emits its body (reading locals live); a call re-issues its call with the
+ * arguments snapshotted when the defer was reached, its result discarded. */
 static void emit_defers(FILE *out, Emit *ex) {
 	for (int i = ex->ndefers - 1; i >= 0; i--) {
-		Stmt *d = ex->defers[i];
-		if (d->expr) {
-			char v[96];
-			emit_expr(out, d->expr, ex, v, sizeof v);
+		Defer *d = &ex->defers[i];
+		if (!d->call) {
+			emit_stmts(out, d->block, ex); /* block form (NULL body = empty defer, a no-op) */
 		} else {
-			emit_stmts(out, d->body, ex);
+			Expr *call = d->call;
+			int r = ex->tmp++;
+			const char *rty = type_is_word(call->rtype) ? "w" : "l";
+			fprintf(out, "\t%%t%d =%s call $%s(", r, rty, call->name);
+			for (int j = 0; j < d->nargs; j++)
+				fprintf(out, "%s%c %s", j ? ", " : "", d->argw[j], d->args[j]);
+			fprintf(out, ")\n");
 		}
 	}
 }
