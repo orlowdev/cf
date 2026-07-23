@@ -469,6 +469,7 @@ typedef struct {
 	int in_defer;   /* 1 while parsing a `defer { … }` block body (no nested defer/return) */
 	int in_closure; /* 1 while parsing a closure body (no nested closures in v1) */
 	int for_id;     /* monotonic id minting each `for` loop's hidden counter-local name */
+	int dest_id;    /* monotonic id minting each destructure's hidden tuple-temp name */
 	Program *prog;  /* the program under construction — lets a closure binding append its
 	                 * lifted top-level function (set by the top-level parse loop) */
 } Parser;
@@ -776,6 +777,9 @@ struct Stmt {
 	                     * body (NULL for the call form) */
 	Expr *yval;         /* ST_YIELD: the yielded value (`<- yval`); `expr` carries the
 	                     * optional guard, mirroring break/continue */
+	int destructure_arity; /* ST_LOCAL: >0 marks a destructuring's hidden tuple temp
+	                        * (`const (a,b) = e`); the value = the pattern's position count,
+	                        * checked against the tuple's arity in typecheck (0 = ordinary) */
 	Stmt *next;
 };
 
@@ -2479,6 +2483,105 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 	if (is_ident(t, "const") || is_ident(t, "let")) {
 		int mutable = is_ident(t, "let");
 		advance(p);
+		if (peek(p)->kind == TK_LPAREN) {
+			/* A tuple destructuring `const (a, _, b) = e` (ebnf § Destructuring). cfcc has no
+			 * tuple-TYPE annotations, so a `(` right after `const`/`let` is unambiguously a
+			 * tuple pattern. It desugars to a hidden tuple temp bound to `e` (evaluated once)
+			 * plus one ordinary binding per named position (`a = .destN[k]`); a `_`/`_n` skip
+			 * drops one/n positions. Brick 1 binds Int positions only (a value copy — sound for
+			 * `let` too); a Str/record position is reached by indexing `.destN` after skipping. */
+			int dline = peek(p)->line;
+			advance(p); /* ( */
+			int destid = p->dest_id++;
+			char hidden[64];
+			snprintf(hidden, sizeof hidden, "dtor.%d", destid); /* `.` = untypeable, no user clash */
+			Stmt *names[MAX_FIELDS];
+			int npos_of[MAX_FIELDS]; /* the tuple position each bound name reads */
+			int nnames = 0, pos = 0;
+			for (;;) {
+				Token *pt = peek(p);
+				if (pt->kind != TK_IDENT || is_type_ident(pt))
+					die(pt->line, "a tuple pattern binds lowercase names or skips (`_`, `_n`)");
+				if (pt->text[0] == '_') {
+					/* A skip: bare `_` drops one position, `_n` drops n (only digits may follow). */
+					int skip = 1;
+					if (pt->len > 1) {
+						skip = 0;
+						for (int i = 1; i < pt->len; i++) {
+							if (pt->text[i] < '0' || pt->text[i] > '9')
+								die(pt->line, "a skip is `_` or `_n` (n a count); a name starts with a lowercase letter");
+							skip = skip * 10 + (pt->text[i] - '0');
+						}
+						if (skip == 0)
+							die(pt->line, "`_0` skips nothing — omit it");
+					}
+					pos += skip;
+					advance(p);
+				} else {
+					if (pt->text[pt->len - 1] == '!')
+						die(pt->line, "M0 does not support `!` in a name");
+					if (nnames == MAX_FIELDS)
+						die(pt->line, "too many pattern positions");
+					char nm[64];
+					tok_copy(pt, nm, sizeof nm);
+					Type tmp;
+					if (resolve_name(fn, nm, &tmp) != R_NONE || func_find_closure(fn, nm) >= 0)
+						die(pt->line, "name already defined (no shadowing in M0)");
+					for (int i = 0; i < nnames; i++)
+						if (strcmp(names[i]->name, nm) == 0)
+							die(pt->line, "duplicate name in the tuple pattern");
+					Stmt *b = new_stmt(ST_LOCAL);
+					b->line = pt->line;
+					snprintf(b->name, sizeof b->name, "%s", nm);
+					names[nnames] = b;
+					npos_of[nnames] = pos;
+					nnames++;
+					pos++;
+					advance(p);
+				}
+				if (peek(p)->kind == TK_COMMA) {
+					advance(p);
+					if (peek(p)->kind == TK_RPAREN) /* trailing comma */
+						break;
+					continue;
+				}
+				break;
+			}
+			expect(p, TK_RPAREN, "expected `)` to close the tuple pattern");
+			if (pos < 1)
+				die(dline, "a tuple pattern binds at least one position");
+			expect(p, TK_EQ, "expected `=`");
+			/* The hidden temp holds the whole tuple (const — cfcc tuples are immutable); its
+			 * arity is checked against the pattern's position count (`pos`) in typecheck. */
+			Stmt *h = new_stmt(ST_LOCAL);
+			h->line = dline;
+			snprintf(h->name, sizeof h->name, "%s", hidden);
+			h->expr = parse_expr(p, fn);
+			h->destructure_arity = pos;
+			Type wt = {TY_INT, NULL, NULL, 0, NULL};
+			func_add_local(fn, hidden, 0, wt, ""); /* provisional word; retyped to the tuple in typecheck */
+			/* Chain the element bindings after the hidden temp: `a = .destN[k]`. Each is added
+			 * as a provisional word local and validated (Int position) in typecheck. */
+			Stmt *tail = h;
+			for (int i = 0; i < nnames; i++) {
+				Expr *base = new_expr(EX_VAR);
+				base->line = dline;
+				snprintf(base->name, sizeof base->name, "%s", hidden);
+				Expr *idx = new_expr(EX_INT);
+				idx->line = dline;
+				idx->ival = npos_of[i];
+				Expr *ix = new_expr(EX_INDEX);
+				ix->line = dline;
+				ix->lhs = base;
+				ix->rhs = idx;
+				names[i]->expr = ix;
+				Type it = {TY_INT, NULL, NULL, 0, NULL};
+				func_add_local(fn, names[i]->name, mutable, it, "");
+				tail->next = names[i];
+				tail = names[i];
+			}
+			return h;
+		}
 		/* Optional type annotation: `Int` (a word local) or a record type name (a
 		 * `data`-typed local). A pointer annotation has no M0 local use. */
 		int is_record = 0, is_str = 0, is_buf = 0, bufsize = 0, is_arr = 0, arrlen = 0;
@@ -2928,6 +3031,8 @@ static Stmt *parse_stmt_seq(Parser *p, Func *fn, int require_return, int open_li
 		else
 			head = s;
 		tail = s;
+		while (tail->next) /* a destructuring desugars to a chain — advance past all of it */
+			tail = tail->next;
 		if (peek(p)->kind != TK_RBRACE) {
 			if (peek(p)->kind == TK_EOF)
 				die(peek(p)->line, "unterminated block (expected `}`)");
@@ -4879,6 +4984,17 @@ static void set_local_record_type(Func *fn, const char *name, DataDecl *d) {
 		}
 }
 
+/* Retype a local (parsed provisionally as a word `Int`) to `Str` — for a `const s = t[k]`
+ * that binds a Str tuple position (an immutable header pointer in the local's `l` slot). */
+static void set_local_str(Func *fn, const char *name) {
+	for (int i = 0; i < fn->nlocals; i++)
+		if (strcmp(fn->locals[i].name, name) == 0) {
+			fn->locals[i].type = (Type){TY_STR, NULL, NULL, 0, NULL};
+			snprintf(fn->locals[i].type_name, sizeof fn->locals[i].type_name, "Str");
+			return;
+		}
+}
+
 /* Retype a local (parsed provisionally as a word `Int`) to a tuple — for an inferred
  * binding `const t = (1, "x")` whose shape comes from the literal, not an annotation. */
 static void set_local_tuple(Func *fn, const char *name, TupleDecl *tup) {
@@ -5015,6 +5131,20 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 		case ST_LOCAL:
 			if (s->bufsize)                                   /* a `[N Uint8]` buffer: no initializer */
 				break;
+			if (s->destructure_arity > 0) {
+				/* The hidden temp of a `const (…) = e` destructuring: `e` must be a tuple, and
+				 * the pattern's position count must match its arity exactly (a positional
+				 * pattern covers the whole tuple — comptime-sized, so this is checkable). The
+				 * temp then homes the tuple; the chained `a = temp[k]` bindings validate each
+				 * bound position (Int in brick 1) on their own. */
+				Type it = typeof_expr(prog, fn, s->expr);
+				if (it.kind != TY_TUPLE)
+					die(s->line, "destructuring `const (…) = e` needs a tuple value on the right");
+				if (it.tup->nelem != s->destructure_arity)
+					die(s->line, "the tuple pattern covers a different number of positions than the tuple has");
+				set_local_tuple(fn, s->name, it.tup);
+				break;
+			}
 			if (strcmp(s->type_name, "Str") == 0) {           /* a `const Str` local */
 				if (typeof_expr(prog, fn, s->expr).kind != TY_STR)
 					die(s->line, "internal: Str local initializer is not a string");
@@ -5053,6 +5183,24 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 				 * interned tuple and homes in the arena via `%r_<name>`. */
 				Type it = typeof_expr(prog, fn, s->expr);
 				set_local_tuple(fn, s->name, it.tup);
+			} else if (s->expr->kind == EX_INDEX) {
+				/* `const a = t[k]` (also a destructuring's desugared element binding): an Int
+				 * position stays a word local; a Str position (immutable) retypes to a Str
+				 * local. A record position would ALIAS the tuple's arena slot — sound only
+				 * while both stay read-only, which cfcc can't yet enforce across a `let`, so it
+				 * is deferred: skip it in the pattern (`_`) and read it with `t[k]`. */
+				Type it = typeof_expr(prog, fn, s->expr);
+				if (it.kind == TY_INT) {
+					/* a word local — its provisional Int type already fits */
+				} else if (it.kind == TY_STR) {
+					Type lt;
+					if (resolve_name(fn, s->name, &lt) == R_LET)
+						die(s->line, "a Str binding must be `const` (a `let` Str is a later brick)");
+					set_local_str(fn, s->name);
+				} else {
+					die(s->line, "cfcc binds an Int or Str position from an index; a record "
+					             "position is reached by skipping it (`_`) and indexing `t[k]` (a later brick)");
+				}
 			} else {
 				expect_int(prog, fn, s->expr);                /* a word local */
 			}
