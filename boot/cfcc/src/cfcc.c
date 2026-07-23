@@ -504,6 +504,11 @@ typedef enum {
 	            * captured BY REFERENCE. It arrives as an `l` pointer to the caller's word
 	            * slot; inside the closure a read is a `loadw` and a write a `storew` through
 	            * it, so mutations are visible to the enclosing scope. See lift_closure. */
+	PK_CAPTURE_REC,/* a captured enclosing RECORD, by reference. A record already lives in the
+	            * arena behind a pointer, so this is that pointer itself (like a PK_RECORD
+	            * param) — used as the `%r_<name>` base directly, but MUTABLE: the closure may
+	            * assign its fields, and the enclosing scope sees the change. `rec`/`type_name`
+	            * carry the record type, resolved in resolve_signatures. */
 } ParamKind;
 
 typedef struct {
@@ -1006,6 +1011,7 @@ static Resolution resolve_name(Func *fn, const char *name, Type *ty) {
 			case PK_UNION:   ty->kind = TY_UNION;  ty->rec = NULL; ty->uni = fn->params[i].uni; break;
 			case PK_VAR:     ty->kind = TY_INT;    ty->rec = NULL; break; /* template body parse only; type is ignored (re-typed per instantiation) */
 			case PK_CAPTURE: ty->kind = TY_INT;    ty->rec = NULL; return R_LET; /* a by-ref word: readable AND writable */
+			case PK_CAPTURE_REC: ty->kind = TY_RECORD; ty->rec = fn->params[i].rec; return R_LET; /* a by-ref record: fields mutable */
 			}
 			return R_PARAM;
 		}
@@ -1902,10 +1908,31 @@ static int looks_like_lambda(Parser *p) {
 	return is_type_ident(t1) && t2->kind == TK_IDENT && !is_type_ident(t2);
 }
 
+/* One captured variable: its name and (for a record) its nominal type. `type_name` is
+ * empty for a word capture (a by-reference `Int`) and the record type name otherwise. */
+typedef struct { char name[64]; char type_name[64]; } Capture;
+
+/* The nominal type name of an enclosing binding (a record's type, e.g. `Point`), searched
+ * up the lexical-parent chain; "" if it is a word or not found. */
+static const char *enclosing_type_name(Func *fn, const char *name) {
+	for (Func *f = fn; f; f = f->parent) {
+		for (int i = 0; i < f->nparams; i++)
+			if (strcmp(f->params[i].name, name) == 0)
+				return f->params[i].type_name;
+		for (int i = 0; i < f->nlocals; i++)
+			if (strcmp(f->locals[i].name, name) == 0)
+				return f->locals[i].type_name;
+	}
+	return "";
+}
+
 /* Classify a name referenced in a closure body: a closure param/local is not a capture;
- * an enclosing word variable is captured by reference (added once, in reference order);
- * anything else (an enclosing record/pointer, or an unknown) is a v1 error. */
-static void note_capture(Func *cl, const char *name, int line, char caps[][64], int *ncaps) {
+ * an enclosing `Int` (word) or record variable is captured by reference (added once, in
+ * reference order); anything else (a string, pointer, union) is a v2 error. `is_write`
+ * marks a mutating occurrence (an assignment / field mutation) — a captured `const` or
+ * parameter cannot be mutated through a closure. */
+static void note_capture(Func *cl, const char *name, int is_write, int line,
+                         Capture *caps, int *ncaps) {
 	for (int i = 0; i < cl->nparams; i++)
 		if (strcmp(cl->params[i].name, name) == 0)
 			return; /* the closure's own (explicit) parameter */
@@ -1916,24 +1943,30 @@ static void note_capture(Func *cl, const char *name, int line, char caps[][64], 
 	Resolution r = resolve_name(cl->parent, name, &ty);
 	if (r == R_NONE)
 		die(line, "unknown name in closure body");
-	if (ty.kind != TY_INT)
-		die(line, "M0 closures capture only `Int` variables by reference (not records, strings, or pointers)");
+	if (ty.kind != TY_INT && ty.kind != TY_RECORD)
+		die(line, "M0 closures capture only `Int` and record variables by reference (not strings, pointers, or unions)");
+	/* A word write to a captured `const` is already rejected while parsing the closure body
+	 * (resolve chains to the parent); a record FIELD write is not, so enforce it here. */
+	if (is_write && r != R_LET)
+		die(line, "a closure cannot mutate a captured `const` binding or parameter");
 	for (int i = 0; i < *ncaps; i++)
-		if (strcmp(caps[i], name) == 0)
+		if (strcmp(caps[i].name, name) == 0)
 			return; /* already captured */
 	if (*ncaps >= MAX_PARAMS)
 		die(line, "closure captures too many variables");
-	snprintf(caps[*ncaps], 64, "%s", name);
-	(*ncaps)++;
+	Capture *c = &caps[(*ncaps)++];
+	snprintf(c->name, sizeof c->name, "%s", name);
+	snprintf(c->type_name, sizeof c->type_name, "%s",
+	         ty.kind == TY_RECORD ? enclosing_type_name(cl->parent, name) : "");
 }
 
-static void collect_captures_stmt(Func *cl, Stmt *s, char caps[][64], int *ncaps);
+static void collect_captures_stmt(Func *cl, Stmt *s, Capture *caps, int *ncaps);
 
-static void collect_captures_expr(Func *cl, Expr *e, char caps[][64], int *ncaps) {
+static void collect_captures_expr(Func *cl, Expr *e, Capture *caps, int *ncaps) {
 	if (!e)
 		return;
 	if (e->kind == EX_VAR) /* a value reference — a call's callee name is NOT a capture */
-		note_capture(cl, e->name, e->line, caps, ncaps);
+		note_capture(cl, e->name, 0, e->line, caps, ncaps);
 	collect_captures_expr(cl, e->lhs, caps, ncaps);
 	collect_captures_expr(cl, e->rhs, caps, ncaps);
 	collect_captures_expr(cl, e->els, caps, ncaps);
@@ -1945,21 +1978,22 @@ static void collect_captures_expr(Func *cl, Expr *e, char caps[][64], int *ncaps
 		collect_captures_expr(cl, e->arms[i].body, caps, ncaps);
 }
 
-static void collect_captures_stmt(Func *cl, Stmt *s, char caps[][64], int *ncaps) {
+static void collect_captures_stmt(Func *cl, Stmt *s, Capture *caps, int *ncaps) {
 	for (; s; s = s->next) {
 		if (s->kind == ST_ASSIGN || s->kind == ST_FIELD_ASSIGN)
-			note_capture(cl, s->name, s->line, caps, ncaps); /* a write target is a capture too */
+			note_capture(cl, s->name, 1, s->line, caps, ncaps); /* a write target is a capture too */
 		collect_captures_expr(cl, s->expr, caps, ncaps);
 		collect_captures_stmt(cl, s->body, caps, ncaps); /* loop / defer-block bodies */
 	}
 }
 
 /* Turn a parsed closure `cl` (its explicit params + body) into a standalone top-level
- * function: prepend a PK_CAPTURE parameter per captured variable, give it a unique name,
- * detach its lexical parent, and append it to the program. Record the binding (name →
- * lifted function + capture list) in the enclosing function for call sites. */
+ * function: prepend a capture parameter per captured variable (PK_CAPTURE for a word,
+ * PK_CAPTURE_REC for a record — both by reference), give it a unique name, detach its
+ * lexical parent, and append it to the program. Record the binding (name → lifted
+ * function + capture list) in the enclosing function for call sites. */
 static void lift_closure(Parser *p, Func *encl, Func *cl, const char *localname, int line,
-                         char caps[][64], int ncaps) {
+                         Capture *caps, int ncaps) {
 	int nexp = cl->nparams;
 	if (nexp + ncaps > MAX_PARAMS)
 		die(line, "closure has too many parameters and captures combined");
@@ -1968,13 +2002,18 @@ static void lift_closure(Parser *p, Func *encl, Func *cl, const char *localname,
 	for (int i = 0; i < ncaps; i++) {
 		Param *pm = &cl->params[i];
 		memset(pm, 0, sizeof *pm);
-		pm->kind = PK_CAPTURE;
 		pm->line = line;
-		snprintf(pm->name, sizeof pm->name, "%s", caps[i]);
+		snprintf(pm->name, sizeof pm->name, "%s", caps[i].name);
+		if (caps[i].type_name[0]) { /* a record capture — resolved to a decl in resolve_signatures */
+			pm->kind = PK_CAPTURE_REC;
+			snprintf(pm->type_name, sizeof pm->type_name, "%s", caps[i].type_name);
+		} else {
+			pm->kind = PK_CAPTURE;
+		}
 	}
 	cl->nparams = nexp + ncaps;
 	snprintf(cl->name, sizeof cl->name, "__cf_closure_%d", p->prog->closure_counter++);
-	cl->parent = NULL; /* now a standalone function; captures reach it as PK_CAPTURE params */
+	cl->parent = NULL; /* now a standalone function; captures reach it as capture params */
 	cl->is_pub = 0;
 	prog_add_func(p->prog, cl);
 	if (encl->nclosures >= MAX_CLOSURES)
@@ -1984,7 +2023,7 @@ static void lift_closure(Parser *p, Func *encl, Func *cl, const char *localname,
 	encl->closures[k].lifted = cl;
 	encl->closures[k].ncaps = ncaps;
 	for (int i = 0; i < ncaps; i++)
-		snprintf(encl->closures[k].caps[i], 64, "%s", caps[i]);
+		snprintf(encl->closures[k].caps[i], 64, "%s", caps[i].name);
 }
 
 /* Parse a closure lambda (the `(params) [Ret] -> body` after `=`) and lift it, recording
@@ -2010,7 +2049,7 @@ static void parse_closure(Parser *p, Func *fn, const char *localname, int line) 
 	p->in_closure = 1;
 	cl->body = parse_body(p, cl);
 	p->in_closure = 0;
-	char caps[MAX_PARAMS][64];
+	Capture caps[MAX_PARAMS];
 	int ncaps = 0;
 	collect_captures_stmt(cl, cl->body, caps, &ncaps);
 	lift_closure(p, fn, cl, localname, line, caps, ncaps);
@@ -3384,6 +3423,7 @@ static const char *shallow_type_name(Program *prog, Func *fn, Expr *e) {
 				case PK_VAR:     return fn->params[i].type_name;
 				case PK_LONG:    return ""; /* a pointer — no simple type name */
 				case PK_CAPTURE: return "Int"; /* a captured word */
+				case PK_CAPTURE_REC: return fn->params[i].type_name; /* a captured record */
 				}
 			}
 		for (int i = 0; i < fn->nlocals; i++)
@@ -3695,6 +3735,11 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 				 * word (captured by reference and read/written through a pointer). */
 				if (at.kind != TY_INT)
 					die(e->line, "internal: closure capture is not a word");
+				break;
+			case PK_CAPTURE_REC:
+				/* A prepended record capture: the enclosing record, passed by pointer. */
+				if (at.kind != TY_RECORD || at.rec != pm->rec)
+					die(e->line, "internal: closure record capture type mismatch");
 				break;
 			}
 		}
@@ -4070,6 +4115,12 @@ static void resolve_signatures(Program *prog) {
 				DataDecl *d = prog_find_data(prog, fn->params[j].type_name);
 				if (!d)
 					die(fn->params[j].line, "a parameter names an unknown data type");
+				fn->params[j].rec = d;
+			} else if (fn->params[j].kind == PK_CAPTURE_REC) {
+				/* A captured record names a `data` type (unions are not captured). */
+				DataDecl *d = prog_find_data(prog, fn->params[j].type_name);
+				if (!d)
+					die(fn->params[j].line, "a captured variable names an unknown data type");
 				fn->params[j].rec = d;
 			}
 		if (fn->ret_type_name[0] && strcmp(fn->ret_type_name, "Uarch") != 0) {
@@ -4876,8 +4927,11 @@ static void emit_func(FILE *out, const Func *fn) {
 		if (param_is_word(&fn->params[i])) {
 			fprintf(out, "\t%%s_%s =l alloc4 4\n", n);
 			fprintf(out, "\tstorew %%u_%s, %%s_%s\n", n, n);
-		} else if (fn->params[i].kind == PK_RECORD ||
+		} else if (fn->params[i].kind == PK_RECORD || fn->params[i].kind == PK_CAPTURE_REC ||
 		           (fn->params[i].kind == PK_UNION && fn->params[i].uni->has_payload)) {
+			/* A record, captured-record, or boxed-union param arrives as an arena pointer,
+			 * copied into the `%r_<name>` form field access uses. A captured record aliases
+			 * the enclosing scope's storage, so field writes there are visible to it. */
 			fprintf(out, "\t%%r_%s =l copy %%u_%s\n", n, n);
 		}
 	}
