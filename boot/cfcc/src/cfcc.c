@@ -634,6 +634,11 @@ struct Expr {
 	Expr **fvals;
 	int nfields;
 	Expr **ford;
+	/* EX_RECORD: an optional value-level spread source `{ ...src, ... }` — a bare
+	 * record variable whose fields seed this literal (later explicit entries override).
+	 * NULL when absent. resolve_record_binding fills each un-overridden `ford` slot with
+	 * a synthesized `src.field` read, so emit is unchanged. */
+	Expr *spread;
 	/* The expression's resolved type, filled by the typecheck pass. Emit reads it to
 	 * tell a record value (an `l` arena pointer — passed/returned by pointer) from a
 	 * word. */
@@ -1913,8 +1918,28 @@ static Expr *parse_data_literal(Parser *p, Func *fn, const char *typename, int l
 	if (peek(p)->kind != TK_RBRACE)
 		for (;;) {
 			Token *f = peek(p);
-			if (f->kind == TK_ELLIPSIS)
-				die(f->line, "value-level record spread (`{ ...other, ... }`) is not supported yet");
+			if (f->kind == TK_ELLIPSIS) {
+				/* Value-level record spread `{ ...src, y: 5 }` — splice a record VALUE's
+				 * fields, then let later explicit entries override (ebnf field_spread;
+				 * type_system §7 "later entries win"). ⚠ THROWAWAY narrowings (cf0 must NOT
+				 * inherit): the spread must be the FIRST and ONLY entry (full grammar admits
+				 * spreads anywhere and several), and its source is any `...expression` there;
+				 * cfcc also requires the source to be a bare same-type record variable with
+				 * all-word fields (see resolve_record_binding). The same-type rule sidesteps a
+				 * SPEC-SILENT question the ratified docs leave open: when the source is a
+				 * DIFFERENT record ("splices another record's fields"), which fields splice —
+				 * all, or only shared names? cf0 needs a ratified answer (type_system §7); cfcc
+				 * dodges it, so this narrowing is not the eventual cf0 semantics. */
+				if (e->spread || e->nfields > 0)
+					die(f->line, "a record spread `...src` must be the first and only spread in the literal");
+				advance(p); /* `...` */
+				e->spread = parse_expr(p, fn);
+				if (peek(p)->kind == TK_COMMA) {
+					advance(p);
+					continue;
+				}
+				break;
+			}
 			if (f->kind != TK_IDENT || is_type_ident(f))
 				die(f->line, "expected a field name in the data literal");
 			if (f->text[f->len - 1] == '!')
@@ -2035,6 +2060,8 @@ static void collect_captures_expr(Func *cl, Expr *e, Capture *caps, int *ncaps) 
 		collect_captures_expr(cl, e->args[i], caps, ncaps);
 	for (int i = 0; i < e->nfields; i++)
 		collect_captures_expr(cl, e->fvals[i], caps, ncaps);
+	if (e->spread) /* value-level record spread source */
+		collect_captures_expr(cl, e->spread, caps, ncaps);
 	for (int i = 0; i < e->narms; i++)
 		collect_captures_expr(cl, e->arms[i].body, caps, ncaps);
 }
@@ -3071,6 +3098,7 @@ static Expr *clone_expr(Expr *e) {
 			c->fvals[i] = clone_expr(e->fvals[i]);
 	}
 	c->ford = NULL; /* rebuilt by typecheck */
+	c->spread = clone_expr(e->spread); /* EX_RECORD value-level spread source */
 	if (e->narms) { /* EX_MATCH */
 		c->arms = xmalloc((size_t)e->narms * sizeof *c->arms);
 		memcpy(c->arms, e->arms, (size_t)e->narms * sizeof *c->arms);
@@ -3192,6 +3220,8 @@ static void subst_expr(Expr *e, Func *tmpl, char targs[][256]) {
 		subst_expr(e->args[i], tmpl, targs);
 	for (int i = 0; i < e->nfields; i++)
 		subst_expr(e->fvals[i], tmpl, targs);
+	if (e->spread)
+		subst_expr(e->spread, tmpl, targs);
 	for (int i = 0; i < e->narms; i++)
 		subst_expr(e->arms[i].body, tmpl, targs);
 }
@@ -3231,6 +3261,8 @@ static void subst_value_expr(Expr *e, char names[][64], long *vals, int nv) {
 		subst_value_expr(e->args[i], names, vals, nv);
 	for (int i = 0; i < e->nfields; i++)
 		subst_value_expr(e->fvals[i], names, vals, nv);
+	if (e->spread)
+		subst_value_expr(e->spread, names, vals, nv);
 	for (int i = 0; i < e->narms; i++)
 		subst_value_expr(e->arms[i].body, names, vals, nv);
 }
@@ -3563,6 +3595,8 @@ static void monomorph_expr(Program *prog, Func *fn, Expr *e) {
 		monomorph_expr(prog, fn, e->args[i]);
 	for (int i = 0; i < e->nfields; i++)
 		monomorph_expr(prog, fn, e->fvals[i]);
+	if (e->spread)
+		monomorph_expr(prog, fn, e->spread);
 	for (int i = 0; i < e->narms; i++)
 		monomorph_expr(prog, fn, e->arms[i].body);
 	/* A generic record literal (`Box[Int]{…}`) or union member value (`Maybe[Int].Just`)
@@ -3820,6 +3854,8 @@ static void specialize_calls_expr(Program *prog, Func *fn, Expr *e) {
 		specialize_calls_expr(prog, fn, e->args[i]);
 	for (int i = 0; i < e->nfields; i++)
 		specialize_calls_expr(prog, fn, e->fvals[i]);
+	if (e->spread)
+		specialize_calls_expr(prog, fn, e->spread);
 	for (int i = 0; i < e->narms; i++)
 		specialize_calls_expr(prog, fn, e->arms[i].body);
 }
@@ -4286,6 +4322,32 @@ static void resolve_record_binding(Program *prog, Func *fn, Stmt *s) {
 		check_member_value(prog, fn, e->fvals[k], data_field_type(prog, d, idx), e->line);
 		e->ford[idx] = e->fvals[k];
 	}
+	if (e->spread) {
+		/* Fill each un-overridden field from the spread source. The source must be a
+		 * bare same-type record variable (re-read once per copied field — an EX_VAR read
+		 * is a cheap pointer load, so no double-evaluation); a copied field must be
+		 * word-sized, since a shallow copy of an aggregate field would alias its
+		 * sub-record and reopen the value-semantics hole (an explicitly-overridden
+		 * aggregate field is fine — it is not copied). The whole literal remains a FRESH
+		 * arena allocation (emit), so this is a genuine copy, never an alias of `src`. */
+		if (e->spread->kind != EX_VAR)
+			die(e->line, "a record spread source must be a bare record variable");
+		Type st = typeof_expr(prog, fn, e->spread);
+		if (st.kind != TY_RECORD || st.rec != d)
+			die(e->line, "a record spread source must be the same record type as the target");
+		for (int i = 0; i < d->nfields; i++) {
+			if (e->ford[i]) /* explicitly overridden — not copied */
+				continue;
+			if (!type_is_word(data_field_type(prog, d, i)))
+				die(e->line, "a spread-copied field must be word-sized (a shallow copy of an aggregate field would alias its sub-record)");
+			Expr *fe = new_expr(EX_FIELD);
+			fe->line = e->line;
+			fe->lhs = e->spread;
+			snprintf(fe->name, sizeof fe->name, "%s", d->fields[i]);
+			typeof_expr(prog, fn, fe); /* resolves rec/foff/rtype for emit */
+			e->ford[i] = fe;
+		}
+	}
 	for (int i = 0; i < d->nfields; i++)
 		if (!e->ford[i])
 			die(e->line, "data literal is missing a field");
@@ -4588,6 +4650,8 @@ static void collect_strlits_expr(Expr *e) {
 		collect_strlits_expr(e->args[i]);
 	for (int i = 0; i < e->nfields; i++)
 		collect_strlits_expr(e->fvals[i]);
+	if (e->spread)
+		collect_strlits_expr(e->spread);
 	for (int i = 0; i < e->narms; i++) /* EX_MATCH arm bodies */
 		collect_strlits_expr(e->arms[i].body);
 }
@@ -5255,6 +5319,8 @@ static void assign_expr_slots(Expr *e, int *n) {
 		assign_expr_slots(e->args[i], n);
 	for (int i = 0; i < e->nfields; i++) /* EX_RECORD field-init values */
 		assign_expr_slots(e->fvals[i], n);
+	if (e->spread)
+		assign_expr_slots(e->spread, n);
 	for (int i = 0; i < e->narms; i++) /* EX_MATCH arm bodies */
 		assign_expr_slots(e->arms[i].body, n);
 }
