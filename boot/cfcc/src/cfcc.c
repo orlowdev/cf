@@ -479,6 +479,7 @@ typedef struct {
  * pointer is filled in by the typecheck pass (parse leaves it NULL). */
 typedef struct DataDecl DataDecl;
 typedef struct UnionDecl UnionDecl;
+typedef struct TupleDecl TupleDecl;
 struct Func; /* forward: an EX_CALL caches its resolved callee for emit */
 
 typedef enum {
@@ -517,6 +518,13 @@ typedef enum {
 	            * Its Int-arity rides on the Expr (`fn_arity`), not here. cfcc restricts function
 	            * types to all-`Int` params and an `Int` return; a CAPTURING closure has no
 	            * runtime value and is a later (specialization) brick. */
+	TY_TUPLE,  /* a tuple `(T0, …, Tn-1)` — a heterogeneous positional product (ebnf § Aggregate
+	            * Literals). An `l` pointer to n arena elements in UNIFORM 8-byte slots (like a
+	            * record: a word element in the low half of its slot, an aggregate element an
+	            * 8-byte pointer). Structural, not nominal — its shape rides on `tup` (interned so
+	            * equal shapes share one decl → identity is a pointer compare). Indexed ONLY at a
+	            * comptime literal `t[k]` (per-position type; not iterable, no `.len`). ⚠ THROWAWAY
+	            * layout, like the record layout: cf0's tuple packs by real element size. */
 } TypeKind;
 
 typedef struct {
@@ -524,6 +532,7 @@ typedef struct {
 	DataDecl *rec;  /* TY_RECORD: the record's declaration */
 	UnionDecl *uni; /* TY_UNION: the union's declaration */
 	int alen;       /* TY_ARRAY: the comptime element count N (elements are Int) */
+	TupleDecl *tup; /* TY_TUPLE: the (interned) tuple shape */
 } Type;
 
 /* The entry ABI kinds an M0 `main` parameter can take: a word (Int, e.g. argc)
@@ -576,6 +585,9 @@ typedef enum {
 	EX_FIELD, /* record field access: base.name (lhs=base record expr) */
 	EX_INDEX, /* array element access: base[index] (lhs=base array, rhs=index Int expr) */
 	EX_ARRAY, /* fixed-array literal `[e0, e1, …]` (elements in args/nargs; type `[nargs Int]`) */
+	EX_TUPLE, /* tuple literal `(e0, e1, …)` (elements in args/nargs; type `(T0, …)` — heterogeneous).
+	           * Reuses the EX_ARRAY arg machinery (every tree walker already recurses `args[]`);
+	           * `rtype.tup` carries the interned shape, filled by typecheck. */
 	EX_RECORD,/* record construction: a data literal { f: v, ... } of type `name` */
 	EX_CALL,  /* function call: name(args) */
 	EX_CAST,  /* numeric cast Int(x)/Uarch(x) — a scalar conversion (lhs=operand, name=target type) */
@@ -825,6 +837,16 @@ struct DataDecl {
 	int ntyparams;
 };
 
+/* A tuple shape `(T0, …, Tn-1)` — a structural, anonymous positional product. Unlike a
+ * nominal `data` record it has no name and no source declaration; it is synthesized from a
+ * tuple literal's element types and INTERNED (prog_intern_tuple), so two literals of the
+ * same shape share one decl and type identity is a `tup` pointer compare. Layout mirrors a
+ * record's uniform 8-byte slots (data_field_offset), so tuple emit reuses the record path. */
+struct TupleDecl {
+	int nelem;
+	Type elems[MAX_FIELDS]; /* per-position element type (cfcc brick 1: Int, Str, or a record) */
+};
+
 #define MAX_UNION_MEMBERS 64
 
 /* A `union Name = { A, B, C }` declaration. M1.1 handles ALL-nullary members — a pure
@@ -961,8 +983,64 @@ struct Program {
 	int nunions, cap_unions;
 	Func **funcs;
 	int nfuncs, cap_funcs;
+	TupleDecl **tuples; /* interned tuple shapes (structural — one decl per distinct shape) */
+	int ntuples, cap_tuples;
 	int closure_counter; /* mints unique names for lifted closures (`__cf_closure_<n>`) */
 };
+
+/* Structural type equality. Scalars match on kind; the nominal aggregates match on their
+ * decl pointer (records/unions) or comptime length (arrays); tuples match element-wise (used
+ * to intern shapes, so afterwards `a.tup == b.tup` is the fast identity test). */
+static int types_equal(Type a, Type b) {
+	if (a.kind != b.kind)
+		return 0;
+	switch (a.kind) {
+	case TY_RECORD: return a.rec == b.rec;
+	case TY_UNION:  return a.uni == b.uni;
+	case TY_ARRAY:  return a.alen == b.alen;
+	case TY_TUPLE:
+		if (a.tup == b.tup)
+			return 1;
+		if (a.tup->nelem != b.tup->nelem)
+			return 0;
+		for (int i = 0; i < a.tup->nelem; i++)
+			if (!types_equal(a.tup->elems[i], b.tup->elems[i]))
+				return 0;
+		return 1;
+	default: return 1; /* INT/PTR/STR/UARCH/BUF/FN — kind alone identifies the type */
+	}
+}
+
+/* Intern a tuple shape: return the existing decl for this element-type list, or create and
+ * register a fresh one. Interning makes structurally-equal tuples share identity. */
+static TupleDecl *prog_intern_tuple(Program *prog, const Type *elems, int n) {
+	for (int i = 0; i < prog->ntuples; i++) {
+		TupleDecl *t = prog->tuples[i];
+		if (t->nelem != n)
+			continue;
+		int same = 1;
+		for (int k = 0; k < n; k++)
+			if (!types_equal(t->elems[k], elems[k])) {
+				same = 0;
+				break;
+			}
+		if (same)
+			return t;
+	}
+	TupleDecl *t = xmalloc(sizeof *t);
+	memset(t, 0, sizeof *t);
+	t->nelem = n;
+	for (int k = 0; k < n; k++)
+		t->elems[k] = elems[k];
+	if (prog->ntuples == prog->cap_tuples) {
+		prog->cap_tuples = prog->cap_tuples ? prog->cap_tuples * 2 : 8;
+		prog->tuples = realloc(prog->tuples, prog->cap_tuples * sizeof *prog->tuples);
+		if (!prog->tuples)
+			die(0, "out of memory");
+	}
+	prog->tuples[prog->ntuples++] = t;
+	return t;
+}
 
 /* Index of a type variable among a function's generic parameters, or -1. */
 static int func_typaram_index(const Func *fn, const char *name) {
@@ -1043,13 +1121,13 @@ static void prog_add_union(Program *prog, UnionDecl *u) {
  * and a tag-only union are word-repr (see type_is_word). Dies if the name is unknown. */
 static Type resolve_member_type(Program *prog, const char *name, int line) {
 	if (strcmp(name, "Int") == 0)
-		return (Type){TY_INT, NULL, NULL, 0};
+		return (Type){TY_INT, NULL, NULL, 0, NULL};
 	UnionDecl *u = prog_find_union(prog, name);
 	if (u)
-		return (Type){TY_UNION, NULL, u, 0};
+		return (Type){TY_UNION, NULL, u, 0, NULL};
 	DataDecl *d = prog_find_data(prog, name);
 	if (d)
-		return (Type){TY_RECORD, d, NULL, 0};
+		return (Type){TY_RECORD, d, NULL, 0, NULL};
 	char msg[128];
 	snprintf(msg, sizeof msg, "unknown field/payload type `%s`", name);
 	die(line, msg);
@@ -1445,9 +1523,43 @@ static Expr *parse_primary(Parser *p, Func *fn) {
 		return parse_data_literal(p, fn, "", t->line);
 	}
 	if (t->kind == TK_LPAREN) {
+		/* `(` opens either a grouped expression `(e)` or a tuple `(e0, e1, …)` — a comma
+		 * after the first element forks to the tuple (ebnf § Aggregate Literals: a one-tuple
+		 * `(e)` ≅ its element, so a lone element, even with a trailing comma, stays grouping).
+		 * An empty `()` is the unit value — not modeled in cfcc (no Unit type) yet. */
+		int line = t->line;
 		advance(p);
-		Expr *e = parse_expr(p, fn);
-		expect(p, TK_RPAREN, "expected `)`");
+		if (peek(p)->kind == TK_RPAREN)
+			die(peek(p)->line, "the unit value `()` is not supported yet");
+		if (peek(p)->kind == TK_ELLIPSIS)
+			die(peek(p)->line, "tuple spread `(...x, …)` is not supported yet");
+		Expr *first = parse_expr(p, fn);
+		if (peek(p)->kind != TK_COMMA) {
+			expect(p, TK_RPAREN, "expected `)`");
+			return first; /* a grouped expression */
+		}
+		Expr *e = new_expr(EX_TUPLE);
+		e->line = line;
+		int cap = 4;
+		e->args = xmalloc(cap * sizeof *e->args);
+		e->args[e->nargs++] = first;
+		while (peek(p)->kind == TK_COMMA) {
+			advance(p); /* , */
+			if (peek(p)->kind == TK_RPAREN) /* trailing comma */
+				break;
+			if (peek(p)->kind == TK_ELLIPSIS)
+				die(peek(p)->line, "tuple spread `(...x, …)` is not supported yet");
+			if (e->nargs == cap) {
+				cap *= 2;
+				e->args = realloc(e->args, cap * sizeof *e->args);
+				if (!e->args)
+					die(0, "out of memory");
+			}
+			e->args[e->nargs++] = parse_expr(p, fn);
+		}
+		expect(p, TK_RPAREN, "expected `)` to close the tuple");
+		if (e->nargs < 2) /* `(e,)` — a one-tuple is just its element (grouping) */
+			return e->args[0];
 		return e;
 	}
 	if (is_ident(t, "loop")) {
@@ -2452,7 +2564,7 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 				die(peek(p)->line, "a `[N Uint8]` buffer has no initializer (`read` fills it)");
 			s->bufsize = bufsize;
 			snprintf(s->bufsize_name, sizeof s->bufsize_name, "%s", bufsize_name);
-			Type bt = {TY_BUF, NULL, NULL, 0};
+			Type bt = {TY_BUF, NULL, NULL, 0, NULL};
 			func_add_local(fn, s->name, mutable, bt, "");
 			return s;
 		}
@@ -2480,7 +2592,7 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 				s->expr = parse_data_literal(p, fn, rectype, name->line);
 			else
 				s->expr = parse_expr(p, fn);
-			Type rt = {TY_RECORD, NULL, NULL, 0};
+			Type rt = {TY_RECORD, NULL, NULL, 0, NULL};
 			func_add_local(fn, s->name, mutable, rt, rectype);
 		} else if (is_str) {
 			/* `const Str name = "literal"` — a Str local binds a string literal only.
@@ -2494,7 +2606,7 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 			if (s->expr->kind != EX_STR)
 				die(name->line, "a Str local binds a string literal only (M0 has no Str copy or interpolation yet)");
 			snprintf(s->type_name, sizeof s->type_name, "Str");
-			Type st = {TY_STR, NULL, NULL, 0};
+			Type st = {TY_STR, NULL, NULL, 0, NULL};
 			func_add_local(fn, s->name, mutable, st, "Str");
 		} else if (is_arr) {
 			/* `const [N Int] xs = [e0, …]` — a fixed array bound to an array literal
@@ -2509,7 +2621,7 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 			s->expr = parse_expr(p, fn);
 			if (s->expr->kind != EX_ARRAY)
 				die(name->line, "a `[N Int]` array binds an array literal `[…]` (an array-returning call is not supported yet)");
-			Type at = {TY_ARRAY, NULL, NULL, 0};
+			Type at = {TY_ARRAY, NULL, NULL, 0, NULL};
 			at.alen = arrlen;
 			func_add_local(fn, s->name, mutable, at, "");
 		} else {
@@ -2519,7 +2631,12 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 				die(peek(p)->line,
 				    "a record binding needs a type annotation, e.g. `const Point p = { x: 1 }`");
 			s->expr = parse_expr(p, fn); /* initializer: name not yet in scope */
-			Type it = {TY_INT, NULL, NULL, 0};
+			/* A tuple binds `const` only (like a `[N Int]` array): a mutable tuple, whole-
+			 * tuple reassignment, and element assignment are later bricks. The local is added
+			 * as a provisional word; typecheck retypes it to the interned tuple shape. */
+			if (mutable && s->expr->kind == EX_TUPLE)
+				die(name->line, "a tuple must be bound with `const` (a mutable tuple is a later brick)");
+			Type it = {TY_INT, NULL, NULL, 0, NULL};
 			func_add_local(fn, s->name, mutable, it, "");
 		}
 		return s;
@@ -2583,7 +2700,7 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 			die(s->line, "M1 `for` iterates a bare array variable (`for x in xs`)");
 		/* The loop var is a const Int local; a hidden counter local carries the index.
 		 * Both are word locals (their `%s_` slots are hoisted to the entry block). */
-		Type ti = {TY_INT, NULL, NULL, 0};
+		Type ti = {TY_INT, NULL, NULL, 0, NULL};
 		Type tmp;
 		if (resolve_name(fn, varname, &tmp) != R_NONE || func_find_closure(fn, varname) >= 0)
 			die(vt->line, "name already defined (no shadowing in M0)");
@@ -4304,9 +4421,9 @@ static int loop_body_yields(const Stmt *body) {
 static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 	switch (e->kind) {
 	case EX_INT:
-		return (Type){TY_INT, NULL, NULL, 0};
+		return (Type){TY_INT, NULL, NULL, 0, NULL};
 	case EX_STR:
-		return (Type){TY_STR, NULL, NULL, 0};
+		return (Type){TY_STR, NULL, NULL, 0, NULL};
 	case EX_VAR: {
 		/* A function reference (a bare top-level function or capture-free closure name):
 		 * a function VALUE, valid only as a `(…) Int` argument. Resolve it to its emit
@@ -4334,7 +4451,7 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 				die(e->line, "a function value must return `Int` (M0)");
 			snprintf(e->name, sizeof e->name, "%s", g->name); /* the emit symbol ($<name>) */
 			e->fn_arity = g->nparams;
-			return (Type){TY_FN, NULL, NULL, 0};
+			return (Type){TY_FN, NULL, NULL, 0, NULL};
 		}
 		/* A match-arm payload binding shadows params/locals; its value is an Int read
 		 * from the `%pb<id>` storage temp (loaded at the arm block). */
@@ -4363,16 +4480,16 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 			 * — enough to hand a buffer + length to `write`. (Both are provisional
 			 * cfcc surface over the throwaway {bytes*,len} header; cf0's Str API differs.) */
 			if (strcmp(e->name, "len") == 0)
-				return (Type){TY_INT, NULL, NULL, 0};
+				return (Type){TY_INT, NULL, NULL, 0, NULL};
 			if (strcmp(e->name, "bytes") == 0)
-				return (Type){TY_PTR, NULL, NULL, 0};
+				return (Type){TY_PTR, NULL, NULL, 0, NULL};
 			die(e->line, "a string has only the `.len` and `.bytes` fields");
 		}
 		if (base.kind == TY_ARRAY) {
 			/* A fixed array exposes `.len`, its comptime element count (an Int). Emit
 			 * reads the constant from the base's cached rtype.alen. */
 			if (strcmp(e->name, "len") == 0)
-				return (Type){TY_INT, NULL, NULL, 0};
+				return (Type){TY_INT, NULL, NULL, 0, NULL};
 			die(e->line, "a fixed array has only the `.len` field");
 		}
 		if (base.kind != TY_RECORD)
@@ -4385,14 +4502,26 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		return data_field_type(prog, base.rec, idx); /* Int or an aggregate field type */
 	}
 	case EX_INDEX: {
-		/* `base[i]` — the base must be a fixed array, the index an Int; yields the
-		 * element type (Int). No bounds check (throwaway; cf0's `[N T]` is bounds-checked).
-		 * ⚠ cf0 must NOT inherit: §6.2 makes the index a `Uarch` — cfcc uses Int (see TY_ARRAY). */
+		/* `base[i]` — a fixed array (runtime index → Int element) or a tuple (COMPTIME
+		 * literal index → the exact per-position element type). No array bounds check
+		 * (throwaway; cf0's `[N T]` is bounds-checked). ⚠ cf0 must NOT inherit the array
+		 * index type: §6.2 makes it a `Uarch` — cfcc uses Int (see TY_ARRAY). */
 		Type base = typeof_expr(prog, fn, e->lhs);
+		if (base.kind == TY_TUPLE) {
+			/* A tuple is heterogeneous, so the position must be statically known — only a
+			 * literal `t[k]`, in range, yields a well-defined element type. */
+			if (e->rhs->kind != EX_INT)
+				die(e->line, "a tuple is indexed only at a comptime literal position (`t[0]`), "
+				             "so each access has a known element type");
+			long k = e->rhs->ival;
+			if (k < 0 || k >= base.tup->nelem)
+				die(e->line, "tuple index out of range");
+			return base.tup->elems[k];
+		}
 		if (base.kind != TY_ARRAY)
-			die(e->line, "index `[…]` needs a fixed-array value on the left");
+			die(e->line, "index `[…]` needs a fixed-array or tuple value on the left");
 		expect_int(prog, fn, e->rhs);
-		return (Type){TY_INT, NULL, NULL, 0};
+		return (Type){TY_INT, NULL, NULL, 0, NULL};
 	}
 	case EX_ARRAY: {
 		/* A fixed-array literal `[e0, …]`: every element is an Int (M1 element type);
@@ -4400,8 +4529,35 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		 * initializer — resolve_array_binding checks the length matches the annotation. */
 		for (int i = 0; i < e->nargs; i++)
 			expect_int(prog, fn, e->args[i]);
-		Type t = {TY_ARRAY, NULL, NULL, 0};
+		Type t = {TY_ARRAY, NULL, NULL, 0, NULL};
 		t.alen = e->nargs;
+		return t;
+	}
+	case EX_TUPLE: {
+		/* A tuple literal `(e0, …, en-1)`: type each element and intern the shape. Brick 1
+		 * elements are Int, Str, or a FRESH record (a record-returning call or literal) — an
+		 * aggregate element takes over its arena storage, so aliasing an existing record is
+		 * rejected (the record-field freshness rule, memory_model §6). Array/tuple/union/
+		 * pointer elements are a later brick. */
+		Type elems[MAX_FIELDS];
+		if (e->nargs > MAX_FIELDS)
+			die(e->line, "tuple has too many elements");
+		for (int i = 0; i < e->nargs; i++) {
+			Type et = typeof_expr(prog, fn, e->args[i]);
+			if (type_is_word(et) || et.kind == TY_STR) {
+				/* Int, a tag-only union (a word), or an immutable Str literal — no alias risk. */
+			} else if (et.kind == TY_RECORD) {
+				if (e->args[i]->kind != EX_CALL && e->args[i]->kind != EX_RECORD)
+					die(e->args[i]->line, "a record tuple element must be a fresh value (a record-"
+					                      "returning call or literal), not an alias of existing storage");
+			} else {
+				die(e->args[i]->line, "a tuple element is an Int, Str, or record value in cfcc "
+				                      "(array/tuple/union/pointer elements are a later brick)");
+			}
+			elems[i] = et;
+		}
+		Type t = {TY_TUPLE, NULL, NULL, 0, NULL};
+		t.tup = prog_intern_tuple(prog, elems, e->nargs);
 		return t;
 	}
 	case EX_RECORD:
@@ -4437,7 +4593,7 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 				for (int i = 0; i < e->nargs; i++)
 					expect_int(prog, fn, e->args[i]);
 				e->indirect = 1;
-				return (Type){TY_INT, NULL, NULL, 0};
+				return (Type){TY_INT, NULL, NULL, 0, NULL};
 			}
 		}
 		/* A call to a closure bound in this function rewrites to a call of its lifted
@@ -4548,7 +4704,7 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 			check_member_value(prog, fn, e->args[i], union_payload_type(prog, u, tag, i), e->line);
 		e->uni = u;
 		e->ival = tag; /* the member's tag */
-		return (Type){TY_UNION, NULL, u, 0};
+		return (Type){TY_UNION, NULL, u, 0, NULL};
 	}
 	case EX_MATCH: {
 		/* Compare-chain over a union scrutinee's tag (seed_subset §7). Each arm names a
@@ -4562,7 +4718,7 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		e->uni = u;
 		int covered[MAX_UNION_MEMBERS] = {0};
 		int has_wild = 0, have_rt = 0;
-		Type rt = {TY_INT, NULL, NULL, 0}; /* the arms' common (result) type */
+		Type rt = {TY_INT, NULL, NULL, 0, NULL}; /* the arms' common (result) type */
 		for (int i = 0; i < e->narms; i++) {
 			MatchArm *a = &e->arms[i];
 			if (has_wild)
@@ -4640,13 +4796,13 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		Type at = typeof_expr(prog, fn, e->lhs);
 		if (at.kind != TY_INT && at.kind != TY_UARCH)
 			die(e->line, "a numeric cast `Int(x)`/`Uarch(x)` takes a scalar integer value");
-		return (Type){strcmp(e->name, "Uarch") == 0 ? TY_UARCH : TY_INT, NULL, NULL, 0};
+		return (Type){strcmp(e->name, "Uarch") == 0 ? TY_UARCH : TY_INT, NULL, NULL, 0, NULL};
 	}
 	case EX_IF:
 		expect_int(prog, fn, e->lhs); /* condition */
 		expect_int(prog, fn, e->rhs); /* then — M0 if-branches are Int */
 		expect_int(prog, fn, e->els); /* else */
-		return (Type){TY_INT, NULL, NULL, 0};
+		return (Type){TY_INT, NULL, NULL, 0, NULL};
 	case EX_LOOP:
 		/* A value-yielding `loop`: check its body (each `<- v` yields an Int — validated
 		 * per-statement in check_stmts), and require at least one yield so the loop has a
@@ -4656,7 +4812,7 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		if (!loop_body_yields(e->loop_body))
 			die(e->line, "a value-yielding `loop` must reach a `<- v` (add a yield, or use a "
 			             "statement `loop` if no value is needed)");
-		return (Type){TY_INT, NULL, NULL, 0};
+		return (Type){TY_INT, NULL, NULL, 0, NULL};
 	case EX_DEFER: {
 		/* A `defer` tap: type its call (validates callee/args, caches the call's and
 		 * each arg's rtype for emit), then yield the *tapped argument* — the call's last
@@ -4672,14 +4828,14 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 	case EX_BNOT:
 	case EX_LNOT:
 		expect_int(prog, fn, e->lhs);
-		return (Type){TY_INT, NULL, NULL, 0};
+		return (Type){TY_INT, NULL, NULL, 0, NULL};
 	case EX_ADD: case EX_SUB: case EX_MUL: case EX_DIV: case EX_REM:
 	case EX_BOR: case EX_BXOR: case EX_BAND: case EX_SHL: case EX_SHR:
 	case EX_EQ: case EX_NE: case EX_LT: case EX_GT: case EX_LE: case EX_GE:
 	case EX_AND: case EX_OR:
 		expect_int(prog, fn, e->lhs);
 		expect_int(prog, fn, e->rhs);
-		return (Type){TY_INT, NULL, NULL, 0};
+		return (Type){TY_INT, NULL, NULL, 0, NULL};
 	}
 	die(e->line, "internal: unhandled expression kind in typecheck");
 }
@@ -4695,12 +4851,12 @@ static Type typeof_expr(Program *prog, Func *fn, Expr *e) {
 /* A function's declared return type: a record (returned by pointer) or Int. */
 static Type func_ret_type(const Func *fn) {
 	if (strcmp(fn->ret_type_name, "Uarch") == 0)
-		return (Type){TY_UARCH, NULL, NULL, 0};
+		return (Type){TY_UARCH, NULL, NULL, 0, NULL};
 	if (fn->ret_uni)
-		return (Type){TY_UNION, NULL, fn->ret_uni, 0};
+		return (Type){TY_UNION, NULL, fn->ret_uni, 0, NULL};
 	if (fn->ret_type_name[0])
-		return (Type){TY_RECORD, fn->ret_rec, NULL, 0};
-	return (Type){TY_INT, NULL, NULL, 0};
+		return (Type){TY_RECORD, fn->ret_rec, NULL, 0, NULL};
+	return (Type){TY_INT, NULL, NULL, 0, NULL};
 }
 
 /* Backfill a record local's declaration so later field accesses resolve. */
@@ -4717,8 +4873,18 @@ static void set_local_rec(Func *fn, const char *name, DataDecl *d) {
 static void set_local_record_type(Func *fn, const char *name, DataDecl *d) {
 	for (int i = 0; i < fn->nlocals; i++)
 		if (strcmp(fn->locals[i].name, name) == 0) {
-			fn->locals[i].type = (Type){TY_RECORD, d, NULL, 0};
+			fn->locals[i].type = (Type){TY_RECORD, d, NULL, 0, NULL};
 			snprintf(fn->locals[i].type_name, sizeof fn->locals[i].type_name, "%s", d->name);
+			return;
+		}
+}
+
+/* Retype a local (parsed provisionally as a word `Int`) to a tuple — for an inferred
+ * binding `const t = (1, "x")` whose shape comes from the literal, not an annotation. */
+static void set_local_tuple(Func *fn, const char *name, TupleDecl *tup) {
+	for (int i = 0; i < fn->nlocals; i++)
+		if (strcmp(fn->locals[i].name, name) == 0) {
+			fn->locals[i].type = (Type){TY_TUPLE, NULL, NULL, 0, tup};
 			return;
 		}
 }
@@ -4755,7 +4921,7 @@ static void set_local_union(Func *fn, const char *name, UnionDecl *u) {
  * call argument), which cf0 restores. */
 static void resolve_record_literal(Program *prog, Func *fn, Expr *e, DataDecl *d) {
 	e->rec = d;
-	e->rtype = (Type){TY_RECORD, d, NULL, 0};
+	e->rtype = (Type){TY_RECORD, d, NULL, 0, NULL};
 	e->ford = xmalloc((size_t)d->nfields * sizeof *e->ford);
 	for (int i = 0; i < d->nfields; i++)
 		e->ford[i] = NULL;
@@ -4881,6 +5047,12 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 				 * from the constructor (no annotation needed; the local was parsed as a word). */
 				Type it = typeof_expr(prog, fn, s->expr);
 				set_local_record_type(fn, s->name, it.rec);
+			} else if (s->expr->kind == EX_TUPLE) {
+				/* `const t = (1, "x")` — the tuple's structural shape is inferred from the
+				 * literal (no annotation); the local, parsed as a word, is retyped to the
+				 * interned tuple and homes in the arena via `%r_<name>`. */
+				Type it = typeof_expr(prog, fn, s->expr);
+				set_local_tuple(fn, s->name, it.tup);
 			} else {
 				expect_int(prog, fn, s->expr);                /* a word local */
 			}
@@ -5230,11 +5402,11 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 			snprintf(dst, cap, "%%pb%d", e->bind_id);
 			return;
 		}
-		/* A record, byte-buffer, fixed-array, or boxed (payload) union name is an arena
-		 * pointer (`%r_<name>`), used directly as an operand; a word name (Int or tag-only
-		 * union) is a `loadw` from its slot. */
+		/* A record, byte-buffer, fixed-array, tuple, or boxed (payload) union name is an
+		 * arena pointer (`%r_<name>`), used directly as an operand; a word name (Int or
+		 * tag-only union) is a `loadw` from its slot. */
 		if (e->rtype.kind == TY_RECORD || e->rtype.kind == TY_BUF || e->rtype.kind == TY_ARRAY ||
-		    (e->rtype.kind == TY_UNION && e->rtype.uni->has_payload)) {
+		    e->rtype.kind == TY_TUPLE || (e->rtype.kind == TY_UNION && e->rtype.uni->has_payload)) {
 			snprintf(dst, cap, "%%r_%s", e->name);
 			return;
 		}
@@ -5313,24 +5485,64 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		return;
 	}
 	case EX_INDEX: {
-		/* `xs[i]` — element pointer = base + i*8 (widen the word index to a long first),
-		 * then load the element word. No bounds check (throwaway). */
-		char base[96], idx[96];
+		/* A tuple index `t[k]` has a COMPTIME literal position (k*8 is a constant offset) and
+		 * loads a word or an 8-byte pointer per the element's type; an array index `xs[i]`
+		 * takes a runtime word index (widened to a long, *8) and always loads a word. Neither
+		 * bounds-checks (throwaway). */
+		char base[96];
 		emit_expr(out, e->lhs, ex, base, sizeof base);
-		emit_expr(out, e->rhs, ex, idx, sizeof idx);
-		int iw = ex->tmp++;
-		fprintf(out, "\t%%t%d =l extsw %s\n", iw, idx);
-		int off = ex->tmp++;
-		fprintf(out, "\t%%t%d =l mul %%t%d, 8\n", off, iw);
-		int addr = ex->tmp++;
-		fprintf(out, "\t%%t%d =l add %s, %%t%d\n", addr, base, off);
+		char addr[96];
+		if (e->lhs->rtype.kind == TY_TUPLE) {
+			long off = e->rhs->ival * 8; /* rhs is a literal (checked in typeof) */
+			if (off == 0) {
+				snprintf(addr, sizeof addr, "%s", base);
+			} else {
+				int a = ex->tmp++;
+				fprintf(out, "\t%%t%d =l add %s, %ld\n", a, base, off);
+				snprintf(addr, sizeof addr, "%%t%d", a);
+			}
+		} else {
+			char idx[96];
+			emit_expr(out, e->rhs, ex, idx, sizeof idx);
+			int iw = ex->tmp++;
+			fprintf(out, "\t%%t%d =l extsw %s\n", iw, idx);
+			int o = ex->tmp++;
+			fprintf(out, "\t%%t%d =l mul %%t%d, 8\n", o, iw);
+			int a = ex->tmp++;
+			fprintf(out, "\t%%t%d =l add %s, %%t%d\n", a, base, o);
+			snprintf(addr, sizeof addr, "%%t%d", a);
+		}
 		int r = ex->tmp++;
-		fprintf(out, "\t%%t%d =w loadw %%t%d\n", r, addr);
+		if (type_is_word(e->rtype)) /* an Int/tag-only element is a word; an aggregate a pointer */
+			fprintf(out, "\t%%t%d =w loadw %s\n", r, addr);
+		else
+			fprintf(out, "\t%%t%d =l loadl %s\n", r, addr);
 		snprintf(dst, cap, "%%t%d", r);
 		return;
 	}
 	case EX_ARRAY:
 		die(e->line, "internal: array literal in expression position");
+	case EX_TUPLE: {
+		/* Construct a tuple in the arena: bump-allocate n uniform 8-byte slots and store each
+		 * element at slot i (a word Int/Str/tag-only element via storew/storel, an aggregate
+		 * element as its arena pointer). Yields the fresh base pointer. Mirrors EX_RECORD. */
+		int r = ex->tmp++;
+		fprintf(out, "\t%%t%d =l call $cf_alloc(w %d)\n", r, e->nargs * 8);
+		for (int i = 0; i < e->nargs; i++) {
+			char ev[96];
+			emit_expr(out, e->args[i], ex, ev, sizeof ev);
+			const char *st = type_is_word(e->args[i]->rtype) ? "storew" : "storel";
+			if (i == 0) {
+				fprintf(out, "\t%s %s, %%t%d\n", st, ev, r);
+			} else {
+				int a = ex->tmp++;
+				fprintf(out, "\t%%t%d =l add %%t%d, %d\n", a, r, i * 8);
+				fprintf(out, "\t%s %s, %%t%d\n", st, ev, a);
+			}
+		}
+		snprintf(dst, cap, "%%t%d", r);
+		return;
+	}
 	case EX_RECORD: {
 		/* Construct a record in expression position (a directly-returned literal
 		 * `-> ({…})`): bump-allocate its storage, store each field at its offset (in
@@ -5760,10 +5972,11 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 						fprintf(out, "\t%s %s, %%t%d\n", st, fv, a);
 					}
 				}
-			} else if (s->expr->rtype.kind == TY_RECORD ||
+			} else if (s->expr->rtype.kind == TY_RECORD || s->expr->rtype.kind == TY_TUPLE ||
 			           (s->expr->rtype.kind == TY_UNION && s->expr->rtype.uni->has_payload)) {
-				/* A record or boxed-union local: adopt the initializer's fresh arena
-				 * pointer as this local's storage (a move, no copy). */
+				/* A record, tuple, or boxed-union local: adopt the initializer's fresh arena
+				 * pointer as this local's storage (a move, no copy). The EX_TUPLE emit built
+				 * the tuple in the arena and yielded its base pointer. */
 				emit_expr(out, s->expr, ex, v, sizeof v);
 				fprintf(out, "\t%%r_%s =l copy %s\n", s->name, v);
 			} else if (s->expr->rtype.kind == TY_STR) {
