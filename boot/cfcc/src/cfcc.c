@@ -5310,21 +5310,29 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 				set_local_tuple(fn, s->name, it.tup);
 			} else if (s->expr->kind == EX_INDEX) {
 				/* `const a = t[k]` (also a destructuring's desugared element binding): an Int
-				 * position stays a word local; a Str position (immutable) retypes to a Str
-				 * local. A record position would ALIAS the tuple's arena slot — sound only
-				 * while both stay read-only, which cfcc can't yet enforce across a `let`, so it
-				 * is deferred: skip it in the pattern (`_`) and read it with `t[k]`. */
+				 * position stays a word local; a Str position retypes to a Str local; a record
+				 * position retypes to a record local that ALIASES the tuple's arena slot. That
+				 * alias is sound only while BOTH sides stay read-only — the tuple is immutable
+				 * and a `const` record cannot have its fields mutated, so `const` is required
+				 * for Str and record positions (a `let` record could mutate the shared storage,
+				 * a second mutable binding memory_model §6 forbids). */
 				Type it = typeof_expr(prog, fn, s->expr);
+				Type lt;
+				int is_let = resolve_name(fn, s->name, &lt) == R_LET;
 				if (it.kind == TY_INT) {
-					/* a word local — its provisional Int type already fits */
+					/* a word local — its provisional Int type already fits (a value copy) */
 				} else if (it.kind == TY_STR) {
-					Type lt;
-					if (resolve_name(fn, s->name, &lt) == R_LET)
-						die(s->line, "a Str binding must be `const` (a `let` Str is a later brick)");
+					if (is_let)
+						die(s->line, "a Str position binds `const` (a `let` Str is a later brick)");
 					set_local_str(fn, s->name);
+				} else if (it.kind == TY_RECORD) {
+					if (is_let)
+						die(s->line, "a record position binds `const` (a `let` would alias the "
+						             "tuple's storage mutably — not allowed without a copy)");
+					set_local_record_type(fn, s->name, it.rec);
 				} else {
-					die(s->line, "cfcc binds an Int or Str position from an index; a record "
-					             "position is reached by skipping it (`_`) and indexing `t[k]` (a later brick)");
+					die(s->line, "cfcc binds an Int, Str, or record position from an index "
+					             "(array/tuple/union positions are a later brick)");
 				}
 			} else {
 				/* Any other initializer: an Int (a word local), or a TUPLE-valued expression
