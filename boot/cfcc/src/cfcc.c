@@ -484,6 +484,19 @@ typedef enum {
 	            * writable buffer `read` fills. Named by a local; decays to a `*[Uint8]`
 	            * where a pointer/Uarch is expected. Throwaway: no indexing/bounds, no
 	            * length value (cf0's `[N Uint8]` is a real array). */
+	TY_ARRAY,  /* a `[N Int]` FIXED ARRAY — an `l` pointer to N arena elements (an aggregate,
+	            * like a record: passed by pointer, fresh-allocated, value semantics, const-only).
+	            * The comptime length N rides on `alen`. Index `xs[i]` (runtime i, no bounds
+	            * check) and length `xs.len` (comptime constant) read it; a future `for` brick
+	            * will iterate it. ⚠ THROWAWAY — cf0 must NOT inherit (type_system §6.2/§7.2):
+	            * elements are Int-only in uniform 8-byte slots (cf0's `[N T]` is any element
+	            * type, tightly packed); the index is a signed `Int` and `.len` returns `Int`,
+	            * whereas §6.2 makes BOTH `Uarch` (cfcc has no Uarch arithmetic, so it stays Int
+	            * — an owner-flagged genesis narrowing); `.len` is a PROVISIONAL cfcc surface
+	            * spelling (like Str's `.len` — the spec names no array-length accessor, so cf0's
+	            * array API may differ); indexing is unchecked (cf0 bounds-checks); the length
+	            * must be annotated (cf0 infers `[N T]` from the literal, §7.2); and an array
+	            * cannot yet be a parameter, a return, or a record/union field. */
 	TY_UNION,  /* a `union` type. M1.1 handles ALL-nullary (tag-only) unions only, which
 	            * lower to a plain integer tag (type_system §8.4) — so a union value is a
 	            * `w`, stored/read like an Int; the union identity (for match) is `uni`.
@@ -499,6 +512,7 @@ typedef struct {
 	TypeKind kind;
 	DataDecl *rec;  /* TY_RECORD: the record's declaration */
 	UnionDecl *uni; /* TY_UNION: the union's declaration */
+	int alen;       /* TY_ARRAY: the comptime element count N (elements are Int) */
 } Type;
 
 /* The entry ABI kinds an M0 `main` parameter can take: a word (Int, e.g. argc)
@@ -549,6 +563,8 @@ typedef enum {
 	EX_STR,   /* string literal (sval/slen; strid names its module data) */
 	EX_VAR,   /* reference to a bound name (param or local; any type) */
 	EX_FIELD, /* record field access: base.name (lhs=base record expr) */
+	EX_INDEX, /* array element access: base[index] (lhs=base array, rhs=index Int expr) */
+	EX_ARRAY, /* fixed-array literal `[e0, e1, …]` (elements in args/nargs; type `[nargs Int]`) */
 	EX_RECORD,/* record construction: a data literal { f: v, ... } of type `name` */
 	EX_CALL,  /* function call: name(args) */
 	EX_CAST,  /* numeric cast Int(x)/Uarch(x) — a scalar conversion (lhs=operand, name=target type) */
@@ -1000,13 +1016,13 @@ static void prog_add_union(Program *prog, UnionDecl *u) {
  * and a tag-only union are word-repr (see type_is_word). Dies if the name is unknown. */
 static Type resolve_member_type(Program *prog, const char *name, int line) {
 	if (strcmp(name, "Int") == 0)
-		return (Type){TY_INT, NULL, NULL};
+		return (Type){TY_INT, NULL, NULL, 0};
 	UnionDecl *u = prog_find_union(prog, name);
 	if (u)
-		return (Type){TY_UNION, NULL, u};
+		return (Type){TY_UNION, NULL, u, 0};
 	DataDecl *d = prog_find_data(prog, name);
 	if (d)
-		return (Type){TY_RECORD, d, NULL};
+		return (Type){TY_RECORD, d, NULL, 0};
 	char msg[128];
 	snprintf(msg, sizeof msg, "unknown field/payload type `%s`", name);
 	die(line, msg);
@@ -1102,7 +1118,7 @@ static int find_active_bind_type(Func *fn, const char *name, Type *ty) {
 }
 
 /* Record a new local with the given type. Caller has checked for a clash. For a
- * record local parse passes {TY_RECORD, NULL, NULL}; the typecheck pass backfills rec
+ * record local parse passes {TY_RECORD, NULL, NULL, 0}; the typecheck pass backfills rec
  * (see resolve_record_binding). */
 static void func_add_local(Func *fn, const char *name, int mutable, Type ty, const char *type_name) {
 	if (fn->nlocals == fn->cap_locals) {
@@ -1309,6 +1325,25 @@ static void parse_paren_params(Parser *p, Func *fn) {
 
 static Expr *parse_expr(Parser *p, Func *fn); /* forward */
 
+/* Disambiguate `name[…]`: a generic call `f[Type](args)` vs an array index `xs[i]`.
+ * Assumes the current token is `[`; returns 1 iff the matching `]` is immediately
+ * followed by `(` (the call form). Scans the token stream tracking bracket depth;
+ * the stream is TK_EOF-terminated so the [i+1] peek past the last `]` is safe. */
+static int generic_call_ahead(Parser *p) {
+	int depth = 0;
+	for (size_t i = p->pos;; i++) {
+		TokKind k = p->toks[i].kind;
+		if (k == TK_EOF)
+			return 0;
+		if (k == TK_LBRACKET) {
+			depth++;
+		} else if (k == TK_RBRACKET) {
+			if (--depth == 0)
+				return p->toks[i + 1].kind == TK_LPAREN;
+		}
+	}
+}
+
 /* primary = INT | call | var_name | "(" expr ")"
  * call    = var_name "(" [ expr { "," expr } ] ")"
  * A bare name resolves to an Int parameter or local; a name followed by `(` is a
@@ -1338,6 +1373,41 @@ static Expr *parse_primary(Parser *p, Func *fn) {
 		e->slen = t->slen;
 		return e;
 	}
+	if (t->kind == TK_LBRACKET) {
+		/* Fixed-array literal `[e0, e1, …]` (ebnf aggregate; brackets = arrays only).
+		 * Elements are Int expressions; the value's type is `[nargs Int]`. ⚠ deferred:
+		 * empty `[]` (needs an annotation to know the element type), element spread
+		 * `[...x, …]` (the aggregate-spread tier), and non-Int elements. */
+		int line = t->line;
+		advance(p); /* [ */
+		if (peek(p)->kind == TK_ELLIPSIS)
+			die(peek(p)->line, "aggregate spread `[...x]` is not supported yet");
+		if (peek(p)->kind == TK_RBRACKET)
+			die(peek(p)->line, "an empty array literal `[]` needs a type annotation (not supported yet)");
+		Expr *e = new_expr(EX_ARRAY);
+		e->line = line;
+		int cap = 0;
+		for (;;) {
+			if (peek(p)->kind == TK_ELLIPSIS)
+				die(peek(p)->line, "aggregate spread `[...x]` is not supported yet");
+			if (e->nargs == cap) {
+				cap = cap ? cap * 2 : 4;
+				e->args = realloc(e->args, cap * sizeof *e->args);
+				if (!e->args)
+					die(0, "out of memory");
+			}
+			e->args[e->nargs++] = parse_expr(p, fn);
+			if (peek(p)->kind == TK_COMMA) {
+				advance(p);
+				if (peek(p)->kind == TK_RBRACKET) /* trailing comma */
+					break;
+				continue;
+			}
+			break;
+		}
+		expect(p, TK_RBRACKET, "expected `]` to close the array literal");
+		return e;
+	}
 	if (t->kind == TK_LPAREN) {
 		advance(p);
 		Expr *e = parse_expr(p, fn);
@@ -1355,7 +1425,10 @@ static Expr *parse_primary(Parser *p, Func *fn) {
 			die(t->line, "M0 does not support `!` in a name here");
 		int line = t->line;
 		advance(p); /* `t` still points at the name token (stable in the array) */
-		if (peek(p)->kind == TK_LBRACKET || peek(p)->kind == TK_LPAREN) {
+		/* `name(` is a direct call; `name[Type](` a generic call. A bare `name[i]` NOT
+		 * followed by `(` is an ARRAY INDEX — leave `name` as an EX_VAR here and let
+		 * parse_postfix consume the `[i]`. */
+		if (peek(p)->kind == TK_LPAREN || (peek(p)->kind == TK_LBRACKET && generic_call_ahead(p))) {
 			Expr *e = new_expr(EX_CALL);
 			e->line = line;
 			tok_copy(t, e->name, sizeof e->name);
@@ -1499,19 +1572,34 @@ static Expr *parse_primary(Parser *p, Func *fn) {
  * a record-typed name); the field's type and offset are resolved in typecheck. */
 static Expr *parse_postfix(Parser *p, Func *fn) {
 	Expr *e = parse_primary(p, fn);
-	while (peek(p)->kind == TK_DOT) {
-		advance(p);
-		Token *f = peek(p);
-		if (f->kind != TK_IDENT || is_type_ident(f))
-			die(f->line, "expected a field name after `.`");
-		if (f->text[f->len - 1] == '!')
-			die(f->line, "M0 does not support `!` in a field name");
-		Expr *fe = new_expr(EX_FIELD);
-		fe->line = f->line;
-		fe->lhs = e;
-		tok_copy(f, fe->name, sizeof fe->name);
-		advance(p);
-		e = fe;
+	for (;;) {
+		if (peek(p)->kind == TK_DOT) {
+			advance(p);
+			Token *f = peek(p);
+			if (f->kind != TK_IDENT || is_type_ident(f))
+				die(f->line, "expected a field name after `.`");
+			if (f->text[f->len - 1] == '!')
+				die(f->line, "M0 does not support `!` in a field name");
+			Expr *fe = new_expr(EX_FIELD);
+			fe->line = f->line;
+			fe->lhs = e;
+			tok_copy(f, fe->name, sizeof fe->name);
+			advance(p);
+			e = fe;
+		} else if (peek(p)->kind == TK_LBRACKET) {
+			/* Array index `base[i]` — a `[` reaching postfix is never a generic call
+			 * (parse_primary consumes `name[Type](…)`). The index is a full expression. */
+			int line = peek(p)->line;
+			advance(p); /* [ */
+			Expr *ie = new_expr(EX_INDEX);
+			ie->line = line;
+			ie->lhs = e;
+			ie->rhs = parse_expr(p, fn);
+			expect(p, TK_RBRACKET, "expected `]` to close the index");
+			e = ie;
+		} else {
+			break;
+		}
 	}
 	return e;
 }
@@ -2195,41 +2283,57 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 		advance(p);
 		/* Optional type annotation: `Int` (a word local) or a record type name (a
 		 * `data`-typed local). A pointer annotation has no M0 local use. */
-		int is_record = 0, is_str = 0, is_buf = 0, bufsize = 0;
+		int is_record = 0, is_str = 0, is_buf = 0, bufsize = 0, is_arr = 0, arrlen = 0;
 		char bufsize_name[64] = {0}; /* a `[n Uint8]` buffer sized by a comptime value param */
 		char rectype[64] = {0};
 		Token *tt = peek(p);
 		if (tt->kind == TK_STAR)
 			die(tt->line, "M0 locals are `Int`, `Str`, a `[N Uint8]` buffer, or a record type, not a pointer");
 		if (tt->kind == TK_LBRACKET) {
-			/* `[N Uint8]` — a fixed byte buffer: N arena bytes, no initializer, the
-			 * writable target `read` fills. Throwaway (no indexing/bounds); cf0's
-			 * `[N Uint8]` is a real fixed array. */
+			/* `[N Uint8]` = a fixed byte buffer (no initializer, `read` fills it); `[N Int]`
+			 * = a fixed array (bound to an array literal). Both take a comptime length N.
+			 * The buffer is throwaway (no indexing/bounds); the array supports index/`.len`. */
 			advance(p); /* [ */
 			Token *nt = peek(p);
+			int have_lit = 0;
+			long litN = 0;
 			if (nt->kind == TK_INT) {
 				if (nt->ival <= 0)
-					die(nt->line, "a byte buffer needs a positive comptime length, e.g. `[16 Uint8]`");
+					die(nt->line, "a `[N …]` length must be a positive comptime integer");
 				if (nt->ival > INT32_MAX)
-					die(nt->line, "byte buffer too large");
-				bufsize = (int)nt->ival;
+					die(nt->line, "`[N …]` length too large");
+				litN = nt->ival;
+				have_lit = 1;
 				advance(p);
 			} else { /* a comptime value parameter (`[n Uint8]`) — resolved at instantiation */
 				char nm[64];
 				if (nt->kind != TK_IDENT || is_type_ident(nt))
-					die(nt->line, "a byte buffer needs a comptime length: a literal (`[16 Uint8]`) "
+					die(nt->line, "a `[N …]` needs a comptime length: a literal (`[16 Uint8]`) "
 					              "or a value parameter (`[n Uint8]`)");
 				tok_copy(nt, nm, sizeof nm);
 				if (func_valparam_index(fn, nm) < 0)
-					die(nt->line, "a byte buffer length must be a literal or a comptime value parameter");
+					die(nt->line, "a `[N …]` length must be a literal or a comptime value parameter");
 				snprintf(bufsize_name, sizeof bufsize_name, "%s", nm);
 				advance(p);
 			}
-			if (!is_ident(peek(p), "Uint8"))
-				die(peek(p)->line, "M0 byte buffers hold `Uint8` (e.g. `[16 Uint8]`)");
-			advance(p);
-			expect(p, TK_RBRACKET, "expected `]` to close the `[N Uint8]` buffer type");
-			is_buf = 1;
+			Token *et = peek(p);
+			if (is_ident(et, "Uint8")) {
+				advance(p);
+				if (have_lit)
+					bufsize = (int)litN;
+				is_buf = 1;
+			} else if (is_ident(et, "Int")) {
+				/* A `[N Int]` fixed array. cfcc's array length must be a literal (a
+				 * value-parameter length rides only the `[n Uint8]` buffer path). */
+				if (!have_lit)
+					die(et->line, "a `[N Int]` array length must be a literal (a value-parameter length is only for `[n Uint8]` buffers in M1)");
+				advance(p);
+				arrlen = (int)litN;
+				is_arr = 1;
+			} else {
+				die(et->line, "M0 `[N …]` holds `Uint8` (a byte buffer) or `Int` (a fixed array)");
+			}
+			expect(p, TK_RBRACKET, "expected `]` to close the `[N …]` type");
 		} else if (is_type_ident(tt)) {
 			if (is_ident(tt, "Int")) {
 				advance(p);
@@ -2262,7 +2366,7 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 				die(peek(p)->line, "a `[N Uint8]` buffer has no initializer (`read` fills it)");
 			s->bufsize = bufsize;
 			snprintf(s->bufsize_name, sizeof s->bufsize_name, "%s", bufsize_name);
-			Type bt = {TY_BUF, NULL, NULL};
+			Type bt = {TY_BUF, NULL, NULL, 0};
 			func_add_local(fn, s->name, mutable, bt, "");
 			return s;
 		}
@@ -2290,7 +2394,7 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 				s->expr = parse_data_literal(p, fn, rectype, name->line);
 			else
 				s->expr = parse_expr(p, fn);
-			Type rt = {TY_RECORD, NULL, NULL};
+			Type rt = {TY_RECORD, NULL, NULL, 0};
 			func_add_local(fn, s->name, mutable, rt, rectype);
 		} else if (is_str) {
 			/* `const Str name = "literal"` — a Str local binds a string literal only.
@@ -2304,8 +2408,24 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 			if (s->expr->kind != EX_STR)
 				die(name->line, "a Str local binds a string literal only (M0 has no Str copy or interpolation yet)");
 			snprintf(s->type_name, sizeof s->type_name, "Str");
-			Type st = {TY_STR, NULL, NULL};
+			Type st = {TY_STR, NULL, NULL, 0};
 			func_add_local(fn, s->name, mutable, st, "Str");
+		} else if (is_arr) {
+			/* `const [N Int] xs = [e0, …]` — a fixed array bound to an array literal
+			 * (only; an array-returning call is a later brick). The declared length N
+			 * rides on the local's type; typecheck checks the literal's length matches.
+			 * The array's N elements live in the arena (fresh alloc at emit), like a
+			 * record; `%r_<name>` names the base pointer. ⚠ const-only: element assignment
+			 * `xs[i] = v` (a side-effecting lvalue) and whole-array reassignment are later
+			 * bricks — a `[N Int]` array is read-only after construction in M1. */
+			if (mutable)
+				die(name->line, "a `[N Int]` array must be `const` (mutable arrays / element assignment are a later brick)");
+			s->expr = parse_expr(p, fn);
+			if (s->expr->kind != EX_ARRAY)
+				die(name->line, "a `[N Int]` array binds an array literal `[…]` (an array-returning call is not supported yet)");
+			Type at = {TY_ARRAY, NULL, NULL, 0};
+			at.alen = arrlen;
+			func_add_local(fn, s->name, mutable, at, "");
 		} else {
 			/* A `{` initializer with no type annotation is an attempted record
 			 * literal (M0 requires the annotation to know the record's type). */
@@ -2313,7 +2433,7 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 				die(peek(p)->line,
 				    "a record binding needs a type annotation, e.g. `const Point p = { x: 1 }`");
 			s->expr = parse_expr(p, fn); /* initializer: name not yet in scope */
-			Type it = {TY_INT, NULL, NULL};
+			Type it = {TY_INT, NULL, NULL, 0};
 			func_add_local(fn, s->name, mutable, it, "");
 		}
 		return s;
@@ -2416,6 +2536,14 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 			Stmt *s = new_stmt(ST_EXPR);
 			s->line = t->line;
 			s->expr = parse_expr(p, fn);
+			/* An index expression (`xs[i]`) at statement head followed by `=`/`op=` is an
+			 * attempted element assignment — a side-effecting lvalue, a later brick. */
+			ExprKind cop;
+			if (peek(p)->kind == TK_EQ || compound_assign_op(peek(p)->kind, &cop)) {
+				if (s->expr->kind == EX_INDEX)
+					die(peek(p)->line, "array element assignment (`xs[i] = …`) is not supported yet (arrays are read-only in M1)");
+				die(peek(p)->line, "cannot assign to this expression");
+			}
 			return s;
 		}
 		char target[64];
@@ -3985,9 +4113,9 @@ static void check_member_value(Program *prog, Func *fn, Expr *val, Type want, in
 static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 	switch (e->kind) {
 	case EX_INT:
-		return (Type){TY_INT, NULL, NULL};
+		return (Type){TY_INT, NULL, NULL, 0};
 	case EX_STR:
-		return (Type){TY_STR, NULL, NULL};
+		return (Type){TY_STR, NULL, NULL, 0};
 	case EX_VAR: {
 		/* A function reference (a bare top-level function or capture-free closure name):
 		 * a function VALUE, valid only as a `(…) Int` argument. Resolve it to its emit
@@ -4015,7 +4143,7 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 				die(e->line, "a function value must return `Int` (M0)");
 			snprintf(e->name, sizeof e->name, "%s", g->name); /* the emit symbol ($<name>) */
 			e->fn_arity = g->nparams;
-			return (Type){TY_FN, NULL, NULL};
+			return (Type){TY_FN, NULL, NULL, 0};
 		}
 		/* A match-arm payload binding shadows params/locals; its value is an Int read
 		 * from the `%pb<id>` storage temp (loaded at the arm block). */
@@ -4044,10 +4172,17 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 			 * — enough to hand a buffer + length to `write`. (Both are provisional
 			 * cfcc surface over the throwaway {bytes*,len} header; cf0's Str API differs.) */
 			if (strcmp(e->name, "len") == 0)
-				return (Type){TY_INT, NULL, NULL};
+				return (Type){TY_INT, NULL, NULL, 0};
 			if (strcmp(e->name, "bytes") == 0)
-				return (Type){TY_PTR, NULL, NULL};
+				return (Type){TY_PTR, NULL, NULL, 0};
 			die(e->line, "a string has only the `.len` and `.bytes` fields");
+		}
+		if (base.kind == TY_ARRAY) {
+			/* A fixed array exposes `.len`, its comptime element count (an Int). Emit
+			 * reads the constant from the base's cached rtype.alen. */
+			if (strcmp(e->name, "len") == 0)
+				return (Type){TY_INT, NULL, NULL, 0};
+			die(e->line, "a fixed array has only the `.len` field");
 		}
 		if (base.kind != TY_RECORD)
 			die(e->line, "field access `.` needs a record value on the left");
@@ -4057,6 +4192,26 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		e->rec = base.rec;
 		e->foff = data_field_offset(idx);
 		return data_field_type(prog, base.rec, idx); /* Int or an aggregate field type */
+	}
+	case EX_INDEX: {
+		/* `base[i]` — the base must be a fixed array, the index an Int; yields the
+		 * element type (Int). No bounds check (throwaway; cf0's `[N T]` is bounds-checked).
+		 * ⚠ cf0 must NOT inherit: §6.2 makes the index a `Uarch` — cfcc uses Int (see TY_ARRAY). */
+		Type base = typeof_expr(prog, fn, e->lhs);
+		if (base.kind != TY_ARRAY)
+			die(e->line, "index `[…]` needs a fixed-array value on the left");
+		expect_int(prog, fn, e->rhs);
+		return (Type){TY_INT, NULL, NULL, 0};
+	}
+	case EX_ARRAY: {
+		/* A fixed-array literal `[e0, …]`: every element is an Int (M1 element type);
+		 * the value's type is `[nargs Int]`. Only valid as a `[N Int]` binding's
+		 * initializer — resolve_array_binding checks the length matches the annotation. */
+		for (int i = 0; i < e->nargs; i++)
+			expect_int(prog, fn, e->args[i]);
+		Type t = {TY_ARRAY, NULL, NULL, 0};
+		t.alen = e->nargs;
+		return t;
 	}
 	case EX_RECORD:
 		die(e->line, "a record literal may only initialize a record-typed binding");
@@ -4076,7 +4231,7 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 				for (int i = 0; i < e->nargs; i++)
 					expect_int(prog, fn, e->args[i]);
 				e->indirect = 1;
-				return (Type){TY_INT, NULL, NULL};
+				return (Type){TY_INT, NULL, NULL, 0};
 			}
 		}
 		/* A call to a closure bound in this function rewrites to a call of its lifted
@@ -4187,7 +4342,7 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 			check_member_value(prog, fn, e->args[i], union_payload_type(prog, u, tag, i), e->line);
 		e->uni = u;
 		e->ival = tag; /* the member's tag */
-		return (Type){TY_UNION, NULL, u};
+		return (Type){TY_UNION, NULL, u, 0};
 	}
 	case EX_MATCH: {
 		/* Compare-chain over a union scrutinee's tag (seed_subset §7). Each arm names a
@@ -4201,7 +4356,7 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		e->uni = u;
 		int covered[MAX_UNION_MEMBERS] = {0};
 		int has_wild = 0, have_rt = 0;
-		Type rt = {TY_INT, NULL, NULL}; /* the arms' common (result) type */
+		Type rt = {TY_INT, NULL, NULL, 0}; /* the arms' common (result) type */
 		for (int i = 0; i < e->narms; i++) {
 			MatchArm *a = &e->arms[i];
 			if (has_wild)
@@ -4279,13 +4434,13 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		Type at = typeof_expr(prog, fn, e->lhs);
 		if (at.kind != TY_INT && at.kind != TY_UARCH)
 			die(e->line, "a numeric cast `Int(x)`/`Uarch(x)` takes a scalar integer value");
-		return (Type){strcmp(e->name, "Uarch") == 0 ? TY_UARCH : TY_INT, NULL, NULL};
+		return (Type){strcmp(e->name, "Uarch") == 0 ? TY_UARCH : TY_INT, NULL, NULL, 0};
 	}
 	case EX_IF:
 		expect_int(prog, fn, e->lhs); /* condition */
 		expect_int(prog, fn, e->rhs); /* then — M0 if-branches are Int */
 		expect_int(prog, fn, e->els); /* else */
-		return (Type){TY_INT, NULL, NULL};
+		return (Type){TY_INT, NULL, NULL, 0};
 	case EX_DEFER: {
 		/* A `defer` tap: type its call (validates callee/args, caches the call's and
 		 * each arg's rtype for emit), then yield the *tapped argument* — the call's last
@@ -4301,14 +4456,14 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 	case EX_BNOT:
 	case EX_LNOT:
 		expect_int(prog, fn, e->lhs);
-		return (Type){TY_INT, NULL, NULL};
+		return (Type){TY_INT, NULL, NULL, 0};
 	case EX_ADD: case EX_SUB: case EX_MUL: case EX_DIV: case EX_REM:
 	case EX_BOR: case EX_BXOR: case EX_BAND: case EX_SHL: case EX_SHR:
 	case EX_EQ: case EX_NE: case EX_LT: case EX_GT: case EX_LE: case EX_GE:
 	case EX_AND: case EX_OR:
 		expect_int(prog, fn, e->lhs);
 		expect_int(prog, fn, e->rhs);
-		return (Type){TY_INT, NULL, NULL};
+		return (Type){TY_INT, NULL, NULL, 0};
 	}
 	die(e->line, "internal: unhandled expression kind in typecheck");
 }
@@ -4324,12 +4479,12 @@ static Type typeof_expr(Program *prog, Func *fn, Expr *e) {
 /* A function's declared return type: a record (returned by pointer) or Int. */
 static Type func_ret_type(const Func *fn) {
 	if (strcmp(fn->ret_type_name, "Uarch") == 0)
-		return (Type){TY_UARCH, NULL, NULL};
+		return (Type){TY_UARCH, NULL, NULL, 0};
 	if (fn->ret_uni)
-		return (Type){TY_UNION, NULL, fn->ret_uni};
+		return (Type){TY_UNION, NULL, fn->ret_uni, 0};
 	if (fn->ret_type_name[0])
-		return (Type){TY_RECORD, fn->ret_rec, NULL};
-	return (Type){TY_INT, NULL, NULL};
+		return (Type){TY_RECORD, fn->ret_rec, NULL, 0};
+	return (Type){TY_INT, NULL, NULL, 0};
 }
 
 /* Backfill a record local's declaration so later field accesses resolve. */
@@ -4457,6 +4612,16 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 					resolve_record_binding(prog, fn, s);      /* { … } literal */
 				else
 					resolve_record_expr_binding(prog, fn, s); /* a record-valued call */
+			} else if (s->expr->kind == EX_ARRAY) {           /* a `[N Int]` fixed-array binding */
+				Type dt;
+				resolve_name(fn, s->name, &dt);
+				if (dt.kind != TY_ARRAY)
+					/* ⚠ cf0 must NOT inherit: §7.2 infers `[N T]` from the literal with no
+					 * annotation; cfcc requires the `[N Int]` annotation and infers nothing. */
+					die(s->line, "an array literal needs a `[N Int]` annotation (e.g. `const [3 Int] xs = [1, 2, 3]`)");
+				Type it = typeof_expr(prog, fn, s->expr); /* checks each element is Int; sets alen */
+				if (it.alen != dt.alen)
+					die(s->line, "array literal length does not match the `[N Int]` annotation");
 			} else {
 				expect_int(prog, fn, s->expr);                /* a word local */
 			}
@@ -4776,10 +4941,10 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 			snprintf(dst, cap, "%%pb%d", e->bind_id);
 			return;
 		}
-		/* A record, byte-buffer, or boxed (payload) union name is an arena pointer
-		 * (`%r_<name>`), used directly as an operand; a word name (Int or tag-only
+		/* A record, byte-buffer, fixed-array, or boxed (payload) union name is an arena
+		 * pointer (`%r_<name>`), used directly as an operand; a word name (Int or tag-only
 		 * union) is a `loadw` from its slot. */
-		if (e->rtype.kind == TY_RECORD || e->rtype.kind == TY_BUF ||
+		if (e->rtype.kind == TY_RECORD || e->rtype.kind == TY_BUF || e->rtype.kind == TY_ARRAY ||
 		    (e->rtype.kind == TY_UNION && e->rtype.uni->has_payload)) {
 			snprintf(dst, cap, "%%r_%s", e->name);
 			return;
@@ -4829,6 +4994,12 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 			snprintf(dst, cap, "%%t%d", r);
 			return;
 		}
+		if (e->lhs->rtype.kind == TY_ARRAY) {
+			/* `xs.len` — the comptime element count, emitted as a constant (the base is a
+			 * side-effect-free array local, so it needs no evaluation). */
+			snprintf(dst, cap, "%d", e->lhs->rtype.alen);
+			return;
+		}
 		/* Read a record field. Emit the base to its pointer operand (a record VAR is
 		 * `%r_<name>`, a bound aggregate payload is `%pb<id>`, a record-returning call or a
 		 * chained field access is a temp), add the field offset, then load a word (an Int
@@ -4852,6 +5023,25 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		snprintf(dst, cap, "%%t%d", t);
 		return;
 	}
+	case EX_INDEX: {
+		/* `xs[i]` — element pointer = base + i*8 (widen the word index to a long first),
+		 * then load the element word. No bounds check (throwaway). */
+		char base[96], idx[96];
+		emit_expr(out, e->lhs, ex, base, sizeof base);
+		emit_expr(out, e->rhs, ex, idx, sizeof idx);
+		int iw = ex->tmp++;
+		fprintf(out, "\t%%t%d =l extsw %s\n", iw, idx);
+		int off = ex->tmp++;
+		fprintf(out, "\t%%t%d =l mul %%t%d, 8\n", off, iw);
+		int addr = ex->tmp++;
+		fprintf(out, "\t%%t%d =l add %s, %%t%d\n", addr, base, off);
+		int r = ex->tmp++;
+		fprintf(out, "\t%%t%d =w loadw %%t%d\n", r, addr);
+		snprintf(dst, cap, "%%t%d", r);
+		return;
+	}
+	case EX_ARRAY:
+		die(e->line, "internal: array literal in expression position");
 	case EX_RECORD:
 		die(e->line, "internal: record literal in expression position");
 	case EX_CALL: {
@@ -5200,7 +5390,24 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 				fprintf(out, "\t%%r_%s =l call $cf_alloc(w %d)\n", s->name, s->bufsize);
 				break;
 			}
-			if (s->expr->kind == EX_RECORD) {
+			if (s->expr->kind == EX_ARRAY) {
+				/* A fixed-array local lives in the arena: bump-allocate N*8 bytes
+				 * (`%r_<name>` = the base pointer) and store each element word at
+				 * offset i*8 (uniform 8-byte slots, like a record). */
+				Expr *a = s->expr;
+				fprintf(out, "\t%%r_%s =l call $cf_alloc(w %d)\n", s->name, a->nargs * 8);
+				for (int i = 0; i < a->nargs; i++) {
+					char ev[96];
+					emit_expr(out, a->args[i], ex, ev, sizeof ev);
+					if (i == 0) {
+						fprintf(out, "\tstorew %s, %%r_%s\n", ev, s->name);
+					} else {
+						int off = ex->tmp++;
+						fprintf(out, "\t%%t%d =l add %%r_%s, %d\n", off, s->name, i * 8);
+						fprintf(out, "\tstorew %s, %%t%d\n", ev, off);
+					}
+				}
+			} else if (s->expr->kind == EX_RECORD) {
 				/* A record local lives in the arena: bump-allocate its storage
 				 * (`%r_<name>` = the returned pointer) and store each field's value at
 				 * its offset, in declaration order (ford). */
