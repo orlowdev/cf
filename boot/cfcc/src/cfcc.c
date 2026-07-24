@@ -1070,6 +1070,21 @@ static char param_qtype(const Param *p) {
 	return param_is_word(p) ? 'w' : 'l';
 }
 
+/* True if a value of type `t` can flow through a value-merge slot (`%m`): a scalar that
+ * fits an 8-byte slot — a word (Int/tag-only union/Unit), a Uarch, or a float. An
+ * if/match/loop yielding an aggregate (a record/tuple/boxed-union pointer, a Str) is a
+ * later brick — those carry value semantics the plain merge slot doesn't model. */
+static int is_mergeable_scalar(Type t) {
+	return type_is_word(t) || t.kind == TY_UARCH || is_float_type(t);
+}
+
+/* A type-appropriate zero literal for a `store%c` of qtype `q`. A float slot needs the
+ * `d_`/`s_` constant syntax — a bare `0` is not a valid float operand — so this is used
+ * for the unreachable fall-through store of an exhaustive match. */
+static const char *zero_lit(char q) {
+	return q == 'd' ? "d_0" : q == 's' ? "s_0" : "0";
+}
+
 /* Record layout — uniform 8-byte slots (G3a): field i at byte offset i*8, size nfields*8.
  * A boxed union puts its tag in the first slot, so payload field i sits at 8 + i*8. */
 static int data_size(const DataDecl *d) { return d->nfields * 8; }
@@ -5570,6 +5585,29 @@ static int loop_body_yields(const Stmt *body) {
 	return 0;
 }
 
+/* The value type of a value-yielding loop: the common type of its direct `<- v` yields
+ * (a yield inside a NESTED loop belongs to that loop, so only direct statements count,
+ * like loop_body_yields). Every yield must agree, and the result must be a mergeable
+ * scalar. The caller has already checked loop_body_yields, so at least one yield exists. */
+static Type loop_yield_type(Program *prog, Func *fn, Stmt *body) {
+	Type rt = (Type){TY_INT, NULL, NULL, 0, NULL};
+	int have = 0;
+	for (Stmt *s = body; s; s = s->next) {
+		if (s->kind != ST_YIELD)
+			continue;
+		Type yt = typeof_expr(prog, fn, s->yval);
+		if (!is_mergeable_scalar(yt))
+			die(s->line, "a value-yielding loop yields a scalar value (an aggregate yield is a later brick)");
+		if (!have) {
+			rt = yt;
+			have = 1;
+		} else if (!types_equal(yt, rt)) {
+			die(s->line, "all of a value loop's `<- v` yields must have the same type");
+		}
+	}
+	return rt;
+}
+
 /* Compute and validate the type of an expression, resolving field accesses and
  * calls against the whole program (so forward references and recursion work).
  * Field accesses are annotated in place (rec, foff) for emit. The public entry is
@@ -6043,17 +6081,17 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 					}
 				}
 			}
-			/* Arm bodies unify to one type — an Int or a tag-only union (both a word);
-			 * that type is the match's value type, so a `match` can yield either. The
-			 * scrutinee may still be a boxed (payload) union — a match yielding a boxed
-			 * union (which the word merge slot can't hold) is a later brick. */
+			/* Arm bodies unify to one type — any mergeable scalar (Int/tag-only union/
+			 * Uarch/float); that type is the match's value type. An arm yielding an
+			 * aggregate (a boxed union, record, or tuple pointer, which the plain merge
+			 * slot doesn't model for value semantics) is a later brick. */
 			Type bt = typeof_expr(prog, fn, a->body);
-			if (!type_is_word(bt))
-				die(a->line, "a match arm yields an Int or a tag-only union (a boxed-union result is a later brick)");
+			if (!is_mergeable_scalar(bt))
+				die(a->line, "a match arm yields a scalar value (an aggregate result is a later brick)");
 			if (!have_rt) {
 				rt = bt;
 				have_rt = 1;
-			} else if (bt.kind != rt.kind || (rt.kind == TY_UNION && bt.uni != rt.uni)) {
+			} else if (!types_equal(bt, rt)) {
 				die(a->line, "match arms must all yield the same type");
 			}
 			fn->nabinds = saved_abinds; /* pop this arm's bindings */
@@ -6076,21 +6114,27 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		            : TY_INT;
 		return (Type){tk, NULL, NULL, 0, NULL};
 	}
-	case EX_IF:
+	case EX_IF: {
+		/* if cond then A else B — the condition is truthy when nonzero (Bool arrives in
+		 * N6); the two branches unify to one mergeable scalar, which is the if's type. */
 		expect_int(prog, fn, e->lhs); /* condition */
-		expect_int(prog, fn, e->rhs); /* then — M0 if-branches are Int */
-		expect_int(prog, fn, e->els); /* else */
-		return (Type){TY_INT, NULL, NULL, 0, NULL};
+		Type tb = typeof_expr(prog, fn, e->rhs); /* then */
+		Type eb = typeof_expr(prog, fn, e->els); /* else */
+		if (!is_mergeable_scalar(tb))
+			die(e->line, "an if-branch yields a scalar value (an aggregate result is a later brick)");
+		if (!types_equal(tb, eb))
+			die(e->line, "an if's `then` and `else` branches must yield the same type");
+		return tb;
+	}
 	case EX_LOOP:
-		/* A value-yielding `loop`: check its body (each `<- v` yields an Int — validated
-		 * per-statement in check_stmts), and require at least one yield so the loop has a
-		 * value. M0 merges yields through a word slot, so a loop yields an Int (like an
-		 * if-expression); a record/aggregate yield is out of reach, same limitation. */
+		/* A value-yielding `loop`: check its body (each `<- v` is validated per-statement
+		 * in check_stmts), require at least one yield so the loop has a value, then take
+		 * the common type of those yields as the loop's value type. */
 		check_stmts(prog, fn, e->loop_body);
 		if (!loop_body_yields(e->loop_body))
 			die(e->line, "a value-yielding `loop` must reach a `<- v` (add a yield, or use a "
 			             "statement `loop` if no value is needed)");
-		return (Type){TY_INT, NULL, NULL, 0, NULL};
+		return loop_yield_type(prog, fn, e->loop_body);
 	case EX_DEFER: {
 		/* A `defer` tap: type its call (validates callee/args, caches the call's and
 		 * each arg's rtype for emit), then yield the *tapped argument* — the call's last
@@ -6614,11 +6658,12 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 				expect_int(prog, fn, s->expr);
 			break;
 		case ST_YIELD:
-			/* `<- v` (or `if <cond> then <- v`): the guard, when present, and the yielded
-			 * value are both Int (the loop merges yields through a word slot, § EX_LOOP). */
+			/* `<- v` (or `if <cond> then <- v`): the guard, when present, is a word (truthy
+			 * = nonzero). The yielded value may be any scalar; EX_LOOP unifies all of a
+			 * loop's yields to one type (loop_yield_type), so here it is only validated/cached. */
 			if (s->expr) /* guard */
 				expect_int(prog, fn, s->expr);
-			expect_int(prog, fn, s->yval);
+			typeof_expr(prog, fn, s->yval);
 			break;
 		case ST_EXPR:
 			/* A call or a `defer` tap evaluated for effect: type it (validates the
@@ -7319,6 +7364,7 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		 * entry-block merge slot `%m<slot>` and jumps to @mend; the `_` arm (or, for an
 		 * exhaustive match, an unreachable fallback) is the ladder's fall-through. Arm
 		 * results merge through the slot exactly like `if`. */
+		char mq = qtype_of(e->rtype); /* the merged arm-value width (w/l/s/d) */
 		int id = ex->lbl++;
 		char sc[96];
 		emit_expr(out, e->lhs, ex, sc, sizeof sc);
@@ -7366,7 +7412,7 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 					}
 					char b[96];
 					emit_expr(out, a->body, ex, b, sizeof b);
-					fprintf(out, "\tstorew %s, %%m%d\n", b, e->slot);
+					fprintf(out, "\tstore%c %s, %%m%d\n", mq, b, e->slot);
 					fprintf(out, "\tjmp @mend%d\n", id);
 					fprintf(out, "@mnext%d\n", nxt); /* falls into the next arm, or the default */
 				}
@@ -7375,16 +7421,16 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		if (wild >= 0) {
 			char b[96];
 			emit_expr(out, e->arms[wild].body, ex, b, sizeof b);
-			fprintf(out, "\tstorew %s, %%m%d\n", b, e->slot);
+			fprintf(out, "\tstore%c %s, %%m%d\n", mq, b, e->slot);
 		} else {
 			/* Exhaustive: the fall-through is unreachable for a valid value; store a
-			 * defined 0 so the block has a terminator either way. */
-			fprintf(out, "\tstorew 0, %%m%d\n", e->slot);
+			 * defined (type-appropriate) zero so the block has a terminator either way. */
+			fprintf(out, "\tstore%c %s, %%m%d\n", mq, zero_lit(mq), e->slot);
 		}
 		fprintf(out, "\tjmp @mend%d\n", id);
 		fprintf(out, "@mend%d\n", id);
 		int r = ex->tmp++;
-		fprintf(out, "\t%%t%d =w loadw %%m%d\n", r, e->slot);
+		fprintf(out, "\t%%t%d =%c load%c %%m%d\n", r, mq, mq, e->slot);
 		snprintf(dst, cap, "%%t%d", r);
 		return;
 	}
@@ -7393,6 +7439,7 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		 * slot `%m<slot>` (a `phi` would need each value's predecessor block, which
 		 * nesting makes awkward; a slot store/load is robust and reuses the local
 		 * model). The condition is truthy when nonzero (`jnz`). */
+		char mq = qtype_of(e->rtype); /* the merged branch width (w/l/s/d) */
 		int id = ex->lbl++;
 		char c[96];
 		emit_expr(out, e->lhs, ex, c, sizeof c);
@@ -7400,16 +7447,16 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		fprintf(out, "@then%d\n", id);
 		char tb[96];
 		emit_expr(out, e->rhs, ex, tb, sizeof tb);
-		fprintf(out, "\tstorew %s, %%m%d\n", tb, e->slot);
+		fprintf(out, "\tstore%c %s, %%m%d\n", mq, tb, e->slot);
 		fprintf(out, "\tjmp @end%d\n", id);
 		fprintf(out, "@else%d\n", id);
 		char eb[96];
 		emit_expr(out, e->els, ex, eb, sizeof eb);
-		fprintf(out, "\tstorew %s, %%m%d\n", eb, e->slot);
+		fprintf(out, "\tstore%c %s, %%m%d\n", mq, eb, e->slot);
 		fprintf(out, "\tjmp @end%d\n", id);
 		fprintf(out, "@end%d\n", id);
 		int r = ex->tmp++;
-		fprintf(out, "\t%%t%d =w loadw %%m%d\n", r, e->slot);
+		fprintf(out, "\t%%t%d =%c load%c %%m%d\n", r, mq, mq, e->slot);
 		snprintf(dst, cap, "%%t%d", r);
 		return;
 	}
@@ -7433,7 +7480,8 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 			fprintf(out, "\tjmp @ltop%d\n", id);
 		fprintf(out, "@lend%d\n", id);
 		int r = ex->tmp++;
-		fprintf(out, "\t%%t%d =w loadw %%m%d\n", r, e->slot);
+		char mq = qtype_of(e->rtype); /* the merged yield width (w/l/s/d) */
+		fprintf(out, "\t%%t%d =%c load%c %%m%d\n", r, mq, mq, e->slot);
 		snprintf(dst, cap, "%%t%d", r);
 		return;
 	}
@@ -7740,6 +7788,7 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 			 * yield just does it (and is terminal, so nothing follows in its block). */
 			int id = ex->loops[ex->loop_depth - 1];
 			int slot = ex->loop_slots[ex->loop_depth - 1];
+			char yq = qtype_of(s->yval->rtype); /* the yield width — all of a loop's yields agree */
 			char vv[96];
 			if (s->expr) { /* guarded */
 				char c[96];
@@ -7748,12 +7797,12 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 				fprintf(out, "\tjnz %s, @ydo%d, @yskip%d\n", c, g, g);
 				fprintf(out, "@ydo%d\n", g);
 				emit_expr(out, s->yval, ex, vv, sizeof vv);
-				fprintf(out, "\tstorew %s, %%m%d\n", vv, slot);
+				fprintf(out, "\tstore%c %s, %%m%d\n", yq, vv, slot);
 				fprintf(out, "\tjmp @lend%d\n", id);
 				fprintf(out, "@yskip%d\n", g);
 			} else {
 				emit_expr(out, s->yval, ex, vv, sizeof vv);
-				fprintf(out, "\tstorew %s, %%m%d\n", vv, slot);
+				fprintf(out, "\tstore%c %s, %%m%d\n", yq, vv, slot);
 				fprintf(out, "\tjmp @lend%d\n", id);
 			}
 			break;
@@ -7898,8 +7947,11 @@ static void emit_func(FILE *out, const Func *fn) {
 	 * evaluation (which may recur inside a loop). */
 	int nslots = 0;
 	assign_stmt_slots(fn->body, &nslots);
+	/* Each merge slot is 8 bytes so it holds any scalar (a `w`/`s` store uses the low
+	 * bytes; an `l`/`d` uses all 8). The store and load agree on the value's width
+	 * (qtype_of the merged expr), so the slot size need not be tracked per id. */
 	for (int i = 0; i < nslots; i++)
-		fprintf(out, "\t%%m%d =l alloc4 4\n", i);
+		fprintf(out, "\t%%m%d =l alloc8 8\n", i);
 
 	Emit ex = {0};
 	ex.fn = fn;
