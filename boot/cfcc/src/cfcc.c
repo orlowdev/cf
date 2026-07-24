@@ -1681,6 +1681,45 @@ static void reject_nonscalar_fn_component(const Param *pm, int line) {
 	}
 }
 
+/* In a TYPE position, consume an optional `.Member` qualifier after a just-parsed type name
+ * — a "member type" (ebnf § Types: `Maybe[Int].Just` names one variant of a union). cfcc
+ * COLLAPSES a member type to its union: a member-typed value is represented identically to a
+ * union value (a tag + optional payload), so the qualifier is validated then ERASED — `base`
+ * (already the union name, or its generic-application mangle like `Maybe.1.Int`) is left
+ * unchanged and stands in for the whole type. Validation requires the union to be declared
+ * textually-before and to own the member.
+ * ⚠ cf0 must NOT inherit: (1) the collapse — cf0 tracks the PRECISE member type and its §8.1
+ * subtyping (a `Maybe.Just`-typed slot rejects a `Nothing` value; cfcc, seeing only `Maybe`,
+ * accepts it); (2) declared-before — cf0 resolves member types order-independently; (3) only
+ * the head-generic spelling `Maybe[Int].Just` is accepted — a member-position generic suffix
+ * (`Tree.Node[Int32]`, §8.1) is not parsed here (cfcc unions are head-generic-only anyway). */
+static void consume_member_type_suffix(Parser *p, const char *base, int line) {
+	if (peek(p)->kind != TK_DOT || !is_type_ident(&p->toks[p->pos + 1]))
+		return; /* no `.Member` follows — leave any stray `.` for the caller to diagnose */
+	advance(p); /* . */
+	char mem[64];
+	tok_copy(peek(p), mem, sizeof mem);
+	advance(p); /* Member */
+	if (!p->prog)
+		return; /* a pre-`prog` pass only consumes the tokens; validation waits for `prog` */
+	/* The base union name is `base` up to any generic-application mangle (`Maybe.1.Int`→`Maybe`). */
+	char bname[64];
+	size_t bl = 0;
+	while (base[bl] && base[bl] != '.' && bl + 1 < sizeof bname) {
+		bname[bl] = base[bl];
+		bl++;
+	}
+	bname[bl] = 0;
+	UnionDecl *u = prog_find_union(p->prog, bname);
+	if (!u) {
+		if (prog_find_data(p->prog, bname))
+			die(line, "a member type (`Union.Member`) requires a union base; a record has no members");
+		die(line, "a member type (`Union.Member`) needs its union declared before it (a genesis limit)");
+	}
+	if (union_member_tag(u, mem) < 0)
+		die(line, "unknown member in a member-type annotation (`Union.Member`)");
+}
+
 /* Consume a parameter's type and classify it. M0 param types are `Int` (a word),
  * a record type (a long — a pointer to the caller's arena record; the type name is
  * stashed and resolved to a decl in typecheck), or a pointer type like `*[Str]` (a
@@ -1842,6 +1881,7 @@ static void parse_param_type(Parser *p, Param *out) {
 	}
 	if (is_type_ident(t)) { /* a record/union type, or a generic application `Box[Int]` (G3b) */
 		parse_type_arg(p, out->type_name, sizeof out->type_name);
+		consume_member_type_suffix(p, out->type_name, t->line); /* `Maybe[Int].Just` → the union */
 		out->kind = PK_RECORD; /* resolve_signatures reclassifies a union to PK_UNION */
 		return;
 	}
@@ -2972,8 +3012,10 @@ static int parse_return_type(Parser *p, Func *fn) {
 		fn->ret_line = rt->line;
 		if (is_ident(rt, "Int"))
 			advance(p);
-		else /* Uarch, a record/union type, or a generic application `Box[Int]` (G3b) */
+		else { /* Uarch, a record/union type, or a generic application `Box[Int]` (G3b) */
 			parse_type_arg(p, fn->ret_type_name, sizeof fn->ret_type_name);
+			consume_member_type_suffix(p, fn->ret_type_name, rt->line); /* `Maybe[Int].Just` → the union */
+		}
 	} else {
 		die(rt->line, "expected a return type after `:`");
 	}
@@ -3200,6 +3242,7 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 				advance(p);
 			} else { /* a record/union type, or a generic application `Box[Int]` (G3b) */
 				parse_type_arg(p, rectype, sizeof rectype);
+				consume_member_type_suffix(p, rectype, tt->line); /* `Maybe[Int].Just` → the union */
 				is_record = 1;
 			}
 		}
