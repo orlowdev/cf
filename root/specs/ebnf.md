@@ -88,7 +88,7 @@ Disambiguation inside `[ ]` (both bracket forms share the brackets):
   **unit** type is `()`, below)
 - leading **integer** or **lowercase value name** → `fixed_array` (its size; a
   type never starts with a digit, and every type form starts uppercase, `'`,
-  `*`, `&`, `[`, or `(` — so a lowercase leading token is a comptime size like the
+  `*`, `[`, or `(` — so a lowercase leading token is a comptime size like the
   `n` of `[n 'T]`)
 - a single type → `array`
 
@@ -908,7 +908,7 @@ Points:
   chiefly a function-type annotation on the binding (`const Sum sum = (a, b) -> …`,
   where `Sum = (Int32, Int32) -> Int32` types `a` and `b`). A bare param is a lone
   `var_name`; a typed one leads with a `type` (`Int32 x`) — cased apart the usual
-  way, since a type starts uppercase, `'`, `*`, `&`, or `[` and a value name
+  way, since a type starts uppercase, `'`, `*`, or `[` and a value name
   lowercase. A `record_pattern` param still requires its type (`ServerOptions { … }`).
   That every bare param's type is actually derivable is a semantic check; the
   grammar only permits the omission.
