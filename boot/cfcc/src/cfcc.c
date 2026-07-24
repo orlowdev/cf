@@ -4126,6 +4126,8 @@ static void reclassify_param(Param *p, const char *concrete, int line) {
 		p->kind = PK_WORD;
 	} else if (strcmp(concrete, "Uarch") == 0) {
 		p->kind = PK_UARCH;
+	} else if (strcmp(concrete, "Unit") == 0) {
+		p->kind = PK_UNIT; /* the unit type argument — a word `0` parameter (see PK_UNIT) */
 	} else if (strcmp(concrete, "Str") == 0) {
 		die(line, "a type argument of `Str` is not supported (M0 has no Str parameters)");
 	} else if (concrete[0] == '\'') {
