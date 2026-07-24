@@ -1609,6 +1609,17 @@ static int is_capture_param(const Func *fn, const char *name) {
 	return 0;
 }
 
+/* True if `name` is a parameter of `fn` (vs. a local) — distinguishes a `*Aggregate` PARAM
+ * (its incoming `%u_` temp) from a `*Aggregate` LOCAL (its adopted `%r_` pointer) at emit. */
+static int is_param_name(const Func *fn, const char *name) {
+	if (!fn)
+		return 0;
+	for (int i = 0; i < fn->nparams; i++)
+		if (strcmp(fn->params[i].name, name) == 0)
+			return 1;
+	return 0;
+}
+
 /* If `name` is a match-arm payload binding currently in scope, return its storage id
  * (`%pb<id>`); else -1. Innermost binding wins, so a binding shadows an outer name. */
 static int find_active_bind(Func *fn, const char *name) {
@@ -3257,12 +3268,27 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 		/* Optional type annotation: `Int` (a word local) or a record type name (a
 		 * `data`-typed local). A pointer annotation has no M0 local use. */
 		int is_record = 0, is_str = 0, is_buf = 0, bufsize = 0, is_arr = 0, arrlen = 0, is_f64 = 0, is_f32 = 0;
+		int is_ptr_local = 0;
 		char bufsize_name[64] = {0}; /* a `[n Uint8]` buffer sized by a comptime value param */
 		char rectype[64] = {0};
 		Token *tt = peek(p);
-		if (tt->kind == TK_STAR)
-			die(tt->line, "M0 locals are `Int`, `Str`, a `[N Uint8]` buffer, or a record type, not a pointer");
-		if (tt->kind == TK_LBRACKET) {
+		if (tt->kind == TK_STAR) {
+			/* A `*Aggregate` pointer local: `const *Point p = &q`. Its initializer must be a
+			 * pointer value (`&x` or another `*T`) — checked in typecheck; the pointee is
+			 * resolved there too. ⚠ cf0 must NOT inherit: cfcc is const-only (no `let`
+			 * repointing — like a whole-record reassign, forbidden); cf0 allows a `let` pointer. */
+			advance(p); /* * */
+			Token *pt = peek(p);
+			if (!is_type_ident(pt))
+				die(pt->line, "expected an aggregate type after `*`");
+			char pointee[64];
+			tok_copy(pt, pointee, sizeof pointee);
+			if (is_scalar_type_name(pointee))
+				die(pt->line, "a pointer type `*T` points to a record or union, not a scalar (§6.4)");
+			rectype[0] = '*';
+			parse_type_arg(p, rectype + 1, sizeof rectype - 1); /* the (generic) pointee name */
+			is_ptr_local = 1;
+		} else if (tt->kind == TK_LBRACKET) {
 			/* `[N Uint8]` = a fixed byte buffer (no initializer, `read` fills it); `[N Int]`
 			 * = a fixed array (bound to an array literal). Both take a comptime length N.
 			 * The buffer is throwaway (no indexing/bounds); the array supports index/`.len`. */
@@ -3362,7 +3388,17 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 			s->kind = ST_CLOSURE;
 			return s;
 		}
-		if (is_record) {
+		if (is_ptr_local) {
+			/* `const *Point p = &q` — a pointer local (a named reference/alias). The
+			 * initializer is any expression; typecheck requires it to be a `*T` of the
+			 * annotated pointee. Const-only (no `let` repointing). type_name keeps the `*`. */
+			if (mutable)
+				die(name->line, "a `*Aggregate` local must be `const` (repointing a `let` pointer is a later brick)");
+			snprintf(s->type_name, sizeof s->type_name, "%s", rectype); /* "*Point" */
+			s->expr = parse_expr(p, fn);
+			Type pt = {TY_PTR, NULL, NULL, 0, NULL}; /* pointee resolved in typecheck */
+			func_add_local(fn, s->name, mutable, pt, rectype);
+		} else if (is_record) {
 			/* A record local's initializer is a data literal (`{ … }`) or a
 			 * record-valued expression such as a call that returns this record
 			 * (`mk(…)`). Binding from another record variable is not allowed — that is
@@ -6223,6 +6259,15 @@ static void set_local_union(Func *fn, const char *name, UnionDecl *u) {
 		}
 }
 
+/* Backfill a `*Aggregate` pointer local's resolved TY_PTR type (its pointee `rec`/`uni`). */
+static void set_local_ptr(Func *fn, const char *name, Type pt) {
+	for (int i = 0; i < fn->nlocals; i++)
+		if (strcmp(fn->locals[i].name, name) == 0) {
+			fn->locals[i].type = pt;
+			return;
+		}
+}
+
 /* Bind an EX_RECORD data literal to its `data` declaration: check the fields
  * cover it exactly (each declared field set once, no unknowns, none missing),
  * type-check the values, reorder them into declaration order (`ford`), and
@@ -6363,6 +6408,14 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 			} else if (strcmp(s->type_name, "Float32") == 0) { /* a Float32 local */
 				if (typeof_expr(prog, fn, s->expr).kind != TY_F32)
 					die(s->line, "a Float32 local's initializer must be a Float32 value (cast with `Float32(x)`)");
+			} else if (s->type_name[0] == '*') { /* a `*Aggregate` pointer local */
+				/* Resolve the pointee (`*Point` → TY_PTR{rec/uni}) and require the initializer
+				 * to be a matching pointer value (`&x` or a `*T`), per the 4c tightening. */
+				Type pt = resolve_member_type(prog, s->type_name, s->line);
+				Type it = typeof_expr(prog, fn, s->expr);
+				if (it.kind != TY_PTR || (pt.rec ? it.rec != pt.rec : it.uni != pt.uni))
+					die(s->line, "a `*Aggregate` local's initializer must be a pointer of that type — `&x` or a `*T`");
+				set_local_ptr(fn, s->name, pt);
 			} else if (prog_find_union(prog, s->type_name)) { /* a union binding */
 				/* `const Color c = Color.Red` — the annotation names a union; the
 				 * initializer must be a value of that union (a member, or another
@@ -6882,9 +6935,13 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 			return;
 		}
 		if (e->rtype.kind == TY_PTR || e->rtype.kind == TY_UARCH) {
-			/* A pointer (`*[Uint8]` buffer) or Uarch value is, in M0, always an
-			 * immutable `l` parameter — reference its incoming temp directly (no slot). */
-			snprintf(dst, cap, "%%u_%s", e->name);
+			/* A pointer/Uarch PARAMETER is an immutable incoming `l` temp — reference it
+			 * directly (no slot). A `*Aggregate` LOCAL instead adopted the initializer's
+			 * pointer into its `%r_<name>` storage (like a record local), so read that. */
+			if (e->rtype.kind == TY_PTR && !is_param_name(ex->fn, e->name))
+				snprintf(dst, cap, "%%r_%s", e->name);
+			else
+				snprintf(dst, cap, "%%u_%s", e->name);
 			return;
 		}
 		if (e->rtype.kind == TY_STR) {
@@ -7526,10 +7583,11 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 					}
 				}
 			} else if (s->expr->rtype.kind == TY_RECORD || s->expr->rtype.kind == TY_TUPLE ||
+			           s->expr->rtype.kind == TY_PTR ||
 			           (s->expr->rtype.kind == TY_UNION && s->expr->rtype.uni->has_payload)) {
-				/* A record, tuple, or boxed-union local: adopt the initializer's fresh arena
-				 * pointer as this local's storage (a move, no copy). The EX_TUPLE emit built
-				 * the tuple in the arena and yielded its base pointer. */
+				/* A record, tuple, boxed-union, or `*Aggregate`-pointer local: adopt the
+				 * initializer's arena pointer as this local's `%r_<name>` storage (a move/alias,
+				 * no copy). For a pointer local the initializer is `&x`/a `*T` — the same pointer. */
 				emit_expr(out, s->expr, ex, v, sizeof v);
 				fprintf(out, "\t%%r_%s =l copy %s\n", s->name, v);
 			} else if (s->expr->rtype.kind == TY_STR) {
