@@ -668,6 +668,10 @@ typedef struct Param {
 	char type_name[64]; /* PK_RECORD/PK_UNION: the nominal type name (resolved later) */
 	DataDecl *rec;      /* PK_RECORD: the resolved declaration */
 	UnionDecl *uni;     /* PK_UNION: the resolved declaration */
+	int is_ptr;         /* PK_RECORD/PK_UNION: this param is an EXPLICIT pointer `*Aggregate`
+	                     * (its Type is TY_PTR to `rec`/`uni`), not the aggregate value itself.
+	                     * cfcc represents both as the same arena pointer, so they interconvert.
+	                     * ⚠ cf0 must NOT inherit: cf0 keeps a value and its `&`-reference distinct. */
 	int fn_arity;       /* PK_FN: the function type's parameter count */
 	/* PK_FN: the function type's parameter descriptors (fn_arity of them) and its single
 	 * return descriptor — each is a scalar/pointer/nested-function component (aggregates are
@@ -1105,6 +1109,8 @@ typedef struct Func {
 	int nparams;
 	char ret_type_name[64]; /* empty = Int; "Uarch" = Uarch; else a record/union/'T return */
 	int ret_line;           /* source line of the return type (for diagnostics) */
+	int ret_is_ptr;         /* the return type is an explicit pointer `*Aggregate` (TY_PTR to
+	                         * ret_rec/ret_uni); see Param.is_ptr */
 	DataDecl *ret_rec;      /* resolved record return type (typecheck) */
 	UnionDecl *ret_uni;     /* resolved union return type (typecheck) */
 	/* A tuple return type `(T0, …)` — structural, so it has no `ret_type_name`. Parse records
@@ -1264,6 +1270,17 @@ static void func_value_sig(const Func *g, char *buf, size_t cap) {
 	sig_append(buf, cap, type_sig_char(func_ret_type(g)));
 }
 
+/* The record/union a type denotes whether it is the aggregate VALUE (TY_RECORD/TY_UNION) or
+ * an explicit pointer to it (TY_PTR to that decl). cfcc represents an aggregate value as its
+ * arena pointer, so `Point` and `*Point` share a representation and interconvert freely at
+ * calls/returns. ⚠ cf0 must NOT inherit: cf0 keeps a value and its `&`-reference distinct. */
+static DataDecl *aggregate_record(Type t) {
+	return (t.kind == TY_RECORD || t.kind == TY_PTR) ? t.rec : NULL;
+}
+static UnionDecl *aggregate_union(Type t) {
+	return (t.kind == TY_UNION || t.kind == TY_PTR) ? t.uni : NULL;
+}
+
 /* A function-type component descriptor (a scalar/pointer/nested-function type) as a Type —
  * used for the result type of an indirect call and for checking an indirect call's arguments.
  * Aggregates never reach here (rejected when the function type is parsed). */
@@ -1415,6 +1432,20 @@ static void reject_group_as_type(Program *prog, const char *name, int line) {
 static TupleDecl *resolve_tuple_shape(Program *prog, char names[][64], int n, int line); /* forward */
 
 static Type resolve_member_type(Program *prog, const char *name, int line) {
+	if (name[0] == '*') {
+		/* An explicit pointer type `*Aggregate` (ebnf § Types; type_system §6.4 — a pointer
+		 * points ONLY to a record or union, never a scalar). cfcc represents it as a TY_PTR
+		 * carrying the pointee decl — the very arena pointer an aggregate value already is, so
+		 * `*Point` and `Point` share a representation and interconvert. ⚠ cf0 must NOT inherit:
+		 * cf0 distinguishes an aggregate value from its `&`-reference. */
+		const char *pointee = name + 1;
+		if (prog_find_union(prog, pointee)) /* `*Union` — a later brick (tag-only unions are words, */
+			die(line, "cfcc `*Union` pointers are a later brick — a pointer to a `data` record only");
+		DataDecl *pd = prog_find_data(prog, pointee);
+		if (pd)
+			return (Type){TY_PTR, pd, NULL, 0, NULL};
+		die(line, "a pointer type `*T` points to a record or union, not a scalar or unknown type (§6.4)");
+	}
 	if (strcmp(name, "Int") == 0)
 		return (Type){TY_INT, NULL, NULL, 0, NULL};
 	if (strcmp(name, "Unit") == 0) /* `Unit`/`()` — the zero-tuple, a word `0` field/payload */
@@ -1511,10 +1542,17 @@ static Resolution resolve_name(Func *fn, const char *name, Type *ty) {
 			ty->tup = NULL;
 			switch (fn->params[i].kind) {
 			case PK_WORD:    ty->kind = TY_INT;    ty->rec = NULL; break;
-			case PK_RECORD:  ty->kind = TY_RECORD; ty->rec = fn->params[i].rec; break;
+			case PK_RECORD: /* is_ptr → an explicit `*Record` pointer (TY_PTR to the pointee) */
+				if (fn->params[i].is_ptr) { ty->kind = TY_PTR; ty->rec = fn->params[i].rec; }
+				else { ty->kind = TY_RECORD; ty->rec = fn->params[i].rec; }
+				break;
 			case PK_LONG:    ty->kind = TY_PTR;    ty->rec = NULL; break;
 			case PK_UARCH:   ty->kind = TY_UARCH;  ty->rec = NULL; break;
-			case PK_UNION:   ty->kind = TY_UNION;  ty->rec = NULL; ty->uni = fn->params[i].uni; break;
+			case PK_UNION: /* is_ptr → an explicit `*Union` pointer (TY_PTR to the pointee union) */
+				ty->kind = fn->params[i].is_ptr ? TY_PTR : TY_UNION;
+				ty->rec = NULL;
+				ty->uni = fn->params[i].uni;
+				break;
 			case PK_VAR:     ty->kind = TY_INT;    ty->rec = NULL; break; /* template body parse only; type is ignored (re-typed per instantiation) */
 			case PK_CAPTURE: ty->kind = TY_INT;    ty->rec = NULL; return R_LET; /* a by-ref word: readable AND writable */
 			case PK_CAPTURE_REC: ty->kind = TY_RECORD; ty->rec = fn->params[i].rec; return R_LET; /* a by-ref record: fields mutable */
@@ -1658,6 +1696,12 @@ static int is_builtin_type_name(const char *name) {
 	       strcmp(name, "Str") == 0 || strcmp(name, "Uint8") == 0;
 }
 
+/* The scalar type names — a pointer must NOT point to one (type_system §6.4, no `*Scalar`). */
+static int is_scalar_type_name(const char *name) {
+	return is_builtin_type_name(name) || strcmp(name, "Float32") == 0 ||
+	       strcmp(name, "Float64") == 0 || strcmp(name, "Unit") == 0;
+}
+
 /* Type-reference helpers (G3b) — defined further down, forward-declared here as the type
  * positions that use them (params, union values, locals, returns) come first. */
 static void parse_type_arg(Parser *p, char *out, size_t cap);
@@ -1728,6 +1772,10 @@ static void consume_member_type_suffix(Parser *p, const char *base, int line) {
  * for a record). */
 static void parse_param_type(Parser *p, Param *out) {
 	Token *t = peek(p);
+	memset(out, 0, sizeof *out); /* a clean slate: `is_ptr` (and every other flag) defaults off
+	                             * regardless of how the caller allocated the Param — grouped-
+	                             * params fields reuse this via parse_param and would otherwise
+	                             * read a garbage `is_ptr`. */
 	out->line = t->line;
 	if (t->kind == TK_LPAREN) {
 		/* A leading `(` at type position opens EITHER a function type `(Int, …) -> Int` OR a
@@ -1854,7 +1902,7 @@ static void parse_param_type(Parser *p, Param *out) {
 	if (t->kind == TK_STAR) {
 		advance(p);
 		Token *u = peek(p);
-		if (u->kind == TK_LBRACKET) { /* skip a balanced [ ... ] pointee */
+		if (u->kind == TK_LBRACKET) { /* `*[…]` — an OPAQUE buffer pointer (argv/envp, `*[Uint8]`) */
 			int depth = 0;
 			do {
 				Token *v = advance(p);
@@ -1865,12 +1913,22 @@ static void parse_param_type(Parser *p, Param *out) {
 				else if (v->kind == TK_EOF)
 					die(v->line, "unterminated pointer type");
 			} while (depth > 0);
-		} else if (is_type_ident(u)) {
-			advance(p);
-		} else {
-			die(u->line, "expected a type after `*`");
+			out->kind = PK_LONG;
+			return;
 		}
-		out->kind = PK_LONG;
+		if (!is_type_ident(u))
+			die(u->line, "expected a type after `*`");
+		/* `*Aggregate` — an EXPLICIT typed pointer to a record/union (§6.4: never a scalar).
+		 * Classified like a record param (PK_RECORD → reclassified to PK_UNION in
+		 * resolve_signatures if the pointee is a union) but flagged `is_ptr`, so its resolved
+		 * type is TY_PTR to the pointee. */
+		char pointee[64];
+		tok_copy(u, pointee, sizeof pointee);
+		if (is_scalar_type_name(pointee))
+			die(u->line, "a pointer type `*T` points to a record or union, not a scalar (§6.4)");
+		parse_type_arg(p, out->type_name, sizeof out->type_name); /* the pointee (generic ok) */
+		out->kind = PK_RECORD;
+		out->is_ptr = 1;
 		return;
 	}
 	if (is_tyvar(t)) { /* a generic type variable (`'T`) — resolved at specialization */
@@ -2975,8 +3033,6 @@ static int parse_return_type(Parser *p, Func *fn) {
 		return 0;
 	advance(p); /* : */
 	Token *rt = peek(p);
-	if (rt->kind == TK_STAR)
-		die(rt->line, "a function returns `Int` or a record, not a pointer");
 	if (rt->kind == TK_LPAREN) {
 		/* A tuple return type `(T0, …, Tn-1)` — a function returning a heterogeneous product
 		 * (the multi-value return). Element types are Int, Str, or a record name (brick 1,
@@ -3008,6 +3064,18 @@ static int parse_return_type(Parser *p, Func *fn) {
 		tok_copy(rt, fn->ret_type_name, sizeof fn->ret_type_name);
 		fn->ret_line = rt->line;
 		advance(p);
+	} else if (rt->kind == TK_STAR) { /* an explicit pointer return `*Aggregate` (§6.4) */
+		fn->ret_line = rt->line;
+		advance(p); /* * */
+		Token *pt = peek(p);
+		if (!is_type_ident(pt))
+			die(pt->line, "expected an aggregate type after `*` in a return type");
+		char pointee[64];
+		tok_copy(pt, pointee, sizeof pointee);
+		if (is_scalar_type_name(pointee))
+			die(pt->line, "a pointer type `*T` points to a record or union, not a scalar (§6.4)");
+		parse_type_arg(p, fn->ret_type_name, sizeof fn->ret_type_name); /* the pointee (generic ok) */
+		fn->ret_is_ptr = 1;
 	} else if (is_type_ident(rt)) {
 		fn->ret_line = rt->line;
 		if (is_ident(rt, "Int"))
@@ -5506,14 +5574,18 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 				return (Type){TY_INT, NULL, NULL, 0, NULL};
 			die(e->line, "a fixed array has only the `.len` field");
 		}
-		if (base.kind != TY_RECORD)
+		/* A record VALUE or an explicit `*Record` pointer both address the record (cfcc
+		 * represents an aggregate value as its arena pointer), so a field reads the same way. */
+		DataDecl *brec = base.kind == TY_RECORD ? base.rec
+		               : (base.kind == TY_PTR ? base.rec : NULL);
+		if (!brec)
 			die(e->line, "field access `.` needs a record value on the left");
-		int idx = data_field_index(base.rec, e->name);
+		int idx = data_field_index(brec, e->name);
 		if (idx < 0)
 			die(e->line, "this data type has no such field");
-		e->rec = base.rec;
+		e->rec = brec;
 		e->foff = data_field_offset(idx);
-		return data_field_type(prog, base.rec, idx); /* Int or an aggregate field type */
+		return data_field_type(prog, brec, idx); /* Int or an aggregate field type */
 	}
 	case EX_INDEX: {
 		/* `base[i]` — a fixed array (runtime index → Int element) or a tuple (COMPTIME
@@ -5724,10 +5796,11 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 					die(e->line, "argument type mismatch (a word parameter expects an Int)");
 				break;
 			case PK_RECORD:
-				if (at.kind != TY_RECORD)
-					die(e->line, "argument type mismatch (a record parameter expects a record)");
-				if (at.rec != pm->rec)
-					die(e->line, "argument type mismatch (record type differs)");
+				/* A record value OR an explicit `*Record` pointer to the same decl (they share
+				 * the arena-pointer representation, so either satisfies a `Point` or `*Point`
+				 * parameter — pm->rec is the same decl for both param spellings). */
+				if (aggregate_record(at) != pm->rec)
+					die(e->line, "argument type mismatch (expected a record or `*Record` of the parameter's type)");
 				break;
 			case PK_UARCH:
 				if (at.kind != TY_UARCH && at.kind != TY_INT && at.kind != TY_PTR && at.kind != TY_BUF)
@@ -5738,8 +5811,9 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 					die(e->line, "argument type mismatch (a pointer parameter expects a pointer or `[N Uint8]` buffer, e.g. `s.bytes`)");
 				break;
 			case PK_UNION:
-				if (at.kind != TY_UNION || at.uni != pm->uni)
-					die(e->line, "argument type mismatch (union type differs)");
+				/* A union value OR an explicit `*Union` pointer to the same decl. */
+				if (aggregate_union(at) != pm->uni)
+					die(e->line, "argument type mismatch (expected a union or `*Union` of the parameter's type)");
 				break;
 			case PK_VAR:
 				die(e->line, "internal: call to an unspecialized generic function");
@@ -6000,6 +6074,8 @@ static Type func_ret_type(const Func *fn) {
 		return (Type){TY_F32, NULL, NULL, 0, NULL};
 	if (strcmp(fn->ret_type_name, "Unit") == 0) /* `Unit`/`()` — the zero-tuple, a word `0` */
 		return (Type){TY_UNIT, NULL, NULL, 0, NULL};
+	if (fn->ret_is_ptr) /* an explicit `*Aggregate` return — a TY_PTR to the pointee decl */
+		return (Type){TY_PTR, fn->ret_rec, fn->ret_uni, 0, NULL};
 	if (fn->ret_uni)
 		return (Type){TY_UNION, NULL, fn->ret_uni, 0, NULL};
 	if (fn->ret_type_name[0])
@@ -6335,7 +6411,20 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 			 * of its own argument; a returned record must be freshly built (a local or
 			 * another call's result), which the arena keeps alive past the frame. */
 			Type rt = func_ret_type(fn);
-			if (rt.kind == TY_RECORD) {
+			if (rt.kind == TY_PTR && (rt.rec || rt.uni)) {
+				/* An explicit `*Aggregate` return. A record/union value — or another such
+				 * pointer — satisfies it (same arena pointer, viewed as a reference); a
+				 * directly-returned literal adopts the pointee record. Unlike a by-value
+				 * record return, returning a bare parameter pointer is fine — a `*T` is
+				 * explicitly an alias. */
+				if (rt.rec && s->expr->kind == EX_RECORD && !s->expr->name[0]) {
+					resolve_record_literal(prog, fn, s->expr, rt.rec);
+					break;
+				}
+				Type et = typeof_expr(prog, fn, s->expr);
+				if (rt.rec ? aggregate_record(et) != rt.rec : aggregate_union(et) != rt.uni)
+					die(s->expr->line, "returned value does not match the `*Aggregate` return type");
+			} else if (rt.kind == TY_RECORD) {
 				if (s->expr->kind == EX_RECORD && !s->expr->name[0]) {
 					/* An UNANNOTATED directly-returned literal (`-> ({…})`) adopts the
 					 * return type (the sugar for `RetType({…})`). A fresh arena alloc that
@@ -6447,6 +6536,8 @@ static void resolve_signatures(Program *prog) {
 				 * (tag-only → a word); otherwise it must name a `data` record. */
 				UnionDecl *u = prog_find_union(prog, fn->params[j].type_name);
 				if (u) {
+					if (fn->params[j].is_ptr) /* `*Union` — a later brick (see resolve_member_type) */
+						die(fn->params[j].line, "cfcc `*Union` pointers are a later brick — a pointer to a `data` record only");
 					fn->params[j].kind = PK_UNION;
 					fn->params[j].uni = u;
 					continue;
@@ -6469,6 +6560,8 @@ static void resolve_signatures(Program *prog) {
 		    strcmp(fn->ret_type_name, "Float32") != 0) {
 			UnionDecl *u = prog_find_union(prog, fn->ret_type_name);
 			if (u) {
+				if (fn->ret_is_ptr) /* `*Union` return — a later brick (see resolve_member_type) */
+					die(fn->ret_line, "cfcc `*Union` pointers are a later brick — a pointer to a `data` record only");
 				fn->ret_uni = u;
 			} else {
 				DataDecl *d = prog_find_data(prog, fn->ret_type_name);
@@ -7640,12 +7733,14 @@ static void emit_func(FILE *out, const Func *fn) {
 			char qt = param_qtype(&fn->params[i]);
 			fprintf(out, "\t%%s_%s =l alloc%d %d\n", n, qt == 'd' ? 8 : 4, qt == 'd' ? 8 : 4);
 			fprintf(out, "\tstore%c %%u_%s, %%s_%s\n", qt, n, n);
-		} else if (fn->params[i].kind == PK_RECORD || fn->params[i].kind == PK_CAPTURE_REC ||
-		           fn->params[i].kind == PK_TUPLE ||
+		} else if ((fn->params[i].kind == PK_RECORD && !fn->params[i].is_ptr) ||
+		           fn->params[i].kind == PK_CAPTURE_REC || fn->params[i].kind == PK_TUPLE ||
 		           (fn->params[i].kind == PK_UNION && fn->params[i].uni->has_payload)) {
 			/* A record, captured-record, tuple, or boxed-union param arrives as an arena
 			 * pointer, copied into the `%r_<name>` form field/index access uses. A captured
-			 * record aliases the enclosing scope's storage, so field writes there are visible. */
+			 * record aliases the enclosing scope's storage, so field writes there are visible.
+			 * An explicit `*Record` pointer param is instead read directly as its `%u_<name>`
+			 * incoming temp (EX_VAR TY_PTR path), so it is excluded here — it needs no `%r_`. */
 			fprintf(out, "\t%%r_%s =l copy %%u_%s\n", n, n);
 		}
 	}
