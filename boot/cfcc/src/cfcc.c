@@ -2937,6 +2937,16 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 		if (peek(p)->kind == TK_LBRACE)
 			die(peek(p)->line,
 			    "parenthesize a returned record literal: `return ({ … })` (a bare `{` reads as a block)");
+		/* A valueless `return` is sugar for `return ()` — it yields the unit value (§6.1), for
+		 * a `Unit`-returning body. A returned value always rides on the `return`'s own line, so
+		 * a newline or block-end `}` right after `return` means no value was written. */
+		if (peek(p)->kind == TK_NEWLINE || peek(p)->kind == TK_RBRACE) {
+			Expr *u = new_expr(EX_UNIT);
+			u->line = t->line;
+			s->expr = u;
+			*saw_return = 1;
+			return s;
+		}
 		s->expr = parse_expr(p, fn);
 		*saw_return = 1;
 		return s;
