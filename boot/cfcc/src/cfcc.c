@@ -571,6 +571,8 @@ typedef enum {
 	PK_TUPLE,  /* a tuple parameter `(T0, …) name` -> l (a pointer to the caller's arena tuple,
 	            * like a record). Read-only in the body, indexed at comptime `name[k]`. Its shape
 	            * rides on `tup` (resolved from `tuple_types`/`tuple_n` in resolve_signatures). */
+	PK_UNIT,   /* a unit parameter `Unit name` (or `() name`) -> w. The zero-tuple carries no data,
+	            * so it arrives as a word `0` and spills to a word slot like an Int (type TY_UNIT). */
 } ParamKind;
 
 typedef struct {
@@ -928,7 +930,7 @@ static int type_is_word(Type t) {
 /* True if a parameter is passed in a word register: a word Int, or a tag-only union.
  * A boxed (payload) union is passed by pointer, like a record. */
 static int param_is_word(const Param *p) {
-	return p->kind == PK_WORD || (p->kind == PK_UNION && !p->uni->has_payload);
+	return p->kind == PK_WORD || p->kind == PK_UNIT || (p->kind == PK_UNION && !p->uni->has_payload);
 }
 
 /* Record layout — uniform 8-byte slots (G3a): field i at byte offset i*8, size nfields*8.
@@ -1255,6 +1257,7 @@ static Resolution resolve_name(Func *fn, const char *name, Type *ty) {
 			case PK_CAPTURE_REC: ty->kind = TY_RECORD; ty->rec = fn->params[i].rec; return R_LET; /* a by-ref record: fields mutable */
 			case PK_FN:      ty->kind = TY_FN; ty->rec = NULL; break; /* a function value (arity on the Param) */
 			case PK_TUPLE:   ty->kind = TY_TUPLE; ty->rec = NULL; ty->tup = fn->params[i].tup; break; /* by pointer, read-only */
+			case PK_UNIT:    ty->kind = TY_UNIT;  ty->rec = NULL; break; /* the unit value, a word `0` */
 			}
 			return R_PARAM;
 		}
@@ -1427,8 +1430,14 @@ static void parse_param_type(Parser *p, Param *out) {
 		if (!is_fn) {
 			/* A tuple parameter type `(T0, …, Tn-1)` — a heterogeneous product passed by
 			 * pointer (like a record). Elements are Int, Str, or a record type (brick 1);
-			 * resolved + interned in resolve_signatures. */
+			 * resolved + interned in resolve_signatures. An empty `()` is instead the unit
+			 * parameter type — the zero-tuple, `Unit` spelled with the crab-claw (§6.1). */
 			advance(p); /* ( */
+			if (peek(p)->kind == TK_RPAREN) {
+				advance(p); /* ) — `() name` is the unit parameter */
+				out->kind = PK_UNIT;
+				return;
+			}
 			int cap = 4;
 			out->tuple_types = xmalloc(cap * sizeof *out->tuple_types);
 			for (;;) {
@@ -1486,6 +1495,11 @@ static void parse_param_type(Parser *p, Param *out) {
 	if (is_ident(t, "Uarch")) {
 		advance(p);
 		out->kind = PK_UARCH;
+		return;
+	}
+	if (is_ident(t, "Unit")) { /* `Unit name` — the unit parameter (a word `0`); `()` below is the same */
+		advance(p);
+		out->kind = PK_UNIT;
 		return;
 	}
 	if (is_ident(t, "Str")) /* Str params await a later brick (Str is a local-only type in M0) */
@@ -4377,6 +4391,7 @@ static const char *shallow_type_name(Program *prog, Func *fn, Expr *e) {
 				case PK_CAPTURE_REC: return fn->params[i].type_name; /* a captured record */
 				case PK_FN: return ""; /* a function value — no simple nominal type name */
 				case PK_TUPLE: return ""; /* a structural tuple — no nominal name to infer from */
+				case PK_UNIT: return "Unit"; /* the unit type */
 				}
 			}
 		for (int i = 0; i < fn->nlocals; i++)
@@ -5066,6 +5081,11 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 					die(e->line, "argument type mismatch (a tuple parameter expects a tuple)");
 				if (!types_equal(at, (Type){TY_TUPLE, NULL, NULL, 0, pm->tup}))
 					die(e->line, "argument type mismatch (tuple shape differs)");
+				break;
+			case PK_UNIT:
+				/* A unit argument: the unit value `()` — its only value (a word `0`). */
+				if (at.kind != TY_UNIT)
+					die(e->line, "argument type mismatch (a `Unit` parameter expects the unit value `()`)");
 				break;
 			}
 		}
