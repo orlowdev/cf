@@ -7093,6 +7093,244 @@ static void cleanup_tmp(void) {
 		rmdir(g_tmpdir);
 }
 
+/* ----------------------------------------------- comptime `type` aliases - *
+ *
+ * `type Name = <type>` (ebnf § Data & Type Declarations) is a COMPTIME structural
+ * alias: the name has no runtime identity — it is "resolved and erased before run
+ * time". cfcc implements the plain-alias form as a TOKEN-LEVEL erasure pass between
+ * lex and parse: collect every top-level `type` decl, drop its line, then splice the
+ * target token-sequence in wherever the alias name appears. Because a `type` is a
+ * pure comptime substitution, this reproduces the semantics exactly and needs ZERO
+ * changes to the parser / type gate / emit — an alias for a scalar (`type Id = Uarch`),
+ * an aggregate (`type P = Point`), a tuple (`type Pair = (Int, Int)`), or a generic
+ * application (`type IntBox = Box[Int]`) all splice uniformly.
+ *
+ * ⚠ cf0 must NOT inherit these genesis narrowings (a faithful SUBSET — rejects more,
+ * never mis-accepts):
+ *   (1) the RECORD-body form `type T = { Int x }` (the "named tuple" that splats
+ *       positionally, ebnf § Data & Type Declarations) is rejected — a separate later
+ *       brick; cf0 desugars it field-by-field;
+ *   (2) generic aliases `type T['A] = ...` are rejected;
+ *   (3) a `type` name may not shadow a builtin / `data` / `union` head / a `union`
+ *       MEMBER / another alias (hard collision error; cf0 has scoped resolve-or-shadow
+ *       rules). The member guard keeps the erasure strictly subtractive;
+ *   (4) the body must fit on the decl's line (collection stops at the first NEWLINE),
+ *       so a bracketed body wrapping across lines is not accepted (cfcc's own source
+ *       never needs it; cf0 parses the full grammar);
+ *   (5) `pub type` is erased wholesale — cfcc is a single-file module with no imports,
+ *       so a type's cross-module visibility (M2) has nothing to preserve yet.
+ * Resolution here is ORDER-INDEPENDENT (every decl is collected before any
+ * substitution) — that is CLOSER to cf0's Resolve arc than cfcc's other
+ * order-dependent features, so it is not a divergence to unwind. A member/field
+ * selector (an ident right after `.`) is never expanded, so `Maybe.Just` keeps its
+ * member even if `Just` were aliased. */
+#define MAX_TYPE_ALIASES 64
+
+typedef struct {
+	char name[64];
+	const Token *body; /* target tokens (into the lexer's array), no NEWLINE/EOF */
+	int nbody;
+	int line;
+} TypeAlias;
+
+typedef struct { Token *buf; size_t n, cap; } TokBuf;
+
+static void tb_push(TokBuf *tb, Token t) {
+	if (tb->n == tb->cap) {
+		tb->cap = tb->cap ? tb->cap * 2 : 256;
+		tb->buf = realloc(tb->buf, tb->cap * sizeof(Token));
+		if (!tb->buf)
+			die(0, "out of memory");
+	}
+	tb->buf[tb->n++] = t;
+}
+
+/* Index of the alias whose name equals PascalCase token `t`, or -1. */
+static int find_alias(TypeAlias *al, int nal, Token *t) {
+	if (!is_type_ident(t))
+		return -1;
+	for (int i = 0; i < nal; i++)
+		if (is_ident(t, al[i].name))
+			return i;
+	return -1;
+}
+
+/* Append `toks[0..n)` to `tb`, expanding any alias name (except a selector right
+ * after `.`) into its target sequence — recursively, so an alias-of-alias resolves
+ * to a fixpoint; a depth cap breaks a cyclic alias. */
+static void alias_emit_seq(TokBuf *tb, TypeAlias *al, int nal, const Token *toks, int n, int depth) {
+	if (depth > 64)
+		die(toks[0].line, "cyclic `type` alias");
+	TokKind prev = TK_EOF;
+	for (int i = 0; i < n; i++) {
+		Token *t = (Token *)&toks[i];
+		int a = (prev == TK_DOT) ? -1 : find_alias(al, nal, t);
+		if (a >= 0)
+			alias_emit_seq(tb, al, nal, al[a].body, al[a].nbody, depth + 1);
+		else
+			tb_push(tb, *t);
+		prev = t->kind;
+	}
+}
+
+/* Set `*kw` to the keyword-token index of the declaration starting at index `i`,
+ * past an optional leading `pub`. */
+static void decl_kw(Token *toks, size_t i, size_t *kw) {
+	*kw = is_ident(&toks[i], "pub") ? i + 1 : i;
+}
+
+/* Rewrite the token stream, erasing top-level `type` aliases (see the block comment).
+ * Updates the token array and count in place; a no-op when there is no `type`. */
+static void expand_type_aliases(Token **ptoks, size_t *pntoks) {
+	Token *toks = *ptoks;
+	size_t n = *pntoks;
+
+	TypeAlias al[MAX_TYPE_ALIASES];
+	int nal = 0;
+
+	/* PASS 1 — collect every top-level `type Name = <body>` decl. */
+	int depth = 0, line_start = 1;
+	for (size_t i = 0; i < n; i++) {
+		Token *t = &toks[i];
+		if (t->kind == TK_NEWLINE) {
+			line_start = 1;
+			continue;
+		}
+		int here = line_start && depth == 0;
+		line_start = 0;
+		if (t->kind == TK_LPAREN || t->kind == TK_LBRACE || t->kind == TK_LBRACKET)
+			depth++;
+		else if (t->kind == TK_RPAREN || t->kind == TK_RBRACE || t->kind == TK_RBRACKET)
+			depth--;
+		if (!here)
+			continue;
+		size_t kw;
+		decl_kw(toks, i, &kw);
+		if (!is_ident(&toks[kw], "type"))
+			continue;
+		size_t k = kw + 1; /* the type name */
+		if (!is_type_ident(&toks[k]))
+			die(toks[k].line, "expected a type name after `type`");
+		Token *nmeT = &toks[k];
+		k++;
+		if (toks[k].kind == TK_LBRACKET)
+			die(toks[k].line, "generic `type` aliases are not supported yet (a later brick)");
+		if (toks[k].kind != TK_EQ)
+			die(toks[k].line, "a `type` declaration needs `=` (e.g. `type Id = Uarch`)");
+		k++; /* past `=` */
+		if (toks[k].kind == TK_LBRACE)
+			die(toks[k].line, "the named-tuple `type { ... }` form is not supported yet (use a plain type alias)");
+		size_t b0 = k;
+		while (toks[k].kind != TK_NEWLINE && toks[k].kind != TK_EOF)
+			k++;
+		if (k == b0)
+			die(nmeT->line, "a `type` declaration needs a body after `=`");
+		if (nal == MAX_TYPE_ALIASES)
+			die(nmeT->line, "too many type aliases");
+		char nm[64];
+		tok_copy(nmeT, nm, sizeof nm);
+		if (is_builtin_type_name(nm) || strcmp(nm, "Unit") == 0)
+			die(nmeT->line, "a `type` alias may not shadow a built-in type");
+		for (int j = 0; j < nal; j++)
+			if (strcmp(al[j].name, nm) == 0)
+				die(nmeT->line, "duplicate `type` alias");
+		snprintf(al[nal].name, sizeof al[nal].name, "%s", nm);
+		al[nal].body = &toks[b0];
+		al[nal].nbody = (int)(k - b0);
+		al[nal].line = nmeT->line;
+		nal++;
+	}
+	if (nal == 0)
+		return;
+
+	/* A `type` name may not collide with a top-level `data`/`union` HEAD, nor with an
+	 * inline `union` MEMBER name — a member is the only place a bare (unqualified)
+	 * PascalCase name that is NOT a type would be silently rewritten (a member USE is
+	 * `.`-qualified, so the selector guard already spares it; only the DECLARATION is
+	 * bare). Guarding it keeps the erasure strictly subtractive — never a mis-lowering. */
+	depth = 0;
+	line_start = 1;
+	for (size_t i = 0; i < n; i++) {
+		Token *t = &toks[i];
+		if (t->kind == TK_NEWLINE) {
+			line_start = 1;
+			continue;
+		}
+		int here = line_start && depth == 0;
+		line_start = 0;
+		if (t->kind == TK_LPAREN || t->kind == TK_LBRACE || t->kind == TK_LBRACKET)
+			depth++;
+		else if (t->kind == TK_RPAREN || t->kind == TK_RBRACE || t->kind == TK_RBRACKET)
+			depth--;
+		if (!here || (!is_ident(t, "data") && !is_ident(t, "union")))
+			continue;
+		if (is_type_ident(&toks[i + 1]) && find_alias(al, nal, &toks[i + 1]) >= 0)
+			die(toks[i + 1].line, "a `type` alias collides with a `data`/`union` of the same name");
+		if (!is_ident(t, "union"))
+			continue;
+		/* Scan the union body for member names. The first `{` after the keyword is the
+		 * body (only `['T]` and `=` can precede it). A member name sits at brace-depth 1,
+		 * paren-depth 0, right after `{` or a top-level `,`; a `...` spreads a union HEAD
+		 * (already guarded) so it starts no new member. */
+		size_t j = i + 1;
+		while (j < n && toks[j].kind != TK_LBRACE && toks[j].kind != TK_EOF)
+			j++;
+		int bd = 0, pd = 0, want_member = 0;
+		for (; j < n && toks[j].kind != TK_EOF; j++) {
+			TokKind k = toks[j].kind;
+			if (k == TK_LBRACE) { if (++bd == 1) want_member = 1; continue; }
+			if (k == TK_RBRACE) { if (--bd == 0) break; continue; }
+			if (k == TK_LPAREN || k == TK_LBRACKET) { pd++; continue; }
+			if (k == TK_RPAREN || k == TK_RBRACKET) { pd--; continue; }
+			if (bd != 1 || pd != 0)
+				continue;
+			if (k == TK_COMMA) { want_member = 1; continue; }
+			if (k == TK_ELLIPSIS) { want_member = 0; continue; }
+			if (want_member && is_type_ident(&toks[j]) && find_alias(al, nal, &toks[j]) >= 0)
+				die(toks[j].line, "a `type` alias collides with a union member of the same name");
+			want_member = 0;
+		}
+	}
+
+	/* PASS 2a — copy the stream, dropping each `type` decl line (with its NEWLINE). */
+	TokBuf stripped = {0};
+	depth = 0;
+	line_start = 1;
+	for (size_t i = 0; i < n; i++) {
+		Token *t = &toks[i];
+		int here = line_start && depth == 0;
+		if (t->kind == TK_NEWLINE) {
+			line_start = 1;
+			tb_push(&stripped, *t);
+			continue;
+		}
+		line_start = 0;
+		if (t->kind == TK_LPAREN || t->kind == TK_LBRACE || t->kind == TK_LBRACKET)
+			depth++;
+		else if (t->kind == TK_RPAREN || t->kind == TK_RBRACE || t->kind == TK_RBRACKET)
+			depth--;
+		size_t kw;
+		if (here && (decl_kw(toks, i, &kw), is_ident(&toks[kw], "type"))) {
+			while (i < n && toks[i].kind != TK_NEWLINE && toks[i].kind != TK_EOF)
+				i++; /* skip the decl body */
+			if (i < n && toks[i].kind == TK_NEWLINE) {
+				line_start = 1; /* the dropped NEWLINE ends the line — next token starts a new one */
+				continue;       /* drop the NEWLINE too (loop's ++ moves past) */
+			}
+			i--; /* EOF: let the outer loop see it */
+			continue;
+		}
+		tb_push(&stripped, *t);
+	}
+
+	/* PASS 2b — expand alias names in the stripped stream. */
+	TokBuf out = {0};
+	alias_emit_seq(&out, al, nal, stripped.buf, (int)stripped.n, 0);
+	free(stripped.buf);
+	*ptoks = out.buf;
+	*pntoks = out.n;
+}
+
 /* Return the stem of a path — its basename without a trailing .cf. Used for the
  * default ./out/<stem> artifact name. */
 static char *stem_of(const char *path) {
@@ -7168,6 +7406,7 @@ int main(int argc, char **argv) {
 
 	Parser ps = {0};
 	ps.toks = lx.toks;
+	expand_type_aliases(&ps.toks, &lx.ntoks); /* erase comptime `type` aliases before parse */
 	Program prog = {0};
 	parse(&ps, &prog);
 	monomorphize(&prog); /* specialize generic calls before the concrete passes */
