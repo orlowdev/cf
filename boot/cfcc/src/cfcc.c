@@ -3471,8 +3471,9 @@ static void parse_type_arg(Parser *p, char *out, size_t cap) {
 }
 
 /* Parse ONE tuple element type into a canonical string: a simple leaf/aggregate name (via
- * parse_type_arg, e.g. `Int`, `Str`, `Point`) or a NESTED tuple `(T0,T1,…)` — recursively,
- * so `((Int,Int),Int)` round-trips. A generic `'T` element is a later brick. */
+ * parse_type_arg, e.g. `Int`, `Str`, `Point`), a type variable `'T` (validated against the
+ * enclosing declaration's type parameters, substituted at instantiation), or a NESTED tuple
+ * `(T0,T1,…)` — recursively, so `((Int,'T),Int)` round-trips. */
 static void parse_tuple_elem_type(Parser *p, char *out, size_t cap) {
 	Token *t = peek(p);
 	if (t->kind == TK_LPAREN) {
@@ -3502,11 +3503,9 @@ static void parse_tuple_elem_type(Parser *p, char *out, size_t cap) {
 		out[off] = '\0';
 		return;
 	}
-	if (is_tyvar(t))
-		die(t->line, "a generic element in a tuple type is a later brick");
-	if (!is_type_ident(t))
+	if (!is_tyvar(t) && !is_type_ident(t))
 		die(t->line, "a tuple type lists element types (`(Int, Str)`)");
-	parse_type_arg(p, out, cap);
+	parse_type_arg(p, out, cap); /* a leaf/aggregate name, `'T`, or a generic application */
 }
 
 /* Parse a field/payload type into `out`: `Int`, an aggregate (record/union) type, a tuple
@@ -3574,7 +3573,9 @@ static void check_tyvars_declared(const char *mangled, char typarams[][64], int 
 	char buf[512];
 	if ((size_t)snprintf(buf, sizeof buf, "%s", mangled) >= sizeof buf)
 		die(line, "type name too long");
-	for (char *tok = strtok(buf, "."); tok; tok = strtok(NULL, ".")) {
+	/* Split on `.` (mangle separator) AND `(`,`)`,`,` so a `'T` nested inside a tuple element
+	 * type — `(Int,'T)` — is validated too, not just a top-level `'T`. */
+	for (char *tok = strtok(buf, ".(),"); tok; tok = strtok(NULL, ".(),")) {
 		if (tok[0] != '\'')
 			continue;
 		int found = 0;
@@ -3999,6 +4000,44 @@ static void mangle_join(const Mangle *m, int a, int b, char *out, size_t cap) {
  * name); other elements (base names, arity digits) pass through unchanged. */
 static void subst_mangled(char *dst, size_t cap, const char *src,
                           char typarams[][64], char args[][256], int ntp) {
+	if (src[0] == '(') {
+		/* A tuple type string `(T0,T1,…)` — substitute each element (top-level comma split,
+		 * respecting nested parens) and rejoin, so a `'T` element picks up its concrete arg
+		 * (`(Int,'T)` → `(Int,Int)`). Element names are themselves mangled/tuple strings, so
+		 * each recurses through here. */
+		int off = 0;
+		if ((size_t)2 >= cap)
+			die(0, "tuple type name too long");
+		dst[off++] = '(';
+		int depth = 0, start = 1, n = 0;
+		for (int i = 1;; i++) {
+			char ch = src[i];
+			if (ch == '(') {
+				depth++;
+			} else if (ch == ')' && depth > 0) {
+				depth--;
+			} else if (ch == '\0' || ((ch == ',' || ch == ')') && depth == 0)) {
+				char el[256], sub[256];
+				int len = i - start;
+				if (len < 0 || (size_t)len >= sizeof el)
+					die(0, "tuple element type too long");
+				memcpy(el, src + start, (size_t)len);
+				el[len] = '\0';
+				subst_mangled(sub, sizeof sub, el, typarams, args, ntp);
+				int w = snprintf(dst + off, cap - (size_t)off, "%s%s", n ? "," : "", sub);
+				if (w < 0 || (size_t)(off + w) + 1 >= cap)
+					die(0, "tuple type name too long");
+				off += w;
+				n++;
+				start = i + 1;
+				if (ch == ')' || ch == '\0')
+					break;
+			}
+		}
+		dst[off++] = ')';
+		dst[off] = '\0';
+		return;
+	}
 	char buf[512];
 	Mangle m;
 	mangle_split(src, &m, buf, sizeof buf);
