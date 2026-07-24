@@ -186,6 +186,21 @@ static int ident_char(int c) {
 	return isalnum(c) || c == '_';
 }
 
+/* The value of digit `c` in `base` (2/8/10/16), or -1 if it is not a digit of that
+ * base. Hex accepts either case (`0xff`, `0xDEAD`). */
+static int digit_val(int c, int base) {
+	int d;
+	if (c >= '0' && c <= '9')
+		d = c - '0';
+	else if (c >= 'a' && c <= 'f')
+		d = c - 'a' + 10;
+	else if (c >= 'A' && c <= 'F')
+		d = c - 'A' + 10;
+	else
+		return -1;
+	return d < base ? d : -1;
+}
+
 /* Append a string segment (growing the array), returning it for the caller to
  * fill. Used only while lexing a string literal into its literal/interp pieces. */
 static StrSeg *push_seg(StrSeg **segs, int *nsegs, int *cap) {
@@ -333,13 +348,27 @@ static void lex(Lexer *lx) {
 		if (isdigit(c)) {
 			size_t start = lx->pos;
 			long v = 0;
-			while (isdigit((unsigned char)s[lx->pos])) {
-				int d = s[lx->pos] - '0';
-				if (v > (LONG_MAX - d) / 10)
-					die(lx->line, "integer literal out of range");
-				v = v * 10 + d;
-				lx->pos++;
+			/* A base prefix is lowercase only (`0x`/`0o`/`0b`, ebnf § Numbers); anything
+			 * else is a decimal run. A leading `0` alone (or `07`) stays decimal — there is
+			 * no C-style leading-zero octal. */
+			int base = 10;
+			if (s[lx->pos] == '0' && (s[lx->pos + 1] == 'x' || s[lx->pos + 1] == 'o' || s[lx->pos + 1] == 'b')) {
+				base = s[lx->pos + 1] == 'x' ? 16 : s[lx->pos + 1] == 'o' ? 8 : 2;
+				lx->pos += 2; /* past `0x`/`0o`/`0b` */
 			}
+			int any = 0;
+			for (;;) {
+				int d = digit_val((unsigned char)s[lx->pos], base);
+				if (d < 0)
+					break;
+				if (v > (LONG_MAX - d) / base)
+					die(lx->line, "integer literal out of range");
+				v = v * base + d;
+				lx->pos++;
+				any = 1;
+			}
+			if (!any) /* `0x`/`0o`/`0b` with no following digit */
+				die(lx->line, "expected digits after the base prefix (e.g. `0xff`, `0o17`, `0b101`)");
 			push_tok(lx, TK_INT, s + start, (int)(lx->pos - start), v);
 			continue;
 		}
