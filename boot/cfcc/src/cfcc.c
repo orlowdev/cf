@@ -3398,11 +3398,18 @@ static Func *parse_func(Parser *p, Program *prog) {
 		advance(p);
 		return fn;
 	}
-	/* Every type variable used in a signature — a bare `'T` param/return or one nested in a
-	 * generic application like `Box['T]` — must be a declared type parameter. */
-	for (int i = 0; i < fn->nparams; i++)
+	/* Every type variable used in a signature — a bare `'T` param/return, one nested in a
+	 * generic application like `Box['T]`, or one in a tuple element like `('T, Int)` — must be
+	 * a declared type parameter. A tuple param/return keeps its elements as separate strings. */
+	for (int i = 0; i < fn->nparams; i++) {
 		check_tyvars_declared(fn->params[i].type_name, fn->typarams, fn->ntyparams, fn->params[i].line);
+		if (fn->params[i].kind == PK_TUPLE)
+			for (int j = 0; j < fn->params[i].tuple_n; j++)
+				check_tyvars_declared(fn->params[i].tuple_types[j], fn->typarams, fn->ntyparams, fn->params[i].line);
+	}
 	check_tyvars_declared(fn->ret_type_name, fn->typarams, fn->ntyparams, fn->ret_line);
+	for (int j = 0; j < fn->ret_tuple_n; j++)
+		check_tyvars_declared(fn->ret_tuple_types[j], fn->typarams, fn->ntyparams, fn->ret_line);
 	fn->body = parse_body(p, fn);
 	return fn;
 }
@@ -4379,7 +4386,33 @@ static Func *instantiate(Program *prog, Func *tmpl, char typeargs[][64], int nar
 			if (strlen(sub) >= sizeof c->params[i].type_name)
 				die(line, "parameter type name too long");
 			snprintf(c->params[i].type_name, sizeof c->params[i].type_name, "%s", sub);
+		} else if (c->params[i].kind == PK_TUPLE) {
+			/* A tuple param `('T, Int)` — its element strings are a heap array SHARED with the
+			 * template (copied by pointer above), so substitute into a FRESH copy, never in place
+			 * (that would corrupt the template for its other instantiations). resolve_signatures
+			 * interns the clone's own shape from these substituted strings. */
+			int tn = c->params[i].tuple_n;
+			char (*elems)[64] = xmalloc((size_t)tn * sizeof *elems);
+			for (int j = 0; j < tn; j++) {
+				char sub[256];
+				subst_mangled(sub, sizeof sub, tmpl->params[i].tuple_types[j], tmpl->typarams, targs, tmpl->ntyparams);
+				if (strlen(sub) >= sizeof elems[0])
+					die(line, "tuple parameter element type name too long");
+				snprintf(elems[j], sizeof elems[0], "%s", sub);
+			}
+			c->params[i].tuple_types = elems;
+			c->params[i].tup = NULL; /* re-interned per this instantiation in resolve_signatures */
 		}
+	}
+	for (int j = 0; j < c->ret_tuple_n; j++) {
+		/* A tuple RETURN's element strings live in a by-value array (already the clone's own),
+		 * so substitute each in place; resolve_signatures re-interns `ret_tup`. */
+		char sub[256];
+		subst_mangled(sub, sizeof sub, tmpl->ret_tuple_types[j], tmpl->typarams, targs, tmpl->ntyparams);
+		if (strlen(sub) >= sizeof c->ret_tuple_types[0])
+			die(line, "tuple return element type name too long");
+		snprintf(c->ret_tuple_types[j], sizeof c->ret_tuple_types[0], "%s", sub);
+		c->ret_tup = NULL;
 	}
 	if (c->ret_type_name[0] && strchr(c->ret_type_name, '\'')) {
 		char sub[256];
