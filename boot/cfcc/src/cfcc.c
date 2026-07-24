@@ -526,6 +526,12 @@ typedef enum {
 	            * equal shapes share one decl → identity is a pointer compare). Indexed ONLY at a
 	            * comptime literal `t[k]` (per-position type; not iterable, no `.len`). ⚠ THROWAWAY
 	            * layout, like the record layout: cf0's tuple packs by real element size. */
+	TY_UNIT,   /* `Unit` / `()` — the zero-element tuple, the terminal type `1` (type_system §2.3,
+	            * §6.1). It carries no information, so cfcc lowers its sole value to a word `0`
+	            * (type_is_word ⇒ it rides every word slot/store/return path); it stays a DISTINCT
+	            * kind from Int so typecheck never confuses the two (`() + 1` is rejected — Int
+	            * contexts test `.kind == TY_INT`, not `type_is_word`). Chiefly a function return
+	            * type (`(A) -> Unit`) and a bindable value. */
 } TypeKind;
 
 typedef struct {
@@ -600,6 +606,8 @@ typedef enum {
 	EX_SPREAD,/* a tuple-element spread `...src` (lhs=src, a tuple value). Appears ONLY as an
 	           * element of an EX_TUPLE; at typecheck/emit its src tuple's elements are spliced
 	           * in place (`(...t, x)` — a comptime desugar, ebnf § Aggregate Literals). */
+	EX_UNIT,  /* the unit value `()` — the zero-element tuple (type `Unit`/`()`, TY_UNIT). It holds
+	           * no data, so it carries no operands and emits the word constant `0`. */
 	EX_RECORD,/* record construction: a data literal { f: v, ... } of type `name` */
 	EX_CALL,  /* function call: name(args) */
 	EX_CAST,  /* numeric cast Int(x)/Uarch(x) — a scalar conversion (lhs=operand, name=target type) */
@@ -909,6 +917,8 @@ static int union_member_tag(const UnionDecl *u, const char *name) {
  * handled like a `data` record — as are records/pointers/Uarch/Str/buffers. */
 static int type_is_word(Type t) {
 	if (t.kind == TY_INT)
+		return 1;
+	if (t.kind == TY_UNIT) /* the unit value lowers to a word `0` — see TY_UNIT */
 		return 1;
 	if (t.kind == TY_UNION)
 		return !t.uni->has_payload;
@@ -1650,11 +1660,15 @@ static Expr *parse_primary(Parser *p, Func *fn) {
 		 * the first element — OR a leading `...spread` — forks to the tuple (ebnf § Aggregate
 		 * Literals: a one-tuple `(e)` ≅ its element, so a lone plain element, even with a
 		 * trailing comma, stays grouping). An element may be a `...src` spread, splicing a
-		 * tuple's elements in place. An empty `()` is the unit value — not modeled yet. */
+		 * tuple's elements in place. An empty `()` is the unit value (§6.1 — the zero-tuple). */
 		int line = t->line;
 		advance(p);
-		if (peek(p)->kind == TK_RPAREN)
-			die(peek(p)->line, "the unit value `()` is not supported yet");
+		if (peek(p)->kind == TK_RPAREN) {
+			advance(p); /* ) — the unit value `()` */
+			Expr *u = new_expr(EX_UNIT);
+			u->line = line;
+			return u;
+		}
 		int first_spread = peek(p)->kind == TK_ELLIPSIS;
 		Expr *first;
 		if (first_spread) {
@@ -2410,8 +2424,12 @@ static int looks_like_lambda(Parser *p) {
 	if (peek(p)->kind != TK_LPAREN)
 		return 0;
 	Token *t1 = &p->toks[p->pos + 1];
-	if (t1->kind == TK_RPAREN)
-		return 1; /* `() ->` */
+	if (t1->kind == TK_RPAREN) {
+		/* `()` is a nullary closure only if a body/return-type arrow follows (`() ->` or
+		 * `() : Ret ->`); a bare `()` with neither is the unit value (§6.1), an expression. */
+		Token *t2 = &p->toks[p->pos + 2];
+		return t2->kind == TK_ARROW || t2->kind == TK_COLON;
+	}
 	if (is_tyvar(t1) || t1->kind == TK_STAR)
 		return 1; /* `('T x) ->` / `(*[Str] x) ->` */
 	/* `(Type name` — a param, distinct from a cast `(Int(…)` whose type is followed by `(`. */
@@ -2555,9 +2573,15 @@ static int parse_return_type(Parser *p, Func *fn) {
 	if (rt->kind == TK_LPAREN) {
 		/* A tuple return type `(T0, …, Tn-1)` — a function returning a heterogeneous product
 		 * (the multi-value return). Element types are Int, Str, or a record name (brick 1,
-		 * matching a tuple value's elements); resolved + interned in resolve_signatures. */
+		 * matching a tuple value's elements); resolved + interned in resolve_signatures. An
+		 * empty `()` is instead the unit return type — the zero-tuple, spelled `Unit` (§6.1). */
 		fn->ret_line = rt->line;
 		advance(p); /* ( */
+		if (peek(p)->kind == TK_RPAREN) {
+			advance(p); /* ) — `: ()` reads as the unit return type `Unit` */
+			snprintf(fn->ret_type_name, sizeof fn->ret_type_name, "Unit");
+			return 1;
+		}
 		for (;;) {
 			if (fn->ret_tuple_n == MAX_FIELDS)
 				die(peek(p)->line, "tuple return type has too many elements");
@@ -4893,6 +4917,9 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		t.tup = prog_intern_tuple(prog, elems, n);
 		return t;
 	}
+	case EX_UNIT:
+		/* The unit value `()` — the sole value of the zero-tuple type `Unit`. */
+		return (Type){TY_UNIT, NULL, NULL, 0, NULL};
 	case EX_SPREAD:
 		die(e->line, "a spread `...x` is only valid as a tuple element");
 	case EX_RECORD:
@@ -5199,6 +5226,8 @@ static Type func_ret_type(const Func *fn) {
 		return (Type){TY_TUPLE, NULL, NULL, 0, fn->ret_tup};
 	if (strcmp(fn->ret_type_name, "Uarch") == 0)
 		return (Type){TY_UARCH, NULL, NULL, 0, NULL};
+	if (strcmp(fn->ret_type_name, "Unit") == 0) /* `Unit`/`()` — the zero-tuple, a word `0` */
+		return (Type){TY_UNIT, NULL, NULL, 0, NULL};
 	if (fn->ret_uni)
 		return (Type){TY_UNION, NULL, fn->ret_uni, 0, NULL};
 	if (fn->ret_type_name[0])
@@ -5243,6 +5272,17 @@ static void set_local_tuple(Func *fn, const char *name, TupleDecl *tup) {
 	for (int i = 0; i < fn->nlocals; i++)
 		if (strcmp(fn->locals[i].name, name) == 0) {
 			fn->locals[i].type = (Type){TY_TUPLE, NULL, NULL, 0, tup};
+			return;
+		}
+}
+
+/* Retype a local (parsed provisionally as a word `Int`) to `Unit` — for `const u = ()` or a
+ * binding of a `Unit`-returning call. Unit is word-repr (a `0`), so the provisional word slot
+ * already fits; this only makes the local's type precise (a read yields `Unit`, not `Int`). */
+static void set_local_unit(Func *fn, const char *name) {
+	for (int i = 0; i < fn->nlocals; i++)
+		if (strcmp(fn->locals[i].name, name) == 0) {
+			fn->locals[i].type = (Type){TY_UNIT, NULL, NULL, 0, NULL};
 			return;
 		}
 }
@@ -5465,6 +5505,8 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 				Type it = typeof_expr(prog, fn, s->expr);
 				if (it.kind == TY_TUPLE)
 					set_local_tuple(fn, s->name, it.tup);
+				else if (it.kind == TY_UNIT) /* `const u = ()` or a `Unit`-returning call */
+					set_local_unit(fn, s->name);
 				else if (it.kind != TY_INT)
 					die(s->expr->line, "expected an Int value (a record is used only via field "
 					                   "access, and a string only via `.len`, in M0)");
@@ -5535,6 +5577,11 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 				Type et = typeof_expr(prog, fn, s->expr);
 				if (et.kind != TY_TUPLE || !types_equal(et, rt))
 					die(s->expr->line, "returned value does not match the tuple return type");
+			} else if (rt.kind == TY_UNIT) {
+				/* A `Unit`-returning function yields the unit value `()` — its only value. */
+				Type et = typeof_expr(prog, fn, s->expr);
+				if (et.kind != TY_UNIT)
+					die(s->expr->line, "a `Unit` function returns the unit value `()`");
 			} else {
 				expect_int(prog, fn, s->expr);
 			}
@@ -5617,7 +5664,8 @@ static void resolve_signatures(Program *prog) {
 					die(fn->params[j].line, "a captured variable names an unknown data type");
 				fn->params[j].rec = d;
 			}
-		if (fn->ret_type_name[0] && strcmp(fn->ret_type_name, "Uarch") != 0) {
+		if (fn->ret_type_name[0] && strcmp(fn->ret_type_name, "Uarch") != 0 &&
+		    strcmp(fn->ret_type_name, "Unit") != 0) {
 			UnionDecl *u = prog_find_union(prog, fn->ret_type_name);
 			if (u) {
 				fn->ret_uni = u;
@@ -5992,6 +6040,10 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		snprintf(dst, cap, "%%t%d", r);
 		return;
 	}
+	case EX_UNIT:
+		/* The unit value carries no data — lower it to the word constant `0` (see TY_UNIT). */
+		snprintf(dst, cap, "0");
+		return;
 	case EX_SPREAD:
 		die(e->line, "internal: spread outside a tuple literal");
 	case EX_RECORD: {
