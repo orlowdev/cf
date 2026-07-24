@@ -598,14 +598,18 @@ typedef enum {
 	            * type_system §2); cfcc has it as a local/param/return/argument and in arithmetic,
 	            * comparison, and Int/Uarch↔Float casts. NOT a word — its own load/store/register
 	            * path. ⚠ THROWAWAY narrowings (cf0 takes the full tower; all are SUBSET-safe —
-	            * cfcc rejects more, never mis-lowers): (1) no Float32 yet (a later brick); (2) a
-	            * float literal is Float64-only — no literal-adopts-Float32 (use `Float32(…)` when
-	            * it lands); (3) an INT literal does NOT adopt a Float64 context (`const Float64 x =
-	            * 5` is rejected, use `5.0` or `Float64(5)`) and an INFERRED float local `const x =
-	            * 1.5` is rejected (defaults to Int) — §3 grants both, so like the Uarch precedent
-	            * cf0 should WARN/adopt not reject; (4) float `%` is DEFERRED (§5.6 lists it as
-	            * arithmetic — spec-legal on floats — cfcc just hasn't wired float `rem`); (5) floats
-	            * are not yet aggregate fields/payloads/tuple elements/array elements. */
+	            * cfcc rejects more, never mis-lowers): (1) a float LITERAL is Float64 — a Float32
+	            * value comes from an explicit `Float32(…)` cast (no literal-adopts-Float32); (2) an
+	            * INT literal does NOT adopt a float context (`const Float64 x = 5` is rejected, use
+	            * `5.0` or `Float64(5)`) and an INFERRED float local `const x = 1.5` is rejected
+	            * (defaults to Int) — §3 grants both, so like the Uarch precedent cf0 should
+	            * WARN/adopt not reject; (3) float `%` is DEFERRED (§5.6 lists it as arithmetic —
+	            * spec-legal on floats — cfcc just hasn't wired float `rem`); (4) floats are not yet
+	            * aggregate fields/payloads/tuple elements/array elements. */
+	TY_F32,    /* Float32 — an IEEE-754 single, QBE `s`. Same story as TY_F64 (its own `s`
+	            * load/store/register path, 4-byte slot). A float LITERAL is Float64, so a
+	            * Float32 value comes from an explicit `Float32(…)` cast (of a float or an int).
+	            * Same THROWAWAY narrowings as TY_F64. */
 	TY_UNIT,   /* `Unit` / `()` — the zero-element tuple, the terminal type `1` (type_system §2.3,
 	            * §6.1). It carries no information, so cfcc lowers its sole value to a word `0`
 	            * (type_is_word ⇒ it rides every word slot/store/return path); it stays a DISTINCT
@@ -654,6 +658,7 @@ typedef enum {
 	PK_UNIT,   /* a unit parameter `Unit name` (or `() name`) -> w. The zero-tuple carries no data,
 	            * so it arrives as a word `0` and spills to a word slot like an Int (type TY_UNIT). */
 	PK_F64,    /* Float64 -> d (an IEEE double passed in a float register; see TY_F64). */
+	PK_F32,    /* Float32 -> s (an IEEE single passed in a float register; see TY_F32). */
 } ParamKind;
 
 typedef struct {
@@ -1029,17 +1034,24 @@ static int param_is_word(const Param *p) {
 	return p->kind == PK_WORD || p->kind == PK_UNIT || (p->kind == PK_UNION && !p->uni->has_payload);
 }
 
-/* The QBE base type of a scalar value: `d` for a Float64, `w` for a word (Int/tag-only
- * union/unit), `l` for everything else (a pointer/Uarch/aggregate reference). Used to pick
- * a value's register, load/store, and constant syntax. */
+/* True if a type is a floating-point scalar (Float32/Float64). */
+static int is_float_type(Type t) { return t.kind == TY_F32 || t.kind == TY_F64; }
+
+/* The QBE base type of a scalar value: `d`/`s` for a Float64/Float32, `w` for a word
+ * (Int/tag-only union/unit), `l` for everything else (a pointer/Uarch/aggregate reference).
+ * Used to pick a value's register, load/store (`load%c`/`store%c`), and constant syntax. */
 static char qtype_of(Type t) {
 	if (t.kind == TY_F64)
 		return 'd';
+	if (t.kind == TY_F32)
+		return 's';
 	return type_is_word(t) ? 'w' : 'l';
 }
 static char param_qtype(const Param *p) {
 	if (p->kind == PK_F64)
 		return 'd';
+	if (p->kind == PK_F32)
+		return 's';
 	return param_is_word(p) ? 'w' : 'l';
 }
 
@@ -1407,6 +1419,7 @@ static Resolution resolve_name(Func *fn, const char *name, Type *ty) {
 			case PK_TUPLE:   ty->kind = TY_TUPLE; ty->rec = NULL; ty->tup = fn->params[i].tup; break; /* by pointer, read-only */
 			case PK_UNIT:    ty->kind = TY_UNIT;  ty->rec = NULL; break; /* the unit value, a word `0` */
 			case PK_F64:     ty->kind = TY_F64;   ty->rec = NULL; break; /* Float64 -> d */
+			case PK_F32:     ty->kind = TY_F32;   ty->rec = NULL; break; /* Float32 -> s */
 			}
 			return R_PARAM;
 		}
@@ -1649,6 +1662,11 @@ static void parse_param_type(Parser *p, Param *out) {
 	if (is_ident(t, "Float64")) {
 		advance(p);
 		out->kind = PK_F64;
+		return;
+	}
+	if (is_ident(t, "Float32")) {
+		advance(p);
+		out->kind = PK_F32;
 		return;
 	}
 	if (is_ident(t, "Unit")) { /* `Unit name` — the unit parameter (a word `0`); `()` below is the same */
@@ -2042,11 +2060,12 @@ static Expr *parse_primary(Parser *p, Func *fn) {
 		 * <Uarch>`, via expect_int), forcing this explicit cast; type_system §4 instead treats
 		 * `const T x = v` as sugar for `const x = T(v)` and WARNS rather than forbids — cf0
 		 * should warn, not reject. */
-		if ((is_ident(t, "Int") || is_ident(t, "Uarch") || is_ident(t, "Float64")) &&
+		if ((is_ident(t, "Int") || is_ident(t, "Uarch") || is_ident(t, "Float64") ||
+		     is_ident(t, "Float32")) &&
 		    p->toks[p->pos + 1].kind == TK_LPAREN) {
 			Expr *e = new_expr(EX_CAST);
 			e->line = t->line;
-			tok_copy(t, e->name, sizeof e->name); /* target type: "Int", "Uarch", or "Float64" */
+			tok_copy(t, e->name, sizeof e->name); /* target: "Int"/"Uarch"/"Float64"/"Float32" */
 			advance(p); /* type name */
 			advance(p); /* ( */
 			e->lhs = parse_expr(p, fn);
@@ -2978,7 +2997,7 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 		}
 		/* Optional type annotation: `Int` (a word local) or a record type name (a
 		 * `data`-typed local). A pointer annotation has no M0 local use. */
-		int is_record = 0, is_str = 0, is_buf = 0, bufsize = 0, is_arr = 0, arrlen = 0, is_f64 = 0;
+		int is_record = 0, is_str = 0, is_buf = 0, bufsize = 0, is_arr = 0, arrlen = 0, is_f64 = 0, is_f32 = 0;
 		char bufsize_name[64] = {0}; /* a `[n Uint8]` buffer sized by a comptime value param */
 		char rectype[64] = {0};
 		Token *tt = peek(p);
@@ -3039,6 +3058,9 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 				die(tt->line, "M0 has no `Uarch` locals (Uarch is a parameter/return type)");
 			} else if (is_ident(tt, "Float64")) {
 				is_f64 = 1;
+				advance(p);
+			} else if (is_ident(tt, "Float32")) {
+				is_f32 = 1;
 				advance(p);
 			} else { /* a record/union type, or a generic application `Box[Int]` (G3b) */
 				parse_type_arg(p, rectype, sizeof rectype);
@@ -3124,14 +3146,15 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 			Type at = {TY_ARRAY, NULL, NULL, 0, NULL};
 			at.alen = arrlen;
 			func_add_local(fn, s->name, mutable, at, "");
-		} else if (is_f64) {
-			/* `const Float64 x = <float expr>` (or `let` — floats reassign like Int). A float
-			 * literal is Float64, so `const Float64 x = 1.5` needs no cast; typecheck verifies
-			 * the initializer's type is Float64. */
+		} else if (is_f64 || is_f32) {
+			/* `const Float64 x = <float expr>` / `const Float32 x = Float32(…)` (or `let` —
+			 * floats reassign like Int). Typecheck verifies the initializer matches the
+			 * annotated float type. */
 			s->expr = parse_expr(p, fn);
-			snprintf(s->type_name, sizeof s->type_name, "Float64");
-			Type ft = {TY_F64, NULL, NULL, 0, NULL};
-			func_add_local(fn, s->name, mutable, ft, "Float64");
+			const char *tn = is_f64 ? "Float64" : "Float32";
+			snprintf(s->type_name, sizeof s->type_name, "%s", tn);
+			Type ft = {is_f64 ? TY_F64 : TY_F32, NULL, NULL, 0, NULL};
+			func_add_local(fn, s->name, mutable, ft, tn);
 		} else {
 			/* A `{` initializer with no type annotation is an attempted record
 			 * literal (M0 requires the annotation to know the record's type). */
@@ -3402,7 +3425,7 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 		/* Only a scalar `let` in a slot (an Int word or a Float64) can be reassigned as a
 		 * unit; a whole record/aggregate cannot — mutate its fields with `.`. (Aggregate
 		 * copy-binding is a later concern — memory_model §6 requires an explicit copy.) */
-		if (ty.kind != TY_INT && ty.kind != TY_F64)
+		if (ty.kind != TY_INT && !is_float_type(ty))
 			die(t->line, "cannot assign to a whole record (mutate a field with `.`)");
 		ExprKind cop;
 		if (compound_assign_op(peek(p)->kind, &cop)) {
@@ -4739,6 +4762,7 @@ static const char *shallow_type_name(Program *prog, Func *fn, Expr *e) {
 				case PK_TUPLE: return ""; /* a structural tuple — no nominal name to infer from */
 				case PK_UNIT: return "Unit"; /* the unit type */
 				case PK_F64: return "Float64";
+				case PK_F32: return "Float32";
 				}
 			}
 		for (int i = 0; i < fn->nlocals; i++)
@@ -5530,6 +5554,10 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 				if (at.kind != TY_F64)
 					die(e->line, "argument type mismatch (a Float64 parameter expects a Float64 value)");
 				break;
+			case PK_F32:
+				if (at.kind != TY_F32)
+					die(e->line, "argument type mismatch (a Float32 parameter expects a Float32 value)");
+				break;
 			}
 		}
 		e->callee = callee; /* cached for emit (per-arg register width, Int→Uarch widen) */
@@ -5641,13 +5669,14 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		return rt;
 	}
 	case EX_CAST: {
-		/* A numeric cast converts between scalar numbers (Int/Uarch/Float64); its operand
-		 * must itself be a scalar number (no pointer↔number conversion, type_system §4). */
+		/* A numeric cast converts between scalar numbers (Int/Uarch/Float64/Float32); its
+		 * operand must itself be a scalar number (no pointer↔number conversion, §4). */
 		Type at = typeof_expr(prog, fn, e->lhs);
-		if (at.kind != TY_INT && at.kind != TY_UARCH && at.kind != TY_F64)
-			die(e->line, "a numeric cast `Int(x)`/`Uarch(x)`/`Float64(x)` takes a scalar number");
+		if (at.kind != TY_INT && at.kind != TY_UARCH && !is_float_type(at))
+			die(e->line, "a numeric cast `Int(x)`/`Uarch(x)`/`Float64(x)`/`Float32(x)` takes a scalar number");
 		TypeKind tk = strcmp(e->name, "Uarch") == 0 ? TY_UARCH
 		            : strcmp(e->name, "Float64") == 0 ? TY_F64
+		            : strcmp(e->name, "Float32") == 0 ? TY_F32
 		            : TY_INT;
 		return (Type){tk, NULL, NULL, 0, NULL};
 	}
@@ -5678,10 +5707,10 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		return e->lhs->args[e->lhs->nargs - 1]->rtype;
 	}
 	case EX_NEG: {
-		/* Unary `-` negates an Int or a Float64 (yielding the operand type); `~`/`!` are
+		/* Unary `-` negates an Int or a float (yielding the operand type); `~`/`!` are
 		 * integer-only. */
 		Type t = typeof_expr(prog, fn, e->lhs);
-		if (t.kind == TY_F64)
+		if (is_float_type(t))
 			return t;
 		expect_int(prog, fn, e->lhs);
 		return (Type){TY_INT, NULL, NULL, 0, NULL};
@@ -5693,16 +5722,17 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 	case EX_ADD: case EX_SUB: case EX_MUL: case EX_DIV:
 	case EX_EQ: case EX_NE: case EX_LT: case EX_GT: case EX_LE: case EX_GE: {
 		/* Arithmetic `+ - * /` and comparison `== != < > <= >=` are NUMERIC: both operands
-		 * are Int OR both Float64 (no mixed operands — cast explicitly, type_system §4).
-		 * Arithmetic yields the operand type; a comparison yields Int (0/1). */
+		 * are Int OR both the SAME float type (no mixed Int/float and no mixed Float32/Float64
+		 * — cast explicitly, type_system §4). Arithmetic yields the operand type; a comparison
+		 * yields Int (0/1). */
 		Type lt = typeof_expr(prog, fn, e->lhs);
 		Type rt = typeof_expr(prog, fn, e->rhs);
-		if (lt.kind == TY_F64 || rt.kind == TY_F64) {
-			if (lt.kind != TY_F64 || rt.kind != TY_F64)
-				die(e->line, "a numeric operator needs two operands of the same type (no mixed Int/Float64 — cast explicitly)");
+		if (is_float_type(lt) || is_float_type(rt)) {
+			if (lt.kind != rt.kind || !is_float_type(lt))
+				die(e->line, "a numeric operator needs two operands of the same type (no mixed Int/Float or Float32/Float64 — cast explicitly)");
 			int is_cmp = e->kind == EX_EQ || e->kind == EX_NE || e->kind == EX_LT ||
 			             e->kind == EX_GT || e->kind == EX_LE || e->kind == EX_GE;
-			return (Type){is_cmp ? TY_INT : TY_F64, NULL, NULL, 0, NULL};
+			return (Type){is_cmp ? TY_INT : lt.kind, NULL, NULL, 0, NULL};
 		}
 		expect_int(prog, fn, e->lhs);
 		expect_int(prog, fn, e->rhs);
@@ -5736,6 +5766,8 @@ static Type func_ret_type(const Func *fn) {
 		return (Type){TY_UARCH, NULL, NULL, 0, NULL};
 	if (strcmp(fn->ret_type_name, "Float64") == 0)
 		return (Type){TY_F64, NULL, NULL, 0, NULL};
+	if (strcmp(fn->ret_type_name, "Float32") == 0)
+		return (Type){TY_F32, NULL, NULL, 0, NULL};
 	if (strcmp(fn->ret_type_name, "Unit") == 0) /* `Unit`/`()` — the zero-tuple, a word `0` */
 		return (Type){TY_UNIT, NULL, NULL, 0, NULL};
 	if (fn->ret_uni)
@@ -5947,6 +5979,9 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 			} else if (strcmp(s->type_name, "Float64") == 0) { /* a Float64 local */
 				if (typeof_expr(prog, fn, s->expr).kind != TY_F64)
 					die(s->line, "a Float64 local's initializer must be a Float64 value (cast with `Float64(x)` if needed)");
+			} else if (strcmp(s->type_name, "Float32") == 0) { /* a Float32 local */
+				if (typeof_expr(prog, fn, s->expr).kind != TY_F32)
+					die(s->line, "a Float32 local's initializer must be a Float32 value (cast with `Float32(x)`)");
 			} else if (prog_find_union(prog, s->type_name)) { /* a union binding */
 				/* `const Color c = Color.Red` — the annotation names a union; the
 				 * initializer must be a value of that union (a member, or another
@@ -6056,9 +6091,9 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 		case ST_ASSIGN: { /* target is a scalar `let` local; the value must match its type */
 			Type tt;
 			resolve_name(fn, s->name, &tt);
-			if (tt.kind == TY_F64) {
-				if (typeof_expr(prog, fn, s->expr).kind != TY_F64)
-					die(s->line, "a Float64 `let` is reassigned a Float64 value");
+			if (is_float_type(tt)) {
+				if (typeof_expr(prog, fn, s->expr).kind != tt.kind)
+					die(s->line, "a float `let` is reassigned a value of its own float type");
 			} else {
 				expect_int(prog, fn, s->expr);
 			}
@@ -6111,10 +6146,10 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 				Type et = typeof_expr(prog, fn, s->expr);
 				if (et.kind != TY_UNIT)
 					die(s->expr->line, "a `Unit` function returns the unit value `()`");
-			} else if (rt.kind == TY_F64) {
+			} else if (is_float_type(rt)) {
 				Type et = typeof_expr(prog, fn, s->expr);
-				if (et.kind != TY_F64)
-					die(s->expr->line, "a Float64 function returns a Float64 value (cast with `Float64(x)` if needed)");
+				if (et.kind != rt.kind)
+					die(s->expr->line, "a float function returns a value of its declared float type (cast if needed)");
 			} else {
 				expect_int(prog, fn, s->expr);
 			}
@@ -6200,7 +6235,8 @@ static void resolve_signatures(Program *prog) {
 				fn->params[j].rec = d;
 			}
 		if (fn->ret_type_name[0] && strcmp(fn->ret_type_name, "Uarch") != 0 &&
-		    strcmp(fn->ret_type_name, "Unit") != 0 && strcmp(fn->ret_type_name, "Float64") != 0) {
+		    strcmp(fn->ret_type_name, "Unit") != 0 && strcmp(fn->ret_type_name, "Float64") != 0 &&
+		    strcmp(fn->ret_type_name, "Float32") != 0) {
 			UnionDecl *u = prog_find_union(prog, fn->ret_type_name);
 			if (u) {
 				fn->ret_uni = u;
@@ -6466,11 +6502,12 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 			snprintf(dst, cap, "%%t%d", t);
 			return;
 		}
-		if (e->rtype.kind == TY_F64) {
-			/* A Float64 local/param lives in an 8-byte slot (params spill there like words),
-			 * so a read is a `loadd`. */
+		if (is_float_type(e->rtype)) {
+			/* A float local/param lives in its own slot (params spill there like words), so a
+			 * read is a `load<qt>` (`loads`/`loadd`). */
+			char qt = qtype_of(e->rtype);
 			int t = ex->tmp++;
-			fprintf(out, "\t%%t%d =d loadd %%s_%s\n", t, e->name);
+			fprintf(out, "\t%%t%d =%c load%c %%s_%s\n", t, qt, qt, e->name);
 			snprintf(dst, cap, "%%t%d", t);
 			return;
 		}
@@ -6756,26 +6793,30 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		return;
 	}
 	case EX_CAST: {
-		/* Convert a scalar number between Int (`w`, signed), Uarch (`l`, unsigned), and
-		 * Float64 (`d`). Int↔Uarch: widen `extsw` (exact) / narrow `w copy` (truncate). To a
-		 * float: `swtof` from signed Int, `ultof` from unsigned Uarch. From a float: `dtosi`
-		 * to signed Int, `dtoui` to unsigned Uarch. Same-type is an identity copy. */
+		/* Convert a scalar number between Int (`w`, signed), Uarch (`l`, unsigned), Float64
+		 * (`d`), and Float32 (`s`). Int↔Uarch: `extsw` widen / `w copy` truncate. Int/Uarch →
+		 * float: `swtof` (signed Int) / `ultof` (unsigned Uarch), result `s` or `d`. Float →
+		 * Int/Uarch: `<src>tosi` (→ signed Int `w`) / `<src>toui` (→ unsigned Uarch `l`),
+		 * `<src>` ∈ {s,d}. Float↔float: `truncd` (d→s) / `exts` (s→d). Same-type = copy. */
 		char op[96];
 		emit_expr(out, e->lhs, ex, op, sizeof op);
 		TypeKind s = e->lhs->rtype.kind, d = e->rtype.kind;
+		char sq = qtype_of(e->lhs->rtype), dq = qtype_of(e->rtype);
+		int sf = is_float_type(e->lhs->rtype), df = is_float_type(e->rtype);
 		int r = ex->tmp++;
 		if (s == d)
-			fprintf(out, "\t%%t%d =%c copy %s\n", r, qtype_of(e->rtype), op);
-		else if (s != TY_F64 && d != TY_F64) { /* Int↔Uarch */
+			fprintf(out, "\t%%t%d =%c copy %s\n", r, dq, op);
+		else if (!sf && !df) { /* Int↔Uarch */
 			if (d == TY_INT)
 				fprintf(out, "\t%%t%d =w copy %s\n", r, op);   /* → Int: truncate */
 			else
 				fprintf(out, "\t%%t%d =l extsw %s\n", r, op);  /* → Uarch: sign-extend */
-		} else if (d == TY_F64)
-			fprintf(out, "\t%%t%d =d %s %s\n", r, s == TY_INT ? "swtof" : "ultof", op);
-		else
-			fprintf(out, "\t%%t%d =%c %s %s\n", r, d == TY_INT ? 'w' : 'l',
-			        d == TY_INT ? "dtosi" : "dtoui", op);
+		} else if (!sf && df) /* Int/Uarch → float */
+			fprintf(out, "\t%%t%d =%c %s %s\n", r, dq, s == TY_INT ? "swtof" : "ultof", op);
+		else if (sf && !df) /* float → Int/Uarch */
+			fprintf(out, "\t%%t%d =%c %cto%s %s\n", r, dq, sq, d == TY_INT ? "si" : "ui", op);
+		else /* float → float (different widths) */
+			fprintf(out, "\t%%t%d =%c %s %s\n", r, dq, s == TY_F64 ? "truncd" : "exts", op);
 		snprintf(dst, cap, "%%t%d", r);
 		return;
 	}
@@ -7080,10 +7121,10 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 				 * entry block); store the literal's static header address into it. */
 				emit_expr(out, s->expr, ex, v, sizeof v);
 				fprintf(out, "\tstorel %s, %%s_%s\n", v, s->name);
-			} else if (s->expr->rtype.kind == TY_F64) {
-				/* A Float64 local: store the double into its 8-byte slot. */
+			} else if (is_float_type(s->expr->rtype)) {
+				/* A float local: store the value into its slot with the matching width. */
 				emit_expr(out, s->expr, ex, v, sizeof v);
-				fprintf(out, "\tstored %s, %%s_%s\n", v, s->name);
+				fprintf(out, "\tstore%c %s, %%s_%s\n", qtype_of(s->expr->rtype), v, s->name);
 			} else {
 				/* A word local: its slot was reserved in the entry block (see
 				 * emit_func); the binding just stores the initial value. */
@@ -7098,11 +7139,11 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 			 * slot with the store matching its type (`stored` for a Float64, else `storew`). */
 			Type tt;
 			resolve_name((Func *)ex->fn, s->name, &tt);
-			const char *st = tt.kind == TY_F64 ? "stored" : "storew";
+			char st = is_float_type(tt) ? qtype_of(tt) : 'w'; /* store<st>: stores/stored/storew */
 			if (is_capture_param(ex->fn, s->name))
-				fprintf(out, "\t%s %s, %%u_%s\n", st, v, s->name);
+				fprintf(out, "\tstore%c %s, %%u_%s\n", st, v, s->name);
 			else
-				fprintf(out, "\t%s %s, %%s_%s\n", st, v, s->name);
+				fprintf(out, "\tstore%c %s, %%s_%s\n", st, v, s->name);
 			break;
 		}
 		case ST_FIELD_ASSIGN:
@@ -7345,9 +7386,11 @@ static void emit_func(FILE *out, const Func *fn) {
 		if (param_is_word(&fn->params[i])) {
 			fprintf(out, "\t%%s_%s =l alloc4 4\n", n);
 			fprintf(out, "\tstorew %%u_%s, %%s_%s\n", n, n);
-		} else if (fn->params[i].kind == PK_F64) { /* a Float64 param spills to an 8-byte slot */
-			fprintf(out, "\t%%s_%s =l alloc8 8\n", n);
-			fprintf(out, "\tstored %%u_%s, %%s_%s\n", n, n);
+		} else if (fn->params[i].kind == PK_F64 || fn->params[i].kind == PK_F32) {
+			/* A float param spills to its slot (8 bytes for a `d`, 4 for an `s`). */
+			char qt = param_qtype(&fn->params[i]);
+			fprintf(out, "\t%%s_%s =l alloc%d %d\n", n, qt == 'd' ? 8 : 4, qt == 'd' ? 8 : 4);
+			fprintf(out, "\tstore%c %%u_%s, %%s_%s\n", qt, n, n);
 		} else if (fn->params[i].kind == PK_RECORD || fn->params[i].kind == PK_CAPTURE_REC ||
 		           fn->params[i].kind == PK_TUPLE ||
 		           (fn->params[i].kind == PK_UNION && fn->params[i].uni->has_payload)) {
@@ -7369,8 +7412,9 @@ static void emit_func(FILE *out, const Func *fn) {
 			fprintf(out, "\t%%s_%s =l alloc4 4\n", fn->locals[i].name);
 		else if (fn->locals[i].type.kind == TY_STR) /* holds an `l` header pointer */
 			fprintf(out, "\t%%s_%s =l alloc8 8\n", fn->locals[i].name);
-		else if (fn->locals[i].type.kind == TY_F64) /* a Float64 (`d`) lives in an 8-byte slot */
-			fprintf(out, "\t%%s_%s =l alloc8 8\n", fn->locals[i].name);
+		else if (is_float_type(fn->locals[i].type)) /* a float slot: 8 bytes for `d`, 4 for `s` */
+			fprintf(out, "\t%%s_%s =l alloc%d %d\n", fn->locals[i].name,
+			        fn->locals[i].type.kind == TY_F64 ? 8 : 4, fn->locals[i].type.kind == TY_F64 ? 8 : 4);
 	}
 
 	/* Likewise reserve every if/logical merge slot once here, not at each
