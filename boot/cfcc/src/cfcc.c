@@ -832,6 +832,19 @@ typedef struct {
 
 #define MAX_PARAMS 32
 #define MAX_FIELDS 64
+
+/* A `type Name = { Type a, Type b }` grouped-params named tuple (ebnf § Data & Type
+ * Declarations): a COMPTIME type hint with no runtime identity whose fields — which
+ * are exactly params (`field_decl` = the shape of a `param`) — SPLAT positionally into
+ * a parameter list. `(Name x)` desugars to `(Type a, Type b)`; the placeholder name is
+ * discarded and each field becomes its own parameter. This is the record-body `type`
+ * fork; the plain-alias fork is erased earlier by the token pre-pass. */
+typedef struct {
+	char name[64];
+	Param fields[MAX_PARAMS];
+	int nfields;
+	int line;
+} ParamGroup;
 #define MAX_DEFERS 64     /* cap on `defer`s per function (bounds Emit.defers[]) */
 #define MAX_CLOSURES 64   /* cap on closures declared in one function (bounds Func.closures[]) */
 
@@ -1005,6 +1018,14 @@ typedef struct Func {
 	 * PK_CAPTURE parameters. A call `f(args)` prepends these captures' addresses. */
 	struct { char name[64]; struct Func *lifted; char caps[MAX_PARAMS][64]; int ncaps; } closures[MAX_CLOSURES];
 	int nclosures;
+	/* Caller-facing parameter signature: one slot per WRITTEN parameter. A grouped-params
+	 * `type` param is ONE slot (the caller passes a single `{…}` literal, desugared to the
+	 * group's field values); an ordinary param is one slot with `callgroups[i] == NULL`.
+	 * Used only by the pre-monomorphize group-call desugar; `nparams` stays the splatted
+	 * count. `has_group` is 1 iff any slot is a group (else the desugar skips the callee). */
+	ParamGroup *callgroups[MAX_PARAMS];
+	int ncallslots;
+	int has_group;
 } Func;
 
 /* The whole program: a set of `data` declarations and a set of functions, one of
@@ -1018,6 +1039,8 @@ struct Program {
 	int nfuncs, cap_funcs;
 	TupleDecl **tuples; /* interned tuple shapes (structural — one decl per distinct shape) */
 	int ntuples, cap_tuples;
+	ParamGroup **groups; /* `type { … }` grouped-params named tuples (comptime, splat at param sites) */
+	int ngroups, cap_groups;
 	int closure_counter; /* mints unique names for lifted closures (`__cf_closure_<n>`) */
 };
 
@@ -1149,6 +1172,31 @@ static void prog_add_union(Program *prog, UnionDecl *u) {
 	prog->unions[prog->nunions++] = u;
 }
 
+static ParamGroup *prog_find_group(Program *prog, const char *name) {
+	for (int i = 0; i < prog->ngroups; i++)
+		if (strcmp(prog->groups[i]->name, name) == 0)
+			return prog->groups[i];
+	return NULL;
+}
+
+static void prog_add_group(Program *prog, ParamGroup *g) {
+	if (prog->ngroups == prog->cap_groups) {
+		prog->cap_groups = prog->cap_groups ? prog->cap_groups * 2 : 8;
+		prog->groups = realloc(prog->groups, prog->cap_groups * sizeof *prog->groups);
+		if (!prog->groups)
+			die(0, "out of memory");
+	}
+	prog->groups[prog->ngroups++] = g;
+}
+
+/* A grouped-params `type` name is only valid in parameter position (where it splats). If
+ * `name` is a group, reject it here with a targeted message instead of a generic
+ * unknown-type error — it reached a return/local/field position it may not occupy. */
+static void reject_group_as_type(Program *prog, const char *name, int line) {
+	if (prog_find_group(prog, name))
+		die(line, "a grouped-params `type` may only group parameters, not name a return/local/field type");
+}
+
 /* Resolve a concrete field/payload type name to a Type (G3a): "Int" or an aggregate
  * (a `data` record or a `union`). A record and a boxed union are pointer-repr; an Int
  * and a tag-only union are word-repr (see type_is_word). Dies if the name is unknown. */
@@ -1194,6 +1242,7 @@ static Type resolve_member_type(Program *prog, const char *name, int line) {
 	DataDecl *d = prog_find_data(prog, name);
 	if (d)
 		return (Type){TY_RECORD, d, NULL, 0, NULL};
+	reject_group_as_type(prog, name, line);
 	char msg[128];
 	snprintf(msg, sizeof msg, "unknown field/payload type `%s`", name);
 	die(line, msg);
@@ -1563,13 +1612,45 @@ static void parse_paren_params(Parser *p, Func *fn) {
 	expect(p, TK_LPAREN, "expected `(`");
 	if (peek(p)->kind != TK_RPAREN)
 		for (;;) {
-			if (fn->nparams == MAX_PARAMS)
-				die(peek(p)->line, "too many parameters");
-			parse_param(p, &fn->params[fn->nparams]);
-			for (int j = 0; j < fn->nparams; j++)
-				if (strcmp(fn->params[j].name, fn->params[fn->nparams].name) == 0)
-					die(p->toks[p->pos - 1].line, "duplicate parameter name");
-			fn->nparams++;
+			/* A grouped-params `type` name in parameter position SPLATS its fields as
+			 * separate parameters in place; the written placeholder name is discarded
+			 * (ebnf § Data & Type Declarations). */
+			Token *tt = peek(p);
+			ParamGroup *g = NULL;
+			if (is_type_ident(tt) && p->prog) {
+				char tn[64];
+				tok_copy(tt, tn, sizeof tn);
+				g = prog_find_group(p->prog, tn);
+			}
+			if (g) {
+				advance(p); /* the group type name */
+				Token *gn = peek(p);
+				if (gn->kind != TK_IDENT || is_type_ident(gn))
+					die(gn->line, "expected a placeholder name after a grouped-params type");
+				advance(p); /* discard the placeholder — the fields splat as their own params */
+				if (fn->ncallslots == MAX_PARAMS)
+					die(gn->line, "too many parameters");
+				fn->callgroups[fn->ncallslots++] = g; /* one caller slot: a `{…}` literal */
+				fn->has_group = 1;
+				for (int gi = 0; gi < g->nfields; gi++) {
+					if (fn->nparams == MAX_PARAMS)
+						die(gn->line, "too many parameters");
+					fn->params[fn->nparams] = g->fields[gi];
+					for (int j = 0; j < fn->nparams; j++)
+						if (strcmp(fn->params[j].name, fn->params[fn->nparams].name) == 0)
+							die(gn->line, "a grouped-params field collides with another parameter name");
+					fn->nparams++;
+				}
+			} else {
+				if (fn->nparams == MAX_PARAMS)
+					die(peek(p)->line, "too many parameters");
+				parse_param(p, &fn->params[fn->nparams]);
+				for (int j = 0; j < fn->nparams; j++)
+					if (strcmp(fn->params[j].name, fn->params[fn->nparams].name) == 0)
+						die(p->toks[p->pos - 1].line, "duplicate parameter name");
+				fn->callgroups[fn->ncallslots++] = NULL; /* one caller slot: a single param */
+				fn->nparams++;
+			}
 			if (peek(p)->kind == TK_COMMA) {
 				advance(p);
 				continue;
@@ -3865,8 +3946,71 @@ static UnionDecl *parse_union_decl(Parser *p, Program *prog) {
 	return u;
 }
 
+/* type_decl (record-body fork) = "type" type_name "=" "{" field_decl { "," field_decl } "}"
+ * A grouped-params named tuple (ebnf § Data & Type Declarations). Only the record-body
+ * form reaches here — the plain-alias form (`type Id = Uarch`) is erased by the token
+ * pre-pass. Each field is exactly a `param` (`field_decl` shares the param shape), so the
+ * body is parsed with parse_param and stored as a ParamGroup that splats at param sites.
+ *
+ * A CALL passes the group as one record literal `f({ a: 1, b: 2 })` (named, order-free),
+ * desugared to positional field values (`f(1, 2)`) by desugar_group_calls before
+ * monomorphize; positional `f(1, 2)` is NOT accepted for a group slot.
+ *
+ * ⚠ cf0 must NOT inherit (a faithful SUBSET; disclaimed): the group name splats ONLY in a
+ * parameter list (cf0's named tuple is a general type — usable as a return, local, or field,
+ * "each field expanding to a separate variable in place"); no field DEFAULTS (`Int x = 0`),
+ * no field SPREAD (`...Base`), no generic groups, no `pub`; a nested group-typed field is
+ * rejected (no group nesting); the EMPTY group `{ }` is rejected though `record_body`'s entry
+ * list is grammatically optional (a zero-field splat); the group must be declared textually
+ * before use (cfcc is order-dependent; cf0 resolves order-independently). */
+static ParamGroup *parse_type_decl(Parser *p, Program *prog) {
+	expect_ident(p, "type");
+	Token *nm = peek(p);
+	if (!is_type_ident(nm))
+		die(nm->line, "expected a type name after `type`");
+	ParamGroup *g = xmalloc(sizeof *g);
+	g->nfields = 0;
+	tok_copy(nm, g->name, sizeof g->name);
+	g->line = nm->line;
+	advance(p);
+	if (peek(p)->kind == TK_LBRACKET)
+		die(peek(p)->line, "generic `type` declarations are not supported yet (a later brick)");
+	if (prog_find_data(prog, g->name) || prog_find_union(prog, g->name) || prog_find_group(prog, g->name))
+		die(nm->line, "a type of that name is already defined");
+	expect(p, TK_EQ, "a `type` declaration needs `=`");
+	expect(p, TK_LBRACE, "a grouped-params `type` body is a record shape `{ Type name, … }`");
+	if (peek(p)->kind == TK_RBRACE)
+		die(peek(p)->line, "a grouped-params `type` needs at least one field");
+	for (;;) {
+		if (g->nfields == MAX_PARAMS)
+			die(peek(p)->line, "too many fields in a grouped-params `type`");
+		parse_param(p, &g->fields[g->nfields]);
+		Param *f = &g->fields[g->nfields];
+		if (f->kind == PK_VAR)
+			die(f->line, "a grouped-params `type` field cannot be generic (`'T`)");
+		if (prog_find_group(prog, f->type_name))
+			die(f->line, "a grouped-params `type` field cannot itself be a grouped-params type");
+		if (peek(p)->kind == TK_EQ)
+			die(peek(p)->line, "grouped-params `type` fields cannot carry defaults yet");
+		for (int j = 0; j < g->nfields; j++)
+			if (strcmp(g->fields[j].name, f->name) == 0)
+				die(f->line, "duplicate field name in a grouped-params `type`");
+		g->nfields++;
+		if (peek(p)->kind == TK_COMMA) {
+			advance(p);
+			if (peek(p)->kind == TK_RBRACE) /* trailing comma */
+				break;
+			continue;
+		}
+		break;
+	}
+	expect(p, TK_RBRACE, "expected `}` to close the grouped-params `type`");
+	return g;
+}
+
 /* module = { declaration } — one per line; exactly one is `pub const main`. A
- * declaration is a `data` record, a `union`, or a `[pub] const` function. */
+ * declaration is a `data` record, a `union`, a `type` (grouped params), or a
+ * `[pub] const` function. */
 static void parse(Parser *p, Program *prog) {
 	p->prog = prog; /* so a closure binding can append its lifted top-level function */
 	skip_newlines(p);
@@ -3875,6 +4019,8 @@ static void parse(Parser *p, Program *prog) {
 			prog_add_data(prog, parse_data_decl(p, prog));
 		else if (is_ident(peek(p), "union"))
 			prog_add_union(prog, parse_union_decl(p, prog));
+		else if (is_ident(peek(p), "type"))
+			prog_add_group(prog, parse_type_decl(p, prog));
 		else
 			prog_add_func(prog, parse_func(p, prog));
 		if (peek(p)->kind != TK_EOF) {
@@ -4797,6 +4943,91 @@ static void specialize_hofs(Program *prog) {
 	}
 }
 
+/* ------------------------------------------- grouped-params call desugar - *
+ *
+ * A call to a function with a grouped-params `type` parameter passes ONE `{…}` record
+ * literal per group; this pass rewrites it to the group's field VALUES, positionally in
+ * the group's declared field order (matched by field name), so every downstream pass sees
+ * an ordinary flattened positional call. It runs after parse (all callees are known, so a
+ * forward call resolves) and before monomorphize (clones then inherit the flattened calls,
+ * so generics + groups compose for free). The bare-`{…}` call form is authorized by
+ * type_system §7.3 (a structural `type` payload is the bare data literal, order-independent;
+ * a nominal `data` would instead be `Point({…})`). ⚠ cf0 must NOT inherit: the group literal
+ * must be a BARE `{ f: v, … }` (no spread, no annotation) that sets every field exactly once;
+ * and ONLY a direct by-name call desugars — a grouped-params function used as a first-class
+ * value (a HOF argument) would not splat (cfcc has no such callee; disclaimed). */
+static void desugar_group_calls_expr(Program *prog, Expr *e);
+
+static void expand_group_call(Program *prog, Expr *e, Func *callee) {
+	(void)prog;
+	if (e->nargs != callee->ncallslots)
+		die(e->line, "wrong number of arguments (a grouped-params `type` is passed as one `{…}` literal)");
+	Expr **out = xmalloc(sizeof(Expr *) * (size_t)callee->nparams);
+	int no = 0;
+	for (int s = 0; s < callee->ncallslots; s++) {
+		Expr *arg = e->args[s];
+		ParamGroup *g = callee->callgroups[s];
+		if (!g) {
+			out[no++] = arg;
+			continue;
+		}
+		if (arg->kind != EX_RECORD || arg->name[0] || arg->spread)
+			die(arg->line, "a grouped-params argument must be a bare `{ field: value, … }` literal");
+		if (arg->nfields != g->nfields)
+			die(arg->line, "the `{…}` group literal must set every field of the grouped-params type exactly once");
+		for (int fi = 0; fi < g->nfields; fi++) {
+			Expr *v = NULL;
+			for (int k = 0; k < arg->nfields; k++)
+				if (strcmp(arg->fnames[k], g->fields[fi].name) == 0) {
+					if (v)
+						die(arg->line, "a group literal sets a field more than once");
+					v = arg->fvals[k];
+				}
+			if (!v)
+				die(arg->line, "the `{…}` group literal is missing a field of the grouped-params type");
+			out[no++] = v;
+		}
+	}
+	e->args = out;
+	e->nargs = no;
+}
+
+static void desugar_group_calls_stmt(Program *prog, Stmt *s) {
+	for (; s; s = s->next) {
+		desugar_group_calls_expr(prog, s->expr);
+		desugar_group_calls_expr(prog, s->yval);
+		desugar_group_calls_stmt(prog, s->body);
+	}
+}
+
+static void desugar_group_calls_expr(Program *prog, Expr *e) {
+	if (!e)
+		return;
+	if (e->kind == EX_CALL) {
+		Func *callee = prog_find_func(prog, e->name);
+		if (callee && callee->has_group)
+			expand_group_call(prog, e, callee);
+	}
+	desugar_group_calls_expr(prog, e->lhs);
+	desugar_group_calls_expr(prog, e->rhs);
+	desugar_group_calls_expr(prog, e->els);
+	for (int i = 0; i < e->nargs; i++)
+		desugar_group_calls_expr(prog, e->args[i]);
+	for (int i = 0; i < e->nfields; i++)
+		desugar_group_calls_expr(prog, e->fvals[i]);
+	if (e->spread)
+		desugar_group_calls_expr(prog, e->spread);
+	for (int i = 0; i < e->narms; i++)
+		desugar_group_calls_expr(prog, e->arms[i].body);
+	desugar_group_calls_stmt(prog, e->loop_body);
+}
+
+static void desugar_group_calls(Program *prog) {
+	for (int i = 0; i < prog->nfuncs; i++)
+		if (!prog->funcs[i]->is_asm)
+			desugar_group_calls_stmt(prog, prog->funcs[i]->body);
+}
+
 /* ------------------------------------------------------------- typecheck - */
 
 static Type typeof_expr(Program *prog, Func *fn, Expr *e);
@@ -5495,8 +5726,10 @@ static void resolve_record_binding(Program *prog, Func *fn, Stmt *s) {
 		die(e->line, "constructed record type does not match the binding annotation");
 	const char *tn = e->name[0] ? e->name : s->type_name;
 	DataDecl *d = prog_find_data(prog, tn);
-	if (!d)
+	if (!d) {
+		reject_group_as_type(prog, tn, e->line);
 		die(e->line, "unknown data type");
+	}
 	resolve_record_literal(prog, fn, e, d);
 	set_local_rec(fn, s->name, d);
 }
@@ -5507,8 +5740,10 @@ static void resolve_record_binding(Program *prog, Func *fn, Stmt *s) {
  * §6). Sets the local's record type from the annotation. */
 static void resolve_record_expr_binding(Program *prog, Func *fn, Stmt *s) {
 	DataDecl *d = prog_find_data(prog, s->type_name);
-	if (!d)
+	if (!d) {
+		reject_group_as_type(prog, s->type_name, s->line);
 		die(s->line, "unknown data type");
+	}
 	Type it = typeof_expr(prog, fn, s->expr); /* validates the call/defer, sets nargs, rtype */
 	if (it.kind != TY_RECORD || it.rec != d)
 		die(s->line, "initializer type does not match the record binding");
@@ -5778,8 +6013,10 @@ static void resolve_signatures(Program *prog) {
 					continue;
 				}
 				DataDecl *d = prog_find_data(prog, fn->params[j].type_name);
-				if (!d)
+				if (!d) {
+					reject_group_as_type(prog, fn->params[j].type_name, fn->params[j].line);
 					die(fn->params[j].line, "a parameter names an unknown data type");
+				}
 				fn->params[j].rec = d;
 			} else if (fn->params[j].kind == PK_CAPTURE_REC) {
 				/* A captured record names a `data` type (unions are not captured). */
@@ -5795,8 +6032,10 @@ static void resolve_signatures(Program *prog) {
 				fn->ret_uni = u;
 			} else {
 				DataDecl *d = prog_find_data(prog, fn->ret_type_name);
-				if (!d)
+				if (!d) {
+					reject_group_as_type(prog, fn->ret_type_name, fn->ret_line);
 					die(fn->ret_line, "a return type names an unknown data type");
+				}
 				fn->ret_rec = d;
 			}
 		}
@@ -7214,12 +7453,12 @@ static void expand_type_aliases(Token **ptoks, size_t *pntoks) {
 		Token *nmeT = &toks[k];
 		k++;
 		if (toks[k].kind == TK_LBRACKET)
-			die(toks[k].line, "generic `type` aliases are not supported yet (a later brick)");
+			die(toks[k].line, "generic `type` declarations are not supported yet (a later brick)");
 		if (toks[k].kind != TK_EQ)
 			die(toks[k].line, "a `type` declaration needs `=` (e.g. `type Id = Uarch`)");
 		k++; /* past `=` */
 		if (toks[k].kind == TK_LBRACE)
-			die(toks[k].line, "the named-tuple `type { ... }` form is not supported yet (use a plain type alias)");
+			continue; /* a record-body named tuple (grouped params) — kept in the stream for the parser */
 		size_t b0 = k;
 		while (toks[k].kind != TK_NEWLINE && toks[k].kind != TK_EOF)
 			k++;
@@ -7292,7 +7531,9 @@ static void expand_type_aliases(Token **ptoks, size_t *pntoks) {
 		}
 	}
 
-	/* PASS 2a — copy the stream, dropping each `type` decl line (with its NEWLINE). */
+	/* PASS 2a — copy the stream, dropping each PLAIN-alias `type` decl line (with its
+	 * NEWLINE). A record-body named-tuple `type` (its name is NOT in the alias table) is
+	 * KEPT, so the parser sees it as a real declaration. */
 	TokBuf stripped = {0};
 	depth = 0;
 	line_start = 1;
@@ -7310,7 +7551,8 @@ static void expand_type_aliases(Token **ptoks, size_t *pntoks) {
 		else if (t->kind == TK_RPAREN || t->kind == TK_RBRACE || t->kind == TK_RBRACKET)
 			depth--;
 		size_t kw;
-		if (here && (decl_kw(toks, i, &kw), is_ident(&toks[kw], "type"))) {
+		if (here && (decl_kw(toks, i, &kw), is_ident(&toks[kw], "type")) &&
+		    find_alias(al, nal, &toks[kw + 1]) >= 0) {
 			while (i < n && toks[i].kind != TK_NEWLINE && toks[i].kind != TK_EOF)
 				i++; /* skip the decl body */
 			if (i < n && toks[i].kind == TK_NEWLINE) {
@@ -7409,6 +7651,7 @@ int main(int argc, char **argv) {
 	expand_type_aliases(&ps.toks, &lx.ntoks); /* erase comptime `type` aliases before parse */
 	Program prog = {0};
 	parse(&ps, &prog);
+	desugar_group_calls(&prog); /* expand `{…}` group-literal args to positional field values */
 	monomorphize(&prog); /* specialize generic calls before the concrete passes */
 	specialize_hofs(&prog); /* fake-closure specialization: capturing closures → hidden params */
 	typecheck(&prog);
