@@ -1062,25 +1062,26 @@ y = x` or `let y = x` where `x` is an aggregate — is a type error: that would 
 borrow, and C! has none ([[memory_model.md]]). A **scalar** rebinds freely (it is a
 by-value copy). To get your own instance of an aggregate, `copy` it.
 
-**By-value is a read-only view; `copy`/`copy_deep` make it writable.** A by-value
+**By-value is a read-only view; `copy`/`copy_transitive` make it writable.** A by-value
 parameter — and any by-value binding — is a **read-only view** regardless of the
 caller's `let`/`const`; the gate treats it as const for lvalue purposes. To mutate,
-take your own instance with **`copy`** or **`copy_deep`**, which the gate types as a
-**fresh, writable instance** of the same type (`copy x : T`, `copy_deep x : T` for
+take your own instance with **`copy`** or **`copy_transitive`**, which the gate types as a
+**fresh, writable instance** of the same type (`copy x : T`, `copy_transitive x : T` for
 `x : T` — both are identity on the type). The result is writable when its home is a
 `let`, because **rehoming adopts the destination's rule** ([[memory_model.md]]): a
 value moved into a `const` aggregate becomes const, into a `let` aggregate becomes
 let. The gate re-derives the mutability attribute from the destination home, never
 from the source.
 
-**What `copy` versus `copy_deep` actually duplicate — and how each treats a pointer
-field — is [[memory_model.md]]'s to define, not the type gate's.** The distinction is
-a runtime copying *depth*, invisible to typing. It carries an ownership hazard the
-type gate only points at: a copy that duplicated a *pointer field* rather than its
-referent would leave the copy aliasing the source's owned sub-aggregate — reopening
-the very sharing the no-second-bind rule forbids. Pinning the depth-and-pointer
-semantics of `copy` (and whether `copy` is even legal on a pointer-bearing aggregate)
-is an **open [[memory_model.md]] question**, flagged here and resolved there.
+**What `copy` versus `copy_transitive` actually duplicate is [[memory_model.md]]'s to
+define, not the type gate's — and it is settled there (§6).** Both clone the entire
+*owned* value; they differ only at **`*T` reference edges**, which `copy` reproduces as
+**aliases** and `copy_transitive` follows and clones (so its result shares nothing with
+the source). Neither creates a second owner — a `*T` referent is owned by a `let`
+elsewhere, not *inside* the aggregate, so `copy`'s aliasing is the permitted
+multi-pointer case, and an inline owned sub-aggregate is duplicated outright. `copy` is
+therefore legal on any aggregate, pointer-bearing or not; the copying *behaviour* across
+pointers is the memory model's, the fresh-instance *type* is the gate's.
 
 Finally, the **region-level** half of ownership — the no-dangling / region-outlives
 check — is **not** this gate's. It needs concrete node identities and runs in the
