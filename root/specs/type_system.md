@@ -694,10 +694,17 @@ way the annotation sugar `const Point p = <payload>` is `Point(<payload>)` (§6.
 - **Named-record fields** are order-independent; each value is checked against its
   field's declared type (a literal adopts it, §3). **Puns** (`{ x }` ≡ `{ x: x }`)
   and **defaults** (a field with a `= default` in its declaration may be omitted) are
-  per [[ebnf.md]]. A **value-level spread** (`{ ...other, z: 3 }` splices another
-  record's fields; later entries win on a collision) — per [[ebnf.md]]'s `data_literal`
-  value spread, distinct from the record-*declaration* spread and the bracket-aggregate
-  spread.
+  per [[ebnf.md]]. A **value-level spread** (`{ ...src, z: 3 }`) splices a record
+  value's fields into a new record; **fields match by name and later entries win** on
+  a collision. The result's **type is the destination's**: an annotation (or a target
+  field's type) fixes it, and every spliced-or-explicit field must belong to that type
+  — a source field it lacks, or a field it needs but nothing supplies, is an error.
+  With **no annotation** the type is *inferred* — a single source, or several of
+  identical structure, supplies it, and you may **override** its fields but not **add**
+  one (an extra field is an error); **sources of differing structure** cannot be
+  inferred, so an explicit type is **required** and each is matched against it by name.
+  Per [[ebnf.md]]'s `data_literal` value spread, distinct from the record-*declaration*
+  spread and the bracket-aggregate spread.
   **Positional-record** fields are filled by position, like any tuple.
 
 ## 8. Unions, subtyping, and constraints
