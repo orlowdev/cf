@@ -1157,6 +1157,8 @@ static TupleDecl *resolve_tuple_shape(Program *prog, char names[][64], int n, in
 static Type resolve_member_type(Program *prog, const char *name, int line) {
 	if (strcmp(name, "Int") == 0)
 		return (Type){TY_INT, NULL, NULL, 0, NULL};
+	if (strcmp(name, "Unit") == 0) /* `Unit`/`()` — the zero-tuple, a word `0` field/payload */
+		return (Type){TY_UNIT, NULL, NULL, 0, NULL};
 	if (name[0] == '(') {
 		/* A tuple field/payload type stored as `(T0,T1,…)` (parse_member_type): split the
 		 * element names on TOP-LEVEL commas (a comma inside a nested `(…)` stays part of the
@@ -4764,6 +4766,10 @@ static void check_member_value(Program *prog, Func *fn, Expr *val, Type want, in
 		 * variable may alias here (like a union) — no freshness rule needed. */
 		if (at.kind != TY_TUPLE || !types_equal(at, want))
 			die(line, "field/payload type mismatch (tuple shape differs)");
+	} else if (want.kind == TY_UNIT) {
+		/* A `Unit` field/payload takes the unit value `()` — its only value (a word `0`). */
+		if (at.kind != TY_UNIT)
+			die(line, "expected the unit value `()` for this `Unit` field/payload");
 	} else {
 		die(line, "unsupported field/payload type");
 	}
