@@ -1439,8 +1439,16 @@ static Type resolve_member_type(Program *prog, const char *name, int line) {
 		 * `*Point` and `Point` share a representation and interconvert. ⚠ cf0 must NOT inherit:
 		 * cf0 distinguishes an aggregate value from its `&`-reference. */
 		const char *pointee = name + 1;
-		if (prog_find_union(prog, pointee)) /* `*Union` — a later brick (tag-only unions are words, */
-			die(line, "cfcc `*Union` pointers are a later brick — a pointer to a `data` record only");
+		UnionDecl *pu = prog_find_union(prog, pointee);
+		if (pu) {
+			/* Only a payload-bearing (boxed) union is a pointer's referent. An all-tag-only
+			 * union lowers to a plain integer, so `*TagOnlyUnion` would be a `*Scalar` — which
+			 * §6.4 forbids; type_system §8.4 makes this a PERMANENT type-gate rejection (cf0
+			 * rejects it too), not a cfcc narrowing. */
+			if (!pu->has_payload)
+				die(line, "a pointer to an all-tag-only union is illegal (it would be `*Scalar`, §6.4/§8.4)");
+			return (Type){TY_PTR, NULL, pu, 0, NULL};
+		}
 		DataDecl *pd = prog_find_data(prog, pointee);
 		if (pd)
 			return (Type){TY_PTR, pd, NULL, 0, NULL};
@@ -3996,8 +4004,24 @@ static void parse_tuple_elem_type(Parser *p, char *out, size_t cap) {
  * name is resolved (and any `'T` validated) later, so forward/mutual references work. */
 static void parse_member_type(Parser *p, char *out, size_t cap) {
 	Token *t = peek(p);
-	if (t->kind == TK_STAR)
-		die(t->line, "a field/payload type is `Int`, an aggregate, or `'T`, not a pointer");
+	if (t->kind == TK_STAR) {
+		/* An explicit `*Aggregate` field/payload type (§6.4; the recursive `*List`/`*Node`
+		 * form, type_system §8.4). Stored with the leading `*` — resolve_member_type turns
+		 * `*List` into a TY_PTR to the pointee. §6.4: never a scalar. */
+		advance(p); /* * */
+		Token *u = peek(p);
+		if (!is_type_ident(u))
+			die(u->line, "expected an aggregate type after `*`");
+		char pointee[64];
+		tok_copy(u, pointee, sizeof pointee);
+		if (is_scalar_type_name(pointee))
+			die(u->line, "a pointer type `*T` points to a record or union, not a scalar (§6.4)");
+		if (cap < 2)
+			die(t->line, "type name too long");
+		out[0] = '*';
+		parse_type_arg(p, out + 1, cap - 1); /* the (possibly generic) pointee name */
+		return;
+	}
 	if (t->kind == TK_LBRACKET)
 		die(t->line, "a field/payload type is `Int`, an aggregate, or `'T`, not an array/buffer");
 	if (t->kind == TK_LPAREN) {
@@ -4840,6 +4864,10 @@ static void instantiate_type(Program *prog, const char *mangled, int line) {
  * application, error on a generic template used without arguments or a stray `'T`; a plain
  * concrete/leaf name is left for resolve_member_type/resolve_signatures to validate. */
 static void concretize_name(Program *prog, char *name, int line) {
+	if (name[0] == '*') /* an explicit `*Aggregate`: concretize the POINTEE — the `*` is not
+	                     * part of the (possibly generic) type name (mirrors resolve_member_type).
+	                     * The buffer keeps its `*`; resolve_member_type strips it later. */
+		name++;
 	if (name[0] == '\0' || strcmp(name, "Int") == 0 ||
 	    strcmp(name, "Uarch") == 0 || strcmp(name, "Str") == 0)
 		return;
@@ -5476,6 +5504,13 @@ static void check_member_value(Program *prog, Func *fn, Expr *val, Type want, in
 		/* A `Unit` field/payload takes the unit value `()` — its only value (a word `0`). */
 		if (at.kind != TY_UNIT)
 			die(line, "expected the unit value `()` for this `Unit` field/payload");
+	} else if (want.kind == TY_PTR && (want.rec || want.uni)) {
+		/* An explicit `*Aggregate` field/payload — the recursive `*List`/`*Node` slot. An
+		 * aggregate value (or another such pointer) satisfies it; cfcc stores the arena
+		 * pointer. A `*T` is explicitly a reference, so (unlike a by-value record payload)
+		 * no freshness rule applies — aliasing is the intent. */
+		if (want.rec ? aggregate_record(at) != want.rec : aggregate_union(at) != want.uni)
+			die(line, "field/payload type mismatch (`*Aggregate` differs)");
 	} else {
 		die(line, "unsupported field/payload type");
 	}
@@ -5890,9 +5925,11 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		 * (M1.1) and unify to the match's type. Exhaustiveness: cover every member or
 		 * carry a `_`. */
 		Type st = typeof_expr(prog, fn, e->lhs);
-		if (st.kind != TY_UNION)
+		/* A union value OR an explicit `*Union` pointer (a boxed union is already a pointer,
+		 * so `match` on a `*List` binding drives the recursive walk). */
+		UnionDecl *u = aggregate_union(st);
+		if (!u)
 			die(e->line, "M1.1 `match` requires a union scrutinee");
-		UnionDecl *u = st.uni;
 		e->uni = u;
 		int covered[MAX_UNION_MEMBERS] = {0};
 		int has_wild = 0, have_rt = 0;
@@ -6536,8 +6573,8 @@ static void resolve_signatures(Program *prog) {
 				 * (tag-only → a word); otherwise it must name a `data` record. */
 				UnionDecl *u = prog_find_union(prog, fn->params[j].type_name);
 				if (u) {
-					if (fn->params[j].is_ptr) /* `*Union` — a later brick (see resolve_member_type) */
-						die(fn->params[j].line, "cfcc `*Union` pointers are a later brick — a pointer to a `data` record only");
+					if (fn->params[j].is_ptr && !u->has_payload) /* `*TagOnlyUnion` = `*Scalar`, §6.4/§8.4 */
+						die(fn->params[j].line, "a pointer to an all-tag-only union is illegal (it would be `*Scalar`, §6.4/§8.4)");
 					fn->params[j].kind = PK_UNION;
 					fn->params[j].uni = u;
 					continue;
@@ -6560,8 +6597,8 @@ static void resolve_signatures(Program *prog) {
 		    strcmp(fn->ret_type_name, "Float32") != 0) {
 			UnionDecl *u = prog_find_union(prog, fn->ret_type_name);
 			if (u) {
-				if (fn->ret_is_ptr) /* `*Union` return — a later brick (see resolve_member_type) */
-					die(fn->ret_line, "cfcc `*Union` pointers are a later brick — a pointer to a `data` record only");
+				if (fn->ret_is_ptr && !u->has_payload) /* `*TagOnlyUnion` return = `*Scalar`, §6.4/§8.4 */
+					die(fn->ret_line, "a pointer to an all-tag-only union is illegal (it would be `*Scalar`, §6.4/§8.4)");
 				fn->ret_uni = u;
 			} else {
 				DataDecl *d = prog_find_data(prog, fn->ret_type_name);
@@ -7735,12 +7772,13 @@ static void emit_func(FILE *out, const Func *fn) {
 			fprintf(out, "\tstore%c %%u_%s, %%s_%s\n", qt, n, n);
 		} else if ((fn->params[i].kind == PK_RECORD && !fn->params[i].is_ptr) ||
 		           fn->params[i].kind == PK_CAPTURE_REC || fn->params[i].kind == PK_TUPLE ||
-		           (fn->params[i].kind == PK_UNION && fn->params[i].uni->has_payload)) {
+		           (fn->params[i].kind == PK_UNION && fn->params[i].uni->has_payload &&
+		            !fn->params[i].is_ptr)) {
 			/* A record, captured-record, tuple, or boxed-union param arrives as an arena
 			 * pointer, copied into the `%r_<name>` form field/index access uses. A captured
 			 * record aliases the enclosing scope's storage, so field writes there are visible.
-			 * An explicit `*Record` pointer param is instead read directly as its `%u_<name>`
-			 * incoming temp (EX_VAR TY_PTR path), so it is excluded here — it needs no `%r_`. */
+			 * An explicit `*Record`/`*Union` pointer param is instead read directly as its
+			 * `%u_<name>` incoming temp (EX_VAR TY_PTR path), so it is excluded — no `%r_`. */
 			fprintf(out, "\t%%r_%s =l copy %%u_%s\n", n, n);
 		}
 	}
