@@ -661,14 +661,20 @@ typedef enum {
 	PK_F32,    /* Float32 -> s (an IEEE single passed in a float register; see TY_F32). */
 } ParamKind;
 
-typedef struct {
+typedef struct Param {
 	char name[64];
 	ParamKind kind;
 	int line;           /* source line of the type (for diagnostics) */
 	char type_name[64]; /* PK_RECORD/PK_UNION: the nominal type name (resolved later) */
 	DataDecl *rec;      /* PK_RECORD: the resolved declaration */
 	UnionDecl *uni;     /* PK_UNION: the resolved declaration */
-	int fn_arity;       /* PK_FN: the function type's Int-parameter count */
+	int fn_arity;       /* PK_FN: the function type's parameter count */
+	/* PK_FN: the function type's parameter descriptors (fn_arity of them) and its single
+	 * return descriptor — each is a scalar/pointer/nested-function component (aggregates are
+	 * a later brick). Heap-allocated; shared read-only when a Param is copied onto a clone
+	 * (like `tuple_types`), since a function-type signature is immutable metadata. */
+	struct Param *fn_ptypes;
+	struct Param *fn_ret;
 	/* PK_TUPLE: the element type NAMES (heap array, shared read-only on a generic clone) and
 	 * count, interned to `tup` in resolve_signatures. */
 	char (*tuple_types)[64];
@@ -831,7 +837,9 @@ struct Expr {
 	 * `indirect` marks a call through a PK_FN parameter (an indirect call). */
 	int is_fnref;
 	int indirect;
-	int fn_arity; /* EX_VAR of TY_FN: the function value's Int-parameter count (for arg checks) */
+	int fn_arity; /* EX_VAR of TY_FN: the function value's parameter count (for arg checks) */
+	char fn_sig[256]; /* EX_VAR of TY_FN: the function value's signature string (see func_value_sig),
+	                   * compared against a function-type parameter's expected signature */
 	int hof_specialized; /* EX_CALL: this HOF call has been specialized for its capturing-closure args */
 };
 
@@ -1173,6 +1181,101 @@ static int types_equal(Type a, Type b) {
 				return 0;
 		return 1;
 	default: return 1; /* INT/PTR/STR/UARCH/BUF/FN — kind alone identifies the type */
+	}
+}
+
+/* ---- Function-value signatures (brick: full function types) ------------------
+ * A function VALUE is checked structurally: two functions match iff their parameter kinds
+ * and return kind agree. We reduce a signature to a short string — one letter per parameter,
+ * a `>`, then the return letter — and compare strings. Nested function types recurse as
+ * `(params>ret)`. cfcc's function-type components are scalars, pointers, and nested functions
+ * (record/union/tuple components are a later brick), so the letters distinguish exactly those;
+ * a non-scalar letter (`R`/`U`/`T`) leaks in only from a passed function that could never
+ * match a scalar/pointer slot, which is the mismatch we want. ⚠ cf0 must NOT inherit this
+ * letter matching — it carries full nominal function types and matches them structurally
+ * against the type-system (a `*Point` and a `*Str` are distinct there, both `p` here). */
+static char type_sig_char(Type t) {
+	switch (t.kind) {
+	case TY_INT:    return 'i';
+	case TY_UARCH:  return 'u';
+	case TY_F64:    return 'd';
+	case TY_F32:    return 's';
+	case TY_UNIT:   return 'n';
+	case TY_PTR: case TY_BUF: return 'p';
+	case TY_FN:     return 'F';
+	case TY_RECORD: return 'R';
+	case TY_UNION:  return 'U';
+	case TY_TUPLE:  return 'T';
+	default:        return '?';
+	}
+}
+
+static void sig_append(char *buf, size_t cap, char c) {
+	size_t n = strlen(buf);
+	if (n + 1 >= cap)
+		/* Fail closed: a silently-truncated signature could compare EQUAL to a different
+		 * truncated one and license an unsound width match. A function type this deeply
+		 * nested is a genesis limit, not valid input, so reject it outright. */
+		die(0, "function type too complex for cfcc (signature exceeds buffer)");
+	buf[n] = c;
+	buf[n + 1] = 0;
+}
+
+static void sig_append_param(const Param *pm, char *buf, size_t cap) {
+	switch (pm->kind) {
+	case PK_WORD:   sig_append(buf, cap, 'i'); return;
+	case PK_UARCH:  sig_append(buf, cap, 'u'); return;
+	case PK_F64:    sig_append(buf, cap, 'd'); return;
+	case PK_F32:    sig_append(buf, cap, 's'); return;
+	case PK_UNIT:   sig_append(buf, cap, 'n'); return;
+	case PK_LONG:   sig_append(buf, cap, 'p'); return;
+	case PK_RECORD: sig_append(buf, cap, 'R'); return;
+	case PK_UNION:  sig_append(buf, cap, 'U'); return;
+	case PK_TUPLE:  sig_append(buf, cap, 'T'); return;
+	case PK_VAR:    sig_append(buf, cap, 'V'); return;
+	case PK_FN:
+		sig_append(buf, cap, '(');
+		for (int i = 0; i < pm->fn_arity; i++)
+			sig_append_param(&pm->fn_ptypes[i], buf, cap);
+		sig_append(buf, cap, '>');
+		sig_append_param(pm->fn_ret, buf, cap);
+		sig_append(buf, cap, ')');
+		return;
+	default:        sig_append(buf, cap, '?'); return;
+	}
+}
+
+/* The signature string a function-type PARAMETER expects of its argument. */
+static void param_fn_sig(const Param *pm, char *buf, size_t cap) {
+	buf[0] = 0;
+	for (int i = 0; i < pm->fn_arity; i++)
+		sig_append_param(&pm->fn_ptypes[i], buf, cap);
+	sig_append(buf, cap, '>');
+	sig_append_param(pm->fn_ret, buf, cap);
+}
+
+/* The signature string of a top-level function used as a VALUE (a bare function name). */
+static Type func_ret_type(const Func *fn);
+static void func_value_sig(const Func *g, char *buf, size_t cap) {
+	buf[0] = 0;
+	for (int i = 0; i < g->nparams; i++)
+		sig_append_param(&g->params[i], buf, cap);
+	sig_append(buf, cap, '>');
+	sig_append(buf, cap, type_sig_char(func_ret_type(g)));
+}
+
+/* A function-type component descriptor (a scalar/pointer/nested-function type) as a Type —
+ * used for the result type of an indirect call and for checking an indirect call's arguments.
+ * Aggregates never reach here (rejected when the function type is parsed). */
+static Type param_component_type(const Param *pm) {
+	switch (pm->kind) {
+	case PK_UARCH: return (Type){TY_UARCH, NULL, NULL, 0, NULL};
+	case PK_F64:   return (Type){TY_F64, NULL, NULL, 0, NULL};
+	case PK_F32:   return (Type){TY_F32, NULL, NULL, 0, NULL};
+	case PK_UNIT:  return (Type){TY_UNIT, NULL, NULL, 0, NULL};
+	case PK_LONG:  return (Type){TY_PTR, NULL, NULL, 0, NULL};
+	case PK_FN:    return (Type){TY_FN, NULL, NULL, 0, NULL};
+	default:       return (Type){TY_INT, NULL, NULL, 0, NULL}; /* PK_WORD */
 	}
 }
 
@@ -1561,6 +1664,23 @@ static void parse_type_arg(Parser *p, char *out, size_t cap);
 static void parse_tuple_elem_type(Parser *p, char *out, size_t cap); /* forward: nested tuple types */
 static void check_tyvars_declared(const char *mangled, char typarams[][64], int ntp, int line);
 
+/* A function-type component (a parameter type or the return type) may be a scalar
+ * (`Int`/`Uarch`/`Float64`/`Float32`/`Unit`), a pointer (`*T`), or a nested function type
+ * — every form whose register width is fixed by its kind. Aggregate components (a record,
+ * union, or tuple) and a bare type variable (`'T`) are a later brick: reject them cleanly.
+ * ⚠ cf0 must NOT inherit this restriction — its function types admit any type. */
+static void reject_nonscalar_fn_component(const Param *pm, int line) {
+	switch (pm->kind) {
+	case PK_WORD: case PK_UARCH: case PK_F64: case PK_F32: case PK_UNIT:
+	case PK_LONG: case PK_FN:
+		return;
+	default:
+		die(line, "a function-type parameter/return must be a scalar (`Int`/`Uarch`/`Float64`/"
+		          "`Float32`/`Unit`), a pointer (`*T`), or a function type in M0 — record/union/"
+		          "tuple/`'T` components are a later brick");
+	}
+}
+
 /* Consume a parameter's type and classify it. M0 param types are `Int` (a word),
  * a record type (a long — a pointer to the caller's arena record; the type name is
  * stashed and resolved to a decl in typecheck), or a pointer type like `*[Str]` (a
@@ -1622,17 +1742,30 @@ static void parse_param_type(Parser *p, Param *out) {
 			out->kind = PK_TUPLE;
 			return;
 		}
-		/* A function type `(Int, …) -> Int` — a higher-order function's callable parameter.
-		 * The `->` separates the return type (as in a bare function type); cfcc restricts it
-		 * to all-`Int` params and an `Int` return (enough for HOFs over Int; cf0 takes the
-		 * full function-type grammar). */
+		/* A function type `(P0, …) -> R` — a higher-order function's callable parameter.
+		 * The `->` separates the return type (as in a bare function type). Each parameter
+		 * type and the return type is parsed recursively by parse_param_type, so a component
+		 * may be any scalar, a pointer, or a nested function type (aggregates rejected). */
 		advance(p); /* ( */
-		int arity = 0;
+		Param *fps = NULL;
+		int arity = 0, fcap = 0;
 		if (peek(p)->kind != TK_RPAREN)
 			for (;;) {
-				if (!is_ident(peek(p), "Int"))
-					die(peek(p)->line, "a function-type parameter takes `Int` arguments in M0 (e.g. `(Int) -> Int`)");
-				advance(p);
+				/* Cap the arity at MAX_PARAMS: a value of this type is called through the
+				 * fixed `it[MAX_PARAMS]`/`iw[MAX_PARAMS]` emit arrays, and any function passed
+				 * to it is itself parse-capped at MAX_PARAMS — so a larger arity could never be
+				 * satisfied anyway, and would overflow those arrays at the indirect call. */
+				if (arity == MAX_PARAMS)
+					die(t->line, "a function type has too many parameters");
+				if (arity == fcap) {
+					fcap = fcap ? fcap * 2 : 4;
+					fps = realloc(fps, (size_t)fcap * sizeof *fps);
+					if (!fps)
+						die(t->line, "out of memory");
+				}
+				memset(&fps[arity], 0, sizeof fps[arity]);
+				parse_param_type(p, &fps[arity]);
+				reject_nonscalar_fn_component(&fps[arity], t->line);
 				arity++;
 				if (peek(p)->kind == TK_COMMA) {
 					advance(p);
@@ -1642,11 +1775,14 @@ static void parse_param_type(Parser *p, Param *out) {
 			}
 		expect(p, TK_RPAREN, "expected `)` to close the function-type parameters");
 		expect(p, TK_ARROW, "a function type separates its return with `->` (e.g. `(Int) -> Int`)");
-		if (!is_ident(peek(p), "Int"))
-			die(peek(p)->line, "a function type returns `Int` in M0 (e.g. `(Int) -> Int`)");
-		advance(p); /* Int (return) */
+		Param *fret = xmalloc(sizeof *fret);
+		memset(fret, 0, sizeof *fret);
+		parse_param_type(p, fret);
+		reject_nonscalar_fn_component(fret, t->line);
 		out->kind = PK_FN;
 		out->fn_arity = arity;
+		out->fn_ptypes = fps;
+		out->fn_ret = fret;
 		return;
 	}
 	if (is_ident(t, "Int")) {
@@ -4938,11 +5074,16 @@ static void specialize_hof(Program *prog, Func *fn, Expr *e, Func *callee) {
 			int nc = fn->closures[ci].ncaps;
 			if (lifted->nparams - nc != callee->params[i].fn_arity)
 				die(e->line, "the closure has the wrong number of parameters for this function-type argument");
+			/* The closure's non-capture parameters + its return must match the function-type
+			 * parameter's signature (same structural test as a bare function value). */
+			char csig[256] = {0}, esig[256];
 			for (int j = nc; j < lifted->nparams; j++)
-				if (lifted->params[j].kind != PK_WORD)
-					die(e->line, "a closure passed as a function value must take only `Int` parameters (M0)");
-			if (lifted->ret_type_name[0])
-				die(e->line, "a closure passed as a function value must return `Int` (M0)");
+				sig_append_param(&lifted->params[j], csig, sizeof csig);
+			sig_append(csig, sizeof csig, '>');
+			sig_append(csig, sizeof csig, type_sig_char(func_ret_type(lifted)));
+			param_fn_sig(&callee->params[i], esig, sizeof esig);
+			if (strcmp(csig, esig) != 0)
+				die(e->line, "the closure's signature does not match this function-type argument");
 			spec[i] = ci;
 			any = 1;
 		}
@@ -5273,13 +5414,12 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 				if (g->ntyparams > 0)
 					die(e->line, "a generic function cannot be passed as a value (instantiate it first)");
 			}
-			for (int i = 0; i < g->nparams; i++)
-				if (g->params[i].kind != PK_WORD)
-					die(e->line, "a function value must take only `Int` parameters (M0)");
-			if (g->ret_type_name[0])
-				die(e->line, "a function value must return `Int` (M0)");
+			/* No Int-only restriction: a function value carries its full signature, checked
+			 * structurally where it is passed to a function-type parameter (a mismatch — say a
+			 * record-taking function into a scalar slot — is reported there, at the call). */
 			snprintf(e->name, sizeof e->name, "%s", g->name); /* the emit symbol ($<name>) */
 			e->fn_arity = g->nparams;
+			func_value_sig(g, e->fn_sig, sizeof e->fn_sig);
 			return (Type){TY_FN, NULL, NULL, 0, NULL};
 		}
 		/* A match-arm payload binding shadows params/locals; its value is an Int read
@@ -5295,10 +5435,12 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		Resolution r = resolve_name(fn, e->name, &ty);
 		if (r == R_NONE)
 			die(e->line, "unknown name");
-		if (ty.kind == TY_FN) /* a function-value parameter used as a value — carry its arity */
+		if (ty.kind == TY_FN) /* a function-value parameter passed along — carry its signature */
 			for (int i = 0; i < fn->nparams; i++)
-				if (fn->params[i].kind == PK_FN && strcmp(fn->params[i].name, e->name) == 0)
+				if (fn->params[i].kind == PK_FN && strcmp(fn->params[i].name, e->name) == 0) {
 					e->fn_arity = fn->params[i].fn_arity;
+					param_fn_sig(&fn->params[i], e->fn_sig, sizeof e->fn_sig);
+				}
 		return ty;
 	}
 	case EX_FIELD: {
@@ -5429,22 +5571,64 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		die(e->line, "cannot infer the record type to construct here (annotate the binding, "
 		             "or use it as a record return value)");
 	case EX_CALL: {
-		/* A call whose "callee" is a function-VALUE parameter (`f(x)` where `f` is a
-		 * `(…) Int` param) is an INDIRECT call through the code pointer. Its arguments are
-		 * Int and it returns Int; the arity is the function type's. */
+		/* A call whose "callee" is a function-VALUE parameter (`f(x)` where `f` is a `(…) -> R`
+		 * param) is an INDIRECT call through the code pointer. Each argument is checked against
+		 * the corresponding function-type component, and the call's type is the return component
+		 * (any scalar, pointer, or nested function type). */
 		{
 			Type pty;
 			if (resolve_name(fn, e->name, &pty) == R_PARAM && pty.kind == TY_FN) {
-				int arity = 0;
+				const Param *fp = NULL;
 				for (int i = 0; i < fn->nparams; i++)
 					if (fn->params[i].kind == PK_FN && strcmp(fn->params[i].name, e->name) == 0)
-						arity = fn->params[i].fn_arity;
-				if (e->nargs != arity)
+						fp = &fn->params[i];
+				if (!fp) /* a TY_FN param is always a PK_FN param — belt and braces */
+					die(e->line, "internal: function-value parameter not found");
+				if (e->nargs != fp->fn_arity)
 					die(e->line, "wrong number of arguments to a function value");
-				for (int i = 0; i < e->nargs; i++)
-					expect_int(prog, fn, e->args[i]);
+				for (int i = 0; i < e->nargs; i++) {
+					const Param *pc = &fp->fn_ptypes[i];
+					Type at = typeof_expr(prog, fn, e->args[i]);
+					switch (pc->kind) {
+					case PK_WORD:
+						if (at.kind != TY_INT)
+							die(e->line, "argument type mismatch (an `Int` function-type parameter expects an `Int`)");
+						break;
+					case PK_UARCH: /* an Int widens to Uarch (throwaway cfcc coercion) */
+						if (at.kind != TY_UARCH && at.kind != TY_INT)
+							die(e->line, "argument type mismatch (a `Uarch` function-type parameter expects a `Uarch`)");
+						break;
+					case PK_F64:
+						if (at.kind != TY_F64)
+							die(e->line, "argument type mismatch (a `Float64` function-type parameter expects a `Float64`)");
+						break;
+					case PK_F32:
+						if (at.kind != TY_F32)
+							die(e->line, "argument type mismatch (a `Float32` function-type parameter expects a `Float32`)");
+						break;
+					case PK_UNIT:
+						if (at.kind != TY_UNIT)
+							die(e->line, "argument type mismatch (a `Unit` function-type parameter expects the unit value `()`)");
+						break;
+					case PK_LONG:
+						if (at.kind != TY_PTR && at.kind != TY_BUF)
+							die(e->line, "argument type mismatch (a pointer function-type parameter expects a pointer)");
+						break;
+					case PK_FN: {
+						if (at.kind != TY_FN)
+							die(e->line, "argument type mismatch (a function-type parameter expects a function value)");
+						char expect_sig[256];
+						param_fn_sig(pc, expect_sig, sizeof expect_sig);
+						if (strcmp(e->args[i]->fn_sig, expect_sig) != 0)
+							die(e->line, "argument type mismatch (the function value's signature does not match)");
+						break;
+					}
+					default:
+						die(e->line, "internal: unsupported function-type component");
+					}
+				}
 				e->indirect = 1;
-				return (Type){TY_INT, NULL, NULL, 0, NULL};
+				return param_component_type(fp->fn_ret);
 			}
 		}
 		/* A call to a closure bound in this function rewrites to a call of its lifted
@@ -5528,13 +5712,16 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 				if (at.kind != TY_RECORD || at.rec != pm->rec)
 					die(e->line, "internal: closure record capture type mismatch");
 				break;
-			case PK_FN:
-				/* A higher-order argument: a function value of matching Int-arity. */
+			case PK_FN: {
+				/* A higher-order argument: a function value whose full signature matches. */
 				if (at.kind != TY_FN)
 					die(e->line, "argument type mismatch (a function-type parameter expects a function value, e.g. a bare function name)");
-				if (e->args[i]->fn_arity != pm->fn_arity)
-					die(e->line, "argument type mismatch (the function value has the wrong number of parameters)");
+				char expect_sig[256];
+				param_fn_sig(pm, expect_sig, sizeof expect_sig);
+				if (strcmp(e->args[i]->fn_sig, expect_sig) != 0)
+					die(e->line, "argument type mismatch (the function value's signature does not match the function-type parameter)");
 				break;
+			}
 			case PK_TUPLE:
 				/* A tuple argument: a tuple of the SAME shape, passed by pointer. cfcc tuples
 				 * are immutable and the parameter is read-only, so aliasing the caller's tuple
@@ -6683,19 +6870,38 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 	}
 	case EX_CALL: {
 		/* An INDIRECT call through a function-value parameter (`f(x)`): the callee is the
-		 * `%u_<name>` code pointer; all args and the result are Int (`w`). */
+		 * `%u_<name>` code pointer. Each argument's register width follows the corresponding
+		 * function-type component (an `Int` passed to a `Uarch` slot is sign-extended, as in a
+		 * direct call), and the result width follows the return component. */
 		if (e->indirect) {
+			const Param *fp = NULL;
+			for (int i = 0; i < ex->fn->nparams; i++)
+				if (ex->fn->params[i].kind == PK_FN && strcmp(ex->fn->params[i].name, e->name) == 0)
+					fp = &ex->fn->params[i];
 			int it[MAX_PARAMS];
+			char iw[MAX_PARAMS];
 			for (int i = 0; i < e->nargs; i++) {
 				char op[96];
 				emit_expr(out, e->args[i], ex, op, sizeof op);
-				it[i] = ex->tmp++;
-				fprintf(out, "\t%%t%d =w copy %s\n", it[i], op);
+				char w = fp ? param_qtype(&fp->fn_ptypes[i]) : 'w';
+				if (w == 'l' && fp && fp->fn_ptypes[i].kind == PK_UARCH &&
+				    e->args[i]->rtype.kind == TY_INT) {
+					/* Widen an Int argument to a Uarch slot (throwaway coercion; cf0 casts). */
+					int tw = ex->tmp++;
+					fprintf(out, "\t%%t%d =w copy %s\n", tw, op);
+					it[i] = ex->tmp++;
+					fprintf(out, "\t%%t%d =l extsw %%t%d\n", it[i], tw);
+				} else {
+					it[i] = ex->tmp++;
+					fprintf(out, "\t%%t%d =%c copy %s\n", it[i], w, op);
+				}
+				iw[i] = w;
 			}
+			char rw = fp ? param_qtype(fp->fn_ret) : 'w';
 			int r = ex->tmp++;
-			fprintf(out, "\t%%t%d =w call %%u_%s(", r, e->name);
+			fprintf(out, "\t%%t%d =%c call %%u_%s(", r, rw, e->name);
 			for (int i = 0; i < e->nargs; i++)
-				fprintf(out, "%sw %%t%d", i ? ", " : "", it[i]);
+				fprintf(out, "%s%c %%t%d", i ? ", " : "", iw[i], it[i]);
 			fprintf(out, ")\n");
 			snprintf(dst, cap, "%%t%d", r);
 			return;
