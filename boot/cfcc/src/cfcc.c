@@ -724,6 +724,9 @@ typedef enum {
 	EX_NEG,   /* - negate */
 	EX_BNOT,  /* ~ bitwise not */
 	EX_LNOT,  /* ! logical not (yields 0/1) */
+	EX_ADDR,  /* &x — address-of: an aggregate value (lhs) → a `*T` pointer to it. In cfcc an
+	           * aggregate value IS its arena pointer, so this is a TYPE-level cast (zero codegen —
+	           * it yields the operand's own pointer). §6.4: the operand must be a record/union. */
 	/* binary (lhs, rhs) */
 	EX_ADD,
 	EX_SUB,
@@ -1271,9 +1274,10 @@ static void func_value_sig(const Func *g, char *buf, size_t cap) {
 }
 
 /* The record/union a type denotes whether it is the aggregate VALUE (TY_RECORD/TY_UNION) or
- * an explicit pointer to it (TY_PTR to that decl). cfcc represents an aggregate value as its
- * arena pointer, so `Point` and `*Point` share a representation and interconvert freely at
- * calls/returns. ⚠ cf0 must NOT inherit: cf0 keeps a value and its `&`-reference distinct. */
+ * an explicit pointer to it (TY_PTR to that decl). Used for the DEREF direction only — a `*T`
+ * value is accepted where its by-value `T` is wanted (they share the arena-pointer rep). The
+ * REVERSE (making a `*T`) is NOT implicit: it requires the `&` operator. ⚠ cf0 must NOT inherit
+ * the deref either — cf0 keeps a value and its `&`-reference distinct (no whole-value `*T`→`T`). */
 static DataDecl *aggregate_record(Type t) {
 	return (t.kind == TY_RECORD || t.kind == TY_PTR) ? t.rec : NULL;
 }
@@ -2426,6 +2430,7 @@ static Expr *parse_unary(Parser *p, Func *fn) {
 	case TK_MINUS: op = EX_NEG; break;
 	case TK_TILDE: op = EX_BNOT; break;
 	case TK_BANG: op = EX_LNOT; break;
+	case TK_AMP: op = EX_ADDR; break; /* prefix `&` = address-of (binary `&` is folded above) */
 	default: return parse_postfix(p, fn);
 	}
 	advance(p);
@@ -5052,6 +5057,8 @@ static const char *shallow_type_name(Program *prog, Func *fn, Expr *e) {
 			return "Uarch";
 		return c->ret_type_name[0] ? c->ret_type_name : "Int";
 	}
+	case EX_ADDR:
+		return ""; /* `&x` is a pointer — no simple nominal name to infer a `'T` from (like PK_LONG) */
 	default:
 		/* arithmetic/comparison/logical/field — Int in the common case; a genuine
 		 * mismatch surfaces later as a per-instantiation error. */
@@ -5505,12 +5512,11 @@ static void check_member_value(Program *prog, Func *fn, Expr *val, Type want, in
 		if (at.kind != TY_UNIT)
 			die(line, "expected the unit value `()` for this `Unit` field/payload");
 	} else if (want.kind == TY_PTR && (want.rec || want.uni)) {
-		/* An explicit `*Aggregate` field/payload — the recursive `*List`/`*Node` slot. An
-		 * aggregate value (or another such pointer) satisfies it; cfcc stores the arena
-		 * pointer. A `*T` is explicitly a reference, so (unlike a by-value record payload)
-		 * no freshness rule applies — aliasing is the intent. */
-		if (want.rec ? aggregate_record(at) != want.rec : aggregate_union(at) != want.uni)
-			die(line, "field/payload type mismatch (`*Aggregate` differs)");
+		/* An explicit `*Aggregate` field/payload — the recursive `*List`/`*Node` slot — needs a
+		 * POINTER: `&x` or another `*T` (a bare aggregate value does not implicitly become one).
+		 * A `*T` is explicitly a reference, so no freshness rule applies — aliasing is the intent. */
+		if (at.kind != TY_PTR || (want.rec ? at.rec != want.rec : at.uni != want.uni))
+			die(line, "a `*Aggregate` field/payload needs a pointer — take the aggregate's address with `&`");
 	} else {
 		die(line, "unsupported field/payload type");
 	}
@@ -5831,11 +5837,19 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 					die(e->line, "argument type mismatch (a word parameter expects an Int)");
 				break;
 			case PK_RECORD:
-				/* A record value OR an explicit `*Record` pointer to the same decl (they share
-				 * the arena-pointer representation, so either satisfies a `Point` or `*Point`
-				 * parameter — pm->rec is the same decl for both param spellings). */
-				if (aggregate_record(at) != pm->rec)
-					die(e->line, "argument type mismatch (expected a record or `*Record` of the parameter's type)");
+				if (pm->is_ptr) {
+					/* A `*Record` parameter needs a POINTER — `&x` or another `*Record`. A bare
+					 * record value does NOT implicitly become a pointer (§6.4; `&` is the only
+					 * way to make one). */
+					if (at.kind != TY_PTR || at.rec != pm->rec)
+						die(e->line, "a `*Record` parameter needs a pointer — take the record's address with `&`");
+				} else if (aggregate_record(at) != pm->rec) {
+					/* A by-value `Record` parameter accepts a record value OR a `*Record` (the
+					 * pointer derefs to its record — kept implicit, the reverse direction).
+					 * ⚠ cf0 must NOT inherit this whole-value deref: the spec has no `*T`→`T`
+					 * coercion; it is a cfcc convenience (both are the same arena pointer). */
+					die(e->line, "argument type mismatch (expected this record or a `*Record` to it)");
+				}
 				break;
 			case PK_UARCH:
 				if (at.kind != TY_UARCH && at.kind != TY_INT && at.kind != TY_PTR && at.kind != TY_BUF)
@@ -5846,9 +5860,14 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 					die(e->line, "argument type mismatch (a pointer parameter expects a pointer or `[N Uint8]` buffer, e.g. `s.bytes`)");
 				break;
 			case PK_UNION:
-				/* A union value OR an explicit `*Union` pointer to the same decl. */
-				if (aggregate_union(at) != pm->uni)
-					die(e->line, "argument type mismatch (expected a union or `*Union` of the parameter's type)");
+				if (pm->is_ptr) {
+					/* A `*Union` parameter needs a POINTER — `&x` or another `*Union`. */
+					if (at.kind != TY_PTR || at.uni != pm->uni)
+						die(e->line, "a `*Union` parameter needs a pointer — take the union's address with `&`");
+				} else if (aggregate_union(at) != pm->uni) {
+					/* A by-value `Union` parameter accepts a union value OR a `*Union` (deref). */
+					die(e->line, "argument type mismatch (expected this union or a `*Union` to it)");
+				}
 				break;
 			case PK_VAR:
 				die(e->line, "internal: call to an unspecialized generic function");
@@ -6060,6 +6079,25 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 	case EX_LNOT:
 		expect_int(prog, fn, e->lhs);
 		return (Type){TY_INT, NULL, NULL, 0, NULL};
+	case EX_ADDR: {
+		/* `&x` — address-of: the operand is a record or (payload) union VALUE; the result is a
+		 * `*T` pointer to it (§6.4 — never a scalar). cfcc's aggregate value is already its arena
+		 * pointer, so `&` changes only the static type. It is the spec's ONLY way to make a `*T`
+		 * from a value, so no implicit record→`*T` coercion elsewhere. ⚠ cf0 must NOT inherit:
+		 * cf0 restricts `&` to a `let` aggregate LVALUE; cfcc allows any aggregate operand (a
+		 * fresh construction is an arena value with an address). */
+		Type t = typeof_expr(prog, fn, e->lhs);
+		if (t.kind == TY_RECORD)
+			return (Type){TY_PTR, t.rec, NULL, 0, NULL};
+		if (t.kind == TY_UNION) {
+			if (!t.uni->has_payload) /* a tag-only union is a word — `*U` would be `*Scalar` (§8.4) */
+				die(e->line, "cannot take the address of an all-tag-only union (`*U` would be `*Scalar`, §6.4/§8.4)");
+			return (Type){TY_PTR, NULL, t.uni, 0, NULL};
+		}
+		if (t.kind == TY_PTR)
+			die(e->line, "`&` takes the address of an aggregate value, not of a pointer (no `**T`)");
+		die(e->line, "`&` takes the address of a record or union value (§6.4: never a scalar)");
+	}
 	case EX_ADD: case EX_SUB: case EX_MUL: case EX_DIV:
 	case EX_EQ: case EX_NE: case EX_LT: case EX_GT: case EX_LE: case EX_GE: {
 		/* Arithmetic `+ - * /` and comparison `== != < > <= >=` are NUMERIC: both operands
@@ -6449,18 +6487,12 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 			 * another call's result), which the arena keeps alive past the frame. */
 			Type rt = func_ret_type(fn);
 			if (rt.kind == TY_PTR && (rt.rec || rt.uni)) {
-				/* An explicit `*Aggregate` return. A record/union value — or another such
-				 * pointer — satisfies it (same arena pointer, viewed as a reference); a
-				 * directly-returned literal adopts the pointee record. Unlike a by-value
-				 * record return, returning a bare parameter pointer is fine — a `*T` is
-				 * explicitly an alias. */
-				if (rt.rec && s->expr->kind == EX_RECORD && !s->expr->name[0]) {
-					resolve_record_literal(prog, fn, s->expr, rt.rec);
-					break;
-				}
+				/* An explicit `*Aggregate` return needs a POINTER value — `&x` or another `*T`
+				 * (a bare aggregate value does not implicitly become one; `&` is the only way).
+				 * Returning a bare parameter pointer is fine — a `*T` is explicitly an alias. */
 				Type et = typeof_expr(prog, fn, s->expr);
-				if (rt.rec ? aggregate_record(et) != rt.rec : aggregate_union(et) != rt.uni)
-					die(s->expr->line, "returned value does not match the `*Aggregate` return type");
+				if (et.kind != TY_PTR || (rt.rec ? et.rec != rt.rec : et.uni != rt.uni))
+					die(s->expr->line, "a `*Aggregate` return needs a pointer — return `&x` (or a `*T` value)");
 			} else if (rt.kind == TY_RECORD) {
 				if (s->expr->kind == EX_RECORD && !s->expr->name[0]) {
 					/* An UNANNOTATED directly-returned literal (`-> ({…})`) adopts the
@@ -7377,6 +7409,11 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		snprintf(dst, cap, "%%t%d", r);
 		return;
 	}
+	case EX_ADDR:
+		/* `&x` is a TYPE-level cast: an aggregate value is already its arena pointer, so the
+		 * address IS the operand's own value. Emit the operand and pass it through unchanged. */
+		emit_expr(out, e->lhs, ex, dst, cap);
+		return;
 	case EX_NEG:
 	case EX_BNOT:
 	case EX_LNOT: {
