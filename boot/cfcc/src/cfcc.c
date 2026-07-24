@@ -1206,12 +1206,14 @@ static TupleDecl *resolve_tuple_shape(Program *prog, char names[][64], int n, in
 			elems[j] = (Type){TY_INT, NULL, NULL, 0, NULL};
 		} else if (strcmp(tn, "Str") == 0) {
 			elems[j] = (Type){TY_STR, NULL, NULL, 0, NULL};
+		} else if (strcmp(tn, "Unit") == 0) { /* the unit element `Unit`/`()` — a word `0` */
+			elems[j] = (Type){TY_UNIT, NULL, NULL, 0, NULL};
 		} else if (tn[0] == '(') { /* a nested tuple element `(A,B)` */
 			elems[j] = resolve_member_type(prog, tn, line);
 		} else {
 			DataDecl *d = prog_find_data(prog, tn);
 			if (!d)
-				die(line, "a tuple element is Int, Str, a record, or a nested tuple");
+				die(line, "a tuple element is Int, Str, Unit, a record, or a nested tuple");
 			elems[j] = (Type){TY_RECORD, d, NULL, 0, NULL};
 		}
 	}
@@ -5503,8 +5505,12 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 					if (is_let)
 						die(s->line, "a nested-tuple position binds `const`");
 					set_local_tuple(fn, s->name, it.tup);
+				} else if (it.kind == TY_UNIT) {
+					/* a unit position — a word `0`, so the provisional word local already fits;
+					 * retype it to `Unit` so a read yields the precise type. */
+					set_local_unit(fn, s->name);
 				} else {
-					die(s->line, "cfcc binds an Int, Str, record, or tuple position from an index "
+					die(s->line, "cfcc binds an Int, Str, Unit, record, or tuple position from an index "
 					             "(array/union positions are a later brick)");
 				}
 			} else {
