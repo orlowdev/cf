@@ -2255,9 +2255,13 @@ static Expr *parse_match(Parser *p, Func *fn) {
 				Token *qt = peek(p);
 				if (!is_type_ident(qt))
 					die(qt->line, "expected a `Union.Member` pattern");
+				/* The union qualifier is a base name `List` OR a concrete instance `List[Int]`
+				 * (parse_type_arg mangles the latter to `List.1.Int`). Both name the scrutinee's
+				 * union — typecheck accepts the qual against the union's base AND instance names,
+				 * so `List.Cons` and `List[Int].Cons` are interchangeable, and a wrong instance
+				 * (`List[Str].Cons` on a `List[Int]`) is rejected. */
 				char q[64];
-				tok_copy(qt, q, sizeof q);
-				advance(p);
+				parse_type_arg(p, q, sizeof q);
 				expect(p, TK_DOT, "a match arm names a member qualified by its union (`Union.Member`)");
 				Token *mt = peek(p);
 				if (!is_type_ident(mt))
@@ -5210,10 +5214,14 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 			if (a->is_wild) {
 				has_wild = 1;
 			} else {
-				/* Arms qualify members by the union's base (template) name — `Maybe.Just`,
-				 * not the mangled instance name `Maybe.1.Int` (type_system §8.3). */
-				if (strcmp(a->qual, u->base_name) != 0)
-					die(a->line, "a match arm must name a member of the scrutinee's union, qualified by it");
+				/* Arms qualify members by the scrutinee's union: its base (template) name
+				 * `Maybe.Just`, or the exact concrete instance `Maybe[Int].Just` (mangled
+				 * `Maybe.1.Int`, == u->name). Both spell the same member (type_system §8.1/§8.3);
+				 * a DIFFERENT instance (`Maybe[Str]` on a `Maybe[Int]`) matches neither and is
+				 * rejected. For a non-generic union base_name == name, so this is one check. */
+				if (strcmp(a->qual, u->base_name) != 0 && strcmp(a->qual, u->name) != 0)
+					die(a->line, "a match arm must name a member of the scrutinee's union, qualified "
+					             "by its name or its exact instance");
 				for (int k = 0; k < a->nalts; k++) {
 					int tag = union_member_tag(u, a->members[k]);
 					if (tag < 0)
