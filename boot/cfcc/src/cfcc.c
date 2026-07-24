@@ -366,6 +366,12 @@ static void lex(Lexer *lx) {
 				v = v * base + d;
 				lx->pos++;
 				any = 1;
+				/* A `_` digit separator is consumed only BETWEEN two digits (ebnf § Numbers:
+				 * `{ [ "_" ] , dec_digit }`), so a single `_` with a digit on each side is
+				 * skipped; a leading/trailing/doubled `_` is left for the next token (a stray
+				 * `_…` then lexes as an identifier → a downstream parse error, never a value). */
+				if (s[lx->pos] == '_' && digit_val((unsigned char)s[lx->pos + 1], base) >= 0)
+					lx->pos++;
 			}
 			if (!any) /* `0x`/`0o`/`0b` with no following digit */
 				die(lx->line, "expected digits after the base prefix (e.g. `0xff`, `0o17`, `0b101`)");
