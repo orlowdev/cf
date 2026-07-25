@@ -2054,7 +2054,7 @@ static void parse_param_type(Parser *p, Param *out) {
 		out->fn_ret = fret;
 		return;
 	}
-	if (is_ident(t, "Int")) {
+	if (is_ident(t, "Int") || is_ident(t, "Iarch")) { /* `Int` aliases `Iarch` — the operable default param */
 		advance(p);
 		out->kind = PK_WORD;
 		return;
@@ -3496,9 +3496,9 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 				if (have_lit)
 					bufsize = (int)litN;
 				is_buf = 1;
-			} else if (is_ident(et, "Int")) {
-				/* A `[N Int]` fixed array. cfcc's array length must be a literal (a
-				 * value-parameter length rides only the `[n Uint8]` buffer path). */
+			} else if (is_ident(et, "Int") || is_ident(et, "Iarch")) {
+				/* A `[N Int]`/`[N Iarch]` fixed array (`Int` aliases `Iarch`). cfcc's array length
+				 * must be a literal (a value-parameter length rides only the `[n Uint8]` buffer path). */
 				if (!have_lit)
 					die(et->line, "a `[N Int]` array length must be a literal (a value-parameter length is only for `[n Uint8]` buffers in M1)");
 				advance(p);
@@ -4052,8 +4052,8 @@ static Func *parse_func(Parser *p, Program *prog) {
 			} else if (lead[0] && nx->kind == TK_IDENT && !is_type_ident(nx)) {
 				/* a comptime value parameter `Type name`; cfcc carries it as an integer
 				 * literal, so its type must be `Int` or `Uarch`. */
-				if (strcmp(lead, "Int") != 0 && strcmp(lead, "Uarch") != 0)
-					die(nx->line, "a comptime value parameter must be typed `Int` or `Uarch`");
+				if (strcmp(lead, "Int") != 0 && strcmp(lead, "Iarch") != 0 && strcmp(lead, "Uarch") != 0)
+					die(nx->line, "a comptime value parameter must be typed `Int`/`Iarch` or `Uarch`");
 				if (nx->text[nx->len - 1] == '!')
 					die(nx->line, "M0 does not support `!` in a value parameter name");
 				tok_copy(nx, fn->typarams[fn->ntyparams], sizeof fn->typarams[0]);
@@ -4963,7 +4963,7 @@ static void subst_value_stmts(Stmt *s, char names[][64], long *vals, int nv) {
 /* Reclassify a `'T` parameter to the concrete kind of its type argument. A record or
  * union name stays PK_RECORD (resolve_signatures reclassifies a union to PK_UNION). */
 static void reclassify_param(Param *p, const char *concrete, int line) {
-	if (strcmp(concrete, "Int") == 0) {
+	if (strcmp(concrete, "Int") == 0 || strcmp(concrete, "Iarch") == 0) { /* `Int` aliases `Iarch` */
 		p->kind = PK_WORD;
 	} else if (strcmp(concrete, "Uarch") == 0) {
 		p->kind = PK_UARCH;
@@ -5249,20 +5249,20 @@ static Func *instantiate(Program *prog, Func *tmpl, char typeargs[][64], int nar
 static const char *shallow_type_name(Program *prog, Func *fn, Expr *e) {
 	switch (e->kind) {
 	case EX_INT:
-		return "Int";
+		return "Iarch"; /* a bare literal is the operable default `Iarch` */
 	case EX_UMEMBER:
 		return e->name; /* the union type name */
 	case EX_VAR:
 		for (int i = 0; i < fn->nparams; i++)
 			if (strcmp(fn->params[i].name, e->name) == 0) {
 				switch (fn->params[i].kind) {
-				case PK_WORD:    return "Int";
+				case PK_WORD:    return "Iarch";
 				case PK_UARCH:   return "Uarch";
 				case PK_RECORD:
 				case PK_UNION:
 				case PK_VAR:     return fn->params[i].type_name;
 				case PK_LONG:    return ""; /* a pointer — no simple type name */
-				case PK_CAPTURE: return "Int"; /* a captured word */
+				case PK_CAPTURE: return "Iarch"; /* a captured Iarch */
 				case PK_CAPTURE_REC: return fn->params[i].type_name; /* a captured record */
 				case PK_FN: return ""; /* a function value — no simple nominal type name */
 				case PK_TUPLE: return ""; /* a structural tuple — no nominal name to infer from */
@@ -5293,9 +5293,9 @@ static const char *shallow_type_name(Program *prog, Func *fn, Expr *e) {
 	case EX_ADDR:
 		return ""; /* `&x` is a pointer — no simple nominal name to infer a `'T` from (like PK_LONG) */
 	default:
-		/* arithmetic/comparison/logical/field — Int in the common case; a genuine
+		/* arithmetic/comparison/logical/field — Iarch in the common case; a genuine
 		 * mismatch surfaces later as a per-instantiation error. */
-		return "Int";
+		return "Iarch";
 	}
 }
 
