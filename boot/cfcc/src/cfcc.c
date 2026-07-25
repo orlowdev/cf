@@ -552,7 +552,14 @@ typedef struct TupleDecl TupleDecl;
 struct Func; /* forward: an EX_CALL caches its resolved callee for emit */
 
 typedef enum {
-	TY_INT,    /* Int — a word */
+	TY_INT,    /* a 32-bit word `w`. Since the Int→Iarch default flip, NO source value has this
+	            * type — the operable default integer is `Iarch` (a 64-bit `l`, TY_FIXED+is_arch),
+	            * and a bare literal, an `Int`/`Iarch` cast, a comparison/`!` result, `.len`, an
+	            * array/tuple element, an `Int` field/param, and the `main` return are all Iarch.
+	            * TY_INT survives ONLY as a vestige: the still-`w` slot of a `for`-loop's hidden
+	            * index counter, TY_UNIT's word `0` sibling in is_operable_int, and dead switch
+	            * arms. `is_operable_int` = TY_INT ‖ Iarch keeps them interchangeable so any
+	            * lingering `w` still type-checks. (A later cleanup can retire TY_INT entirely.) */
 	TY_PTR,    /* *T  — an opaque pointer (a long; not usable in Int expressions) */
 	TY_RECORD, /* a `data` record type (see rec) */
 	TY_STR,    /* Str — an `l` pointer to a {bytes*, len} header; not an Int */
@@ -653,10 +660,14 @@ typedef struct {
 	int is_arch;    /* TY_FIXED: 1 = `Iarch` (the pointer-width signed leaf) — a NOMINALLY
 	                 * distinct type from `Int64` (§2) though it shares Int64's 64-bit `l`
 	                 * representation; distinguished only in types_equal. 0 for the eight IntN/UintN.
-	                 * ⚠ THIS BRICK adds Iarch as a distinct operable type only; it is NOT YET the
-	                 * bare-literal default (§3 — that flip is the next brick; cfcc's default is still
-	                 * the 32-bit `Int` degeneracy), and like the other fixed leaves it is not yet an
-	                 * aggregate field nor usable as a bare condition/index (cast to `Int`). */
+	                 * `Iarch` is now cfcc's OPERABLE DEFAULT integer (§3): a bare literal, `Int`/
+	                 * `Iarch` casts, params/fields/returns, `.len`, comparison, and array/tuple
+	                 * elements are all Iarch, and it is fully usable as a condition/index and an
+	                 * aggregate field. `Int` is a surface ALIAS for it (see the TY_INT comment).
+	                 * ⚠ cf0 must NOT inherit: in real cf `Int` is the SIGNED UNION {Int8,Int16,
+	                 * Int32,Int64,Iarch} (§8.6), a bound — not a concrete alias for Iarch; cfcc's
+	                 * alias is a TEMPORARY intermediate the numeric-union brick replaces (so cfcc
+	                 * cannot `match` on `Int` nor subsume a narrower width into it yet). */
 } Type;
 
 /* The entry ABI kinds an M0 `main` parameter can take: a word (Int, e.g. argc)
@@ -1082,10 +1093,11 @@ static int type_is_word(Type t) {
 	return 0;
 }
 
-/* True if a parameter is passed in a word register: a word Int, or a tag-only union.
- * A boxed (payload) union is passed by pointer, like a record. */
+/* True if a parameter is passed in a 32-bit word register: the unit value or a tag-only union
+ * tag. An `Int`/`Iarch` param (PK_WORD) is now the 64-bit `l` default, NOT a word; a boxed
+ * (payload) union is passed by pointer, like a record. */
 static int param_is_word(const Param *p) {
-	return p->kind == PK_WORD || p->kind == PK_UNIT || (p->kind == PK_UNION && !p->uni->has_payload);
+	return p->kind == PK_UNIT || (p->kind == PK_UNION && !p->uni->has_payload);
 }
 
 /* True if a type is a floating-point scalar (Float32/Float64). */
@@ -1328,6 +1340,8 @@ static int types_equal(Type a, Type b) {
  * letter matching — it carries full nominal function types and matches them structurally
  * against the type-system (a `*Point` and a `*Str` are distinct there, both `p` here). */
 static char type_sig_char(Type t) {
+	if (is_iarch(t)) /* `Iarch` (the operable default) shares the `Int`/PK_WORD signature letter */
+		return 'i';
 	switch (t.kind) {
 	case TY_INT:    return 'i';
 	case TY_UARCH:  return 'u';
@@ -1420,7 +1434,7 @@ static Type param_component_type(const Param *pm) {
 	case PK_UNIT:  return (Type){TY_UNIT, NULL, NULL, 0, NULL};
 	case PK_LONG:  return (Type){TY_PTR, NULL, NULL, 0, NULL};
 	case PK_FN:    return (Type){TY_FN, NULL, NULL, 0, NULL};
-	default:       return (Type){TY_INT, NULL, NULL, 0, NULL}; /* PK_WORD */
+	default:       return mk_iarch(); /* PK_WORD — the `Int`/`Iarch` operable default */
 	}
 }
 
@@ -1582,9 +1596,7 @@ static Type resolve_member_type(Program *prog, const char *name, int line) {
 			return (Type){TY_PTR, pd, NULL, 0, NULL};
 		die(line, "a pointer type `*T` points to a record or union, not a scalar or unknown type (§6.4)");
 	}
-	if (strcmp(name, "Int") == 0)
-		return (Type){TY_INT, NULL, NULL, 0, NULL};
-	if (strcmp(name, "Iarch") == 0) /* a pointer-width signed field — a 64-bit `l` in its 8-byte slot */
+	if (strcmp(name, "Int") == 0 || strcmp(name, "Iarch") == 0) /* `Int` aliases `Iarch` — a 64-bit `l` field in its 8-byte slot */
 		return mk_iarch();
 	if (strcmp(name, "Unit") == 0) /* `Unit`/`()` — the zero-tuple, a word `0` field/payload */
 		return (Type){TY_UNIT, NULL, NULL, 0, NULL};
@@ -1638,8 +1650,8 @@ static TupleDecl *resolve_tuple_shape(Program *prog, char names[][64], int n, in
 	Type elems[MAX_FIELDS];
 	for (int j = 0; j < n; j++) {
 		const char *tn = names[j];
-		if (strcmp(tn, "Int") == 0) {
-			elems[j] = (Type){TY_INT, NULL, NULL, 0, NULL};
+		if (strcmp(tn, "Int") == 0 || strcmp(tn, "Iarch") == 0) {
+			elems[j] = mk_iarch(); /* `Int` aliases `Iarch` — a 64-bit `l` element */
 		} else if (strcmp(tn, "Str") == 0) {
 			elems[j] = (Type){TY_STR, NULL, NULL, 0, NULL};
 		} else if (strcmp(tn, "Unit") == 0) { /* the unit element `Unit`/`()` — a word `0` */
@@ -1684,7 +1696,7 @@ static Resolution resolve_name(Func *fn, const char *name, Type *ty) {
 			ty->is_signed = 0;
 			ty->is_arch = 0;
 			switch (fn->params[i].kind) {
-			case PK_WORD:    ty->kind = TY_INT;    ty->rec = NULL; break;
+			case PK_WORD:    *ty = mk_iarch(); break; /* an `Int`/`Iarch` param — the operable default (64-bit `l`) */
 			case PK_RECORD: /* is_ptr → an explicit `*Record` pointer (TY_PTR to the pointee) */
 				if (fn->params[i].is_ptr) { ty->kind = TY_PTR; ty->rec = fn->params[i].rec; }
 				else { ty->kind = TY_RECORD; ty->rec = fn->params[i].rec; }
@@ -1697,7 +1709,7 @@ static Resolution resolve_name(Func *fn, const char *name, Type *ty) {
 				ty->uni = fn->params[i].uni;
 				break;
 			case PK_VAR:     ty->kind = TY_INT;    ty->rec = NULL; break; /* template body parse only; type is ignored (re-typed per instantiation) */
-			case PK_CAPTURE: ty->kind = TY_INT;    ty->rec = NULL; return R_LET; /* a by-ref word: readable AND writable */
+			case PK_CAPTURE: *ty = mk_iarch(); return R_LET; /* a by-ref Iarch: readable AND writable */
 			case PK_CAPTURE_REC: ty->kind = TY_RECORD; ty->rec = fn->params[i].rec; return R_LET; /* a by-ref record: fields mutable */
 			case PK_FN:      ty->kind = TY_FN; ty->rec = NULL; break; /* a function value (arity on the Param) */
 			case PK_TUPLE:   ty->kind = TY_TUPLE; ty->rec = NULL; ty->tup = fn->params[i].tup; break; /* by pointer, read-only */
@@ -3123,8 +3135,8 @@ static void note_capture(Func *cl, const char *name, int is_write, int line,
 	Resolution r = resolve_name(cl->parent, name, &ty);
 	if (r == R_NONE)
 		die(line, "unknown name in closure body");
-	if (ty.kind != TY_INT && ty.kind != TY_RECORD)
-		die(line, "M0 closures capture only `Int` and record variables by reference (not strings, pointers, or unions)");
+	if (!is_operable_int(ty) && ty.kind != TY_RECORD)
+		die(line, "M0 closures capture only `Int`/`Iarch` and record variables by reference (not strings, pointers, or unions)");
 	/* A word write to a captured `const` is already rejected while parsing the closure body
 	 * (resolve chains to the parent); a record FIELD write is not, so enforce it here. */
 	if (is_write && r != R_LET)
@@ -3713,15 +3725,15 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 		s->expr = parse_expr(p, fn); /* the iterable — a bare array variable in cfcc */
 		if (s->expr->kind != EX_VAR)
 			die(s->line, "M1 `for` iterates a bare array variable (`for x in xs`)");
-		/* The loop var is a const Int local; a hidden counter local carries the index.
-		 * Both are word locals (their `%s_` slots are hoisted to the entry block). */
-		Type ti = {TY_INT, NULL, NULL, 0, NULL};
+		/* The loop var is a const `Iarch` local (an array element — the operable default, 64-bit
+		 * `l`); a hidden counter local (a 32-bit word `%s_` slot) carries the index 0..N-1. */
+		Type tword = {TY_INT, NULL, NULL, 0, NULL};
 		Type tmp;
 		if (resolve_name(fn, varname, &tmp) != R_NONE || func_find_closure(fn, varname) >= 0)
 			die(vt->line, "name already defined (no shadowing in M0)");
-		func_add_local(fn, varname, 0, ti, "");        /* const Int loop variable */
+		func_add_local(fn, varname, 0, mk_iarch(), "Iarch"); /* const Iarch loop variable */
 		snprintf(s->field, sizeof s->field, "for.i%d", p->for_id++); /* hidden counter name (`.` = untypeable) */
-		func_add_local(fn, s->field, 1, ti, "");       /* let Int hidden counter */
+		func_add_local(fn, s->field, 1, tword, "");    /* let word hidden counter */
 		if (p->loop_depth >= MAX_LOOP_DEPTH)
 			die(t->line, "loops nested too deep");
 		expect(p, TK_LBRACE, "expected `{` (a `for` body is a block)");
@@ -5707,12 +5719,9 @@ static void expect_int(Program *prog, Func *fn, Expr *e) {
  * memory_model §6; a `union` value is immutable so aliasing it is sound). */
 static void check_member_value(Program *prog, Func *fn, Expr *val, Type want, int line) {
 	Type at = typeof_expr(prog, fn, val);
-	if (want.kind == TY_INT) {
-		if (at.kind != TY_INT)
-			die(line, "expected an Int value for this field/payload");
-	} else if (is_iarch(want)) { /* an `Iarch` field/payload wants an exact `Iarch` value */
-		if (!is_iarch(at))
-			die(line, "expected an `Iarch` value for this field/payload");
+	if (want.kind == TY_INT || is_iarch(want)) { /* an `Int`/`Iarch` field wants an operable integer */
+		if (!is_operable_int(at))
+			die(line, "expected an `Int`/`Iarch` value for this field/payload");
 	} else if (want.kind == TY_RECORD) {
 		if (at.kind != TY_RECORD || at.rec != want.rec)
 			die(line, "field/payload type mismatch (record type differs)");
@@ -5794,7 +5803,10 @@ static Type loop_yield_type(Program *prog, Func *fn, Stmt *body) {
 static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 	switch (e->kind) {
 	case EX_INT:
-		return (Type){TY_INT, NULL, NULL, 0, NULL};
+		/* A bare integer literal defaults to `Iarch` (§3, the pointer-width signed word). The
+		 * ST_LOCAL/arg/return adoption paths key on the EX_INT *kind*, not this type, so a
+		 * literal still adopts a narrower annotated width where one is present. */
+		return mk_iarch();
 	case EX_FLOAT: /* a float literal is Float64 (no literal-adopts-Float32 in cfcc) */
 		return (Type){TY_F64, NULL, NULL, 0, NULL};
 	case EX_STR:
@@ -5856,7 +5868,7 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 			 * — enough to hand a buffer + length to `write`. (Both are provisional
 			 * cfcc surface over the throwaway {bytes*,len} header; cf0's Str API differs.) */
 			if (strcmp(e->name, "len") == 0)
-				return (Type){TY_INT, NULL, NULL, 0, NULL};
+				return mk_iarch(); /* the byte count — the operable default integer */
 			if (strcmp(e->name, "bytes") == 0)
 				return (Type){TY_PTR, NULL, NULL, 0, NULL};
 			die(e->line, "a string has only the `.len` and `.bytes` fields");
@@ -5865,7 +5877,7 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 			/* A fixed array exposes `.len`, its comptime element count (an Int). Emit
 			 * reads the constant from the base's cached rtype.alen. */
 			if (strcmp(e->name, "len") == 0)
-				return (Type){TY_INT, NULL, NULL, 0, NULL};
+				return mk_iarch(); /* the element count — the operable default integer */
 			die(e->line, "a fixed array has only the `.len` field");
 		}
 		/* A record VALUE or an explicit `*Record` pointer both address the record (cfcc
@@ -5901,7 +5913,7 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		if (base.kind != TY_ARRAY)
 			die(e->line, "index `[…]` needs a fixed-array or tuple value on the left");
 		expect_int(prog, fn, e->rhs);
-		return (Type){TY_INT, NULL, NULL, 0, NULL};
+		return mk_iarch(); /* an array element is the operable default integer (64-bit `l`) */
 	}
 	case EX_ARRAY: {
 		/* A fixed-array literal `[e0, …]`: every element is an Int (M1 element type);
@@ -5936,8 +5948,8 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 				continue;
 			}
 			Type et = typeof_expr(prog, fn, e->args[i]);
-			if (type_is_word(et) || et.kind == TY_STR || et.kind == TY_TUPLE) {
-				/* Int / a tag-only union (a word), an immutable Str, or a nested tuple (also
+			if (is_operable_int(et) || type_is_word(et) || et.kind == TY_STR || et.kind == TY_TUPLE) {
+				/* Iarch/Int / a tag-only union (a word), an immutable Str, or a nested tuple (also
 				 * immutable, so its pointer may ride in unchanged) — no alias/freshness risk. */
 			} else if (et.kind == TY_RECORD) {
 				if (e->args[i]->kind != EX_CALL && e->args[i]->kind != EX_RECORD)
@@ -6000,8 +6012,8 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 					Type at = typeof_expr(prog, fn, e->args[i]);
 					switch (pc->kind) {
 					case PK_WORD:
-						if (at.kind != TY_INT)
-							die(e->line, "argument type mismatch (an `Int` function-type parameter expects an `Int`)");
+						if (!is_operable_int(at))
+							die(e->line, "argument type mismatch (an `Int` function-type parameter expects an integer)");
 						break;
 					case PK_UARCH: /* an Int widens to Uarch (throwaway cfcc coercion) */
 						if (at.kind != TY_UARCH && at.kind != TY_INT)
@@ -6086,8 +6098,8 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 			Type at = typeof_expr(prog, fn, e->args[i]);
 			switch (pm->kind) {
 			case PK_WORD:
-				if (at.kind != TY_INT)
-					die(e->line, "argument type mismatch (a word parameter expects an Int)");
+				if (!is_operable_int(at))
+					die(e->line, "argument type mismatch (an `Int`/`Iarch` parameter expects an integer)");
 				break;
 			case PK_RECORD:
 				if (pm->is_ptr) {
@@ -6105,7 +6117,7 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 				}
 				break;
 			case PK_UARCH:
-				if (at.kind != TY_UARCH && at.kind != TY_INT && at.kind != TY_PTR && at.kind != TY_BUF)
+				if (at.kind != TY_UARCH && !is_operable_int(at) && at.kind != TY_PTR && at.kind != TY_BUF)
 					die(e->line, "argument type mismatch (a Uarch parameter expects a Uarch, Int, pointer, or buffer)");
 				break;
 			case PK_LONG:
@@ -6126,10 +6138,10 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 				die(e->line, "internal: call to an unspecialized generic function");
 				break;
 			case PK_CAPTURE:
-				/* A prepended capture argument: the enclosing variable, which must be a
-				 * word (captured by reference and read/written through a pointer). */
-				if (at.kind != TY_INT)
-					die(e->line, "internal: closure capture is not a word");
+				/* A prepended capture argument: the enclosing variable, an operable integer
+				 * (Iarch) captured by reference and read/written through a pointer. */
+				if (!is_operable_int(at))
+					die(e->line, "internal: closure capture is not an operable integer");
 				break;
 			case PK_CAPTURE_REC:
 				/* A prepended record capture: the enclosing record, passed by pointer. */
@@ -6299,6 +6311,8 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		int b, sgn, arch;
 		if (fixed_name_bits_signed(e->name, &b, &sgn, &arch))
 			return mk_fixed(b, sgn, arch);
+		if (strcmp(e->name, "Int") == 0) /* `Int(x)` — `Int` is a surface alias for `Iarch` (the default) */
+			return mk_iarch();
 		TypeKind tk = strcmp(e->name, "Uarch") == 0 ? TY_UARCH
 		            : strcmp(e->name, "Float64") == 0 ? TY_F64
 		            : strcmp(e->name, "Float32") == 0 ? TY_F32
@@ -6347,23 +6361,23 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		if (is_fixed_type(t)) {
 			if (!t.is_signed)
 				die(e->line, "unary `-` is undefined on an unsigned integer type (§8.5) — cast to a signed type first");
-			return t;
+			return t; /* signed IntN / Iarch */
 		}
 		expect_int(prog, fn, e->lhs);
-		return (Type){TY_INT, NULL, NULL, 0, NULL};
+		return mk_iarch();
 	}
 	case EX_BNOT: {
 		/* `~` (bitwise not) applies to any integer scalar, including a fixed-width IntN/UintN
 		 * (yielding that type — the emit wraps the sub-word result). */
 		Type t = typeof_expr(prog, fn, e->lhs);
 		if (is_fixed_type(t))
-			return t;
+			return t; /* IntN/UintN/Iarch — yields that type */
 		expect_int(prog, fn, e->lhs);
-		return (Type){TY_INT, NULL, NULL, 0, NULL};
+		return mk_iarch();
 	}
-	case EX_LNOT: /* `!` is Int-only (truthiness) — a fixed value must be cast to Int first */
+	case EX_LNOT: /* `!` is operable-int-only (truthiness) — a fixed value must be cast to Int first */
 		expect_int(prog, fn, e->lhs);
-		return (Type){TY_INT, NULL, NULL, 0, NULL};
+		return mk_iarch();
 	case EX_ADDR: {
 		/* `&x` — address-of: the operand is a record or (payload) union VALUE; the result is a
 		 * `*T` pointer to it (§6.4 — never a scalar). cfcc's aggregate value is already its arena
@@ -6396,19 +6410,23 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		if (is_float_type(lt) || is_float_type(rt)) {
 			if (lt.kind != rt.kind || !is_float_type(lt))
 				die(e->line, "a numeric operator needs two operands of the same type (no mixed Int/Float or Float32/Float64 — cast explicitly)");
-			return (Type){is_cmp ? TY_INT : lt.kind, NULL, NULL, 0, NULL};
+			return is_cmp ? mk_iarch() : (Type){lt.kind, NULL, NULL, 0, NULL};
+		}
+		if (is_operable_int(lt) && is_operable_int(rt)) {
+			/* `Int`/`Iarch` — the operable default integer; the two coexisting reprs mix freely
+			 * and the result is `Iarch` (arithmetic) or a `0/1` `Iarch` (comparison). */
+			return mk_iarch();
 		}
 		if (is_fixed_type(lt) || is_fixed_type(rt)) {
-			/* Both operands must be the SAME fixed-width type (no mixed widths/signedness, and
-			 * no Int mixed in — §5 same-type operands, §4 cast explicitly). Arithmetic yields
-			 * that type; a comparison yields Int (0/1). */
+			/* A sub-family `IntN/UintN` — both operands the SAME type (Iarch is handled above);
+			 * arithmetic yields it, a comparison yields `Iarch` (0/1). */
 			if (!types_equal(lt, rt))
-				die(e->line, "a numeric operator needs two operands of the same fixed-width type (no mixed widths/signedness or `Int` — cast explicitly)");
-			return is_cmp ? (Type){TY_INT, NULL, NULL, 0, NULL} : lt;
+				die(e->line, "a numeric operator needs two operands of the same fixed-width type (no mixed widths/signedness — cast explicitly)");
+			return is_cmp ? mk_iarch() : lt;
 		}
 		expect_int(prog, fn, e->lhs);
 		expect_int(prog, fn, e->rhs);
-		return (Type){TY_INT, NULL, NULL, 0, NULL};
+		return mk_iarch();
 	}
 	case EX_REM:
 	case EX_BOR: case EX_BXOR: case EX_BAND: case EX_SHL: case EX_SHR: {
@@ -6420,6 +6438,8 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		 * canon_fixed; type_system does not yet pin overlarge-shift semantics). */
 		Type lt = typeof_expr(prog, fn, e->lhs);
 		Type rt = typeof_expr(prog, fn, e->rhs);
+		if (is_operable_int(lt) && is_operable_int(rt))
+			return mk_iarch(); /* Int/Iarch — the operable default */
 		if (is_fixed_type(lt) || is_fixed_type(rt)) {
 			if (!types_equal(lt, rt))
 				die(e->line, "a `%`/bitwise/shift operator needs two operands of the same fixed-width type (cast explicitly)");
@@ -6427,13 +6447,13 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		}
 		expect_int(prog, fn, e->lhs);
 		expect_int(prog, fn, e->rhs);
-		return (Type){TY_INT, NULL, NULL, 0, NULL};
+		return mk_iarch();
 	}
 	case EX_AND: case EX_OR:
 		/* Logical `&&`/`||` are Int-only (truthiness) — a fixed value must be cast to Int. */
 		expect_int(prog, fn, e->lhs);
 		expect_int(prog, fn, e->rhs);
-		return (Type){TY_INT, NULL, NULL, 0, NULL};
+		return mk_iarch();
 	}
 	die(e->line, "internal: unhandled expression kind in typecheck");
 }
@@ -6470,7 +6490,7 @@ static Type func_ret_type(const Func *fn) {
 		return (Type){TY_UNION, NULL, fn->ret_uni, 0, NULL};
 	if (fn->ret_type_name[0])
 		return (Type){TY_RECORD, fn->ret_rec, NULL, 0, NULL};
-	return (Type){TY_INT, NULL, NULL, 0, NULL};
+	return mk_iarch(); /* the default (and a bare `: Int`, which leaves ret_type_name empty) — `Int` aliases Iarch */
 }
 
 /* Backfill a record local's declaration so later field accesses resolve. */
@@ -6521,6 +6541,17 @@ static void set_local_unit(Func *fn, const char *name) {
 	for (int i = 0; i < fn->nlocals; i++)
 		if (strcmp(fn->locals[i].name, name) == 0) {
 			fn->locals[i].type = (Type){TY_UNIT, NULL, NULL, 0, NULL};
+			return;
+		}
+}
+
+/* Retype a provisional (word) local to an inferred SCALAR type `t` — for an unannotated
+ * `const x = <scalar>` whose type comes from the initializer (an `Iarch` from a bare literal,
+ * a fixed-width value, etc.). emit_func then reserves the correct slot width from the type. */
+static void set_local_scalar(Func *fn, const char *name, Type t) {
+	for (int i = 0; i < fn->nlocals; i++)
+		if (strcmp(fn->locals[i].name, name) == 0) {
+			fn->locals[i].type = t;
 			return;
 		}
 }
@@ -6595,8 +6626,9 @@ static void resolve_record_literal(Program *prog, Func *fn, Expr *e, DataDecl *d
 		for (int i = 0; i < d->nfields; i++) {
 			if (e->ford[i]) /* explicitly overridden — not copied */
 				continue;
-			if (!type_is_word(data_field_type(prog, d, i)))
-				die(e->line, "a spread-copied field must be word-sized (a shallow copy of an aggregate field would alias its sub-record)");
+			Type sft = data_field_type(prog, d, i);
+			if (!type_is_word(sft) && !is_iarch(sft)) /* a scalar (word or Iarch) copies by value; an aggregate would alias */
+				die(e->line, "a spread-copied field must be scalar (a shallow copy of an aggregate field would alias its sub-record)");
 			Expr *fe = new_expr(EX_FIELD);
 			fe->line = e->line;
 			fe->lhs = e->spread;
@@ -6764,6 +6796,9 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 				int is_let = resolve_name(fn, s->name, &lt) == R_LET;
 				if (it.kind == TY_INT) {
 					/* a word local — its provisional Int type already fits (a value copy) */
+				} else if (is_iarch(it)) {
+					/* an `Iarch` tuple element — retype the provisional word local to a 64-bit `l` */
+					set_local_scalar(fn, s->name, it);
 				} else if (it.kind == TY_STR) {
 					if (is_let)
 						die(s->line, "a Str position binds `const` (a `let` Str is a later brick)");
@@ -6797,9 +6832,18 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 					set_local_tuple(fn, s->name, it.tup);
 				else if (it.kind == TY_UNIT) /* `const u = ()` or a `Unit`-returning call */
 					set_local_unit(fn, s->name);
-				else if (it.kind != TY_INT)
+				else if (it.kind == TY_INT) {
+					/* a word local — its provisional Int type already fits */
+				} else if (is_iarch(it)) {
+					/* `const x = 5` — a bare literal (or any Iarch value) infers an `Iarch` local
+					 * (the default). Retype the provisional word local so its slot is a 64-bit `l`.
+					 * ⚠ cf0 must NOT inherit: cfcc infers ONLY Iarch here (a fixed-width `Int8`
+					 * value still needs an annotation) — §3 infers any scalar's precise type. */
+					set_local_scalar(fn, s->name, it);
+				} else {
 					die(s->expr->line, "expected an Int value (a record is used only via field "
 					                   "access, and a string only via `.len`, in M0)");
+				}
 			}
 			break;
 		case ST_FIELD_ASSIGN: {
@@ -6876,7 +6920,7 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 				/* A Uarch return accepts a Uarch, or an Int/pointer widened to register
 				 * width (the same call-site coercion as a Uarch parameter). */
 				Type et = typeof_expr(prog, fn, s->expr);
-				if (et.kind != TY_UARCH && et.kind != TY_INT && et.kind != TY_PTR)
+				if (et.kind != TY_UARCH && !is_operable_int(et) && et.kind != TY_PTR)
 					die(s->expr->line, "a Uarch function returns a Uarch, Int, or pointer value");
 			} else if (rt.kind == TY_UNION) {
 				Type et = typeof_expr(prog, fn, s->expr);
@@ -6900,13 +6944,20 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 				Type et = typeof_expr(prog, fn, s->expr);
 				if (et.kind != rt.kind)
 					die(s->expr->line, "a float function returns a value of its declared float type (cast if needed)");
+			} else if (is_iarch(rt)) {
+				/* An `Iarch`/`Int` return (the default): accepts any operable-int value. Post-flip
+				 * every such value is already an `l` (literals, casts, params, comparisons, `.len`,
+				 * fields), so the `ret` needs no widening; the `TY_INT` arm of is_operable_int is a
+				 * transition vestige (no source expression produces a bare `TY_INT` anymore). */
+				Type et = typeof_expr(prog, fn, s->expr);
+				if (!is_operable_int(et))
+					die(s->expr->line, "an `Int`/`Iarch` function returns an integer value (cast a float/pointer/aggregate)");
 			} else if (is_fixed_type(rt)) {
-				/* A fixed-width integer return: the value must be that EXACT IntN/UintN (a cast
-				 * `Int8(x)`, a fixed-typed local/param, or an if/match yielding it) — no implicit
-				 * widen/narrow of an Int, unlike Uarch's throwaway coercion. ⚠ cf0 must NOT
-				 * inherit: a bare literal RETURN should ADOPT the return's fixed width per §3
-				 * (cfcc only adopts at a binding — here `-> 5` from a `Uint8` fn is rejected,
-				 * test 733). */
+				/* A sub-family fixed-width integer return: the value must be that EXACT IntN/UintN
+				 * (a cast `Int8(x)`, a fixed-typed local/param, or an if/match yielding it) — no
+				 * implicit widen/narrow. ⚠ cf0 must NOT inherit: a bare literal RETURN should ADOPT
+				 * the return's fixed width per §3 (cfcc only adopts at a binding — here `-> 5` from
+				 * a `Uint8` fn is rejected, test 733). */
 				Type et = typeof_expr(prog, fn, s->expr);
 				if (!types_equal(et, rt))
 					die(s->expr->line, "a fixed-width integer function returns that exact `IntN`/`UintN` (cast with `Int8(x)` etc.)");
@@ -7306,10 +7357,15 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		}
 		if (is_fixed_type(e->rtype)) {
 			/* A fixed-width integer local/param lives in its own slot (params spill there); a
-			 * read is a `loadw` (≤32-bit) or `loadl` (64-bit). The stored value is canonical. */
+			 * read is a `loadw` (≤32-bit) or `loadl` (64-bit). The stored value is canonical.
+			 * An `Iarch` captured by reference (PK_CAPTURE) instead reads through its `%u_`
+			 * pointer, which holds the enclosing slot's address. */
 			char qt = qtype_of(e->rtype);
 			int t = ex->tmp++;
-			fprintf(out, "\t%%t%d =%c load%c %%s_%s\n", t, qt, qt, e->name);
+			if (is_capture_param(ex->fn, e->name))
+				fprintf(out, "\t%%t%d =%c load%c %%u_%s\n", t, qt, qt, e->name);
+			else
+				fprintf(out, "\t%%t%d =%c load%c %%s_%s\n", t, qt, qt, e->name);
 			snprintf(dst, cap, "%%t%d", t);
 			return;
 		}
@@ -7337,11 +7393,14 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 				snprintf(dst, cap, "%%t%d", r);
 				return;
 			}
-			/* `.len` — the length word sits at offset 8 of the string header. */
+			/* `.len` — the length word sits at offset 8 of the string header; widen the
+			 * 32-bit count to an `l` (its type is the Iarch default). */
 			int a = ex->tmp++;
 			fprintf(out, "\t%%t%d =l add %s, 8\n", a, s);
+			int w = ex->tmp++;
+			fprintf(out, "\t%%t%d =w loadw %%t%d\n", w, a);
 			int r = ex->tmp++;
-			fprintf(out, "\t%%t%d =w loadw %%t%d\n", r, a);
+			fprintf(out, "\t%%t%d =l extuw %%t%d\n", r, w);
 			snprintf(dst, cap, "%%t%d", r);
 			return;
 		}
@@ -7375,10 +7434,10 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		return;
 	}
 	case EX_INDEX: {
-		/* A tuple index `t[k]` has a COMPTIME literal position (k*8 is a constant offset) and
-		 * loads a word or an 8-byte pointer per the element's type; an array index `xs[i]`
-		 * takes a runtime word index (widened to a long, *8) and always loads a word. Neither
-		 * bounds-checks (throwaway). */
+		/* A tuple index `t[k]` has a COMPTIME literal position (k*8 is a constant offset); an
+		 * array index `xs[i]` takes a runtime `Iarch` index (already an `l`, scaled *8). Both
+		 * load per the element's type — a `w` for a tag-only/unit element, else an `l` (an
+		 * `Iarch` element or an 8-byte aggregate pointer). Neither bounds-checks (throwaway). */
 		char base[96];
 		emit_expr(out, e->lhs, ex, base, sizeof base);
 		char addr[96];
@@ -7394,10 +7453,9 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		} else {
 			char idx[96];
 			emit_expr(out, e->rhs, ex, idx, sizeof idx);
-			int iw = ex->tmp++;
-			fprintf(out, "\t%%t%d =l extsw %s\n", iw, idx);
+			/* the index is an `Iarch` (`l`) — scale by the 8-byte slot directly, no widening */
 			int o = ex->tmp++;
-			fprintf(out, "\t%%t%d =l mul %%t%d, 8\n", o, iw);
+			fprintf(out, "\t%%t%d =l mul %s, 8\n", o, idx);
 			int a = ex->tmp++;
 			fprintf(out, "\t%%t%d =l add %s, %%t%d\n", a, base, o);
 			snprintf(addr, sizeof addr, "%%t%d", a);
@@ -7836,19 +7894,21 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 			fprintf(out, "\tjnz %s, @rhs%d, @sc%d\n", a, id, id);
 		else
 			fprintf(out, "\tjnz %s, @sc%d, @rhs%d\n", a, id, id);
-		fprintf(out, "@sc%d\n", id); /* short-circuit: 0 for &&, 1 for || */
-		fprintf(out, "\tstorew %d, %%m%d\n", is_and ? 0 : 1, e->slot);
+		fprintf(out, "@sc%d\n", id); /* short-circuit: 0 for &&, 1 for || — the result is Iarch (`l`) */
+		fprintf(out, "\tstorel %d, %%m%d\n", is_and ? 0 : 1, e->slot);
 		fprintf(out, "\tjmp @lend%d\n", id);
 		fprintf(out, "@rhs%d\n", id);
 		char b[96];
 		emit_expr(out, e->rhs, ex, b, sizeof b);
 		int bt = ex->tmp++;
-		fprintf(out, "\t%%t%d =w cnew %s, 0\n", bt, b); /* b != 0 → 0/1 */
-		fprintf(out, "\tstorew %%t%d, %%m%d\n", bt, e->slot);
+		fprintf(out, "\t%%t%d =w cne%c %s, 0\n", bt, qtype_of(e->rhs->rtype), b); /* b != 0 → 0/1 word */
+		int bl = ex->tmp++;
+		fprintf(out, "\t%%t%d =l extuw %%t%d\n", bl, bt); /* widen to the `l` slot */
+		fprintf(out, "\tstorel %%t%d, %%m%d\n", bl, e->slot);
 		fprintf(out, "\tjmp @lend%d\n", id);
 		fprintf(out, "@lend%d\n", id);
 		int r = ex->tmp++;
-		fprintf(out, "\t%%t%d =w loadw %%m%d\n", r, e->slot);
+		fprintf(out, "\t%%t%d =l loadl %%m%d\n", r, e->slot);
 		snprintf(dst, cap, "%%t%d", r);
 		return;
 	}
@@ -7868,9 +7928,11 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 			fprintf(out, "\t%%t%d =%c neg %s\n", t, qtype_of(e->lhs->rtype), a);
 		else if (e->kind == EX_BNOT)
 			fprintf(out, "\t%%t%d =%c xor %s, -1\n", t, qtype_of(e->lhs->rtype), a);
-		else { /* EX_LNOT — Int-only (typecheck), a 0/1 word */
-			fprintf(out, "\t%%t%d =w ceqw %s, 0\n", t, a);
-			snprintf(dst, cap, "%%t%d", t);
+		else { /* EX_LNOT — result is Iarch (`l`), a 0/1: compare the operand to 0 at its width */
+			fprintf(out, "\t%%t%d =w ceq%c %s, 0\n", t, qtype_of(e->lhs->rtype), a);
+			int r = ex->tmp++;
+			fprintf(out, "\t%%t%d =l extuw %%t%d\n", r, t);
+			snprintf(dst, cap, "%%t%d", r);
 			return;
 		}
 		/* `-x`/`~x` on a sub-word fixed type must wrap back to its width. */
@@ -7910,8 +7972,10 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		if (is_cmp) {
 			char m[16];
 			cmp_mnemonic(e->kind, oq, is_signed, m, sizeof m);
-			fprintf(out, "\t%%t%d =w %s %s, %s\n", t, m, a, b); /* result is a 0/1 word — already canonical */
-			snprintf(dst, cap, "%%t%d", t);
+			fprintf(out, "\t%%t%d =w %s %s, %s\n", t, m, a, b); /* QBE compare yields a 0/1 word */
+			int r = ex->tmp++; /* the comparison's type is Iarch (`l`) — widen the 0/1 to a long */
+			fprintf(out, "\t%%t%d =l extuw %%t%d\n", r, t);
+			snprintf(dst, cap, "%%t%d", r);
 		} else {
 			fprintf(out, "\t%%t%d =%c %s %s, %s\n", t, oq, arith_mnemonic(e->kind, is_signed), a, b);
 			/* Wrap a sub-word fixed-width result back to its width (no-op for Int/Uarch/float). */
@@ -7953,12 +8017,14 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 				for (int i = 0; i < a->nargs; i++) {
 					char ev[96];
 					emit_expr(out, a->args[i], ex, ev, sizeof ev);
+					/* An `Iarch` element stores an `l`; a tag-only word element a `w`. */
+					const char *st = type_is_word(a->args[i]->rtype) ? "storew" : "storel";
 					if (i == 0) {
-						fprintf(out, "\tstorew %s, %%r_%s\n", ev, s->name);
+						fprintf(out, "\t%s %s, %%r_%s\n", st, ev, s->name);
 					} else {
 						int off = ex->tmp++;
 						fprintf(out, "\t%%t%d =l add %%r_%s, %d\n", off, s->name, i * 8);
-						fprintf(out, "\tstorew %s, %%t%d\n", ev, off);
+						fprintf(out, "\t%s %s, %%t%d\n", st, ev, off);
 					}
 				}
 			} else if (s->expr->kind == EX_RECORD) {
@@ -8105,8 +8171,8 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 			int addr = ex->tmp++;
 			fprintf(out, "\t%%t%d =l add %s, %%t%d\n", addr, base, off);
 			int elem = ex->tmp++;
-			fprintf(out, "\t%%t%d =w loadw %%t%d\n", elem, addr);
-			fprintf(out, "\tstorew %%t%d, %%s_%s\n", elem, s->name); /* bind the loop var */
+			fprintf(out, "\t%%t%d =l loadl %%t%d\n", elem, addr);   /* an `Iarch` element (64-bit) */
+			fprintf(out, "\tstorel %%t%d, %%s_%s\n", elem, s->name); /* bind the loop var */
 			emit_stmts(out, s->body, ex);
 			ex->loop_depth--;
 			Stmt *ftail = s->body;
@@ -8263,6 +8329,10 @@ static void emit_func(FILE *out, const Func *fn) {
 		if (param_is_word(&fn->params[i])) {
 			fprintf(out, "\t%%s_%s =l alloc4 4\n", n);
 			fprintf(out, "\tstorew %%u_%s, %%s_%s\n", n, n);
+		} else if (fn->params[i].kind == PK_WORD) {
+			/* An `Int`/`Iarch` param — the operable default, a 64-bit `l` (argc, an integer arg). */
+			fprintf(out, "\t%%s_%s =l alloc8 8\n", n);
+			fprintf(out, "\tstorel %%u_%s, %%s_%s\n", n, n);
 		} else if (fn->params[i].kind == PK_FIXED) {
 			/* A fixed-width integer param spills to its slot (`w` ≤32-bit → 4 bytes, `l`
 			 * 64-bit → 8), like a float but with `storew`/`storel`. */
