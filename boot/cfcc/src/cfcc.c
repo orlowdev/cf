@@ -1002,6 +1002,7 @@ typedef struct {
  * fork; the plain-alias fork is erased earlier by the token pre-pass. */
 typedef struct {
 	char name[64];
+	int is_pub;         /* `pub type` — exported (a grouped-params named tuple) */
 	Param fields[MAX_PARAMS];
 	int nfields;
 	int line;
@@ -1024,6 +1025,7 @@ typedef struct {
  * inline-vs-boxed field decision belongs to the M6/M9 representation gate. */
 struct DataDecl {
 	char name[64];        /* the concrete (possibly mangled, e.g. `Box.1.Int`) type name */
+	int is_pub;           /* `pub data` — exported, so another module may import the type */
 	char base_name[64];   /* the un-mangled template name (== name for a non-generic decl) */
 	char fields[MAX_FIELDS][64];
 	char field_types[MAX_FIELDS][64]; /* per-field type name: "Int", an aggregate name, a `'T`,
@@ -1065,6 +1067,7 @@ struct TupleDecl {
  * these specific bytes, the uniform-8 slotting, or the 0..n-by-order tags. */
 struct UnionDecl {
 	char name[64];        /* the concrete (possibly mangled, e.g. `Maybe.1.Int`) type name */
+	int is_pub;           /* `pub union` — exported, so another module may import the type */
 	char base_name[64];   /* the un-mangled template name (== name for a non-generic decl);
 	                       * a match arm qualifies members by this (`Maybe.Just`, not the mangle) */
 	char typarams[MAX_TYPARAMS][64]; /* generic type parameters; ntyparams > 0 = a TEMPLATE */
@@ -1347,11 +1350,11 @@ struct Program {
 #define MAX_IMPORT_NAMES 64
 
 /* One `import "path" as …` at a module's top level (ebnf § Imports). This slice
- * (the flatten-and-mangle tracer bullet) supports only the DESTRUCTURED value form
- * — `import "m" as { foo, bar }`, binding named `pub` value functions of module
- * `m` straight into scope. The namespace forms (`as mem`, `as Math`) and `pub
- * import` reexports parse to a clear "not yet" error; types, transitive imports,
- * and the `std/` root land in later slices. */
+ * supports the DESTRUCTURED form — `import "m" as { foo, Point }`, binding named
+ * `pub` functions and non-generic record/union/group TYPES of module `m` straight
+ * into scope. The namespace forms (`as mem`, `as Math`) and `pub import` reexports
+ * parse to a clear "not yet" error; cross-module generics, transitive imports, and
+ * the `std/` root land in later slices. */
 typedef struct {
 	char path[256];   /* the import string as written, e.g. "mem" or "sub/util" (no `.cf`) */
 	char prefix[128]; /* module mangling prefix: `path` with each non-ident char → '_', plus a
@@ -4399,6 +4402,9 @@ static void check_tyvars_declared(const char *mangled, char typarams[][64], int 
  * interior newlines — all later increments), with at least one field so the record is
  * never zero-sized. A field is an `Int` or an aggregate (record/union) type (G3a). */
 static DataDecl *parse_data_decl(Parser *p, Program *prog) {
+	int is_pub = is_ident(peek(p), "pub");
+	if (is_pub)
+		advance(p); /* `pub` */
 	advance(p); /* `data` */
 	Token *nm = peek(p);
 	if (!is_type_ident(nm))
@@ -4407,6 +4413,7 @@ static DataDecl *parse_data_decl(Parser *p, Program *prog) {
 		die(nm->line, "M0 does not support `!` in a type name");
 	DataDecl *d = xmalloc(sizeof *d);
 	memset(d, 0, sizeof *d);
+	d->is_pub = is_pub;
 	tok_copy(nm, d->name, sizeof d->name);
 	snprintf(d->base_name, sizeof d->base_name, "%s", d->name);
 	advance(p);
@@ -4508,6 +4515,9 @@ static DataDecl *parse_data_decl(Parser *p, Program *prog) {
  * compose-over members (a bare member naming an existing type) stay later bricks — each
  * rejected with a clear message. */
 static UnionDecl *parse_union_decl(Parser *p, Program *prog) {
+	int is_pub = is_ident(peek(p), "pub");
+	if (is_pub)
+		advance(p); /* `pub` */
 	advance(p); /* `union` */
 	Token *nm = peek(p);
 	if (!is_type_ident(nm))
@@ -4516,6 +4526,7 @@ static UnionDecl *parse_union_decl(Parser *p, Program *prog) {
 		die(nm->line, "M0 does not support `!` in a type name");
 	UnionDecl *u = xmalloc(sizeof *u);
 	memset(u, 0, sizeof *u);
+	u->is_pub = is_pub;
 	tok_copy(nm, u->name, sizeof u->name);
 	snprintf(u->base_name, sizeof u->base_name, "%s", u->name);
 	advance(p);
@@ -4675,12 +4686,16 @@ static UnionDecl *parse_union_decl(Parser *p, Program *prog) {
  * list is grammatically optional (a zero-field splat); the group must be declared textually
  * before use (cfcc is order-dependent; cf0 resolves order-independently). */
 static ParamGroup *parse_type_decl(Parser *p, Program *prog) {
+	int is_pub = is_ident(peek(p), "pub");
+	if (is_pub)
+		advance(p); /* `pub` */
 	expect_ident(p, "type");
 	Token *nm = peek(p);
 	if (!is_type_ident(nm))
 		die(nm->line, "expected a type name after `type`");
 	ParamGroup *g = xmalloc(sizeof *g);
 	g->nfields = 0;
+	g->is_pub = is_pub;
 	tok_copy(nm, g->name, sizeof g->name);
 	g->line = nm->line;
 	advance(p);
@@ -4722,15 +4737,19 @@ static ParamGroup *parse_type_decl(Parser *p, Program *prog) {
 /* --------------------------------------------------------- flatten/mangle - */
 
 /* A name-substitution map applied while flattening modules into one program. Each
- * entry rewrites a bare value reference `from` → `to`. It serves two steps of the
- * flatten (see flatten_imports): prefix-mangling a module's own top-level names so
- * they cannot collide with another module's private ones, and rewriting an
- * importer's destructured aliases to those mangled targets.
+ * entry rewrites a reference `from` → `to`. It serves two steps of the flatten (see
+ * flatten_imports): prefix-mangling a module's own top-level names so they cannot
+ * collide with another module's private ones, and rewriting an importer's
+ * destructured aliases to those mangled targets. Both VALUE names (functions,
+ * EX_VAR/EX_CALL) and TYPE names (records, unions, groups, and every type-name
+ * annotation) are rewritten — value and type names never collide because the casing
+ * rule keeps them disjoint (snake_case values, PascalCase types), so one flat map is
+ * safe.
  *
- * ⚠ THROWAWAY: the rewrite is purely textual over EX_VAR/EX_CALL names — it has no
- * notion of lexical scope, so a *local* binding that happens to share a name with a
- * mapped top-level symbol would be rewritten too. cfcc's own inputs simply avoid
- * that shadow; the real flatten arc resolves names with scope and never inherits it. */
+ * ⚠ THROWAWAY: the rewrite is purely textual — it has no notion of lexical scope, so
+ * a *local* binding that happens to share a name with a mapped top-level symbol would
+ * be rewritten too. cfcc's own inputs simply avoid that shadow; the real flatten arc
+ * resolves names with scope and never inherits it. */
 typedef struct {
 	char from[64];
 	char to[64];
@@ -4747,7 +4766,8 @@ static const char *rename_lookup(const Renames *r, const char *name) {
 	return NULL;
 }
 
-/* Rewrite a name buffer in place if it is mapped; `cap` guards the copy. */
+/* Rewrite a VALUE-name buffer (a function name, an EX_VAR/EX_CALL reference) in place
+ * if it is mapped; `cap` guards the copy. */
 static void rename_apply(const Renames *r, char *name, size_t cap) {
 	const char *to = rename_lookup(r, name);
 	if (!to)
@@ -4757,16 +4777,41 @@ static void rename_apply(const Renames *r, char *name, size_t cap) {
 	snprintf(name, cap, "%s", to);
 }
 
+/* Rewrite a TYPE-name buffer in place. A type annotation may carry a leading `*` for an
+ * explicit pointer (`*List` in a field/payload/local); the `*` is preserved and the
+ * base name mapped, so `*List` under module `m` becomes `*m_List`. */
+static void rename_type(const Renames *r, char *name, size_t cap) {
+	if (name[0] == '\0')
+		return;
+	int star = name[0] == '*';
+	const char *to = rename_lookup(r, star ? name + 1 : name);
+	if (!to)
+		return;
+	char buf[128];
+	int w = snprintf(buf, sizeof buf, "%s%s", star ? "*" : "", to);
+	if (w < 0 || (size_t)w >= cap)
+		die(0, "mangled type name too long");
+	snprintf(name, cap, "%s", buf);
+}
+
 static void rename_stmt(const Renames *r, Stmt *s); /* forward */
 
-/* Walk an expression, rewriting the name of every value reference (an EX_VAR read or
- * an EX_CALL callee). Type-name references — record/union names, match qualifiers —
- * are left alone: this slice moves only value functions across module boundaries. */
+/* Walk an expression, rewriting value references (EX_VAR read, EX_CALL callee) and the
+ * type names an expression can carry (a record-literal / cast target, a union member
+ * qualifier `Union.Member`, a match arm's union qualifier, explicit call type-args). */
 static void rename_expr(const Renames *r, Expr *e) {
 	if (!e)
 		return;
 	if (e->kind == EX_VAR || e->kind == EX_CALL)
 		rename_apply(r, e->name, sizeof e->name);
+	else if (e->kind == EX_RECORD || e->kind == EX_CAST || e->kind == EX_UMEMBER)
+		rename_type(r, e->name, sizeof e->name);
+	for (int i = 0; i < e->ntypeargs; i++)
+		rename_type(r, e->typeargs[i], sizeof e->typeargs[i]);
+	for (int i = 0; i < e->narms; i++) {
+		rename_type(r, e->arms[i].qual, sizeof e->arms[i].qual);
+		rename_expr(r, e->arms[i].body);
+	}
 	rename_expr(r, e->lhs);
 	rename_expr(r, e->rhs);
 	rename_expr(r, e->els);
@@ -4775,29 +4820,76 @@ static void rename_expr(const Renames *r, Expr *e) {
 		rename_expr(r, e->args[i]);
 	for (int i = 0; i < e->nfields; i++)
 		rename_expr(r, e->fvals[i]);
-	for (int i = 0; i < e->narms; i++)
-		rename_expr(r, e->arms[i].body);
 	rename_stmt(r, e->loop_body);
 }
 
 static void rename_stmt(const Renames *r, Stmt *s) {
 	for (; s; s = s->next) {
+		rename_type(r, s->type_name, sizeof s->type_name); /* ST_LOCAL record/union annotation */
 		rename_expr(r, s->expr);
 		rename_expr(r, s->yval);
 		rename_stmt(r, s->body);
 	}
 }
 
-/* Rewrite a function's own name and every value reference in its body. Signature
- * type names are untouched (values-only slice). */
+/* Rewrite the type names a parameter carries — its own type, a tuple param's element
+ * types, and a function-type param's component/return descriptors (recursively). */
+static void rename_param(const Renames *r, Param *p) {
+	rename_type(r, p->type_name, sizeof p->type_name);
+	for (int i = 0; i < p->tuple_n; i++)
+		rename_type(r, p->tuple_types[i], sizeof p->tuple_types[i]);
+	for (int i = 0; i < p->fn_arity; i++)
+		rename_param(r, &p->fn_ptypes[i]);
+	if (p->fn_ret)
+		rename_param(r, p->fn_ret);
+}
+
+/* Rewrite a function's own name, its signature type names (params, return, generic
+ * bounds), and every reference in its body. */
 static void rename_func(const Renames *r, Func *f) {
 	rename_apply(r, f->name, sizeof f->name);
+	for (int i = 0; i < f->nparams; i++)
+		rename_param(r, &f->params[i]);
+	rename_type(r, f->ret_type_name, sizeof f->ret_type_name);
+	for (int i = 0; i < f->ret_tuple_n; i++)
+		rename_type(r, f->ret_tuple_types[i], sizeof f->ret_tuple_types[i]);
+	for (int i = 0; i < f->ntyparams; i++)
+		rename_type(r, f->bounds[i], sizeof f->bounds[i]);
 	rename_stmt(r, f->body);
+}
+
+/* Rewrite a `data` record's name and field type names. */
+static void rename_data(const Renames *r, DataDecl *d) {
+	rename_apply(r, d->name, sizeof d->name);
+	rename_apply(r, d->base_name, sizeof d->base_name);
+	for (int i = 0; i < d->nfields; i++)
+		rename_type(r, d->field_types[i], sizeof d->field_types[i]);
+	for (int i = 0; i < d->ntyparams; i++)
+		rename_type(r, d->bounds[i], sizeof d->bounds[i]);
+}
+
+/* Rewrite a `union`'s name and every member payload's type names (member names stay —
+ * they live in the union's own namespace, reached as `Union.Member`). */
+static void rename_union(const Renames *r, UnionDecl *u) {
+	rename_apply(r, u->name, sizeof u->name);
+	rename_apply(r, u->base_name, sizeof u->base_name);
+	for (int i = 0; i < u->nmembers; i++)
+		for (int j = 0; j < u->arity[i]; j++)
+			rename_type(r, u->payload_types[i][j], sizeof u->payload_types[i][j]);
+	for (int i = 0; i < u->ntyparams; i++)
+		rename_type(r, u->bounds[i], sizeof u->bounds[i]);
+}
+
+/* Rewrite a grouped-params `type`'s name and its field (param) type names. */
+static void rename_group(const Renames *r, ParamGroup *g) {
+	rename_apply(r, g->name, sizeof g->name);
+	for (int i = 0; i < g->nfields; i++)
+		rename_param(r, &g->fields[i]);
 }
 
 /* import_decl = [ "pub" ] "import" string "as" import_alias   (ebnf § Imports).
  * Parses one import into an `Import`. Only the destructured value form
- * (`as { foo, bar }`) is honoured in this slice; the namespace forms and `pub
+ * (`as { foo, Point }`) is honoured in this slice; the namespace forms and `pub
  * import` reexports parse far enough to raise a clear "not supported yet". */
 static Import parse_import(Parser *p) {
 	Import im = {0};
@@ -4829,8 +4921,6 @@ static Import parse_import(Parser *p) {
 			Token *n = peek(p);
 			if (n->kind != TK_IDENT)
 				die(n->line, "expected an imported name inside `{ … }`");
-			if (is_type_ident(n))
-				die(n->line, "importing a type is not supported yet (values only)");
 			if (im.nnames >= MAX_IMPORT_NAMES)
 				die(n->line, "too many imported names");
 			tok_copy(n, im.names[im.nnames++], sizeof im.names[0]);
@@ -4875,16 +4965,18 @@ static void parse(Parser *p, Program *prog, Import *imps, int *nimps) {
 	p->prog = prog; /* so a closure binding can append its lifted top-level function */
 	skip_newlines(p);
 	while (peek(p)->kind != TK_EOF) {
-		if (is_ident(peek(p), "import") ||
-		    (is_ident(peek(p), "pub") && is_ident(&p->toks[p->pos + 1], "import"))) {
+		/* A `pub` may prefix any declaration (and a `pub import` reexport), so route on the
+		 * keyword AFTER an optional leading `pub`. */
+		Token *kw = is_ident(peek(p), "pub") ? &p->toks[p->pos + 1] : peek(p);
+		if (is_ident(kw, "import")) {
 			if (*nimps >= MAX_IMPORTS)
 				die(peek(p)->line, "too many imports");
 			imps[(*nimps)++] = parse_import(p);
-		} else if (is_ident(peek(p), "data"))
+		} else if (is_ident(kw, "data"))
 			prog_add_data(prog, parse_data_decl(p, prog));
-		else if (is_ident(peek(p), "union"))
+		else if (is_ident(kw, "union"))
 			prog_add_union(prog, parse_union_decl(p, prog));
-		else if (is_ident(peek(p), "type"))
+		else if (is_ident(kw, "type"))
 			prog_add_group(prog, parse_type_decl(p, prog));
 		else
 			prog_add_func(prog, parse_func(p, prog));
@@ -9195,17 +9287,40 @@ static void parse_source_file(const char *path, Program *prog, Import *imps, int
 	g_path = saved;
 }
 
+/* The `pub`-ness of a top-level name across all four declaration namespaces (function,
+ * data, union, grouped-type). Returns 1/0 for a found decl, or -1 if the name is not
+ * declared at all. */
+static int decl_pubness(Program *prog, const char *name) {
+	Func *f = prog_find_func(prog, name);
+	if (f)
+		return f->is_pub;
+	DataDecl *d = prog_find_data(prog, name);
+	if (d)
+		return d->is_pub;
+	UnionDecl *u = prog_find_union(prog, name);
+	if (u)
+		return u->is_pub;
+	ParamGroup *g = prog_find_group(prog, name);
+	if (g)
+		return g->is_pub;
+	return -1;
+}
+
 /* Flatten every module imported by the main file into `prog` — the `resolved` arc
  * (order_of_compilation §Resolve & flatten), in the reduced form this slice covers:
- * single-level, destructured, value functions only.
+ * single-level, destructured, non-generic value functions and record/union/group types.
  *
- * `prog` already holds the main file's declarations (funcs [0, main_end)). For each
- * import we: resolve its path to a sibling `.cf`; parse it in; prefix-mangle its own
- * top-level names so two modules' privates never collide; and record each requested
- * `pub` function's mangled target under the name the importer bound it to. Finally we
- * rewrite the main file's references through those aliases. */
+ * `prog` already holds the main file's declarations. For each import we: resolve its
+ * path to a sibling `.cf`; parse it in isolation; prefix-mangle its own top-level names
+ * (values AND types) so two modules' privates never collide; splice its declarations
+ * into the whole program; and record each requested `pub` name's mangled target under
+ * the name the importer bound it to. Finally we rewrite the main file's declarations
+ * through those aliases. */
 static void flatten_imports(const char *main_path, Program *prog, Import *imps, int nimps) {
-	int main_end = prog->nfuncs; /* everything past here belongs to an imported module */
+	/* The main file's own declarations occupy the leading slots of each namespace;
+	 * everything appended past these belongs to an imported module. */
+	int main_funcs = prog->nfuncs, main_datas = prog->ndatas,
+	    main_unions = prog->nunions, main_groups = prog->ngroups;
 
 	/* The main file's directory — sibling module paths resolve against it. */
 	char dir[4096];
@@ -9218,7 +9333,7 @@ static void flatten_imports(const char *main_path, Program *prog, Import *imps, 
 		dir[0] = '\0';   /* main file is in the cwd */
 
 	/* The importer-scope alias map, accumulated across every import: each destructured
-	 * name → its mangled target. Applied to the main file's bodies at the end. */
+	 * name → its mangled target. Applied to the main file's declarations at the end. */
 	Rename *aliases = NULL;
 	int naliases = 0;
 
@@ -9241,7 +9356,7 @@ static void flatten_imports(const char *main_path, Program *prog, Import *imps, 
 
 			/* Parse the module in ISOLATION (its own Program), so its top-level names cannot
 			 * collide with the main file's — or another module's — before mangling separates
-			 * them. Two modules' private `helper`s must coexist; that is the point. */
+			 * them. Two modules' private `helper`s (or `Point`s) must coexist; that is the point. */
 			Program mod = {0};
 			Import modimps[MAX_IMPORTS];
 			int nmodimps = 0;
@@ -9249,39 +9364,54 @@ static void flatten_imports(const char *main_path, Program *prog, Import *imps, 
 
 			if (nmodimps > 0)
 				die(im->line, "an imported module that itself imports is not supported yet");
-			if (mod.ndatas > 0 || mod.nunions > 0 || mod.ngroups > 0)
-				die(im->line, "importing a module that declares types is not supported yet (values only)");
+			for (int i = 0; i < mod.ndatas; i++)
+				if (mod.datas[i]->ntyparams > 0)
+					die(im->line, "importing a module with generic types is not supported yet");
+			for (int i = 0; i < mod.nunions; i++)
+				if (mod.unions[i]->ntyparams > 0)
+					die(im->line, "importing a module with generic types is not supported yet");
 
-			/* Prefix-mangle every one of the module's top-level names, then splice the
-			 * functions into the whole program — the prefix makes them globally unique. */
-			Rename *mr = xmalloc((mod.nfuncs ? mod.nfuncs : 1) * sizeof *mr);
-			for (int i = 0; i < mod.nfuncs; i++) {
-				snprintf(mr[i].from, sizeof mr[i].from, "%s", mod.funcs[i]->name);
-				int wrote = snprintf(mr[i].to, sizeof mr[i].to, "%s%s", im->prefix, mod.funcs[i]->name);
+			/* Build the module's prefix-mangling map from EVERY one of its top-level names —
+			 * functions and types alike — capturing the originals before any rename runs (a
+			 * decl's own field/return type may reference a sibling decl, so the whole map must
+			 * exist first). Then rename each declaration and splice it into the program. */
+			int total = mod.nfuncs + mod.ndatas + mod.nunions + mod.ngroups;
+			Rename *mr = xmalloc((total ? total : 1) * sizeof *mr);
+			int m = 0;
+			for (int i = 0; i < mod.nfuncs; i++)
+				snprintf(mr[m++].from, sizeof mr[0].from, "%s", mod.funcs[i]->name);
+			for (int i = 0; i < mod.ndatas; i++)
+				snprintf(mr[m++].from, sizeof mr[0].from, "%s", mod.datas[i]->name);
+			for (int i = 0; i < mod.nunions; i++)
+				snprintf(mr[m++].from, sizeof mr[0].from, "%s", mod.unions[i]->name);
+			for (int i = 0; i < mod.ngroups; i++)
+				snprintf(mr[m++].from, sizeof mr[0].from, "%s", mod.groups[i]->name);
+			for (int i = 0; i < m; i++) {
+				int wrote = snprintf(mr[i].to, sizeof mr[i].to, "%s%s", im->prefix, mr[i].from);
 				if (wrote < 0 || (size_t)wrote >= sizeof mr[i].to)
 					die(im->line, "mangled module name too long");
 			}
-			Renames R = {mr, mod.nfuncs};
-			for (int i = 0; i < mod.nfuncs; i++) {
-				rename_func(&R, mod.funcs[i]);
-				prog_add_func(prog, mod.funcs[i]);
-			}
+			Renames R = {mr, m};
+			for (int i = 0; i < mod.nfuncs; i++)  { rename_func(&R, mod.funcs[i]);   prog_add_func(prog, mod.funcs[i]); }
+			for (int i = 0; i < mod.ndatas; i++)  { rename_data(&R, mod.datas[i]);   prog_add_data(prog, mod.datas[i]); }
+			for (int i = 0; i < mod.nunions; i++) { rename_union(&R, mod.unions[i]); prog_add_union(prog, mod.unions[i]); }
+			for (int i = 0; i < mod.ngroups; i++) { rename_group(&R, mod.groups[i]); prog_add_group(prog, mod.groups[i]); }
 			free(mr);
 
 			snprintf(loaded[nloaded++], sizeof loaded[0], "%s", im->prefix);
 		}
 
-		/* Bind each requested name to its mangled target — which must be an exported
-		 * (`pub`) function of the module. The mangled target is simply prefix + name. */
+		/* Bind each requested name to its mangled target — an exported (`pub`) function OR
+		 * type of the module. The mangled target is simply prefix + name. */
 		for (int j = 0; j < im->nnames; j++) {
 			char target[128];
 			int wrote = snprintf(target, sizeof target, "%s%s", im->prefix, im->names[j]);
 			if (wrote < 0 || (size_t)wrote >= sizeof target)
 				die(im->line, "mangled name too long");
-			Func *tf = prog_find_func(prog, target);
-			if (!tf)
+			int pub = decl_pubness(prog, target);
+			if (pub < 0)
 				die(im->line, "the module exports no such name (unknown import)");
-			if (!tf->is_pub)
+			if (!pub)
 				die(im->line, "imported name is not exported (`pub`) by the module");
 			for (int a = 0; a < naliases; a++)
 				if (strcmp(aliases[a].from, im->names[j]) == 0)
@@ -9297,15 +9427,22 @@ static void flatten_imports(const char *main_path, Program *prog, Import *imps, 
 
 	/* A local top-level name must not clash with an imported one — the textual rewrite
 	 * cannot tell them apart, so reject the ambiguity outright. */
-	for (int a = 0; a < naliases; a++)
-		for (int i = 0; i < main_end; i++)
-			if (strcmp(prog->funcs[i]->name, aliases[a].from) == 0)
-				die(0, "a name is both imported and defined at the top level");
+	for (int a = 0; a < naliases; a++) {
+		int clash = 0;
+		for (int i = 0; i < main_funcs; i++)  clash |= strcmp(prog->funcs[i]->name, aliases[a].from) == 0;
+		for (int i = 0; i < main_datas; i++)  clash |= strcmp(prog->datas[i]->name, aliases[a].from) == 0;
+		for (int i = 0; i < main_unions; i++) clash |= strcmp(prog->unions[i]->name, aliases[a].from) == 0;
+		for (int i = 0; i < main_groups; i++) clash |= strcmp(prog->groups[i]->name, aliases[a].from) == 0;
+		if (clash)
+			die(0, "a name is both imported and defined at the top level");
+	}
 
-	/* Resolve the importer's references to the mangled targets. */
+	/* Resolve the importer's references (in every main-file declaration) to the targets. */
 	Renames AM = {aliases, naliases};
-	for (int i = 0; i < main_end; i++)
-		rename_func(&AM, prog->funcs[i]);
+	for (int i = 0; i < main_funcs; i++)  rename_func(&AM, prog->funcs[i]);
+	for (int i = 0; i < main_datas; i++)  rename_data(&AM, prog->datas[i]);
+	for (int i = 0; i < main_unions; i++) rename_union(&AM, prog->unions[i]);
+	for (int i = 0; i < main_groups; i++) rename_group(&AM, prog->groups[i]);
 	free(aliases);
 }
 
