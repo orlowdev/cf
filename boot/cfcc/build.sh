@@ -18,7 +18,11 @@ if [ ! -x "$qbe" ]; then
 fi
 
 mkdir -p "$root/var"
-cc -std=c11 -O2 -Wall -Wextra \
+# -Wno-missing-field-initializers: the `Type`/`Param` structs are built with positional
+# initializers that intentionally omit trailing fields (e.g. the fixed-width `bits`/`is_signed`,
+# meaningful only for TY_FIXED); C zero-fills the rest, which is exactly what we want, so this
+# -Wextra sub-warning is pure noise here (it never flags uninitialized memory).
+cc -std=c11 -O2 -Wall -Wextra -Wno-missing-field-initializers \
 	-DCF_QBE="\"$qbe\"" \
 	-o "$out" \
 	"$root/boot/cfcc/src/cfcc.c"

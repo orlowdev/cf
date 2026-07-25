@@ -610,6 +610,21 @@ typedef enum {
 	            * load/store/register path, 4-byte slot). A float LITERAL is Float64, so a
 	            * Float32 value comes from an explicit `Float32(…)` cast (of a float or an int).
 	            * Same THROWAWAY narrowings as TY_F64. */
+	TY_FIXED,  /* a fixed-width integer scalar — Int8/16/32/64 (signed) or Uint8/16/32/64
+	            * (unsigned), type_system §2. `bits` ∈ {8,16,32,64} + `is_signed` name the exact
+	            * leaf. A ≤32-bit value lives in a QBE `w`, a 64-bit one in an `l` (see qtype_of);
+	            * every producer keeps the value CANONICAL (sign/zero-extended to its width) so the
+	            * plain `w`/`l` register holds a well-formed value. cfcc has these as
+	            * locals/params/returns/arguments/cast operands and if/match/loop branch values.
+	            * ⚠ THROWAWAY narrowings (cf0 takes the full tower; all SUBSET-safe — cfcc rejects
+	            * more, never mis-lowers): (1) fixed-width ARITHMETIC/comparison is a later brick
+	            * (sub-word wrap canonicalization) — cast to `Int` to compute; (2) not yet an
+	            * aggregate field/payload/tuple/array element (like floats); (3) `Int` (a word) and
+	            * `Uarch` stay their own distinct kinds, not folded into TY_FIXED; (4) a literal
+	            * ADOPTS a fixed width (range-checked, §3) ONLY at a `const`/`let` binding, and only
+	            * a NON-NEGATIVE literal — cf0 adopts at every context (arg/return/branch) and for
+	            * negatives too (`const Int32 x = -5`); everywhere else here a bare literal stays
+	            * `Int` and needs an explicit `IntN(...)` cast. */
 	TY_UNIT,   /* `Unit` / `()` — the zero-element tuple, the terminal type `1` (type_system §2.3,
 	            * §6.1). It carries no information, so cfcc lowers its sole value to a word `0`
 	            * (type_is_word ⇒ it rides every word slot/store/return path); it stays a DISTINCT
@@ -624,6 +639,8 @@ typedef struct {
 	UnionDecl *uni; /* TY_UNION: the union's declaration */
 	int alen;       /* TY_ARRAY: the comptime element count N (elements are Int) */
 	TupleDecl *tup; /* TY_TUPLE: the (interned) tuple shape */
+	int bits;       /* TY_FIXED: width in bits (8/16/32/64) */
+	int is_signed;  /* TY_FIXED: 1 = signed (IntN), 0 = unsigned (UintN) */
 } Type;
 
 /* The entry ABI kinds an M0 `main` parameter can take: a word (Int, e.g. argc)
@@ -659,6 +676,9 @@ typedef enum {
 	            * so it arrives as a word `0` and spills to a word slot like an Int (type TY_UNIT). */
 	PK_F64,    /* Float64 -> d (an IEEE double passed in a float register; see TY_F64). */
 	PK_F32,    /* Float32 -> s (an IEEE single passed in a float register; see TY_F32). */
+	PK_FIXED,  /* a fixed-width integer param — IntN/UintN (see TY_FIXED). Its `bits`+`is_signed`
+	            * pick the register (`w` for ≤32, `l` for 64) and spill width. Passed like a word
+	            * or a long by width; the incoming value is canonical. */
 } ParamKind;
 
 typedef struct Param {
@@ -684,6 +704,8 @@ typedef struct Param {
 	char (*tuple_types)[64];
 	int tuple_n;
 	TupleDecl *tup;
+	int bits;      /* PK_FIXED: width in bits (8/16/32/64) */
+	int is_signed; /* PK_FIXED: 1 = signed (IntN), 0 = unsigned (UintN) */
 } Param;
 
 /* Expression AST. M0 expressions are word-valued: literals, references to a
@@ -1052,6 +1074,53 @@ static int param_is_word(const Param *p) {
 /* True if a type is a floating-point scalar (Float32/Float64). */
 static int is_float_type(Type t) { return t.kind == TY_F32 || t.kind == TY_F64; }
 
+/* True if a type is a fixed-width integer leaf (IntN/UintN — see TY_FIXED). */
+static int is_fixed_type(Type t) { return t.kind == TY_FIXED; }
+
+/* Build a fixed-width integer Type from its width and signedness. */
+static Type mk_fixed(int bits, int is_signed) {
+	Type t = {TY_FIXED, NULL, NULL, 0, NULL, bits, is_signed};
+	return t;
+}
+
+/* If `name` is a fixed-width integer type name (Int8/16/32/64, Uint8/16/32/64), fill the
+ * `bits` and `is_signed` out-params and return 1; else return 0. The bare `Int`/`Uint`
+ * UNIONS are not leaves (cfcc has no numeric unions), so they are not matched here. */
+static int fixed_name_bits_signed(const char *name, int *bits, int *is_signed) {
+	static const struct { const char *n; int b, s; } tbl[] = {
+		{"Int8", 8, 1}, {"Int16", 16, 1}, {"Int32", 32, 1}, {"Int64", 64, 1},
+		{"Uint8", 8, 0}, {"Uint16", 16, 0}, {"Uint32", 32, 0}, {"Uint64", 64, 0},
+	};
+	for (size_t i = 0; i < sizeof tbl / sizeof tbl[0]; i++)
+		if (strcmp(name, tbl[i].n) == 0) {
+			*bits = tbl[i].b;
+			*is_signed = tbl[i].s;
+			return 1;
+		}
+	return 0;
+}
+
+static int is_fixed_type_name(const char *name) {
+	int b, s;
+	return fixed_name_bits_signed(name, &b, &s);
+}
+
+/* Integer-scalar helpers spanning Int (a 32-bit signed word), Uarch (a 64-bit unsigned
+ * long), and the fixed-width leaves — the operands a numeric CAST works over. */
+static int is_int_scalar(Type t) { return t.kind == TY_INT || t.kind == TY_UARCH || t.kind == TY_FIXED; }
+static int int_scalar_bits(Type t) { return t.kind == TY_INT ? 32 : t.kind == TY_UARCH ? 64 : t.bits; }
+static int int_scalar_signed(Type t) { return t.kind == TY_INT ? 1 : t.kind == TY_UARCH ? 0 : t.is_signed; }
+
+/* True if a NON-NEGATIVE integer literal `v` (the lexer caps literals at INT32_MAX, so `v`
+ * is 0..2^31-1) fits a fixed-width type — the §3 literal range check at adoption. A signed
+ * N-bit type holds 0..2^(N-1)-1 of a non-negative value; an unsigned one holds 0..2^N-1. */
+static int literal_fits_fixed(long v, int bits, int is_signed) {
+	if (bits >= 32) /* 32/64-bit: any lexer literal (≤ 2^31-1) fits both signed and unsigned */
+		return 1;
+	long max = is_signed ? (1L << (bits - 1)) - 1 : (1L << bits) - 1;
+	return v <= max;
+}
+
 /* The QBE base type of a scalar value: `d`/`s` for a Float64/Float32, `w` for a word
  * (Int/tag-only union/unit), `l` for everything else (a pointer/Uarch/aggregate reference).
  * Used to pick a value's register, load/store (`load%c`/`store%c`), and constant syntax. */
@@ -1060,6 +1129,8 @@ static char qtype_of(Type t) {
 		return 'd';
 	if (t.kind == TY_F32)
 		return 's';
+	if (t.kind == TY_FIXED) /* ≤32-bit fixed int in a `w`, 64-bit in an `l` */
+		return t.bits <= 32 ? 'w' : 'l';
 	return type_is_word(t) ? 'w' : 'l';
 }
 static char param_qtype(const Param *p) {
@@ -1067,6 +1138,8 @@ static char param_qtype(const Param *p) {
 		return 'd';
 	if (p->kind == PK_F32)
 		return 's';
+	if (p->kind == PK_FIXED)
+		return p->bits <= 32 ? 'w' : 'l';
 	return param_is_word(p) ? 'w' : 'l';
 }
 
@@ -1075,7 +1148,7 @@ static char param_qtype(const Param *p) {
  * if/match/loop yielding an aggregate (a record/tuple/boxed-union pointer, a Str) is a
  * later brick — those carry value semantics the plain merge slot doesn't model. */
 static int is_mergeable_scalar(Type t) {
-	return type_is_word(t) || t.kind == TY_UARCH || is_float_type(t);
+	return type_is_word(t) || t.kind == TY_UARCH || is_float_type(t) || is_fixed_type(t);
 }
 
 /* A type-appropriate zero literal for a `store%c` of qtype `q`. A float slot needs the
@@ -1195,6 +1268,7 @@ static int types_equal(Type a, Type b) {
 	case TY_RECORD: return a.rec == b.rec;
 	case TY_UNION:  return a.uni == b.uni;
 	case TY_ARRAY:  return a.alen == b.alen;
+	case TY_FIXED:  return a.bits == b.bits && a.is_signed == b.is_signed;
 	case TY_TUPLE:
 		if (a.tup == b.tup)
 			return 1;
@@ -1506,6 +1580,8 @@ static Type resolve_member_type(Program *prog, const char *name, int line) {
 		n++;
 		return (Type){TY_TUPLE, NULL, NULL, 0, resolve_tuple_shape(prog, names, n, line)};
 	}
+	if (is_fixed_type_name(name)) /* a fixed-width integer field/payload is a later brick (like floats) */
+		die(line, "a fixed-width integer field/payload is a later brick (M1 aggregate members are `Int` or an aggregate type)");
 	UnionDecl *u = prog_find_union(prog, name);
 	if (u)
 		return (Type){TY_UNION, NULL, u, 0, NULL};
@@ -1567,6 +1643,8 @@ static Resolution resolve_name(Func *fn, const char *name, Type *ty) {
 		if (strcmp(fn->params[i].name, name) == 0) {
 			ty->uni = NULL;
 			ty->tup = NULL;
+			ty->bits = 0;
+			ty->is_signed = 0;
 			switch (fn->params[i].kind) {
 			case PK_WORD:    ty->kind = TY_INT;    ty->rec = NULL; break;
 			case PK_RECORD: /* is_ptr → an explicit `*Record` pointer (TY_PTR to the pointee) */
@@ -1588,6 +1666,8 @@ static Resolution resolve_name(Func *fn, const char *name, Type *ty) {
 			case PK_UNIT:    ty->kind = TY_UNIT;  ty->rec = NULL; break; /* the unit value, a word `0` */
 			case PK_F64:     ty->kind = TY_F64;   ty->rec = NULL; break; /* Float64 -> d */
 			case PK_F32:     ty->kind = TY_F32;   ty->rec = NULL; break; /* Float32 -> s */
+			case PK_FIXED:   ty->kind = TY_FIXED; ty->rec = NULL; /* IntN/UintN */
+			                 ty->bits = fn->params[i].bits; ty->is_signed = fn->params[i].is_signed; break;
 			}
 			return R_PARAM;
 		}
@@ -1715,6 +1795,19 @@ static void tok_copy(Token *t, char *buf, size_t cap) {
 	buf[t->len] = '\0';
 }
 
+/* A token's text as a NUL-terminated string in a rotating static buffer — for a
+ * transient `strcmp`/predicate check (the result must be used before the next call).
+ * A few buffers rotate so a couple of live uses in one expression stay valid. */
+static const char *tok_str(Token *t) {
+	static char bufs[4][64];
+	static int which = 0;
+	char *b = bufs[which++ & 3];
+	int n = t->len < 63 ? t->len : 63;
+	memcpy(b, t->text, n);
+	b[n] = '\0';
+	return b;
+}
+
 /* True if an identifier names a type (PascalCase — leading uppercase). */
 static int is_type_ident(Token *t) {
 	return t->kind == TK_IDENT && t->len > 0 && t->text[0] >= 'A' && t->text[0] <= 'Z';
@@ -1731,7 +1824,7 @@ static int is_tyvar(Token *t) {
  * does not implement — so it is rejected rather than minted as a fresh nullary tag. */
 static int is_builtin_type_name(const char *name) {
 	return strcmp(name, "Int") == 0 || strcmp(name, "Uarch") == 0 ||
-	       strcmp(name, "Str") == 0 || strcmp(name, "Uint8") == 0;
+	       strcmp(name, "Str") == 0 || is_fixed_type_name(name);
 }
 
 /* The scalar type names — a pointer must NOT point to one (type_system §6.4, no `*Scalar`). */
@@ -1929,6 +2022,18 @@ static void parse_param_type(Parser *p, Param *out) {
 		advance(p);
 		out->kind = PK_F32;
 		return;
+	}
+	if (t->kind == TK_IDENT) {
+		char nm[64];
+		tok_copy(t, nm, sizeof nm);
+		int bits, sgn;
+		if (fixed_name_bits_signed(nm, &bits, &sgn)) { /* IntN/UintN — a fixed-width integer param */
+			advance(p);
+			out->kind = PK_FIXED;
+			out->bits = bits;
+			out->is_signed = sgn;
+			return;
+		}
 	}
 	if (is_ident(t, "Unit")) { /* `Unit name` — the unit parameter (a word `0`); `()` below is the same */
 		advance(p);
@@ -2332,12 +2437,14 @@ static Expr *parse_primary(Parser *p, Func *fn) {
 		 * <Uarch>`, via expect_int), forcing this explicit cast; type_system §4 instead treats
 		 * `const T x = v` as sugar for `const x = T(v)` and WARNS rather than forbids — cf0
 		 * should warn, not reject. */
+		char castnm[64];
+		tok_copy(t, castnm, sizeof castnm);
 		if ((is_ident(t, "Int") || is_ident(t, "Uarch") || is_ident(t, "Float64") ||
-		     is_ident(t, "Float32")) &&
+		     is_ident(t, "Float32") || is_fixed_type_name(castnm)) &&
 		    p->toks[p->pos + 1].kind == TK_LPAREN) {
 			Expr *e = new_expr(EX_CAST);
 			e->line = t->line;
-			tok_copy(t, e->name, sizeof e->name); /* target: "Int"/"Uarch"/"Float64"/"Float32" */
+			tok_copy(t, e->name, sizeof e->name); /* target: Int, Uarch, a float, or IntN/UintN */
 			advance(p); /* type name */
 			advance(p); /* ( */
 			e->lhs = parse_expr(p, fn);
@@ -3284,6 +3391,7 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 		 * `data`-typed local). A pointer annotation has no M0 local use. */
 		int is_record = 0, is_str = 0, is_buf = 0, bufsize = 0, is_arr = 0, arrlen = 0, is_f64 = 0, is_f32 = 0;
 		int is_ptr_local = 0;
+		int is_fixed = 0, fx_bits = 0, fx_signed = 0; /* a fixed-width integer local (IntN/UintN) */
 		char bufsize_name[64] = {0}; /* a `[n Uint8]` buffer sized by a comptime value param */
 		char rectype[64] = {0};
 		Token *tt = peek(p);
@@ -3361,6 +3469,11 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 				advance(p);
 			} else if (is_ident(tt, "Float32")) {
 				is_f32 = 1;
+				advance(p);
+			} else if (is_fixed_type_name(tok_str(tt))) {
+				/* `const Int8 x = …` — a fixed-width integer local */
+				fixed_name_bits_signed(tok_str(tt), &fx_bits, &fx_signed);
+				is_fixed = 1;
 				advance(p);
 			} else { /* a record/union type, or a generic application `Box[Int]` (G3b) */
 				parse_type_arg(p, rectype, sizeof rectype);
@@ -3466,6 +3579,13 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 			snprintf(s->type_name, sizeof s->type_name, "%s", tn);
 			Type ft = {is_f64 ? TY_F64 : TY_F32, NULL, NULL, 0, NULL};
 			func_add_local(fn, s->name, mutable, ft, tn);
+		} else if (is_fixed) {
+			/* `const Int8 x = <expr>` / `let Uint16 y = …` — a fixed-width integer local. The
+			 * initializer is any scalar-integer expression (a literal ADOPTS this width, range-
+			 * checked in typecheck; a cast `Int8(v)` yields it); `let` reassigns like Int. */
+			s->expr = parse_expr(p, fn);
+			snprintf(s->type_name, sizeof s->type_name, "%s%d", fx_signed ? "Int" : "Uint", fx_bits);
+			func_add_local(fn, s->name, mutable, mk_fixed(fx_bits, fx_signed), s->type_name);
 		} else {
 			/* A `{` initializer with no type annotation is an attempted record
 			 * literal (M0 requires the annotation to know the record's type). */
@@ -3733,10 +3853,10 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 		case R_CONST: die(t->line, "cannot reassign a `const` binding (declare it with `let`)");
 		case R_LET: break; /* ok */
 		}
-		/* Only a scalar `let` in a slot (an Int word or a Float64) can be reassigned as a
-		 * unit; a whole record/aggregate cannot — mutate its fields with `.`. (Aggregate
-		 * copy-binding is a later concern — memory_model §6 requires an explicit copy.) */
-		if (ty.kind != TY_INT && !is_float_type(ty))
+		/* Only a scalar `let` in a slot (an Int word, a float, or a fixed-width IntN/UintN) can
+		 * be reassigned as a unit; a whole record/aggregate cannot — mutate its fields with `.`.
+		 * (Aggregate copy-binding is a later concern — memory_model §6 requires an explicit copy.) */
+		if (ty.kind != TY_INT && !is_float_type(ty) && !is_fixed_type(ty))
 			die(t->line, "cannot assign to a whole record (mutate a field with `.`)");
 		ExprKind cop;
 		if (compound_assign_op(peek(p)->kind, &cop)) {
@@ -5094,6 +5214,11 @@ static const char *shallow_type_name(Program *prog, Func *fn, Expr *e) {
 				case PK_UNIT: return "Unit"; /* the unit type */
 				case PK_F64: return "Float64";
 				case PK_F32: return "Float32";
+				case PK_FIXED: { /* a fixed-width integer param — reconstruct IntN/UintN */
+					static char nm[16];
+					snprintf(nm, sizeof nm, "%s%d", fn->params[i].is_signed ? "Int" : "Uint", fn->params[i].bits);
+					return nm;
+				}
 				}
 			}
 		for (int i = 0; i < fn->nlocals; i++)
@@ -5520,7 +5645,11 @@ static void resolve_record_literal(Program *prog, Func *fn, Expr *e, DataDecl *d
 /* Require that `e` yields an Int. A record is legal only as a field-access base
  * and a pointer never, so wherever an Int is expected this rejects them both. */
 static void expect_int(Program *prog, Func *fn, Expr *e) {
-	if (typeof_expr(prog, fn, e).kind != TY_INT)
+	Type t = typeof_expr(prog, fn, e);
+	if (is_fixed_type(t)) /* a fixed-width int is not usable in an Int context yet — cast explicitly */
+		die(e->line, "a fixed-width integer must be cast to `Int` here (`Int(x)`) — fixed-width "
+		             "arithmetic, comparison, and use as a condition/Int value are a later brick");
+	if (t.kind != TY_INT)
 		die(e->line, "expected an Int value (a record is used only via field access, "
 		             "and a string only via `.len`, in M0)");
 }
@@ -5990,6 +6119,14 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 				if (at.kind != TY_F32)
 					die(e->line, "argument type mismatch (a Float32 parameter expects a Float32 value)");
 				break;
+			case PK_FIXED:
+				/* A fixed-width integer parameter expects that EXACT IntN/UintN — no implicit
+				 * widen/narrow (cast explicitly with `Int8(x)`, §4). ⚠ cf0 must NOT inherit: a
+				 * bare literal ARGUMENT should ADOPT the parameter's fixed width per §3 (cfcc only
+				 * adopts at a binding — here `f(5)` for an `Int8` param is rejected, test 731). */
+				if (at.kind != TY_FIXED || at.bits != pm->bits || at.is_signed != pm->is_signed)
+					die(e->line, "argument type mismatch (a fixed-width integer parameter expects that exact `IntN`/`UintN` — cast with `Int8(x)` etc.)");
+				break;
 			}
 		}
 		e->callee = callee; /* cached for emit (per-arg register width, Int→Uarch widen) */
@@ -6103,11 +6240,15 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		return rt;
 	}
 	case EX_CAST: {
-		/* A numeric cast converts between scalar numbers (Int/Uarch/Float64/Float32); its
-		 * operand must itself be a scalar number (no pointer↔number conversion, §4). */
+		/* A numeric cast converts between scalar numbers — Int, Uarch, Float32/64, or a
+		 * fixed-width IntN/UintN; its operand must itself be a scalar number (no pointer↔number
+		 * conversion, §4). */
 		Type at = typeof_expr(prog, fn, e->lhs);
-		if (at.kind != TY_INT && at.kind != TY_UARCH && !is_float_type(at))
-			die(e->line, "a numeric cast `Int(x)`/`Uarch(x)`/`Float64(x)`/`Float32(x)` takes a scalar number");
+		if (!is_int_scalar(at) && !is_float_type(at))
+			die(e->line, "a numeric cast (`Int(x)`, `Uarch(x)`, `Int8(x)`, `Float64(x)`, …) takes a scalar number");
+		int b, sgn;
+		if (fixed_name_bits_signed(e->name, &b, &sgn))
+			return mk_fixed(b, sgn);
 		TypeKind tk = strcmp(e->name, "Uarch") == 0 ? TY_UARCH
 		            : strcmp(e->name, "Float64") == 0 ? TY_F64
 		            : strcmp(e->name, "Float32") == 0 ? TY_F32
@@ -6227,6 +6368,11 @@ static Type func_ret_type(const Func *fn) {
 		return (Type){TY_F64, NULL, NULL, 0, NULL};
 	if (strcmp(fn->ret_type_name, "Float32") == 0)
 		return (Type){TY_F32, NULL, NULL, 0, NULL};
+	{
+		int b, s;
+		if (fixed_name_bits_signed(fn->ret_type_name, &b, &s)) /* IntN/UintN return */
+			return mk_fixed(b, s);
+	}
 	if (strcmp(fn->ret_type_name, "Unit") == 0) /* `Unit`/`()` — the zero-tuple, a word `0` */
 		return (Type){TY_UNIT, NULL, NULL, 0, NULL};
 	if (fn->ret_is_ptr) /* an explicit `*Aggregate` return — a TY_PTR to the pointee decl */
@@ -6452,6 +6598,27 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 			} else if (strcmp(s->type_name, "Float32") == 0) { /* a Float32 local */
 				if (typeof_expr(prog, fn, s->expr).kind != TY_F32)
 					die(s->line, "a Float32 local's initializer must be a Float32 value (cast with `Float32(x)`)");
+			} else if (is_fixed_type_name(s->type_name)) { /* a fixed-width integer local (IntN/UintN) */
+				int b, sgn;
+				fixed_name_bits_signed(s->type_name, &b, &sgn);
+				if (s->expr->kind == EX_INT) {
+					/* A bare non-negative literal ADOPTS this width (§3), range-checked. The
+					 * literal is stored directly at the slot's width; no retyping needed.
+					 * ⚠ cf0 must NOT inherit: cfcc adopts only a NON-NEGATIVE literal — a signed
+					 * `const Int8 x = -5` is `EX_NEG` (an `Int` expression), so it takes the
+					 * exact-type branch below and is rejected, whereas §3 adopts negatives too. */
+					if (!literal_fits_fixed(s->expr->ival, b, sgn))
+						die(s->line, "integer literal out of range for this fixed-width type");
+				} else {
+					/* Any other initializer must already be this EXACT IntN/UintN — a cast
+					 * `Int8(x)`, another fixed local/param, or an if/match yielding it. No implicit
+					 * widen/narrow. ⚠ cf0 must NOT inherit: this is the ONLY literal-adoption site
+					 * (plus let-reassign); at an arg/return/if-match-loop BRANCH a bare literal
+					 * stays `Int` and must be cast, whereas §3 adopts the context type everywhere. */
+					Type it = typeof_expr(prog, fn, s->expr);
+					if (!types_equal(it, mk_fixed(b, sgn)))
+						die(s->line, "a fixed-width integer local's initializer must be that exact `IntN`/`UintN` (a literal, or a value cast with `Int8(x)` etc.)");
+				}
 			} else if (s->type_name[0] == '*') { /* a `*Aggregate` pointer local */
 				/* Resolve the pointee (`*Point` → TY_PTR{rec/uni}) and require the initializer
 				 * to be a matching pointer value (`&x` or a `*T`), per the 4c tightening. */
@@ -6572,6 +6739,15 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 			if (is_float_type(tt)) {
 				if (typeof_expr(prog, fn, s->expr).kind != tt.kind)
 					die(s->line, "a float `let` is reassigned a value of its own float type");
+			} else if (is_fixed_type(tt)) {
+				/* A fixed-width `let` is reassigned that same IntN/UintN — a bare non-negative
+				 * literal adopts it (range-checked), else the value must be that exact type. */
+				if (s->expr->kind == EX_INT) {
+					if (!literal_fits_fixed(s->expr->ival, tt.bits, tt.is_signed))
+						die(s->line, "integer literal out of range for this fixed-width type");
+				} else if (!types_equal(typeof_expr(prog, fn, s->expr), tt)) {
+					die(s->line, "a fixed-width `let` is reassigned a value of its own `IntN`/`UintN` type (cast with `Int8(x)` etc.)");
+				}
 			} else {
 				expect_int(prog, fn, s->expr);
 			}
@@ -6635,6 +6811,16 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 				Type et = typeof_expr(prog, fn, s->expr);
 				if (et.kind != rt.kind)
 					die(s->expr->line, "a float function returns a value of its declared float type (cast if needed)");
+			} else if (is_fixed_type(rt)) {
+				/* A fixed-width integer return: the value must be that EXACT IntN/UintN (a cast
+				 * `Int8(x)`, a fixed-typed local/param, or an if/match yielding it) — no implicit
+				 * widen/narrow of an Int, unlike Uarch's throwaway coercion. ⚠ cf0 must NOT
+				 * inherit: a bare literal RETURN should ADOPT the return's fixed width per §3
+				 * (cfcc only adopts at a binding — here `-> 5` from a `Uint8` fn is rejected,
+				 * test 733). */
+				Type et = typeof_expr(prog, fn, s->expr);
+				if (!types_equal(et, rt))
+					die(s->expr->line, "a fixed-width integer function returns that exact `IntN`/`UintN` (cast with `Int8(x)` etc.)");
 			} else {
 				expect_int(prog, fn, s->expr);
 			}
@@ -6724,7 +6910,7 @@ static void resolve_signatures(Program *prog) {
 			}
 		if (fn->ret_type_name[0] && strcmp(fn->ret_type_name, "Uarch") != 0 &&
 		    strcmp(fn->ret_type_name, "Unit") != 0 && strcmp(fn->ret_type_name, "Float64") != 0 &&
-		    strcmp(fn->ret_type_name, "Float32") != 0) {
+		    strcmp(fn->ret_type_name, "Float32") != 0 && !is_fixed_type_name(fn->ret_type_name)) {
 			UnionDecl *u = prog_find_union(prog, fn->ret_type_name);
 			if (u) {
 				if (fn->ret_is_ptr && !u->has_payload) /* `*TagOnlyUnion` return = `*Scalar`, §6.4/§8.4 */
@@ -6999,6 +7185,15 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		if (is_float_type(e->rtype)) {
 			/* A float local/param lives in its own slot (params spill there like words), so a
 			 * read is a `load<qt>` (`loads`/`loadd`). */
+			char qt = qtype_of(e->rtype);
+			int t = ex->tmp++;
+			fprintf(out, "\t%%t%d =%c load%c %%s_%s\n", t, qt, qt, e->name);
+			snprintf(dst, cap, "%%t%d", t);
+			return;
+		}
+		if (is_fixed_type(e->rtype)) {
+			/* A fixed-width integer local/param lives in its own slot (params spill there); a
+			 * read is a `loadw` (≤32-bit) or `loadl` (64-bit). The stored value is canonical. */
 			char qt = qtype_of(e->rtype);
 			int t = ex->tmp++;
 			fprintf(out, "\t%%t%d =%c load%c %%s_%s\n", t, qt, qt, e->name);
@@ -7306,30 +7501,60 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		return;
 	}
 	case EX_CAST: {
-		/* Convert a scalar number between Int (`w`, signed), Uarch (`l`, unsigned), Float64
-		 * (`d`), and Float32 (`s`). Int↔Uarch: `extsw` widen / `w copy` truncate. Int/Uarch →
-		 * float: `swtof` (signed Int) / `ultof` (unsigned Uarch), result `s` or `d`. Float →
-		 * Int/Uarch: `<src>tosi` (→ signed Int `w`) / `<src>toui` (→ unsigned Uarch `l`),
-		 * `<src>` ∈ {s,d}. Float↔float: `truncd` (d→s) / `exts` (s→d). Same-type = copy. */
+		/* Convert a scalar number between the integer scalars (Int, Uarch, IntN/UintN) and the
+		 * floats (Float32/64). The integer cases are UNIFORM over (bits, signedness): int→int
+		 * materializes the source's exact value in an `l` (sign/zero-extend per SOURCE signedness)
+		 * then produces the canonical destination (truncate to db bits + sign/zero-extend per DEST
+		 * signedness); int→float uses s/u·w/l·tof; float→int uses ·tosi/·toui then canonicalizes a
+		 * sub-word dest; float→float uses truncd/exts. All results stay canonical for their width. */
 		char op[96];
 		emit_expr(out, e->lhs, ex, op, sizeof op);
-		TypeKind s = e->lhs->rtype.kind, d = e->rtype.kind;
-		char sq = qtype_of(e->lhs->rtype), dq = qtype_of(e->rtype);
-		int sf = is_float_type(e->lhs->rtype), df = is_float_type(e->rtype);
+		Type st = e->lhs->rtype, dt = e->rtype;
+		int sf = is_float_type(st), df = is_float_type(dt);
+		char dq = qtype_of(dt);
 		int r = ex->tmp++;
-		if (s == d)
-			fprintf(out, "\t%%t%d =%c copy %s\n", r, dq, op);
-		else if (!sf && !df) { /* Int↔Uarch */
-			if (d == TY_INT)
-				fprintf(out, "\t%%t%d =w copy %s\n", r, op);   /* → Int: truncate */
+		if (!sf && !df) { /* integer → integer */
+			int sb = int_scalar_bits(st), ss = int_scalar_signed(st);
+			int db = int_scalar_bits(dt), ds = int_scalar_signed(dt);
+			char full[32]; /* the source's exact value as a full 64-bit `l` */
+			if (sb >= 64) {
+				snprintf(full, sizeof full, "%s", op);
+			} else {
+				int f = ex->tmp++;
+				fprintf(out, "\t%%t%d =l %s %s\n", f, ss ? "extsw" : "extuw", op);
+				snprintf(full, sizeof full, "%%t%d", f);
+			}
+			if (db >= 64) {
+				fprintf(out, "\t%%t%d =l copy %s\n", r, full);
+			} else if (db == 32) {
+				fprintf(out, "\t%%t%d =w copy %s\n", r, full); /* truncate low 32 — canonical at 32-bit */
+			} else {
+				int w = ex->tmp++;
+				fprintf(out, "\t%%t%d =w copy %s\n", w, full); /* low 32 */
+				const char *ext = db == 16 ? (ds ? "extsh" : "extuh") : (ds ? "extsb" : "extub");
+				fprintf(out, "\t%%t%d =w %s %%t%d\n", r, ext, w); /* sign/zero-extend to db bits */
+			}
+		} else if (!sf && df) { /* integer → float */
+			int sb = int_scalar_bits(st), ss = int_scalar_signed(st);
+			const char *m = sb <= 32 ? (ss ? "swtof" : "uwtof") : (ss ? "sltof" : "ultof");
+			fprintf(out, "\t%%t%d =%c %s %s\n", r, dq, m, op);
+		} else if (sf && !df) { /* float → integer */
+			char sq = qtype_of(st);
+			int db = int_scalar_bits(dt), ds = int_scalar_signed(dt);
+			if (db >= 32) {
+				fprintf(out, "\t%%t%d =%c %cto%s %s\n", r, dq, sq, ds ? "si" : "ui", op);
+			} else {
+				int w = ex->tmp++;
+				fprintf(out, "\t%%t%d =w %cto%s %s\n", w, sq, ds ? "si" : "ui", op);
+				const char *ext = db == 16 ? (ds ? "extsh" : "extuh") : (ds ? "extsb" : "extub");
+				fprintf(out, "\t%%t%d =w %s %%t%d\n", r, ext, w);
+			}
+		} else { /* float → float */
+			if (st.kind == dt.kind)
+				fprintf(out, "\t%%t%d =%c copy %s\n", r, dq, op);
 			else
-				fprintf(out, "\t%%t%d =l extsw %s\n", r, op);  /* → Uarch: sign-extend */
-		} else if (!sf && df) /* Int/Uarch → float */
-			fprintf(out, "\t%%t%d =%c %s %s\n", r, dq, s == TY_INT ? "swtof" : "ultof", op);
-		else if (sf && !df) /* float → Int/Uarch */
-			fprintf(out, "\t%%t%d =%c %cto%s %s\n", r, dq, sq, d == TY_INT ? "si" : "ui", op);
-		else /* float → float (different widths) */
-			fprintf(out, "\t%%t%d =%c %s %s\n", r, dq, s == TY_F64 ? "truncd" : "exts", op);
+				fprintf(out, "\t%%t%d =%c %s %s\n", r, dq, st.kind == TY_F64 ? "truncd" : "exts", op);
+		}
 		snprintf(dst, cap, "%%t%d", r);
 		return;
 	}
@@ -7648,10 +7873,14 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 				emit_expr(out, s->expr, ex, v, sizeof v);
 				fprintf(out, "\tstore%c %s, %%s_%s\n", qtype_of(s->expr->rtype), v, s->name);
 			} else {
-				/* A word local: its slot was reserved in the entry block (see
-				 * emit_func); the binding just stores the initial value. */
+				/* A word or fixed-width integer local: its slot was reserved in the entry block
+				 * (see emit_func); the binding just stores the initial value. The store WIDTH
+				 * comes from the LOCAL's declared type, not the initializer's — a bare literal
+				 * has rtype `Int` yet may adopt an `Int64` slot (needing `storel`). */
+				Type lt;
+				resolve_name((Func *)ex->fn, s->name, &lt);
 				emit_expr(out, s->expr, ex, v, sizeof v);
-				fprintf(out, "\tstorew %s, %%s_%s\n", v, s->name);
+				fprintf(out, "\tstore%c %s, %%s_%s\n", qtype_of(lt), v, s->name);
 			}
 			break;
 		case ST_ASSIGN: {
@@ -7661,7 +7890,7 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 			 * slot with the store matching its type (`stored` for a Float64, else `storew`). */
 			Type tt;
 			resolve_name((Func *)ex->fn, s->name, &tt);
-			char st = is_float_type(tt) ? qtype_of(tt) : 'w'; /* store<st>: stores/stored/storew */
+			char st = (is_float_type(tt) || is_fixed_type(tt)) ? qtype_of(tt) : 'w'; /* stores/stored/storel/storew */
 			if (is_capture_param(ex->fn, s->name))
 				fprintf(out, "\tstore%c %s, %%u_%s\n", st, v, s->name);
 			else
@@ -7909,6 +8138,12 @@ static void emit_func(FILE *out, const Func *fn) {
 		if (param_is_word(&fn->params[i])) {
 			fprintf(out, "\t%%s_%s =l alloc4 4\n", n);
 			fprintf(out, "\tstorew %%u_%s, %%s_%s\n", n, n);
+		} else if (fn->params[i].kind == PK_FIXED) {
+			/* A fixed-width integer param spills to its slot (`w` ≤32-bit → 4 bytes, `l`
+			 * 64-bit → 8), like a float but with `storew`/`storel`. */
+			char qt = param_qtype(&fn->params[i]);
+			fprintf(out, "\t%%s_%s =l alloc%d %d\n", n, qt == 'l' ? 8 : 4, qt == 'l' ? 8 : 4);
+			fprintf(out, "\tstore%c %%u_%s, %%s_%s\n", qt, n, n);
 		} else if (fn->params[i].kind == PK_F64 || fn->params[i].kind == PK_F32) {
 			/* A float param spills to its slot (8 bytes for a `d`, 4 for an `s`). */
 			char qt = param_qtype(&fn->params[i]);
@@ -7941,6 +8176,9 @@ static void emit_func(FILE *out, const Func *fn) {
 		else if (is_float_type(fn->locals[i].type)) /* a float slot: 8 bytes for `d`, 4 for `s` */
 			fprintf(out, "\t%%s_%s =l alloc%d %d\n", fn->locals[i].name,
 			        fn->locals[i].type.kind == TY_F64 ? 8 : 4, fn->locals[i].type.kind == TY_F64 ? 8 : 4);
+		else if (is_fixed_type(fn->locals[i].type)) /* a fixed-width int slot: 8 bytes for 64-bit, else 4 */
+			fprintf(out, "\t%%s_%s =l alloc%d %d\n", fn->locals[i].name,
+			        qtype_of(fn->locals[i].type) == 'l' ? 8 : 4, qtype_of(fn->locals[i].type) == 'l' ? 8 : 4);
 	}
 
 	/* Likewise reserve every if/logical merge slot once here, not at each
