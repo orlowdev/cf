@@ -667,11 +667,9 @@ typedef struct {
 	                 * all Iarch, and it is fully usable as a condition/index and an aggregate field.
 	                 * The name `Int` is now the SIGNED NUMERIC UNION bound {Int8,Int16,Int32,Int64,
 	                 * Iarch} (§8.6, is_numeric_union_name), rejected as a value type — so `Iarch`
-	                 * (not `Int`) is how you name the concrete default. ⚠ cf0 must NOT inherit:
-	                 * narrowing a numeric-bounded `'T` by `match Int.Int8(v)` — the comptime
-	                 * type-switch (§8.3/§8.5) — is DEFERRED to a follow-up brick; cfcc's
-	                 * numeric-bounded generic body operates on `'T` only by cast (`Iarch(x)`),
-	                 * and a `match` on a width/fixed value is cleanly rejected (not a union). */
+	                 * (not `Int`) is how you name the concrete default. A numeric-bounded `'T` is
+	                 * narrowed by the comptime type-switch `match x { Int.Int8(v) -> … }` (§8.3/§8.5,
+	                 * check_numeric_typeswitch — the concrete width picks the live arm). */
 } Type;
 
 /* The entry ABI kinds an M0 `main` parameter can take: a word (Int, e.g. argc)
@@ -881,6 +879,12 @@ struct Expr {
 	UnionDecl *uni;
 	MatchArm *arms;
 	int narms;
+	/* EX_MATCH: a NUMERIC COMPTIME TYPE-SWITCH (`match x { Int.Int8(v) -> … }` on a fixed-width
+	 * scrutinee, dispatched on the concrete width at comptime) sets `numswitch`=1 and `live_arm`
+	 * = the index of the one arm whose width matches the scrutinee (the rest are dead-code). A
+	 * regular tag-dispatch union match leaves both 0/… (uni != NULL distinguishes it). */
+	int numswitch;
+	int live_arm;
 	/* EX_VAR: set by typecheck when the name resolves to a match-arm payload binding
 	 * (not a param/local) — emit reads its value from the `%pb<bind_id>` storage temp. */
 	int is_bind;
@@ -1136,6 +1140,27 @@ static Type mk_fixed(int bits, int is_signed, int is_arch) {
 
 /* The `Iarch` Type — the pointer-width signed default (64-bit `l`). */
 static Type mk_iarch(void) { return mk_fixed(64, 1, 1); }
+
+/* The canonical type NAME of a NUMERIC scalar — a fixed leaf (`Iarch`, `Int%d`, `Uint%d`),
+ * `Uarch`, or a float (`Float32`/`Float64`). Used to name the scrutinee's concrete width in a
+ * comptime type-switch. Returned in a rotating static buffer (used transiently). "" if `t`
+ * is not a numeric scalar. */
+static const char *numeric_type_name(Type t) {
+	static char bufs[2][16];
+	static int which = 0;
+	char *b = bufs[which++ & 1];
+	if (t.kind == TY_FIXED)
+		snprintf(b, 16, t.is_arch ? "Iarch" : t.is_signed ? "Int%d" : "Uint%d", t.bits);
+	else if (t.kind == TY_UARCH)
+		snprintf(b, 16, "Uarch");
+	else if (t.kind == TY_F64)
+		snprintf(b, 16, "Float64");
+	else if (t.kind == TY_F32)
+		snprintf(b, 16, "Float32");
+	else
+		b[0] = '\0';
+	return b;
+}
 
 /* If `name` is a fixed-width integer type name — the eight `Int8/16/32/64`, `Uint8/16/32/64`,
  * or `Iarch` (the pointer-width signed leaf, 64-bit `l`, nominally ≠ Int64) — fill the
@@ -5761,6 +5786,68 @@ static Type typeof_expr(Program *prog, Func *fn, Expr *e);
 static Type func_ret_type(const Func *fn);
 static void resolve_record_literal(Program *prog, Func *fn, Expr *e, DataDecl *d);
 
+/* A numeric comptime TYPE-SWITCH: `match x { Int.Int8(v) -> …, Int.Iarch(v) -> … }` on a
+ * fixed-width scrutinee (type_system §8.3/§8.5's comptime type-switch). The scrutinee's
+ * concrete width picks the ONE live arm — the others are dead-code, never typechecked or
+ * emitted — and an optional binding names the value at that width. In a `[Int 'T]` generic
+ * body, `'T` is a concrete width per instantiation, so this NARROWS a numeric-bounded `'T`
+ * (§8.5). Sets `numswitch`/`live_arm` on the match; returns the live arm's type. ⚠ cf0 must
+ * NOT inherit: cf0 checks §8.3 exhaustiveness across the union's members and typechecks every
+ * arm at the type it refines to; cfcc requires only the live arm present and checks only it. */
+static Type check_numeric_typeswitch(Program *prog, Func *fn, Expr *e, Type st) {
+	char wk[16];
+	snprintf(wk, sizeof wk, "%s", numeric_type_name(st)); /* the scrutinee's concrete width */
+	const char *uni = NULL;
+	for (int i = 0; i < e->narms; i++)
+		if (!e->arms[i].is_wild) { uni = e->arms[i].qual; break; }
+	if (!uni || !numeric_bound_admits(uni, wk))
+		die(e->line, "the scrutinee's width is not a member of this numeric union");
+	int live = -1, wild = -1;
+	for (int i = 0; i < e->narms; i++) {
+		MatchArm *a = &e->arms[i];
+		if (wild >= 0) /* a `_` makes every following arm unreachable (§8.3) */
+			die(a->line, "unreachable match arm after `_`");
+		if (a->is_wild) { wild = i; continue; }
+		if (a->nalts != 1)
+			die(a->line, "a numeric type-switch arm names one width (`Int.Int8`), not an or-pattern");
+		if (strcmp(a->qual, uni) != 0)
+			die(a->line, "all numeric type-switch arms share one numeric union qualifier");
+		if (!numeric_bound_admits(uni, a->members[0]))
+			die(a->line, "this numeric union has no such width member");
+		if (a->nbinds > 1)
+			die(a->line, "a numeric type-switch binds at most one name (the value at its width)");
+		if (strcmp(a->members[0], wk) == 0) {
+			if (live >= 0)
+				die(a->line, "duplicate match arm for this width");
+			live = i;
+		}
+	}
+	if (live < 0)
+		live = wild;
+	if (live < 0)
+		die(e->line, "no match arm covers the scrutinee's width (add its width's arm or a `_`)");
+	e->numswitch = 1;
+	e->live_arm = live;
+	/* Bind the live arm's name (if any) to the scrutinee value, typed at the scrutinee's
+	 * width. Only the live arm's body is typechecked (the rest are comptime-dead). */
+	MatchArm *a = &e->arms[live];
+	int saved = fn->nabinds;
+	if (!a->is_wild && a->nbinds == 1 && strcmp(a->binds[0], "_") != 0) {
+		a->bind_word[0] = type_is_word(st);
+		int id = fn->next_bind_id++;
+		a->bind_ids[0] = id;
+		snprintf(fn->abinds[fn->nabinds].name, sizeof fn->abinds[0].name, "%s", a->binds[0]);
+		fn->abinds[fn->nabinds].id = id;
+		fn->abinds[fn->nabinds].type = st;
+		fn->nabinds++;
+	}
+	Type bt = typeof_expr(prog, fn, a->body);
+	fn->nabinds = saved;
+	if (!is_mergeable_scalar(bt))
+		die(a->line, "a numeric type-switch arm yields a scalar value (an aggregate result is a later brick)");
+	return bt;
+}
+
 /* Require that `e` yields an Int. A record is legal only as a field-access base
  * and a pointer never, so wherever an Int is expected this rejects them both. */
 static void expect_int(Program *prog, Func *fn, Expr *e) {
@@ -6279,8 +6366,18 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		 * (M1.1) and unify to the match's type. Exhaustiveness: cover every member or
 		 * carry a `_`. */
 		Type st = typeof_expr(prog, fn, e->lhs);
-		/* A union value OR an explicit `*Union` pointer (a boxed union is already a pointer,
-		 * so `match` on a `*List` binding drives the recursive walk). */
+		/* A NUMERIC scalar scrutinee (a fixed leaf, `Uarch`, or a float) whose arms are qualified
+		 * by a numeric union (`Int`/`Uint`/`Number`) is a comptime TYPE-SWITCH — the concrete
+		 * width picks the live arm. */
+		if (is_fixed_type(st) || st.kind == TY_UARCH || is_float_type(st)) {
+			const char *q = NULL;
+			for (int i = 0; i < e->narms; i++)
+				if (!e->arms[i].is_wild) { q = e->arms[i].qual; break; }
+			if (q && is_numeric_union_name(q))
+				return check_numeric_typeswitch(prog, fn, e, st);
+		}
+		/* Otherwise a tag-dispatch union match: a union value OR an explicit `*Union` pointer (a
+		 * boxed union is already a pointer, so `match` on a `*List` binding drives the walk). */
 		UnionDecl *u = aggregate_union(st);
 		if (!u)
 			die(e->line, "M1.1 `match` requires a union scrutinee");
@@ -7818,6 +7915,20 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		return;
 	}
 	case EX_MATCH: {
+		/* A numeric comptime type-switch emits ONLY the live arm (the concrete width was
+		 * resolved at typecheck) — no tag ladder, no merge slot. If it binds a name, copy the
+		 * scrutinee value into the binding's `%pb<id>` at the scrutinee's width. */
+		if (e->numswitch) {
+			MatchArm *a = &e->arms[e->live_arm];
+			char sc[96];
+			emit_expr(out, e->lhs, ex, sc, sizeof sc); /* evaluate the scrutinee (any side effects) */
+			if (!a->is_wild && a->nbinds == 1 && a->bind_ids[0] >= 0) {
+				char qt = qtype_of(e->lhs->rtype); /* the scrutinee's width (w/l/s/d) */
+				fprintf(out, "\t%%pb%d =%c copy %s\n", a->bind_ids[0], qt, sc);
+			}
+			emit_expr(out, a->body, ex, dst, cap); /* the match's value is the live arm's */
+			return;
+		}
 		/* Compare-chain over the scrutinee's tag (seed_subset §7): a linear ladder of
 		 * `ceqw tag, <k>` tests. Each member arm's block stores its value into the
 		 * entry-block merge slot `%m<slot>` and jumps to @mend; the `_` arm (or, for an
