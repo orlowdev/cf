@@ -1362,9 +1362,11 @@ typedef struct {
 	                   * module's top-level names, so two modules' private `helper`s never collide. */
 	char names[MAX_IMPORT_NAMES][64]; /* destructured member names bound into the importer's scope */
 	int nnames;
-	char ns[64];      /* a lowercase namespace alias (`import "p" as mem` → `mem.foo()`); empty for
-	                   * the destructured form. Its members are reached qualified and rewritten to
-	                   * the module's mangled names on flatten. */
+	char ns[64];      /* a namespace alias — lowercase (`import "p" as mem` → `mem.foo()`, VALUES) or
+	                   * PascalCase (`import "p" as Math` → `Math.Point`, TYPES); empty for the
+	                   * destructured form. Members are reached qualified and rewritten to the
+	                   * module's mangled names on flatten. */
+	int ns_is_type;   /* 1 = a PascalCase type namespace (exposes types), 0 = lowercase (values) */
 	int line;
 } Import;
 
@@ -1987,7 +1989,7 @@ static void reject_nonscalar_fn_component(const Param *pm, int line) {
  * accepts it); (2) declared-before — cf0 resolves member types order-independently; (3) only
  * the head-generic spelling `Maybe[Int].Just` is accepted — a member-position generic suffix
  * (`Tree.Node[Int32]`, §8.1) is not parsed here (cfcc unions are head-generic-only anyway). */
-static void consume_member_type_suffix(Parser *p, const char *base, int line) {
+static void consume_member_type_suffix(Parser *p, char *base, size_t cap, int line) {
 	if (peek(p)->kind != TK_DOT || !is_type_ident(&p->toks[p->pos + 1]))
 		return; /* no `.Member` follows — leave any stray `.` for the caller to diagnose */
 	advance(p); /* . */
@@ -2005,13 +2007,23 @@ static void consume_member_type_suffix(Parser *p, const char *base, int line) {
 	}
 	bname[bl] = 0;
 	UnionDecl *u = prog_find_union(p->prog, bname);
-	if (!u) {
-		if (prog_find_data(p->prog, bname))
-			die(line, "a member type (`Union.Member`) requires a union base; a record has no members");
-		die(line, "a member type (`Union.Member`) needs its union declared before it (a genesis limit)");
+	if (u) {
+		/* A real union base: this is a member type — validate and COLLAPSE (leave `base` = the
+		 * union; a member-typed value is represented identically to a union value). */
+		if (union_member_tag(u, mem) < 0)
+			die(line, "unknown member in a member-type annotation (`Union.Member`)");
+		return;
 	}
-	if (union_member_tag(u, mem) < 0)
-		die(line, "unknown member in a member-type annotation (`Union.Member`)");
+	if (prog_find_data(p->prog, bname))
+		die(line, "a member type (`Union.Member`) requires a union base; a record has no members");
+	/* Otherwise the base is not a declared type — treat `Base.Member` as a NAMESPACE-qualified
+	 * type `Ns.Type` (import "…" as Ns) and KEEP the qualified name for the flatten arc to
+	 * rewrite to the module's mangled type. If `Ns` is not a namespace, or `Base` is a union
+	 * declared later (a genesis order limit), typecheck reports the unresolved type. */
+	size_t len = strlen(base);
+	int w = snprintf(base + len, cap - len, ".%s", mem);
+	if (w < 0 || (size_t)(len + (size_t)w) >= cap)
+		die(line, "qualified type name too long");
 }
 
 /* Consume a parameter's type and classify it. M0 param types are `Int` (a word),
@@ -2205,7 +2217,7 @@ static void parse_param_type(Parser *p, Param *out) {
 	}
 	if (is_type_ident(t)) { /* a record/union type, or a generic application `Box[Int]` (G3b) */
 		parse_type_arg(p, out->type_name, sizeof out->type_name);
-		consume_member_type_suffix(p, out->type_name, t->line); /* `Maybe[Int].Just` → the union */
+		consume_member_type_suffix(p, out->type_name, sizeof out->type_name, t->line); /* `Maybe[Int].Just` → union; `Math.Point` → namespace type */
 		out->kind = PK_RECORD; /* resolve_signatures reclassifies a union to PK_UNION */
 		return;
 	}
@@ -2626,6 +2638,26 @@ static Expr *parse_primary(Parser *p, Func *fn) {
 			expect(p, TK_RPAREN, "expected `)` to close the record construction");
 			return e;
 		}
+		/* Namespace record construction `Math.Point({ … })` — a type namespace's record type
+		 * (import "…" as Math), constructed. The qualified name `Math.Point` rides in the
+		 * EX_RECORD name and is rewritten to the module's mangled record on flatten. It is
+		 * distinguished from a union-member payload `Union.Member(expr)` by the `{` (a record
+		 * literal) that must follow the `(`. */
+		if (p->toks[p->pos + 1].kind == TK_DOT && is_type_ident(&p->toks[p->pos + 2]) &&
+		    p->toks[p->pos + 3].kind == TK_LPAREN && p->toks[p->pos + 4].kind == TK_LBRACE) {
+			Token *yt = &p->toks[p->pos + 2];
+			char rname[64];
+			if ((size_t)snprintf(rname, sizeof rname, "%.*s.%.*s",
+			                     t->len, t->text, yt->len, yt->text) >= sizeof rname)
+				die(t->line, "qualified type name too long");
+			advance(p); /* namespace */
+			advance(p); /* . */
+			advance(p); /* member type */
+			advance(p); /* ( */
+			Expr *e = parse_data_literal(p, fn, rname, t->line); /* EX_RECORD, name = "Ns.Type" */
+			expect(p, TK_RPAREN, "expected `)` to close the record construction");
+			return e;
+		}
 		/* Otherwise a PascalCase name in value position is a union member value
 		 * `Union.Member` or `Union[Args].Member` (G3b: a generic union is applied before
 		 * the member is selected). A bare type name is not itself a value. */
@@ -3017,6 +3049,9 @@ static Expr *parse_match(Parser *p, Func *fn) {
 				tok_copy(mt, arm.members[arm.nalts], sizeof arm.members[0]);
 				arm.nalts++;
 				advance(p);
+				if (peek(p)->kind == TK_DOT)
+					die(peek(p)->line, "matching a namespaced union's member (`Ns.Union.Member`) is not "
+					                   "supported yet — destructure the union (`import … as { Union }`) to match it");
 				if (peek(p)->kind == TK_LPAREN) {
 					/* Payload sub-pattern: bind lowercase names (or `_`) positionally.
 					 * Only on a single member — an or-pattern arm cannot bind. */
@@ -3382,7 +3417,7 @@ static int parse_return_type(Parser *p, Func *fn) {
 			              "a return type names a width (`Iarch`, `Int32`, …)");
 		/* Uarch, Iarch, a record/union type, or a generic application `Box[Iarch]` (G3b) */
 		parse_type_arg(p, fn->ret_type_name, sizeof fn->ret_type_name);
-		consume_member_type_suffix(p, fn->ret_type_name, rt->line); /* `Maybe[Iarch].Just` → the union */
+		consume_member_type_suffix(p, fn->ret_type_name, sizeof fn->ret_type_name, rt->line); /* `Maybe[Iarch].Just` → union; `Math.Point` → namespace type */
 	} else {
 		die(rt->line, "expected a return type after `:`");
 	}
@@ -3631,7 +3666,7 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 				advance(p);
 			} else { /* a record/union type, or a generic application `Box[Int]` (G3b) */
 				parse_type_arg(p, rectype, sizeof rectype);
-				consume_member_type_suffix(p, rectype, tt->line); /* `Maybe[Int].Just` → the union */
+				consume_member_type_suffix(p, rectype, sizeof rectype, tt->line); /* `Maybe[Int].Just` → union; `Math.Point` → namespace type */
 				is_record = 1;
 			}
 		}
@@ -4971,13 +5006,12 @@ static Import parse_import(Parser *p) {
 		if (im.nnames == 0)
 			die(im.line, "an import list cannot be empty");
 	} else if (peek(p)->kind == TK_IDENT) {
-		/* A namespace alias: lowercase `as mem` binds the module's VALUES, reached `mem.foo()`.
-		 * The PascalCase type namespace (`as Math` → `Math.Point`) is a later slice. */
+		/* A namespace alias: lowercase `as mem` binds the module's VALUES (reached `mem.foo()`),
+		 * PascalCase `as Math` binds its TYPES (reached `Math.Point`). */
 		Token *a = peek(p);
-		if (is_type_ident(a))
-			die(a->line, "a type namespace (`as Name`) is not supported yet (use lowercase `as name` or `as { … }`)");
 		if (a->text[a->len - 1] == '!')
 			die(a->line, "M0 does not support `!` in a namespace alias");
+		im.ns_is_type = is_type_ident(a);
 		tok_copy(a, im.ns, sizeof im.ns);
 		advance(p);
 	} else {
@@ -9464,24 +9498,34 @@ static void flatten_imports(const char *main_path, Program *prog, Import *imps, 
 		}
 
 		if (im->ns[0]) {
-			/* Namespace import (`import "p" as mem`): expose every exported VALUE of the module
-			 * as a qualified `mem.name`, keyed to the module's mangled function. A member is
-			 * reached only through the alias, so a private function stays hidden. (Lowercase
-			 * namespaces are values-only; the type namespace `as Math` is a later slice.) */
+			/* Namespace import: expose every exported member of the module as a qualified
+			 * `ns.name`, keyed to the module's mangled decl. A member is reached only through the
+			 * alias, so a private one stays hidden. A lowercase alias (`as mem`) exposes VALUES
+			 * (functions); a PascalCase alias (`as Math`) exposes TYPES (records/unions/groups). */
 			for (int u = 0; u < nnsused; u++)
 				if (strcmp(nsused[u], im->ns) == 0)
 					die(im->line, "the same namespace alias is used by two imports");
 			snprintf(nsused[nnsused++], sizeof nsused[0], "%s", im->ns);
 			size_t plen = strlen(im->prefix);
-			for (int i = 0; i < prog->nfuncs; i++) {
-				Func *f = prog->funcs[i];
-				if (!f->is_pub || strncmp(f->name, im->prefix, plen) != 0)
-					continue;
-				char key[128];
-				if (snprintf(key, sizeof key, "%s.%s", im->ns, f->name + plen) >= (int)sizeof key)
-					die(im->line, "qualified name too long");
-				add_alias(&aliases, &naliases, key, f->name, im->line);
+			/* Enumerate the exported members of the requested kind by scanning the flattened
+			 * program for `pub` decls carrying this module's prefix, and add `ns.orig` → mangled. */
+			#define NS_EXPOSE(count, ispub, nm)                                                      \
+				for (int i = 0; i < (count); i++) {                                                \
+					if (!(ispub) || strncmp((nm), im->prefix, plen) != 0)                       \
+						continue;                                                          \
+					char key[128];                                                             \
+					if (snprintf(key, sizeof key, "%s.%s", im->ns, (nm) + plen) >= (int)sizeof key) \
+						die(im->line, "qualified name too long");                          \
+					add_alias(&aliases, &naliases, key, (nm), im->line);                       \
+				}
+			if (im->ns_is_type) {
+				NS_EXPOSE(prog->ndatas,  prog->datas[i]->is_pub,  prog->datas[i]->name);
+				NS_EXPOSE(prog->nunions, prog->unions[i]->is_pub, prog->unions[i]->name);
+				NS_EXPOSE(prog->ngroups, prog->groups[i]->is_pub, prog->groups[i]->name);
+			} else {
+				NS_EXPOSE(prog->nfuncs, prog->funcs[i]->is_pub, prog->funcs[i]->name);
 			}
+			#undef NS_EXPOSE
 		}
 
 		/* Bind each destructured name to its mangled target — an exported (`pub`) function OR
