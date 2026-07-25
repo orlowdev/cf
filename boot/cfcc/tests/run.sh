@@ -33,8 +33,24 @@ fi
 
 pass=0
 fail=0
-for cf in "$here"/[0-9]*.cf; do
-	name=$(basename "$cf")
+# A test is either a single NNN_*.cf file or a NNN_*/ directory whose `main.cf` is
+# the entry (it carries the directives) and whose sibling .cf files are the modules
+# it imports. The [0-9]*.cf glob only matches files, so module files never run
+# standalone.
+for entry in "$here"/[0-9]*.cf "$here"/[0-9]*/; do
+	[ -e "$entry" ] || continue
+	if [ -d "$entry" ]; then
+		name=$(basename "${entry%/}")
+		cf="${entry%/}/main.cf"
+		if [ ! -f "$cf" ]; then
+			echo "FAIL $name (test directory has no main.cf)"
+			fail=$((fail + 1))
+			continue
+		fi
+	else
+		cf="$entry"
+		name=$(basename "$cf")
+	fi
 	expect=$(sed -n 's/^# *expect: *//p' "$cf" | head -1)
 	args=$(sed -n 's/^# *args: *//p' "$cf" | head -1)
 	# Optional extra flags for the cfcc compile invocation (e.g. `--libc dynamic`).
