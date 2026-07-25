@@ -615,16 +615,25 @@ typedef enum {
 	            * leaf. A ≤32-bit value lives in a QBE `w`, a 64-bit one in an `l` (see qtype_of);
 	            * every producer keeps the value CANONICAL (sign/zero-extended to its width) so the
 	            * plain `w`/`l` register holds a well-formed value. cfcc has these as
-	            * locals/params/returns/arguments/cast operands and if/match/loop branch values.
-	            * ⚠ THROWAWAY narrowings (cf0 takes the full tower; all SUBSET-safe — cfcc rejects
-	            * more, never mis-lowers): (1) fixed-width ARITHMETIC/comparison is a later brick
-	            * (sub-word wrap canonicalization) — cast to `Int` to compute; (2) not yet an
-	            * aggregate field/payload/tuple/array element (like floats); (3) `Int` (a word) and
-	            * `Uarch` stay their own distinct kinds, not folded into TY_FIXED; (4) a literal
-	            * ADOPTS a fixed width (range-checked, §3) ONLY at a `const`/`let` binding, and only
-	            * a NON-NEGATIVE literal — cf0 adopts at every context (arg/return/branch) and for
-	            * negatives too (`const Int32 x = -5`); everywhere else here a bare literal stays
-	            * `Int` and needs an explicit `IntN(...)` cast. */
+	            * locals/params/returns/arguments/cast operands, if/match/loop branch values, and
+	            * arithmetic/bitwise/shift/comparison (same-type operands; sub-word results WRAP —
+	            * canon_fixed; div/rem/shift/compare pick the signed/unsigned form; `-x` is signed-
+	            * only, §8.5). PERMANENT rules cf0 KEEPS (matches the full spec — NOT narrowings):
+	            * an operator needs two operands of the SAME type (a mixed width/signedness operand
+	            * is a genuine type error, §5.6/§4); a fixed value is not a truthy condition / `&&`/
+	            * `||`/`!` operand (§5.6 no-truthiness) nor a bare array index (§6.2) — cfcc's advice
+	            * to "cast to `Int`" is the only degeneracy there (cf0 casts to `Bool` via a compare,
+	            * or `Uarch` for an index). ⚠ THROWAWAY narrowings (cf0 takes the full tower; all
+	            * SUBSET-safe — cfcc rejects more, never mis-lowers): (1) no untyped-literal adoption
+	            * in operator position — `a + 2` (a fixed `a`) is rejected, whereas §3 adopts the `2`
+	            * to `a`'s width; (2) not yet an aggregate field/payload/tuple/array element (like
+	            * floats); (3) `Int` (a word) and `Uarch` stay their own distinct kinds, not folded
+	            * into TY_FIXED; (4) a literal ADOPTS a fixed width (range-checked, §3) ONLY at a
+	            * `const`/`let` binding, and only a NON-NEGATIVE literal — cf0 adopts at every context
+	            * (arg/return/branch/operator operand) and for negatives too (`const Int32 x = -5`);
+	            * everywhere else here a bare literal stays `Int` and needs an explicit `IntN(...)`
+	            * cast. See also arith_mnemonic (div/rem-by-zero) and the shift-count note in the
+	            * `%`/bitwise/shift typecheck for two more pre-existing div/shift disclaimers. */
 	TY_UNIT,   /* `Unit` / `()` — the zero-element tuple, the terminal type `1` (type_system §2.3,
 	            * §6.1). It carries no information, so cfcc lowers its sole value to a word `0`
 	            * (type_is_word ⇒ it rides every word slot/store/return path); it stays a DISTINCT
@@ -5646,9 +5655,10 @@ static void resolve_record_literal(Program *prog, Func *fn, Expr *e, DataDecl *d
  * and a pointer never, so wherever an Int is expected this rejects them both. */
 static void expect_int(Program *prog, Func *fn, Expr *e) {
 	Type t = typeof_expr(prog, fn, e);
-	if (is_fixed_type(t)) /* a fixed-width int is not usable in an Int context yet — cast explicitly */
-		die(e->line, "a fixed-width integer must be cast to `Int` here (`Int(x)`) — fixed-width "
-		             "arithmetic, comparison, and use as a condition/Int value are a later brick");
+	if (is_fixed_type(t)) /* a fixed-width int is not usable in a plain Int context — cast explicitly */
+		die(e->line, "a fixed-width integer must be cast to `Int` here (`Int(x)`) — it is not usable "
+		             "directly as a condition, a logical `&&`/`||`/`!` operand, or an array index "
+		             "(fixed-width arithmetic and comparison, however, are supported)");
 	if (t.kind != TY_INT)
 		die(e->line, "expected an Int value (a record is used only via field access, "
 		             "and a string only via `.len`, in M0)");
@@ -6288,16 +6298,30 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		return e->lhs->args[e->lhs->nargs - 1]->rtype;
 	}
 	case EX_NEG: {
-		/* Unary `-` negates an Int or a float (yielding the operand type); `~`/`!` are
-		 * integer-only. */
+		/* Unary `-` negates an Int, a float, or a SIGNED fixed-width integer (yielding the
+		 * operand type). It is undefined on an unsigned type (§8.5). `~` is any-integer; `!` is
+		 * Int-only. */
 		Type t = typeof_expr(prog, fn, e->lhs);
 		if (is_float_type(t))
+			return t;
+		if (is_fixed_type(t)) {
+			if (!t.is_signed)
+				die(e->line, "unary `-` is undefined on an unsigned integer type (§8.5) — cast to a signed type first");
+			return t;
+		}
+		expect_int(prog, fn, e->lhs);
+		return (Type){TY_INT, NULL, NULL, 0, NULL};
+	}
+	case EX_BNOT: {
+		/* `~` (bitwise not) applies to any integer scalar, including a fixed-width IntN/UintN
+		 * (yielding that type — the emit wraps the sub-word result). */
+		Type t = typeof_expr(prog, fn, e->lhs);
+		if (is_fixed_type(t))
 			return t;
 		expect_int(prog, fn, e->lhs);
 		return (Type){TY_INT, NULL, NULL, 0, NULL};
 	}
-	case EX_BNOT:
-	case EX_LNOT:
+	case EX_LNOT: /* `!` is Int-only (truthiness) — a fixed value must be cast to Int first */
 		expect_int(prog, fn, e->lhs);
 		return (Type){TY_INT, NULL, NULL, 0, NULL};
 	case EX_ADDR: {
@@ -6327,21 +6351,46 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		 * yields Int (0/1). */
 		Type lt = typeof_expr(prog, fn, e->lhs);
 		Type rt = typeof_expr(prog, fn, e->rhs);
+		int is_cmp = e->kind == EX_EQ || e->kind == EX_NE || e->kind == EX_LT ||
+		             e->kind == EX_GT || e->kind == EX_LE || e->kind == EX_GE;
 		if (is_float_type(lt) || is_float_type(rt)) {
 			if (lt.kind != rt.kind || !is_float_type(lt))
 				die(e->line, "a numeric operator needs two operands of the same type (no mixed Int/Float or Float32/Float64 — cast explicitly)");
-			int is_cmp = e->kind == EX_EQ || e->kind == EX_NE || e->kind == EX_LT ||
-			             e->kind == EX_GT || e->kind == EX_LE || e->kind == EX_GE;
 			return (Type){is_cmp ? TY_INT : lt.kind, NULL, NULL, 0, NULL};
+		}
+		if (is_fixed_type(lt) || is_fixed_type(rt)) {
+			/* Both operands must be the SAME fixed-width type (no mixed widths/signedness, and
+			 * no Int mixed in — §5 same-type operands, §4 cast explicitly). Arithmetic yields
+			 * that type; a comparison yields Int (0/1). */
+			if (!types_equal(lt, rt))
+				die(e->line, "a numeric operator needs two operands of the same fixed-width type (no mixed widths/signedness or `Int` — cast explicitly)");
+			return is_cmp ? (Type){TY_INT, NULL, NULL, 0, NULL} : lt;
 		}
 		expect_int(prog, fn, e->lhs);
 		expect_int(prog, fn, e->rhs);
 		return (Type){TY_INT, NULL, NULL, 0, NULL};
 	}
 	case EX_REM:
-	case EX_BOR: case EX_BXOR: case EX_BAND: case EX_SHL: case EX_SHR:
+	case EX_BOR: case EX_BXOR: case EX_BAND: case EX_SHL: case EX_SHR: {
+		/* `%`, bitwise, and shift are integer-only; operands are both the SAME fixed-width type
+		 * (yielding it) or both Int. A shift's count shares the operand type in cfcc (§5). ⚠ cf0
+		 * must NOT inherit: an over-wide shift COUNT (≥ the register width, e.g. `Uint8 << 33`)
+		 * follows the hardware's count-masking (33 mod 32 for a `w`), not a width-relative or
+		 * defined-zero rule — a genesis reliance on raw arm64 (counts ≤ width wrap correctly via
+		 * canon_fixed; type_system does not yet pin overlarge-shift semantics). */
+		Type lt = typeof_expr(prog, fn, e->lhs);
+		Type rt = typeof_expr(prog, fn, e->rhs);
+		if (is_fixed_type(lt) || is_fixed_type(rt)) {
+			if (!types_equal(lt, rt))
+				die(e->line, "a `%`/bitwise/shift operator needs two operands of the same fixed-width type (cast explicitly)");
+			return lt;
+		}
+		expect_int(prog, fn, e->lhs);
+		expect_int(prog, fn, e->rhs);
+		return (Type){TY_INT, NULL, NULL, 0, NULL};
+	}
 	case EX_AND: case EX_OR:
-		/* `%`, bitwise, shift, and logical are integer-only. */
+		/* Logical `&&`/`||` are Int-only (truthiness) — a fixed value must be cast to Int. */
 		expect_int(prog, fn, e->lhs);
 		expect_int(prog, fn, e->rhs);
 		return (Type){TY_INT, NULL, NULL, 0, NULL};
@@ -6962,21 +7011,27 @@ static void typecheck(Program *prog) {
 
 /* The QBE word instruction for a binary op. Comparisons are signed and yield a
  * 0/1 word; `>>` is arithmetic (sar). div/rem are signed. */
-/* The QBE mnemonic for an arithmetic/bitwise/shift op. Type-agnostic — the result type
- * on the `=<t>` selects the operation (float `add` on a `d`, integer `add` on a `w`);
- * `div`/`rem` are the signed integer forms and float `div` on a `d`. */
-static const char *arith_mnemonic(ExprKind k) {
+/* The QBE mnemonic for an arithmetic/bitwise/shift op. The result register type on the
+ * `=<t>` selects the width (float `add` on a `d`, integer `add` on a `w`). `is_signed`
+ * picks the signed/unsigned form of the operations that differ by signedness: `div`/`udiv`,
+ * `rem`/`urem`, and right-shift `sar` (arithmetic)/`shr` (logical). Callers pass `is_signed=1`
+ * for a signed Int or a float (a float `div` is the signed spelling — its rem/shr never occur).
+ * ⚠ cf0 must NOT inherit (pre-existing, shared by Int and fixed-width): DIVIDE/REM BY ZERO is
+ * left to raw arm64 — `x / 0` yields 0 (matches type_system §5.6) but `x % 0` yields the
+ * DIVIDEND (arm64 computes `rem = x - (x/0)*0 = x`), whereas §5.6 defines `x % 0 == 0`. A later
+ * brick guards it (§5.6 wants `/0`/`%0` == 0 on all targets); cfcc does not yet. */
+static const char *arith_mnemonic(ExprKind k, int is_signed) {
 	switch (k) {
 	case EX_ADD: return "add";
 	case EX_SUB: return "sub";
 	case EX_MUL: return "mul";
-	case EX_DIV: return "div";
-	case EX_REM: return "rem";
+	case EX_DIV: return is_signed ? "div" : "udiv";
+	case EX_REM: return is_signed ? "rem" : "urem";
 	case EX_BOR: return "or";
 	case EX_BXOR: return "xor";
 	case EX_BAND: return "and";
 	case EX_SHL: return "shl";
-	case EX_SHR: return "sar";
+	case EX_SHR: return is_signed ? "sar" : "shr";
 	default: die(0, "internal: not an arithmetic op"); return NULL;
 	}
 }
@@ -6985,16 +7040,16 @@ static const char *arith_mnemonic(ExprKind k) {
  * the SIGNED integer conditions (`cslt…`) for a word/long and the ORDERED float conditions
  * (`clt…`, no signedness) for a `s`/`d`; equality is `ceq`/`cne`. Float `ceq`/`clt` follow
  * IEEE (NaN compares unequal / unordered), which type_system §5 mandates. */
-static void cmp_mnemonic(ExprKind k, char oq, char *buf, size_t cap) {
+static void cmp_mnemonic(ExprKind k, char oq, int is_signed, char *buf, size_t cap) {
 	int fp = oq == 's' || oq == 'd';
 	const char *cond;
 	switch (k) {
 	case EX_EQ: cond = "eq"; break;
 	case EX_NE: cond = "ne"; break;
-	case EX_LT: cond = fp ? "lt" : "slt"; break;
-	case EX_GT: cond = fp ? "gt" : "sgt"; break;
-	case EX_LE: cond = fp ? "le" : "sle"; break;
-	case EX_GE: cond = fp ? "ge" : "sge"; break;
+	case EX_LT: cond = fp ? "lt" : is_signed ? "slt" : "ult"; break;
+	case EX_GT: cond = fp ? "gt" : is_signed ? "sgt" : "ugt"; break;
+	case EX_LE: cond = fp ? "le" : is_signed ? "sle" : "ule"; break;
+	case EX_GE: cond = fp ? "ge" : is_signed ? "sge" : "uge"; break;
 	default: die(0, "internal: not a comparison op"); cond = NULL;
 	}
 	snprintf(buf, cap, "c%s%c", cond, oq);
@@ -7033,6 +7088,24 @@ typedef struct {
 	Defer defers[MAX_DEFERS];
 	int ndefers;
 } Emit;
+
+/* Re-canonicalize a freshly-computed fixed-width result. An 8/16-bit op leaves its result
+ * in a full `w` register whose high bits may not match the type's width (e.g. `Uint8(200) +
+ * Uint8(100)` computes 300 in the `w`); a sub-word type must WRAP to its width (2's-complement
+ * — type_system §5.6 "integer overflow wraps"), so sign/zero-extend from `bits` back into the
+ * `w`. A 32/64-bit result already fills its `w`/`l` canonically, and a non-fixed result is
+ * left untouched. `src` is the raw result operand; returns the canonical operand (in `buf` if
+ * an extend was emitted, else `src` unchanged). */
+static const char *canon_fixed(FILE *out, Emit *ex, Type t, const char *src, char *buf, size_t cap) {
+	if (t.kind != TY_FIXED || t.bits >= 32)
+		return src;
+	const char *ext = t.bits == 16 ? (t.is_signed ? "extsh" : "extuh")
+	                               : (t.is_signed ? "extsb" : "extub");
+	int r = ex->tmp++;
+	fprintf(out, "\t%%t%d =w %s %s\n", r, ext, src);
+	snprintf(buf, cap, "%%t%d", r);
+	return buf;
+}
 
 /* The module's string table: every EX_STR literal, assigned a stable index
  * (`Expr.strid`) by a pre-emit walk. Each becomes two module data defs — the raw
@@ -7750,14 +7823,20 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		char a[96];
 		emit_expr(out, e->lhs, ex, a, sizeof a);
 		int t = ex->tmp++;
-		/* neg (word or float); ~x is `xor x, -1`; !x is `x == 0` (0/1). */
+		/* neg (word/long/float); ~x is `xor x, -1` at the operand width; !x is `x == 0` (0/1). */
 		if (e->kind == EX_NEG)
 			fprintf(out, "\t%%t%d =%c neg %s\n", t, qtype_of(e->lhs->rtype), a);
 		else if (e->kind == EX_BNOT)
-			fprintf(out, "\t%%t%d =w xor %s, -1\n", t, a);
-		else
+			fprintf(out, "\t%%t%d =%c xor %s, -1\n", t, qtype_of(e->lhs->rtype), a);
+		else { /* EX_LNOT — Int-only (typecheck), a 0/1 word */
 			fprintf(out, "\t%%t%d =w ceqw %s, 0\n", t, a);
-		snprintf(dst, cap, "%%t%d", t);
+			snprintf(dst, cap, "%%t%d", t);
+			return;
+		}
+		/* `-x`/`~x` on a sub-word fixed type must wrap back to its width. */
+		char raw[32], cbuf[32];
+		snprintf(raw, sizeof raw, "%%t%d", t);
+		snprintf(dst, cap, "%s", canon_fixed(out, ex, e->rtype, raw, cbuf, sizeof cbuf));
 		return;
 	}
 	case EX_ADD:
@@ -7782,18 +7861,24 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		int t = ex->tmp++;
 		/* Both operands share a type (typecheck); pick the QBE operand type from the LHS. A
 		 * comparison yields a word via a type-suffixed `c…` mnemonic; arithmetic yields the
-		 * operand type. */
+		 * operand type. Signedness selects `div`/`udiv`, `rem`/`urem`, `sar`/`shr`, and the
+		 * `cslt`/`cult` family — a signed Int or a float uses the signed spelling. */
 		char oq = qtype_of(e->lhs->rtype);
+		int is_signed = is_int_scalar(e->lhs->rtype) ? int_scalar_signed(e->lhs->rtype) : 1;
 		int is_cmp = e->kind == EX_EQ || e->kind == EX_NE || e->kind == EX_LT ||
 		             e->kind == EX_GT || e->kind == EX_LE || e->kind == EX_GE;
 		if (is_cmp) {
 			char m[16];
-			cmp_mnemonic(e->kind, oq, m, sizeof m);
-			fprintf(out, "\t%%t%d =w %s %s, %s\n", t, m, a, b);
+			cmp_mnemonic(e->kind, oq, is_signed, m, sizeof m);
+			fprintf(out, "\t%%t%d =w %s %s, %s\n", t, m, a, b); /* result is a 0/1 word — already canonical */
+			snprintf(dst, cap, "%%t%d", t);
 		} else {
-			fprintf(out, "\t%%t%d =%c %s %s, %s\n", t, oq, arith_mnemonic(e->kind), a, b);
+			fprintf(out, "\t%%t%d =%c %s %s, %s\n", t, oq, arith_mnemonic(e->kind, is_signed), a, b);
+			/* Wrap a sub-word fixed-width result back to its width (no-op for Int/Uarch/float). */
+			char raw[32], cbuf[32];
+			snprintf(raw, sizeof raw, "%%t%d", t);
+			snprintf(dst, cap, "%s", canon_fixed(out, ex, e->rtype, raw, cbuf, sizeof cbuf));
 		}
-		snprintf(dst, cap, "%%t%d", t);
 		return;
 	}
 	}
