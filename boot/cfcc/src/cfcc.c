@@ -1091,14 +1091,28 @@ static int param_is_word(const Param *p) {
 /* True if a type is a floating-point scalar (Float32/Float64). */
 static int is_float_type(Type t) { return t.kind == TY_F32 || t.kind == TY_F64; }
 
-/* True if a type is a fixed-width integer leaf (IntN/UintN — see TY_FIXED). */
+/* True if a type is a fixed-width integer leaf (IntN/UintN/Iarch — see TY_FIXED). */
 static int is_fixed_type(Type t) { return t.kind == TY_FIXED; }
+
+/* True if a type is `Iarch` — the pointer-width signed default, a TY_FIXED(64,signed) tagged
+ * is_arch. Iarch is the operable default integer (once the literal-default flip lands); it is
+ * distinguished from the eight IntN/UintN leaves, which are NOT operable as conditions etc. */
+static int is_iarch(Type t) { return t.kind == TY_FIXED && t.is_arch; }
+
+/* The OPERABLE default-integer concept — the type a bare literal takes and the only integer
+ * usable bare as a condition / index / logical operand. During the Int→Iarch transition this
+ * spans BOTH the legacy 32-bit `TY_INT` and the new 64-bit `Iarch`, so a half-flipped tree
+ * stays well-typed; once every producer emits Iarch, the TY_INT arm becomes dead. */
+static int is_operable_int(Type t) { return t.kind == TY_INT || is_iarch(t); }
 
 /* Build a fixed-width integer Type from its width, signedness, and arch flag. */
 static Type mk_fixed(int bits, int is_signed, int is_arch) {
 	Type t = {TY_FIXED, NULL, NULL, 0, NULL, bits, is_signed, is_arch};
 	return t;
 }
+
+/* The `Iarch` Type — the pointer-width signed default (64-bit `l`). */
+static Type mk_iarch(void) { return mk_fixed(64, 1, 1); }
 
 /* If `name` is a fixed-width integer type name — the eight `Int8/16/32/64`, `Uint8/16/32/64`,
  * or `Iarch` (the pointer-width signed leaf, 64-bit `l`, nominally ≠ Int64) — fill the
@@ -1570,6 +1584,8 @@ static Type resolve_member_type(Program *prog, const char *name, int line) {
 	}
 	if (strcmp(name, "Int") == 0)
 		return (Type){TY_INT, NULL, NULL, 0, NULL};
+	if (strcmp(name, "Iarch") == 0) /* a pointer-width signed field — a 64-bit `l` in its 8-byte slot */
+		return mk_iarch();
 	if (strcmp(name, "Unit") == 0) /* `Unit`/`()` — the zero-tuple, a word `0` field/payload */
 		return (Type){TY_UNIT, NULL, NULL, 0, NULL};
 	if (name[0] == '(') {
@@ -5675,13 +5691,14 @@ static void resolve_record_literal(Program *prog, Func *fn, Expr *e, DataDecl *d
  * and a pointer never, so wherever an Int is expected this rejects them both. */
 static void expect_int(Program *prog, Func *fn, Expr *e) {
 	Type t = typeof_expr(prog, fn, e);
-	if (is_fixed_type(t)) /* a fixed-width int is not usable in a plain Int context — cast explicitly */
+	if (is_operable_int(t)) /* `Int` or `Iarch` — the operable default integer */
+		return;
+	if (is_fixed_type(t)) /* a sub-family fixed-width int is not usable in a plain Int context — cast */
 		die(e->line, "a fixed-width integer must be cast to `Int` here (`Int(x)`) — it is not usable "
 		             "directly as a condition, a logical `&&`/`||`/`!` operand, or an array index "
 		             "(fixed-width arithmetic and comparison, however, are supported)");
-	if (t.kind != TY_INT)
-		die(e->line, "expected an Int value (a record is used only via field access, "
-		             "and a string only via `.len`, in M0)");
+	die(e->line, "expected an Int value (a record is used only via field access, "
+	             "and a string only via `.len`, in M0)");
 }
 
 /* Check that value `val` matches an expected field/payload type `want` (G3a). An Int
@@ -5693,6 +5710,9 @@ static void check_member_value(Program *prog, Func *fn, Expr *val, Type want, in
 	if (want.kind == TY_INT) {
 		if (at.kind != TY_INT)
 			die(line, "expected an Int value for this field/payload");
+	} else if (is_iarch(want)) { /* an `Iarch` field/payload wants an exact `Iarch` value */
+		if (!is_iarch(at))
+			die(line, "expected an `Iarch` value for this field/payload");
 	} else if (want.kind == TY_RECORD) {
 		if (at.kind != TY_RECORD || at.rec != want.rec)
 			die(line, "field/payload type mismatch (record type differs)");
