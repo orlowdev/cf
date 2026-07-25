@@ -1362,6 +1362,9 @@ typedef struct {
 	                   * module's top-level names, so two modules' private `helper`s never collide. */
 	char names[MAX_IMPORT_NAMES][64]; /* destructured member names bound into the importer's scope */
 	int nnames;
+	char ns[64];      /* a lowercase namespace alias (`import "p" as mem` → `mem.foo()`); empty for
+	                   * the destructured form. Its members are reached qualified and rewritten to
+	                   * the module's mangled names on flatten. */
 	int line;
 } Import;
 
@@ -2301,6 +2304,59 @@ static int generic_call_ahead(Parser *p) {
 	}
 }
 
+/* Parse a call's optional explicit type arguments `[Int, Point]` and its argument list
+ * `(a, b)` into an already-built EX_CALL `e` (its callee name set), with the cursor at
+ * the leading `[` or `(`. Shared by the plain `name(…)` path and the namespace-qualified
+ * `ns.member(…)` path. */
+static void parse_call_tail(Parser *p, Func *fn, Expr *e) {
+	/* Optional explicit type arguments `f[Int, Point](…)`. A type argument is a type name
+	 * (Int/Uarch/Str/record/union) or, when the caller is itself generic, one of its type
+	 * variables (`'T`, substituted at specialization). */
+	if (peek(p)->kind == TK_LBRACKET) {
+		advance(p); /* [ */
+		for (;;) {
+			Token *ta = peek(p);
+			if (e->ntypeargs == MAX_TYPARAMS)
+				die(ta->line, "too many generic arguments");
+			if (ta->kind == TK_INT) { /* a comptime value argument `f[8](...)` */
+				if (ta->ival < 0)
+					die(ta->line, "a comptime value argument must be non-negative");
+			} else if (is_tyvar(ta) || is_type_ident(ta)) {
+				if (ta->text[ta->len - 1] == '!')
+					die(ta->line, "M0 does not support `!` in a type name");
+			} else {
+				die(ta->line, "expected a generic argument (a type name, `'T`, or a comptime value)");
+			}
+			tok_copy(ta, e->typeargs[e->ntypeargs++], sizeof e->typeargs[0]);
+			advance(p);
+			if (peek(p)->kind == TK_COMMA) {
+				advance(p);
+				continue;
+			}
+			break;
+		}
+		expect(p, TK_RBRACKET, "expected `]` to close the generic arguments");
+	}
+	expect(p, TK_LPAREN, "expected `(` for the call arguments");
+	int cap = 0;
+	if (peek(p)->kind != TK_RPAREN)
+		for (;;) {
+			if (e->nargs == cap) {
+				cap = cap ? cap * 2 : 4;
+				e->args = realloc(e->args, cap * sizeof *e->args);
+				if (!e->args)
+					die(0, "out of memory");
+			}
+			e->args[e->nargs++] = parse_expr(p, fn);
+			if (peek(p)->kind == TK_COMMA) {
+				advance(p);
+				continue;
+			}
+			break;
+		}
+	expect(p, TK_RPAREN, "expected `)`");
+}
+
 /* primary = INT | call | var_name | "(" expr ")"
  * call    = var_name "(" [ expr { "," expr } ] ")"
  * A bare name resolves to an Int parameter or local; a name followed by `(` is a
@@ -2476,52 +2532,29 @@ static Expr *parse_primary(Parser *p, Func *fn) {
 			Expr *e = new_expr(EX_CALL);
 			e->line = line;
 			tok_copy(t, e->name, sizeof e->name);
-			/* Optional explicit type arguments `f[Int, Point](…)`. A type argument is a
-			 * type name (Int/Uarch/Str/record/union) or, when the caller is itself
-			 * generic, one of its type variables (`'T`, substituted at specialization). */
-			if (peek(p)->kind == TK_LBRACKET) {
-				advance(p); /* [ */
-				for (;;) {
-					Token *ta = peek(p);
-					if (e->ntypeargs == MAX_TYPARAMS)
-						die(ta->line, "too many generic arguments");
-					if (ta->kind == TK_INT) { /* a comptime value argument `f[8](...)` */
-						if (ta->ival < 0)
-							die(ta->line, "a comptime value argument must be non-negative");
-					} else if (is_tyvar(ta) || is_type_ident(ta)) {
-						if (ta->text[ta->len - 1] == '!')
-							die(ta->line, "M0 does not support `!` in a type name");
-					} else {
-						die(ta->line, "expected a generic argument (a type name, `'T`, or a comptime value)");
-					}
-					tok_copy(ta, e->typeargs[e->ntypeargs++], sizeof e->typeargs[0]);
-					advance(p);
-					if (peek(p)->kind == TK_COMMA) {
-						advance(p);
-						continue;
-					}
-					break;
-				}
-				expect(p, TK_RBRACKET, "expected `]` to close the generic arguments");
-			}
-			expect(p, TK_LPAREN, "expected `(` for the call arguments");
-			int cap = 0;
-			if (peek(p)->kind != TK_RPAREN)
-				for (;;) {
-					if (e->nargs == cap) {
-						cap = cap ? cap * 2 : 4;
-						e->args = realloc(e->args, cap * sizeof *e->args);
-						if (!e->args)
-							die(0, "out of memory");
-					}
-					e->args[e->nargs++] = parse_expr(p, fn);
-					if (peek(p)->kind == TK_COMMA) {
-						advance(p);
-						continue;
-					}
-					break;
-				}
-			expect(p, TK_RPAREN, "expected `)`");
+			parse_call_tail(p, fn, e);
+			return e;
+		}
+		/* A namespace value call `ns.member(args)` — a name followed by `.member(`. The
+		 * callee is stored as the qualified string `ns.member`; the flatten arc rewrites it
+		 * to the imported module's mangled name (`import "…" as ns`). Checked BEFORE the plain
+		 * EX_VAR path so the namespace alias — which is neither a local, param, nor function —
+		 * is not rejected here as an unknown name; a genuinely bad `ns` surfaces at typecheck
+		 * as an unknown callee. (A generic namespace call `ns.member[T](…)` is a later slice.) */
+		if (peek(p)->kind == TK_DOT && p->toks[p->pos + 1].kind == TK_IDENT &&
+		    !is_type_ident(&p->toks[p->pos + 1]) && p->toks[p->pos + 2].kind == TK_LPAREN) {
+			Token *mt = &p->toks[p->pos + 1];
+			if (mt->text[mt->len - 1] == '!')
+				die(mt->line, "M0 does not support `!` in a name here");
+			Expr *e = new_expr(EX_CALL);
+			e->line = line;
+			int w = snprintf(e->name, sizeof e->name, "%.*s.%.*s",
+			                 t->len, t->text, mt->len, mt->text);
+			if (w < 0 || (size_t)w >= (int)sizeof e->name)
+				die(line, "qualified name too long");
+			advance(p); /* . */
+			advance(p); /* member */
+			parse_call_tail(p, fn, e);
 			return e;
 		}
 		Expr *e = new_expr(EX_VAR);
@@ -4889,8 +4922,9 @@ static void rename_group(const Renames *r, ParamGroup *g) {
 
 /* import_decl = [ "pub" ] "import" string "as" import_alias   (ebnf § Imports).
  * Parses one import into an `Import`. Only the destructured value form
- * (`as { foo, Point }`) is honoured in this slice; the namespace forms and `pub
- * import` reexports parse far enough to raise a clear "not supported yet". */
+ * (`as { foo, Point }`) and the lowercase VALUE namespace (`as mem` → `mem.foo()`)
+ * are honoured; the PascalCase type namespace and `pub import` reexports parse far
+ * enough to raise a clear "not supported yet". */
 static Import parse_import(Parser *p) {
 	Import im = {0};
 	im.line = peek(p)->line;
@@ -4937,9 +4971,17 @@ static Import parse_import(Parser *p) {
 		if (im.nnames == 0)
 			die(im.line, "an import list cannot be empty");
 	} else if (peek(p)->kind == TK_IDENT) {
-		die(peek(p)->line, "a namespace import (`as name`) is not supported yet (use `as { … }`)");
+		/* A namespace alias: lowercase `as mem` binds the module's VALUES, reached `mem.foo()`.
+		 * The PascalCase type namespace (`as Math` → `Math.Point`) is a later slice. */
+		Token *a = peek(p);
+		if (is_type_ident(a))
+			die(a->line, "a type namespace (`as Name`) is not supported yet (use lowercase `as name` or `as { … }`)");
+		if (a->text[a->len - 1] == '!')
+			die(a->line, "M0 does not support `!` in a namespace alias");
+		tok_copy(a, im.ns, sizeof im.ns);
+		advance(p);
 	} else {
-		die(peek(p)->line, "expected `{ … }` after `as`");
+		die(peek(p)->line, "expected a namespace alias or `{ … }` after `as`");
 	}
 
 	/* Mangling prefix: the path with every non-identifier char folded to '_', plus a
@@ -9306,6 +9348,22 @@ static int decl_pubness(Program *prog, const char *name) {
 	return -1;
 }
 
+/* Append a `from` → `to` entry to the importer alias map, rejecting a duplicate `from`
+ * (a name imported twice). Both must fit a Rename buffer. */
+static void add_alias(Rename **aliases, int *n, const char *from, const char *to, int line) {
+	if (strlen(from) >= sizeof (*aliases)[0].from || strlen(to) >= sizeof (*aliases)[0].to)
+		die(line, "imported name too long");
+	for (int a = 0; a < *n; a++)
+		if (strcmp((*aliases)[a].from, from) == 0)
+			die(line, "the same name is imported more than once");
+	*aliases = realloc(*aliases, (*n + 1) * sizeof **aliases);
+	if (!*aliases)
+		die(0, "out of memory");
+	snprintf((*aliases)[*n].from, sizeof (*aliases)[*n].from, "%s", from);
+	snprintf((*aliases)[*n].to, sizeof (*aliases)[*n].to, "%s", to);
+	(*n)++;
+}
+
 /* Flatten every module imported by the main file into `prog` — the `resolved` arc
  * (order_of_compilation §Resolve & flatten), in the reduced form this slice covers:
  * single-level, destructured, non-generic value functions and record/union/group types.
@@ -9341,6 +9399,10 @@ static void flatten_imports(const char *main_path, Program *prog, Import *imps, 
 	 * under two statements loads and appends it only once. */
 	char loaded[MAX_IMPORTS][128];
 	int nloaded = 0;
+
+	/* Namespace aliases in use (`import … as mem`), so the same alias is not bound twice. */
+	char nsused[MAX_IMPORTS][64];
+	int nnsused = 0;
 
 	for (int k = 0; k < nimps; k++) {
 		Import *im = &imps[k];
@@ -9401,7 +9463,28 @@ static void flatten_imports(const char *main_path, Program *prog, Import *imps, 
 			snprintf(loaded[nloaded++], sizeof loaded[0], "%s", im->prefix);
 		}
 
-		/* Bind each requested name to its mangled target — an exported (`pub`) function OR
+		if (im->ns[0]) {
+			/* Namespace import (`import "p" as mem`): expose every exported VALUE of the module
+			 * as a qualified `mem.name`, keyed to the module's mangled function. A member is
+			 * reached only through the alias, so a private function stays hidden. (Lowercase
+			 * namespaces are values-only; the type namespace `as Math` is a later slice.) */
+			for (int u = 0; u < nnsused; u++)
+				if (strcmp(nsused[u], im->ns) == 0)
+					die(im->line, "the same namespace alias is used by two imports");
+			snprintf(nsused[nnsused++], sizeof nsused[0], "%s", im->ns);
+			size_t plen = strlen(im->prefix);
+			for (int i = 0; i < prog->nfuncs; i++) {
+				Func *f = prog->funcs[i];
+				if (!f->is_pub || strncmp(f->name, im->prefix, plen) != 0)
+					continue;
+				char key[128];
+				if (snprintf(key, sizeof key, "%s.%s", im->ns, f->name + plen) >= (int)sizeof key)
+					die(im->line, "qualified name too long");
+				add_alias(&aliases, &naliases, key, f->name, im->line);
+			}
+		}
+
+		/* Bind each destructured name to its mangled target — an exported (`pub`) function OR
 		 * type of the module. The mangled target is simply prefix + name. */
 		for (int j = 0; j < im->nnames; j++) {
 			char target[128];
@@ -9413,15 +9496,7 @@ static void flatten_imports(const char *main_path, Program *prog, Import *imps, 
 				die(im->line, "the module exports no such name (unknown import)");
 			if (!pub)
 				die(im->line, "imported name is not exported (`pub`) by the module");
-			for (int a = 0; a < naliases; a++)
-				if (strcmp(aliases[a].from, im->names[j]) == 0)
-					die(im->line, "the same name is imported more than once");
-			aliases = realloc(aliases, (naliases + 1) * sizeof *aliases);
-			if (!aliases)
-				die(0, "out of memory");
-			snprintf(aliases[naliases].from, sizeof aliases[naliases].from, "%s", im->names[j]);
-			snprintf(aliases[naliases].to, sizeof aliases[naliases].to, "%s", target);
-			naliases++;
+			add_alias(&aliases, &naliases, im->names[j], target, im->line);
 		}
 	}
 
