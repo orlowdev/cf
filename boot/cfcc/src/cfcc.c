@@ -554,8 +554,10 @@ struct Func; /* forward: an EX_CALL caches its resolved callee for emit */
 typedef enum {
 	TY_INT,    /* a 32-bit word `w`. Since the Int→Iarch default flip, NO source value has this
 	            * type — the operable default integer is `Iarch` (a 64-bit `l`, TY_FIXED+is_arch),
-	            * and a bare literal, an `Int`/`Iarch` cast, a comparison/`!` result, `.len`, an
-	            * array/tuple element, an `Int` field/param, and the `main` return are all Iarch.
+	            * and a bare literal, an `Iarch` cast, a comparison/`!` result, `.len`, an
+	            * array/tuple element, an `Iarch` field/param, and the `main` return are all Iarch.
+	            * The name `Int` itself is now the signed NUMERIC UNION bound (§8.6), NOT a value
+	            * type (see is_numeric_union_name) — `Iarch` is the concrete pointer-width default.
 	            * TY_INT survives ONLY as a vestige: the still-`w` slot of a `for`-loop's hidden
 	            * index counter, TY_UNIT's word `0` sibling in is_operable_int, and dead switch
 	            * arms. `is_operable_int` = TY_INT ‖ Iarch keeps them interchangeable so any
@@ -660,14 +662,16 @@ typedef struct {
 	int is_arch;    /* TY_FIXED: 1 = `Iarch` (the pointer-width signed leaf) — a NOMINALLY
 	                 * distinct type from `Int64` (§2) though it shares Int64's 64-bit `l`
 	                 * representation; distinguished only in types_equal. 0 for the eight IntN/UintN.
-	                 * `Iarch` is now cfcc's OPERABLE DEFAULT integer (§3): a bare literal, `Int`/
-	                 * `Iarch` casts, params/fields/returns, `.len`, comparison, and array/tuple
-	                 * elements are all Iarch, and it is fully usable as a condition/index and an
-	                 * aggregate field. `Int` is a surface ALIAS for it (see the TY_INT comment).
-	                 * ⚠ cf0 must NOT inherit: in real cf `Int` is the SIGNED UNION {Int8,Int16,
-	                 * Int32,Int64,Iarch} (§8.6), a bound — not a concrete alias for Iarch; cfcc's
-	                 * alias is a TEMPORARY intermediate the numeric-union brick replaces (so cfcc
-	                 * cannot `match` on `Int` nor subsume a narrower width into it yet). */
+	                 * `Iarch` is cfcc's OPERABLE DEFAULT integer (§3): a bare literal, an `Iarch`
+	                 * cast, params/fields/returns, `.len`, comparison, and array/tuple elements are
+	                 * all Iarch, and it is fully usable as a condition/index and an aggregate field.
+	                 * The name `Int` is now the SIGNED NUMERIC UNION bound {Int8,Int16,Int32,Int64,
+	                 * Iarch} (§8.6, is_numeric_union_name), rejected as a value type — so `Iarch`
+	                 * (not `Int`) is how you name the concrete default. ⚠ cf0 must NOT inherit:
+	                 * narrowing a numeric-bounded `'T` by `match Int.Int8(v)` — the comptime
+	                 * type-switch (§8.3/§8.5) — is DEFERRED to a follow-up brick; cfcc's
+	                 * numeric-bounded generic body operates on `'T` only by cast (`Iarch(x)`),
+	                 * and a `match` on a width/fixed value is cleanly rejected (not a union). */
 } Type;
 
 /* The entry ABI kinds an M0 `main` parameter can take: a word (Int, e.g. argc)
@@ -1116,6 +1120,13 @@ static int is_iarch(Type t) { return t.kind == TY_FIXED && t.is_arch; }
  * spans BOTH the legacy 32-bit `TY_INT` and the new 64-bit `Iarch`, so a half-flipped tree
  * stays well-typed; once every producer emits Iarch, the TY_INT arm becomes dead. */
 static int is_operable_int(Type t) { return t.kind == TY_INT || is_iarch(t); }
+
+/* True if `name` is a std NUMERIC-UNION name (`Int`/`Uint`/`Number`, §8.6). These are generic
+ * BOUNDS only — there is no runtime `Int` value (a bare literal is `Iarch`, a width names a
+ * concrete type) — so they are rejected wherever a concrete value type is expected. */
+static int is_numeric_union_name(const char *name) {
+	return strcmp(name, "Int") == 0 || strcmp(name, "Uint") == 0 || strcmp(name, "Number") == 0;
+}
 
 /* Build a fixed-width integer Type from its width, signedness, and arch flag. */
 static Type mk_fixed(int bits, int is_signed, int is_arch) {
@@ -1596,8 +1607,11 @@ static Type resolve_member_type(Program *prog, const char *name, int line) {
 			return (Type){TY_PTR, pd, NULL, 0, NULL};
 		die(line, "a pointer type `*T` points to a record or union, not a scalar or unknown type (§6.4)");
 	}
-	if (strcmp(name, "Int") == 0 || strcmp(name, "Iarch") == 0) /* `Int` aliases `Iarch` — a 64-bit `l` field in its 8-byte slot */
+	if (strcmp(name, "Iarch") == 0) /* the operable default integer field — a 64-bit `l` in its 8-byte slot */
 		return mk_iarch();
+	if (is_numeric_union_name(name)) /* `Int`/`Uint`/`Number` are bounds, not field types */
+		die(line, "a numeric union (`Int`/`Uint`/`Number`) is a generic bound, not a value type — "
+		          "name a width (`Iarch`, `Int32`, …) for a field/payload");
 	if (strcmp(name, "Unit") == 0) /* `Unit`/`()` — the zero-tuple, a word `0` field/payload */
 		return (Type){TY_UNIT, NULL, NULL, 0, NULL};
 	if (name[0] == '(') {
@@ -1650,8 +1664,10 @@ static TupleDecl *resolve_tuple_shape(Program *prog, char names[][64], int n, in
 	Type elems[MAX_FIELDS];
 	for (int j = 0; j < n; j++) {
 		const char *tn = names[j];
-		if (strcmp(tn, "Int") == 0 || strcmp(tn, "Iarch") == 0) {
-			elems[j] = mk_iarch(); /* `Int` aliases `Iarch` — a 64-bit `l` element */
+		if (strcmp(tn, "Iarch") == 0) {
+			elems[j] = mk_iarch(); /* the operable default integer element — a 64-bit `l` */
+		} else if (is_numeric_union_name(tn)) {
+			die(line, "a numeric union (`Int`/`Uint`/`Number`) is a generic bound, not a tuple element type — name a width");
 		} else if (strcmp(tn, "Str") == 0) {
 			elems[j] = (Type){TY_STR, NULL, NULL, 0, NULL};
 		} else if (strcmp(tn, "Unit") == 0) { /* the unit element `Unit`/`()` — a word `0` */
@@ -2054,11 +2070,14 @@ static void parse_param_type(Parser *p, Param *out) {
 		out->fn_ret = fret;
 		return;
 	}
-	if (is_ident(t, "Int") || is_ident(t, "Iarch")) { /* `Int` aliases `Iarch` — the operable default param */
+	if (is_ident(t, "Iarch")) { /* the operable default integer param (a 64-bit `l`) */
 		advance(p);
 		out->kind = PK_WORD;
 		return;
 	}
+	if (is_numeric_union_name(tok_str(t))) /* `Int`/`Uint`/`Number` are BOUNDS, not value types (§8.6) */
+		die(t->line, "a numeric union (`Int`/`Uint`/`Number`) is a generic bound, not a value type — "
+		             "name a width (`Iarch`, `Int32`, `Uarch`, …) for a parameter");
 	if (is_ident(t, "Uarch")) {
 		advance(p);
 		out->kind = PK_UARCH;
@@ -2491,8 +2510,8 @@ static Expr *parse_primary(Parser *p, Func *fn) {
 		 * should warn, not reject. */
 		char castnm[64];
 		tok_copy(t, castnm, sizeof castnm);
-		if ((is_ident(t, "Int") || is_ident(t, "Uarch") || is_ident(t, "Float64") ||
-		     is_ident(t, "Float32") || is_fixed_type_name(castnm)) &&
+		if ((is_ident(t, "Uarch") || is_ident(t, "Float64") || is_ident(t, "Float32") ||
+		     is_fixed_type_name(castnm) || is_numeric_union_name(castnm)) &&
 		    p->toks[p->pos + 1].kind == TK_LPAREN) {
 			Expr *e = new_expr(EX_CAST);
 			e->line = t->line;
@@ -3276,12 +3295,12 @@ static int parse_return_type(Parser *p, Func *fn) {
 		fn->ret_is_ptr = 1;
 	} else if (is_type_ident(rt)) {
 		fn->ret_line = rt->line;
-		if (is_ident(rt, "Int"))
-			advance(p);
-		else { /* Uarch, a record/union type, or a generic application `Box[Int]` (G3b) */
-			parse_type_arg(p, fn->ret_type_name, sizeof fn->ret_type_name);
-			consume_member_type_suffix(p, fn->ret_type_name, rt->line); /* `Maybe[Int].Just` → the union */
-		}
+		if (is_numeric_union_name(tok_str(rt))) /* `Int`/`Uint`/`Number` are bounds, not return types */
+			die(rt->line, "a numeric union (`Int`/`Uint`/`Number`) is a generic bound, not a value type — "
+			              "a return type names a width (`Iarch`, `Int32`, …)");
+		/* Uarch, Iarch, a record/union type, or a generic application `Box[Iarch]` (G3b) */
+		parse_type_arg(p, fn->ret_type_name, sizeof fn->ret_type_name);
+		consume_member_type_suffix(p, fn->ret_type_name, rt->line); /* `Maybe[Iarch].Just` → the union */
 	} else {
 		die(rt->line, "expected a return type after `:`");
 	}
@@ -3496,21 +3515,22 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 				if (have_lit)
 					bufsize = (int)litN;
 				is_buf = 1;
-			} else if (is_ident(et, "Int") || is_ident(et, "Iarch")) {
-				/* A `[N Int]`/`[N Iarch]` fixed array (`Int` aliases `Iarch`). cfcc's array length
+			} else if (is_ident(et, "Iarch")) {
+				/* A `[N Iarch]` fixed array (the operable default element). cfcc's array length
 				 * must be a literal (a value-parameter length rides only the `[n Uint8]` buffer path). */
 				if (!have_lit)
-					die(et->line, "a `[N Int]` array length must be a literal (a value-parameter length is only for `[n Uint8]` buffers in M1)");
+					die(et->line, "a `[N Iarch]` array length must be a literal (a value-parameter length is only for `[n Uint8]` buffers in M1)");
 				advance(p);
 				arrlen = (int)litN;
 				is_arr = 1;
 			} else {
-				die(et->line, "M0 `[N …]` holds `Uint8` (a byte buffer) or `Int` (a fixed array)");
+				die(et->line, "M0 `[N …]` holds `Uint8` (a byte buffer) or `Iarch` (a fixed array)");
 			}
 			expect(p, TK_RBRACKET, "expected `]` to close the `[N …]` type");
 		} else if (is_type_ident(tt)) {
-			if (is_ident(tt, "Int")) {
-				advance(p);
+			if (is_numeric_union_name(tok_str(tt))) {
+				die(tt->line, "a numeric union (`Int`/`Uint`/`Number`) is a generic bound, not a value type — "
+				              "a local names a width (`Iarch`, `Int32`, …) or is inferred (`const x = 5` is `Iarch`)");
 			} else if (is_ident(tt, "Str")) {
 				is_str = 1;
 				advance(p);
@@ -4052,8 +4072,8 @@ static Func *parse_func(Parser *p, Program *prog) {
 			} else if (lead[0] && nx->kind == TK_IDENT && !is_type_ident(nx)) {
 				/* a comptime value parameter `Type name`; cfcc carries it as an integer
 				 * literal, so its type must be `Int` or `Uarch`. */
-				if (strcmp(lead, "Int") != 0 && strcmp(lead, "Iarch") != 0 && strcmp(lead, "Uarch") != 0)
-					die(nx->line, "a comptime value parameter must be typed `Int`/`Iarch` or `Uarch`");
+				if (strcmp(lead, "Iarch") != 0 && strcmp(lead, "Uarch") != 0)
+					die(nx->line, "a comptime value parameter must be typed `Iarch` or `Uarch`");
 				if (nx->text[nx->len - 1] == '!')
 					die(nx->line, "M0 does not support `!` in a value parameter name");
 				tok_copy(nx, fn->typarams[fn->ntyparams], sizeof fn->typarams[0]);
@@ -4963,8 +4983,20 @@ static void subst_value_stmts(Stmt *s, char names[][64], long *vals, int nv) {
 /* Reclassify a `'T` parameter to the concrete kind of its type argument. A record or
  * union name stays PK_RECORD (resolve_signatures reclassifies a union to PK_UNION). */
 static void reclassify_param(Param *p, const char *concrete, int line) {
-	if (strcmp(concrete, "Int") == 0 || strcmp(concrete, "Iarch") == 0) { /* `Int` aliases `Iarch` */
+	int fb, fs, fa;
+	if (strcmp(concrete, "Iarch") == 0) { /* the operable default (an `Int` alias) */
 		p->kind = PK_WORD;
+	} else if (fixed_name_bits_signed(concrete, &fb, &fs, &fa)) {
+		/* a fixed-width leaf type argument (Int8..Uint64, or Iarch caught above) — e.g. a
+		 * `[Int 'T]`/`[Number 'T]` bound instantiated with a concrete width. */
+		p->kind = fa ? PK_WORD : PK_FIXED; /* Iarch → PK_WORD; the eight IntN/UintN → PK_FIXED */
+		p->bits = fb;
+		p->is_signed = fs;
+		p->is_arch = fa;
+	} else if (strcmp(concrete, "Float64") == 0) {
+		p->kind = PK_F64;
+	} else if (strcmp(concrete, "Float32") == 0) {
+		p->kind = PK_F32;
 	} else if (strcmp(concrete, "Uarch") == 0) {
 		p->kind = PK_UARCH;
 	} else if (strcmp(concrete, "Unit") == 0) {
@@ -4973,6 +5005,9 @@ static void reclassify_param(Param *p, const char *concrete, int line) {
 		die(line, "a type argument of `Str` is not supported (M0 has no Str parameters)");
 	} else if (concrete[0] == '\'') {
 		die(line, "internal: unsubstituted type variable in a type argument");
+	} else if (is_numeric_union_name(concrete)) {
+		die(line, "a numeric union (`Int`/`Uint`/`Number`) is a generic bound, not a type argument — "
+		          "pass a concrete width (`Iarch`, `Int32`, …)");
 	} else {
 		p->kind = PK_RECORD; /* a record or union name; resolved in resolve_signatures */
 		snprintf(p->type_name, sizeof p->type_name, "%s", concrete);
@@ -5000,14 +5035,41 @@ static void concretize_name(Program *prog, char *name, int line); /* forward (mu
  * per-instantiation checking: an unused template's bound is not checked (its body is not
  * typechecked either). ⚠ cf0 does real union-membership + sub-union subsumption (§8.2);
  * this reflexive-only rule is the disclaimed genesis narrowing.
- * ⚠ cf0 must NOT inherit a second narrowing: cfcc has no std numeric unions (§8.6) —
- *   `Int`/`Uarch`/`Str`/`Uint8` are builtins and `Uint`/`Float`/`Number` are absent — so the
- *   spec's canonical bounds `[Int 'T]`/`[Number 'T]` are NOT valid bounds here (they error
- *   "not a union"). cf0 restores Int/Uint/Float/Number as unions and accepts those bounds. */
+ * ⚠ cf0 must NOT inherit: `Float` is still absent (cfcc has no `Float` union), so `[Float 'T]`
+ *   is not a valid bound here; and a bound is restricted to a bare union NAME (no generic-union
+ *   application before the tick, §8.5). The std numeric unions `Int`/`Uint`/`Number` (§8.6) ARE
+ *   now real bounds — see numeric_bound_admits. */
+
+/* The std numeric unions (§8.6) recognised as generic BOUNDS. They are bounds ONLY (there is no
+ * runtime `Int`/`Uint`/`Number` value — a bound restricts a `'T`, §2/§8.6). */
+static int is_numeric_bound(const char *b) {
+	return strcmp(b, "Int") == 0 || strcmp(b, "Uint") == 0 || strcmp(b, "Number") == 0;
+}
+
+/* True if `arg` (a concrete type-argument name) is a member of the numeric union `bound`:
+ * `Int` = the signed leaves {Int8,Int16,Int32,Int64,Iarch}; `Uint` = the unsigned
+ * {Uint8,Uint16,Uint32,Uint64,Uarch}; `Number` = all twelve (both + Float32/Float64). */
+static int numeric_bound_admits(const char *bound, const char *arg) {
+	int b, s, a, leaf = fixed_name_bits_signed(arg, &b, &s, &a); /* IntN/UintN/Iarch */
+	int uarch = strcmp(arg, "Uarch") == 0;
+	int flt = strcmp(arg, "Float32") == 0 || strcmp(arg, "Float64") == 0;
+	if (strcmp(bound, "Int") == 0)    return leaf && s;              /* a signed leaf (Iarch is signed) */
+	if (strcmp(bound, "Uint") == 0)   return (leaf && !s) || uarch;  /* an unsigned leaf, or Uarch */
+	if (strcmp(bound, "Number") == 0) return leaf || uarch || flt;   /* any numeric leaf */
+	return 0;
+}
+
 static void check_bound_satisfied(Program *prog, const char *bound, const char *arg, int line) {
 	if (bound[0] == '\0')
 		return; /* unbounded `'T` — any type argument */
 	char msg[320];
+	if (is_numeric_bound(bound)) { /* a std numeric union bound (§8.6): real member check */
+		if (!numeric_bound_admits(bound, arg)) {
+			snprintf(msg, sizeof msg, "type argument `%s` is not a member of the numeric union `%s`", arg, bound);
+			die(line, msg);
+		}
+		return;
+	}
 	if (!prog_find_union(prog, bound)) {
 		snprintf(msg, sizeof msg, "a generic bound must name a union type (`%s` is not a union)", bound);
 		die(line, msg);
@@ -6311,8 +6373,9 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		int b, sgn, arch;
 		if (fixed_name_bits_signed(e->name, &b, &sgn, &arch))
 			return mk_fixed(b, sgn, arch);
-		if (strcmp(e->name, "Int") == 0) /* `Int(x)` — `Int` is a surface alias for `Iarch` (the default) */
-			return mk_iarch();
+		if (is_numeric_union_name(e->name)) /* `Int(x)`/`Uint(x)`/`Number(x)` — a union bound is not a cast target */
+			die(e->line, "a numeric union (`Int`/`Uint`/`Number`) is a generic bound, not a value type — "
+			             "cast to a width (`Iarch(x)`, `Int32(x)`, …)");
 		TypeKind tk = strcmp(e->name, "Uarch") == 0 ? TY_UARCH
 		            : strcmp(e->name, "Float64") == 0 ? TY_F64
 		            : strcmp(e->name, "Float32") == 0 ? TY_F32
