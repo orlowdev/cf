@@ -200,11 +200,11 @@ list of values; **tuples** are the **paren** literal `(…)` (see Types). The ar
 concrete kind (fixed vs dynamic) is a **type** decision resolved by inference or
 annotation, not by the parser:
 
-- all elements the same type, or no annotation → fixed array (`[1, 2, 3]` → `[3 Arch]`)
+- all elements the same type, or no annotation → fixed array (`[1, 2, 3]` → `[3 Iarch]`)
 - empty (`[]`) or an explicit `[Type]` annotation → dynamic array
 
 A **tuple** is written with parentheses and is heterogeneous — each position keeps
-its own type (`(1, true)` → `(Arch, Bool)`).
+its own type (`(1, true)` → `(Iarch, Bool)`).
 
 The three kinds are genuinely distinct — the difference is **iterability and how
 they may be indexed**. Arrays use the `[n]` bracket access; a tuple uses the same
@@ -1079,7 +1079,7 @@ pub const syscall6 = (Uarch num, Uarch a0, Uarch a1, Uarch a2,
     ret
 "
 
-pub const write = (Arch fd, *[Uint8] buf, Uarch n): Uarch ->  (* ordinary C! atop it *)
+pub const write = (Iarch fd, *[Uint8] buf, Uarch n): Uarch ->  (* ordinary C! atop it *)
   syscall6(4, fd, buf, n, 0, 0, 0)
 ```
 
@@ -1485,14 +1485,14 @@ it without a call.
   whether or not the body allocates. The entry is `main`, full stop. (Allocation
   still happens inside, in the page geometry below — the name just carries no
   signal no one consumes.)
-- **Signature.** The entry returns an `Arch` exit code and takes the process
+- **Signature.** The entry returns an `Iarch` exit code and takes the process
   arguments and environment. All three are **optional by arity** — the runtime
   supplies as many as the signature declares:
 
   ```
   pub const main = () -> 0                                       # no args
-  pub const main = (Arch argc, *[Str] argv) -> { return 0 }      # argc + argv
-  pub const main = (Arch argc, *[Str] argv, *[Str] envp) -> {    # + environment
+  pub const main = (Iarch argc, *[Str] argv) -> { return 0 }      # argc + argv
+  pub const main = (Iarch argc, *[Str] argv, *[Str] envp) -> {    # + environment
     return 0
   }
   ```

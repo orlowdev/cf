@@ -5065,7 +5065,7 @@ static void concretize_name(Program *prog, char *name, int line) {
 	/* ⚠ cfcc requires EXPLICIT type arguments at every generic-type use, INCLUDING a value
 	 * construction (`Maybe[Int].Just(5)`, not `Maybe.Just(5)`) — constructor-argument
 	 * inference is deferred. cf0 must NOT inherit this: type_system §8.1/§5.1 infer the member
-	 * at the construction site (`Maybe.Just(1) : Maybe[Arch].Just`), and seed_subset §4 keeps
+	 * at the construction site (`Maybe.Just(1) : Maybe[Iarch].Just`), and seed_subset §4 keeps
 	 * generics-with-inference in full. cfcc infers args for a function CALL (shallow path) but
 	 * demands them for a construction — a genesis narrowing that rejects, never miscompiles. */
 	DataDecl *d = prog_find_data(prog, name);

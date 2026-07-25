@@ -54,20 +54,20 @@ with four fixed widths plus a pointer-width member:
 | `Int16` | `Uint16` | 16 bits |
 | `Int32` | `Uint32` | 32 bits |
 | `Int64` | `Uint64` | 64 bits |
-| `Arch`  | `Uarch`  | the target's pointer width |
+| `Iarch`  | `Uarch`  | the target's pointer width |
 
-- **`Arch`/`Uarch` are pointer-width** — the natural word of the target (64-bit on
+- **`Iarch`/`Uarch` are pointer-width** — the natural word of the target (64-bit on
   cf0's sole target `arm64-apple-darwin`), the types for addresses, sizes, and
-  counts. `Arch` is a *distinct type* from `Int64` even where they share a
+  counts. `Iarch` is a *distinct type* from `Int64` even where they share a
   representation (like Rust's `isize` vs `i64`): pointer-width is a semantic
-  property, not "64", so a move between them is an explicit conversion (§4). `Arch`
+  property, not "64", so a move between them is an explicit conversion (§4). `Iarch`
   is also the **default type of an unannotated integer literal** (§3).
 - **`Int`/`Uint` are the *unions*, not concrete types.** `Int` is the std union of
   all signed widths, `Uint` of all unsigned, defined in §8:
-  `Int = { Int8, Int16, Int32, Int64, Arch }` and likewise `Uint`. They are the
+  `Int = { Int8, Int16, Int32, Int64, Iarch }` and likewise `Uint`. They are the
   **generic bounds** ("any signed integer"), never a runtime value type — a
   `[Int 'T]` function is parametric over one width, monomorphized (§5.4, §8). There
-  is no bare `Int` value; everyday code names a width (`Arch`, `Int32`, …).
+  is no bare `Int` value; everyday code names a width (`Iarch`, `Int32`, …).
 - **Each width is an intrinsic type carrying its constructor** —
   `pub intrinsic type Uint8 = (Number value) -> Uint8` — so `Uint8(x)` is the cast
   (§4), and the argument bound `Number` (§8) rejects `Uint8("hi")` cleanly.
@@ -188,8 +188,8 @@ write(1, buf, n)         # a literal argument takes the parameter's type
   *arithmetic* over already-typed literals is not re-range-checked; it wraps like any
   other overflow (§2.1, §5.6), so `const Uint8 x = 200 + 100` is `44`, not an error.
 - **Default type when none is supplied.** A bare literal with no annotation and no
-  typed context takes a **default concrete type**: an integer literal is `Arch` (the
-  machine word — §2.1), a float literal is `Float64`. So `const x = 5` is `Arch` and
+  typed context takes a **default concrete type**: an integer literal is `Iarch` (the
+  machine word — §2.1), a float literal is `Float64`. So `const x = 5` is `Iarch` and
   `const x = 3.14` is `Float64`. Every *other* width is user-specified — you annotate
   (`const Int32 x = 5`) or reach a typed context only when you want a non-default
   width. This is the Go model (word-size int, double float): the defaults exist so
@@ -199,10 +199,10 @@ write(1, buf, n)         # a literal argument takes the parameter's type
   only expected type is a numeric union — `Int`, `Uint`, `Number`, `Float` — the
   literal cannot pick a width from the union (its members each have their own
   representation), so it takes the **default concrete member**, chosen so it is always
-  a member of *that* union: a signed or `Number` integer → `Arch`, an integer whose
-  union is the unsigned family `Uint` → `Uarch`, a float → `Float64` (`Arch ∈ Int,
+  a member of *that* union: a signed or `Number` integer → `Iarch`, an integer whose
+  union is the unsigned family `Uint` → `Uarch`, a float → `Float64` (`Iarch ∈ Int,
   Number`; `Uarch ∈ Uint`; `Float64 ∈ Float`). `const Number n = 5` resolves the
-  literal to its `Arch` member and the binding's value **is** that plain `Arch`;
+  literal to its `Iarch` member and the binding's value **is** that plain `Iarch`;
   default resolution never fabricates a runtime union box out of thin air, so a literal
   is operable at its default width without a `match`. Where such a member *later*
   reaches a genuinely union-typed position — a `Number` parameter, a `Number`-annotated
@@ -214,7 +214,7 @@ write(1, buf, n)         # a literal argument takes the parameter's type
   of arithmetic over untyped literals (`const Int8 y = 5 + 3` types both `5` and
   `3`, and the result, as `Int8`); a literal combined with an already-typed value
   takes that value's type; two untyped literals with no expected type each take the
-  default (`Arch`/`Float64`). The full propagation/unification mechanics are
+  default (`Iarch`/`Float64`). The full propagation/unification mechanics are
   §5.2/§5.6; the rule here is only that a literal never invents a *non-default* type.
 
 A **float literal** (`3.14` — decimal with a point) follows the same rules: it takes
@@ -241,7 +241,7 @@ structural record typing) are §7.
 
 Conversions between distinct types are **explicit**. There is **no implicit**
 widening, narrowing, or signedness change: an `Int32` does not silently become an
-`Int64`, an `Int32` does not silently become a `Uint32` (nor `Arch` an `Int64`), and
+`Int64`, an `Int32` does not silently become a `Uint32` (nor `Iarch` an `Int64`), and
 a value never changes type by flowing into a differently-typed context. Wherever two distinct types meet and
 the language does not otherwise unify them, a written conversion is required.
 
@@ -307,12 +307,12 @@ A type annotation is required exactly where a type cannot be synthesized:
   `asm`/`intrinsic` has no body, so its return type is mandatory — [[ebnf.md]].)
 - **`const`/`let` locals** may omit the type iff the initializer **synthesizes** a
   concrete type: `const p = make_point()` infers `Point`, and `const x = 5`
-  synthesizes its default `Arch` (§3). But `const xs = []` (an empty aggregate with
+  synthesizes its default `Iarch` (§3). But `const xs = []` (an empty aggregate with
   no element type), or any initializer that only *checks against* an expected type
   without producing one, still requires an annotation. A member construction infers the
-**precise member type** — `let m = Maybe.Just(1)` gives `m : Maybe[Arch].Just` (§8.1);
+**precise member type** — `let m = Maybe.Just(1)` gives `m : Maybe[Iarch].Just` (§8.1);
 to hold the whole union — e.g. so a `let` may be reassigned across members — annotate
-it (`let Maybe[Arch] m = Maybe.Just(1)`), which widens by subtyping.
+it (`let Maybe[Iarch] m = Maybe.Just(1)`), which widens by subtyping.
 
 ### 5.2 Expected-type propagation (checking)
 
@@ -330,7 +330,7 @@ When a form supplies an expected type, it is pushed inward:
 
 Where no expected type is supplied, a form must synthesize its own; a numeric
 literal that reaches neither an annotation nor a typed neighbour synthesizes its
-**default** — `Arch` for an integer, `Float64` for a float (§3).
+**default** — `Iarch` for an integer, `Float64` for a float (§3).
 
 ### 5.3 Unifying branches and match arms
 
@@ -345,11 +345,11 @@ implicit conversion:
   (say `Int32`).
 - **Members of a single common union combine to that union.** Two branches whose
   types are members (or precise member types) of the **same one** union join to it —
-  `Maybe[Arch].Just` and `Maybe[Arch].Nothing` combine to `Maybe[Arch]` — with **no
+  `Maybe[Iarch].Just` and `Maybe[Iarch].Nothing` combine to `Maybe[Iarch]` — with **no
   expected type needed and no search**, because a member's home union is unique enough
   to name the join (member→union subtyping, §8). A payload-free member carrying a free
   type parameter (`Maybe.Nothing` synthesizes `Maybe[?].Nothing`) takes that parameter
-  from the constrained sibling in the same join — `Maybe[Arch]` from a `Maybe[Arch].Just`
+  from the constrained sibling in the same join — `Maybe[Iarch]` from a `Maybe[Iarch].Just`
   branch — which is unifying the one union's own argument, not a lattice search. When the members belong to **several**
   unions (a compose-over leaf like `Int8`, in both `Int` and `Number`) the join is
   ambiguous, so it happens only toward an **expected** union (annotation/param/return),
@@ -413,7 +413,7 @@ require **both operands to be the same type** — a numeric type for arithmetic,
 integer type for bitwise — and yield that type. There is no implicit conversion
 between operands: `a + b` with `a: Int32` and `b: Int64` is an error. An untyped
 literal operand adopts the other operand's type; two untyped literals stay untyped
-and take the expression's expected type, or their default `Arch`/`Float64` if none
+and take the expression's expected type, or their default `Iarch`/`Float64` if none
 (§3). Unary `-` requires a
 signed operand (§2.1), `~` an integer, both yielding the operand's type.
 
@@ -653,14 +653,14 @@ else from the expected element type (§3). The **kind** follows the context:
 - a **fixed** expected type `[N T]`, or **no annotation at all** → a **fixed array**
   `[n T]` of the literal's own comptime-known length (the length is right there in
   the literal); with `[N T]`, that length must equal `N`. The element type comes from
-  the elements, or their default (`Arch`/`Float64`, §3) when they are untyped
-  literals — so `const xs = [1, 2, 3]` is now a well-formed `[3 Arch]`;
+  the elements, or their default (`Iarch`/`Float64`, §3) when they are untyped
+  literals — so `const xs = [1, 2, 3]` is now a well-formed `[3 Iarch]`;
 - a **dynamic** expected type `[T]`, the empty literal `[]` **with no fixed expected
   type**, or a literal that flows into a growing binding → a **dynamic array** `[T]`.
   An explicit `[N T]` context always wins over the `[]`-is-dynamic default: `[]`
   checked against `[0 T]` is the fixed empty array, not a dynamic one.
 
-So `[1, 2, 3]` is `[3 Arch]` (fixed) unless a `[T]` context or growth makes it
+So `[1, 2, 3]` is `[3 Iarch]` (fixed) unless a `[T]` context or growth makes it
 dynamic.
 
 ### 7.3 Record construction and data-literal typing
@@ -689,7 +689,7 @@ way the annotation sugar `const Point p = <payload>` is `Point(<payload>)` (§6.
   named-tuple alias), the
   value is **structural** and comptime-erased. A payload literal with **no** type
   source is an error, like a bare numeric literal (§3) — a record is never anonymous
-  (and a bare `(1, 2)` with no type is just the tuple `(Arch, Arch)` by the default
+  (and a bare `(1, 2)` with no type is just the tuple `(Iarch, Iarch)` by the default
   rule of §3, not a `Point`).
 - **Named-record fields** are order-independent; each value is checked against its
   field's declared type (a literal adopts it, §3). **Puns** (`{ x }` ≡ `{ x: x }`)
@@ -782,16 +782,16 @@ A member is **constructed by application** (§6.6): `Maybe.Just(1)`,
 `Node.IntLit({ value: 5 })`, `Maybe.Nothing` (nullary — no application).
 
 A member-constructor expression **synthesizes the precise member type** —
-`Maybe.Just(1) : Maybe[Arch].Just` (the `1` taking its default, §3) — because the
+`Maybe.Just(1) : Maybe[Iarch].Just` (the `1` taking its default, §3) — because the
 member is statically known at the construction site: the value is exactly that case,
-carries no tag, and **widens to its union** (`Maybe[Arch]`) by member→union subtyping
+carries no tag, and **widens to its union** (`Maybe[Iarch]`) by member→union subtyping
 (§8.2) wherever a union is expected (an annotation, param, return, or unification
 against a sibling member). This is what lets a signature state a *precise* result —
 `f() Maybe[Int32].Just` returns **only** `Just`, never `Nothing` — and lets the
 compiler carry that exact case through for codegen (no tag, no dispatch). It also
 still lets sibling-member branches unify with no annotation:
-`match x { A -> Maybe.Just(1), B -> Maybe.Nothing }` is `Maybe[Arch]` — the two
-precise member types `Maybe[Arch].Just` and `Maybe[Arch].Nothing` join to their
+`match x { A -> Maybe.Just(1), B -> Maybe.Nothing }` is `Maybe[Iarch]` — the two
+precise member types `Maybe[Iarch].Just` and `Maybe[Iarch].Nothing` join to their
 **single common union** with no lattice search, since each lives only in `Maybe`
 (§5.3). The member-type spelling carries the container's instantiation:
 **`Maybe[Int32].Just`** (the parameter sits on `Maybe`), or **`Tree.Node[Int32]`**
@@ -935,7 +935,7 @@ first.
 The union system offers two ways to give a union its members: **declare them inline**
 (reachable only through the union — §8.1), or **declare each type separately and reuse
 it** inside the union (compose-over). The **numeric** unions use the *latter* — every
-width (`Int8`, `Int32`, `Arch`, …) is a **standalone, directly-usable type**
+width (`Int8`, `Int32`, `Iarch`, …) is a **standalone, directly-usable type**
 (`const Int32 x = …`) the union merely composes over, so the widths are first-class on
 their own and the union just adds the "any of them" bound. **`Bool` uses the former** —
 `False` and `True` are **inline nullary singletons**, reached only qualified
@@ -943,7 +943,7 @@ their own and the union just adds the "any of them" bound. **`Bool` uses the for
 member set is:
 
 ```
-pub union Int    = { Int8, Int16, Int32, Int64, Arch }
+pub union Int    = { Int8, Int16, Int32, Int64, Iarch }
 pub union Uint   = { Uint8, Uint16, Uint32, Uint64, Uarch }
 pub union Float  = { Float32, Float64 }
 pub union Number = { ...Int, ...Uint, ...Float }        # union (∪) of all 12 leaves
