@@ -6484,6 +6484,8 @@ static void desugar_group_calls(Program *prog) {
 
 static Type typeof_expr(Program *prog, Func *fn, Expr *e);
 static Type func_ret_type(const Func *fn);
+static int is_fresh_producer(const Expr *e);  /* forward: aggregate if/match/loop merge freshness gate */
+static int is_aggregate_pointer(Type t);      /* forward: a record/tuple/boxed-union `l` pointer */
 static void resolve_record_literal(Program *prog, Func *fn, Expr *e, DataDecl *d);
 
 /* A numeric comptime TYPE-SWITCH: `match x { Int.Int8(v) -> …, Int.Iarch(v) -> … }` on a
@@ -6684,8 +6686,14 @@ static Type loop_yield_type(Program *prog, Func *fn, Stmt *body) {
 		if (s->kind != ST_YIELD)
 			continue;
 		Type yt = typeof_expr(prog, fn, s->yval);
-		if (!is_mergeable_scalar(yt))
-			die(s->line, "a value-yielding loop yields a scalar value (an aggregate yield is a later brick)");
+		if (!is_mergeable_scalar(yt)) {
+			/* A `<- v` may yield an aggregate (record/tuple/boxed-union pointer) if it builds a
+			 * FRESH value — no aliasing of mutable storage through the merge (§6). */
+			if (!is_aggregate_pointer(yt))
+				die(s->line, "a value-yielding loop yields a scalar or aggregate value");
+			if (!is_fresh_producer(s->yval))
+				die(s->line, "an aggregate `<- v` must build a FRESH value (a call or construction)");
+		}
 		if (!have) {
 			rt = yt;
 			have = 1;
@@ -6694,6 +6702,41 @@ static Type loop_yield_type(Program *prog, Func *fn, Stmt *body) {
 		}
 	}
 	return rt;
+}
+
+/* True if `e` produces a FRESH aggregate — its OWN new arena allocation — so binding or merging
+ * its pointer creates no second owner of existing storage (the memory_model §6 survivability rule
+ * the owner pinned for the Str alias). A call returns a fresh record (the return rule forbids
+ * returning a bare param); a construction (`Point({…})`, `U.Member(…)`, a tuple, `Str(…)`) allocates;
+ * an `if`/`match` is fresh IFF every branch/arm is; a defer tap forwards its tapped arg (fresh iff
+ * that is). A bare var / field access ALIASES existing storage and is NOT fresh. Used to gate an
+ * aggregate value flowing through an `if`/`match`/loop merge (each branch must be fresh — else the
+ * merge would alias a mutable aggregate). ⚠ cf0 must NOT inherit: cf0's memory arc rehomes/copies an
+ * aliased aggregate; cfcc simply requires freshness (a strict, sound subset). */
+static int is_fresh_producer(const Expr *e) {
+	switch (e->kind) {
+	case EX_CALL: case EX_RECORD: case EX_UMEMBER: case EX_TUPLE: case EX_STRNEW:
+		return 1;
+	case EX_DEFER: /* a defer tap forwards its tapped argument unchanged */
+		return e->lhs && e->lhs->nargs > 0 && is_fresh_producer(e->lhs->args[e->lhs->nargs - 1]);
+	case EX_IF:
+		return is_fresh_producer(e->rhs) && is_fresh_producer(e->els);
+	case EX_MATCH:
+		for (int i = 0; i < e->narms; i++)
+			if (!is_fresh_producer(e->arms[i].body))
+				return 0;
+		return e->narms > 0;
+	default:
+		return 0;
+	}
+}
+
+/* An aggregate that is an `l` arena pointer and so CAN merge through the 8-byte `%m` slot (storel/
+ * loadl) exactly like a Str — a record, a tuple, or a BOXED (payload) union. A tag-only union is a
+ * word (already a mergeable scalar); a by-value aggregate is only mergeable when every branch is a
+ * fresh producer (see is_fresh_producer), which the if/match typecheck enforces. */
+static int is_aggregate_pointer(Type t) {
+	return t.kind == TY_RECORD || t.kind == TY_TUPLE || (t.kind == TY_UNION && t.uni->has_payload);
 }
 
 /* Compute and validate the type of an expression, resolving field accesses and
@@ -7221,13 +7264,18 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 					}
 				}
 			}
-			/* Arm bodies unify to one type — any mergeable scalar (Int/tag-only union/
-			 * Uarch/float); that type is the match's value type. An arm yielding an
-			 * aggregate (a boxed union, record, or tuple pointer, which the plain merge
-			 * slot doesn't model for value semantics) is a later brick. */
+			/* Arm bodies unify to one type — a mergeable scalar, or an aggregate (boxed union/
+			 * record/tuple `l` pointer) merged through the `%m` slot like a scalar. An aggregate
+			 * arm must build a FRESH value (a call/construction), so the merged pointer never
+			 * aliases a mutable aggregate (§6 survivability). */
 			Type bt = typeof_expr(prog, fn, a->body);
-			if (!is_mergeable_scalar(bt))
-				die(a->line, "a match arm yields a scalar value (an aggregate result is a later brick)");
+			if (!is_mergeable_scalar(bt)) {
+				if (!is_aggregate_pointer(bt))
+					die(a->line, "a match arm yields a scalar or aggregate value");
+				if (!is_fresh_producer(a->body))
+					die(a->line, "an aggregate-valued match arm must build a FRESH value (a call or "
+					             "construction) — a bare aggregate variable would alias it (§6)");
+			}
 			if (!have_rt) {
 				rt = bt;
 				have_rt = 1;
@@ -7276,8 +7324,16 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		expect_bool(prog, fn, e->lhs); /* condition */
 		Type tb = typeof_expr(prog, fn, e->rhs); /* then */
 		Type eb = typeof_expr(prog, fn, e->els); /* else */
-		if (!is_mergeable_scalar(tb))
-			die(e->line, "an if-branch yields a scalar value (an aggregate result is a later brick)");
+		if (!is_mergeable_scalar(tb)) {
+			/* An aggregate (record/tuple/boxed-union — an `l` arena pointer) merges through the
+			 * `%m` slot like a scalar, but only if BOTH branches build a FRESH value, so the merged
+			 * pointer never aliases a mutable aggregate (§6 survivability). */
+			if (!is_aggregate_pointer(tb))
+				die(e->line, "an if-branch yields a scalar or aggregate value");
+			if (!is_fresh_producer(e->rhs) || !is_fresh_producer(e->els))
+				die(e->line, "an aggregate-valued if needs BOTH branches to build a FRESH value "
+				             "(a call or construction) — a bare aggregate variable would alias it (§6)");
+		}
 		if (!types_equal(tb, eb))
 			die(e->line, "an if's `then` and `else` branches must yield the same type");
 		return tb;
@@ -7636,10 +7692,10 @@ static void resolve_record_expr_binding(Program *prog, Func *fn, Stmt *s) {
 	 * `defer` tap forwards its tapped argument unchanged, so it is fresh exactly when that
 	 * argument is (`of(N) |> defer destroy` binds the fresh arena, schedules its teardown).
 	 * (A data literal takes the resolve_record_binding path.) */
-	Expr *fresh = s->expr->kind == EX_DEFER ? s->expr->lhs->args[s->expr->lhs->nargs - 1] : s->expr;
-	if (fresh->kind != EX_CALL)
-		die(s->line, "a record binding's initializer must be a fresh record (a record-returning call); "
-		             "aliasing existing record storage needs an explicit copy — not in M0");
+	if (!is_fresh_producer(s->expr))
+		die(s->line, "a record binding's initializer must be a fresh record (a record-returning call, "
+		             "or a fresh-branch `if`/`match`); aliasing existing record storage needs an "
+		             "explicit copy — not in M0");
 	set_local_rec(fn, s->name, d);
 }
 
@@ -7749,6 +7805,22 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 				 * interned tuple and homes in the arena via `%r_<name>`. */
 				Type it = typeof_expr(prog, fn, s->expr);
 				set_local_tuple(fn, s->name, it.tup);
+			} else if (s->expr->kind == EX_IF || s->expr->kind == EX_MATCH) {
+				/* `const p = if/match …` — infer the local's type from the merged value (typeof
+				 * validates fresh aggregate branches / a mergeable scalar) and retype the
+				 * provisional word local so its slot and reads use the right width/repr. An
+				 * aggregate result adopts the merged fresh arena pointer (like a call result). */
+				Type it = typeof_expr(prog, fn, s->expr);
+				if (it.kind == TY_RECORD)
+					set_local_record_type(fn, s->name, it.rec);
+				else if (it.kind == TY_TUPLE)
+					set_local_tuple(fn, s->name, it.tup);
+				else if (it.kind == TY_UNION)
+					set_local_union(fn, s->name, it.uni);
+				else if (it.kind == TY_STR)
+					set_local_str(fn, s->name);
+				else if (it.kind != TY_INT) /* a 64-bit scalar (Iarch/Uarch/fixed/float) — retype from the provisional word */
+					set_local_scalar(fn, s->name, it);
 			} else if (s->expr->kind == EX_INDEX) {
 				/* `const a = t[k]` (also a destructuring's desugared element binding): an Int
 				 * position stays a word local; a Str position retypes to a Str local; a record
