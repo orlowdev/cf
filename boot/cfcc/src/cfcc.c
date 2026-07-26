@@ -3878,10 +3878,13 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 			 * construction. Str is IMMUTABLE, so aliasing one is memory-safe (no freshness rule
 			 * needed). `const`-only (`let Str` reassignment is a later brick). typecheck verifies TY_STR.
 			 * ⚠ cf0 must NOT inherit: binding an existing Str VAR/param/field to a new name is an
-			 * ALIAS, which type_system §6's no-second-bind rule forbids for aggregates (cf0 requires
-			 * an explicit `copy`, or `"${s}"` interpolation). cfcc leans on Str immutability — the
-			 * same disclaimed genesis shortcut as the bare-union-var / bare-tuple-var aliases. (A
-			 * §6 carve-out exempting immutable Str is an owner call — surfaced to 谢尔盖.) */
+			 * ALIAS, which type_system §6's no-second-bind rule forbids. §6 is about a value's
+			 * SURVIVABILITY under multiple pointers (ownership/teardown — the memory arc), NOT
+			 * mutability: a tag-only union is a bare SCALAR word (no pointer, so aliasing it is a
+			 * non-issue — why the bare-union-var shortcut is benign), but a Str is a POINTER to a
+			 * header + borrowed bytes, a real multi-pointer aggregate the arc governs — so this IS a
+			 * genuine second-bind. cfcc allows it (no `copy`/arc); cf0 requires an explicit `copy`
+			 * (or `"${s}"`). Owner ruling (谢尔盖): KEEP DISCLAIMED — no §6 carve-out. */
 			if (mutable)
 				die(name->line, "a Str local must be `const` (M0 has no Str reassignment)");
 			s->expr = parse_expr(p, fn);
@@ -6612,9 +6615,11 @@ static void check_member_value(Program *prog, Func *fn, Expr *val, Type want, in
 			die(line, "a `*[Iarch]` field needs a word array or a `*[Iarch]` value");
 	} else if (want.kind == TY_STR) {
 		/* A `Str` field/payload — an immutable `l` header pointer. A bare Str value (literal, var,
-		 * param, field, call) is accepted: Str is immutable, so aliasing is memory-safe (no
-		 * freshness rule), exactly like the bare-union-var payload shortcut. ⚠ cf0 must NOT inherit:
-		 * a Str field from an existing Str VAR aliases it — cf0 rehomes/copies the aggregate (§6). */
+		 * param, field, call) is accepted: aliasing is memory-safe here (no freshness rule), like
+		 * the bare-union-var payload shortcut. ⚠ cf0 must NOT inherit: a Str field from an existing
+		 * Str VAR is a genuine §6 second-bind — a Str is a POINTER-carrying aggregate (not a scalar
+		 * word like a tag-only union), so §6's survivability-under-multiple-pointers rule applies;
+		 * cf0 rehomes/copies the aggregate. */
 		if (at.kind != TY_STR)
 			die(line, "expected a `Str` value for this field/payload");
 	} else {
