@@ -5023,30 +5023,143 @@ static Import parse_import(Parser *p) {
 	return im;
 }
 
-/* module = { module_item } — imports and declarations in any order (ebnf § Modules).
- * A declaration is a `data` record, a `union`, a `type` (grouped params), or a
- * `[pub] const` function; an import is collected into `imps` for the flatten. The
- * `pub const main` entry check is deferred to check_entry (run after flatten), since
- * an imported module has no `main` of its own. */
+static void parse_module_item(Parser *p, Program *prog, Import *imps, int *nimps); /* forward */
+
+/* Evaluate a module-level comptime `if` condition against cfcc's FIXED target (darwin/arm64):
+ * `os.target OP Os.Variant` or `arch.target OP Arch.Variant`, OP ∈ { ==, != }. The `os`/`arch`
+ * namespaces and `Os`/`Arch` types are the compiler-supplied "comptime" module; cfcc's target
+ * is fixed, so `os.target` is `Darwin` and `arch.target` is `Arm64`.
+ * ⚠ cf0 must NOT inherit the hardcoded target or the restricted condition grammar — cf0
+ * evaluates a general comptime expression against the real target triple (seed_subset §3/§7). */
+static int parse_comptime_cond(Parser *p) {
+	Token *nt = peek(p);
+	if (nt->kind != TK_IDENT || is_type_ident(nt))
+		die(nt->line, "a comptime `if` condition reads `os.target` or `arch.target`");
+	char ns[64];
+	tok_copy(nt, ns, sizeof ns);
+	advance(p);
+	const char *actual;
+	if (strcmp(ns, "os") == 0)
+		actual = "Darwin";
+	else if (strcmp(ns, "arch") == 0)
+		actual = "Arm64";
+	else
+		die(nt->line, "a comptime condition reads `os.target` or `arch.target` (cfcc's target is fixed darwin/arm64)");
+	expect(p, TK_DOT, "expected `.target` in a comptime condition");
+	if (!is_ident(peek(p), "target"))
+		die(peek(p)->line, "a comptime condition reads the `.target` field");
+	advance(p);
+	int want_eq;
+	if (peek(p)->kind == TK_EQEQ)
+		want_eq = 1;
+	else if (peek(p)->kind == TK_NE)
+		want_eq = 0;
+	else
+		die(peek(p)->line, "a comptime condition compares with `==` or `!=`");
+	advance(p);
+	if (!is_type_ident(peek(p)))
+		die(peek(p)->line, "a comptime condition compares against a variant like `Os.Darwin`");
+	advance(p); /* the union type name (`Os` / `Arch`) — its member is what matters */
+	expect(p, TK_DOT, "expected `.Variant` in a comptime condition");
+	Token *vt = peek(p);
+	if (!is_type_ident(vt))
+		die(vt->line, "expected a variant name after `.`");
+	char variant[64];
+	tok_copy(vt, variant, sizeof variant);
+	advance(p);
+	int eq = strcmp(variant, actual) == 0;
+	return want_eq ? eq : !eq;
+}
+
+/* Parse a comptime-`if` branch — a single module item, or a braced group of them — into
+ * `prog`/`imps` when `live`, else into a throwaway (the losing branch dissolves, so its
+ * imports are never resolved). */
+static void parse_module_branch(Parser *p, Program *prog, Import *imps, int *nimps, int live) {
+	Program junk = {0};
+	Import *ti = imps;
+	int njunk = 0, *tn = nimps;
+	Program *tp = prog;
+	if (!live) {
+		tp = &junk;
+		ti = xmalloc(MAX_IMPORTS * sizeof *ti); /* discarded; heap so nesting doesn't bloat the stack */
+		tn = &njunk;
+	}
+	if (peek(p)->kind == TK_LBRACE) {
+		advance(p); /* { */
+		skip_newlines(p);
+		while (peek(p)->kind != TK_RBRACE) {
+			if (peek(p)->kind == TK_EOF)
+				die(peek(p)->line, "unterminated `{ … }` comptime branch");
+			parse_module_item(p, tp, ti, tn);
+			skip_newlines(p);
+		}
+		advance(p); /* } */
+	} else {
+		parse_module_item(p, tp, ti, tn);
+	}
+	if (!live)
+		free(ti);
+}
+
+/* comptime_if = "if" expression "then" module_branch [ "else" module_branch ]  (ebnf § Modules).
+ * Build-time conditional compilation at the module top level: the condition is evaluated NOW
+ * (comptime), exactly one branch's items survive, and the losing branch dissolves. `else if`
+ * chains because a branch may itself be a comptime_if. A losing OUTER branch routes its whole
+ * subtree (nested ifs included) into the throwaway, so nested conditions never matter there. */
+static void parse_comptime_if(Parser *p, Program *prog, Import *imps, int *nimps) {
+	advance(p); /* `if` */
+	int cond = parse_comptime_cond(p);
+	if (!is_ident(peek(p), "then"))
+		die(peek(p)->line, "expected `then` in a comptime `if`");
+	advance(p);
+	skip_newlines(p); /* the branch may begin on the next line */
+	parse_module_branch(p, prog, imps, nimps, cond);
+	/* An `else` may sit on a following line; only consume the intervening newlines if it does. */
+	size_t save = p->pos;
+	skip_newlines(p);
+	if (is_ident(peek(p), "else")) {
+		advance(p); /* `else` */
+		skip_newlines(p);
+		parse_module_branch(p, prog, imps, nimps, !cond);
+	} else {
+		p->pos = save; /* no else — leave the newline for the module loop */
+	}
+}
+
+/* Parse one module item (an import, a declaration, or a comptime `if`) into `prog`/`imps`.
+ * `p->prog` is pointed at `prog` so a closure lifted while parsing lands in the right program
+ * (a comptime branch may parse into a throwaway). */
+static void parse_module_item(Parser *p, Program *prog, Import *imps, int *nimps) {
+	p->prog = prog;
+	if (is_ident(peek(p), "if")) { /* a top-level `if` is a comptime conditional, never a value */
+		parse_comptime_if(p, prog, imps, nimps);
+		return;
+	}
+	/* A `pub` may prefix any declaration (and a `pub import` reexport), so route on the keyword
+	 * AFTER an optional leading `pub`. */
+	Token *kw = is_ident(peek(p), "pub") ? &p->toks[p->pos + 1] : peek(p);
+	if (is_ident(kw, "import")) {
+		if (*nimps >= MAX_IMPORTS)
+			die(peek(p)->line, "too many imports");
+		imps[(*nimps)++] = parse_import(p);
+	} else if (is_ident(kw, "data"))
+		prog_add_data(prog, parse_data_decl(p, prog));
+	else if (is_ident(kw, "union"))
+		prog_add_union(prog, parse_union_decl(p, prog));
+	else if (is_ident(kw, "type"))
+		prog_add_group(prog, parse_type_decl(p, prog));
+	else
+		prog_add_func(prog, parse_func(p, prog));
+}
+
+/* module = { module_item } — imports, declarations, and comptime `if`s in any order (ebnf §
+ * Modules). The `pub const main` entry check is deferred to check_entry (run after flatten),
+ * since an imported module has no `main` of its own. */
 static void parse(Parser *p, Program *prog, Import *imps, int *nimps) {
 	p->prog = prog; /* so a closure binding can append its lifted top-level function */
 	skip_newlines(p);
 	while (peek(p)->kind != TK_EOF) {
-		/* A `pub` may prefix any declaration (and a `pub import` reexport), so route on the
-		 * keyword AFTER an optional leading `pub`. */
-		Token *kw = is_ident(peek(p), "pub") ? &p->toks[p->pos + 1] : peek(p);
-		if (is_ident(kw, "import")) {
-			if (*nimps >= MAX_IMPORTS)
-				die(peek(p)->line, "too many imports");
-			imps[(*nimps)++] = parse_import(p);
-		} else if (is_ident(kw, "data"))
-			prog_add_data(prog, parse_data_decl(p, prog));
-		else if (is_ident(kw, "union"))
-			prog_add_union(prog, parse_union_decl(p, prog));
-		else if (is_ident(kw, "type"))
-			prog_add_group(prog, parse_type_decl(p, prog));
-		else
-			prog_add_func(prog, parse_func(p, prog));
+		parse_module_item(p, prog, imps, nimps);
 		if (peek(p)->kind != TK_EOF) {
 			expect(p, TK_NEWLINE, "expected a newline between declarations");
 			skip_newlines(p);
@@ -9487,6 +9600,8 @@ static int load_module(const char *abspath) {
 	char dir[4096];
 	dir_of(abspath, dir, sizeof dir);
 	for (int k = 0; k < nimps; k++) {
+		if (strcmp(imps[k].path, "comptime") == 0)
+			continue; /* the compiler-supplied intrinsic module — no file to load */
 		char dep[4096];
 		resolve_module_path(dir, imps[k].path, imps[k].line, dep, sizeof dep);
 		load_module(dep);
@@ -9552,6 +9667,8 @@ static void build_import_aliases(const char *importer_dir, const Import *imports
 	int nnsused = 0;
 	for (int k = 0; k < nimports; k++) {
 		const Import *im = &imports[k];
+		if (strcmp(im->path, "comptime") == 0)
+			continue; /* the intrinsic comptime module binds no runtime names (only comptime-if reads it) */
 		char dep[4096];
 		resolve_module_path(importer_dir, im->path, im->line, dep, sizeof dep);
 		Module *d = NULL;
@@ -9637,6 +9754,8 @@ static void flatten_imports(const char *main_path, Program *prog, Import *imps, 
 	/* (1) DISCOVER every module reachable from the main file's imports. */
 	g_nmods = 0;
 	for (int k = 0; k < nimps; k++) {
+		if (strcmp(imps[k].path, "comptime") == 0)
+			continue; /* the compiler-supplied intrinsic module — no file to load */
 		char dep[4096];
 		resolve_module_path(maindir, imps[k].path, imps[k].line, dep, sizeof dep);
 		load_module(dep);
