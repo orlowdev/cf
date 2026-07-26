@@ -1705,6 +1705,13 @@ static TupleDecl *resolve_tuple_shape(Program *prog, char names[][64], int n, in
 
 static Type resolve_member_type(Program *prog, const char *name, int line) {
 	if (name[0] == '*') {
+		/* ⚠ cf0 must NOT inherit: only these two element-pointer field types exist here (no general
+		 * `*[T]`/slice field, unknown length, no bounds check) — see the parse_member_type disclaimer. */
+		if (strcmp(name, "*[Uint8]") == 0) /* a byte-pointer field — TY_BUF, indexable (`rec.f[i]`) */
+			return (Type){TY_BUF, NULL, NULL, 0, NULL};
+		if (strcmp(name, "*[Iarch]") == 0) { /* a word-pointer field — TY_ARRAY of unknown length */
+			return (Type){TY_ARRAY, NULL, NULL, -1, NULL};
+		}
 		/* An explicit pointer type `*Aggregate` (ebnf § Types; type_system §6.4 — a pointer
 		 * points ONLY to a record or union, never a scalar). cfcc represents it as a TY_PTR
 		 * carrying the pointee decl — the very arena pointer an aggregate value already is, so
@@ -4498,6 +4505,27 @@ static void parse_member_type(Parser *p, char *out, size_t cap) {
 		 * `*List` into a TY_PTR to the pointee. §6.4: never a scalar. */
 		advance(p); /* * */
 		Token *u = peek(p);
+		if (u->kind == TK_LBRACKET) {
+			/* `*[Uint8]` / `*[Iarch]` — a byte/word POINTER field: a borrowed reference into a
+			 * buffer/array, indexable via `rec.field[i]`. Lets a record BUNDLE a buffer + its
+			 * cursor (a Lexer, a StringBuilder) and be passed around by `*Rec`, instead of
+			 * threading the pointer/length as loose params. Stored as the marker `*[Uint8]`/
+			 * `*[Iarch]`; resolve_member_type turns it into TY_BUF / TY_ARRAY(alen<0). Other
+			 * `*[…]` (e.g. `*[Str]`) are not field types.
+			 * ⚠ cf0 must NOT inherit: cf0 admits a general slice/array field WITH a length (a
+			 * `[Uint8]`/`[T]` slice, or `*[T]` for any T, bounds-checked); cfcc has only the two
+			 * `*[Uint8]`/`*[Iarch]` element-pointer fields, unknown length, no bounds check, Iarch
+			 * index (the same narrowing set as the `*[…]` PARAM bricks). */
+			advance(p); /* [ */
+			Token *el = peek(p);
+			const char *elt = is_ident(el, "Uint8") ? "Uint8" : is_ident(el, "Iarch") ? "Iarch" : NULL;
+			if (!elt || p->toks[p->pos + 1].kind != TK_RBRACKET)
+				die(el->line, "a pointer field is `*[Uint8]` or `*[Iarch]` (a byte/word pointer into a buffer/array)");
+			advance(p); /* Uint8/Iarch */
+			advance(p); /* ] */
+			snprintf(out, cap, "*[%s]", elt);
+			return;
+		}
 		if (!is_type_ident(u))
 			die(u->line, "expected an aggregate type after `*`");
 		char pointee[64];
@@ -6534,6 +6562,17 @@ static void check_member_value(Program *prog, Func *fn, Expr *val, Type want, in
 		 * A `*T` is explicitly a reference, so no freshness rule applies — aliasing is the intent. */
 		if (at.kind != TY_PTR || (want.rec ? at.rec != want.rec : at.uni != want.uni))
 			die(line, "a `*Aggregate` field/payload needs a pointer — take the aggregate's address with `&`");
+	} else if (want.kind == TY_BUF) {
+		/* A `*[Uint8]` byte-pointer field — a borrowed reference into a buffer, indexable via
+		 * `rec.f[i]`. Takes a byte buffer / `*[Uint8]` value (BOTH resolve to TY_BUF; a reference,
+		 * so no freshness rule — aliasing the caller's bytes is the intent, like a `*Aggregate`
+		 * field). A `*Record`/`*Union` aggregate pointer (TY_PTR) is NOT a byte buffer — rejected. */
+		if (at.kind != TY_BUF)
+			die(line, "a `*[Uint8]` field needs a byte buffer or a `*[Uint8]` value");
+	} else if (want.kind == TY_ARRAY) {
+		/* A `*[Iarch]` word-pointer field (alen<0) — a borrowed reference into a word array. */
+		if (at.kind != TY_ARRAY)
+			die(line, "a `*[Iarch]` field needs a word array or a `*[Iarch]` value");
 	} else {
 		die(line, "unsupported field/payload type");
 	}
@@ -7660,17 +7699,28 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 			Resolution r = resolve_name(fn, s->name, &ty);
 			if (r == R_NONE)
 				die(s->line, "unknown name (mutate a declared record local)");
-			if (ty.kind != TY_RECORD)
+			/* The target is a record — either a by-value record (TY_RECORD) or an explicit
+			 * `*Record` pointer (TY_PTR to a record). A `*Record` is a WRITABLE BORROW: mutating
+			 * its field writes the caller's record (the "pass a `*Lexer`, advance its cursor"
+			 * pattern), so R_PARAM is allowed for a pointer target. A by-VALUE record param stays
+			 * read-only (mutate it via a `*Record` instead) — preserving the value/reference split.
+			 * ⚠ cf0 must NOT inherit: no call-site write-capability check — cfcc accepts a field-
+			 * write through a `*Record` taken from a `const` aggregate (`&c`), whereas memory_model
+			 * §6 makes `&const` and writing through it an error. Same pre-existing no-borrow-checker
+			 * laxity the index-assign path disclaims. */
+			DataDecl *trec = aggregate_record(ty);
+			if (!trec)
 				die(s->line, "field assignment `.` needs a record on the left");
-			if (r == R_PARAM)
-				die(s->line, "cannot mutate a parameter's field");
+			int through_ptr = ty.kind == TY_PTR;
+			if (r == R_PARAM && !through_ptr)
+				die(s->line, "cannot mutate a by-value parameter's field (take a `*Record` to mutate through it)");
 			if (r == R_CONST)
 				die(s->line, "cannot mutate a `const` record's field (declare it with `let`)");
-			int idx = data_field_index(ty.rec, s->field);
+			int idx = data_field_index(trec, s->field);
 			if (idx < 0)
 				die(s->line, "this data type has no such field");
 			s->foff = data_field_offset(idx);
-			check_member_value(prog, fn, s->expr, data_field_type(prog, ty.rec, idx), s->line);
+			check_member_value(prog, fn, s->expr, data_field_type(prog, trec, idx), s->line);
 			break;
 		}
 		case ST_INDEX_ASSIGN: {
@@ -9273,18 +9323,19 @@ static void emit_func(FILE *out, const Func *fn) {
 			char qt = param_qtype(&fn->params[i]);
 			fprintf(out, "\t%%s_%s =l alloc%d %d\n", n, qt == 'd' ? 8 : 4, qt == 'd' ? 8 : 4);
 			fprintf(out, "\tstore%c %%u_%s, %%s_%s\n", qt, n, n);
-		} else if ((fn->params[i].kind == PK_RECORD && !fn->params[i].is_ptr) ||
+		} else if (fn->params[i].kind == PK_RECORD ||
 		           fn->params[i].kind == PK_CAPTURE_REC || fn->params[i].kind == PK_TUPLE ||
 		           (fn->params[i].kind == PK_LONG && (fn->params[i].is_bytes || fn->params[i].is_words)) ||
 		           (fn->params[i].kind == PK_UNION && fn->params[i].uni->has_payload &&
 		            !fn->params[i].is_ptr)) {
-			/* A record, captured-record, tuple, byte-buffer (`*[Uint8]`), word-array
-			 * (`*[Iarch]`), or boxed-union param arrives as an arena pointer, copied into the
-			 * `%r_<name>` form field/index access uses. A captured record aliases the enclosing
-			 * scope's storage, so field writes there are visible; likewise a `*[Uint8]`/`*[Iarch]`
-			 * param indexes/writes the caller's bytes/words.
-			 * An explicit `*Record`/`*Union` pointer param is instead read directly as its
-			 * `%u_<name>` incoming temp (EX_VAR TY_PTR path), so it is excluded — no `%r_`. */
+			/* A record (by-value OR a `*Record` pointer), captured-record, tuple, byte-buffer
+			 * (`*[Uint8]`), word-array (`*[Iarch]`), or boxed-union param arrives as an arena
+			 * pointer, copied into the `%r_<name>` form field/index access uses. A captured
+			 * record aliases the enclosing scope's storage, so field writes there are visible;
+			 * a `*Record` param likewise is a writable borrow (field-write through `%r_` mutates
+			 * the caller's record); a `*[Uint8]`/`*[Iarch]` param indexes/writes the caller's
+			 * bytes/words. (An EX_VAR *read* of a `*Record`/`*Union` pointer still uses its
+			 * `%u_<name>` incoming temp — the same pointer — via the EX_VAR TY_PTR path.) */
 			fprintf(out, "\t%%r_%s =l copy %%u_%s\n", n, n);
 		}
 	}
