@@ -1357,9 +1357,6 @@ struct Program {
  * the `std/` root land in later slices. */
 typedef struct {
 	char path[256];   /* the import string as written, e.g. "mem" or "sub/util" (no `.cf`) */
-	char prefix[128]; /* module mangling prefix: `path` with each non-ident char → '_', plus a
-	                   * trailing '_' (so `sub/util` → `sub_util_`). Prepended to every one of the
-	                   * module's top-level names, so two modules' private `helper`s never collide. */
 	char names[MAX_IMPORT_NAMES][64]; /* destructured member names bound into the importer's scope */
 	int nnames;
 	char ns[64];      /* a namespace alias — lowercase (`import "p" as mem` → `mem.foo()`, VALUES) or
@@ -5017,18 +5014,6 @@ static Import parse_import(Parser *p) {
 	} else {
 		die(peek(p)->line, "expected a namespace alias or `{ … }` after `as`");
 	}
-
-	/* Mangling prefix: the path with every non-identifier char folded to '_', plus a
-	 * trailing '_' — `sub/util` → `sub_util_`. */
-	size_t j = 0;
-	for (size_t i = 0; im.path[i] && j + 1 < sizeof im.prefix; i++) {
-		char c = im.path[i];
-		im.prefix[j++] = (isalnum((unsigned char)c) || c == '_') ? c : '_';
-	}
-	if (j == 0 || j + 1 >= sizeof im.prefix)
-		die(im.line, "module path too long to mangle");
-	im.prefix[j++] = '_';
-	im.prefix[j] = '\0';
 	return im;
 }
 
@@ -9398,154 +9383,239 @@ static void add_alias(Rename **aliases, int *n, const char *from, const char *to
 	(*n)++;
 }
 
-/* Flatten every module imported by the main file into `prog` — the `resolved` arc
- * (order_of_compilation §Resolve & flatten), in the reduced form this slice covers:
- * single-level, destructured, non-generic value functions and record/union/group types.
- *
- * `prog` already holds the main file's declarations. For each import we: resolve its
- * path to a sibling `.cf`; parse it in isolation; prefix-mangle its own top-level names
- * (values AND types) so two modules' privates never collide; splice its declarations
- * into the whole program; and record each requested `pub` name's mangled target under
- * the name the importer bound it to. Finally we rewrite the main file's declarations
- * through those aliases. */
-static void flatten_imports(const char *main_path, Program *prog, Import *imps, int nimps) {
-	/* The main file's own declarations occupy the leading slots of each namespace;
-	 * everything appended past these belongs to an imported module. */
-	int main_funcs = prog->nfuncs, main_datas = prog->ndatas,
-	    main_unions = prog->nunions, main_groups = prog->ngroups;
+/* --------------------------------------------------- the module graph - */
 
-	/* The main file's directory — sibling module paths resolve against it. */
-	char dir[4096];
-	if (snprintf(dir, sizeof dir, "%s", main_path) >= (int)sizeof dir)
-		die(0, "input path too long");
-	char *slash = strrchr(dir, '/');
-	if (slash)
-		slash[1] = '\0'; /* keep the trailing '/' */
+#define MAX_MODULES 128
+
+/* One imported module in the flatten's registry, keyed by its CANONICAL absolute path so
+ * the same file reached by two different relative import strings (a diamond) is loaded
+ * once. `prefix` is its unique mangling prefix, assigned at registration — BEFORE the body
+ * is parsed — so an import cycle (A imports B imports A) resolves: when B's rename map is
+ * built, A's prefix already exists. `decls` holds the module's parsed declarations under
+ * their ORIGINAL names; `imports` its own imports (this is what makes imports transitive). */
+typedef struct {
+	char abspath[4096];
+	char prefix[128];
+	Program decls;
+	Import *imports;
+	int nimports;
+} Module;
+
+static Module *g_mods[MAX_MODULES];
+static int g_nmods;
+static char g_mainabs[4096]; /* the entry file's canonical path — a module may not import it */
+
+/* The directory of an absolute path, with the trailing '/' kept (empty for a bare name). */
+static void dir_of(const char *abspath, char *out, size_t cap) {
+	snprintf(out, cap, "%s", abspath);
+	char *s = strrchr(out, '/');
+	if (s)
+		s[1] = '\0';
 	else
-		dir[0] = '\0';   /* main file is in the cwd */
+		out[0] = '\0';
+}
 
-	/* The importer-scope alias map, accumulated across every import: each destructured
-	 * name → its mangled target. Applied to the main file's declarations at the end. */
-	Rename *aliases = NULL;
-	int naliases = 0;
+/* Resolve an import string to a canonical `.cf` path: `<fromdir><path>.cf` run through
+ * realpath (which also collapses `..`/`.` and symlinks, so a diamond dedups). Dies if the
+ * file does not exist. */
+static void resolve_module_path(const char *fromdir, const char *path, int line, char *out, size_t cap) {
+	char cand[4096];
+	if ((size_t)snprintf(cand, sizeof cand, "%s%s.cf", fromdir, path) >= sizeof cand)
+		die(line, "module path too long");
+	char resolved[PATH_MAX];
+	if (!realpath(cand, resolved))
+		die(line, "cannot resolve imported module (no such file?)");
+	if (snprintf(out, cap, "%s", resolved) >= (int)cap)
+		die(line, "resolved module path too long");
+}
 
-	/* Modules already flattened in, keyed by mangling prefix — importing the same path
-	 * under two statements loads and appends it only once. */
-	char loaded[MAX_IMPORTS][128];
-	int nloaded = 0;
+/* A unique, readable-ish mangling prefix for module `idx` at `abspath`: its sanitized file
+ * stem plus the index (`mem` at index 3 → `mem_3_`). The index guarantees uniqueness even
+ * when two modules share a stem. */
+static void derive_module_prefix(const char *abspath, int idx, char *out, size_t cap) {
+	const char *base = strrchr(abspath, '/');
+	base = base ? base + 1 : abspath;
+	char stem[64];
+	size_t j = 0;
+	for (const char *c = base; *c && *c != '.' && j + 1 < sizeof stem; c++)
+		stem[j++] = (isalnum((unsigned char)*c) || *c == '_') ? *c : '_';
+	stem[j] = '\0';
+	if (j == 0)
+		snprintf(stem, sizeof stem, "m");
+	if ((size_t)snprintf(out, cap, "%s_%d_", stem, idx) >= cap)
+		die(0, "module prefix too long");
+}
 
-	/* Namespace aliases in use (`import … as mem`), so the same alias is not bound twice. */
+/* Load the module at canonical `abspath` and, recursively, everything it imports; return
+ * its registry index. Registration (index + prefix) happens BEFORE the body is parsed and
+ * before recursing into dependencies, so a cycle finds this module already present and does
+ * not re-parse it. */
+static int load_module(const char *abspath) {
+	for (int i = 0; i < g_nmods; i++)
+		if (strcmp(g_mods[i]->abspath, abspath) == 0)
+			return i;
+	if (strcmp(abspath, g_mainabs) == 0)
+		die(0, "a module cannot import the entry (main) file");
+	if (g_nmods >= MAX_MODULES)
+		die(0, "too many modules imported (import graph too large)");
+	int idx = g_nmods++;
+	Module *m = xmalloc(sizeof *m);
+	memset(m, 0, sizeof *m);
+	snprintf(m->abspath, sizeof m->abspath, "%s", abspath);
+	derive_module_prefix(abspath, idx, m->prefix, sizeof m->prefix);
+	g_mods[idx] = m; /* register before parse + recurse (cycle-safe) */
+
+	Import imps[MAX_IMPORTS];
+	int nimps = 0;
+	parse_source_file(abspath, &m->decls, imps, &nimps);
+	for (int i = 0; i < m->decls.ndatas; i++)
+		if (m->decls.datas[i]->ntyparams > 0)
+			die(0, "importing a module with generic types is not supported yet");
+	for (int i = 0; i < m->decls.nunions; i++)
+		if (m->decls.unions[i]->ntyparams > 0)
+			die(0, "importing a module with generic types is not supported yet");
+	m->nimports = nimps;
+	m->imports = xmalloc((nimps ? nimps : 1) * sizeof *m->imports);
+	memcpy(m->imports, imps, (size_t)nimps * sizeof *m->imports);
+
+	char dir[4096];
+	dir_of(abspath, dir, sizeof dir);
+	for (int k = 0; k < nimps; k++) {
+		char dep[4096];
+		resolve_module_path(dir, imps[k].path, imps[k].line, dep, sizeof dep);
+		load_module(dep);
+	}
+	return idx;
+}
+
+/* Build the alias map for one importer (the main file or a module) from ITS imports: each
+ * destructured/namespace-qualified name → the mangled target in the dependency module. The
+ * dependency's exported members are read from its ORIGINAL-named `decls` and its prefix, so
+ * this is order-independent (it does not need the dependency spliced yet). Does not add the
+ * importer's own self-mangle entries (the caller does that for a module). */
+static void build_import_aliases(const char *importer_dir, const Import *imports, int nimports,
+                                 Rename **al, int *nal) {
 	char nsused[MAX_IMPORTS][64];
 	int nnsused = 0;
-
-	for (int k = 0; k < nimps; k++) {
-		Import *im = &imps[k];
-
-		int already = 0;
-		for (int i = 0; i < nloaded; i++)
-			if (strcmp(loaded[i], im->prefix) == 0) { already = 1; break; }
-
-		if (!already) {
-			char modpath[4096];
-			if (snprintf(modpath, sizeof modpath, "%s%s.cf", dir, im->path) >= (int)sizeof modpath)
-				die(im->line, "module path too long");
-
-			/* Parse the module in ISOLATION (its own Program), so its top-level names cannot
-			 * collide with the main file's — or another module's — before mangling separates
-			 * them. Two modules' private `helper`s (or `Point`s) must coexist; that is the point. */
-			Program mod = {0};
-			Import modimps[MAX_IMPORTS];
-			int nmodimps = 0;
-			parse_source_file(modpath, &mod, modimps, &nmodimps);
-
-			if (nmodimps > 0)
-				die(im->line, "an imported module that itself imports is not supported yet");
-			for (int i = 0; i < mod.ndatas; i++)
-				if (mod.datas[i]->ntyparams > 0)
-					die(im->line, "importing a module with generic types is not supported yet");
-			for (int i = 0; i < mod.nunions; i++)
-				if (mod.unions[i]->ntyparams > 0)
-					die(im->line, "importing a module with generic types is not supported yet");
-
-			/* Build the module's prefix-mangling map from EVERY one of its top-level names —
-			 * functions and types alike — capturing the originals before any rename runs (a
-			 * decl's own field/return type may reference a sibling decl, so the whole map must
-			 * exist first). Then rename each declaration and splice it into the program. */
-			int total = mod.nfuncs + mod.ndatas + mod.nunions + mod.ngroups;
-			Rename *mr = xmalloc((total ? total : 1) * sizeof *mr);
-			int m = 0;
-			for (int i = 0; i < mod.nfuncs; i++)
-				snprintf(mr[m++].from, sizeof mr[0].from, "%s", mod.funcs[i]->name);
-			for (int i = 0; i < mod.ndatas; i++)
-				snprintf(mr[m++].from, sizeof mr[0].from, "%s", mod.datas[i]->name);
-			for (int i = 0; i < mod.nunions; i++)
-				snprintf(mr[m++].from, sizeof mr[0].from, "%s", mod.unions[i]->name);
-			for (int i = 0; i < mod.ngroups; i++)
-				snprintf(mr[m++].from, sizeof mr[0].from, "%s", mod.groups[i]->name);
-			for (int i = 0; i < m; i++) {
-				int wrote = snprintf(mr[i].to, sizeof mr[i].to, "%s%s", im->prefix, mr[i].from);
-				if (wrote < 0 || (size_t)wrote >= sizeof mr[i].to)
-					die(im->line, "mangled module name too long");
-			}
-			Renames R = {mr, m};
-			for (int i = 0; i < mod.nfuncs; i++)  { rename_func(&R, mod.funcs[i]);   prog_add_func(prog, mod.funcs[i]); }
-			for (int i = 0; i < mod.ndatas; i++)  { rename_data(&R, mod.datas[i]);   prog_add_data(prog, mod.datas[i]); }
-			for (int i = 0; i < mod.nunions; i++) { rename_union(&R, mod.unions[i]); prog_add_union(prog, mod.unions[i]); }
-			for (int i = 0; i < mod.ngroups; i++) { rename_group(&R, mod.groups[i]); prog_add_group(prog, mod.groups[i]); }
-			free(mr);
-
-			snprintf(loaded[nloaded++], sizeof loaded[0], "%s", im->prefix);
-		}
+	for (int k = 0; k < nimports; k++) {
+		const Import *im = &imports[k];
+		char dep[4096];
+		resolve_module_path(importer_dir, im->path, im->line, dep, sizeof dep);
+		Module *d = NULL;
+		for (int i = 0; i < g_nmods; i++)
+			if (strcmp(g_mods[i]->abspath, dep) == 0) { d = g_mods[i]; break; }
+		if (!d)
+			die(im->line, "internal error: imported module was not discovered");
 
 		if (im->ns[0]) {
-			/* Namespace import: expose every exported member of the module as a qualified
-			 * `ns.name`, keyed to the module's mangled decl. A member is reached only through the
-			 * alias, so a private one stays hidden. A lowercase alias (`as mem`) exposes VALUES
-			 * (functions); a PascalCase alias (`as Math`) exposes TYPES (records/unions/groups). */
 			for (int u = 0; u < nnsused; u++)
 				if (strcmp(nsused[u], im->ns) == 0)
 					die(im->line, "the same namespace alias is used by two imports");
 			snprintf(nsused[nnsused++], sizeof nsused[0], "%s", im->ns);
-			size_t plen = strlen(im->prefix);
-			/* Enumerate the exported members of the requested kind by scanning the flattened
-			 * program for `pub` decls carrying this module's prefix, and add `ns.orig` → mangled. */
-			#define NS_EXPOSE(count, ispub, nm)                                                      \
-				for (int i = 0; i < (count); i++) {                                                \
-					if (!(ispub) || strncmp((nm), im->prefix, plen) != 0)                       \
-						continue;                                                          \
-					char key[128];                                                             \
-					if (snprintf(key, sizeof key, "%s.%s", im->ns, (nm) + plen) >= (int)sizeof key) \
-						die(im->line, "qualified name too long");                          \
-					add_alias(&aliases, &naliases, key, (nm), im->line);                       \
+			#define NS_EXPOSE(count, ispub, nm)                                                    \
+				for (int i = 0; i < (count); i++) {                                              \
+					if (!(ispub))                                                            \
+						continue;                                                        \
+					char key[128], tgt[128];                                                 \
+					if (snprintf(key, sizeof key, "%s.%s", im->ns, (nm)) >= (int)sizeof key)  \
+						die(im->line, "qualified name too long");                        \
+					if (snprintf(tgt, sizeof tgt, "%s%s", d->prefix, (nm)) >= (int)sizeof tgt) \
+						die(im->line, "mangled name too long");                          \
+					add_alias(al, nal, key, tgt, im->line);                                  \
 				}
 			if (im->ns_is_type) {
-				NS_EXPOSE(prog->ndatas,  prog->datas[i]->is_pub,  prog->datas[i]->name);
-				NS_EXPOSE(prog->nunions, prog->unions[i]->is_pub, prog->unions[i]->name);
-				NS_EXPOSE(prog->ngroups, prog->groups[i]->is_pub, prog->groups[i]->name);
+				NS_EXPOSE(d->decls.ndatas,  d->decls.datas[i]->is_pub,  d->decls.datas[i]->name);
+				NS_EXPOSE(d->decls.nunions, d->decls.unions[i]->is_pub, d->decls.unions[i]->name);
+				NS_EXPOSE(d->decls.ngroups, d->decls.groups[i]->is_pub, d->decls.groups[i]->name);
 			} else {
-				NS_EXPOSE(prog->nfuncs, prog->funcs[i]->is_pub, prog->funcs[i]->name);
+				NS_EXPOSE(d->decls.nfuncs, d->decls.funcs[i]->is_pub, d->decls.funcs[i]->name);
 			}
 			#undef NS_EXPOSE
 		}
 
-		/* Bind each destructured name to its mangled target — an exported (`pub`) function OR
-		 * type of the module. The mangled target is simply prefix + name. */
 		for (int j = 0; j < im->nnames; j++) {
-			char target[128];
-			int wrote = snprintf(target, sizeof target, "%s%s", im->prefix, im->names[j]);
-			if (wrote < 0 || (size_t)wrote >= sizeof target)
-				die(im->line, "mangled name too long");
-			int pub = decl_pubness(prog, target);
+			int pub = decl_pubness(&d->decls, im->names[j]);
 			if (pub < 0)
 				die(im->line, "the module exports no such name (unknown import)");
 			if (!pub)
 				die(im->line, "imported name is not exported (`pub`) by the module");
-			add_alias(&aliases, &naliases, im->names[j], target, im->line);
+			char tgt[128];
+			if (snprintf(tgt, sizeof tgt, "%s%s", d->prefix, im->names[j]) >= (int)sizeof tgt)
+				die(im->line, "mangled name too long");
+			add_alias(al, nal, im->names[j], tgt, im->line);
 		}
 	}
+}
 
-	/* A local top-level name must not clash with an imported one — the textual rewrite
-	 * cannot tell them apart, so reject the ambiguity outright. */
+/* Flatten the whole import graph reachable from the main file into `prog` — the `resolved`
+ * arc (order_of_compilation §Resolve & flatten). Imports are transitive (a module may import
+ * modules) and cycles are legal. `prog` already holds the main file's declarations.
+ *
+ * Two passes: (1) DISCOVER — load every transitively-reachable module (deduped by canonical
+ * path, each assigned a unique prefix); (2) MANGLE+SPLICE — for each module, rename its own
+ * top-level names by its prefix AND its imported references to their dependencies' mangled
+ * targets, then splice its declarations in. Finally the main file's imported references are
+ * rewritten the same way (main carries no prefix, so its own names stay bare). */
+static void flatten_imports(const char *main_path, Program *prog, Import *imps, int nimps) {
+	int main_funcs = prog->nfuncs, main_datas = prog->ndatas,
+	    main_unions = prog->nunions, main_groups = prog->ngroups;
+
+	if (!realpath(main_path, g_mainabs))
+		die(0, "cannot resolve the main source path");
+	char maindir[4096];
+	dir_of(g_mainabs, maindir, sizeof maindir);
+
+	/* (1) DISCOVER every module reachable from the main file's imports. */
+	g_nmods = 0;
+	for (int k = 0; k < nimps; k++) {
+		char dep[4096];
+		resolve_module_path(maindir, imps[k].path, imps[k].line, dep, sizeof dep);
+		load_module(dep);
+	}
+
+	/* (2a) BUILD every module's rename map — its self-mangle (own names → prefix+name) unioned
+	 * with its import aliases — plus the main file's alias map. This reads ORIGINAL names across
+	 * all modules, so it must complete BEFORE any renaming mutates a decl in place (a module's
+	 * import alias points at a dependency's original name). */
+	Rename *mmap[MAX_MODULES];
+	int mmn[MAX_MODULES];
+	for (int mi = 0; mi < g_nmods; mi++) {
+		Module *m = g_mods[mi];
+		mmap[mi] = NULL;
+		mmn[mi] = 0;
+		#define SELF(count, nm)                                                            \
+			for (int i = 0; i < (count); i++) {                                          \
+				char t[128];                                                         \
+				if (snprintf(t, sizeof t, "%s%s", m->prefix, (nm)) >= (int)sizeof t)  \
+					die(0, "mangled module name too long");                      \
+				add_alias(&mmap[mi], &mmn[mi], (nm), t, 0);                          \
+			}
+		SELF(m->decls.nfuncs,  m->decls.funcs[i]->name);
+		SELF(m->decls.ndatas,  m->decls.datas[i]->name);
+		SELF(m->decls.nunions, m->decls.unions[i]->name);
+		SELF(m->decls.ngroups, m->decls.groups[i]->name);
+		#undef SELF
+		char mdir[4096];
+		dir_of(m->abspath, mdir, sizeof mdir);
+		build_import_aliases(mdir, m->imports, m->nimports, &mmap[mi], &mmn[mi]);
+	}
+	Rename *aliases = NULL;
+	int naliases = 0;
+	build_import_aliases(maindir, imps, nimps, &aliases, &naliases);
+
+	/* (2b) APPLY each module's map to its declarations and splice them in. */
+	for (int mi = 0; mi < g_nmods; mi++) {
+		Module *m = g_mods[mi];
+		Renames RR = {mmap[mi], mmn[mi]};
+		for (int i = 0; i < m->decls.nfuncs; i++)  { rename_func(&RR, m->decls.funcs[i]);   prog_add_func(prog, m->decls.funcs[i]); }
+		for (int i = 0; i < m->decls.ndatas; i++)  { rename_data(&RR, m->decls.datas[i]);   prog_add_data(prog, m->decls.datas[i]); }
+		for (int i = 0; i < m->decls.nunions; i++) { rename_union(&RR, m->decls.unions[i]); prog_add_union(prog, m->decls.unions[i]); }
+		for (int i = 0; i < m->decls.ngroups; i++) { rename_group(&RR, m->decls.groups[i]); prog_add_group(prog, m->decls.groups[i]); }
+		free(mmap[mi]);
+	}
+
+	/* A main top-level name must not clash with an imported one — the textual rewrite cannot
+	 * tell them apart, so reject the ambiguity outright. */
 	for (int a = 0; a < naliases; a++) {
 		int clash = 0;
 		for (int i = 0; i < main_funcs; i++)  clash |= strcmp(prog->funcs[i]->name, aliases[a].from) == 0;
@@ -9556,7 +9626,6 @@ static void flatten_imports(const char *main_path, Program *prog, Import *imps, 
 			die(0, "a name is both imported and defined at the top level");
 	}
 
-	/* Resolve the importer's references (in every main-file declaration) to the targets. */
 	Renames AM = {aliases, naliases};
 	for (int i = 0; i < main_funcs; i++)  rename_func(&AM, prog->funcs[i]);
 	for (int i = 0; i < main_datas; i++)  rename_data(&AM, prog->datas[i]);
