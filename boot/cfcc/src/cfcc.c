@@ -843,8 +843,9 @@ typedef struct {
 	 * bare/or-pattern arm, else the member's arity. */
 	char binds[MAX_ARM_ALTS][64];
 	int bind_ids[MAX_ARM_ALTS];
-	int bind_word[MAX_ARM_ALTS]; /* 1 = the bound payload field is word-repr (Int/tag-only union),
-	                              * 0 = pointer-repr (record/boxed union); set in typecheck */
+	int bind_word[MAX_ARM_ALTS]; /* the bound payload field's REGISTER-WIDTH char (qtype_of): 'w' for
+	                              * an Int/tag-only-union/sub-word-fixed field, 'l' for a 64-bit int or
+	                              * an aggregate pointer. Set in typecheck; the arm load reads at it. */
 	int nbinds;
 	Expr *body;
 	int line;
@@ -1784,8 +1785,11 @@ static Type resolve_member_type(Program *prog, const char *name, int line) {
 		n++;
 		return (Type){TY_TUPLE, NULL, NULL, 0, resolve_tuple_shape(prog, names, n, line)};
 	}
-	if (is_fixed_type_name(name)) /* a fixed-width integer field/payload is a later brick (like floats) */
-		die(line, "a fixed-width integer field/payload is a later brick (M1 aggregate members are `Int` or an aggregate type)");
+	{
+		int b, sgn, arch;
+		if (is_fixed_type_name(name)) /* a fixed-width integer field/payload — IntN/UintN/Iarch */
+			return fixed_name_bits_signed(name, &b, &sgn, &arch), mk_fixed(b, sgn, arch);
+	}
 	UnionDecl *u = prog_find_union(prog, name);
 	if (u)
 		return (Type){TY_UNION, NULL, u, 0, NULL};
@@ -6529,7 +6533,7 @@ static Type check_numeric_typeswitch(Program *prog, Func *fn, Expr *e, Type st) 
 	MatchArm *a = &e->arms[live];
 	int saved = fn->nabinds;
 	if (!a->is_wild && a->nbinds == 1 && strcmp(a->binds[0], "_") != 0) {
-		a->bind_word[0] = type_is_word(st);
+		a->bind_word[0] = qtype_of(st); /* qtype char; the numeric-switch emit uses qtype_of directly */
 		int id = fn->next_bind_id++;
 		a->bind_ids[0] = id;
 		snprintf(fn->abinds[fn->nabinds].name, sizeof fn->abinds[0].name, "%s", a->binds[0]);
@@ -6579,6 +6583,19 @@ static void check_member_value(Program *prog, Func *fn, Expr *val, Type want, in
 	if (want.kind == TY_INT || is_iarch(want)) { /* an `Int`/`Iarch` field wants an operable integer */
 		if (!is_operable_int(at))
 			die(line, "expected an `Int`/`Iarch` value for this field/payload");
+	} else if (is_fixed_type(want)) {
+		/* A sub-family fixed-width `IntN`/`UintN` field/payload — a bare non-negative literal adopts
+		 * it (range-checked), else the value must be that EXACT type (cast with `Int8(x)` etc.). No
+		 * implicit widen/narrow. ⚠ cf0 must NOT inherit: adoption here is literal-only + non-negative-
+		 * only (§3 types the literal; cf0 also converts non-literals in context, §4); this mirrors the
+		 * fixed-width local/return narrowings. */
+		if (val->kind == EX_INT) {
+			if (!literal_fits_fixed(val->ival, want.bits, want.is_signed))
+				die(line, "integer literal out of range for this fixed-width field/payload");
+			val->rtype = want; /* the literal ADOPTS the field's fixed width, so emit stores/loads at it */
+		} else if (!types_equal(at, want)) {
+			die(line, "a fixed-width field/payload needs that exact `IntN`/`UintN` (cast with `Int8(x)` etc.)");
+		}
 	} else if (want.kind == TY_RECORD) {
 		if (at.kind != TY_RECORD || at.rec != want.rec)
 			die(line, "field/payload type mismatch (record type differs)");
@@ -7185,7 +7202,7 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 						/* A payload field's type (Int or an aggregate) sets the bound name's
 						 * type and repr — a word (Int/tag-only union) or a pointer. */
 						Type pt = union_payload_type(prog, u, tag, b);
-						a->bind_word[b] = type_is_word(pt);
+						a->bind_word[b] = qtype_of(pt); /* the payload's register width char (w/l) */
 						if (strcmp(a->binds[b], "_") == 0) {
 							a->bind_ids[b] = -1;
 							continue;
@@ -8459,10 +8476,11 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 			snprintf(addr, sizeof addr, "%%t%d", a);
 		}
 		int t = ex->tmp++;
-		if (type_is_word(e->rtype))
-			fprintf(out, "\t%%t%d =w loadw %s\n", t, addr);
-		else
-			fprintf(out, "\t%%t%d =l loadl %s\n", t, addr);
+		/* Load the field at its type's register width: a sub-word fixed `IntN`/`UintN` is a
+		 * `w` (loadw), a 64-bit int / aggregate pointer an `l` (loadl). qtype_of gives w/l
+		 * correctly and matches the old `type_is_word` for every prior field type. */
+		char fq = qtype_of(e->rtype);
+		fprintf(out, "\t%%t%d =%c load%c %s\n", t, fq, fq, addr);
 		snprintf(dst, cap, "%%t%d", t);
 		return;
 	}
@@ -8580,13 +8598,13 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		for (int fi = 0; fi < d->nfields; fi++) {
 			char fv[96];
 			emit_expr(out, e->ford[fi], ex, fv, sizeof fv);
-			const char *st = type_is_word(e->ford[fi]->rtype) ? "storew" : "storel";
+			char st = qtype_of(e->ford[fi]->rtype); /* w/l per the field's width (sub-word fixed → w) */
 			if (fi == 0) {
-				fprintf(out, "\t%s %s, %%t%d\n", st, fv, r);
+				fprintf(out, "\tstore%c %s, %%t%d\n", st, fv, r);
 			} else {
 				int a = ex->tmp++;
 				fprintf(out, "\t%%t%d =l add %%t%d, %d\n", a, r, data_field_offset(fi));
-				fprintf(out, "\t%s %s, %%t%d\n", st, fv, a);
+				fprintf(out, "\tstore%c %s, %%t%d\n", st, fv, a);
 			}
 		}
 		snprintf(dst, cap, "%%t%d", r);
@@ -8814,11 +8832,9 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 			emit_expr(out, e->args[i], ex, a, sizeof a);
 			int fa = ex->tmp++;
 			fprintf(out, "\t%%t%d =l add %%t%d, %d\n", fa, p, union_payload_offset(i));
-			/* An Int/tag-only-union payload is a word; a record/boxed-union payload is a pointer. */
-			if (type_is_word(e->args[i]->rtype))
-				fprintf(out, "\tstorew %s, %%t%d\n", a, fa);
-			else
-				fprintf(out, "\tstorel %s, %%t%d\n", a, fa);
+			/* Store the payload at its width: a word (Int/tag-only-union), a sub-word fixed → `w`,
+			 * a 64-bit int / aggregate pointer → `l` (qtype_of). */
+			fprintf(out, "\tstore%c %s, %%t%d\n", qtype_of(e->args[i]->rtype), a, fa);
 		}
 		snprintf(dst, cap, "%%t%d", p);
 		return;
@@ -8883,11 +8899,11 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 							continue;
 						int addr = ex->tmp++;
 						fprintf(out, "\t%%t%d =l add %s, %d\n", addr, sc, union_payload_offset(bi));
-						/* Load a word (Int/tag-only union) or an 8-byte pointer (aggregate). */
-						if (a->bind_word[bi])
-							fprintf(out, "\t%%pb%d =w loadw %%t%d\n", a->bind_ids[bi], addr);
-						else
-							fprintf(out, "\t%%pb%d =l loadl %%t%d\n", a->bind_ids[bi], addr);
+						/* Load the payload at its type's width: a word (Int/tag-only union) or a
+						 * sub-word fixed `IntN`/`UintN` → `w`, a 64-bit int / 8-byte pointer → `l`
+						 * (`bind_word` holds the qtype char, set in typecheck). */
+						fprintf(out, "\t%%pb%d =%c load%c %%t%d\n",
+						        a->bind_ids[bi], a->bind_word[bi], a->bind_word[bi], addr);
 					}
 					char b[96];
 					emit_expr(out, a->body, ex, b, sizeof b);
@@ -9134,14 +9150,16 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 				for (int fi = 0; fi < d->nfields; fi++) {
 					char fv[96];
 					emit_expr(out, s->expr->ford[fi], ex, fv, sizeof fv);
-					/* An Int/tag-only-union field stores a word; an aggregate field a pointer. */
-					const char *st = type_is_word(s->expr->ford[fi]->rtype) ? "storew" : "storel";
+					/* Store each field at its type's width: a sub-word fixed field → `w`, a 64-bit
+					 * int / aggregate pointer → `l` (qtype_of; matches the old type_is_word for
+					 * every prior field type, correct for fixed-width). */
+					char st = qtype_of(s->expr->ford[fi]->rtype);
 					if (fi == 0) {
-						fprintf(out, "\t%s %s, %%r_%s\n", st, fv, s->name);
+						fprintf(out, "\tstore%c %s, %%r_%s\n", st, fv, s->name);
 					} else {
 						int a = ex->tmp++;
 						fprintf(out, "\t%%t%d =l add %%r_%s, %d\n", a, s->name, data_field_offset(fi));
-						fprintf(out, "\t%s %s, %%t%d\n", st, fv, a);
+						fprintf(out, "\tstore%c %s, %%t%d\n", st, fv, a);
 					}
 				}
 			} else if (s->expr->rtype.kind == TY_RECORD || s->expr->rtype.kind == TY_TUPLE ||
@@ -9190,12 +9208,13 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 			/* Mutate a record field: store through the record's arena pointer
 			 * (`%r_<name>`) at the field's offset. */
 			emit_expr(out, s->expr, ex, v, sizeof v);
+			char fst = qtype_of(s->expr->rtype); /* store the new value at the field's width (fixed → w/l) */
 			if (s->foff == 0) {
-				fprintf(out, "\t%s %s, %%r_%s\n", type_is_word(s->expr->rtype) ? "storew" : "storel", v, s->name);
+				fprintf(out, "\tstore%c %s, %%r_%s\n", fst, v, s->name);
 			} else {
 				int a = ex->tmp++;
 				fprintf(out, "\t%%t%d =l add %%r_%s, %d\n", a, s->name, s->foff);
-				fprintf(out, "\t%s %s, %%t%d\n", type_is_word(s->expr->rtype) ? "storew" : "storel", v, a);
+				fprintf(out, "\tstore%c %s, %%t%d\n", fst, v, a);
 			}
 			break;
 		case ST_INDEX_ASSIGN: {
