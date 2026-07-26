@@ -9534,12 +9534,20 @@ static void dir_of(const char *abspath, char *out, size_t cap) {
 		out[0] = '\0';
 }
 
-/* Resolve an import string to a canonical `.cf` path: `<fromdir><path>.cf` run through
- * realpath (which also collapses `..`/`.` and symlinks, so a diamond dedups). Dies if the
- * file does not exist. */
+/* Resolve an import string to a canonical `.cf` path, then run it through realpath (which
+ * collapses `..`/`.` and symlinks, so a diamond dedups). A `std/…` path is the standard
+ * library, resolved under the baked-in lib root (`CF_LIB`, `<repo>/lib`) — `std/mem` →
+ * `<lib>/std/mem.cf` — regardless of the importer's location; every other path is relative
+ * to the importing file's directory. (The std tree is on disk now; embedding it into the
+ * binary so programs need not ship it is a later step.) Dies if the file does not exist. */
 static void resolve_module_path(const char *fromdir, const char *path, int line, char *out, size_t cap) {
 	char cand[4096];
-	if ((size_t)snprintf(cand, sizeof cand, "%s%s.cf", fromdir, path) >= sizeof cand)
+	int n;
+	if (strncmp(path, "std/", 4) == 0)
+		n = snprintf(cand, sizeof cand, "%s/%s.cf", CF_LIB, path);
+	else
+		n = snprintf(cand, sizeof cand, "%s%s.cf", fromdir, path);
+	if (n < 0 || (size_t)n >= sizeof cand)
 		die(line, "module path too long");
 	char resolved[PATH_MAX];
 	if (!realpath(cand, resolved))

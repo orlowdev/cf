@@ -9,6 +9,7 @@ set -eu
 
 root=$(cd "$(dirname "$0")/../.." && pwd)
 qbe="$root/opt/qbe/qbe"
+lib="$root/lib"
 out="$root/var/cfcc"
 
 if [ ! -x "$qbe" ]; then
@@ -24,6 +25,7 @@ mkdir -p "$root/var"
 # -Wextra sub-warning is pure noise here (it never flags uninitialized memory).
 cc -std=c11 -O2 -Wall -Wextra -Wno-missing-field-initializers \
 	-DCF_QBE="\"$qbe\"" \
+	-DCF_LIB="\"$lib\"" \
 	-o "$out" \
 	"$root/boot/cfcc/src/cfcc.c"
 
