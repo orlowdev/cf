@@ -4927,12 +4927,54 @@ static void rename_apply(const Renames *r, char *name, size_t cap) {
 
 /* Rewrite a TYPE-name buffer in place. A type annotation may carry a leading `*` for an
  * explicit pointer (`*List` in a field/payload/local); the `*` is preserved and the
- * base name mapped, so `*List` under module `m` becomes `*m_List`. */
+ * base name mapped, so `*List` under module `m` becomes `*m_List`.
+ *
+ * A GENERIC APPLICATION is carried as the arity-mangled form `Base.<arity>.<args…>`
+ * (parse_type_arg): `Box[Int]`→`Box.1.Int`, `Pair[Box[Int],'B]`→`Pair.2.Box.1.Int.'B`.
+ * A cross-module generic needs each type-NAME component rewritten (the base and every
+ * nested arg), leaving arity digits and `'T` tyvars — so `Box.1.Int` imported from module
+ * `m` becomes `m_Box.1.Int`, and a local `List[Point]` with an imported `Point` becomes
+ * `List.1.m_Point`. A generic mangle is recognised by an arity DIGIT in the second
+ * `.`-component; a plain name, a namespace-qualified type (`Shapes.Point`), or a
+ * union-member qualifier (`Color.Red`) has no arity digit and takes the single whole-name
+ * lookup (its whole string is the map key — namespace/member resolution is unchanged). */
 static void rename_type(const Renames *r, char *name, size_t cap) {
 	if (name[0] == '\0')
 		return;
 	int star = name[0] == '*';
-	const char *to = rename_lookup(r, star ? name + 1 : name);
+	const char *body = star ? name + 1 : name;
+	if (strchr(body, '.') && strlen(body) < 256) {
+		char tmp[256];
+		snprintf(tmp, sizeof tmp, "%s", body);
+		strtok(tmp, ".");                        /* base */
+		char *second = strtok(NULL, ".");        /* arity marker iff a generic application */
+		if (second && is_all_digits(second)) {
+			char out[256];
+			size_t off = 0;
+			if (star)
+				out[off++] = '*';
+			out[off] = '\0';
+			char work[256];
+			snprintf(work, sizeof work, "%s", body);
+			int first = 1;
+			for (char *tok = strtok(work, "."); tok; tok = strtok(NULL, ".")) {
+				char comp[128];
+				snprintf(comp, sizeof comp, "%s", tok);
+				if (!is_all_digits(comp) && comp[0] != '\'') /* a type name: map it (leaves/locals stay) */
+					rename_apply(r, comp, sizeof comp);
+				int w = snprintf(out + off, sizeof out - off, "%s%s", first ? "" : ".", comp);
+				if (w < 0 || off + (size_t)w >= sizeof out)
+					die(0, "mangled type name too long");
+				off += (size_t)w;
+				first = 0;
+			}
+			if (strlen(out) >= cap)
+				die(0, "mangled type name too long");
+			snprintf(name, cap, "%s", out);
+			return;
+		}
+	}
+	const char *to = rename_lookup(r, body);
 	if (!to)
 		return;
 	char buf[128];
@@ -9795,12 +9837,6 @@ static int load_module(const char *abspath) {
 	Import imps[MAX_IMPORTS];
 	int nimps = 0;
 	parse_source_file(abspath, &m->decls, imps, &nimps);
-	for (int i = 0; i < m->decls.ndatas; i++)
-		if (m->decls.datas[i]->ntyparams > 0)
-			die(0, "importing a module with generic types is not supported yet");
-	for (int i = 0; i < m->decls.nunions; i++)
-		if (m->decls.unions[i]->ntyparams > 0)
-			die(0, "importing a module with generic types is not supported yet");
 	m->nimports = nimps;
 	m->imports = xmalloc((nimps ? nimps : 1) * sizeof *m->imports);
 	memcpy(m->imports, imps, (size_t)nimps * sizeof *m->imports);
