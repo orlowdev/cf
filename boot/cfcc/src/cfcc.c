@@ -642,8 +642,9 @@ typedef enum {
 	            * `const`/`let` binding, and only a NON-NEGATIVE literal — cf0 adopts at every context
 	            * (arg/return/branch/operator operand) and for negatives too (`const Int32 x = -5`);
 	            * everywhere else here a bare literal stays `Int` and needs an explicit `IntN(...)`
-	            * cast. See also arith_mnemonic (div/rem-by-zero) and the shift-count note in the
-	            * `%`/bitwise/shift typecheck for two more pre-existing div/shift disclaimers. */
+	            * cast. See also the shift-count note in the `%`/bitwise/shift typecheck for a
+	            * pre-existing over-wide-shift disclaimer (div/rem-by-zero is now §5.6-correct —
+	            * arith_mnemonic + the EX_REM emit guard). */
 	TY_UNIT,   /* `Unit` / `()` — the zero-element tuple, the terminal type `1` (type_system §2.3,
 	            * §6.1). It carries no information, so cfcc lowers its sole value to a word `0`
 	            * (type_is_word ⇒ it rides every word slot/store/return path); it stays a DISTINCT
@@ -7844,10 +7845,10 @@ static void typecheck(Program *prog) {
  * picks the signed/unsigned form of the operations that differ by signedness: `div`/`udiv`,
  * `rem`/`urem`, and right-shift `sar` (arithmetic)/`shr` (logical). Callers pass `is_signed=1`
  * for a signed Int or a float (a float `div` is the signed spelling — its rem/shr never occur).
- * ⚠ cf0 must NOT inherit (pre-existing, shared by Int and fixed-width): DIVIDE/REM BY ZERO is
- * left to raw arm64 — `x / 0` yields 0 (matches type_system §5.6) but `x % 0` yields the
- * DIVIDEND (arm64 computes `rem = x - (x/0)*0 = x`), whereas §5.6 defines `x % 0 == 0`. A later
- * brick guards it (§5.6 wants `/0`/`%0` == 0 on all targets); cfcc does not yet. */
+ * DIVIDE/REM BY ZERO now matches type_system §5.6 (`x / 0 == x % 0 == 0`): `/ 0` rides arm64
+ * `sdiv`/`udiv` (already 0), and `% 0` is guarded at the emit site (EX_REM multiplies the raw
+ * remainder by `(b != 0)`, since arm64's synthesized `rem = x - (x/0)*0 = x` would else return
+ * the dividend). cfcc targets arm64 only, so no x86-style fault-guard on `/` is needed. */
 static const char *arith_mnemonic(ExprKind k, int is_signed) {
 	switch (k) {
 	case EX_ADD: return "add";
@@ -8724,9 +8725,29 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 			snprintf(dst, cap, "%%t%d", t);
 		} else {
 			fprintf(out, "\t%%t%d =%c %s %s, %s\n", t, oq, arith_mnemonic(e->kind, is_signed), a, b);
-			/* Wrap a sub-word fixed-width result back to its width (no-op for Int/Uarch/float). */
 			char raw[32], cbuf[32];
 			snprintf(raw, sizeof raw, "%%t%d", t);
+			if (e->kind == EX_REM) {
+				/* §5.6: `% 0` is 0 (a total, defined result). arm64 has no modulo
+				 * instruction — QBE lowers `rem`/`urem` to `a - (a/b)*b`, and since `a/0`
+				 * is 0 that yields the DIVIDEND `a`, not 0. (`/ 0` needs no guard: arm64
+				 * `sdiv`/`udiv` already give 0, matching §5.6.) Force it branch-free:
+				 * multiply the raw remainder by `(b != 0)`, so a zero divisor zeros it. */
+				int nz = ex->tmp++;
+				fprintf(out, "\t%%t%d =w cne%c %s, 0\n", nz, oq, b);
+				char nzop[32];
+				if (oq == 'l') { /* widen the 0/1 word to the operand's `l` width for the mul */
+					int nl = ex->tmp++;
+					fprintf(out, "\t%%t%d =l extuw %%t%d\n", nl, nz);
+					snprintf(nzop, sizeof nzop, "%%t%d", nl);
+				} else {
+					snprintf(nzop, sizeof nzop, "%%t%d", nz);
+				}
+				int g = ex->tmp++;
+				fprintf(out, "\t%%t%d =%c mul %%t%d, %s\n", g, oq, t, nzop);
+				snprintf(raw, sizeof raw, "%%t%d", g);
+			}
+			/* Wrap a sub-word fixed-width result back to its width (no-op for Int/Uarch/float). */
 			snprintf(dst, cap, "%s", canon_fixed(out, ex, e->rtype, raw, cbuf, sizeof cbuf));
 		}
 		return;
