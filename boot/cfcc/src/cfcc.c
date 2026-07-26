@@ -712,6 +712,8 @@ typedef enum {
 	PK_FIXED,  /* a fixed-width integer param — IntN/UintN (see TY_FIXED). Its `bits`+`is_signed`
 	            * pick the register (`w` for ≤32, `l` for 64) and spill width. Passed like a word
 	            * or a long by width; the incoming value is canonical. */
+	PK_STR,    /* a `Str` param — an `l` pointer to a `{bytes*, len}` header (TY_STR). Spilled to
+	            * an `l` slot `%s_<name>` at entry, then read exactly like a Str local (loadl). */
 } ParamKind;
 
 typedef struct Param {
@@ -780,6 +782,8 @@ typedef enum {
 	EX_RECORD,/* record construction: a data literal { f: v, ... } of type `name` */
 	EX_CALL,  /* function call: name(args) */
 	EX_CAST,  /* numeric cast Int(x)/Uarch(x) — a scalar conversion (lhs=operand, name=target type) */
+	EX_STRNEW,/* Str(buf, n) — construct a Str from a byte buffer/pointer (lhs) + a byte length
+	           * (rhs); allocates a `{bytes, len}` header. Turns `read` bytes into a Str. */
 	EX_UMEMBER,/* union member value: Union.Member — a tag-only member's tag (uni, ival=tag) */
 	EX_MATCH, /* match scrut { arms } — compare-chain tag dispatch (lhs=scrut, arms/narms) */
 	EX_IF,    /* if cond then a else b (lhs=cond, rhs=then, els=else) */
@@ -1275,7 +1279,11 @@ static char param_qtype(const Param *p) {
  * if/match/loop yielding an aggregate (a record/tuple/boxed-union pointer, a Str) is a
  * later brick — those carry value semantics the plain merge slot doesn't model. */
 static int is_mergeable_scalar(Type t) {
-	return type_is_word(t) || t.kind == TY_UARCH || is_float_type(t) || is_fixed_type(t);
+	/* A Str is an immutable `l` header pointer, so it merges through the 8-byte `%m` slot
+	 * soundly (like a Uarch pointer) — an `if`/`match`/loop may yield one. A record/tuple/
+	 * boxed-union pointer is NOT mergeable here: those are mutable value-semantic aggregates
+	 * the plain slot doesn't model (a later brick). */
+	return type_is_word(t) || t.kind == TY_UARCH || is_float_type(t) || is_fixed_type(t) || t.kind == TY_STR;
 }
 
 /* A type-appropriate zero literal for a `store%c` of qtype `q`. A float slot needs the
@@ -1459,6 +1467,7 @@ static char type_sig_char(Type t) {
 	case TY_RECORD: return 'R';
 	case TY_UNION:  return 'U';
 	case TY_TUPLE:  return 'T';
+	case TY_STR:    return 'S';
 	default:        return '?';
 	}
 }
@@ -1485,6 +1494,7 @@ static void sig_append_param(const Param *pm, char *buf, size_t cap) {
 	case PK_RECORD: sig_append(buf, cap, 'R'); return;
 	case PK_UNION:  sig_append(buf, cap, 'U'); return;
 	case PK_TUPLE:  sig_append(buf, cap, 'T'); return;
+	case PK_STR:    sig_append(buf, cap, 'S'); return;
 	case PK_VAR:    sig_append(buf, cap, 'V'); return;
 	case PK_FN:
 		sig_append(buf, cap, '(');
@@ -1539,6 +1549,7 @@ static Type param_component_type(const Param *pm) {
 	case PK_F32:   return (Type){TY_F32, NULL, NULL, 0, NULL};
 	case PK_UNIT:  return (Type){TY_UNIT, NULL, NULL, 0, NULL};
 	case PK_LONG:  return (Type){TY_PTR, NULL, NULL, 0, NULL};
+	case PK_STR:   return (Type){TY_STR, NULL, NULL, 0, NULL};
 	case PK_FN:    return (Type){TY_FN, NULL, NULL, 0, NULL};
 	default:       return mk_iarch(); /* PK_WORD — the `Int`/`Iarch` operable default */
 	}
@@ -1740,6 +1751,8 @@ static Type resolve_member_type(Program *prog, const char *name, int line) {
 		          "name a width (`Iarch`, `Int32`, …) for a field/payload");
 	if (strcmp(name, "Unit") == 0) /* `Unit`/`()` — the zero-tuple, a word `0` field/payload */
 		return (Type){TY_UNIT, NULL, NULL, 0, NULL};
+	if (strcmp(name, "Str") == 0) /* a `Str` field — an 8-byte `l` header pointer (immutable) */
+		return (Type){TY_STR, NULL, NULL, 0, NULL};
 	if (name[0] == '(') {
 		/* A tuple field/payload type stored as `(T0,T1,…)` (parse_member_type): split the
 		 * element names on TOP-LEVEL commas (a comma inside a nested `(…)` stays part of the
@@ -1865,6 +1878,7 @@ static Resolution resolve_name(Func *fn, const char *name, Type *ty) {
 			case PK_FIXED:   ty->kind = TY_FIXED; ty->rec = NULL; /* IntN/UintN/Iarch */
 			                 ty->bits = fn->params[i].bits; ty->is_signed = fn->params[i].is_signed;
 			                 ty->is_arch = fn->params[i].is_arch; break;
+			case PK_STR:     ty->kind = TY_STR; ty->rec = NULL; break; /* an `l` header pointer */
 			}
 			return R_PARAM;
 		}
@@ -2251,8 +2265,11 @@ static void parse_param_type(Parser *p, Param *out) {
 		out->kind = PK_UNIT;
 		return;
 	}
-	if (is_ident(t, "Str")) /* Str params await a later brick (Str is a local-only type in M0) */
-		die(t->line, "M0 has no Str parameters yet (pass `*[Uint8]` + a `Uarch` length)");
+	if (is_ident(t, "Str")) { /* a `Str` param — an `l` header pointer (TY_STR), like a Str local */
+		advance(p);
+		out->kind = PK_STR;
+		return;
+	}
 	if (t->kind == TK_STAR) {
 		advance(p);
 		Token *u = peek(p);
@@ -2727,6 +2744,23 @@ static Expr *parse_primary(Parser *p, Func *fn) {
 		}
 		if (t->text[t->len - 1] == '!')
 			die(t->line, "M0 does not support `!` in a type name");
+		/* `Str(buf, n)` — construct a Str from a byte buffer/pointer + a byte length, allocating a
+		 * `{bytes, len}` header. THE runtime-Str path (a file `read` fills a buffer, then `Str(buf,
+		 * n)` makes a real Str). ⚠ cf0 must NOT inherit: cf0's Str is a 3-field `{buf,char_count,len}`
+		 * value (§2.3) built by the std, not a 2-arg builtin; the length is a byte count taken on
+		 * trust (no UTF-8 validation, no bounds tie to the buffer); and the header's `len` is a
+		 * 32-bit `w`, so a >4GB string truncates (the emit narrows the `l` length to a `w`). */
+		if (is_ident(t, "Str") && p->toks[p->pos + 1].kind == TK_LPAREN) {
+			advance(p); /* Str */
+			advance(p); /* ( */
+			Expr *e = new_expr(EX_STRNEW);
+			e->line = t->line;
+			e->lhs = parse_expr(p, fn);                                  /* the bytes buffer/pointer */
+			expect(p, TK_COMMA, "`Str(buf, n)` takes a byte buffer and a byte length");
+			e->rhs = parse_expr(p, fn);                                  /* the byte length */
+			expect(p, TK_RPAREN, "expected `)` to close `Str(buf, n)`");
+			return e;
+		}
 		/* A record type name applied to a `{ … }` payload is record CONSTRUCTION —
 		 * `Point({ x: 1, y: 2 })` — construction-is-application (type_system §6.6/§7.3;
 		 * the construction mirrors the named-field declaration). The bare context-typed
@@ -3839,16 +3873,18 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 			Type rt = {TY_RECORD, NULL, NULL, 0, NULL};
 			func_add_local(fn, s->name, mutable, rt, rectype);
 		} else if (is_str) {
-			/* `const Str name = "literal"` — a Str local binds a string literal only.
-			 * No `let Str` (M0 has no Str reassignment) and no `const Str t = other`
-			 * (an aggregate copy: memory_model §6 wants an explicit copy — and the owner's
-			 * rule is that a string copy is `const Str t = "${s}"`, deferred with runtime
-			 * interpolation). Marked with type_name "Str" for typecheck/emit. */
+			/* `const Str name = <str expr>` — a Str local binds ANY Str-valued expression: a
+			 * literal, another Str var/param/field, a Str-returning call, or a `Str(buf, n)`
+			 * construction. Str is IMMUTABLE, so aliasing one is memory-safe (no freshness rule
+			 * needed). `const`-only (`let Str` reassignment is a later brick). typecheck verifies TY_STR.
+			 * ⚠ cf0 must NOT inherit: binding an existing Str VAR/param/field to a new name is an
+			 * ALIAS, which type_system §6's no-second-bind rule forbids for aggregates (cf0 requires
+			 * an explicit `copy`, or `"${s}"` interpolation). cfcc leans on Str immutability — the
+			 * same disclaimed genesis shortcut as the bare-union-var / bare-tuple-var aliases. (A
+			 * §6 carve-out exempting immutable Str is an owner call — surfaced to 谢尔盖.) */
 			if (mutable)
 				die(name->line, "a Str local must be `const` (M0 has no Str reassignment)");
 			s->expr = parse_expr(p, fn);
-			if (s->expr->kind != EX_STR)
-				die(name->line, "a Str local binds a string literal only (M0 has no Str copy or interpolation yet)");
 			snprintf(s->type_name, sizeof s->type_name, "Str");
 			Type st = {TY_STR, NULL, NULL, 0, NULL};
 			func_add_local(fn, s->name, mutable, st, "Str");
@@ -4548,8 +4584,8 @@ static void parse_member_type(Parser *p, char *out, size_t cap) {
 		return;
 	}
 	parse_type_arg(p, out, cap);
-	if (strcmp(out, "Uarch") == 0 || strcmp(out, "Str") == 0)
-		die(t->line, "a field/payload type is `Int`, an aggregate, or `'T` (not Uarch/Str)");
+	if (strcmp(out, "Uarch") == 0) /* `Str` IS a field type now (an `l` header pointer); Uarch still isn't */
+		die(t->line, "a field/payload type is `Int`, `Str`, an aggregate, or `'T` (not Uarch)");
 }
 
 /* Parse an optional generic type-parameter list `['A, Union 'B, …]` into
@@ -5991,6 +6027,7 @@ static const char *shallow_type_name(Program *prog, Func *fn, Expr *e) {
 				case PK_UNION:
 				case PK_VAR:     return fn->params[i].type_name;
 				case PK_LONG:    return ""; /* a pointer — no simple type name */
+				case PK_STR:     return "Str";
 				case PK_CAPTURE: return "Iarch"; /* a captured Iarch */
 				case PK_CAPTURE_REC: return fn->params[i].type_name; /* a captured record */
 				case PK_FN: return ""; /* a function value — no simple nominal type name */
@@ -6573,6 +6610,13 @@ static void check_member_value(Program *prog, Func *fn, Expr *val, Type want, in
 		/* A `*[Iarch]` word-pointer field (alen<0) — a borrowed reference into a word array. */
 		if (at.kind != TY_ARRAY)
 			die(line, "a `*[Iarch]` field needs a word array or a `*[Iarch]` value");
+	} else if (want.kind == TY_STR) {
+		/* A `Str` field/payload — an immutable `l` header pointer. A bare Str value (literal, var,
+		 * param, field, call) is accepted: Str is immutable, so aliasing is memory-safe (no
+		 * freshness rule), exactly like the bare-union-var payload shortcut. ⚠ cf0 must NOT inherit:
+		 * a Str field from an existing Str VAR aliases it — cf0 rehomes/copies the aggregate (§6). */
+		if (at.kind != TY_STR)
+			die(line, "expected a `Str` value for this field/payload");
 	} else {
 		die(line, "unsupported field/payload type");
 	}
@@ -6739,8 +6783,17 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 			expect_int(prog, fn, e->rhs);
 			return mk_fixed(8, 0, 0); /* Uint8 */
 		}
+		if (base.kind == TY_STR) {
+			/* Byte-index a Str: `s[i]` reads the i-th byte (a Uint8) through the header's bytes
+			 * pointer — the natural lexer access. (`.bytes` still yields the raw `*[Uint8]` pointer
+			 * for syscalls, but is not itself indexable — an opaque TY_PTR; use `s[i]`.)
+			 * ⚠ cf0 must NOT inherit: no bounds check; index is Iarch not Uarch; and cf0
+			 * distinguishes byte vs character (UTF-8) indexing — cfcc is byte-only. */
+			expect_int(prog, fn, e->rhs);
+			return mk_fixed(8, 0, 0); /* Uint8 */
+		}
 		if (base.kind != TY_ARRAY)
-			die(e->line, "index `[…]` needs a fixed-array, byte-buffer, or tuple value on the left");
+			die(e->line, "index `[…]` needs a fixed-array, byte-buffer, string, or tuple value on the left");
 		expect_int(prog, fn, e->rhs);
 		return mk_iarch(); /* an array element is the operable default integer (64-bit `l`) */
 	}
@@ -6959,6 +7012,10 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 				if (at.kind != TY_PTR && at.kind != TY_BUF && at.kind != TY_ARRAY)
 					die(e->line, "argument type mismatch (a pointer parameter expects a pointer, buffer, or array)");
 				break;
+			case PK_STR:
+				if (at.kind != TY_STR)
+					die(e->line, "argument type mismatch (a `Str` parameter expects a string)");
+				break;
 			case PK_UNION:
 				if (pm->is_ptr) {
 					/* A `*Union` parameter needs a POINTER — `&x` or another `*Union`. */
@@ -7165,6 +7222,15 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		            : TY_INT;
 		return (Type){tk, NULL, NULL, 0, NULL};
 	}
+	case EX_STRNEW: {
+		/* `Str(buf, n)` — buf is a byte buffer / `*[Uint8]` pointer, n an operable-int byte
+		 * length; yields a Str (a fresh `{bytes, len}` header). */
+		Type bt = typeof_expr(prog, fn, e->lhs);
+		if (bt.kind != TY_BUF && bt.kind != TY_PTR)
+			die(e->line, "`Str(buf, n)` needs a byte buffer or `*[Uint8]` pointer as its first argument");
+		expect_int(prog, fn, e->rhs);
+		return (Type){TY_STR, NULL, NULL, 0, NULL};
+	}
 	case EX_IF: {
 		/* if cond then A else B — the condition is a `Bool` (no truthiness, §5); the two
 		 * branches unify to one mergeable scalar, which is the if's type. */
@@ -7330,6 +7396,8 @@ static Type func_ret_type(const Func *fn) {
 	}
 	if (strcmp(fn->ret_type_name, "Unit") == 0) /* `Unit`/`()` — the zero-tuple, a word `0` */
 		return (Type){TY_UNIT, NULL, NULL, 0, NULL};
+	if (strcmp(fn->ret_type_name, "Str") == 0) /* a `Str` return — an `l` header pointer */
+		return (Type){TY_STR, NULL, NULL, 0, NULL};
 	if (fn->ret_is_ptr) /* an explicit `*Aggregate` return — a TY_PTR to the pointee decl */
 		return (Type){TY_PTR, fn->ret_rec, fn->ret_uni, 0, NULL};
 	if (fn->ret_uni)
@@ -7558,7 +7626,8 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 			}
 			if (strcmp(s->type_name, "Str") == 0) {           /* a `const Str` local */
 				if (typeof_expr(prog, fn, s->expr).kind != TY_STR)
-					die(s->line, "internal: Str local initializer is not a string");
+					die(s->line, "a `Str` local's initializer must be a string value (a literal, a Str "
+					             "var/param/field, a Str-returning call, or `Str(buf, n)`)");
 			} else if (strcmp(s->type_name, "Float64") == 0) { /* a Float64 local */
 				if (typeof_expr(prog, fn, s->expr).kind != TY_F64)
 					die(s->line, "a Float64 local's initializer must be a Float64 value (cast with `Float64(x)` if needed)");
@@ -7870,6 +7939,13 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 				Type et = typeof_expr(prog, fn, s->expr);
 				if (!types_equal(et, rt))
 					die(s->expr->line, "a fixed-width integer function returns that exact `IntN`/`UintN` (cast with `Int8(x)` etc.)");
+			} else if (rt.kind == TY_STR) {
+				/* A `Str` return — an `l` header pointer. The value must be a Str (a literal, a
+				 * Str local/param/field, or a Str-returning call). The header lives in read-only
+				 * data (a literal) or the arena (a constructed Str), both outliving the frame. */
+				Type et = typeof_expr(prog, fn, s->expr);
+				if (et.kind != TY_STR)
+					die(s->expr->line, "a `Str` function returns a string value");
 			} else {
 				expect_int(prog, fn, s->expr);
 			}
@@ -7962,7 +8038,8 @@ static void resolve_signatures(Program *prog) {
 			}
 		if (fn->ret_type_name[0] && strcmp(fn->ret_type_name, "Uarch") != 0 &&
 		    strcmp(fn->ret_type_name, "Unit") != 0 && strcmp(fn->ret_type_name, "Float64") != 0 &&
-		    strcmp(fn->ret_type_name, "Float32") != 0 && !is_fixed_type_name(fn->ret_type_name)) {
+		    strcmp(fn->ret_type_name, "Float32") != 0 && strcmp(fn->ret_type_name, "Str") != 0 &&
+		    !is_fixed_type_name(fn->ret_type_name)) {
 			UnionDecl *u = prog_find_union(prog, fn->ret_type_name);
 			if (u) {
 				if (fn->ret_is_ptr && !u->has_payload) /* `*TagOnlyUnion` return = `*Scalar`, §6.4/§8.4 */
@@ -8354,6 +8431,14 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		emit_expr(out, e->lhs, ex, base, sizeof base);
 		char addr[96];
 		int is_buf = e->lhs->rtype.kind == TY_BUF;
+		int is_str = e->lhs->rtype.kind == TY_STR;
+		if (is_str) {
+			/* a Str: the bytes pointer lives at header offset 0 — deref it, then byte-address
+			 * the chars exactly like a `[N Uint8]` buffer (`s[i]` ≡ `s.bytes[i]`). */
+			int b = ex->tmp++;
+			fprintf(out, "\t%%t%d =l loadl %s\n", b, base);
+			snprintf(base, sizeof base, "%%t%d", b);
+		}
 		if (e->lhs->rtype.kind == TY_TUPLE) {
 			long off = e->rhs->ival * 8; /* rhs is a literal (checked in typeof) */
 			if (off == 0) {
@@ -8369,7 +8454,7 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 			/* the index is an `Iarch` (`l`); a byte buffer addresses per-byte (no scaling), a
 			 * fixed array scales by its 8-byte slot. */
 			char scaled[96];
-			if (is_buf) {
+			if (is_buf || is_str) { /* byte-addressed: no scaling */
 				snprintf(scaled, sizeof scaled, "%s", idx);
 			} else {
 				int o = ex->tmp++;
@@ -8381,7 +8466,7 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 			snprintf(addr, sizeof addr, "%%t%d", a);
 		}
 		int r = ex->tmp++;
-		if (is_buf) /* a byte: load unsigned, zero-extended into a `w` Uint8 */
+		if (is_buf || is_str) /* a byte: load unsigned, zero-extended into a `w` Uint8 */
 			fprintf(out, "\t%%t%d =w loadub %s\n", r, addr);
 		else if (type_is_word(e->rtype)) /* an Int/tag-only element is a word; an aggregate a pointer */
 			fprintf(out, "\t%%t%d =w loadw %s\n", r, addr);
@@ -8649,6 +8734,24 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 				fprintf(out, "\t%%t%d =%c %s %s\n", r, dq, st.kind == TY_F64 ? "truncd" : "exts", op);
 		}
 		snprintf(dst, cap, "%%t%d", r);
+		return;
+	}
+	case EX_STRNEW: {
+		/* Construct a Str: allocate a `{ l bytes, w len }` header (matching the literal layout —
+		 * bytes @0, len @8), fill it, yield the `l` pointer. The length is truncated to a `w`
+		 * (the header's len field is 32-bit — a genesis limit, disclaimed at the parse site). */
+		char buf[96], len[96];
+		emit_expr(out, e->lhs, ex, buf, sizeof buf);
+		emit_expr(out, e->rhs, ex, len, sizeof len);
+		int wl = ex->tmp++;
+		fprintf(out, "\t%%t%d =w copy %s\n", wl, len); /* truncate the `l` length to a `w` */
+		int h = ex->tmp++;
+		fprintf(out, "\t%%t%d =l call $cf_alloc(w 16)\n", h);
+		fprintf(out, "\tstorel %s, %%t%d\n", buf, h);  /* bytes @0 */
+		int a = ex->tmp++;
+		fprintf(out, "\t%%t%d =l add %%t%d, 8\n", a, h);
+		fprintf(out, "\tstorew %%t%d, %%t%d\n", wl, a); /* len @8 */
+		snprintf(dst, cap, "%%t%d", h);
 		return;
 	}
 	case EX_UMEMBER: {
@@ -9323,6 +9426,11 @@ static void emit_func(FILE *out, const Func *fn) {
 			char qt = param_qtype(&fn->params[i]);
 			fprintf(out, "\t%%s_%s =l alloc%d %d\n", n, qt == 'd' ? 8 : 4, qt == 'd' ? 8 : 4);
 			fprintf(out, "\tstore%c %%u_%s, %%s_%s\n", qt, n, n);
+		} else if (fn->params[i].kind == PK_STR) {
+			/* A `Str` param spills its incoming `l` header pointer into an `l` slot, so it
+			 * reads exactly like a Str local (EX_VAR TY_STR → loadl `%s_<name>`). */
+			fprintf(out, "\t%%s_%s =l alloc8 8\n", n);
+			fprintf(out, "\tstorel %%u_%s, %%s_%s\n", n, n);
 		} else if (fn->params[i].kind == PK_RECORD ||
 		           fn->params[i].kind == PK_CAPTURE_REC || fn->params[i].kind == PK_TUPLE ||
 		           (fn->params[i].kind == PK_LONG && (fn->params[i].is_bytes || fn->params[i].is_words)) ||
