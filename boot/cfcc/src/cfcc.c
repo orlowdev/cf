@@ -6606,8 +6606,16 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 				die(e->line, "tuple index out of range");
 			return base.tup->elems[k];
 		}
+		if (base.kind == TY_BUF) {
+			/* A `[N Uint8]` byte buffer indexes to a `Uint8` (byte-addressed). This unblocks
+			 * both directions cf0.cf needs: a lexer reads source bytes, an emitter writes
+			 * output bytes. ⚠ cf0 must NOT inherit: no bounds check, and the index is Iarch/Int
+			 * (§6.2 bounds-checks and makes the index Uarch). */
+			expect_int(prog, fn, e->rhs);
+			return mk_fixed(8, 0, 0); /* Uint8 */
+		}
 		if (base.kind != TY_ARRAY)
-			die(e->line, "index `[…]` needs a fixed-array or tuple value on the left");
+			die(e->line, "index `[…]` needs a fixed-array, byte-buffer, or tuple value on the left");
 		expect_int(prog, fn, e->rhs);
 		return mk_iarch(); /* an array element is the operable default integer (64-bit `l`) */
 	}
@@ -7574,34 +7582,47 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 			break;
 		}
 		case ST_INDEX_ASSIGN: {
-			/* `xs[i] = v` — the target must be a mutable (`let`) fixed-array local. A
-			 * `const` array (or a param, or a tuple) is read-only. The index is an
-			 * operable integer and the value is an array element (an Iarch).
+			/* `xs[i] = v` — the target must be a mutable (`let`) fixed-array OR byte-buffer
+			 * local; a `const` target (or a param, or a tuple) is read-only. For an array the
+			 * value is an Iarch element; for a `[N Uint8]` buffer it is a Uint8 byte (a bare
+			 * non-negative literal adopts 0..255, else cast with `Uint8(x)`).
 			 * ⚠ cf0 must NOT inherit these write-path narrowings (all strictly subtractive):
 			 * (1) NO BOUNDS CHECK — an out-of-range store corrupts memory; §6.2 bounds-checks,
 			 *     and a comptime-known OOB literal index is a compile error in cf0 (this write
 			 *     shares the EX_INDEX read path's disclaimed degeneracy);
 			 * (2) the index is Iarch, not §6.2's Uarch (inherited from the read path);
 			 * (3) compound element-assign `xs[i] op= v` is deferred (cf0 has it, ebnf
-			 *     § Assignment); (4) the target must be a bare `EX_VAR` array — a `p.arr[i]`
+			 *     § Assignment); (4) the target must be a bare `EX_VAR` local — a `p.arr[i]`
 			 *     or chained `xs[i][j]` lvalue is rejected, whereas §type_system makes
-			 *     mutability transitive through aggregates. */
+			 *     mutability transitive through aggregates; (5) only a buffer LOCAL is indexable,
+			 *     not a `*[Uint8]` pointer param (pointer indexing is deferred). */
 			Expr *tgt = s->expr;   /* the EX_INDEX */
 			Expr *base = tgt->lhs;
 			Type bt = typeof_expr(prog, fn, base);
-			if (bt.kind != TY_ARRAY)
-				die(s->line, "element assignment `xs[i] = …` needs a fixed array on the left "
-				             "(a tuple is immutable; a byte buffer is not indexable)");
+			if (bt.kind != TY_ARRAY && bt.kind != TY_BUF)
+				die(s->line, "element assignment `xs[i] = …` needs a fixed array or byte "
+				             "buffer on the left (a tuple is immutable)");
 			if (base->kind != EX_VAR)
-				die(s->line, "element assignment targets a named array local");
+				die(s->line, "element assignment targets a named array or buffer local");
 			Type lt;
 			Resolution r = resolve_name(fn, base->name, &lt);
 			if (r == R_CONST)
-				die(s->line, "cannot assign into a `const` array (declare it with `let`)");
+				die(s->line, "cannot assign into a `const` array/buffer (declare it with `let`)");
 			if (r == R_PARAM)
-				die(s->line, "cannot assign into an array parameter");
+				die(s->line, "cannot assign into an array/buffer parameter");
 			typeof_expr(prog, fn, tgt);       /* validates the index; caches the element rtype */
-			expect_int(prog, fn, s->yval);    /* the stored value — an Iarch element */
+			if (bt.kind == TY_BUF) {
+				/* a byte: a bare non-negative literal adopts Uint8 (range 0..255), else the
+				 * value must already be a Uint8 (cast with `Uint8(x)`). */
+				if (s->yval->kind == EX_INT) {
+					if (s->yval->ival < 0 || s->yval->ival > 255)
+						die(s->line, "a byte value must be in 0..255");
+				} else if (!types_equal(typeof_expr(prog, fn, s->yval), mk_fixed(8, 0, 0))) {
+					die(s->line, "a `[N Uint8]` buffer element is a `Uint8` (cast with `Uint8(x)`)");
+				}
+			} else {
+				expect_int(prog, fn, s->yval); /* an array element is an Iarch */
+			}
 			break;
 		}
 		case ST_ASSIGN: { /* target is a scalar `let` local; the value must match its type */
@@ -8172,13 +8193,14 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		return;
 	}
 	case EX_INDEX: {
-		/* A tuple index `t[k]` has a COMPTIME literal position (k*8 is a constant offset); an
-		 * array index `xs[i]` takes a runtime `Iarch` index (already an `l`, scaled *8). Both
-		 * load per the element's type — a `w` for a tag-only/unit element, else an `l` (an
-		 * `Iarch` element or an 8-byte aggregate pointer). Neither bounds-checks (throwaway). */
+		/* Three index kinds: a tuple `t[k]` (COMPTIME literal position, constant k*8 offset);
+		 * a fixed array `xs[i]` (runtime `Iarch` index, scaled *8 for the 8-byte slot); and a
+		 * byte buffer `buf[i]` (runtime index, byte-addressed *1, loaded as a `Uint8` via
+		 * `loadub`). None bounds-checks (throwaway). */
 		char base[96];
 		emit_expr(out, e->lhs, ex, base, sizeof base);
 		char addr[96];
+		int is_buf = e->lhs->rtype.kind == TY_BUF;
 		if (e->lhs->rtype.kind == TY_TUPLE) {
 			long off = e->rhs->ival * 8; /* rhs is a literal (checked in typeof) */
 			if (off == 0) {
@@ -8191,15 +8213,24 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		} else {
 			char idx[96];
 			emit_expr(out, e->rhs, ex, idx, sizeof idx);
-			/* the index is an `Iarch` (`l`) — scale by the 8-byte slot directly, no widening */
-			int o = ex->tmp++;
-			fprintf(out, "\t%%t%d =l mul %s, 8\n", o, idx);
+			/* the index is an `Iarch` (`l`); a byte buffer addresses per-byte (no scaling), a
+			 * fixed array scales by its 8-byte slot. */
+			char scaled[96];
+			if (is_buf) {
+				snprintf(scaled, sizeof scaled, "%s", idx);
+			} else {
+				int o = ex->tmp++;
+				fprintf(out, "\t%%t%d =l mul %s, 8\n", o, idx);
+				snprintf(scaled, sizeof scaled, "%%t%d", o);
+			}
 			int a = ex->tmp++;
-			fprintf(out, "\t%%t%d =l add %s, %%t%d\n", a, base, o);
+			fprintf(out, "\t%%t%d =l add %s, %s\n", a, base, scaled);
 			snprintf(addr, sizeof addr, "%%t%d", a);
 		}
 		int r = ex->tmp++;
-		if (type_is_word(e->rtype)) /* an Int/tag-only element is a word; an aggregate a pointer */
+		if (is_buf) /* a byte: load unsigned, zero-extended into a `w` Uint8 */
+			fprintf(out, "\t%%t%d =w loadub %s\n", r, addr);
+		else if (type_is_word(e->rtype)) /* an Int/tag-only element is a word; an aggregate a pointer */
 			fprintf(out, "\t%%t%d =w loadw %s\n", r, addr);
 		else
 			fprintf(out, "\t%%t%d =l loadl %s\n", r, addr);
@@ -8868,22 +8899,31 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 			}
 			break;
 		case ST_INDEX_ASSIGN: {
-			/* `xs[i] = v` — store v through the array's base pointer at i*8. Mirrors the
-			 * EX_INDEX read: scale the Iarch index by the 8-byte slot, add it to the base,
-			 * store the value (a word for a tag-only element, else an `l`).
+			/* `xs[i] = v` — store v through the target's base pointer. A fixed array scales
+			 * the Iarch index by its 8-byte slot and stores a word/`l` per element type; a
+			 * `[N Uint8]` byte buffer addresses per-byte (no scaling) and stores the low byte
+			 * via `storeb`. Mirrors the EX_INDEX read.
 			 * ⚠ cf0 must NOT inherit: the store is UNCHECKED (memory-corrupting on an
 			 * out-of-range index); cf0's `[N T]` is bounds-checked (§6.2). */
 			Expr *tgt = s->expr;
+			int buf = tgt->lhs->rtype.kind == TY_BUF;
 			char abase[96];
 			emit_expr(out, tgt->lhs, ex, abase, sizeof abase);
 			char aidx[96];
 			emit_expr(out, tgt->rhs, ex, aidx, sizeof aidx);
-			int o = ex->tmp++;
-			fprintf(out, "\t%%t%d =l mul %s, 8\n", o, aidx);
+			char scaled[96];
+			if (buf) {
+				snprintf(scaled, sizeof scaled, "%s", aidx); /* 1-byte elements: no scaling */
+			} else {
+				int o = ex->tmp++;
+				fprintf(out, "\t%%t%d =l mul %s, 8\n", o, aidx);
+				snprintf(scaled, sizeof scaled, "%%t%d", o);
+			}
 			int a = ex->tmp++;
-			fprintf(out, "\t%%t%d =l add %s, %%t%d\n", a, abase, o);
+			fprintf(out, "\t%%t%d =l add %s, %s\n", a, abase, scaled);
 			emit_expr(out, s->yval, ex, v, sizeof v);
-			fprintf(out, "\t%s %s, %%t%d\n", type_is_word(tgt->rtype) ? "storew" : "storel", v, a);
+			const char *st = buf ? "storeb" : (type_is_word(tgt->rtype) ? "storew" : "storel");
+			fprintf(out, "\t%s %s, %%t%d\n", st, v, a);
 			break;
 		}
 		case ST_RETURN:
