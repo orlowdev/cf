@@ -554,8 +554,9 @@ struct Func; /* forward: an EX_CALL caches its resolved callee for emit */
 typedef enum {
 	TY_INT,    /* a 32-bit word `w`. Since the Int→Iarch default flip, NO source value has this
 	            * type — the operable default integer is `Iarch` (a 64-bit `l`, TY_FIXED+is_arch),
-	            * and a bare literal, an `Iarch` cast, a comparison/`!` result, `.len`, an
-	            * array/tuple element, an `Iarch` field/param, and the `main` return are all Iarch.
+	            * and a bare literal, an `Iarch` cast, `.len`, an array/tuple element, an `Iarch`
+	            * field/param, and the `main` return are all Iarch (a comparison/`!`/`&&`/`||`
+	            * yields the built-in `Bool` union, N6 — see g_bool_union).
 	            * The name `Int` itself is now the signed NUMERIC UNION bound (§8.6), NOT a value
 	            * type (see is_numeric_union_name) — `Iarch` is the concrete pointer-width default.
 	            * TY_INT survives ONLY as a vestige: the still-`w` slot of a `for`-loop's hidden
@@ -663,8 +664,10 @@ typedef struct {
 	                 * distinct type from `Int64` (§2) though it shares Int64's 64-bit `l`
 	                 * representation; distinguished only in types_equal. 0 for the eight IntN/UintN.
 	                 * `Iarch` is cfcc's OPERABLE DEFAULT integer (§3): a bare literal, an `Iarch`
-	                 * cast, params/fields/returns, `.len`, comparison, and array/tuple elements are
-	                 * all Iarch, and it is fully usable as a condition/index and an aggregate field.
+	                 * cast, params/fields/returns, `.len`, and array/tuple elements are all Iarch,
+	                 * and it is fully usable as an array index and an aggregate field (a comparison
+	                 * of two Iarch yields the built-in `Bool`, N6 — and a condition MUST be a Bool,
+	                 * no truthiness §5, so Iarch is no longer usable bare as a condition).
 	                 * The name `Int` is now the SIGNED NUMERIC UNION bound {Int8,Int16,Int32,Int64,
 	                 * Iarch} (§8.6, is_numeric_union_name), rejected as a value type — so `Iarch`
 	                 * (not `Int`) is how you name the concrete default. A numeric-bounded `'T` is
@@ -775,7 +778,7 @@ typedef enum {
 	/* unary (lhs) */
 	EX_NEG,   /* - negate */
 	EX_BNOT,  /* ~ bitwise not */
-	EX_LNOT,  /* ! logical not (yields 0/1) */
+	EX_LNOT,  /* ! logical not — a Bool operand, a Bool result (N6, §5) */
 	EX_ADDR,  /* &x — address-of: an aggregate value (lhs) → a `*T` pointer to it. In cfcc an
 	           * aggregate value IS its arena pointer, so this is a TYPE-level cast (zero codegen —
 	           * it yields the operand's own pointer). §6.4: the operand must be a record/union. */
@@ -790,13 +793,13 @@ typedef enum {
 	EX_BAND,  /* & */
 	EX_SHL,   /* << */
 	EX_SHR,   /* >> (arithmetic; signed word) */
-	EX_EQ,    /* == (yields 0/1) */
+	EX_EQ,    /* == (a comparison yields the built-in Bool union, N6 — a 0/1 tag word) */
 	EX_NE,    /* != */
 	EX_LT,    /* < */
 	EX_GT,    /* > */
 	EX_LE,    /* <= */
 	EX_GE,    /* >= */
-	/* short-circuit logical (lhs, rhs); yield 0/1 — NOT plain binary ops */
+	/* short-circuit logical (lhs, rhs); Bool operands, a Bool result — NOT plain binary ops */
 	EX_AND,   /* && */
 	EX_OR,    /* || */
 } ExprKind;
@@ -1122,10 +1125,12 @@ static int is_fixed_type(Type t) { return t.kind == TY_FIXED; }
  * distinguished from the eight IntN/UintN leaves, which are NOT operable as conditions etc. */
 static int is_iarch(Type t) { return t.kind == TY_FIXED && t.is_arch; }
 
-/* The OPERABLE default-integer concept — the type a bare literal takes and the only integer
- * usable bare as a condition / index / logical operand. During the Int→Iarch transition this
- * spans BOTH the legacy 32-bit `TY_INT` and the new 64-bit `Iarch`, so a half-flipped tree
- * stays well-typed; once every producer emits Iarch, the TY_INT arm becomes dead. */
+/* The OPERABLE default-integer concept — the type a bare literal takes and the integer usable
+ * bare as an array index and in arithmetic/comparison. (Since N6 no integer is a bare condition —
+ * a condition must be a `Bool`, no truthiness §5; a comparison of two operable ints yields Bool.)
+ * During the Int→Iarch transition this spans BOTH the legacy 32-bit `TY_INT` and the new 64-bit
+ * `Iarch`, so a half-flipped tree stays well-typed; once every producer emits Iarch, the TY_INT
+ * arm becomes dead. */
 static int is_operable_int(Type t) { return t.kind == TY_INT || is_iarch(t); }
 
 /* True if `name` is a std NUMERIC-UNION name (`Int`/`Uint`/`Number`, §8.6). These are generic
@@ -1143,6 +1148,23 @@ static Type mk_fixed(int bits, int is_signed, int is_arch) {
 
 /* The `Iarch` Type — the pointer-width signed default (64-bit `l`). */
 static Type mk_iarch(void) { return mk_fixed(64, 1, 1); }
+
+/* cf's `Bool` is a std union of two singleton constructors `{False, True}` (type_system §2/§8.6),
+ * so cfcc models it as a BUILT-IN tag-only union: `Bool.False` = tag 0, `Bool.True` = tag 1,
+ * lowering to a `w` (a plain tag, zero cost). `true`/`false` are sugar for `Bool.True`/`Bool.False`;
+ * comparisons and `!`/`&&`/`||` yield it; `if`, a `match`, and the `&&`/`||`/`then break` guard
+ * conditions CONSUME it — cf has no truthiness (§5), so a bare integer is never a condition.
+ * `g_bool_union` is registered once into the MAIN program by register_builtins.
+ * ⚠ cf0 must NOT inherit: cf0 resolves `Bool` (and `true`/`false`) through a std-library `.cf`
+ * definition (a `pub intrinsic type` union, imported), NOT hard-registered by the compiler — cfcc
+ * has no std/imports, so it hardcodes the union (the same shortcut as the numeric unions Int/Uint/
+ * Number). The False=0/True=1 tag values by declaration order + the `w` tag width are provisional
+ * (the general union-throwaway note above; M6/M9 owns real tag assignment). Structural union `==`
+ * (`a == b` for two `Bool`s, §5.6 — by tag) is OUT OF M0 SCOPE: cfcc's `==` is numeric-scalar-only,
+ * so comparing two Bool values is (harmlessly) rejected; cf0 restores structural equality on unions. */
+static UnionDecl *g_bool_union;
+static Type mk_bool(void) { Type t = {TY_UNION, NULL, g_bool_union, 0, NULL}; return t; }
+static int is_bool(Type t) { return t.kind == TY_UNION && t.uni == g_bool_union; }
 
 /* The canonical type NAME of a NUMERIC scalar — a fixed leaf (`Iarch`, `Int%d`, `Uint%d`),
  * `Uarch`, or a float (`Float32`/`Float64`). Used to name the scrutinee's concrete width in a
@@ -1606,6 +1628,30 @@ static void prog_add_union(Program *prog, UnionDecl *u) {
 			die(0, "out of memory");
 	}
 	prog->unions[prog->nunions++] = u;
+}
+
+/* Register cfcc's built-in types into a program. Currently just `Bool` — a tag-only union
+ * `{False, True}` (see g_bool_union / mk_bool). Called once for the MAIN program before its
+ * declarations parse, so (a) a user `data`/`union Bool` collides via the ordinary prog_find_*
+ * check, and (b) every later pass — resolve_signatures, typecheck, match, emit — treats `Bool`
+ * exactly like a declared tag-only union (word ABI, tag dispatch, no codegen). Imported modules
+ * are parsed in ISOLATION without their own Bool: their references to the name `Bool` are absent
+ * from the module's mangle map, so the rename walker leaves them unmangled and they resolve
+ * against the main program's Bool at typecheck. */
+static void register_builtins(Program *prog) {
+	UnionDecl *b = calloc(1, sizeof *b);
+	if (!b)
+		die(0, "out of memory");
+	snprintf(b->name, sizeof b->name, "Bool");
+	snprintf(b->base_name, sizeof b->base_name, "Bool");
+	b->is_pub = 1;
+	b->nmembers = 2;
+	snprintf(b->members[0], sizeof b->members[0], "False"); /* tag 0 */
+	snprintf(b->members[1], sizeof b->members[1], "True");  /* tag 1 */
+	b->arity[0] = b->arity[1] = 0;
+	b->has_payload = 0;
+	prog_add_union(prog, b);
+	g_bool_union = b;
 }
 
 static ParamGroup *prog_find_group(Program *prog, const char *name) {
@@ -2533,6 +2579,17 @@ static Expr *parse_primary(Parser *p, Func *fn) {
 		if (is_ident(t, "match"))
 			die(t->line, "a `match` expression must stand alone or be parenthesized "
 			             "(e.g. `1 + (match x { ... })`)");
+		/* `true`/`false` are sugar for the Bool union's singleton members `Bool.True`/
+		 * `Bool.False` (type_system §8.6) — the same EX_UMEMBER node, resolved at typecheck. */
+		if (is_ident(t, "true") || is_ident(t, "false")) {
+			int istrue = is_ident(t, "true");
+			advance(p);
+			Expr *e = new_expr(EX_UMEMBER);
+			e->line = t->line;
+			snprintf(e->name, sizeof e->name, "Bool");
+			snprintf(e->mem, sizeof e->mem, "%s", istrue ? "True" : "False");
+			return e;
+		}
 		if (t->text[t->len - 1] == '!')
 			die(t->line, "M0 does not support `!` in a name here");
 		int line = t->line;
@@ -5831,9 +5888,12 @@ static const char *shallow_type_name(Program *prog, Func *fn, Expr *e) {
 	}
 	case EX_ADDR:
 		return ""; /* `&x` is a pointer — no simple nominal name to infer a `'T` from (like PK_LONG) */
+	case EX_EQ: case EX_NE: case EX_LT: case EX_GT: case EX_LE: case EX_GE:
+	case EX_AND: case EX_OR: case EX_LNOT:
+		return "Bool"; /* a comparison / logical op / `!` yields the Bool union (§5) */
 	default:
-		/* arithmetic/comparison/logical/field — Iarch in the common case; a genuine
-		 * mismatch surfaces later as a per-instantiation error. */
+		/* arithmetic/field — Iarch in the common case; a genuine mismatch surfaces later
+		 * as a per-instantiation error. */
 		return "Iarch";
 	}
 }
@@ -6312,6 +6372,18 @@ static void expect_int(Program *prog, Func *fn, Expr *e) {
 		             "(fixed-width arithmetic and comparison, however, are supported)");
 	die(e->line, "expected an Int value (a record is used only via field access, "
 	             "and a string only via `.len`, in M0)");
+}
+
+/* A condition / logical-operand context requires a `Bool` — cf has NO truthiness (§5). An
+ * `if`/`match` condition, a `&&`/`||`/`!` operand, and a `then break/continue/<- v` guard all
+ * pass through here; a bare integer (even the operable `Iarch`) is rejected. A Bool comes from
+ * a comparison, a `!`/`&&`/`||`, a `Bool` value, or the `true`/`false` literals. */
+static void expect_bool(Program *prog, Func *fn, Expr *e) {
+	Type t = typeof_expr(prog, fn, e);
+	if (is_bool(t))
+		return;
+	die(e->line, "a condition must be a `Bool` — cf has no truthiness (§5). Use a comparison "
+	             "(`x == 0`, `x < y`), a logical `!`/`&&`/`||`, or `true`/`false`");
 }
 
 /* Check that value `val` matches an expected field/payload type `want` (G3a). An Int
@@ -6932,9 +7004,9 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		return (Type){tk, NULL, NULL, 0, NULL};
 	}
 	case EX_IF: {
-		/* if cond then A else B — the condition is truthy when nonzero (Bool arrives in
-		 * N6); the two branches unify to one mergeable scalar, which is the if's type. */
-		expect_int(prog, fn, e->lhs); /* condition */
+		/* if cond then A else B — the condition is a `Bool` (no truthiness, §5); the two
+		 * branches unify to one mergeable scalar, which is the if's type. */
+		expect_bool(prog, fn, e->lhs); /* condition */
 		Type tb = typeof_expr(prog, fn, e->rhs); /* then */
 		Type eb = typeof_expr(prog, fn, e->els); /* else */
 		if (!is_mergeable_scalar(tb))
@@ -6987,9 +7059,9 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		expect_int(prog, fn, e->lhs);
 		return mk_iarch();
 	}
-	case EX_LNOT: /* `!` is operable-int-only (truthiness) — a fixed value must be cast to Int first */
-		expect_int(prog, fn, e->lhs);
-		return mk_iarch();
+	case EX_LNOT: /* logical `!` — a `Bool` operand yielding a `Bool` (no truthiness, §5) */
+		expect_bool(prog, fn, e->lhs);
+		return mk_bool();
 	case EX_ADDR: {
 		/* `&x` — address-of: the operand is a record or (payload) union VALUE; the result is a
 		 * `*T` pointer to it (§6.4 — never a scalar). cfcc's aggregate value is already its arena
@@ -7014,7 +7086,7 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		/* Arithmetic `+ - * /` and comparison `== != < > <= >=` are NUMERIC: both operands
 		 * are Int OR both the SAME float type (no mixed Int/float and no mixed Float32/Float64
 		 * — cast explicitly, type_system §4). Arithmetic yields the operand type; a comparison
-		 * yields Int (0/1). */
+		 * yields `Bool` (§5 — no truthiness; a comparison is the primary Bool source). */
 		Type lt = typeof_expr(prog, fn, e->lhs);
 		Type rt = typeof_expr(prog, fn, e->rhs);
 		int is_cmp = e->kind == EX_EQ || e->kind == EX_NE || e->kind == EX_LT ||
@@ -7022,23 +7094,23 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		if (is_float_type(lt) || is_float_type(rt)) {
 			if (lt.kind != rt.kind || !is_float_type(lt))
 				die(e->line, "a numeric operator needs two operands of the same type (no mixed Int/Float or Float32/Float64 — cast explicitly)");
-			return is_cmp ? mk_iarch() : (Type){lt.kind, NULL, NULL, 0, NULL};
+			return is_cmp ? mk_bool() : (Type){lt.kind, NULL, NULL, 0, NULL};
 		}
 		if (is_operable_int(lt) && is_operable_int(rt)) {
 			/* `Int`/`Iarch` — the operable default integer; the two coexisting reprs mix freely
-			 * and the result is `Iarch` (arithmetic) or a `0/1` `Iarch` (comparison). */
-			return mk_iarch();
+			 * and the result is `Iarch` (arithmetic) or a `Bool` (comparison). */
+			return is_cmp ? mk_bool() : mk_iarch();
 		}
 		if (is_fixed_type(lt) || is_fixed_type(rt)) {
 			/* A sub-family `IntN/UintN` — both operands the SAME type (Iarch is handled above);
-			 * arithmetic yields it, a comparison yields `Iarch` (0/1). */
+			 * arithmetic yields it, a comparison yields `Bool`. */
 			if (!types_equal(lt, rt))
 				die(e->line, "a numeric operator needs two operands of the same fixed-width type (no mixed widths/signedness — cast explicitly)");
-			return is_cmp ? mk_iarch() : lt;
+			return is_cmp ? mk_bool() : lt;
 		}
 		expect_int(prog, fn, e->lhs);
 		expect_int(prog, fn, e->rhs);
-		return mk_iarch();
+		return is_cmp ? mk_bool() : mk_iarch();
 	}
 	case EX_REM:
 	case EX_BOR: case EX_BXOR: case EX_BAND: case EX_SHL: case EX_SHR: {
@@ -7062,10 +7134,10 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		return mk_iarch();
 	}
 	case EX_AND: case EX_OR:
-		/* Logical `&&`/`||` are Int-only (truthiness) — a fixed value must be cast to Int. */
-		expect_int(prog, fn, e->lhs);
-		expect_int(prog, fn, e->rhs);
-		return mk_iarch();
+		/* Logical `&&`/`||` take two `Bool` operands and yield a `Bool` (§5 — no truthiness). */
+		expect_bool(prog, fn, e->lhs);
+		expect_bool(prog, fn, e->rhs);
+		return mk_bool();
 	}
 	die(e->line, "internal: unhandled expression kind in typecheck");
 }
@@ -7593,14 +7665,14 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 		case ST_BREAK:
 		case ST_CONTINUE:
 			if (s->expr) /* guarded: `if <cond> then break/continue` */
-				expect_int(prog, fn, s->expr);
+				expect_bool(prog, fn, s->expr);
 			break;
 		case ST_YIELD:
-			/* `<- v` (or `if <cond> then <- v`): the guard, when present, is a word (truthy
-			 * = nonzero). The yielded value may be any scalar; EX_LOOP unifies all of a
+			/* `<- v` (or `if <cond> then <- v`): the guard, when present, is a `Bool` (§5 — no
+			 * truthiness). The yielded value may be any scalar; EX_LOOP unifies all of a
 			 * loop's yields to one type (loop_yield_type), so here it is only validated/cached. */
 			if (s->expr) /* guard */
-				expect_int(prog, fn, s->expr);
+				expect_bool(prog, fn, s->expr);
 			typeof_expr(prog, fn, s->yval);
 			break;
 		case ST_EXPR:
@@ -8509,9 +8581,10 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 	}
 	case EX_AND:
 	case EX_OR: {
-		/* Short-circuit, reusing the entry-block merge slot `%m<slot>`. Evaluate lhs;
-		 * if it settles the result (false for &&, true for ||) store the constant and
-		 * skip rhs, else evaluate rhs and store its truthiness (`cnew b, 0` → 0/1). */
+		/* Short-circuit, reusing the entry-block merge slot `%m<slot>`. Evaluate lhs (a `Bool`
+		 * `w`); if it settles the result (False for &&, True for ||) store the constant tag and
+		 * skip rhs, else evaluate rhs (also a Bool) and store it. The result is a `Bool` (`w`),
+		 * so the slot is stored/loaded as a word (§5 — no truthiness). */
 		int id = ex->lbl++;
 		int is_and = e->kind == EX_AND;
 		char a[96];
@@ -8520,21 +8593,17 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 			fprintf(out, "\tjnz %s, @rhs%d, @sc%d\n", a, id, id);
 		else
 			fprintf(out, "\tjnz %s, @sc%d, @rhs%d\n", a, id, id);
-		fprintf(out, "@sc%d\n", id); /* short-circuit: 0 for &&, 1 for || — the result is Iarch (`l`) */
-		fprintf(out, "\tstorel %d, %%m%d\n", is_and ? 0 : 1, e->slot);
+		fprintf(out, "@sc%d\n", id); /* short-circuit: Bool.False (0) for &&, Bool.True (1) for || */
+		fprintf(out, "\tstorew %d, %%m%d\n", is_and ? 0 : 1, e->slot);
 		fprintf(out, "\tjmp @lend%d\n", id);
 		fprintf(out, "@rhs%d\n", id);
 		char b[96];
 		emit_expr(out, e->rhs, ex, b, sizeof b);
-		int bt = ex->tmp++;
-		fprintf(out, "\t%%t%d =w cne%c %s, 0\n", bt, qtype_of(e->rhs->rtype), b); /* b != 0 → 0/1 word */
-		int bl = ex->tmp++;
-		fprintf(out, "\t%%t%d =l extuw %%t%d\n", bl, bt); /* widen to the `l` slot */
-		fprintf(out, "\tstorel %%t%d, %%m%d\n", bl, e->slot);
+		fprintf(out, "\tstorew %s, %%m%d\n", b, e->slot); /* the rhs Bool is already a 0/1 word */
 		fprintf(out, "\tjmp @lend%d\n", id);
 		fprintf(out, "@lend%d\n", id);
 		int r = ex->tmp++;
-		fprintf(out, "\t%%t%d =l loadl %%m%d\n", r, e->slot);
+		fprintf(out, "\t%%t%d =w loadw %%m%d\n", r, e->slot);
 		snprintf(dst, cap, "%%t%d", r);
 		return;
 	}
@@ -8554,11 +8623,9 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 			fprintf(out, "\t%%t%d =%c neg %s\n", t, qtype_of(e->lhs->rtype), a);
 		else if (e->kind == EX_BNOT)
 			fprintf(out, "\t%%t%d =%c xor %s, -1\n", t, qtype_of(e->lhs->rtype), a);
-		else { /* EX_LNOT — result is Iarch (`l`), a 0/1: compare the operand to 0 at its width */
+		else { /* EX_LNOT — result is a `Bool` (`w`), a 0/1: compare the Bool operand to 0 */
 			fprintf(out, "\t%%t%d =w ceq%c %s, 0\n", t, qtype_of(e->lhs->rtype), a);
-			int r = ex->tmp++;
-			fprintf(out, "\t%%t%d =l extuw %%t%d\n", r, t);
-			snprintf(dst, cap, "%%t%d", r);
+			snprintf(dst, cap, "%%t%d", t);
 			return;
 		}
 		/* `-x`/`~x` on a sub-word fixed type must wrap back to its width. */
@@ -8598,10 +8665,10 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		if (is_cmp) {
 			char m[16];
 			cmp_mnemonic(e->kind, oq, is_signed, m, sizeof m);
-			fprintf(out, "\t%%t%d =w %s %s, %s\n", t, m, a, b); /* QBE compare yields a 0/1 word */
-			int r = ex->tmp++; /* the comparison's type is Iarch (`l`) — widen the 0/1 to a long */
-			fprintf(out, "\t%%t%d =l extuw %%t%d\n", r, t);
-			snprintf(dst, cap, "%%t%d", r);
+			/* A QBE compare yields a 0/1 word — exactly the `Bool` tag repr (§5), so the temp
+			 * IS the Bool value; no widening (qtype_of(Bool) == 'w'). */
+			fprintf(out, "\t%%t%d =w %s %s, %s\n", t, m, a, b);
+			snprintf(dst, cap, "%%t%d", t);
 		} else {
 			fprintf(out, "\t%%t%d =%c %s %s, %s\n", t, oq, arith_mnemonic(e->kind, is_signed), a, b);
 			/* Wrap a sub-word fixed-width result back to its width (no-op for Int/Uarch/float). */
@@ -10106,6 +10173,7 @@ int main(int argc, char **argv) {
 	/* Front end. Parse the main file, then flatten every imported module into the same
 	 * program (the `resolved` arc) before the concrete passes run over the whole. */
 	Program prog = {0};
+	register_builtins(&prog); /* Bool (a built-in tag-only union) — before any decl parses */
 	Import imps[MAX_IMPORTS];
 	int nimps = 0;
 	parse_source_file(input, &prog, imps, &nimps);
