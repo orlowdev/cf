@@ -924,6 +924,8 @@ typedef enum {
 	ST_LOCAL,       /* const/let binding: declare + initialize */
 	ST_ASSIGN,      /* reassign an existing `let` word local */
 	ST_FIELD_ASSIGN,/* mutate a field of a `let` record local: name.field = expr */
+	ST_INDEX_ASSIGN,/* mutate an element of a `let` fixed array: xs[i] = expr. `expr` holds the
+	                 * EX_INDEX target (base array in lhs, index in rhs), `yval` the stored value. */
 	ST_RETURN,
 	ST_LOOP,        /* loop { body } — infinite loop statement */
 	ST_FOR,         /* for <var> in <array> { body } — iterate a fixed array (statement-only).
@@ -956,12 +958,14 @@ struct Stmt {
 	char bufsize_name[64]; /* ST_LOCAL: a `[n Uint8]` buffer whose length is a comptime
 	                        * value parameter (`n`); resolved to `bufsize` at instantiation */
 	Expr *expr;         /* ST_LOCAL/ST_ASSIGN/ST_FIELD_ASSIGN: value (NULL for a buffer
-	                     * local); ST_RETURN: returned; ST_BREAK/ST_CONTINUE: guard or NULL;
-	                     * ST_DEFER: the scheduled call (call form; NULL for the block form) */
+	                     * local); ST_INDEX_ASSIGN: the EX_INDEX target; ST_RETURN: returned;
+	                     * ST_BREAK/ST_CONTINUE: guard or NULL; ST_DEFER: the scheduled call
+	                     * (call form; NULL for the block form) */
 	Stmt *body;         /* ST_LOOP: the loop body statement list; ST_DEFER: the block form's
 	                     * body (NULL for the call form) */
 	Expr *yval;         /* ST_YIELD: the yielded value (`<- yval`); `expr` carries the
-	                     * optional guard, mirroring break/continue */
+	                     * optional guard, mirroring break/continue. ST_INDEX_ASSIGN: the
+	                     * stored value (`xs[i] = yval`) */
 	int destructure_arity; /* ST_LOCAL: >0 marks a destructuring's hidden tuple temp
 	                        * (`const (a,b) = e`); the value = the pattern's position count,
 	                        * checked against the tuple's arity in typecheck (0 = ordinary) */
@@ -3801,15 +3805,18 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 			Type st = {TY_STR, NULL, NULL, 0, NULL};
 			func_add_local(fn, s->name, mutable, st, "Str");
 		} else if (is_arr) {
-			/* `const [N Int] xs = [e0, …]` — a fixed array bound to an array literal
-			 * (only; an array-returning call is a later brick). The declared length N
-			 * rides on the local's type; typecheck checks the literal's length matches.
-			 * The array's N elements live in the arena (fresh alloc at emit), like a
-			 * record; `%r_<name>` names the base pointer. ⚠ const-only: element assignment
-			 * `xs[i] = v` (a side-effecting lvalue) and whole-array reassignment are later
-			 * bricks — a `[N Int]` array is read-only after construction in M1. */
-			if (mutable)
-				die(name->line, "a `[N Int]` array must be `const` (mutable arrays / element assignment are a later brick)");
+			/* `const [N Iarch] xs = [e0, …]` / `let [N Iarch] xs = […]` — a fixed array
+			 * bound to an array literal (only; an array-returning call is a later brick).
+			 * The declared length N rides on the local's type; typecheck checks the
+			 * literal's length matches. The array's N elements live in the arena (fresh
+			 * alloc at emit), like a record; `%r_<name>` names the base pointer. A `let`
+			 * array's elements are mutable via element assignment `xs[i] = v` (the base
+			 * pointer is fixed — whole-array reassignment stays forbidden); a `const`
+			 * array is read-only after construction.
+			 * ⚠ cf0 must NOT inherit: cfcc rejects whole-array reassignment `xs = […]`;
+			 * cf0 likely permits rebinding a `let` array to a FRESH literal (memory_model §6
+			 * forbids only a second binding onto an EXISTING aggregate, not overwriting) —
+			 * revisit when the reassignment rule for aggregates is pinned. */
 			s->expr = parse_expr(p, fn);
 			if (s->expr->kind != EX_ARRAY)
 				die(name->line, "a `[N Int]` array binds an array literal `[…]` (an array-returning call is not supported yet)");
@@ -4031,21 +4038,33 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 	if (t->kind == TK_IDENT && !is_type_ident(t)) {
 		if (t->text[t->len - 1] == '!')
 			die(t->line, "M0 does not support `!` in a name here");
-		/* A name immediately followed by `(` — or `[` for a generic call `f[Int](…)` —
-		 * is a call statement, invoked for its effect (e.g. `write(...)`), its result
-		 * discarded. Parsed as a full expression (which builds the EX_CALL). */
+		/* A name immediately followed by `(` — or `[` — leads either a call statement
+		 * (`write(...)`, `f[Int](...)`, invoked for effect) or an element assignment
+		 * (`xs[i] = v`). Parse the full expression first, then a trailing `=` after an
+		 * index makes it an assignment; anything else is the effect statement. */
 		if (p->toks[p->pos + 1].kind == TK_LPAREN || p->toks[p->pos + 1].kind == TK_LBRACKET) {
+			Expr *lead = parse_expr(p, fn);
+			ExprKind cop;
+			int is_eq = peek(p)->kind == TK_EQ;
+			int is_cop = !is_eq && compound_assign_op(peek(p)->kind, &cop);
+			if (is_eq || is_cop) {
+				/* `xs[i] = v` — element assignment into a mutable (`let`) fixed array.
+				 * The target must be an index; typecheck enforces the array is a `let`. */
+				if (lead->kind != EX_INDEX)
+					die(peek(p)->line, "cannot assign to this expression");
+				if (is_cop)
+					die(peek(p)->line, "compound assignment on an array element (`xs[i] op= …`) "
+					                   "is not supported yet (write `xs[i] = xs[i] op …`)");
+				advance(p); /* = */
+				Stmt *s = new_stmt(ST_INDEX_ASSIGN);
+				s->line = t->line;
+				s->expr = lead;                /* the EX_INDEX target */
+				s->yval = parse_expr(p, fn);   /* the stored value */
+				return s;
+			}
 			Stmt *s = new_stmt(ST_EXPR);
 			s->line = t->line;
-			s->expr = parse_expr(p, fn);
-			/* An index expression (`xs[i]`) at statement head followed by `=`/`op=` is an
-			 * attempted element assignment — a side-effecting lvalue, a later brick. */
-			ExprKind cop;
-			if (peek(p)->kind == TK_EQ || compound_assign_op(peek(p)->kind, &cop)) {
-				if (s->expr->kind == EX_INDEX)
-					die(peek(p)->line, "array element assignment (`xs[i] = …`) is not supported yet (arrays are read-only in M1)");
-				die(peek(p)->line, "cannot assign to this expression");
-			}
+			s->expr = lead;
 			return s;
 		}
 		char target[64];
@@ -4105,8 +4124,11 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 		/* Only a scalar `let` in a slot (an Int word, a float, or a fixed-width IntN/UintN) can
 		 * be reassigned as a unit; a whole record/aggregate cannot — mutate its fields with `.`.
 		 * (Aggregate copy-binding is a later concern — memory_model §6 requires an explicit copy.) */
-		if (ty.kind != TY_INT && !is_float_type(ty) && !is_fixed_type(ty))
+		if (ty.kind != TY_INT && !is_float_type(ty) && !is_fixed_type(ty)) {
+			if (ty.kind == TY_ARRAY)
+				die(t->line, "cannot reassign a whole array (mutate an element with `xs[i] = …`)");
 			die(t->line, "cannot assign to a whole record (mutate a field with `.`)");
+		}
 		ExprKind cop;
 		if (compound_assign_op(peek(p)->kind, &cop)) {
 			/* `x op= y` desugars to `x = x op y` (x a plain `let` word local). */
@@ -7550,6 +7572,37 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 			check_member_value(prog, fn, s->expr, data_field_type(prog, ty.rec, idx), s->line);
 			break;
 		}
+		case ST_INDEX_ASSIGN: {
+			/* `xs[i] = v` — the target must be a mutable (`let`) fixed-array local. A
+			 * `const` array (or a param, or a tuple) is read-only. The index is an
+			 * operable integer and the value is an array element (an Iarch).
+			 * ⚠ cf0 must NOT inherit these write-path narrowings (all strictly subtractive):
+			 * (1) NO BOUNDS CHECK — an out-of-range store corrupts memory; §6.2 bounds-checks,
+			 *     and a comptime-known OOB literal index is a compile error in cf0 (this write
+			 *     shares the EX_INDEX read path's disclaimed degeneracy);
+			 * (2) the index is Iarch, not §6.2's Uarch (inherited from the read path);
+			 * (3) compound element-assign `xs[i] op= v` is deferred (cf0 has it, ebnf
+			 *     § Assignment); (4) the target must be a bare `EX_VAR` array — a `p.arr[i]`
+			 *     or chained `xs[i][j]` lvalue is rejected, whereas §type_system makes
+			 *     mutability transitive through aggregates. */
+			Expr *tgt = s->expr;   /* the EX_INDEX */
+			Expr *base = tgt->lhs;
+			Type bt = typeof_expr(prog, fn, base);
+			if (bt.kind != TY_ARRAY)
+				die(s->line, "element assignment `xs[i] = …` needs a fixed array on the left "
+				             "(a tuple is immutable; a byte buffer is not indexable)");
+			if (base->kind != EX_VAR)
+				die(s->line, "element assignment targets a named array local");
+			Type lt;
+			Resolution r = resolve_name(fn, base->name, &lt);
+			if (r == R_CONST)
+				die(s->line, "cannot assign into a `const` array (declare it with `let`)");
+			if (r == R_PARAM)
+				die(s->line, "cannot assign into an array parameter");
+			typeof_expr(prog, fn, tgt);       /* validates the index; caches the element rtype */
+			expect_int(prog, fn, s->yval);    /* the stored value — an Iarch element */
+			break;
+		}
 		case ST_ASSIGN: { /* target is a scalar `let` local; the value must match its type */
 			Type tt;
 			resolve_name(fn, s->name, &tt);
@@ -8793,6 +8846,25 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 				fprintf(out, "\t%s %s, %%t%d\n", type_is_word(s->expr->rtype) ? "storew" : "storel", v, a);
 			}
 			break;
+		case ST_INDEX_ASSIGN: {
+			/* `xs[i] = v` — store v through the array's base pointer at i*8. Mirrors the
+			 * EX_INDEX read: scale the Iarch index by the 8-byte slot, add it to the base,
+			 * store the value (a word for a tag-only element, else an `l`).
+			 * ⚠ cf0 must NOT inherit: the store is UNCHECKED (memory-corrupting on an
+			 * out-of-range index); cf0's `[N T]` is bounds-checked (§6.2). */
+			Expr *tgt = s->expr;
+			char abase[96];
+			emit_expr(out, tgt->lhs, ex, abase, sizeof abase);
+			char aidx[96];
+			emit_expr(out, tgt->rhs, ex, aidx, sizeof aidx);
+			int o = ex->tmp++;
+			fprintf(out, "\t%%t%d =l mul %s, 8\n", o, aidx);
+			int a = ex->tmp++;
+			fprintf(out, "\t%%t%d =l add %s, %%t%d\n", a, abase, o);
+			emit_expr(out, s->yval, ex, v, sizeof v);
+			fprintf(out, "\t%s %s, %%t%d\n", type_is_word(tgt->rtype) ? "storew" : "storel", v, a);
+			break;
+		}
 		case ST_RETURN:
 			/* Capture the return value first, then fire pending `defer`s (LIFO) before
 			 * the `ret`: the returned word is already snapshotted into a temp, so a defer
