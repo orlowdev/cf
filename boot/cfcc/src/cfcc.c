@@ -725,6 +725,13 @@ typedef struct Param {
 	                     * (its Type is TY_PTR to `rec`/`uni`), not the aggregate value itself.
 	                     * cfcc represents both as the same arena pointer, so they interconvert.
 	                     * ⚠ cf0 must NOT inherit: cf0 keeps a value and its `&`-reference distinct. */
+	int is_bytes;       /* PK_LONG: this param is a `*[Uint8]` byte pointer — the body sees it as
+	                     * TY_BUF (indexable: `p[i]` read + `p[i] = v` write, byte-addressed), while
+	                     * the ABI stays an opaque `l` pointer like any `*[…]`. Lets a buffer be
+	                     * passed to a helper and indexed there (a lexer's source, an emitter's out
+	                     * buffer). Other `*[…]` (e.g. `*[Str]` argv) keep is_bytes=0 → opaque TY_PTR.
+	                     * ⚠ cf0 must NOT inherit: only `*[Uint8]` (a byte element) is indexable here;
+	                     * cf0 indexes ANY `*[T]` param to a `T` (bounds-checked, §6.2/§6.4). */
 	int fn_arity;       /* PK_FN: the function type's parameter count */
 	/* PK_FN: the function type's parameter descriptors (fn_arity of them) and its single
 	 * return descriptor — each is a scalar/pointer/nested-function component (aggregates are
@@ -1822,7 +1829,8 @@ static Resolution resolve_name(Func *fn, const char *name, Type *ty) {
 				if (fn->params[i].is_ptr) { ty->kind = TY_PTR; ty->rec = fn->params[i].rec; }
 				else { ty->kind = TY_RECORD; ty->rec = fn->params[i].rec; }
 				break;
-			case PK_LONG:    ty->kind = TY_PTR;    ty->rec = NULL; break;
+			case PK_LONG:    /* a `*[Uint8]` byte pointer is TY_BUF (indexable); any other `*[…]` is opaque TY_PTR */
+				ty->kind = fn->params[i].is_bytes ? TY_BUF : TY_PTR; ty->rec = NULL; break;
 			case PK_UARCH:   ty->kind = TY_UARCH;  ty->rec = NULL; break;
 			case PK_UNION: /* is_ptr → an explicit `*Union` pointer (TY_PTR to the pointee union) */
 				ty->kind = fn->params[i].is_ptr ? TY_PTR : TY_UNION;
@@ -2231,9 +2239,21 @@ static void parse_param_type(Parser *p, Param *out) {
 	if (t->kind == TK_STAR) {
 		advance(p);
 		Token *u = peek(p);
-		if (u->kind == TK_LBRACKET) { /* `*[…]` — an OPAQUE buffer pointer (argv/envp, `*[Uint8]`) */
-			int depth = 0;
-			do {
+		if (u->kind == TK_LBRACKET) { /* `*[…]` — a buffer pointer (argv/envp, `*[Uint8]`) */
+			advance(p); /* consume `[` */
+			if (is_ident(peek(p), "Uint8") && p->toks[p->pos + 1].kind == TK_RBRACKET) {
+				/* `*[Uint8]` — a pointer to bytes, INDEXABLE in the body (TY_BUF): `p[i]`
+				 * reads a Uint8 and `p[i] = v` writes one, so a buffer can be passed to a
+				 * helper and scanned/filled there. The ABI is the same opaque `l` pointer. */
+				advance(p); /* Uint8 */
+				advance(p); /* ] */
+				out->kind = PK_LONG;
+				out->is_bytes = 1;
+				return;
+			}
+			/* any other `*[…]` (e.g. `*[Str]` argv/envp, nested) stays an OPAQUE pointer */
+			int depth = 1; /* the opening `[` is already consumed */
+			while (depth > 0) {
 				Token *v = advance(p);
 				if (v->kind == TK_LBRACKET)
 					depth++;
@@ -2241,7 +2261,7 @@ static void parse_param_type(Parser *p, Param *out) {
 					depth--;
 				else if (v->kind == TK_EOF)
 					die(v->line, "unterminated pointer type");
-			} while (depth > 0);
+			}
 			out->kind = PK_LONG;
 			return;
 		}
@@ -7624,8 +7644,9 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 			break;
 		}
 		case ST_INDEX_ASSIGN: {
-			/* `xs[i] = v` — the target must be a mutable (`let`) fixed-array OR byte-buffer
-			 * local; a `const` target (or a param, or a tuple) is read-only. For an array the
+			/* `xs[i] = v` — the target is a mutable (`let`) fixed-array or byte-buffer LOCAL,
+			 * or a `*[Uint8]` byte-pointer PARAM (a writable borrow — the store lands in the
+			 * caller's buffer, memory_model §6). A `const` local or a tuple is read-only. For an array the
 			 * value is an Iarch element; for a `[N Uint8]` buffer it is a Uint8 byte (a bare
 			 * non-negative literal adopts 0..255, else cast with `Uint8(x)`).
 			 * ⚠ cf0 must NOT inherit these write-path narrowings (all strictly subtractive):
@@ -7634,10 +7655,12 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 			 *     shares the EX_INDEX read path's disclaimed degeneracy);
 			 * (2) the index is Iarch, not §6.2's Uarch (inherited from the read path);
 			 * (3) compound element-assign `xs[i] op= v` is deferred (cf0 has it, ebnf
-			 *     § Assignment); (4) the target must be a bare `EX_VAR` local — a `p.arr[i]`
+			 *     § Assignment); (4) the target must be a bare `EX_VAR` local/param — a `p.arr[i]`
 			 *     or chained `xs[i][j]` lvalue is rejected, whereas §type_system makes
-			 *     mutability transitive through aggregates; (5) only a buffer LOCAL is indexable,
-			 *     not a `*[Uint8]` pointer param (pointer indexing is deferred). */
+			 *     mutability transitive through aggregates; (5) only a `*[Uint8]` (byte) pointer
+			 *     param is indexable — a `*[Iarch]`/general `*[T]` param stays opaque, whereas cf0
+			 *     indexes any `*[T]` param to a `T`; (6) no call-site write-capability check — cf0
+			 *     rejects writing through a pointer to a `const` buffer (§6). */
 			Expr *tgt = s->expr;   /* the EX_INDEX */
 			Expr *base = tgt->lhs;
 			Type bt = typeof_expr(prog, fn, base);
@@ -7650,8 +7673,11 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 			Resolution r = resolve_name(fn, base->name, &lt);
 			if (r == R_CONST)
 				die(s->line, "cannot assign into a `const` array/buffer (declare it with `let`)");
-			if (r == R_PARAM)
-				die(s->line, "cannot assign into an array/buffer parameter");
+			/* A `*[Uint8]` byte-pointer param (TY_BUF, R_PARAM) IS a writable borrow: `p[i] = v`
+			 * stores into the caller's buffer — the intended pass-a-buffer-and-fill-it semantics.
+			 * A fixed-array param can't occur (arrays aren't params), so R_PARAM else = rejected. */
+			if (r == R_PARAM && bt.kind != TY_BUF)
+				die(s->line, "cannot assign into an array parameter");
 			typeof_expr(prog, fn, tgt);       /* validates the index; caches the element rtype */
 			if (bt.kind == TY_BUF) {
 				/* a byte: a bare non-negative literal adopts Uint8 (range 0..255), else the
@@ -9214,11 +9240,13 @@ static void emit_func(FILE *out, const Func *fn) {
 			fprintf(out, "\tstore%c %%u_%s, %%s_%s\n", qt, n, n);
 		} else if ((fn->params[i].kind == PK_RECORD && !fn->params[i].is_ptr) ||
 		           fn->params[i].kind == PK_CAPTURE_REC || fn->params[i].kind == PK_TUPLE ||
+		           (fn->params[i].kind == PK_LONG && fn->params[i].is_bytes) ||
 		           (fn->params[i].kind == PK_UNION && fn->params[i].uni->has_payload &&
 		            !fn->params[i].is_ptr)) {
-			/* A record, captured-record, tuple, or boxed-union param arrives as an arena
-			 * pointer, copied into the `%r_<name>` form field/index access uses. A captured
-			 * record aliases the enclosing scope's storage, so field writes there are visible.
+			/* A record, captured-record, tuple, byte-buffer (`*[Uint8]`), or boxed-union param
+			 * arrives as an arena pointer, copied into the `%r_<name>` form field/index access
+			 * uses. A captured record aliases the enclosing scope's storage, so field writes
+			 * there are visible; likewise a `*[Uint8]` param indexes/writes the caller's bytes.
 			 * An explicit `*Record`/`*Union` pointer param is instead read directly as its
 			 * `%u_<name>` incoming temp (EX_VAR TY_PTR path), so it is excluded — no `%r_`. */
 			fprintf(out, "\t%%r_%s =l copy %%u_%s\n", n, n);
