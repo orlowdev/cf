@@ -1357,6 +1357,9 @@ struct Program {
  * the `std/` root land in later slices. */
 typedef struct {
 	char path[256];   /* the import string as written, e.g. "mem" or "sub/util" (no `.cf`) */
+	int is_pub;       /* a `pub import` REEXPORT — the names it brings in also become part of THIS
+	                   * module's exported surface, so a module importing this one may pull them
+	                   * from here (a barrel). Only the destructured form reexports in this slice. */
 	char names[MAX_IMPORT_NAMES][64]; /* destructured member names bound into the importer's scope */
 	int nnames;
 	char ns[64];      /* a namespace alias — lowercase (`import "p" as mem` → `mem.foo()`, VALUES) or
@@ -4953,15 +4956,16 @@ static void rename_group(const Renames *r, ParamGroup *g) {
 }
 
 /* import_decl = [ "pub" ] "import" string "as" import_alias   (ebnf § Imports).
- * Parses one import into an `Import`. Only the destructured value form
- * (`as { foo, Point }`) and the lowercase VALUE namespace (`as mem` → `mem.foo()`)
- * are honoured; the PascalCase type namespace and `pub import` reexports parse far
- * enough to raise a clear "not supported yet". */
+ * Parses one import into an `Import`. The destructured form (`as { foo, Point }`) and both
+ * namespaces (`as mem` / `as Math`) are honoured, and `pub import … as { … }` reexports;
+ * a `pub import` namespace reexport parses far enough to raise a clear "not supported yet". */
 static Import parse_import(Parser *p) {
 	Import im = {0};
 	im.line = peek(p)->line;
-	if (is_ident(peek(p), "pub"))
-		die(peek(p)->line, "a `pub import` reexport is not supported yet");
+	if (is_ident(peek(p), "pub")) {
+		im.is_pub = 1;
+		advance(p); /* `pub` */
+	}
 	advance(p); /* `import` — the caller already matched it */
 
 	Token *pt = peek(p);
@@ -5014,6 +5018,8 @@ static Import parse_import(Parser *p) {
 	} else {
 		die(peek(p)->line, "expected a namespace alias or `{ … }` after `as`");
 	}
+	if (im.is_pub && im.ns[0])
+		die(im.line, "a namespace reexport (`pub import … as ns`) is not supported yet (use `pub import … as { … }`)");
 	return im;
 }
 
@@ -9488,11 +9494,58 @@ static int load_module(const char *abspath) {
 	return idx;
 }
 
+/* Whether a module exports a name, and if so where it ultimately lives. */
+typedef enum { RES_NONE, RES_PRIVATE, RES_OK } ExportRes;
+
+/* Resolve what module `m` exports under `name` to its ULTIMATE mangled target, FOLLOWING
+ * `pub import` reexports (a barrel is an import wearing a nicer name). An own `pub` decl wins
+ * and yields `m`'s prefix + name; an own PRIVATE decl blocks (RES_PRIVATE); otherwise each
+ * `pub import` that reexports `name` is followed to its origin. `depth` guards a reexport
+ * cycle. On RES_OK the mangled target is written to `out`. */
+static ExportRes resolve_export(Module *m, const char *name, char *out, size_t cap, int depth) {
+	if (depth > MAX_MODULES)
+		die(0, "a `pub import` reexport cycle");
+	int pub = decl_pubness(&m->decls, name);
+	if (pub == 1) {
+		if ((size_t)snprintf(out, cap, "%s%s", m->prefix, name) >= cap)
+			die(0, "mangled name too long");
+		return RES_OK;
+	}
+	if (pub == 0)
+		return RES_PRIVATE; /* an own private decl shadows any reexport of the same name */
+	for (int k = 0; k < m->nimports; k++) {
+		const Import *im = &m->imports[k];
+		if (!im->is_pub)
+			continue;
+		int reexports = 0;
+		for (int j = 0; j < im->nnames; j++)
+			if (strcmp(im->names[j], name) == 0) { reexports = 1; break; }
+		if (!reexports)
+			continue;
+		char tdir[4096], tabs[4096];
+		dir_of(m->abspath, tdir, sizeof tdir);
+		resolve_module_path(tdir, im->path, im->line, tabs, sizeof tabs);
+		Module *t = NULL;
+		for (int i = 0; i < g_nmods; i++)
+			if (strcmp(g_mods[i]->abspath, tabs) == 0) { t = g_mods[i]; break; }
+		if (!t)
+			die(im->line, "internal error: reexport target was not discovered");
+		return resolve_export(t, name, out, cap, depth + 1);
+	}
+	return RES_NONE;
+}
+
+/* True if `name` is a type name (PascalCase) rather than a value name (snake_case). */
+static int name_is_type(const char *name) {
+	return name[0] >= 'A' && name[0] <= 'Z';
+}
+
 /* Build the alias map for one importer (the main file or a module) from ITS imports: each
- * destructured/namespace-qualified name → the mangled target in the dependency module. The
- * dependency's exported members are read from its ORIGINAL-named `decls` and its prefix, so
- * this is order-independent (it does not need the dependency spliced yet). Does not add the
- * importer's own self-mangle entries (the caller does that for a module). */
+ * destructured/namespace-qualified name → the mangled target in the dependency module,
+ * following `pub import` barrels to the origin. The dependency's exports are read from its
+ * ORIGINAL-named `decls` (+ its own reexports) and prefix, so this is order-independent (it
+ * does not need the dependency spliced yet). Does not add the importer's own self-mangle
+ * entries (the caller does that for a module). */
 static void build_import_aliases(const char *importer_dir, const Import *imports, int nimports,
                                  Rename **al, int *nal) {
 	char nsused[MAX_IMPORTS][64];
@@ -9531,17 +9584,33 @@ static void build_import_aliases(const char *importer_dir, const Import *imports
 				NS_EXPOSE(d->decls.nfuncs, d->decls.funcs[i]->is_pub, d->decls.funcs[i]->name);
 			}
 			#undef NS_EXPOSE
+			/* Also expose the dependency's REEXPORTS (names it `pub import`s), of the matching
+			 * kind — values for a lowercase alias, types for a PascalCase one — followed to origin. */
+			for (int di = 0; di < d->nimports; di++) {
+				const Import *dim = &d->imports[di];
+				if (!dim->is_pub)
+					continue;
+				for (int j = 0; j < dim->nnames; j++) {
+					if (name_is_type(dim->names[j]) != im->ns_is_type)
+						continue;
+					char tgt[128];
+					if (resolve_export(d, dim->names[j], tgt, sizeof tgt, 0) != RES_OK)
+						continue; /* a broken reexport surfaces when the dependency itself flattens */
+					char key[128];
+					if (snprintf(key, sizeof key, "%s.%s", im->ns, dim->names[j]) >= (int)sizeof key)
+						die(im->line, "qualified name too long");
+					add_alias(al, nal, key, tgt, im->line);
+				}
+			}
 		}
 
 		for (int j = 0; j < im->nnames; j++) {
-			int pub = decl_pubness(&d->decls, im->names[j]);
-			if (pub < 0)
-				die(im->line, "the module exports no such name (unknown import)");
-			if (!pub)
-				die(im->line, "imported name is not exported (`pub`) by the module");
 			char tgt[128];
-			if (snprintf(tgt, sizeof tgt, "%s%s", d->prefix, im->names[j]) >= (int)sizeof tgt)
-				die(im->line, "mangled name too long");
+			ExportRes r = resolve_export(d, im->names[j], tgt, sizeof tgt, 0);
+			if (r == RES_NONE)
+				die(im->line, "the module exports no such name (unknown import)");
+			if (r == RES_PRIVATE)
+				die(im->line, "imported name is not exported (`pub`) by the module");
 			add_alias(al, nal, im->names[j], tgt, im->line);
 		}
 	}
