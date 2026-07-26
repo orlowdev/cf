@@ -9830,6 +9830,213 @@ static void flatten_imports(const char *main_path, Program *prog, Import *imps, 
 	free(aliases);
 }
 
+/* ---------------------------------------------------- prune unused imports - */
+
+/* A growable list of names, used both as the reachability set and the worklist. */
+typedef struct { char (*v)[64]; int n, cap; } NameList;
+
+static void nl_push(NameList *l, const char *s) {
+	if (l->n == l->cap) {
+		l->cap = l->cap ? l->cap * 2 : 64;
+		l->v = realloc(l->v, l->cap * sizeof *l->v);
+		if (!l->v)
+			die(0, "out of memory");
+	}
+	snprintf(l->v[l->n++], sizeof l->v[0], "%s", s);
+}
+static int nl_has(const NameList *l, const char *s) {
+	for (int i = 0; i < l->n; i++)
+		if (strcmp(l->v[i], s) == 0)
+			return 1;
+	return 0;
+}
+
+/* Collect the top-level names a TYPE annotation references: strip a leading `*`, then split a
+ * generic-application mangle (`List.1.Int`) on `.` and push each non-numeric segment — so both
+ * the base template (`List`) and its type arguments (`Int`) are reached. A plain name pushes
+ * whole. */
+static void collect_type(NameList *out, const char *s) {
+	if (!s || !s[0])
+		return;
+	const char *p = (s[0] == '*') ? s + 1 : s;
+	while (*p) {
+		char buf[64];
+		int k = 0;
+		while (*p && *p != '.' && k < (int)sizeof buf - 1)
+			buf[k++] = *p++;
+		buf[k] = '\0';
+		while (*p == '.')
+			p++;
+		if (!k)
+			continue;
+		int numeric = 1;
+		for (int i = 0; i < k; i++)
+			if (!isdigit((unsigned char)buf[i])) { numeric = 0; break; }
+		if (!numeric)
+			nl_push(out, buf);
+	}
+}
+
+static void collect_stmt(NameList *out, const Stmt *s); /* forward */
+
+/* Collect every top-level name an expression references — mirrors rename_expr exactly (value
+ * references and the type names an expression carries), so reachability never misses a
+ * reference the flatten would have rewritten. */
+static void collect_expr(NameList *out, const Expr *e) {
+	if (!e)
+		return;
+	if (e->kind == EX_VAR || e->kind == EX_CALL)
+		nl_push(out, e->name);
+	else if (e->kind == EX_RECORD || e->kind == EX_CAST || e->kind == EX_UMEMBER)
+		collect_type(out, e->name);
+	for (int i = 0; i < e->ntypeargs; i++)
+		collect_type(out, e->typeargs[i]);
+	for (int i = 0; i < e->narms; i++) {
+		collect_type(out, e->arms[i].qual);
+		collect_expr(out, e->arms[i].body);
+	}
+	collect_expr(out, e->lhs);
+	collect_expr(out, e->rhs);
+	collect_expr(out, e->els);
+	collect_expr(out, e->spread);
+	for (int i = 0; i < e->nargs; i++)
+		collect_expr(out, e->args[i]);
+	for (int i = 0; i < e->nfields; i++)
+		collect_expr(out, e->fvals[i]);
+	collect_stmt(out, e->loop_body);
+}
+
+static void collect_stmt(NameList *out, const Stmt *s) {
+	for (; s; s = s->next) {
+		collect_type(out, s->type_name);
+		collect_expr(out, s->expr);
+		collect_expr(out, s->yval);
+		collect_stmt(out, s->body);
+	}
+}
+
+static void collect_param(NameList *out, const Param *p) {
+	collect_type(out, p->type_name);
+	for (int i = 0; i < p->tuple_n; i++)
+		collect_type(out, p->tuple_types[i]);
+	for (int i = 0; i < p->fn_arity; i++)
+		collect_param(out, &p->fn_ptypes[i]);
+	if (p->fn_ret)
+		collect_param(out, p->fn_ret);
+}
+
+/* A function reaches: its signature types, its body's references, and its LIFTED CLOSURES —
+ * which the body refers to by pointer (Func.closures[].lifted), not by a name a walker sees. */
+static void collect_func(NameList *out, const Func *f) {
+	for (int i = 0; i < f->nparams; i++)
+		collect_param(out, &f->params[i]);
+	collect_type(out, f->ret_type_name);
+	for (int i = 0; i < f->ret_tuple_n; i++)
+		collect_type(out, f->ret_tuple_types[i]);
+	for (int i = 0; i < f->ntyparams; i++)
+		collect_type(out, f->bounds[i]);
+	collect_stmt(out, f->body);
+	for (int i = 0; i < f->nclosures; i++)
+		if (f->closures[i].lifted)
+			nl_push(out, f->closures[i].lifted->name);
+}
+
+static void collect_data(NameList *out, const DataDecl *d) {
+	for (int i = 0; i < d->nfields; i++)
+		collect_type(out, d->field_types[i]);
+	for (int i = 0; i < d->ntyparams; i++)
+		collect_type(out, d->bounds[i]);
+}
+static void collect_union(NameList *out, const UnionDecl *u) {
+	for (int i = 0; i < u->nmembers; i++)
+		for (int j = 0; j < u->arity[i]; j++)
+			collect_type(out, u->payload_types[i][j]);
+	for (int i = 0; i < u->ntyparams; i++)
+		collect_type(out, u->bounds[i]);
+}
+static void collect_group(NameList *out, const ParamGroup *g) {
+	for (int i = 0; i < g->nfields; i++)
+		collect_param(out, &g->fields[i]);
+}
+
+/* Validate every asm body's `${name}` interpolations name a parameter. asm bodies bypass the
+ * typecheck gate (they are raw), and this check otherwise lives only in emit — so it must run
+ * as a whole-program gate BEFORE DCE, or an unreachable asm function with a bad `${…}` would be
+ * pruned away and its error lost (the emit-time check stays as the belt-and-braces). */
+static void check_asm_bodies(Program *prog) {
+	for (int i = 0; i < prog->nfuncs; i++) {
+		Func *fn = prog->funcs[i];
+		if (!fn->is_asm)
+			continue;
+		Token *b = fn->asm_body;
+		for (int s = 0; s < b->nsegs; s++) {
+			if (b->segs[s].kind != SEG_INTERP)
+				continue;
+			int found = 0;
+			for (int j = 0; j < fn->nparams; j++)
+				if (strcmp(fn->params[j].name, b->segs[s].name) == 0) { found = 1; break; }
+			if (!found)
+				die(b->line, "asm `${...}` must name a parameter "
+				             "(M0 has no comptime constants in asm bodies yet)");
+		}
+	}
+}
+
+/* Drop every top-level declaration not reachable from `main` — the DCE (`pruned`) arc
+ * (order_of_compilation §9), which also realizes the flatten's "prune unused imports": an
+ * imported module used for one function no longer emits its siblings. Runs AFTER typecheck
+ * (a whole-program gate that must reject ill-typed unreachable code first), so this only
+ * shrinks what is emitted and never changes what compiles. Reachability follows the same name
+ * references the flatten rewrites — so it never over-prunes a used decl — plus each reached
+ * function's lifted closures (referred to by pointer, not name). By this point generic
+ * templates have been monomorphized into concrete clones (which calls now name directly), so
+ * the unreferenced templates prune away; emit skipped them regardless. */
+static void prune_unreachable(Program *prog) {
+	NameList reached = {0}, work = {0};
+	nl_push(&work, "main");
+	while (work.n > 0) {
+		char name[64];
+		snprintf(name, sizeof name, "%s", work.v[--work.n]);
+		if (nl_has(&reached, name))
+			continue;
+		nl_push(&reached, name);
+		Func *f = prog_find_func(prog, name);
+		if (f)
+			collect_func(&work, f);
+		DataDecl *d = prog_find_data(prog, name);
+		if (d)
+			collect_data(&work, d);
+		UnionDecl *u = prog_find_union(prog, name);
+		if (u)
+			collect_union(&work, u);
+		ParamGroup *g = prog_find_group(prog, name);
+		if (g)
+			collect_group(&work, g);
+	}
+	int nf = 0;
+	for (int i = 0; i < prog->nfuncs; i++)
+		if (nl_has(&reached, prog->funcs[i]->name))
+			prog->funcs[nf++] = prog->funcs[i];
+	prog->nfuncs = nf;
+	int nd = 0;
+	for (int i = 0; i < prog->ndatas; i++)
+		if (nl_has(&reached, prog->datas[i]->name))
+			prog->datas[nd++] = prog->datas[i];
+	prog->ndatas = nd;
+	int nu = 0;
+	for (int i = 0; i < prog->nunions; i++)
+		if (nl_has(&reached, prog->unions[i]->name))
+			prog->unions[nu++] = prog->unions[i];
+	prog->nunions = nu;
+	int ng = 0;
+	for (int i = 0; i < prog->ngroups; i++)
+		if (nl_has(&reached, prog->groups[i]->name))
+			prog->groups[ng++] = prog->groups[i];
+	prog->ngroups = ng;
+	free(reached.v);
+	free(work.v);
+}
+
 /* Return the stem of a path — its basename without a trailing .cf. Used for the
  * default ./out/<stem> artifact name. */
 static char *stem_of(const char *path) {
@@ -9908,6 +10115,11 @@ int main(int argc, char **argv) {
 	monomorphize(&prog); /* specialize generic calls before the concrete passes */
 	specialize_hofs(&prog); /* fake-closure specialization: capturing closures → hidden params */
 	typecheck(&prog);
+	check_asm_bodies(&prog); /* whole-program asm `${…}` gate, before DCE could hide the error */
+	/* DCE (the `pruned` arc): drop declarations unreachable from main — AFTER the whole-program
+	 * gates (an ill-typed or ill-formed unreachable decl must still be rejected). This only
+	 * shrinks what is emitted; it never changes what compiles. */
+	prune_unreachable(&prog);
 
 	/* Default artifact: ./out/<stem>. */
 	char *stem = stem_of(input);
