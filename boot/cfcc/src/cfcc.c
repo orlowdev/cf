@@ -1753,6 +1753,8 @@ static Type resolve_member_type(Program *prog, const char *name, int line) {
 		return (Type){TY_UNIT, NULL, NULL, 0, NULL};
 	if (strcmp(name, "Str") == 0) /* a `Str` field — an 8-byte `l` header pointer (immutable) */
 		return (Type){TY_STR, NULL, NULL, 0, NULL};
+	if (strcmp(name, "Uarch") == 0) /* a `Uarch` field — a 64-bit `l` word */
+		return (Type){TY_UARCH, NULL, NULL, 0, NULL};
 	if (name[0] == '(') {
 		/* A tuple field/payload type stored as `(T0,T1,…)` (parse_member_type): split the
 		 * element names on TOP-LEVEL commas (a comma inside a nested `(…)` stays part of the
@@ -3720,7 +3722,7 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 		}
 		/* Optional type annotation: `Int` (a word local) or a record type name (a
 		 * `data`-typed local). A pointer annotation has no M0 local use. */
-		int is_record = 0, is_str = 0, is_buf = 0, bufsize = 0, is_arr = 0, arrlen = 0, is_f64 = 0, is_f32 = 0;
+		int is_record = 0, is_str = 0, is_buf = 0, bufsize = 0, is_arr = 0, arrlen = 0, is_f64 = 0, is_f32 = 0, is_uarch = 0;
 		int is_ptr_local = 0;
 		int is_fixed = 0, fx_bits = 0, fx_signed = 0, fx_arch = 0; /* a fixed-width integer local (IntN/UintN/Iarch) */
 		char bufsize_name[64] = {0}; /* a `[n Uint8]` buffer sized by a comptime value param */
@@ -3795,7 +3797,8 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 				is_str = 1;
 				advance(p);
 			} else if (is_ident(tt, "Uarch")) {
-				die(tt->line, "M0 has no `Uarch` locals (Uarch is a parameter/return type)");
+				is_uarch = 1; /* a register-width unsigned integer local (64-bit `l`) */
+				advance(p);
 			} else if (is_ident(tt, "Float64")) {
 				is_f64 = 1;
 				advance(p);
@@ -3919,6 +3922,15 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 			snprintf(s->type_name, sizeof s->type_name, "%s", tn);
 			Type ft = {is_f64 ? TY_F64 : TY_F32, NULL, NULL, 0, NULL};
 			func_add_local(fn, s->name, mutable, ft, tn);
+		} else if (is_uarch) {
+			/* `const Uarch u = <expr>` / `let Uarch u = …` — a register-width unsigned integer
+			 * local (64-bit `l`). The initializer is a Uarch value, a `Uarch(x)` cast, or a bare
+			 * non-negative literal (adopts Uarch); `let` reassigns. Now a fully operable integer
+			 * (arithmetic/comparison, same-type — unsigned ops), no longer param/return-only. */
+			s->expr = parse_expr(p, fn);
+			snprintf(s->type_name, sizeof s->type_name, "Uarch");
+			Type ut = {TY_UARCH, NULL, NULL, 0, NULL};
+			func_add_local(fn, s->name, mutable, ut, "Uarch");
 		} else if (is_fixed) {
 			/* `const Int8 x = <expr>` / `let Uint16 y = …` — a fixed-width integer local. The
 			 * initializer is any scalar-integer expression (a literal ADOPTS this width, range-
@@ -4211,7 +4223,7 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 		/* Only a scalar `let` in a slot (an Int word, a float, or a fixed-width IntN/UintN) can
 		 * be reassigned as a unit; a whole record/aggregate cannot — mutate its fields with `.`.
 		 * (Aggregate copy-binding is a later concern — memory_model §6 requires an explicit copy.) */
-		if (ty.kind != TY_INT && !is_float_type(ty) && !is_fixed_type(ty)) {
+		if (ty.kind != TY_INT && !is_float_type(ty) && !is_fixed_type(ty) && ty.kind != TY_UARCH) {
 			if (ty.kind == TY_ARRAY)
 				die(t->line, "cannot reassign a whole array (mutate an element with `xs[i] = …`)");
 			die(t->line, "cannot assign to a whole record (mutate a field with `.`)");
@@ -4587,8 +4599,7 @@ static void parse_member_type(Parser *p, char *out, size_t cap) {
 		return;
 	}
 	parse_type_arg(p, out, cap);
-	if (strcmp(out, "Uarch") == 0) /* `Str` IS a field type now (an `l` header pointer); Uarch still isn't */
-		die(t->line, "a field/payload type is `Int`, `Str`, an aggregate, or `'T` (not Uarch)");
+	/* `Str` and `Uarch` are both field types now (§: a Str `l` header pointer, a Uarch 64-bit word). */
 }
 
 /* Parse an optional generic type-parameter list `['A, Union 'B, …]` into
@@ -6613,6 +6624,12 @@ static void check_member_value(Program *prog, Func *fn, Expr *val, Type want, in
 		/* A `*[Iarch]` word-pointer field (alen<0) — a borrowed reference into a word array. */
 		if (at.kind != TY_ARRAY)
 			die(line, "a `*[Iarch]` field needs a word array or a `*[Iarch]` value");
+	} else if (want.kind == TY_UARCH) {
+		/* A `Uarch` field/payload — a 64-bit word. A bare non-negative literal adopts it, else the
+		 * value must already be a Uarch (cast `Uarch(x)`). ⚠ cf0 must NOT inherit: cfcc adopts only
+		 * a bare literal here — no §4 implicit widen from another integer, cast explicitly. */
+		if (val->kind != EX_INT && at.kind != TY_UARCH)
+			die(line, "expected a `Uarch` value for this field/payload (a literal, or cast with `Uarch(x)`)");
 	} else if (want.kind == TY_STR) {
 		/* A `Str` field/payload — an immutable `l` header pointer. A bare Str value (literal, var,
 		 * param, field, call) is accepted: aliasing is memory-safe here (no freshness rule), like
@@ -7334,11 +7351,13 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 			 * and the result is `Iarch` (arithmetic) or a `Bool` (comparison). */
 			return is_cmp ? mk_bool() : mk_iarch();
 		}
-		if (is_fixed_type(lt) || is_fixed_type(rt)) {
-			/* A sub-family `IntN/UintN` — both operands the SAME type (Iarch is handled above);
-			 * arithmetic yields it, a comparison yields `Bool`. */
+		if (is_fixed_type(lt) || is_fixed_type(rt) || lt.kind == TY_UARCH || rt.kind == TY_UARCH) {
+			/* A sub-family `IntN/UintN` OR `Uarch` — both operands the SAME type (Iarch is handled
+			 * above); arithmetic yields it, a comparison yields `Bool`. Uarch arithmetic is UNSIGNED
+			 * (udiv/urem/shr, the `cult` compare family) — the emit picks that via int_scalar_signed
+			 * (Uarch → unsigned), and is_int_scalar already treats Uarch as a 64-bit `l`. */
 			if (!types_equal(lt, rt))
-				die(e->line, "a numeric operator needs two operands of the same fixed-width type (no mixed widths/signedness — cast explicitly)");
+				die(e->line, "a numeric operator needs two operands of the same fixed-width or `Uarch` type (no mixed widths/signedness — cast explicitly)");
 			return is_cmp ? mk_bool() : lt;
 		}
 		expect_int(prog, fn, e->lhs);
@@ -7357,10 +7376,10 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		Type rt = typeof_expr(prog, fn, e->rhs);
 		if (is_operable_int(lt) && is_operable_int(rt))
 			return mk_iarch(); /* Int/Iarch — the operable default */
-		if (is_fixed_type(lt) || is_fixed_type(rt)) {
+		if (is_fixed_type(lt) || is_fixed_type(rt) || lt.kind == TY_UARCH || rt.kind == TY_UARCH) {
 			if (!types_equal(lt, rt))
-				die(e->line, "a `%`/bitwise/shift operator needs two operands of the same fixed-width type (cast explicitly)");
-			return lt;
+				die(e->line, "a `%`/bitwise/shift operator needs two operands of the same fixed-width or `Uarch` type (cast explicitly)");
+			return lt; /* Uarch `%`/`>>` are unsigned (urem/shr) — chosen by int_scalar_signed at emit */
 		}
 		expect_int(prog, fn, e->lhs);
 		expect_int(prog, fn, e->rhs);
@@ -7639,6 +7658,16 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 			} else if (strcmp(s->type_name, "Float32") == 0) { /* a Float32 local */
 				if (typeof_expr(prog, fn, s->expr).kind != TY_F32)
 					die(s->line, "a Float32 local's initializer must be a Float32 value (cast with `Float32(x)`)");
+			} else if (strcmp(s->type_name, "Uarch") == 0) { /* a Uarch local (64-bit unsigned) */
+				/* A bare non-negative literal adopts Uarch (any lexer literal ≤2^31-1 fits 64-bit);
+				 * anything else must already be a Uarch (a `Uarch(x)` cast, a Uarch var/param, or
+				 * Uarch arithmetic) — no implicit widen from Iarch, cast explicitly (§4).
+				 * ⚠ cf0 must NOT inherit (same as the fixed-width sibling): literal adoption is
+				 * BINDING-only and NON-NEGATIVE-only; §3 adopts everywhere (arg/return/operator) and
+				 * for negatives (a negative into an unsigned is a §2.1 compile error, which holds). */
+				if (s->expr->kind != EX_INT && typeof_expr(prog, fn, s->expr).kind != TY_UARCH)
+					die(s->line, "a `Uarch` local's initializer must be a Uarch value (a literal, a "
+					             "Uarch var/param, `Uarch(x)`, or Uarch arithmetic)");
 			} else if (is_fixed_type_name(s->type_name)) { /* a fixed-width integer local (IntN/UintN/Iarch) */
 				int b, sgn, arch;
 				fixed_name_bits_signed(s->type_name, &b, &sgn, &arch);
@@ -7864,6 +7893,11 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 				} else if (!types_equal(typeof_expr(prog, fn, s->expr), tt)) {
 					die(s->line, "a fixed-width `let` is reassigned a value of its own `IntN`/`UintN` type (cast with `Int8(x)` etc.)");
 				}
+			} else if (tt.kind == TY_UARCH) {
+				/* A `Uarch` `let` is reassigned a Uarch — a bare non-negative literal adopts it,
+				 * else the value must already be a Uarch (cast with `Uarch(x)`). */
+				if (s->expr->kind != EX_INT && typeof_expr(prog, fn, s->expr).kind != TY_UARCH)
+					die(s->line, "a `Uarch` `let` is reassigned a Uarch value (a literal, or cast with `Uarch(x)`)");
 			} else {
 				expect_int(prog, fn, s->expr);
 			}
@@ -8325,12 +8359,17 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		}
 		if (e->rtype.kind == TY_PTR || e->rtype.kind == TY_UARCH) {
 			/* A pointer/Uarch PARAMETER is an immutable incoming `l` temp — reference it
-			 * directly (no slot). A `*Aggregate` LOCAL instead adopted the initializer's
-			 * pointer into its `%r_<name>` storage (like a record local), so read that. */
-			if (e->rtype.kind == TY_PTR && !is_param_name(ex->fn, e->name))
+			 * directly (no slot). A `*Aggregate` LOCAL adopted its pointer into `%r_<name>`; a
+			 * Uarch LOCAL lives in an `l` slot `%s_<name>` — `loadl` it (like a fixed local). */
+			if (e->rtype.kind == TY_UARCH && !is_param_name(ex->fn, e->name)) {
+				int t = ex->tmp++;
+				fprintf(out, "\t%%t%d =l loadl %%s_%s\n", t, e->name);
+				snprintf(dst, cap, "%%t%d", t);
+			} else if (e->rtype.kind == TY_PTR && !is_param_name(ex->fn, e->name)) {
 				snprintf(dst, cap, "%%r_%s", e->name);
-			else
+			} else {
 				snprintf(dst, cap, "%%u_%s", e->name);
+			}
 			return;
 		}
 		if (e->rtype.kind == TY_STR) {
@@ -9140,7 +9179,7 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 			 * slot with the store matching its type (`stored` for a Float64, else `storew`). */
 			Type tt;
 			resolve_name((Func *)ex->fn, s->name, &tt);
-			char st = (is_float_type(tt) || is_fixed_type(tt)) ? qtype_of(tt) : 'w'; /* stores/stored/storel/storew */
+			char st = (is_float_type(tt) || is_fixed_type(tt) || tt.kind == TY_UARCH) ? qtype_of(tt) : 'w'; /* stores/stored/storel/storew */
 			if (is_capture_param(ex->fn, s->name))
 				fprintf(out, "\tstore%c %s, %%u_%s\n", st, v, s->name);
 			else
@@ -9470,6 +9509,8 @@ static void emit_func(FILE *out, const Func *fn) {
 		else if (is_fixed_type(fn->locals[i].type)) /* a fixed-width int slot: 8 bytes for 64-bit, else 4 */
 			fprintf(out, "\t%%s_%s =l alloc%d %d\n", fn->locals[i].name,
 			        qtype_of(fn->locals[i].type) == 'l' ? 8 : 4, qtype_of(fn->locals[i].type) == 'l' ? 8 : 4);
+		else if (fn->locals[i].type.kind == TY_UARCH) /* a Uarch local: a 64-bit `l` slot */
+			fprintf(out, "\t%%s_%s =l alloc8 8\n", fn->locals[i].name);
 	}
 
 	/* Likewise reserve every if/logical merge slot once here, not at each
