@@ -741,6 +741,12 @@ typedef struct Param {
 	                     * `.len` is rejected (no comptime length — pass it separately). Only `*[Iarch]`
 	                     * (not `*[Uint8]`, which is is_bytes, nor general `*[T]`). ⚠ cf0 must NOT
 	                     * inherit: cf0 indexes any `*[T]` param to `T`, bounds-checked, with a length. */
+	int arr_len;        /* PK_LONG + is_words: >0 ⇒ a BY-VALUE `[N Iarch]` param of comptime length N
+	                     * (the body sees TY_ARRAY with alen=N, so `.len`/`for` work); 0 ⇒ a `*[Iarch]`
+	                     * pointer of unknown length (alen=-1). The ABI is the same `l` arena pointer;
+	                     * a by-value array is passed as a pointer the callee treats as read-only (like
+	                     * a record param). ⚠ cf0 must NOT inherit: cfcc does not deep-copy the array, so
+	                     * it is really a read-only borrow, not a value copy — cf0 copies on by-value. */
 	int fn_arity;       /* PK_FN: the function type's parameter count */
 	/* PK_FN: the function type's parameter descriptors (fn_arity of them) and its single
 	 * return descriptor — each is a scalar/pointer/nested-function component (aggregates are
@@ -1340,6 +1346,8 @@ typedef struct Func {
 	                         * ret_rec/ret_uni); see Param.is_ptr */
 	DataDecl *ret_rec;      /* resolved record return type (typecheck) */
 	UnionDecl *ret_uni;     /* resolved union return type (typecheck) */
+	int ret_alen;           /* >0 ⇒ a `[N Iarch]` fixed-array return of N Iarch elements (an `l`
+	                         * arena pointer, returned copy-free like a record); 0 otherwise */
 	/* A tuple return type `(T0, …)` — structural, so it has no `ret_type_name`. Parse records
 	 * the element type NAMES (like a record's field_types); resolve_signatures interns them
 	 * into `ret_tup`. `ret_tuple_n > 0` is the "returns a tuple" flag. */
@@ -1864,7 +1872,7 @@ static Resolution resolve_name(Func *fn, const char *name, Type *ty) {
 				break;
 			case PK_LONG:    /* `*[Uint8]`→TY_BUF (byte-indexable), `*[Iarch]`→TY_ARRAY (word-indexable, unknown len), else opaque TY_PTR */
 				if (fn->params[i].is_bytes) { ty->kind = TY_BUF; }
-				else if (fn->params[i].is_words) { ty->kind = TY_ARRAY; ty->alen = -1; } /* alen<0 = a pointer, no comptime length */
+				else if (fn->params[i].is_words) { ty->kind = TY_ARRAY; ty->alen = fn->params[i].arr_len > 0 ? fn->params[i].arr_len : -1; } /* by-value `[N Iarch]` → alen=N; `*[Iarch]` → alen<0 (a pointer, no comptime length) */
 				else { ty->kind = TY_PTR; }
 				ty->rec = NULL; break;
 			case PK_UARCH:   ty->kind = TY_UARCH;  ty->rec = NULL; break;
@@ -1899,6 +1907,13 @@ static Resolution resolve_name(Func *fn, const char *name, Type *ty) {
 	if (fn->parent)
 		return resolve_name(fn->parent, name, ty);
 	return R_NONE;
+}
+
+/* True if `name` resolves to a `[N Iarch]` fixed-array local in this scope (used to route a
+ * `const [N Iarch] xs = build()` binding to its array-adopting typecheck/emit). */
+static int local_is_array(Func *fn, const char *name) {
+	Type t;
+	return resolve_name(fn, name, &t) != R_NONE && t.kind == TY_ARRAY;
 }
 
 /* If `name` binds a closure in this function's scope, return its index in the closure
@@ -2274,6 +2289,26 @@ static void parse_param_type(Parser *p, Param *out) {
 	if (is_ident(t, "Str")) { /* a `Str` param — an `l` header pointer (TY_STR), like a Str local */
 		advance(p);
 		out->kind = PK_STR;
+		return;
+	}
+	if (t->kind == TK_LBRACKET) {
+		/* `[N Iarch]` — a BY-VALUE fixed-array param of N Iarch elements. The body sees a
+		 * known-length TY_ARRAY (alen=N) so `.len`, `for x in xs`, and `xs[i]` all work; the ABI
+		 * passes the array's `l` arena pointer, treated read-only in the callee (like a record
+		 * param). ⚠ cf0 must NOT inherit: no deep copy (a read-only borrow, not a value copy);
+		 * elements are Iarch only. */
+		advance(p); /* [ */
+		Token *nt = peek(p);
+		if (nt->kind != TK_INT || nt->ival <= 0)
+			die(nt->line, "a `[N Iarch]` param needs a positive comptime length");
+		advance(p);
+		if (!is_ident(peek(p), "Iarch"))
+			die(peek(p)->line, "a by-value array param holds `Iarch` elements (`[N Iarch]`); other element types are a later brick");
+		advance(p); /* Iarch */
+		expect(p, TK_RBRACKET, "expected `]` to close the `[N Iarch]` param type");
+		out->kind = PK_LONG;
+		out->is_words = 1;
+		out->arr_len = (int)nt->ival;
 		return;
 	}
 	if (t->kind == TK_STAR) {
@@ -3567,6 +3602,22 @@ static int parse_return_type(Parser *p, Func *fn) {
 		/* Uarch, Iarch, a record/union type, or a generic application `Box[Iarch]` (G3b) */
 		parse_type_arg(p, fn->ret_type_name, sizeof fn->ret_type_name);
 		consume_member_type_suffix(p, fn->ret_type_name, sizeof fn->ret_type_name, rt->line); /* `Maybe[Iarch].Just` → union; `Math.Point` → namespace type */
+	} else if (rt->kind == TK_LBRACKET) {
+		/* A `[N Iarch]` fixed-array return type — N Iarch elements. The array is an `l` arena
+		 * pointer, returned copy-free like a record (the arena outlives the frame). ⚠ cf0 must
+		 * NOT inherit: aggregate/fixed-width element arrays and `[N Uint8]` buffer returns are a
+		 * later brick; cfcc returns only `[N Iarch]`. */
+		fn->ret_line = rt->line;
+		advance(p); /* [ */
+		Token *nt = peek(p);
+		if (nt->kind != TK_INT || nt->ival <= 0)
+			die(nt->line, "a `[N Iarch]` return type needs a positive comptime length");
+		fn->ret_alen = (int)nt->ival;
+		advance(p);
+		if (!is_ident(peek(p), "Iarch"))
+			die(peek(p)->line, "M0 returns a `[N Iarch]` fixed array (aggregate/fixed-width element arrays are a later brick)");
+		advance(p); /* Iarch */
+		expect(p, TK_RBRACKET, "expected `]` to close the `[N Iarch]` return type");
 	} else {
 		die(rt->line, "expected a return type after `:`");
 	}
@@ -3912,8 +3963,8 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 			 * forbids only a second binding onto an EXISTING aggregate, not overwriting) —
 			 * revisit when the reassignment rule for aggregates is pinned. */
 			s->expr = parse_expr(p, fn);
-			if (s->expr->kind != EX_ARRAY)
-				die(name->line, "a `[N Int]` array binds an array literal `[…]` (an array-returning call is not supported yet)");
+			if (s->expr->kind != EX_ARRAY && s->expr->kind != EX_CALL)
+				die(name->line, "a `[N Iarch]` array binds an array literal `[…]` or an array-returning call");
 			Type at = {TY_ARRAY, NULL, NULL, 0, NULL};
 			at.alen = arrlen;
 			func_add_local(fn, s->name, mutable, at, "");
@@ -7495,6 +7546,11 @@ static Type func_ret_type(const Func *fn) {
 		return (Type){TY_UNIT, NULL, NULL, 0, NULL};
 	if (strcmp(fn->ret_type_name, "Str") == 0) /* a `Str` return — an `l` header pointer */
 		return (Type){TY_STR, NULL, NULL, 0, NULL};
+	if (fn->ret_alen > 0) { /* a `[N Iarch]` fixed-array return — an `l` arena pointer */
+		Type t = {TY_ARRAY, NULL, NULL, 0, NULL};
+		t.alen = fn->ret_alen;
+		return t;
+	}
 	if (fn->ret_is_ptr) /* an explicit `*Aggregate` return — a TY_PTR to the pointee decl */
 		return (Type){TY_PTR, fn->ret_rec, fn->ret_uni, 0, NULL};
 	if (fn->ret_uni)
@@ -7794,6 +7850,17 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 				Type it = typeof_expr(prog, fn, s->expr); /* checks each element is Int; sets alen */
 				if (it.alen != dt.alen)
 					die(s->line, "array literal length does not match the `[N Int]` annotation");
+			} else if (local_is_array(fn, s->name)) {
+				/* `const [N Iarch] xs = build()` — a `[N Iarch]` local bound to an array-returning
+				 * call. The call's result is a fresh arena pointer that the local adopts (copy-free,
+				 * like a record/tuple call result); the annotated length must match the callee's. */
+				Type dt;
+				resolve_name(fn, s->name, &dt);
+				Type it = typeof_expr(prog, fn, s->expr);
+				if (it.kind != TY_ARRAY)
+					die(s->line, "a `[N Iarch]` array binding needs an array-valued initializer");
+				if (it.alen != dt.alen)
+					die(s->line, "array return length does not match the `[N Iarch]` annotation");
 			} else if (s->expr->kind == EX_RECORD && s->expr->name[0]) {
 				/* `const p = Point({…})` — an explicit construction infers the record type
 				 * from the constructor (no annotation needed; the local was parsed as a word). */
@@ -8074,6 +8141,17 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 				Type et = typeof_expr(prog, fn, s->expr);
 				if (et.kind != TY_STR)
 					die(s->expr->line, "a `Str` function returns a string value");
+			} else if (rt.kind == TY_ARRAY) {
+				/* A `[N Iarch]` fixed-array return — an `l` arena pointer. The value must be a
+				 * `[N Iarch]` array of the SAME length: an array literal `[…]` (allocated fresh in
+				 * the arena, which outlives the frame — copy-free, sound) or another array-valued
+				 * expression (a `[N Iarch]` local or an array-returning call). cfcc has no by-value
+				 * array parameter yet, so a returned array cannot alias a caller's argument. */
+				Type et = typeof_expr(prog, fn, s->expr);
+				if (et.kind != TY_ARRAY)
+					die(s->expr->line, "a `[N Iarch]` function returns a fixed-array value");
+				if (et.alen != rt.alen)
+					die(s->expr->line, "returned array length does not match the `[N Iarch]` return type");
 			} else {
 				expect_int(prog, fn, s->expr);
 			}
@@ -8609,8 +8687,29 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		snprintf(dst, cap, "%%t%d", r);
 		return;
 	}
-	case EX_ARRAY:
-		die(e->line, "internal: array literal in expression position");
+	case EX_ARRAY: {
+		/* A fixed-array literal in value position (a `-> [1,2,3,4]` return): construct it in
+		 * the arena exactly like a `[N Iarch]` local — bump-allocate N*8 bytes and store each
+		 * element word at offset i*8 — then yield the base pointer. The arena outlives the
+		 * frame, so the pointer escapes soundly. ⚠ cf0 must NOT inherit: elements are Iarch
+		 * only (uniform 8-byte `l` slots); a tag-only word element stores `w`. */
+		int base = ex->tmp++;
+		fprintf(out, "\t%%t%d =l call $cf_alloc(w %d)\n", base, e->nargs * 8);
+		for (int i = 0; i < e->nargs; i++) {
+			char ev[96];
+			emit_expr(out, e->args[i], ex, ev, sizeof ev);
+			const char *st = type_is_word(e->args[i]->rtype) ? "storew" : "storel";
+			if (i == 0) {
+				fprintf(out, "\t%s %s, %%t%d\n", st, ev, base);
+			} else {
+				int off = ex->tmp++;
+				fprintf(out, "\t%%t%d =l add %%t%d, %d\n", off, base, i * 8);
+				fprintf(out, "\t%s %s, %%t%d\n", st, ev, off);
+			}
+		}
+		snprintf(dst, cap, "%%t%d", base);
+		return;
+	}
 	case EX_TUPLE: {
 		/* Construct a tuple in the arena: bump-allocate its (comptime-known) slots and fill
 		 * them left to right. A plain element stores its value (word via storew, aggregate
@@ -9235,11 +9334,12 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 					}
 				}
 			} else if (s->expr->rtype.kind == TY_RECORD || s->expr->rtype.kind == TY_TUPLE ||
-			           s->expr->rtype.kind == TY_PTR ||
+			           s->expr->rtype.kind == TY_PTR || s->expr->rtype.kind == TY_ARRAY ||
 			           (s->expr->rtype.kind == TY_UNION && s->expr->rtype.uni->has_payload)) {
-				/* A record, tuple, boxed-union, or `*Aggregate`-pointer local: adopt the
-				 * initializer's arena pointer as this local's `%r_<name>` storage (a move/alias,
-				 * no copy). For a pointer local the initializer is `&x`/a `*T` — the same pointer. */
+				/* A record, tuple, boxed-union, `*Aggregate`-pointer, or `[N Iarch]`-array local:
+				 * adopt the initializer's arena pointer as this local's `%r_<name>` storage (a
+				 * move/alias, no copy). For a pointer local the initializer is `&x`/a `*T` — the
+				 * same pointer; for an array it is an array-returning call's fresh pointer. */
 				emit_expr(out, s->expr, ex, v, sizeof v);
 				fprintf(out, "\t%%r_%s =l copy %s\n", s->name, v);
 			} else if (s->expr->rtype.kind == TY_STR) {
