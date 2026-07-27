@@ -6992,7 +6992,11 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		if (e->nargs == 0)
 			die(e->line, "an empty array literal `[]` needs a `[N T]` annotation (not supported yet)");
 		Type elem = typeof_expr(prog, fn, e->args[0]);
-		int by_value_agg = is_aggregate_pointer(elem) || elem.kind == TY_STR;
+		/* A by-VALUE mutable aggregate element (record/tuple/boxed-union) must be FRESH so the array
+		 * owns distinct storage (memory_model §6). A Str is IMMUTABLE (aliasing is memory-safe, like
+		 * the check_member_value Str branch), and a `*T` pointer element is a borrowed reference — so
+		 * neither requires freshness here. This matches the annotated resolve_array_literal path. */
+		int by_value_agg = is_aggregate_pointer(elem);
 		for (int i = 0; i < e->nargs; i++) {
 			Type et = (i == 0) ? elem : typeof_expr(prog, fn, e->args[i]);
 			if (i > 0 && !types_equal(et, elem))
@@ -7202,10 +7206,23 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 			case PK_LONG:
 				/* An opaque `l` pointer accepts any pointer/buffer/array value (all are a base
 				 * pointer): a `*T`, a `[N Uint8]`/`*[Uint8]` byte pointer, or a `[N Iarch]`/`*[Iarch]`
-				 * word-array pointer. (Element/length aren't tracked here — the pointee-blind
-				 * laxity cf0 tightens; a `*[Iarch]` param's TY_ARRAY passes as its base pointer.) */
+				 * word-array pointer. (Element/length aren't tracked here for the POINTER borrows —
+				 * the pointee-blind laxity cf0 tightens; a `*[Iarch]` param's TY_ARRAY passes as its
+				 * base pointer.) */
 				if (at.kind != TY_PTR && at.kind != TY_BUF && at.kind != TY_ARRAY)
 					die(e->line, "argument type mismatch (a pointer parameter expects a pointer, buffer, or array)");
+				if (pm->is_words && pm->arr_len > 0) {
+					/* A by-value `[N T]` array param (NOT a `*[…]` pointer borrow): both the declared
+					 * length AND element type are statically known on both sides, so check them — the
+					 * callee's comptime `.len`/`for` bound and element-width access would otherwise
+					 * read a phantom element past a too-short array, or misread a wrong-width element.
+					 * A `*[Iarch]` pointer arg (alen<0, unknown length) is correctly rejected here. */
+					Type pelem = pm->arr_elem_t ? *pm->arr_elem_t : mk_iarch();
+					if (at.kind != TY_ARRAY || at.alen != pm->arr_len)
+						die(e->line, "argument type mismatch (a by-value `[N T]` parameter needs a fixed array of exactly N elements)");
+					if (!types_equal(array_elem(at), pelem))
+						die(e->line, "argument type mismatch (a by-value array parameter's element type differs)");
+				}
 				break;
 			case PK_STR:
 				if (at.kind != TY_STR)
@@ -8095,12 +8112,19 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 			Resolution r = resolve_name(fn, base->name, &lt);
 			if (r == R_CONST)
 				die(s->line, "cannot assign into a `const` array/buffer (declare it with `let`)");
-			/* A `*[Uint8]` byte-pointer (TY_BUF) or `*[Iarch]` word-pointer (TY_ARRAY) param,
-			 * R_PARAM, IS a writable borrow: `p[i] = v` stores into the caller's buffer/array —
-			 * the intended pass-and-fill semantics. A by-VALUE array param can't occur (arrays
-			 * aren't value params), so any other R_PARAM index target is rejected. */
-			if (r == R_PARAM && bt.kind != TY_BUF && bt.kind != TY_ARRAY)
-				die(s->line, "cannot assign into an array parameter");
+			/* A `*[Uint8]` byte-pointer (TY_BUF) or `*[Iarch]` word-pointer (TY_ARRAY, UNKNOWN
+			 * length alen<0) param, R_PARAM, IS a writable borrow: `p[i] = v` stores into the
+			 * caller's buffer/array — the intended pass-and-fill semantics. A by-VALUE `[N T]` array
+			 * param (TY_ARRAY, KNOWN length alen>=0) is a READ-ONLY borrow (like a by-value record
+			 * param): cfcc does not copy it, so a write would clobber the caller's array — rejected,
+			 * take a `*[Iarch]` to write through. Any other R_PARAM index target is rejected too. */
+			if (r == R_PARAM) {
+				if (bt.kind == TY_ARRAY && bt.alen >= 0)
+					die(s->line, "cannot assign into a by-value array parameter (it is read-only — "
+					             "take a `*[Iarch]` pointer to write through it)");
+				if (bt.kind != TY_BUF && bt.kind != TY_ARRAY)
+					die(s->line, "cannot assign into an array parameter");
+			}
 			typeof_expr(prog, fn, tgt);       /* validates the index; caches the element rtype */
 			if (bt.kind == TY_BUF) {
 				/* a byte: a bare non-negative literal adopts Uint8 (range 0..255), else the
