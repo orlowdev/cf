@@ -1026,6 +1026,17 @@ typedef enum {
 	ST_YIELD,       /* `<- v` (bare) or `if cond then <- v` (guard in expr) — inside a
 	                 * value-yielding loop it breaks the loop with value `yval`. `expr`
 	                 * holds the optional guard (as for break/continue); `yval` the value. */
+	ST_IF,          /* `if cond then <then> [else <else>]` in STATEMENT position — a control-flow
+	                 * `if` whose branches are statement lists (not a value). `expr` = the Bool
+	                 * condition, `body` = the then-branch statements, `elsebody` = the else-branch
+	                 * (NULL if absent). Each branch is a single statement or a `{ … }` block; a
+	                 * branch may `return` (early return — the big use), `break`/`continue`/`<- v`,
+	                 * assign, or call. The value-producing `if … then A else B` stays an EXPRESSION
+	                 * (EX_IF); this is the statement form the expression form couldn't express.
+	                 * Grammar: ebnf § Control Flow `if_stmt` (ratified alongside this brick — a
+	                 * statement-`if` whose branches are statements, `else` optional, yields no value;
+	                 * terminal when both branches diverge). cfcc's branch is a single statement or a
+	                 * `{ … }` block — a subset of the `stmt_branch` grammar; cf0 takes the full form. */
 	ST_EXPR,        /* an expression evaluated for effect (a call), result discarded */
 	ST_DEFER,       /* defer <call> | defer { block } — schedule a cleanup to run at scope
 	                 * exit, LIFO. `expr` holds the call (call form); `body` the block form. */
@@ -1056,7 +1067,8 @@ struct Stmt {
 	                     * ST_BREAK/ST_CONTINUE: guard or NULL; ST_DEFER: the scheduled call
 	                     * (call form; NULL for the block form) */
 	Stmt *body;         /* ST_LOOP: the loop body statement list; ST_DEFER: the block form's
-	                     * body (NULL for the call form) */
+	                     * body (NULL for the call form); ST_IF: the then-branch statements */
+	Stmt *elsebody;     /* ST_IF: the else-branch statements (NULL if there is no `else`) */
 	Expr *yval;         /* ST_YIELD: the yielded value (`<- yval`); `expr` carries the
 	                     * optional guard, mirroring break/continue. ST_INDEX_ASSIGN: the
 	                     * stored value (`xs[i] = yval`) */
@@ -1066,11 +1078,22 @@ struct Stmt {
 	Stmt *next;
 };
 
-/* A statement diverges (ends its block unconditionally): a `return`, or a bare
- * `break`/`continue`/`<-`. A guarded break/continue/yield and a loop fall through. */
+/* A statement diverges (ends its block unconditionally): a `return`, a bare
+ * `break`/`continue`/`<-`, or a statement-`if` BOTH of whose branches diverge. A guarded
+ * break/continue/yield and a loop fall through. */
 static int stmt_is_terminal(const Stmt *s) {
-	return s->kind == ST_RETURN ||
-	       ((s->kind == ST_BREAK || s->kind == ST_CONTINUE || s->kind == ST_YIELD) && !s->expr);
+	if (s->kind == ST_RETURN)
+		return 1;
+	if ((s->kind == ST_BREAK || s->kind == ST_CONTINUE || s->kind == ST_YIELD) && !s->expr)
+		return 1;
+	if (s->kind == ST_IF) {
+		if (!s->elsebody) /* an else-less `if` can fall through */
+			return 0;
+		const Stmt *tt = s->body;      while (tt && tt->next) tt = tt->next;
+		const Stmt *ee = s->elsebody;  while (ee && ee->next) ee = ee->next;
+		return tt && stmt_is_terminal(tt) && ee && stmt_is_terminal(ee);
+	}
+	return 0;
 }
 
 static Stmt *new_stmt(StmtKind kind) {
@@ -2588,6 +2611,7 @@ static void parse_paren_params(Parser *p, Func *fn) {
 static Expr *parse_expr(Parser *p, Func *fn); /* forward */
 static Expr *parse_data_literal(Parser *p, Func *fn, const char *typename, int line); /* forward */
 static Stmt *parse_stmt_seq(Parser *p, Func *fn, int require_return, int open_line); /* forward: EX_LOOP body */
+static Stmt *parse_if_branch(Parser *p, Func *fn); /* forward: a statement-`if` then/else branch */
 
 /* Disambiguate `name[…]`: a generic call `f[Type](args)` vs an array index `xs[i]`.
  * Assumes the current token is `[`; returns 1 iff the matching `]` is immediately
@@ -3763,7 +3787,8 @@ static void collect_captures_stmt(Func *cl, Stmt *s, Capture *caps, int *ncaps) 
 			note_capture(cl, s->name, 1, s->line, caps, ncaps); /* a write target is a capture too */
 		collect_captures_expr(cl, s->expr, caps, ncaps);
 		collect_captures_expr(cl, s->yval, caps, ncaps); /* ST_YIELD value (NULL otherwise) */
-		collect_captures_stmt(cl, s->body, caps, ncaps); /* loop / defer-block bodies */
+		collect_captures_stmt(cl, s->body, caps, ncaps); /* loop / defer-block / if-then bodies */
+		collect_captures_stmt(cl, s->elsebody, caps, ncaps); /* ST_IF else-branch (NULL otherwise) */
 	}
 }
 
@@ -4424,18 +4449,24 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 		return s;
 	}
 	if (is_ident(t, "if")) {
-		/* In statement position `if` guards a loop control: `if <cond> then break`,
-		 * `if <cond> then continue`, or `if <cond> then <- v` (a guarded value-yield).
-		 * The value-`if` is an expression — it appears on a binding/return right-hand
-		 * side, never as a bare statement. */
+		/* A STATEMENT-position `if`. Two shapes:
+		 *   (1) a compact loop-control GUARD with no `else`: `if c then break`, `if c then continue`,
+		 *       `if c then <- v` — kept as an ST_BREAK/ST_CONTINUE/ST_YIELD carrying the guard in
+		 *       `expr` (the battle-tested loop idiom; its emit branches over the jump).
+		 *   (2) a general control `if c then <branch> [else <branch>]` (ST_IF) — each branch a single
+		 *       statement or a `{ … }` block, which may `return` (the early-return unlock), assign,
+		 *       call, or itself break/continue/yield. The value-producing `if…then A else B` stays an
+		 *       EXPRESSION (EX_IF) on a binding/return RHS; this is the statement form it couldn't do.
+		 * We keep (1) whenever the then-branch is exactly a bare control keyword AND no `else`
+		 * follows; everything else (a `return`/block/assignment branch, or any `else`) is ST_IF. */
 		advance(p);
 		Expr *cond = parse_expr(p, fn);
 		if (!is_ident(peek(p), "then"))
 			die(peek(p)->line, "expected `then`");
 		advance(p);
+		/* (1) the compact guard forms. `<- v` (guarded yield) stays compact always — it is a
+		 * loop-value exit, and an `else` on a yield is not a supported form. */
 		if (peek(p)->kind == TK_YIELD) {
-			/* `if <cond> then <- v` — a guarded yield: exit the value-loop with `v` when
-			 * the guard holds, else fall through. Not terminal (the guard may be false). */
 			int yline = peek(p)->line;
 			advance(p); /* `<-` */
 			if (p->loop_depth == 0 || !p->loop_val[p->loop_depth - 1])
@@ -4447,18 +4478,33 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 			s->yval = parse_expr(p, fn);   /* yielded value */
 			return s;
 		}
-		Token *ctl = peek(p);
-		int is_break = is_ident(ctl, "break");
-		if (!is_break && !is_ident(ctl, "continue"))
-			die(ctl->line, "a statement-position `if` guards a `break`, `continue`, or `<- v`");
-		advance(p);
-		if (p->loop_depth == 0)
-			die(ctl->line, "`break`/`continue` is only valid inside a loop");
-		if (is_break && p->loop_val[p->loop_depth - 1])
-			die(ctl->line, "a value-yielding loop exits by yielding a value: `<- v`, not a bare `break`");
-		Stmt *s = new_stmt(is_break ? ST_BREAK : ST_CONTINUE);
+		if ((is_ident(peek(p), "break") || is_ident(peek(p), "continue")) &&
+		    !is_ident(&p->toks[p->pos + 1], "else")) {
+			Token *ctl = peek(p);
+			int is_break = is_ident(ctl, "break");
+			advance(p);
+			if (p->loop_depth == 0)
+				die(ctl->line, "`break`/`continue` is only valid inside a loop");
+			if (is_break && p->loop_val[p->loop_depth - 1])
+				die(ctl->line, "a value-yielding loop exits by yielding a value: `<- v`, not a bare `break`");
+			Stmt *s = new_stmt(is_break ? ST_BREAK : ST_CONTINUE);
+			s->line = t->line;
+			s->expr = cond; /* guarded */
+			return s;
+		}
+		/* (2) a general control `if` (ST_IF): then-branch, optional else-branch. */
+		Stmt *s = new_stmt(ST_IF);
 		s->line = t->line;
-		s->expr = cond; /* guarded */
+		s->expr = cond;
+		s->body = parse_if_branch(p, fn);
+		if (is_ident(peek(p), "else")) {
+			advance(p); /* else */
+			s->elsebody = parse_if_branch(p, fn);
+		}
+		/* If BOTH branches diverge (each ends in `return`/break/continue/yield), the `if` is a
+		 * terminal statement — it satisfies a function's trailing-`return` requirement. */
+		if (saw_return && stmt_is_terminal(s))
+			*saw_return = 1;
 		return s;
 	}
 	if (is_ident(t, "defer") && p->toks[p->pos + 1].kind == TK_LBRACE) {
@@ -4640,6 +4686,21 @@ static Stmt *parse_stmt_seq(Parser *p, Func *fn, int require_return, int open_li
 	if (require_return && !saw_return)
 		die(open_line, "a function's block must end with `return`");
 	return head;
+}
+
+/* A statement-`if` then/else branch: a `{ … }` block (a statement sequence) or a SINGLE statement
+ * (`return e`, an assignment, a call, a bare break/continue/yield, or a nested `if`). A single
+ * statement's own `saw_return` is local — a conditional branch does not satisfy the enclosing
+ * function's trailing-`return` requirement (only a both-branches-terminal `if` does, via
+ * stmt_is_terminal). */
+static Stmt *parse_if_branch(Parser *p, Func *fn) {
+	if (peek(p)->kind == TK_LBRACE) {
+		int bl = peek(p)->line;
+		advance(p); /* `{` */
+		return parse_stmt_seq(p, fn, 0, bl); /* no required `return` */
+	}
+	int branch_return = 0;
+	return parse_stmt(p, fn, &branch_return);
 }
 
 /* body = expr | "{" stmt_seq "}"   (a function body must return). */
@@ -5497,6 +5558,7 @@ static void rename_stmt(const Renames *r, Stmt *s) {
 		rename_expr(r, s->expr);
 		rename_expr(r, s->yval);
 		rename_stmt(r, s->body);
+		rename_stmt(r, s->elsebody); /* ST_IF else-branch (NULL otherwise) */
 	}
 }
 
@@ -5847,6 +5909,7 @@ static Stmt *clone_stmt(Stmt *s) {
 	c->expr = clone_expr(s->expr);
 	c->yval = clone_expr(s->yval); /* ST_YIELD value (NULL otherwise) */
 	c->body = clone_stmt(s->body);
+	c->elsebody = clone_stmt(s->elsebody); /* ST_IF else-branch (NULL otherwise) */
 	c->next = clone_stmt(s->next);
 	return c;
 }
@@ -6005,6 +6068,7 @@ static void subst_stmts(Stmt *s, Func *tmpl, char targs[][256]) {
 		subst_expr(s->expr, tmpl, targs);
 		subst_expr(s->yval, tmpl, targs); /* ST_YIELD value (NULL otherwise) */
 		subst_stmts(s->body, tmpl, targs);
+		subst_stmts(s->elsebody, tmpl, targs); /* ST_IF else-branch (NULL otherwise) */
 	}
 }
 
@@ -6054,6 +6118,7 @@ static void subst_value_stmts(Stmt *s, char names[][64], long *vals, int nv) {
 		subst_value_expr(s->expr, names, vals, nv);
 		subst_value_expr(s->yval, names, vals, nv); /* ST_YIELD value (NULL otherwise) */
 		subst_value_stmts(s->body, names, vals, nv);
+		subst_value_stmts(s->elsebody, names, vals, nv); /* ST_IF else-branch (NULL otherwise) */
 	}
 }
 
@@ -6596,6 +6661,7 @@ static void monomorph_stmts(Program *prog, Func *fn, Stmt *s) {
 		monomorph_expr(prog, fn, s->expr);
 		monomorph_expr(prog, fn, s->yval); /* ST_YIELD value (NULL otherwise) */
 		monomorph_stmts(prog, fn, s->body);
+		monomorph_stmts(prog, fn, s->elsebody); /* ST_IF else-branch (NULL otherwise) */
 	}
 }
 
@@ -6800,7 +6866,8 @@ static void specialize_calls_stmt(Program *prog, Func *fn, Stmt *s) {
 	for (; s; s = s->next) {
 		specialize_calls_expr(prog, fn, s->expr);
 		specialize_calls_expr(prog, fn, s->yval); /* ST_YIELD value (NULL otherwise) */
-		specialize_calls_stmt(prog, fn, s->body); /* loop / defer-block bodies */
+		specialize_calls_stmt(prog, fn, s->body); /* loop / defer-block / if-then bodies */
+		specialize_calls_stmt(prog, fn, s->elsebody); /* ST_IF else-branch (NULL otherwise) */
 	}
 }
 
@@ -6869,6 +6936,7 @@ static void desugar_group_calls_stmt(Program *prog, Stmt *s) {
 		desugar_group_calls_expr(prog, s->expr);
 		desugar_group_calls_expr(prog, s->yval);
 		desugar_group_calls_stmt(prog, s->body);
+		desugar_group_calls_stmt(prog, s->elsebody); /* ST_IF else-branch (NULL otherwise) */
 	}
 }
 
@@ -7185,11 +7253,16 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list); /* forward: EX_LOO
 
 /* A value loop must actually yield: scan its own body for a `<- v`. Yields target the
  * nearest loop, so a yield inside a NESTED loop belongs to that loop, not this one —
- * only the loop's own direct statements count (guarded yields are ST_YIELD nodes too). */
+ * only statements in THIS loop's scope count. A statement-`if` branch is the SAME loop
+ * scope, so a `<- v` inside an `if` block-branch counts (descend into it); a nested
+ * `loop`/`for` is a different scope, so it does NOT (don't descend). */
 static int loop_body_yields(const Stmt *body) {
-	for (const Stmt *s = body; s; s = s->next)
+	for (const Stmt *s = body; s; s = s->next) {
 		if (s->kind == ST_YIELD)
 			return 1;
+		if (s->kind == ST_IF && (loop_body_yields(s->body) || loop_body_yields(s->elsebody)))
+			return 1;
+	}
 	return 0;
 }
 
@@ -7197,10 +7270,13 @@ static int loop_body_yields(const Stmt *body) {
  * (a yield inside a NESTED loop belongs to that loop, so only direct statements count,
  * like loop_body_yields). Every yield must agree, and the result must be a mergeable
  * scalar. The caller has already checked loop_body_yields, so at least one yield exists. */
-static Type loop_yield_type(Program *prog, Func *fn, Stmt *body) {
-	Type rt = (Type){TY_INT, NULL, NULL, 0, NULL};
-	int have = 0;
+static void loop_yield_scan(Program *prog, Func *fn, Stmt *body, Type *rt, int *have) {
 	for (Stmt *s = body; s; s = s->next) {
+		if (s->kind == ST_IF) { /* same loop scope — a `<- v` in an `if` branch counts */
+			loop_yield_scan(prog, fn, s->body, rt, have);
+			loop_yield_scan(prog, fn, s->elsebody, rt, have);
+			continue;
+		}
 		if (s->kind != ST_YIELD)
 			continue;
 		Type yt = typeof_expr(prog, fn, s->yval);
@@ -7212,13 +7288,18 @@ static Type loop_yield_type(Program *prog, Func *fn, Stmt *body) {
 			if (!is_fresh_producer(s->yval))
 				die(s->line, "an aggregate `<- v` must build a FRESH value (a call or construction)");
 		}
-		if (!have) {
-			rt = yt;
-			have = 1;
-		} else if (!types_equal(yt, rt)) {
+		if (!*have) {
+			*rt = yt;
+			*have = 1;
+		} else if (!types_equal(yt, *rt)) {
 			die(s->line, "all of a value loop's `<- v` yields must have the same type");
 		}
 	}
+}
+static Type loop_yield_type(Program *prog, Func *fn, Stmt *body) {
+	Type rt = (Type){TY_INT, NULL, NULL, 0, NULL};
+	int have = 0;
+	loop_yield_scan(prog, fn, body, &rt, &have); /* descends `if` branches (same loop scope) */
 	return rt;
 }
 
@@ -8784,6 +8865,15 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 		case ST_LOOP:
 			check_stmts(prog, fn, s->body);
 			break;
+		case ST_IF:
+			/* A statement-`if`: the condition is a `Bool` (§5 — no truthiness); typecheck each
+			 * branch's statements (a `return` inside is validated against the fn's return type by
+			 * the ST_RETURN case). */
+			expect_bool(prog, fn, s->expr);
+			check_stmts(prog, fn, s->body);
+			if (s->elsebody)
+				check_stmts(prog, fn, s->elsebody);
+			break;
 		case ST_FOR: {
 			/* The iterable must be a fixed array; the loop var is Int (already declared).
 			 * Then check the body. */
@@ -9104,8 +9194,10 @@ static void collect_strlits_stmt(Stmt *list) {
 	for (Stmt *s = list; s; s = s->next) {
 		collect_strlits_expr(s->expr);
 		collect_strlits_expr(s->yval); /* ST_YIELD value (NULL otherwise) */
-		if (s->kind == ST_LOOP || s->kind == ST_FOR || s->kind == ST_DEFER) /* bodies with statements */
+		if (s->kind == ST_LOOP || s->kind == ST_FOR || s->kind == ST_DEFER || s->kind == ST_IF) /* bodies with statements */
 			collect_strlits_stmt(s->body);
+		if (s->kind == ST_IF) /* the else-branch too */
+			collect_strlits_stmt(s->elsebody);
 	}
 }
 
@@ -10397,6 +10489,38 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 				fprintf(out, "\tret %s\n", v);
 			}
 			break;
+		case ST_IF: {
+			/* A statement-`if`: eval the Bool cond, branch to the then-block (and the else-block or
+			 * a fall-through @end). A branch that diverges (ends in return/break/continue/yield) has
+			 * already closed its block, so no `jmp @end` is added after it. @end is emitted ONLY when
+			 * some path falls through to it — if BOTH branches diverge (a terminal `if`), there is no
+			 * @end and no dangling block. (require_return guarantees code follows a non-terminal
+			 * `if`, so @end never dangles.) */
+			int id = ex->lbl++;
+			char c[96];
+			emit_expr(out, s->expr, ex, c, sizeof c);
+			int has_else = s->elsebody != NULL;
+			Stmt *tt = s->body;     while (tt && tt->next) tt = tt->next;
+			Stmt *ee = s->elsebody; while (ee && ee->next) ee = ee->next;
+			int then_term = tt && stmt_is_terminal(tt);
+			int else_term = ee && stmt_is_terminal(ee);
+			int need_end = has_else ? (!then_term || !else_term) : 1;
+			fprintf(out, "\tjnz %s, @sifthen%d, @%s%d\n", c, id,
+			        has_else ? "sifelse" : "sifend", id);
+			fprintf(out, "@sifthen%d\n", id);
+			emit_stmts(out, s->body, ex);
+			if (!then_term)
+				fprintf(out, "\tjmp @sifend%d\n", id);
+			if (has_else) {
+				fprintf(out, "@sifelse%d\n", id);
+				emit_stmts(out, s->elsebody, ex);
+				if (!else_term)
+					fprintf(out, "\tjmp @sifend%d\n", id);
+			}
+			if (need_end)
+				fprintf(out, "@sifend%d\n", id);
+			break;
+		}
 		case ST_LOOP: {
 			/* @ltop<id>: body ; jmp @ltop<id> (back-edge) ; @lend<id>: fall-through.
 			 * The back-edge is the body's fall-through, so it is only emitted when the
@@ -10603,8 +10727,10 @@ static void assign_stmt_slots(Stmt *list, int *n) {
 	for (Stmt *s = list; s; s = s->next) {
 		assign_expr_slots(s->expr, n);
 		assign_expr_slots(s->yval, n); /* ST_YIELD value (NULL otherwise) */
-		if (s->kind == ST_LOOP || s->kind == ST_FOR || s->kind == ST_DEFER) /* bodies with statements */
+		if (s->kind == ST_LOOP || s->kind == ST_FOR || s->kind == ST_DEFER || s->kind == ST_IF) /* bodies with statements */
 			assign_stmt_slots(s->body, n);
+		if (s->kind == ST_IF) /* the else-branch too */
+			assign_stmt_slots(s->elsebody, n);
 	}
 }
 
@@ -11804,6 +11930,7 @@ static void collect_stmt(NameList *out, const Stmt *s) {
 		collect_expr(out, s->expr);
 		collect_expr(out, s->yval);
 		collect_stmt(out, s->body);
+		collect_stmt(out, s->elsebody); /* ST_IF else-branch (NULL otherwise) */
 	}
 }
 
