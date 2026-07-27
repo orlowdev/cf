@@ -7167,6 +7167,20 @@ static void expect_bool(Program *prog, Func *fn, Expr *e) {
  * whose arena pointer the field would alias (an aggregate copy needs an explicit `copy`,
  * memory_model §6; a `union` value is immutable so aliasing it is sound). */
 static void check_member_value(Program *prog, Func *fn, Expr *val, Type want, int line) {
+	/* An INLINE nested record literal `{ a: { v: 1 } }`: a bare (unannotated) `{ … }` value takes its
+	 * record type from the position it fills (a record field, an array element, an append, a field
+	 * assignment — every context routes through here). Resolve it against the expected record type
+	 * BEFORE typing it (an unannotated literal has no self-type, so typeof_expr would otherwise fail
+	 * "cannot infer the record type"). This recurses — a deeper `{ … }` field resolves the same way —
+	 * so an inline literal tree of any depth is built directly, no per-node constructor needed.
+	 * (⚠ NOT covered: a bare literal as a UNION payload `U.Member({…})` — that construction is a
+	 * separate parse path that never reaches here; use the call form `U.Member(mk(…))`.) The `!rec`
+	 * guard keeps this idempotent if the node is ever re-checked. */
+	if (val->kind == EX_RECORD && val->name[0] == '\0' && !val->rec) {
+		if (want.kind != TY_RECORD)
+			die(line, "a `{ … }` record literal does not fit the expected type here");
+		resolve_record_literal(prog, fn, val, want.rec);
+	}
 	Type at = typeof_expr(prog, fn, val);
 	if (want.kind == TY_INT || is_iarch(want)) { /* an `Int`/`Iarch` field wants an operable integer */
 		if (!is_operable_int(at))
@@ -7589,15 +7603,16 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 	case EX_SPREAD:
 		die(e->line, "a spread `...x` is only valid as a tuple element");
 	case EX_RECORD:
+		if (e->rec) /* already resolved — an annotated binding, an inline nested-literal context
+		             * (check_member_value), or a prior idempotent typeof. Yield its type. */
+			return e->rtype;
 		if (e->name[0]) {
 			/* Explicit construction `Point({…})`: the literal names its own record type.
 			 * Resolve once (idempotent — typeof may be called repeatedly) and yield it. */
-			if (!e->rec) {
-				DataDecl *d = prog_find_data(prog, e->name);
-				if (!d)
-					die(e->line, "unknown record type in construction");
-				resolve_record_literal(prog, fn, e, d);
-			}
+			DataDecl *d = prog_find_data(prog, e->name);
+			if (!d)
+				die(e->line, "unknown record type in construction");
+			resolve_record_literal(prog, fn, e, d);
 			return e->rtype;
 		}
 		/* An unresolved bare `{…}` reached here with no type context to construct from —
