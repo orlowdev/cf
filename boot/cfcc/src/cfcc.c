@@ -421,6 +421,40 @@ static void lex(Lexer *lx) {
 			continue;
 		}
 		if (c == '\'') {
+			/* A CHAR literal `'x'` / `'\n'` — a single char (or escape) closed by `'` — lexes to a
+			 * TK_INT byte value, so it flows through ALL the integer-literal machinery (a `'A'` is
+			 * exactly `65`). Disambiguated from a type variable `'T` (an apostrophe + identifier, no
+			 * closing quote): a char literal closes with `'` right after the one-char/escaped content;
+			 * a type variable never has a `'` immediately after its (multi-char, unquoted) name.
+			 * ⚠ cf0 must NOT inherit: the cf spec has NO char-literal syntax and NO `Char` type
+			 * (type_system §2 — a codepoint is a `Uint32` from Str iteration, a byte comes via
+			 * `*[Uint8]`). `'x'` is a cfcc-ONLY convenience yielding a bare `Iarch` integer (the byte
+			 * value); single-byte only (a multibyte `'é'` falls to the type-var path and is rejected). */
+			if (s[lx->pos + 1] == '\\') { /* an escaped char literal `'\n'` */
+				int e = (unsigned char)s[lx->pos + 2];
+				long d;
+				switch (e) {
+				case 'n':  d = '\n'; break;
+				case 't':  d = '\t'; break;
+				case 'r':  d = '\r'; break;
+				case '0':  d = '\0'; break;
+				case '\\': d = '\\'; break;
+				case '\'': d = '\''; break;
+				default: die(lx->line, "unknown char escape (allows \\n \\t \\r \\0 \\\\ \\')");
+				}
+				if (s[lx->pos + 3] != '\'')
+					die(lx->line, "unterminated char literal (expected a closing `'`)");
+				push_tok(lx, TK_INT, s + lx->pos, 4, d);
+				lx->pos += 4;
+				continue;
+			}
+			if (s[lx->pos + 1] != '\0' && s[lx->pos + 1] != '\'' && s[lx->pos + 2] == '\'') {
+				/* a single-char literal `'A'` */
+				long d = (unsigned char)s[lx->pos + 1];
+				push_tok(lx, TK_INT, s + lx->pos, 3, d);
+				lx->pos += 3;
+				continue;
+			}
 			/* A type variable: `'T` — an apostrophe followed by an identifier. Lexed as
 			 * one TK_IDENT whose text starts with `'` (ebnf: `type_var = "'" ident`). */
 			size_t start = lx->pos;
@@ -7166,6 +7200,32 @@ static void expect_bool(Program *prog, Func *fn, Expr *e) {
  * field wants an Int; a record field wants that record — and NOT a bare record variable,
  * whose arena pointer the field would alias (an aggregate copy needs an explicit `copy`,
  * memory_model §6; a `union` value is immutable so aliasing it is sound). */
+/* If `lit` is a bare integer literal and the OTHER operand's type is a fixed-width `IntN`/`UintN`
+ * or `Uarch`, ADOPT the literal to that type (type_system §3 — a literal takes its context's type),
+ * range-checked; pin its rtype so emit compares/computes at that width, and return the adopted type.
+ * Otherwise return `lit_ty` unchanged. Lets `byte == 'A'` / `n8 + 5` / `u & 0xFF` work without an
+ * explicit cast — the common lexer/codegen operand shape (previously cfcc required an exact match).
+ * ⚠ PARTIAL §3 lift: only a POSITIVE bare literal adopts — a negative `-5` parses as EX_NEG (not a
+ * negative EX_INT), so `n8 == -5` is still rejected (a clean reject, never a mis-compile); cf0
+ * adopts negatives too. (Consequently the Uarch `ival < 0` guard below is defensive, not reached.) */
+static Type adopt_int_literal(Expr *lit, Type lit_ty, Type other, int line) {
+	if (lit->kind != EX_INT)
+		return lit_ty;
+	if (is_fixed_type(other)) {
+		if (!literal_fits_fixed(lit->ival, other.bits, other.is_signed))
+			die(line, "integer literal out of range for this fixed-width operand");
+		lit->rtype = other;
+		return other;
+	}
+	if (other.kind == TY_UARCH) {
+		if (lit->ival < 0)
+			die(line, "a negative literal does not fit a `Uarch` operand");
+		lit->rtype = other;
+		return other;
+	}
+	return lit_ty;
+}
+
 static void check_member_value(Program *prog, Func *fn, Expr *val, Type want, int line) {
 	/* An INLINE nested record literal `{ a: { v: 1 } }`: a bare (unannotated) `{ … }` value takes its
 	 * record type from the position it fills (a record field, an array element, an append, a field
@@ -8125,6 +8185,8 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 			 * above); arithmetic yields it, a comparison yields `Bool`. Uarch arithmetic is UNSIGNED
 			 * (udiv/urem/shr, the `cult` compare family) — the emit picks that via int_scalar_signed
 			 * (Uarch → unsigned), and is_int_scalar already treats Uarch as a 64-bit `l`. */
+			lt = adopt_int_literal(e->lhs, lt, rt, e->line); /* a bare literal adopts the other side's width */
+			rt = adopt_int_literal(e->rhs, rt, lt, e->line);
 			if (!types_equal(lt, rt))
 				die(e->line, "a numeric operator needs two operands of the same fixed-width or `Uarch` type (no mixed widths/signedness — cast explicitly)");
 			return is_cmp ? mk_bool() : lt;
@@ -8146,6 +8208,8 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		if (is_operable_int(lt) && is_operable_int(rt))
 			return mk_iarch(); /* Int/Iarch — the operable default */
 		if (is_fixed_type(lt) || is_fixed_type(rt) || lt.kind == TY_UARCH || rt.kind == TY_UARCH) {
+			lt = adopt_int_literal(e->lhs, lt, rt, e->line); /* a bare literal adopts the other side's width */
+			rt = adopt_int_literal(e->rhs, rt, lt, e->line);
 			if (!types_equal(lt, rt))
 				die(e->line, "a `%`/bitwise/shift operator needs two operands of the same fixed-width or `Uarch` type (cast explicitly)");
 			return lt; /* Uarch `%`/`>>` are unsigned (urem/shr) — chosen by int_scalar_signed at emit */
