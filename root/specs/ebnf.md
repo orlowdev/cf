@@ -1158,12 +1158,13 @@ match_arm     = or_pattern , "->" , branch ;
 or_pattern    = match_pattern , { "|" , match_pattern } ;    (* alternatives — matches any one *)
 
 match_pattern = "_"                                          (* wildcard — matches anything *)
-              | literal                                      (* 1, "one", true *)
+              | literal_pattern                              (* 1, -5, "one", true *)
               | var_name                                     (* binding — matches anything, names it *)
               | type_pattern                                 (* Maybe.Just(x), Maybe.Nothing, Shape.Point({ x, y }) *)
               | record_pattern                               (* { x, y } — by field, see Destructuring *)
               | array_pattern ;                              (* [a, b] — positional, see Destructuring *)
 type_pattern  = ( named_type | member_access ) , [ "(" , match_pattern , { "," , match_pattern } , ")" ] ;   (* head may be a qualified member *)
+literal_pattern = [ "-" ] , number | string | bool ;         (* a leading "-" negates a NUMBER pattern (`-5`); string/bool take no sign *)
 literal       = number | string | bool ;
 ```
 
