@@ -874,7 +874,7 @@ param_list     = "(" , [ param , { "," , param } ] , ")" ;
 param          = [ type ] , var_name | type , record_pattern ;   (* Int32 x  |  x (type inferred/annotated)  |  ServerOptions { port, host } *)
 
 block          = "{" , { statement } , "}" ;
-statement      = var_decl | return_stmt | yield_stmt | assign_stmt | expression ;   (* (temporary) — widened further with more control flow *)
+statement      = var_decl | return_stmt | yield_stmt | assign_stmt | if_stmt | expression ;   (* (temporary) — widened further with more control flow *)
 return_stmt    = "return" , [ expression ] ;                   (* exits the whole function *)
 yield_stmt     = "<-" , expression ;                           (* yields a block's value and ends the block (terminal, like return); inside a loop it breaks the loop with that value *)
 ```
@@ -1092,14 +1092,23 @@ be revisited; the floor does not require it.
 
 ## Control Flow
 
-`if` is an **expression**, not a statement — it always yields a value, so it may
-be bound (`let x = if …`) or stand alone as an expression-statement
+`if` is primarily an **expression** — it yields a value, so it may be bound
+(`let x = if …`) or stand alone as an expression-statement
 (`if c then f() else g()`). It is a top-level alternative of `expression` (see
-Expressions), so to nest it inside an operator you parenthesize it.
+Expressions), so to nest it inside an operator you parenthesize it. `if` also has
+a **statement form** (`if_stmt`) for control flow: its branches are *statements*
+(they may `return`, `break`, `continue`, `<-`, assign, or call), its `else` is
+optional, and it yields no value. The two are distinguished by position and
+branch content — a value-`if` supplies a value (its branches are expressions or
+`<-`-yielding blocks, and `else` is mandatory so it always yields), whereas a
+statement-`if` drives control flow (a branch diverges or acts for effect).
 
 ```ebnf
 if_expr = "if" , expression , "then" , branch , [ "else" , branch ] ;
 branch  = block | expression ;
+
+if_stmt = "if" , expression , "then" , stmt_branch , [ "else" , stmt_branch ] ;
+stmt_branch = block | statement ;                              (* a `return`/`break`/`continue`/assign statement, or a block of them *)
 ```
 
 ```
@@ -1140,6 +1149,17 @@ Points:
 - **`else if` needs no special rule.** A branch is an `expression` and an
   `expression` may itself be an `if_expr`, so `if a then 1 else if b then 2 else 3`
   chains for free.
+- **The statement form (`if_stmt`) drives control flow.** Its branches are
+  *statements* — `if err then return None`, `if done then break`, `if x < 0 then { … }`
+  — so a branch may `return` (an early return from the whole function), `break`/
+  `continue` a loop, `<-` a value-loop, assign, or call. Its `else` is optional and
+  it yields no value (it is not bound). When **both** branches diverge (each ends in
+  `return`/`break`/`continue`/`<-`), the `if` is itself terminal and satisfies a
+  function's or block's obligation to end by diverging. `else if` chains for free
+  here too (a `stmt_branch` may be another `if_stmt`). The value form and the
+  statement form share the `if … then … [else …]` surface; a use that supplies a
+  value (bound, or an operand) is the expression, a use that acts for effect or
+  diverges is the statement.
 
 `<-` and a comparison `<` never collide: `<-` only ever leads a `yield_stmt`
 (no left operand), while `<` is binary and always sits between two operands —
