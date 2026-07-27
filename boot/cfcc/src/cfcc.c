@@ -6023,12 +6023,15 @@ static void concretize_name(Program *prog, char *name, int line) {
 		instantiate_type(prog, name, line);
 		return;
 	}
-	/* ⚠ cfcc requires EXPLICIT type arguments at every generic-type use, INCLUDING a value
-	 * construction (`Maybe[Int].Just(5)`, not `Maybe.Just(5)`) — constructor-argument
-	 * inference is deferred. cf0 must NOT inherit this: type_system §8.1/§5.1 infer the member
-	 * at the construction site (`Maybe.Just(1) : Maybe[Iarch].Just`), and seed_subset §4 keeps
-	 * generics-with-inference in full. cfcc infers args for a function CALL (shallow path) but
-	 * demands them for a construction — a genesis narrowing that rejects, never miscompiles. */
+	/* A bare generic PAYLOAD-member construction (`Maybe.Just(5)`) is inferred upstream in
+	 * infer_generic_union_ctor (shallow arg-type inference, like a function call), so by here its
+	 * `name` is already the concrete instance. What still reaches here bare is a generic type whose
+	 * args cannot be inferred from a construction: a generic RECORD literal / annotation, a NULLARY
+	 * generic union member (`Maybe.Nothing` — no payload to infer from), or a member whose `'T` is
+	 * buried in a nested payload type. Those still demand explicit `[…]` args. ⚠ cf0 must NOT
+	 * inherit this residual: type_system §8.1/§5.1 infer at EVERY construction site — including a
+	 * nullary member, from the binding/annotation CONTEXT — and seed_subset §4 keeps
+	 * generics-with-inference in full. A genesis narrowing that rejects, never miscompiles. */
 	DataDecl *d = prog_find_data(prog, name);
 	if (d && d->ntyparams > 0)
 		die(line, "generic data type used without type arguments (write `Name[Int]`)");
@@ -6218,6 +6221,63 @@ static const char *shallow_type_name(Program *prog, Func *fn, Expr *e) {
 	}
 }
 
+/* Index of tyvar `name` (`'T`) in a union template's type-parameter list, or -1. */
+static int union_typaram_index(const UnionDecl *u, const char *name) {
+	for (int i = 0; i < u->ntyparams; i++)
+		if (strcmp(u->typarams[i], name) == 0)
+			return i;
+	return -1;
+}
+
+/* If `e` is a BARE generic union member construction with a payload (`Maybe.Just(5)`, not the
+ * explicit `Maybe[Iarch].Just(5)`), infer the union's type arguments from the payload argument
+ * types and rewrite `e->name` to the concrete instance (`Maybe.1.Iarch`), which concretize_name
+ * then instantiates. Mirrors the function call-site inference (shallow_type_name): only a payload
+ * position that is EXACTLY a bare tyvar `'T` fixes that parameter; if any parameter is left unfixed
+ * (a nullary member has no payload; a `'T` buried in a nested type like `*List['T]` isn't a bare
+ * position), the name is left bare and concretize_name reports the usual "write `Name[Int]`" error.
+ * ⚠ cf0 must NOT inherit the residual limitation: type_system §8.1/§5.1 infer at EVERY construction
+ * site — including a nullary member and from the binding/annotation context — which cfcc does not. */
+static void infer_generic_union_ctor(Program *prog, Func *fn, Expr *e) {
+	if (strchr(e->name, '.')) /* already a concrete instance (explicit `[…]` args) */
+		return;
+	UnionDecl *u = prog_find_union(prog, e->name);
+	if (!u || u->ntyparams == 0)
+		return;
+	int tag = union_member_tag(u, e->mem);
+	if (tag < 0 || u->arity[tag] == 0 || e->nargs != u->arity[tag])
+		return; /* nullary or arity mismatch — leave bare (concretize_name/typecheck reports it) */
+	char args[MAX_TYPARAMS][64];
+	int found[MAX_TYPARAMS] = {0};
+	for (int i = 0; i < u->arity[tag]; i++) {
+		int tp = union_typaram_index(u, u->payload_types[tag][i]);
+		if (tp < 0)
+			continue; /* not a bare tyvar position — can't infer from it */
+		const char *at = shallow_type_name(prog, fn, e->args[i]);
+		if (!at[0])
+			continue;
+		if (found[tp] && strcmp(args[tp], at) != 0)
+			die(e->line, "conflicting inferred type arguments for this union construction — write them explicitly (`Name[T].Member`)");
+		snprintf(args[tp], sizeof args[0], "%s", at);
+		found[tp] = 1;
+	}
+	for (int t = 0; t < u->ntyparams; t++)
+		if (!found[t])
+			return; /* not every parameter fixed — leave bare for the explicit-args error */
+	char mangled[256];
+	int n = snprintf(mangled, sizeof mangled, "%s.%d", u->base_name, u->ntyparams);
+	for (int t = 0; t < u->ntyparams; t++) {
+		if (n < 0 || (size_t)n >= sizeof mangled)
+			die(e->line, "instantiation name too long");
+		n += snprintf(mangled + n, sizeof mangled - (size_t)n, ".%s", args[t]);
+	}
+	/* `e->name` is a fixed 64-byte field; refuse a longer mangled instance name rather than
+	 * silently truncating it (a truncated name could collide with another instance). */
+	if (strlen(mangled) >= sizeof e->name)
+		die(e->line, "inferred instantiation name too long — write the type arguments explicitly");
+	snprintf(e->name, sizeof e->name, "%s", mangled);
+}
+
 /* Walk a concrete function's body and specialize every call to a generic template —
  * children first, so a nested generic call is resolved (its return type known) before an
  * enclosing call infers from it. Type arguments come from the explicit `[…]` list or are
@@ -6240,7 +6300,11 @@ static void monomorph_expr(Program *prog, Func *fn, Expr *e) {
 	for (int i = 0; i < e->narms; i++)
 		monomorph_expr(prog, fn, e->arms[i].body);
 	/* A generic record literal (`Box[Int]{…}`) or union member value (`Maybe[Int].Just`)
-	 * names a type application — instantiate it. */
+	 * names a type application — instantiate it. A BARE generic union member construction
+	 * (`Maybe.Just(5)`) first infers its type args from the payload, so it needs no explicit
+	 * `[…]` at the construction site. */
+	if (e->kind == EX_UMEMBER)
+		infer_generic_union_ctor(prog, fn, e);
 	if (e->kind == EX_RECORD || e->kind == EX_UMEMBER)
 		concretize_name(prog, e->name, e->line);
 	if (e->kind != EX_CALL)
