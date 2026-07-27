@@ -887,6 +887,15 @@ typedef struct {
 	 * `_` arm. A negative literal `-5` is allowed (a leading `-` at parse). */
 	int is_int;
 	long ilits[MAX_ARM_ALTS];
+	/* A STRING-LITERAL arm: `"add" -> …` or an or-pattern `"add" | "mul" -> …` (a direct match on
+	 * a `Str` scrutinee — the natural keyword/token-text dispatch). `nalts` counts the literals in
+	 * `slits`/`slitlens` (decoded bytes + byte length, may embed NULs); like an integer match it is
+	 * never exhaustive, so it REQUIRES a `_`. No interpolation in a pattern (a pattern is a
+	 * constant). ⚠ cf0 must NOT inherit: string-literal patterns only — no binding/nested/regex. */
+	int is_str;
+	char *slits[MAX_ARM_ALTS];
+	int slitlens[MAX_ARM_ALTS];
+	int slit_ids[MAX_ARM_ALTS]; /* per-alt module data-blob id (`$patstr_bytes_<id>`), set by collect */
 	/* Payload binding (single-member arms only): `Node.IntLit(v)` binds `v` to payload
 	 * field 0. `binds[i]` is the name (or "_" to ignore field i); `bind_ids[i]` the
 	 * per-function storage id (`%pb<id>`), assigned in typecheck; `nbinds` = 0 for a
@@ -964,6 +973,10 @@ struct Expr {
 	 * over the integer scrutinee's VALUE (not a union tag). Set in typecheck; emit picks the
 	 * value-compare ladder. Mutually exclusive with `uni`/`numswitch`. */
 	int int_match;
+	/* EX_MATCH: a STRING-LITERAL match (`match s { "add" -> …, _ -> … }`) — a compare-chain of
+	 * Str-equality tests (length then bytes) over the `Str` scrutinee. Set in typecheck; emit
+	 * picks the string-compare ladder. Mutually exclusive with `uni`/`numswitch`/`int_match`. */
+	int str_match;
 	/* EX_VAR: set by typecheck when the name resolves to a match-arm payload binding
 	 * (not a param/local) — emit reads its value from the `%pb<bind_id>` storage temp. */
 	int is_bind;
@@ -3460,8 +3473,29 @@ static Expr *parse_match(Parser *p, Func *fn) {
 				if (peek(p)->kind == TK_PIPE) { advance(p); continue; }
 				break;
 			}
+		} else if (pt->kind == TK_STR) {
+			/* A STRING-LITERAL arm: `"add" -> …` or an or-pattern `"add" | "mul" -> …` — a direct
+			 * match on a `Str` scrutinee (the natural token-keyword dispatch). Each alternative is a
+			 * plain string literal (no interpolation — a pattern is a constant); no binding. The `_`
+			 * requirement + duplicates are checked in typecheck. */
+			arm.is_str = 1;
+			for (;;) {
+				Token *lt = peek(p);
+				if (lt->kind != TK_STR)
+					die(lt->line, "a string-literal match alternative is a string (e.g. `\"add\"`)");
+				if (lt->has_interp)
+					die(lt->line, "a match pattern string cannot interpolate (`${…}`) — a pattern is a constant");
+				if (arm.nalts == MAX_ARM_ALTS)
+					die(lt->line, "too many or-pattern alternatives");
+				arm.slits[arm.nalts] = lt->sval;
+				arm.slitlens[arm.nalts] = lt->slen;
+				arm.nalts++;
+				advance(p);
+				if (peek(p)->kind == TK_PIPE) { advance(p); continue; }
+				break;
+			}
 		} else {
-			die(pt->line, "a match arm is an integer literal (`0`, `1 | 2`), `Union.Member` (or `A | B`), or `_`");
+			die(pt->line, "a match arm is an integer literal (`0`, `1 | 2`), a string literal (`\"add\"`), `Union.Member` (or `A | B`), or `_`");
 		}
 		expect(p, TK_ARROW, "expected `->`");
 		/* Put the arm's payload bindings in scope for the body's parse (parse resolves
@@ -4663,7 +4697,7 @@ static Func *parse_func(Parser *p, Program *prog) {
 	    strcmp(fn->name, "cf_oom") == 0 || strcmp(fn->name, "cf_mmap_fail") == 0 ||
 	    strcmp(fn->name, "cf_dyn_push") == 0 || strcmp(fn->name, "cf_uint_append") == 0 ||
 	    strcmp(fn->name, "cf_int_append") == 0 || strcmp(fn->name, "cf_str_append") == 0 ||
-	    strcmp(fn->name, "cf_bool_append") == 0)
+	    strcmp(fn->name, "cf_bool_append") == 0 || strcmp(fn->name, "cf_streq_bytes") == 0)
 		die(name->line, "that name is reserved for the runtime");
 	if (strcmp(fn->name, "asm") == 0)
 		die(name->line, "`asm` is a reserved keyword");
@@ -6937,6 +6971,49 @@ static Type check_int_match(Program *prog, Func *fn, Expr *e, Type st) {
 	return rt;
 }
 
+/* A STRING-LITERAL match `match s { "add" -> …, "mul" -> …, _ -> … }`: the scrutinee is a `Str`;
+ * every non-`_` arm is a string-literal (or-)pattern; a `_` is REQUIRED (never exhaustive). Emit is
+ * a length-then-bytes compare ladder. Mirrors check_int_match. ⚠ cf0 must NOT inherit: string
+ * patterns only (no binding/nested/regex); the mandatory `_` (cf0 may prove exhaustiveness). */
+static Type check_str_match(Program *prog, Func *fn, Expr *e, Type st) {
+	if (st.kind != TY_STR)
+		die(e->line, "a string-literal `match` needs a `Str` scrutinee");
+	e->str_match = 1;
+	const char *seen[256]; int seenlen[256];
+	int nseen = 0, has_wild = 0, have_rt = 0;
+	Type rt = {TY_STR, NULL, NULL, 0, NULL};
+	for (int i = 0; i < e->narms; i++) {
+		MatchArm *a = &e->arms[i];
+		if (has_wild)
+			die(a->line, "unreachable match arm after `_`");
+		if (a->is_wild) {
+			has_wild = 1;
+		} else if (!a->is_str) {
+			die(a->line, "a string `match` takes string-literal arms and a `_` only");
+		} else {
+			for (int k = 0; k < a->nalts; k++) {
+				for (int j = 0; j < nseen; j++)
+					if (seenlen[j] == a->slitlens[k] && memcmp(seen[j], a->slits[k], a->slitlens[k]) == 0)
+						die(a->line, "duplicate match arm for this string literal");
+				if (nseen < 256) { seen[nseen] = a->slits[k]; seenlen[nseen] = a->slitlens[k]; nseen++; }
+			}
+		}
+		/* Arm bodies unify to one type — a mergeable scalar or a FRESH aggregate (as elsewhere). */
+		Type bt = typeof_expr(prog, fn, a->body);
+		if (!is_mergeable_scalar(bt)) {
+			if (!is_aggregate_pointer(bt))
+				die(a->line, "a match arm yields a scalar or aggregate value");
+			if (!is_fresh_producer(a->body))
+				die(a->line, "an aggregate-valued match arm must build a FRESH value (a call or construction)");
+		}
+		if (!have_rt) { rt = bt; have_rt = 1; }
+		else if (!types_equal(bt, rt)) die(a->line, "match arms must all yield the same type");
+	}
+	if (!has_wild)
+		die(e->line, "a non-exhaustive string `match` needs a `_` arm (a string match never covers all values)");
+	return rt;
+}
+
 static Type check_numeric_typeswitch(Program *prog, Func *fn, Expr *e, Type st) {
 	char wk[16];
 	snprintf(wk, sizeof wk, "%s", numeric_type_name(st)); /* the scrutinee's concrete width */
@@ -7703,6 +7780,10 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		for (int i = 0; i < e->narms; i++)
 			if (e->arms[i].is_int)
 				return check_int_match(prog, fn, e, st);
+		/* A STRING-LITERAL match (any `is_str` arm) is a Str-equality compare-chain. */
+		for (int i = 0; i < e->narms; i++)
+			if (e->arms[i].is_str)
+				return check_str_match(prog, fn, e, st);
 		/* A NUMERIC scalar scrutinee (a fixed leaf, `Uarch`, or a float) whose arms are qualified
 		 * by a numeric union (`Int`/`Uint`/`Number`) is a comptime TYPE-SWITCH — the concrete
 		 * width picks the live arm. */
@@ -8973,6 +9054,25 @@ static void register_strlit(Expr *e) {
 	g_strlits[g_nstrlits++] = e;
 }
 
+/* Pattern-literal byte blobs for string `match` arms — a parallel table to g_strlits (these are
+ * raw bytes, not EX_STR nodes). Each gets a `$patstr_bytes_<id>` static data def; the compare
+ * ladder passes its pointer + length to $cf_streq_bytes. */
+static char **g_patlits;
+static int *g_patlit_lens;
+static int g_npatlits, g_cap_patlits;
+static int register_patlit(char *bytes, int len) {
+	if (g_npatlits == g_cap_patlits) {
+		g_cap_patlits = g_cap_patlits ? g_cap_patlits * 2 : 16;
+		g_patlits = realloc(g_patlits, g_cap_patlits * sizeof *g_patlits);
+		g_patlit_lens = realloc(g_patlit_lens, g_cap_patlits * sizeof *g_patlit_lens);
+		if (!g_patlits || !g_patlit_lens)
+			die(0, "out of memory");
+	}
+	g_patlits[g_npatlits] = bytes;
+	g_patlit_lens[g_npatlits] = len;
+	return g_npatlits++;
+}
+
 /* Walk an expression (and its sub-expressions) registering every string literal,
  * so each gets a module-unique data slot before emit. Mirrors assign_expr_slots. */
 static void collect_strlits_stmt(Stmt *list); /* forward: EX_LOOP body */
@@ -8991,8 +9091,13 @@ static void collect_strlits_expr(Expr *e) {
 		collect_strlits_expr(e->fvals[i]);
 	if (e->spread)
 		collect_strlits_expr(e->spread);
-	for (int i = 0; i < e->narms; i++) /* EX_MATCH arm bodies */
-		collect_strlits_expr(e->arms[i].body);
+	for (int i = 0; i < e->narms; i++) { /* EX_MATCH arm bodies + string-pattern blobs */
+		MatchArm *a = &e->arms[i];
+		if (a->is_str)
+			for (int k = 0; k < a->nalts; k++)
+				a->slit_ids[k] = register_patlit(a->slits[k], a->slitlens[k]);
+		collect_strlits_expr(a->body);
+	}
 }
 
 static void collect_strlits_stmt(Stmt *list) {
@@ -9016,6 +9121,12 @@ static void emit_string_data(FILE *out) {
 			fprintf(out, "b %d, ", (unsigned char)e->sval[j]);
 		fprintf(out, "b 0 }\n");
 		fprintf(out, "data $cfstr_%d = { l $cfstr_bytes_%d, w %d }\n", i, i, e->slen);
+	}
+	for (int i = 0; i < g_npatlits; i++) { /* string-`match` pattern byte blobs */
+		fprintf(out, "data $patstr_bytes_%d = { ", i);
+		for (int j = 0; j < g_patlit_lens[i]; j++)
+			fprintf(out, "b %d, ", (unsigned char)g_patlits[i][j]);
+		fprintf(out, "b 0 }\n");
 	}
 }
 
@@ -9723,6 +9834,57 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 				for (int k = 0; k < a->nalts; k++) {
 					int c = ex->tmp++;
 					fprintf(out, "\t%%t%d =w ceq%c %%t%d, %ld\n", c, sq, svt, a->ilits[k]);
+					if (k + 1 < a->nalts) {
+						int altx = ex->lbl++;
+						fprintf(out, "\tjnz %%t%d, @marm%d, @malt%d\n", c, hit, altx);
+						fprintf(out, "@malt%d\n", altx);
+					} else {
+						int nxt = ex->lbl++;
+						fprintf(out, "\tjnz %%t%d, @marm%d, @mnext%d\n", c, hit, nxt);
+						fprintf(out, "@marm%d\n", hit);
+						char b[96];
+						emit_expr(out, a->body, ex, b, sizeof b);
+						fprintf(out, "\tstore%c %s, %%m%d\n", mq, b, e->slot);
+						fprintf(out, "\tjmp @mend%d\n", id);
+						fprintf(out, "@mnext%d\n", nxt);
+					}
+				}
+			}
+			{ /* the mandatory `_` default */
+				char b[96];
+				emit_expr(out, e->arms[wild].body, ex, b, sizeof b);
+				fprintf(out, "\tstore%c %s, %%m%d\n", mq, b, e->slot);
+			}
+			fprintf(out, "\tjmp @mend%d\n", id);
+			fprintf(out, "@mend%d\n", id);
+			int r = ex->tmp++;
+			fprintf(out, "\t%%t%d =%c load%c %%m%d\n", r, mq, mq, e->slot);
+			snprintf(dst, cap, "%%t%d", r);
+			return;
+		}
+		if (e->str_match) {
+			/* A STRING-LITERAL match: a compare-chain of Str-equality tests. Each alternative calls
+			 * `$cf_streq_bytes(scrut, $patstr_bytes_<id>, <len>)` → a `w` 0/1; a hit jumps to the
+			 * shared arm body (stores the `%m` merge slot, jumps @mend), a miss falls through. The
+			 * `_` arm (typecheck guarantees one) is the fall-through default. Mirrors int_match. */
+			char mq = qtype_of(e->rtype);
+			int id = ex->lbl++;
+			char sc[96];
+			emit_expr(out, e->lhs, ex, sc, sizeof sc);
+			int svt = ex->tmp++;
+			fprintf(out, "\t%%t%d =l copy %s\n", svt, sc); /* snapshot the scrutinee pointer */
+			int wild = -1;
+			for (int i = 0; i < e->narms; i++)
+				if (e->arms[i].is_wild) { wild = i; break; }
+			for (int i = 0; i < e->narms; i++) {
+				MatchArm *a = &e->arms[i];
+				if (a->is_wild)
+					continue;
+				int hit = ex->lbl++;
+				for (int k = 0; k < a->nalts; k++) {
+					int c = ex->tmp++;
+					fprintf(out, "\t%%t%d =w call $cf_streq_bytes(l %%t%d, l $patstr_bytes_%d, l %d)\n",
+					        c, svt, a->slit_ids[k], a->slitlens[k]);
 					if (k + 1 < a->nalts) {
 						int altx = ex->lbl++;
 						fprintf(out, "\tjnz %%t%d, @marm%d, @malt%d\n", c, hit, altx);
@@ -10757,6 +10919,44 @@ static void emit_runtime_qbe(FILE *out) {
 	    "\t%f4 =l call $cf_dyn_push(l %vhdr, w 1)\n"
 	    "\tstoreb 101, %f4\n"
 	    "\tret\n"
+	    "}\n"
+	    /* Str-equality against a raw byte blob (a string-`match` pattern): 1 if `str`'s length and
+	     * bytes equal (n, bytes), else 0. Compares the 32-bit header len @8, then byte-for-byte.
+	     * Byte-equality faithfully realizes the spec's normalization-free structural Str equality
+	     * (type_system §2.3/§5 — no NFC/NFD, so for valid UTF-8 byte-equal ⟺ codepoint-equal). ⚠ if
+	     * the std ever defines NORMALIZED Str equality, cf0's string `match` must match that surface. */
+	    "function w $cf_streq_bytes(l %str, l %bytes, l %n) {\n"
+	    "@start\n"
+	    "\t%la =l add %str, 8\n"
+	    "\t%slenw =w loadw %la\n"
+	    "\t%slen =l extuw %slenw\n"
+	    "\t%leq =w ceql %slen, %n\n"
+	    "\tjnz %leq, @cmp, @ne\n"
+	    "@ne\n"
+	    "\tret 0\n"
+	    "@cmp\n"
+	    "\t%sbytes =l loadl %str\n"
+	    "\t%ip =l alloc8 8\n"
+	    "\tstorel 0, %ip\n"
+	    "@loop\n"
+	    "\t%i =l loadl %ip\n"
+	    "\t%done =w cugel %i, %n\n"
+	    "\tjnz %done, @eq, @step\n"
+	    "@step\n"
+	    "\t%a1 =l add %sbytes, %i\n"
+	    "\t%b1 =l add %bytes, %i\n"
+	    "\t%ca =w loadub %a1\n"
+	    "\t%cb =w loadub %b1\n"
+	    "\t%same =w ceqw %ca, %cb\n"
+	    "\tjnz %same, @next, @nematch\n"
+	    "@nematch\n"
+	    "\tret 0\n"
+	    "@next\n"
+	    "\t%i1 =l add %i, 1\n"
+	    "\tstorel %i1, %ip\n"
+	    "\tjmp @loop\n"
+	    "@eq\n"
+	    "\tret 1\n"
 	    "}\n",
 	    out);
 }
