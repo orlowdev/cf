@@ -855,6 +855,12 @@ typedef struct {
 	int tags[MAX_ARM_ALTS]; /* per-alternative member tag, resolved in typecheck */
 	int nalts;
 	int is_wild;
+	/* An INTEGER-LITERAL arm: `0 -> …` or an or-pattern `0 | 1 | 2 -> …` (type_system §8.3 —
+	 * matching a scalar integer directly, not a union). `nalts` counts the literals in `ilits`;
+	 * `qual`/`members`/`binds` are unused. Integer matches are never exhaustive, so they REQUIRE a
+	 * `_` arm. A negative literal `-5` is allowed (a leading `-` at parse). */
+	int is_int;
+	long ilits[MAX_ARM_ALTS];
 	/* Payload binding (single-member arms only): `Node.IntLit(v)` binds `v` to payload
 	 * field 0. `binds[i]` is the name (or "_" to ignore field i); `bind_ids[i]` the
 	 * per-function storage id (`%pb<id>`), assigned in typecheck; `nbinds` = 0 for a
@@ -926,6 +932,10 @@ struct Expr {
 	 * regular tag-dispatch union match leaves both 0/… (uni != NULL distinguishes it). */
 	int numswitch;
 	int live_arm;
+	/* EX_MATCH: an INTEGER-LITERAL match (`match n { 0 -> …, _ -> … }`, §8.3) — a compare-chain
+	 * over the integer scrutinee's VALUE (not a union tag). Set in typecheck; emit picks the
+	 * value-compare ladder. Mutually exclusive with `uni`/`numswitch`. */
+	int int_match;
 	/* EX_VAR: set by typecheck when the name resolves to a match-arm payload binding
 	 * (not a param/local) — emit reads its value from the `%pb<bind_id>` storage temp. */
 	int is_bind;
@@ -3309,8 +3319,29 @@ static Expr *parse_match(Parser *p, Func *fn) {
 				}
 				break;
 			}
+		} else if (pt->kind == TK_INT || pt->kind == TK_MINUS) {
+			/* An INTEGER-LITERAL arm: `0 -> …` or an or-pattern of literals `0 | 1 | 2 -> …`
+			 * (type_system §8.3 — a direct scalar-integer match, the natural lexer/parser dispatch
+			 * on a byte/char/token-kind). Each alternative is an int literal (optionally negated);
+			 * no payload binding. Duplicates + exhaustiveness (a required `_`) are checked in
+			 * typecheck. ⚠ cf0 must NOT inherit: only bare integer literals here — no ranges,
+			 * string/char literals, or binding patterns (those are later bricks). */
+			arm.is_int = 1;
+			for (;;) {
+				int neg = 0;
+				if (peek(p)->kind == TK_MINUS) { neg = 1; advance(p); }
+				Token *lt = peek(p);
+				if (lt->kind != TK_INT)
+					die(lt->line, "an integer-literal match arm alternative is an integer (e.g. `0` or `-5`)");
+				if (arm.nalts == MAX_ARM_ALTS)
+					die(lt->line, "too many or-pattern alternatives");
+				arm.ilits[arm.nalts++] = neg ? -lt->ival : lt->ival;
+				advance(p);
+				if (peek(p)->kind == TK_PIPE) { advance(p); continue; }
+				break;
+			}
 		} else {
-			die(pt->line, "a match arm is `Union.Member` (or `A | B`) or `_` (M1: no literal/binding patterns yet)");
+			die(pt->line, "a match arm is an integer literal (`0`, `1 | 2`), `Union.Member` (or `A | B`), or `_`");
 		}
 		expect(p, TK_ARROW, "expected `->`");
 		/* Put the arm's payload bindings in scope for the body's parse (parse resolves
@@ -6598,6 +6629,60 @@ static void resolve_array_literal(Program *prog, Func *fn, Expr *e, Type elem); 
  * (§8.5). Sets `numswitch`/`live_arm` on the match; returns the live arm's type. ⚠ cf0 must
  * NOT inherit: cf0 checks §8.3 exhaustiveness across the union's members and typechecks every
  * arm at the type it refines to; cfcc requires only the live arm present and checks only it. */
+/* An INTEGER-LITERAL match (`match n { 0 -> …, 2 | 3 -> …, _ -> … }`, type_system §8.3): a
+ * compare-chain over the integer scrutinee's VALUE (not a union tag). The scrutinee is an
+ * operable integer / fixed-width / Uarch; every non-`_` arm is an int-literal (or-)pattern, and a
+ * `_` is REQUIRED (integer matches are never exhaustive). Duplicate literals and unreachable-after-
+ * `_` are rejected; arm bodies unify like a union match (a mergeable scalar, or a FRESH aggregate
+ * merged through the `%m` slot). Sets `int_match` for emit; returns the arms' common type. ⚠ cf0
+ * must NOT inherit: only bare integer literals — no ranges, char/string literals, or binding
+ * patterns; the `_` is mandatory (cf0 may prove exhaustiveness over a bounded type). */
+static Type check_int_match(Program *prog, Func *fn, Expr *e, Type st) {
+	if (!is_operable_int(st) && !is_fixed_type(st) && st.kind != TY_UARCH)
+		die(e->line, "an integer-literal `match` needs an integer scrutinee (`Iarch`, a fixed-width int, or `Uarch`)");
+	e->int_match = 1;
+	long seen[256];
+	int nseen = 0; /* collected literals, for duplicate detection */
+	int has_wild = 0, have_rt = 0;
+	Type rt = {TY_INT, NULL, NULL, 0, NULL};
+	for (int i = 0; i < e->narms; i++) {
+		MatchArm *a = &e->arms[i];
+		if (has_wild)
+			die(a->line, "unreachable match arm after `_`");
+		if (a->is_wild) {
+			has_wild = 1;
+		} else if (!a->is_int) {
+			die(a->line, "an integer `match` takes integer-literal arms and a `_` only (not union members)");
+		} else {
+			for (int k = 0; k < a->nalts; k++) {
+				for (int j = 0; j < nseen; j++)
+					if (seen[j] == a->ilits[k])
+						die(a->line, "duplicate match arm for this integer literal");
+				if (nseen < (int)(sizeof seen / sizeof seen[0]))
+					seen[nseen++] = a->ilits[k];
+			}
+		}
+		/* Arm bodies unify to one type — a mergeable scalar, or a FRESH aggregate pointer (the
+		 * same rule as a union match: a bare aggregate variable would alias, §6). */
+		Type bt = typeof_expr(prog, fn, a->body);
+		if (!is_mergeable_scalar(bt)) {
+			if (!is_aggregate_pointer(bt))
+				die(a->line, "a match arm yields a scalar or aggregate value");
+			if (!is_fresh_producer(a->body))
+				die(a->line, "an aggregate-valued match arm must build a FRESH value (a call or construction)");
+		}
+		if (!have_rt) {
+			rt = bt;
+			have_rt = 1;
+		} else if (!types_equal(bt, rt)) {
+			die(a->line, "match arms must all yield the same type");
+		}
+	}
+	if (!has_wild)
+		die(e->line, "a non-exhaustive integer `match` needs a `_` arm (an integer match never covers all values)");
+	return rt;
+}
+
 static Type check_numeric_typeswitch(Program *prog, Func *fn, Expr *e, Type st) {
 	char wk[16];
 	snprintf(wk, sizeof wk, "%s", numeric_type_name(st)); /* the scrutinee's concrete width */
@@ -7321,6 +7406,11 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		 * (M1.1) and unify to the match's type. Exhaustiveness: cover every member or
 		 * carry a `_`. */
 		Type st = typeof_expr(prog, fn, e->lhs);
+		/* An INTEGER-LITERAL match (any `is_int` arm) is a direct value dispatch on an integer
+		 * scrutinee (§8.3) — routed before the union/type-switch logic. */
+		for (int i = 0; i < e->narms; i++)
+			if (e->arms[i].is_int)
+				return check_int_match(prog, fn, e, st);
 		/* A NUMERIC scalar scrutinee (a fixed leaf, `Uarch`, or a float) whose arms are qualified
 		 * by a numeric union (`Int`/`Uint`/`Number`) is a comptime TYPE-SWITCH — the concrete
 		 * width picks the live arm. */
@@ -9165,6 +9255,58 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 				fprintf(out, "\t%%pb%d =%c copy %s\n", a->bind_ids[0], qt, sc);
 			}
 			emit_expr(out, a->body, ex, dst, cap); /* the match's value is the live arm's */
+			return;
+		}
+		if (e->int_match) {
+			/* An INTEGER-LITERAL match (§8.3): a compare-chain over the scrutinee's VALUE. Each
+			 * arm tests its literal alternative(s) with `ceq{w,l} scrut, <lit>` — a hit jumps to
+			 * the shared arm body (which stores into the `%m` merge slot and jumps to @mend), a
+			 * miss falls through to the next arm. The `_` arm (typecheck guarantees one) is the
+			 * ladder's fall-through default. Reuses the `if`/union merge-slot machinery. */
+			char mq = qtype_of(e->rtype);        /* the merged arm-value width */
+			char sq = qtype_of(e->lhs->rtype);   /* the scrutinee/compare width (w or l) */
+			int id = ex->lbl++;
+			char sc[96];
+			emit_expr(out, e->lhs, ex, sc, sizeof sc);
+			int svt = ex->tmp++;
+			fprintf(out, "\t%%t%d =%c copy %s\n", svt, sq, sc); /* snapshot the scrutinee value */
+			int wild = -1;
+			for (int i = 0; i < e->narms; i++)
+				if (e->arms[i].is_wild) { wild = i; break; }
+			for (int i = 0; i < e->narms; i++) {
+				MatchArm *a = &e->arms[i];
+				if (a->is_wild)
+					continue;
+				int hit = ex->lbl++;
+				for (int k = 0; k < a->nalts; k++) {
+					int c = ex->tmp++;
+					fprintf(out, "\t%%t%d =w ceq%c %%t%d, %ld\n", c, sq, svt, a->ilits[k]);
+					if (k + 1 < a->nalts) {
+						int altx = ex->lbl++;
+						fprintf(out, "\tjnz %%t%d, @marm%d, @malt%d\n", c, hit, altx);
+						fprintf(out, "@malt%d\n", altx);
+					} else {
+						int nxt = ex->lbl++;
+						fprintf(out, "\tjnz %%t%d, @marm%d, @mnext%d\n", c, hit, nxt);
+						fprintf(out, "@marm%d\n", hit);
+						char b[96];
+						emit_expr(out, a->body, ex, b, sizeof b);
+						fprintf(out, "\tstore%c %s, %%m%d\n", mq, b, e->slot);
+						fprintf(out, "\tjmp @mend%d\n", id);
+						fprintf(out, "@mnext%d\n", nxt);
+					}
+				}
+			}
+			{ /* the mandatory `_` default */
+				char b[96];
+				emit_expr(out, e->arms[wild].body, ex, b, sizeof b);
+				fprintf(out, "\tstore%c %s, %%m%d\n", mq, b, e->slot);
+			}
+			fprintf(out, "\tjmp @mend%d\n", id);
+			fprintf(out, "@mend%d\n", id);
+			int r = ex->tmp++;
+			fprintf(out, "\t%%t%d =%c load%c %%m%d\n", r, mq, mq, e->slot);
+			snprintf(dst, cap, "%%t%d", r);
 			return;
 		}
 		/* Compare-chain over the scrutinee's tag (seed_subset §7): a linear ladder of
