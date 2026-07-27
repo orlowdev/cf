@@ -806,6 +806,11 @@ typedef enum {
 	EX_INT,   /* integer literal (ival) */
 	EX_FLOAT, /* float literal (fval) — type Float64 (TY_F64) */
 	EX_STR,   /* string literal (sval/slen; strid names its module data) */
+	EX_INTERP,/* a runtime-interpolated string `"…${name}…"` (segs/nsegs = the literal/interp
+	           * pieces; args = one EX_VAR per `${name}` hole, in order). Lowers to a `[Uint8]`
+	           * byte vector built by appending each literal run + each hole's type-directed
+	           * stringification (itoa for the integer family, the bytes for a Str, true/false for
+	           * a Bool), then sealed to a Str. Yields TY_STR. */
 	EX_VAR,   /* reference to a bound name (param or local; any type) */
 	EX_FIELD, /* record field access: base.name (lhs=base record expr) */
 	EX_INDEX, /* array element access: base[index] (lhs=base array, rhs=index Int expr) */
@@ -904,6 +909,8 @@ struct Expr {
 	char *sval;       /* EX_STR: decoded bytes (heap-owned; may embed NULs) */
 	int slen;         /* EX_STR: decoded byte count */
 	int strid;        /* EX_STR: index into the module's string table (emit) */
+	StrSeg *segs;     /* EX_INTERP: the ordered literal/interp segments (shared from the Token) */
+	int nsegs;        /* EX_INTERP: segment count */
 	char name[64];    /* EX_VAR (bound name) / EX_CALL (callee) */
 	Expr *lhs, *rhs;  /* operands (unary uses lhs; EX_IF: lhs=cond, rhs=then; EX_FIELD: lhs=base) */
 	Expr *els;        /* EX_IF: else branch */
@@ -2664,11 +2671,35 @@ static Expr *parse_primary(Parser *p, Func *fn) {
 		return e;
 	}
 	if (t->kind == TK_STR) {
-		/* A `${…}` interpolation builds a value at runtime — deferred in M0 (the
-		 * `"${s}"` string-copy path lands with runtime interpolation). Interpolation is
-		 * currently meaningful only inside an `asm` body, handled where that is parsed. */
-		if (t->has_interp)
-			die(t->line, "runtime string interpolation is not supported yet");
+		if (t->has_interp) {
+			/* A runtime-interpolated string `"…${name}…"`. Build an EX_INTERP holding the
+			 * ordered segments (shared from the Token) plus one EX_VAR per `${name}` hole (in
+			 * order) in args[]; typecheck/emit stringify each hole by its type. ⚠ cf0 must NOT
+			 * inherit: a hole is a BARE NAME (the grammar allows any `${ expression }`); floats
+			 * are not yet stringifiable (deferred — need a dtoa); the builder lowers via a
+			 * `[Uint8]` vector (a genesis representation, not cf0's `Str` builder). */
+			advance(p);
+			Expr *e = new_expr(EX_INTERP);
+			e->line = t->line;
+			e->segs = t->segs;
+			e->nsegs = t->nsegs;
+			int cap = 0;
+			for (int i = 0; i < t->nsegs; i++) {
+				if (t->segs[i].kind != SEG_INTERP)
+					continue;
+				Expr *v = new_expr(EX_VAR);
+				v->line = t->line;
+				snprintf(v->name, sizeof v->name, "%s", t->segs[i].name);
+				if (e->nargs == cap) {
+					cap = cap ? cap * 2 : 4;
+					e->args = realloc(e->args, cap * sizeof *e->args);
+					if (!e->args)
+						die(t->line, "out of memory");
+				}
+				e->args[e->nargs++] = v;
+			}
+			return e;
+		}
 		advance(p);
 		Expr *e = new_expr(EX_STR);
 		e->line = t->line;
@@ -4630,7 +4661,9 @@ static Func *parse_func(Parser *p, Program *prog) {
 	if (strcmp(fn->name, "start") == 0 || strcmp(fn->name, "cf_alloc") == 0 ||
 	    strcmp(fn->name, "cf_top") == 0 || strcmp(fn->name, "cf_limit") == 0 ||
 	    strcmp(fn->name, "cf_oom") == 0 || strcmp(fn->name, "cf_mmap_fail") == 0 ||
-	    strcmp(fn->name, "cf_dyn_push") == 0)
+	    strcmp(fn->name, "cf_dyn_push") == 0 || strcmp(fn->name, "cf_uint_append") == 0 ||
+	    strcmp(fn->name, "cf_int_append") == 0 || strcmp(fn->name, "cf_str_append") == 0 ||
+	    strcmp(fn->name, "cf_bool_append") == 0)
 		die(name->line, "that name is reserved for the runtime");
 	if (strcmp(fn->name, "asm") == 0)
 		die(name->line, "`asm` is a reserved keyword");
@@ -7162,6 +7195,25 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		return (Type){TY_F64, NULL, NULL, 0, NULL};
 	case EX_STR:
 		return (Type){TY_STR, NULL, NULL, 0, NULL};
+	case EX_INTERP: {
+		/* A runtime-interpolated string yields a Str. Each `${name}` hole must be
+		 * STRINGIFIABLE: an integer of any width (Int/Iarch/Uarch/IntN/UintN — itoa), a Str
+		 * (its bytes), or a Bool (`true`/`false`). A float hole is rejected (deferred — needs a
+		 * dtoa); an aggregate/pointer hole has no textual form here.
+		 * ⚠ SPEC-SILENT (log for the owner): the spec defines NO Display/Show/`to_string` rule, so
+		 * the rendered TEXT is a cfcc guess — PROVISIONAL, cf0 must match whatever type_system pins:
+		 * Bool as lowercase `true`/`false`, integers as signed/unsigned base-10 (no prefix, no
+		 * leading zeros, two's-complement magnitude for negatives). See the cf_*_append helpers. */
+		for (int i = 0; i < e->nargs; i++) {
+			Type ht = typeof_expr(prog, fn, e->args[i]);
+			if (!is_int_scalar(ht) && ht.kind != TY_STR && !is_bool(ht)) {
+				if (is_float_type(ht))
+					die(e->args[i]->line, "a float `${…}` interpolation hole is not supported yet (bind a stringified value, or use an integer)");
+				die(e->args[i]->line, "a `${…}` interpolation hole must be an integer, a Str, or a Bool");
+			}
+		}
+		return (Type){TY_STR, NULL, NULL, 0, NULL};
+	}
 	case EX_VAR: {
 		/* A function reference (a bare top-level function or capture-free closure name):
 		 * a function VALUE, valid only as a `(…) Int` argument. Resolve it to its emit
@@ -9005,6 +9057,69 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		snprintf(dst, cap, "%%t%d", t);
 		return;
 	}
+	case EX_INTERP: {
+		/* Build the interpolated string into a fresh `[Uint8]` vector (empty header), append
+		 * each segment — a literal run byte-by-byte, an integer/Str/Bool hole via its runtime
+		 * append helper — then SEAL the vector to a Str (bytes = data@0, len = len@8). */
+		int vh = ex->tmp++;
+		fprintf(out, "\t%%t%d =l call $cf_alloc(w 24)\n", vh);
+		fprintf(out, "\tstorel 0, %%t%d\n", vh);                 /* data = 0 */
+		int h8 = ex->tmp++;
+		fprintf(out, "\t%%t%d =l add %%t%d, 8\n", h8, vh);
+		fprintf(out, "\tstorel 0, %%t%d\n", h8);                 /* len = 0 */
+		int h16 = ex->tmp++;
+		fprintf(out, "\t%%t%d =l add %%t%d, 16\n", h16, vh);
+		fprintf(out, "\tstorel 0, %%t%d\n", h16);                /* cap = 0 */
+		int ai = 0;
+		for (int si = 0; si < e->nsegs; si++) {
+			StrSeg *sg = &e->segs[si];
+			if (sg->kind == SEG_LIT) {
+				for (int j = 0; j < sg->litlen; j++) {
+					int slot = ex->tmp++;
+					fprintf(out, "\t%%t%d =l call $cf_dyn_push(l %%t%d, w 1)\n", slot, vh);
+					fprintf(out, "\tstoreb %d, %%t%d\n", (unsigned char)sg->lit[j], slot);
+				}
+			} else {
+				Expr *hole = e->args[ai++];
+				char hv[96];
+				emit_expr(out, hole, ex, hv, sizeof hv);
+				Type ht = hole->rtype;
+				if (ht.kind == TY_STR) {
+					fprintf(out, "\tcall $cf_str_append(l %%t%d, l %s)\n", vh, hv);
+				} else if (is_bool(ht)) {
+					fprintf(out, "\tcall $cf_bool_append(l %%t%d, w %s)\n", vh, hv);
+				} else { /* the integer family: extend to `l`, then signed/unsigned itoa */
+					int sgn = int_scalar_signed(ht);
+					char ext[96];
+					if (qtype_of(ht) == 'w') {
+						int e2 = ex->tmp++;
+						fprintf(out, "\t%%t%d =l %s %s\n", e2, sgn ? "extsw" : "extuw", hv);
+						snprintf(ext, sizeof ext, "%%t%d", e2);
+					} else {
+						snprintf(ext, sizeof ext, "%s", hv);
+					}
+					fprintf(out, "\tcall $cf_%s_append(l %%t%d, l %s)\n", sgn ? "int" : "uint", vh, ext);
+				}
+			}
+		}
+		/* seal: a fresh 16-byte `{bytes, len}` Str header borrowing the vector's backing */
+		int data = ex->tmp++;
+		fprintf(out, "\t%%t%d =l loadl %%t%d\n", data, vh);      /* data @0 */
+		int lp = ex->tmp++;
+		fprintf(out, "\t%%t%d =l add %%t%d, 8\n", lp, vh);
+		int ll = ex->tmp++;
+		fprintf(out, "\t%%t%d =l loadl %%t%d\n", ll, lp);        /* len @8 */
+		int lw = ex->tmp++;
+		fprintf(out, "\t%%t%d =w copy %%t%d\n", lw, ll);
+		int hdr = ex->tmp++;
+		fprintf(out, "\t%%t%d =l call $cf_alloc(w 16)\n", hdr);
+		fprintf(out, "\tstorel %%t%d, %%t%d\n", data, hdr);      /* bytes @0 */
+		int hp = ex->tmp++;
+		fprintf(out, "\t%%t%d =l add %%t%d, 8\n", hp, hdr);
+		fprintf(out, "\tstorew %%t%d, %%t%d\n", lw, hp);         /* len @8 */
+		snprintf(dst, cap, "%%t%d", hdr);
+		return;
+	}
 	case EX_VAR: {
 		/* A function reference: materialize the callee's code address ($<symbol>) into an
 		 * `l` temp (typecheck rewrote `name` to the emit symbol). A function-VALUE parameter
@@ -10529,6 +10644,121 @@ static void emit_runtime_qbe(FILE *out) {
 	fprintf(out, "\tstorel %%len3, %%hlen\n");            /* len++ */
 	fprintf(out, "\tret %%slot\n");
 	fprintf(out, "}\n");
+	/* String-interpolation append helpers (all append into a `[Uint8]` vector via $cf_dyn_push,
+	 * stride 1). itoa is a two-pass extract-then-reverse over a 24-byte stack digit buffer. These
+	 * back EX_INTERP's runtime string building. (fputs: no printf `%` escaping needed.) */
+	fputs(
+	    "function $cf_uint_append(l %vhdr, l %val) {\n"
+	    "@start\n"
+	    "\t%buf =l alloc4 24\n"
+	    "\t%ip =l alloc8 8\n"
+	    "\t%vp =l alloc8 8\n"
+	    "\tstorel %val, %vp\n"
+	    "\tstorel 0, %ip\n"
+	    "\t%z =w ceql %val, 0\n"
+	    "\tjnz %z, @zero, @extract\n"
+	    "@zero\n"
+	    "\t%sz =l call $cf_dyn_push(l %vhdr, w 1)\n"
+	    "\tstoreb 48, %sz\n"
+	    "\tret\n"
+	    "@extract\n"
+	    "\t%v =l loadl %vp\n"
+	    "\t%done =w ceql %v, 0\n"
+	    "\tjnz %done, @emit, @digit\n"
+	    "@digit\n"
+	    "\t%q =l udiv %v, 10\n"
+	    "\t%r =l urem %v, 10\n"
+	    "\t%rc =w copy %r\n"
+	    "\t%ch =w add %rc, 48\n"
+	    "\t%i =l loadl %ip\n"
+	    "\t%da =l add %buf, %i\n"
+	    "\tstoreb %ch, %da\n"
+	    "\t%i1 =l add %i, 1\n"
+	    "\tstorel %i1, %ip\n"
+	    "\tstorel %q, %vp\n"
+	    "\tjmp @extract\n"
+	    "@emit\n"
+	    "\t%cnt =l loadl %ip\n"
+	    "\tstorel %cnt, %vp\n"
+	    "@eloop\n"
+	    "\t%k =l loadl %vp\n"
+	    "\t%kz =w ceql %k, 0\n"
+	    "\tjnz %kz, @edone, @estep\n"
+	    "@estep\n"
+	    "\t%k1 =l sub %k, 1\n"
+	    "\t%dap =l add %buf, %k1\n"
+	    "\t%dch =w loadub %dap\n"
+	    "\t%es =l call $cf_dyn_push(l %vhdr, w 1)\n"
+	    "\tstoreb %dch, %es\n"
+	    "\tstorel %k1, %vp\n"
+	    "\tjmp @eloop\n"
+	    "@edone\n"
+	    "\tret\n"
+	    "}\n"
+	    "function $cf_int_append(l %vhdr, l %val) {\n"
+	    "@start\n"
+	    "\t%neg =w csltl %val, 0\n"
+	    "\tjnz %neg, @isneg, @pos\n"
+	    "@isneg\n"
+	    "\t%s =l call $cf_dyn_push(l %vhdr, w 1)\n"
+	    "\tstoreb 45, %s\n"
+	    "\t%nv =l sub 0, %val\n"
+	    "\tcall $cf_uint_append(l %vhdr, l %nv)\n"
+	    "\tret\n"
+	    "@pos\n"
+	    "\tcall $cf_uint_append(l %vhdr, l %val)\n"
+	    "\tret\n"
+	    "}\n"
+	    "function $cf_str_append(l %vhdr, l %str) {\n"
+	    "@start\n"
+	    "\t%bytes =l loadl %str\n"
+	    "\t%la =l add %str, 8\n"
+	    "\t%lenw =w loadw %la\n"
+	    "\t%len =l extuw %lenw\n"
+	    "\t%ip =l alloc8 8\n"
+	    "\tstorel 0, %ip\n"
+	    "@sloop\n"
+	    "\t%i =l loadl %ip\n"
+	    "\t%d =w cugel %i, %len\n"
+	    "\tjnz %d, @sdone, @sstep\n"
+	    "@sstep\n"
+	    "\t%ba =l add %bytes, %i\n"
+	    "\t%b =w loadub %ba\n"
+	    "\t%sl =l call $cf_dyn_push(l %vhdr, w 1)\n"
+	    "\tstoreb %b, %sl\n"
+	    "\t%i1 =l add %i, 1\n"
+	    "\tstorel %i1, %ip\n"
+	    "\tjmp @sloop\n"
+	    "@sdone\n"
+	    "\tret\n"
+	    "}\n"
+	    "function $cf_bool_append(l %vhdr, w %tag) {\n"
+	    "@start\n"
+	    "\tjnz %tag, @true, @false\n"
+	    "@true\n"
+	    "\t%t0 =l call $cf_dyn_push(l %vhdr, w 1)\n"
+	    "\tstoreb 116, %t0\n"
+	    "\t%t1 =l call $cf_dyn_push(l %vhdr, w 1)\n"
+	    "\tstoreb 114, %t1\n"
+	    "\t%t2 =l call $cf_dyn_push(l %vhdr, w 1)\n"
+	    "\tstoreb 117, %t2\n"
+	    "\t%t3 =l call $cf_dyn_push(l %vhdr, w 1)\n"
+	    "\tstoreb 101, %t3\n"
+	    "\tret\n"
+	    "@false\n"
+	    "\t%f0 =l call $cf_dyn_push(l %vhdr, w 1)\n"
+	    "\tstoreb 102, %f0\n"
+	    "\t%f1 =l call $cf_dyn_push(l %vhdr, w 1)\n"
+	    "\tstoreb 97, %f1\n"
+	    "\t%f2 =l call $cf_dyn_push(l %vhdr, w 1)\n"
+	    "\tstoreb 108, %f2\n"
+	    "\t%f3 =l call $cf_dyn_push(l %vhdr, w 1)\n"
+	    "\tstoreb 115, %f3\n"
+	    "\t%f4 =l call $cf_dyn_push(l %vhdr, w 1)\n"
+	    "\tstoreb 101, %f4\n"
+	    "\tret\n"
+	    "}\n",
+	    out);
 }
 
 /* The freestanding asm runtime, emitted beside the QBE-lowered code (asm bypasses
