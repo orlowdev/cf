@@ -588,6 +588,27 @@ typedef enum {
 	            * array API may differ); indexing is unchecked (cf0 bounds-checks); the length
 	            * must be annotated (cf0 infers `[N T]` from the literal, §7.2); and an array
 	            * cannot yet be a parameter, a return, or a record/union field. */
+	TY_DYN,    /* a `[T]` DYNAMIC ARRAY — a growable vector. An `l` pointer to a 24-byte arena
+	            * HEADER `{ l data @0, l len @8, l cap @16 }`: `data` points to a separate arena
+	            * block of `cap` elements PACKED by real element size (elem_size — UNLIKE TY_ARRAY's
+	            * uniform 8-byte slots; so a `[Uint8]` is a genuine contiguous byte vector, which is
+	            * what `Str(xs)` seals, matching type_system §6.2), `len` is the live element count,
+	            * `cap` the allocated capacity. The header pointer is STABLE across growth (only
+	            * `data`/`cap` change on realloc), so a `const [T]` binding keeps working after an
+	            * append. Element type rides on `elem` (like TY_ARRAY; NULL ⇒ Iarch). Surface:
+	            * `let [T] xs = []` / `[a,b,c]` (create), `xs[i]` (index r/w), `xs.len` (runtime
+	            * length), `for x in xs`, `xs = [...xs, e]` (spec's grow-in-place append, ebnf
+	            * § Aggregate Literals — amortized doubling via $cf_dyn_push), and `Str(xs)` for a
+	            * `[Uint8]` seal. The `{data,len,cap}` byte LAYOUT is PROVISIONAL throwaway — re-pinned
+	            * at the M6/M9 representation gate, like the record/union/Str layouts. ⚠ THROWAWAY —
+	            * cf0 must NOT inherit (type_system §6.2): an AGGREGATE/Str/pointer element is BOXED as
+	            * an 8-byte arena pointer (elem_size→8), whereas cf0 inlines an aggregate element by its
+	            * real value; `.len` returns Iarch and the index is Iarch/Int (§6.2 makes BOTH `Uarch`;
+	            * cfcc has no Uarch arithmetic — a genesis narrowing); no bounds check (§6.2
+	            * bounds-checks); `.len` is a PROVISIONAL cfcc spelling; growth is a bounded-arena leak
+	            * (the old backing is never freed — cf0's arc reclaims it, geometry_lowering
+	            * `on_realloc`); and a general `[...ys, e]` copy-append (source ≠ the assigned name) is
+	            * rejected (only in-place `xs = [...xs, e]`). */
 	TY_UNION,  /* a `union` type. M1.1 handles ALL-nullary (tag-only) unions only, which
 	            * lower to a plain integer tag (type_system §8.4) — so a union value is a
 	            * `w`, stored/read like an Int; the union identity (for match) is `uni`.
@@ -1005,9 +1026,11 @@ struct Stmt {
 	                     * (arena-allocated, no initializer); 0 otherwise */
 	char bufsize_name[64]; /* ST_LOCAL: a `[n Uint8]` buffer whose length is a comptime
 	                        * value parameter (`n`); resolved to `bufsize` at instantiation */
-	char arr_elem[64]; /* ST_LOCAL: a `[N T]` array's element type NAME (e.g. "Iarch", "Int8",
+	char arr_elem[64]; /* ST_LOCAL: a `[N T]`/`[T]` array's element type NAME (e.g. "Iarch", "Int8",
 	                    * "Point", "*Node"); "" ⇒ Iarch. Resolved to the local's Type.elem by
 	                    * the ST_LOCAL typecheck (via resolve_member_type — handles forward refs). */
+	int is_dyn;         /* ST_LOCAL: 1 ⇒ a `[T]` DYNAMIC-array local (TY_DYN, growable); the
+	                     * initializer is an array literal (possibly empty `[]`). */
 	Expr *expr;         /* ST_LOCAL/ST_ASSIGN/ST_FIELD_ASSIGN: value (NULL for a buffer
 	                     * local); ST_INDEX_ASSIGN: the EX_INDEX target; ST_RETURN: returned;
 	                     * ST_BREAK/ST_CONTINUE: guard or NULL; ST_DEFER: the scheduled call
@@ -1220,8 +1243,45 @@ static Type mk_array(int alen, Type elem) {
 }
 
 /* The element type of a TY_ARRAY — `*t.elem`, or Iarch when elem is NULL (the back-compat default
- * for legacy Iarch arrays and the unknown-length `*[Iarch]` pointer paths). */
+ * for legacy Iarch arrays and the unknown-length `*[Iarch]` pointer paths). Also serves TY_DYN,
+ * whose element type rides the same `elem` slot. */
 static Type array_elem(Type t) { return t.elem ? *t.elem : mk_iarch(); }
+
+/* A `[T]` dynamic-array Type — a growable vector of `elem` (see TY_DYN). The header/length ride at
+ * runtime, so no comptime length is stored. */
+static Type mk_dyn(Type elem) {
+	Type t = {TY_DYN, NULL, NULL, 0, NULL};
+	t.elem = intern_type(elem);
+	return t;
+}
+
+/* The PACKED byte size of a `[T]` dynamic-array element (its stride in the backing block). Unlike
+ * TY_ARRAY's uniform 8-byte slots, a `[T]` packs by real element size (type_system §6.2) — so a
+ * `[Uint8]` is a genuine contiguous byte vector (the string-builder backing that `Str(xs)` seals
+ * without a copy). A sub-word fixed int is its natural width; everything else (Iarch, Uarch, Str,
+ * a pointer, a record/aggregate — all stored as an 8-byte word/pointer) is 8. */
+static int elem_size(Type elem) {
+	if (is_fixed_type(elem))
+		return elem.bits / 8; /* Int8/Uint8→1, Int16→2, Int32→4, Int64/Iarch→8 */
+	return 8;
+}
+
+/* Byte-EXACT store/load instructions for a PACKED `[T]` element (its stride is elem_size, so a
+ * `storew` of a 1-byte element would clobber the next packed element — these write/read exactly the
+ * element's width). The store writes the low `esz` bytes of the value register; the load
+ * zero/sign-extends a sub-word element into its natural register (`w` for ≤32-bit, `l` for 64-bit),
+ * matching qtype_of(elem). */
+static const char *packed_store_op(int esz) {
+	return esz == 1 ? "storeb" : esz == 2 ? "storeh" : esz == 4 ? "storew" : "storel";
+}
+static const char *packed_load_op(Type elem) {
+	int esz = elem_size(elem);
+	int sgn = is_fixed_type(elem) && elem.is_signed;
+	if (esz == 1) return sgn ? "loadsb" : "loadub";
+	if (esz == 2) return sgn ? "loadsh" : "loaduh";
+	if (esz == 4) return "loadw";  /* 4 bytes into a `w` (Int32/Uint32) */
+	return "loadl";                /* 8 bytes into an `l` (Iarch/Uarch/Str/pointer/aggregate) */
+}
 
 /* cf's `Bool` is a std union of two singleton constructors `{False, True}` (type_system §2/§8.6),
  * so cfcc models it as a BUILT-IN tag-only union: `Bool.False` = tag 0, `Bool.True` = tag 1,
@@ -1486,6 +1546,7 @@ static int types_equal(Type a, Type b) {
 	case TY_RECORD: return a.rec == b.rec;
 	case TY_UNION:  return a.uni == b.uni;
 	case TY_ARRAY:  return a.alen == b.alen && types_equal(array_elem(a), array_elem(b));
+	case TY_DYN:    return types_equal(array_elem(a), array_elem(b)); /* `[T]` — element-wise (no length) */
 	case TY_FIXED:  return a.bits == b.bits && a.is_signed == b.is_signed && a.is_arch == b.is_arch;
 	case TY_TUPLE:
 		if (a.tup == b.tup)
@@ -1525,6 +1586,7 @@ static char type_sig_char(Type t) {
 	case TY_UNION:  return 'U';
 	case TY_TUPLE:  return 'T';
 	case TY_STR:    return 'S';
+	case TY_DYN:    return 'D';
 	default:        return '?';
 	}
 }
@@ -2621,16 +2683,32 @@ static Expr *parse_primary(Parser *p, Func *fn) {
 		 * `[...x, …]` (the aggregate-spread tier), and non-Int elements. */
 		int line = t->line;
 		advance(p); /* [ */
-		if (peek(p)->kind == TK_ELLIPSIS)
-			die(peek(p)->line, "aggregate spread `[...x]` is not supported yet");
-		if (peek(p)->kind == TK_RBRACKET)
-			die(peek(p)->line, "an empty array literal `[]` needs a type annotation (not supported yet)");
 		Expr *e = new_expr(EX_ARRAY);
 		e->line = line;
+		if (peek(p)->kind == TK_RBRACKET) {
+			/* an empty literal `[]` — only valid as a `[T]` dynamic-array initializer (the
+			 * generic EX_ARRAY typecheck rejects nargs==0 elsewhere; the `[T]` ST_LOCAL path
+			 * handles it before that). */
+			advance(p);
+			return e;
+		}
+		if (peek(p)->kind == TK_ELLIPSIS) {
+			/* `[...src, e0, …]` — a spread-headed literal. In cfcc this is ONLY the dynamic-array
+			 * grow-in-place primitive `xs = [...xs, e]` (ebnf § Aggregate Literals): the spread
+			 * source rides `e->spread`, the trailing elements ride `args[]`. A general fresh
+			 * copy-append (source ≠ the assigned name) is rejected in the ST_ASSIGN typecheck. */
+			advance(p); /* ... */
+			e->spread = parse_expr(p, fn);
+			if (peek(p)->kind == TK_RBRACKET) {
+				advance(p); /* `[...src]` — a bare copy; no new elements */
+				return e;
+			}
+			expect(p, TK_COMMA, "expected `,` after the `...src` spread in an array literal");
+		}
 		int cap = 0;
 		for (;;) {
 			if (peek(p)->kind == TK_ELLIPSIS)
-				die(peek(p)->line, "aggregate spread `[...x]` is not supported yet");
+				die(peek(p)->line, "a `...src` spread may appear only at the head of an array literal (`[...xs, e]`)");
 			if (e->nargs == cap) {
 				cap = cap ? cap * 2 : 4;
 				e->args = realloc(e->args, cap * sizeof *e->args);
@@ -2850,10 +2928,17 @@ static Expr *parse_primary(Parser *p, Func *fn) {
 			advance(p); /* ( */
 			Expr *e = new_expr(EX_STRNEW);
 			e->line = t->line;
-			e->lhs = parse_expr(p, fn);                                  /* the bytes buffer/pointer */
-			expect(p, TK_COMMA, "`Str(buf, n)` takes a byte buffer and a byte length");
-			e->rhs = parse_expr(p, fn);                                  /* the byte length */
-			expect(p, TK_RPAREN, "expected `)` to close `Str(buf, n)`");
+			e->lhs = parse_expr(p, fn);                                  /* the bytes buffer/pointer, or a `[Uint8]` vector */
+			if (peek(p)->kind == TK_COMMA) {
+				advance(p); /* , */
+				e->rhs = parse_expr(p, fn);                             /* the byte length (2-arg `Str(buf, n)`) */
+			} else {
+				/* 1-arg `Str(xs)` — SEAL a `[Uint8]` dynamic vector into a Str (bytes = its data
+				 * pointer, len = its runtime length). rhs stays NULL to mark the seal form; the
+				 * string builder's finish. Validated + lowered in typecheck/emit. */
+				e->rhs = NULL;
+			}
+			expect(p, TK_RPAREN, "expected `)` to close `Str(...)`");
 			return e;
 		}
 		/* A record type name applied to a `{ … }` payload is record CONSTRUCTION —
@@ -3895,6 +3980,7 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 		/* Optional type annotation: `Int` (a word local) or a record type name (a
 		 * `data`-typed local). A pointer annotation has no M0 local use. */
 		int is_record = 0, is_str = 0, is_buf = 0, bufsize = 0, is_arr = 0, arrlen = 0, is_f64 = 0, is_f32 = 0, is_uarch = 0;
+		int is_dyn = 0; /* a `[T]` dynamic-array local (growable vector, TY_DYN) */
 		int is_ptr_local = 0;
 		int is_fixed = 0, fx_bits = 0, fx_signed = 0, fx_arch = 0; /* a fixed-width integer local (IntN/UintN/Iarch) */
 		char bufsize_name[64] = {0}; /* a `[n Uint8]` buffer sized by a comptime value param */
@@ -3923,6 +4009,16 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 			 * The buffer is throwaway (no indexing/bounds); the array supports index/`.len`. */
 			advance(p); /* [ */
 			Token *nt = peek(p);
+			/* `[T]` (a type name directly after `[`, no length) is a DYNAMIC array — a growable
+			 * vector (TY_DYN). `[N T]`/`[N Uint8]` (a length first) stays the fixed array/buffer.
+			 * The disambiguation: a leading type ident ⇒ dynamic; a leading int / value-param name
+			 * ⇒ fixed. (`[Uint8]` is a dynamic byte vector — the string-builder backing.) */
+			if (is_type_ident(nt) && !is_numeric_union_name(tok_str(nt))) {
+				parse_member_type(p, arrelem, sizeof arrelem); /* the element type name */
+				expect(p, TK_RBRACKET, "expected `]` to close the `[T]` dynamic-array type");
+				is_dyn = 1;
+				goto after_bracket;
+			}
 			int have_lit = 0;
 			long litN = 0;
 			if (nt->kind == TK_INT) {
@@ -3968,6 +4064,7 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 				is_arr = 1;
 			}
 			expect(p, TK_RBRACKET, "expected `]` to close the `[N …]` type");
+		after_bracket: ; /* a `[T]` dynamic array skips the length parsing above */
 		} else if (is_type_ident(tt)) {
 			if (is_numeric_union_name(tok_str(tt))) {
 				die(tt->line, "a numeric union (`Int`/`Uint`/`Number`) is a generic bound, not a value type — "
@@ -4093,6 +4190,19 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 			Type at = {TY_ARRAY, NULL, NULL, 0, NULL};
 			at.alen = arrlen;
 			func_add_local(fn, s->name, mutable, at, "");
+		} else if (is_dyn) {
+			/* `let [T] xs = []` (empty) or `= [e0, …]` (initial elements) — a growable vector.
+			 * The initializer is an array literal (possibly empty); elements are checked/adopted
+			 * against the element type in the ST_LOCAL typecheck, growth via `xs = [...xs, e]`. */
+			s->expr = parse_expr(p, fn);
+			if (s->expr->kind != EX_ARRAY)
+				die(name->line, "a `[T]` dynamic array binds an array literal (`[]` or `[e0, …]`)");
+			if (s->expr->spread)
+				die(name->line, "a `[T]` initializer is a plain literal — a `[...xs, e]` spread is only for growth `xs = [...xs, e]`");
+			s->is_dyn = 1;
+			snprintf(s->arr_elem, sizeof s->arr_elem, "%s", arrelem); /* "" ⇒ Iarch; resolved in typecheck */
+			Type dt = {TY_DYN, NULL, NULL, 0, NULL};
+			func_add_local(fn, s->name, mutable, dt, "");
 		} else if (is_f64 || is_f32) {
 			/* `const Float64 x = <float expr>` / `const Float32 x = Float32(…)` (or `let` —
 			 * floats reassign like Int). Typecheck verifies the initializer matches the
@@ -4403,11 +4513,13 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 		/* Only a scalar `let` in a slot (an Int word, a float, or a fixed-width IntN/UintN) can
 		 * be reassigned as a unit; a whole record/aggregate cannot — mutate its fields with `.`.
 		 * (Aggregate copy-binding is a later concern — memory_model §6 requires an explicit copy.) */
-		if (ty.kind != TY_INT && !is_float_type(ty) && !is_fixed_type(ty) && ty.kind != TY_UARCH) {
+		if (ty.kind != TY_INT && !is_float_type(ty) && !is_fixed_type(ty) && ty.kind != TY_UARCH && ty.kind != TY_DYN) {
 			if (ty.kind == TY_ARRAY)
 				die(t->line, "cannot reassign a whole array (mutate an element with `xs[i] = …`)");
 			die(t->line, "cannot assign to a whole record (mutate a field with `.`)");
 		}
+		/* A `let [T]` dynamic array accepts ONLY the grow-in-place form `xs = [...xs, e]` (validated
+		 * in the ST_ASSIGN typecheck); it never takes a compound `op=`. */
 		ExprKind cop;
 		if (compound_assign_op(peek(p)->kind, &cop)) {
 			/* `x op= y` desugars to `x = x op y` (x a plain `let` word local). */
@@ -4517,7 +4629,8 @@ static Func *parse_func(Parser *p, Program *prog) {
 	 * the whole hazard.) */
 	if (strcmp(fn->name, "start") == 0 || strcmp(fn->name, "cf_alloc") == 0 ||
 	    strcmp(fn->name, "cf_top") == 0 || strcmp(fn->name, "cf_limit") == 0 ||
-	    strcmp(fn->name, "cf_oom") == 0 || strcmp(fn->name, "cf_mmap_fail") == 0)
+	    strcmp(fn->name, "cf_oom") == 0 || strcmp(fn->name, "cf_mmap_fail") == 0 ||
+	    strcmp(fn->name, "cf_dyn_push") == 0)
 		die(name->line, "that name is reserved for the runtime");
 	if (strcmp(fn->name, "asm") == 0)
 		die(name->line, "`asm` is a reserved keyword");
@@ -7122,7 +7235,15 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 			}
 			die(e->line, "a fixed array has only the `.len` field");
 		}
-		/* A record VALUE or an explicit `*Record` pointer both address the record (cfcc
+		if (base.kind == TY_DYN) {
+			/* A `[T]` dynamic array exposes `.len` — its RUNTIME element count (loaded from the
+			 * header @8). Returns Iarch (the operable default) so it drives arithmetic/comparison.
+			 * ⚠ cf0 must NOT inherit: §6.2 makes `.len` a `Uarch`. */
+			if (strcmp(e->name, "len") == 0)
+				return mk_iarch();
+			die(e->line, "a `[T]` dynamic array has only the `.len` field");
+		}
+	/* A record VALUE or an explicit `*Record` pointer both address the record (cfcc
 		 * represents an aggregate value as its arena pointer), so a field reads the same way. */
 		DataDecl *brec = base.kind == TY_RECORD ? base.rec
 		               : (base.kind == TY_PTR ? base.rec : NULL);
@@ -7169,6 +7290,13 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 			expect_int(prog, fn, e->rhs);
 			return mk_fixed(8, 0, 0); /* Uint8 */
 		}
+		if (base.kind == TY_DYN) {
+			/* `xs[i]` on a dynamic array — the runtime i-th element (through the header's data
+			 * pointer). No bounds check (throwaway). ⚠ cf0 must NOT inherit: §6.2 bounds-checks
+			 * and the index is `Uarch`. */
+			expect_int(prog, fn, e->rhs);
+			return array_elem(base);
+		}
 		if (base.kind != TY_ARRAY)
 			die(e->line, "index `[…]` needs a fixed-array, byte-buffer, string, or tuple value on the left");
 		expect_int(prog, fn, e->rhs);
@@ -7182,6 +7310,8 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		 * freshness). An annotated binding/return instead routes through resolve_array_literal
 		 * (which also ADOPTS bare int literals to a fixed-width element); this inference path is
 		 * the fallback. ⚠ cf0 must NOT inherit: uniform-8 element slots (cf0 packs). */
+		if (e->spread)
+			die(e->line, "a `[...src, e]` spread is only valid as dynamic-array growth `xs = [...xs, e]`");
 		if (e->nargs == 0)
 			die(e->line, "an empty array literal `[]` needs a `[N T]` annotation (not supported yet)");
 		Type elem = typeof_expr(prog, fn, e->args[0]);
@@ -7640,9 +7770,16 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		return (Type){tk, NULL, NULL, 0, NULL};
 	}
 	case EX_STRNEW: {
-		/* `Str(buf, n)` — buf is a byte buffer / `*[Uint8]` pointer, n an operable-int byte
-		 * length; yields a Str (a fresh `{bytes, len}` header). */
 		Type bt = typeof_expr(prog, fn, e->lhs);
+		if (!e->rhs) {
+			/* 1-arg SEAL `Str(xs)` — xs is a `[Uint8]` dynamic vector; the Str borrows its data
+			 * pointer + runtime length (the string-builder finish). Only a byte vector seals. */
+			if (bt.kind != TY_DYN || !is_fixed_type(array_elem(bt)) || array_elem(bt).bits != 8 || array_elem(bt).is_signed)
+				die(e->line, "`Str(xs)` seals a `[Uint8]` dynamic byte vector into a Str");
+			return (Type){TY_STR, NULL, NULL, 0, NULL};
+		}
+		/* 2-arg `Str(buf, n)` — buf is a byte buffer / `*[Uint8]` pointer, n an operable-int byte
+		 * length; yields a Str (a fresh `{bytes, len}` header). */
 		if (bt.kind != TY_BUF && bt.kind != TY_PTR)
 			die(e->line, "`Str(buf, n)` needs a byte buffer or `*[Uint8]` pointer as its first argument");
 		expect_int(prog, fn, e->rhs);
@@ -7995,9 +8132,20 @@ static void resolve_record_literal(Program *prog, Func *fn, Expr *e, DataDecl *d
  * element be a FRESH record (memory_model §6), a `[N *Node]` takes pointer values, etc. The
  * literal's rtype is pinned to `[nargs elem]` so emit stores each element at qtype_of(elem). */
 static void resolve_array_literal(Program *prog, Func *fn, Expr *e, Type elem) {
+	if (e->spread)
+		die(e->line, "a `[...src, e]` spread is only valid as dynamic-array growth `xs = [...xs, e]`");
 	for (int i = 0; i < e->nargs; i++)
 		check_member_value(prog, fn, e->args[i], elem, e->args[i]->line);
 	e->rtype = mk_array(e->nargs, elem);
+}
+
+/* A `[T]` DYNAMIC-array literal `[]` / `[e0, …]` (an initializer, no spread). Like
+ * resolve_array_literal but the result type is TY_DYN (runtime length) and an empty
+ * literal is legal (nargs==0 ⇒ a zero-length vector). */
+static void resolve_dyn_literal(Program *prog, Func *fn, Expr *e, Type elem) {
+	for (int i = 0; i < e->nargs; i++)
+		check_member_value(prog, fn, e->args[i], elem, e->args[i]->line);
+	e->rtype = mk_dyn(elem);
 }
 
 /* The annotated binding path: `const Point p = { … }`. The literal's type is named by
@@ -8131,6 +8279,12 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 					resolve_record_binding(prog, fn, s);      /* { … } literal */
 				else
 					resolve_record_expr_binding(prog, fn, s); /* a record-valued call */
+			} else if (s->is_dyn) {                           /* a `[T]` dynamic-array binding */
+				/* Resolve the annotated element type, pin the local's TY_DYN{elem}, and
+				 * check/adopt each initializer element (empty `[]` is fine). */
+				Type elem = s->arr_elem[0] ? resolve_member_type(prog, s->arr_elem, s->line) : mk_iarch();
+				set_local_scalar(fn, s->name, mk_dyn(elem));
+				resolve_dyn_literal(prog, fn, s->expr, elem);
 			} else if (s->expr->kind == EX_ARRAY) {           /* a `[N T]` fixed-array binding */
 				Type dt;
 				resolve_name(fn, s->name, &dt);
@@ -8303,9 +8457,9 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 			Expr *tgt = s->expr;   /* the EX_INDEX */
 			Expr *base = tgt->lhs;
 			Type bt = typeof_expr(prog, fn, base);
-			if (bt.kind != TY_ARRAY && bt.kind != TY_BUF)
-				die(s->line, "element assignment `xs[i] = …` needs a fixed array or byte "
-				             "buffer on the left (a tuple is immutable)");
+			if (bt.kind != TY_ARRAY && bt.kind != TY_BUF && bt.kind != TY_DYN)
+				die(s->line, "element assignment `xs[i] = …` needs a fixed array, `[T]` dynamic "
+				             "array, or byte buffer on the left (a tuple is immutable)");
 			if (base->kind != EX_VAR)
 				die(s->line, "element assignment targets a named array or buffer local");
 			Type lt;
@@ -8347,6 +8501,24 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 		case ST_ASSIGN: { /* target is a scalar `let` local; the value must match its type */
 			Type tt;
 			resolve_name(fn, s->name, &tt);
+			if (tt.kind == TY_DYN) {
+				/* The ONLY reassignment a `[T]` accepts is grow-in-place `xs = [...xs, e0, …]`
+				 * (ebnf § Aggregate Literals): the RHS is a spread-headed array literal whose
+				 * spread source is THIS same name (an in-place append — amortized doubling). The
+				 * appended elements are checked against the element type. A fresh copy-append
+				 * (source ≠ name) or a plain literal reassign is rejected. */
+				Expr *rhs = s->expr;
+				if (rhs->kind != EX_ARRAY || !rhs->spread)
+					die(s->line, "a `[T]` dynamic array is only reassigned by growth `xs = [...xs, e]`");
+				if (rhs->spread->kind != EX_VAR || strcmp(rhs->spread->name, s->name) != 0)
+					die(s->line, "cfcc grows a `[T]` only in place: the spread source must be the assigned name (`xs = [...xs, e]`)");
+				Type elem = array_elem(tt);
+				for (int i = 0; i < rhs->nargs; i++)
+					check_member_value(prog, fn, rhs->args[i], elem, rhs->args[i]->line);
+				rhs->rtype = tt;
+				rhs->spread->rtype = tt; /* the source is this dynamic array */
+				break;
+			}
 			if (is_float_type(tt)) {
 				if (typeof_expr(prog, fn, s->expr).kind != tt.kind)
 					die(s->line, "a float `let` is reassigned a value of its own float type");
@@ -8483,9 +8655,9 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 			/* The iterable must be a fixed array; the loop var is Int (already declared).
 			 * Then check the body. */
 			Type it = typeof_expr(prog, fn, s->expr);
-			if (it.kind != TY_ARRAY)
-				die(s->line, "`for … in` needs a fixed-array value (M1: a `[N Int]` variable)");
-			if (it.alen < 0)
+			if (it.kind != TY_ARRAY && it.kind != TY_DYN)
+				die(s->line, "`for … in` needs a fixed-array or `[T]` dynamic-array value (M1: a bare variable)");
+			if (it.kind == TY_ARRAY && it.alen < 0)
 				die(s->line, "cannot `for … in` a `*[Iarch]` pointer (unknown length — index it with `p[i]` "
 				             "up to a count passed as a separate argument)");
 			{
@@ -8857,7 +9029,8 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		 * arena pointer (`%r_<name>`), used directly as an operand; a word name (Int or
 		 * tag-only union) is a `loadw` from its slot. */
 		if (e->rtype.kind == TY_RECORD || e->rtype.kind == TY_BUF || e->rtype.kind == TY_ARRAY ||
-		    e->rtype.kind == TY_TUPLE || (e->rtype.kind == TY_UNION && e->rtype.uni->has_payload)) {
+		    e->rtype.kind == TY_DYN || e->rtype.kind == TY_TUPLE ||
+		    (e->rtype.kind == TY_UNION && e->rtype.uni->has_payload)) {
 			snprintf(dst, cap, "%%r_%s", e->name);
 			return;
 		}
@@ -8953,6 +9126,18 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 			snprintf(dst, cap, "%d", e->lhs->rtype.alen);
 			return;
 		}
+		if (e->lhs->rtype.kind == TY_DYN) {
+			/* `xs.len` — the RUNTIME element count at header offset 8 (an `l`; its type is the
+			 * Iarch default). Emit the base (the header pointer) and load. */
+			char s[96];
+			emit_expr(out, e->lhs, ex, s, sizeof s);
+			int a = ex->tmp++;
+			fprintf(out, "\t%%t%d =l add %s, 8\n", a, s);
+			int r = ex->tmp++;
+			fprintf(out, "\t%%t%d =l loadl %%t%d\n", r, a);
+			snprintf(dst, cap, "%%t%d", r);
+			return;
+		}
 		/* Read a record field. Emit the base to its pointer operand (a record VAR is
 		 * `%r_<name>`, a bound aggregate payload is `%pb<id>`, a record-returning call or a
 		 * chained field access is a temp), add the field offset, then load a word (an Int
@@ -8987,9 +9172,11 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		char addr[96];
 		int is_buf = e->lhs->rtype.kind == TY_BUF;
 		int is_str = e->lhs->rtype.kind == TY_STR;
-		if (is_str) {
-			/* a Str: the bytes pointer lives at header offset 0 — deref it, then byte-address
-			 * the chars exactly like a `[N Uint8]` buffer (`s[i]` ≡ `s.bytes[i]`). */
+		int is_dyn = e->lhs->rtype.kind == TY_DYN;
+		if (is_str || is_dyn) {
+			/* a Str or a `[T]` dynamic array: the backing pointer lives at header offset 0 — deref
+			 * it. A Str then byte-addresses (`s[i]` ≡ `s.bytes[i]`); a dynamic array scales *8 and
+			 * loads the element at its width, exactly like a fixed array. */
 			int b = ex->tmp++;
 			fprintf(out, "\t%%t%d =l loadl %s\n", b, base);
 			snprintf(base, sizeof base, "%%t%d", b);
@@ -9012,8 +9199,11 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 			if (is_buf || is_str) { /* byte-addressed: no scaling */
 				snprintf(scaled, sizeof scaled, "%s", idx);
 			} else {
+				/* a fixed array uses uniform 8-byte slots; a `[T]` dynamic array packs by real
+				 * element size (elem_size). */
+				int stride = is_dyn ? elem_size(array_elem(e->lhs->rtype)) : 8;
 				int o = ex->tmp++;
-				fprintf(out, "\t%%t%d =l mul %s, 8\n", o, idx);
+				fprintf(out, "\t%%t%d =l mul %s, %d\n", o, idx, stride);
 				snprintf(scaled, sizeof scaled, "%%t%d", o);
 			}
 			int a = ex->tmp++;
@@ -9023,6 +9213,11 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		int r = ex->tmp++;
 		if (is_buf || is_str) { /* a byte: load unsigned, zero-extended into a `w` Uint8 */
 			fprintf(out, "\t%%t%d =w loadub %s\n", r, addr);
+		} else if (is_dyn) {
+			/* a `[T]` dynamic array packs by element size — load the EXACT element width
+			 * (zero/sign-extended) into its natural register (qtype_of). */
+			char q = qtype_of(e->rtype);
+			fprintf(out, "\t%%t%d =%c %s %s\n", r, q, packed_load_op(array_elem(e->lhs->rtype)), addr);
 		} else {
 			/* An array element loads at its type's register width (qtype_of: a sub-word fixed
 			 * `IntN`/`UintN` and a tag-only word → `w` loadw; a 64-bit int / aggregate pointer →
@@ -9322,8 +9517,24 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		 * bytes @0, len @8), fill it, yield the `l` pointer. The length is truncated to a `w`
 		 * (the header's len field is 32-bit — a genesis limit, disclaimed at the parse site). */
 		char buf[96], len[96];
-		emit_expr(out, e->lhs, ex, buf, sizeof buf);
-		emit_expr(out, e->rhs, ex, len, sizeof len);
+		if (!e->rhs) {
+			/* 1-arg SEAL `Str(xs)` — xs is a `[Uint8]` dynamic vector (header pointer). The Str
+			 * BORROWS its backing bytes: bytes = the vector's data (header @0), len = the vector's
+			 * runtime length (header @8). No copy — the arena keeps both alive. */
+			char hdr[96];
+			emit_expr(out, e->lhs, ex, hdr, sizeof hdr);
+			int b = ex->tmp++;
+			fprintf(out, "\t%%t%d =l loadl %s\n", b, hdr);      /* data @0 */
+			snprintf(buf, sizeof buf, "%%t%d", b);
+			int la = ex->tmp++;
+			fprintf(out, "\t%%t%d =l add %s, 8\n", la, hdr);
+			int lv = ex->tmp++;
+			fprintf(out, "\t%%t%d =l loadl %%t%d\n", lv, la);   /* len @8 */
+			snprintf(len, sizeof len, "%%t%d", lv);
+		} else {
+			emit_expr(out, e->lhs, ex, buf, sizeof buf);
+			emit_expr(out, e->rhs, ex, len, sizeof len);
+		}
 		int wl = ex->tmp++;
 		fprintf(out, "\t%%t%d =w copy %s\n", wl, len); /* truncate the `l` length to a `w` */
 		int h = ex->tmp++;
@@ -9693,6 +9904,44 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 				fprintf(out, "\t%%r_%s =l call $cf_alloc(w %d)\n", s->name, s->bufsize);
 				break;
 			}
+			if (s->is_dyn) {
+				/* A `[T]` dynamic array: `%r_<name>` is the 24-byte header `{ data@0, len@8, cap@16 }`.
+				 * An empty `[]` leaves data=0/len=0/cap=0; initial elements get a fresh cap=len=n
+				 * backing block (uniform 8-byte slots), each stored at its width. Growth (via
+				 * $cf_dyn_push) later reallocs the backing, leaving this header pointer valid. */
+				Expr *a = s->expr;
+				int n = a->nargs;
+				Type ldt;
+				resolve_name((Func *)ex->fn, s->name, &ldt); /* the local's TY_DYN type */
+				int esz = elem_size(array_elem(ldt));        /* packed element stride */
+				fprintf(out, "\t%%r_%s =l call $cf_alloc(w 24)\n", s->name);
+				if (n == 0) {
+					fprintf(out, "\tstorel 0, %%r_%s\n", s->name); /* data = null */
+				} else {
+					int d = ex->tmp++;
+					const char *pstore = packed_store_op(esz);
+					fprintf(out, "\t%%t%d =l call $cf_alloc(w %d)\n", d, n * esz); /* the backing block */
+					for (int i = 0; i < n; i++) {
+						char ev[96];
+						emit_expr(out, a->args[i], ex, ev, sizeof ev);
+						if (i == 0) {
+							fprintf(out, "\t%s %s, %%t%d\n", pstore, ev, d);
+						} else {
+							int off = ex->tmp++;
+							fprintf(out, "\t%%t%d =l add %%t%d, %d\n", off, d, i * esz);
+							fprintf(out, "\t%s %s, %%t%d\n", pstore, ev, off);
+						}
+					}
+					fprintf(out, "\tstorel %%t%d, %%r_%s\n", d, s->name); /* data = block */
+				}
+				int hl = ex->tmp++;
+				fprintf(out, "\t%%t%d =l add %%r_%s, 8\n", hl, s->name);
+				fprintf(out, "\tstorel %d, %%t%d\n", n, hl); /* len = n */
+				int hc = ex->tmp++;
+				fprintf(out, "\t%%t%d =l add %%r_%s, 16\n", hc, s->name);
+				fprintf(out, "\tstorel %d, %%t%d\n", n, hc); /* cap = n */
+				break;
+			}
 			if (s->expr->kind == EX_ARRAY) {
 				/* A fixed-array local lives in the arena: bump-allocate N*8 bytes
 				 * (`%r_<name>` = the base pointer) and store each element word at
@@ -9764,12 +10013,29 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 			}
 			break;
 		case ST_ASSIGN: {
+			Type tt;
+			resolve_name((Func *)ex->fn, s->name, &tt);
+			if (tt.kind == TY_DYN) {
+				/* Grow-in-place `xs = [...xs, e0, …]`: append each trailing element via $cf_dyn_push
+				 * (which reallocs the backing with amortized doubling and returns the new slot
+				 * address), then store the element there at its width. `%r_<name>` is the header
+				 * pointer, stable across the reallocs. */
+				Expr *rhs = s->expr; /* EX_ARRAY with a spread head (validated in typecheck) */
+				int esz = elem_size(array_elem(tt));
+				const char *pstore = packed_store_op(esz);
+				for (int i = 0; i < rhs->nargs; i++) {
+					char ev[96];
+					emit_expr(out, rhs->args[i], ex, ev, sizeof ev);
+					int slot = ex->tmp++;
+					fprintf(out, "\t%%t%d =l call $cf_dyn_push(l %%r_%s, w %d)\n", slot, s->name, esz);
+					fprintf(out, "\t%s %s, %%t%d\n", pstore, ev, slot);
+				}
+				break;
+			}
 			emit_expr(out, s->expr, ex, v, sizeof v);
 			/* Assigning a captured word writes through its `%u_<name>` pointer (mutating the
 			 * enclosing scope's slot); a plain word/float local writes its own `%s_<name>`
 			 * slot with the store matching its type (`stored` for a Float64, else `storew`). */
-			Type tt;
-			resolve_name((Func *)ex->fn, s->name, &tt);
 			char st = qtype_of(tt); /* the local's store width (storew/storel/stores/stored) — from the
 			                         * declared type uniformly, so any assignable scalar stores correctly */
 			if (is_capture_param(ex->fn, s->name))
@@ -9802,14 +10068,22 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 			int buf = tgt->lhs->rtype.kind == TY_BUF;
 			char abase[96];
 			emit_expr(out, tgt->lhs, ex, abase, sizeof abase);
+			if (tgt->lhs->rtype.kind == TY_DYN) {
+				/* a `[T]` dynamic array: the backing pointer is at header offset 0 — deref it,
+				 * then scale/store exactly like a fixed array. */
+				int d = ex->tmp++;
+				fprintf(out, "\t%%t%d =l loadl %s\n", d, abase);
+				snprintf(abase, sizeof abase, "%%t%d", d);
+			}
 			char aidx[96];
 			emit_expr(out, tgt->rhs, ex, aidx, sizeof aidx);
 			char scaled[96];
 			if (buf) {
 				snprintf(scaled, sizeof scaled, "%s", aidx); /* 1-byte elements: no scaling */
 			} else {
+				int wstride = tgt->lhs->rtype.kind == TY_DYN ? elem_size(array_elem(tgt->lhs->rtype)) : 8;
 				int o = ex->tmp++;
-				fprintf(out, "\t%%t%d =l mul %s, 8\n", o, aidx);
+				fprintf(out, "\t%%t%d =l mul %s, %d\n", o, aidx, wstride);
 				snprintf(scaled, sizeof scaled, "%%t%d", o);
 			}
 			int a = ex->tmp++;
@@ -9819,6 +10093,8 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 			 * sub-word fixed → storew, a 64-bit int / aggregate pointer → storel). */
 			if (buf)
 				fprintf(out, "\tstoreb %s, %%t%d\n", v, a);
+			else if (tgt->lhs->rtype.kind == TY_DYN) /* packed element: store its exact width */
+				fprintf(out, "\t%s %s, %%t%d\n", packed_store_op(elem_size(tgt->rtype)), v, a);
 			else
 				fprintf(out, "\tstore%c %s, %%t%d\n", qtype_of(tgt->rtype), v, a);
 			break;
@@ -9871,7 +10147,18 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 			 * reuse the ordinary @ltop/@lend targets. The length N is the array's comptime
 			 * `alen`; the base is the array pointer (`%r_xs`). No bounds check. */
 			int id = ex->lbl++;
-			int N = s->expr->rtype.alen;
+			int is_dyn = s->expr->rtype.kind == TY_DYN;
+				int N = is_dyn ? 0 : s->expr->rtype.alen;
+				int lenT = -1;
+				if (is_dyn) {
+					/* snapshot the runtime length from the header @8 once, before the loop */
+					char hb[96];
+					emit_expr(out, s->expr, ex, hb, sizeof hb);
+					int la = ex->tmp++;
+					fprintf(out, "\t%%t%d =l add %s, 8\n", la, hb);
+					lenT = ex->tmp++;
+					fprintf(out, "\t%%t%d =l loadl %%t%d\n", lenT, la);
+				}
 			fprintf(out, "\tstorew -1, %%s_%s\n", s->field);       /* counter = -1 */
 			ex->loop_slots[ex->loop_depth] = -1; /* a statement `for` yields no value */
 			ex->loops[ex->loop_depth++] = id;
@@ -9882,15 +10169,27 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 			fprintf(out, "\t%%t%d =w add %%t%d, 1\n", c1, c);      /* ++counter */
 			fprintf(out, "\tstorew %%t%d, %%s_%s\n", c1, s->field);
 			int done = ex->tmp++;
-			fprintf(out, "\t%%t%d =w csgew %%t%d, %d\n", done, c1, N); /* counter >= N ? */
+			if (is_dyn) {
+					int c1l = ex->tmp++;
+					fprintf(out, "\t%%t%d =l extsw %%t%d\n", c1l, c1);              /* counter as `l` */
+					fprintf(out, "\t%%t%d =w csgel %%t%d, %%t%d\n", done, c1l, lenT); /* counter >= len ? */
+				} else {
+					fprintf(out, "\t%%t%d =w csgew %%t%d, %d\n", done, c1, N);      /* counter >= N ? */
+				}
 			fprintf(out, "\tjnz %%t%d, @lend%d, @lbody%d\n", done, id, id);
 			fprintf(out, "@lbody%d\n", id);
 			char base[96];
-			emit_expr(out, s->expr, ex, base, sizeof base);        /* %r_xs */
+			emit_expr(out, s->expr, ex, base, sizeof base);        /* %r_xs (fixed) / header (dyn) */
+				if (is_dyn) {
+					int d = ex->tmp++;
+					fprintf(out, "\t%%t%d =l loadl %s\n", d, base); /* deref header @0 → data pointer */
+					snprintf(base, sizeof base, "%%t%d", d);
+				}
 			int ext = ex->tmp++;
 			fprintf(out, "\t%%t%d =l extsw %%t%d\n", ext, c1);
 			int off = ex->tmp++;
-			fprintf(out, "\t%%t%d =l mul %%t%d, 8\n", off, ext);
+			int fstride = is_dyn ? elem_size(array_elem(s->expr->rtype)) : 8;
+			fprintf(out, "\t%%t%d =l mul %%t%d, %d\n", off, ext, fstride);
 			int addr = ex->tmp++;
 			fprintf(out, "\t%%t%d =l add %s, %%t%d\n", addr, base, off);
 			int elem = ex->tmp++;
@@ -9898,7 +10197,10 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 			 * width (qtype_of: a sub-word fixed → w loadw/storew; Iarch/Uarch/Str → l loadl/storel).
 			 * The typecheck restricted `for` to scalar elements, so this is always a `%s_` slot. */
 			char q = qtype_of(array_elem(s->expr->rtype));
-			fprintf(out, "\t%%t%d =%c load%c %%t%d\n", elem, q, q, addr);
+			if (is_dyn) /* packed element: load its exact width (extended) into q's register */
+				fprintf(out, "\t%%t%d =%c %s %%t%d\n", elem, q, packed_load_op(array_elem(s->expr->rtype)), addr);
+			else
+				fprintf(out, "\t%%t%d =%c load%c %%t%d\n", elem, q, q, addr);
 			fprintf(out, "\tstore%c %%t%d, %%s_%s\n", q, elem, s->name); /* bind the loop var */
 			emit_stmts(out, s->body, ex);
 			ex->loop_depth--;
@@ -10172,6 +10474,60 @@ static void emit_runtime_qbe(FILE *out) {
 	fprintf(out, "@ok\n");
 	fprintf(out, "\tstorel %%nt, $cf_top\n");
 	fprintf(out, "\tret %%p\n");
+	fprintf(out, "}\n");
+	/* `[T]` dynamic-array grow-in-place append (the `xs = [...xs, e]` primitive). Given the
+	 * 24-byte header `{ l data@0, l len@8, l cap@16 }`, ensure room for one more element —
+	 * growing the backing (amortized doubling: cap 0 → 4, else ×2) with a fresh cf_alloc + a
+	 * word-copy of the live elements — then RETURN the address of the new (len-th) 8-byte slot
+	 * and bump len. The caller stores the element there at its own width. The header pointer is
+	 * unchanged, so every binding of the vector stays valid. ⚠ THROWAWAY: the old backing is
+	 * leaked into the bounded arena (cf0's arc reclaims it via `on_realloc`). */
+	fprintf(out, "function l $cf_dyn_push(l %%hdr, w %%esize) {\n");
+	fprintf(out, "@start\n");
+	fprintf(out, "\t%%ip =l alloc8 8\n");                 /* a byte-copy counter slot */
+	fprintf(out, "\t%%es =l extuw %%esize\n");            /* the element stride (packed byte size) */
+	fprintf(out, "\t%%hlen =l add %%hdr, 8\n");
+	fprintf(out, "\t%%hcap =l add %%hdr, 16\n");
+	fprintf(out, "\t%%len =l loadl %%hlen\n");
+	fprintf(out, "\t%%cap =l loadl %%hcap\n");
+	fprintf(out, "\t%%full =w ceql %%len, %%cap\n");
+	fprintf(out, "\tjnz %%full, @grow, @store\n");
+	fprintf(out, "@grow\n");
+	fprintf(out, "\t%%dbl =l mul %%cap, 2\n");
+	fprintf(out, "\t%%z =w ceql %%cap, 0\n");
+	fprintf(out, "\t%%zl =l extuw %%z\n");
+	fprintf(out, "\t%%z4 =l mul %%zl, 4\n");
+	fprintf(out, "\t%%ncap =l add %%dbl, %%z4\n");        /* cap==0 ? 4 : cap*2 */
+	fprintf(out, "\t%%nbytes =l mul %%ncap, %%es\n");
+	fprintf(out, "\t%%nbw =w copy %%nbytes\n");           /* cf_alloc takes a `w` size (throwaway: huge caps truncate) */
+	fprintf(out, "\t%%ndata =l call $cf_alloc(w %%nbw)\n");
+	fprintf(out, "\t%%odata =l loadl %%hdr\n");
+	fprintf(out, "\t%%obytes =l mul %%len, %%es\n");      /* live bytes to copy */
+	fprintf(out, "\tstorel 0, %%ip\n");
+	fprintf(out, "@copytop\n");
+	fprintf(out, "\t%%i =l loadl %%ip\n");
+	fprintf(out, "\t%%cdone =w cugel %%i, %%obytes\n");   /* byte-granular copy: i >= obytes ? */
+	fprintf(out, "\tjnz %%cdone, @copydone, @copybody\n");
+	fprintf(out, "@copybody\n");
+	fprintf(out, "\t%%src =l add %%odata, %%i\n");
+	fprintf(out, "\t%%dst =l add %%ndata, %%i\n");
+	fprintf(out, "\t%%b =w loadub %%src\n");
+	fprintf(out, "\tstoreb %%b, %%dst\n");
+	fprintf(out, "\t%%i1 =l add %%i, 1\n");
+	fprintf(out, "\tstorel %%i1, %%ip\n");
+	fprintf(out, "\tjmp @copytop\n");
+	fprintf(out, "@copydone\n");
+	fprintf(out, "\tstorel %%ndata, %%hdr\n");            /* data = ndata */
+	fprintf(out, "\tstorel %%ncap, %%hcap\n");            /* cap = ncap */
+	fprintf(out, "\tjmp @store\n");
+	fprintf(out, "@store\n");
+	fprintf(out, "\t%%data =l loadl %%hdr\n");
+	fprintf(out, "\t%%len2 =l loadl %%hlen\n");
+	fprintf(out, "\t%%soff =l mul %%len2, %%es\n");
+	fprintf(out, "\t%%slot =l add %%data, %%soff\n");
+	fprintf(out, "\t%%len3 =l add %%len2, 1\n");
+	fprintf(out, "\tstorel %%len3, %%hlen\n");            /* len++ */
+	fprintf(out, "\tret %%slot\n");
 	fprintf(out, "}\n");
 }
 
