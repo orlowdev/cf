@@ -1901,6 +1901,8 @@ typedef enum {
 	R_LET,   /* a `let` local (reassignable) */
 } Resolution;
 
+static Type capture_scalar_type(const char *name); /* forward: a PK_CAPTURE's captured scalar type */
+
 /* Resolve a name (params first, then locals) and set *ty to its type. A word param
  * is Int; a record param is TY_RECORD (its decl, resolved in typecheck); a pointer
  * param is TY_PTR (argv/envp — not usable as an Int). */
@@ -1931,7 +1933,9 @@ static Resolution resolve_name(Func *fn, const char *name, Type *ty) {
 				ty->uni = fn->params[i].uni;
 				break;
 			case PK_VAR:     ty->kind = TY_INT;    ty->rec = NULL; break; /* template body parse only; type is ignored (re-typed per instantiation) */
-			case PK_CAPTURE: *ty = mk_iarch(); return R_LET; /* a by-ref Iarch: readable AND writable */
+			case PK_CAPTURE: /* a by-ref scalar capture: Iarch (type_name "") or Str/Uarch/IntN/Float */
+				*ty = capture_scalar_type(fn->params[i].type_name);
+				return R_LET; /* readable AND writable (a captured `const` write is caught in note_capture) */
 			case PK_CAPTURE_REC: ty->kind = TY_RECORD; ty->rec = fn->params[i].rec; return R_LET; /* a by-ref record: fields mutable */
 			case PK_FN:      ty->kind = TY_FN; ty->rec = NULL; break; /* a function value (arity on the Param) */
 			case PK_TUPLE:   ty->kind = TY_TUPLE; ty->rec = NULL; ty->tup = fn->params[i].tup; break; /* by pointer, read-only */
@@ -3493,7 +3497,34 @@ static int looks_like_lambda(Parser *p) {
 
 /* One captured variable: its name and (for a record) its nominal type. `type_name` is
  * empty for a word capture (a by-reference `Int`) and the record type name otherwise. */
-typedef struct { char name[64]; char type_name[64]; } Capture;
+/* One variable captured by a closure. `is_rec` distinguishes a RECORD capture (type_name = the
+ * record's decl name, → PK_CAPTURE_REC) from a scalar capture (type_name = a scalar type name
+ * `Str`/`Uarch`/`IntN`/`Float64`, or "" for the Iarch default, → PK_CAPTURE). Both are by-reference
+ * (the closure gets the enclosing slot's address). */
+typedef struct { char name[64]; char type_name[64]; int is_rec; } Capture;
+
+/* The scalar type NAME of a capturable scalar (`Str`/`Uarch`/`Float64`/`Float32`/`IntN`/`UintN`);
+ * "" for Iarch (the PK_CAPTURE default, left unnamed for back-compat) or a non-scalar. */
+static void capture_scalar_name(Type t, char *out, size_t cap) {
+	if (t.kind == TY_STR) snprintf(out, cap, "Str");
+	else if (t.kind == TY_UARCH) snprintf(out, cap, "Uarch");
+	else if (t.kind == TY_F64) snprintf(out, cap, "Float64");
+	else if (t.kind == TY_F32) snprintf(out, cap, "Float32");
+	else if (t.kind == TY_FIXED && !t.is_arch) snprintf(out, cap, "%s%d", t.is_signed ? "Int" : "Uint", t.bits);
+	else out[0] = '\0'; /* Iarch / TY_INT — the default PK_CAPTURE, or not a capturable scalar */
+}
+
+/* Reconstruct a scalar Type from a capture's scalar type NAME (no `prog` needed — these are all
+ * non-nominal leaves). "" ⇒ the Iarch default. */
+static Type capture_scalar_type(const char *name) {
+	if (strcmp(name, "Str") == 0) return (Type){TY_STR, NULL, NULL, 0, NULL};
+	if (strcmp(name, "Uarch") == 0) return (Type){TY_UARCH, NULL, NULL, 0, NULL};
+	if (strcmp(name, "Float64") == 0) return (Type){TY_F64, NULL, NULL, 0, NULL};
+	if (strcmp(name, "Float32") == 0) return (Type){TY_F32, NULL, NULL, 0, NULL};
+	int b, s, a;
+	if (fixed_name_bits_signed(name, &b, &s, &a)) return mk_fixed(b, s, a);
+	return mk_iarch();
+}
 
 /* The nominal type name of an enclosing binding (a record's type, e.g. `Point`), searched
  * up the lexical-parent chain; "" if it is a word or not found. */
@@ -3526,10 +3557,19 @@ static void note_capture(Func *cl, const char *name, int is_write, int line,
 	Resolution r = resolve_name(cl->parent, name, &ty);
 	if (r == R_NONE)
 		die(line, "unknown name in closure body");
-	if (!is_operable_int(ty) && ty.kind != TY_RECORD)
-		die(line, "M0 closures capture only `Int`/`Iarch` and record variables by reference (not strings, pointers, or unions)");
-	/* A word write to a captured `const` is already rejected while parsing the closure body
-	 * (resolve chains to the parent); a record FIELD write is not, so enforce it here. */
+	/* Capturable by reference: an operable integer (Iarch), a record, or a slot-based SCALAR
+	 * (Str / Uarch / a fixed-width IntN/UintN / a float) — all live in an addressable `%s_`/`%r_`
+	 * slot whose address the closure receives. A pointer/buffer/union local has no such value slot
+	 * to borrow, so those stay a later brick.
+	 * ⚠ cf0 must NOT inherit: cf0 captures ANY value (pointer/union/closure included) — memory_model
+	 * §7 governs a captured value's lifetime; cfcc borrows only slot-backed scalars/records. */
+	int cap_scalar = ty.kind == TY_STR || ty.kind == TY_UARCH || is_float_type(ty) || is_fixed_type(ty);
+	if (!is_operable_int(ty) && ty.kind != TY_RECORD && !cap_scalar)
+		die(line, "M0 closures capture `Int`/`Iarch`, a record, a `Str`, a `Uarch`, a fixed-width int, "
+		          "or a float by reference — not pointers, buffers, or unions");
+	/* A write to a captured `const`/param is rejected: a word write already fails while parsing the
+	 * closure body (resolve chains to the parent); a record FIELD write and a Str/Uarch/fixed/float
+	 * reassignment are caught here. */
 	if (is_write && r != R_LET)
 		die(line, "a closure cannot mutate a captured `const` binding or parameter");
 	for (int i = 0; i < *ncaps; i++)
@@ -3539,8 +3579,11 @@ static void note_capture(Func *cl, const char *name, int is_write, int line,
 		die(line, "closure captures too many variables");
 	Capture *c = &caps[(*ncaps)++];
 	snprintf(c->name, sizeof c->name, "%s", name);
-	snprintf(c->type_name, sizeof c->type_name, "%s",
-	         ty.kind == TY_RECORD ? enclosing_type_name(cl->parent, name) : "");
+	c->is_rec = (ty.kind == TY_RECORD);
+	if (c->is_rec)
+		snprintf(c->type_name, sizeof c->type_name, "%s", enclosing_type_name(cl->parent, name));
+	else
+		capture_scalar_name(ty, c->type_name, sizeof c->type_name); /* "" for Iarch */
 }
 
 static void collect_captures_stmt(Func *cl, Stmt *s, Capture *caps, int *ncaps);
@@ -3591,11 +3634,12 @@ static void lift_closure(Parser *p, Func *encl, Func *cl, const char *localname,
 		memset(pm, 0, sizeof *pm);
 		pm->line = line;
 		snprintf(pm->name, sizeof pm->name, "%s", caps[i].name);
-		if (caps[i].type_name[0]) { /* a record capture — resolved to a decl in resolve_signatures */
+		if (caps[i].is_rec) { /* a record capture — resolved to a decl in resolve_signatures */
 			pm->kind = PK_CAPTURE_REC;
 			snprintf(pm->type_name, sizeof pm->type_name, "%s", caps[i].type_name);
-		} else {
+		} else { /* an Iarch (type_name "") or a scalar (Str/Uarch/IntN/Float) capture, by reference */
 			pm->kind = PK_CAPTURE;
+			snprintf(pm->type_name, sizeof pm->type_name, "%s", caps[i].type_name);
 		}
 	}
 	cl->nparams = nexp + ncaps;
@@ -6181,7 +6225,7 @@ static const char *shallow_type_name(Program *prog, Func *fn, Expr *e) {
 				case PK_VAR:     return fn->params[i].type_name;
 				case PK_LONG:    return ""; /* a pointer — no simple type name */
 				case PK_STR:     return "Str";
-				case PK_CAPTURE: return "Iarch"; /* a captured Iarch */
+				case PK_CAPTURE: return fn->params[i].type_name[0] ? fn->params[i].type_name : "Iarch"; /* a captured scalar (Iarch when unnamed) */
 				case PK_CAPTURE_REC: return fn->params[i].type_name; /* a captured record */
 				case PK_FN: return ""; /* a function value — no simple nominal type name */
 				case PK_TUPLE: return ""; /* a structural tuple — no nominal name to infer from */
@@ -7391,10 +7435,12 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 				die(e->line, "internal: call to an unspecialized generic function");
 				break;
 			case PK_CAPTURE:
-				/* A prepended capture argument: the enclosing variable, an operable integer
-				 * (Iarch) captured by reference and read/written through a pointer. */
-				if (!is_operable_int(at))
-					die(e->line, "internal: closure capture is not an operable integer");
+				/* A prepended capture argument: the enclosing scalar variable, captured by
+				 * reference (its slot address). The captured type must match the lifted param's
+				 * declared scalar type (Iarch when unnamed) — the analysis synthesized this arg
+				 * from that very variable, so a mismatch is an internal error. */
+				if (!types_equal(at, capture_scalar_type(pm->type_name)))
+					die(e->line, "internal: closure capture type mismatch");
 				break;
 			case PK_CAPTURE_REC:
 				/* A prepended record capture: the enclosing record, passed by pointer. */
@@ -8819,7 +8865,12 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 			/* A pointer/Uarch PARAMETER is an immutable incoming `l` temp — reference it
 			 * directly (no slot). A `*Aggregate` LOCAL adopted its pointer into `%r_<name>`; a
 			 * Uarch LOCAL lives in an `l` slot `%s_<name>` — `loadl` it (like a fixed local). */
-			if (e->rtype.kind == TY_UARCH && !is_param_name(ex->fn, e->name)) {
+			if (e->rtype.kind == TY_UARCH && is_capture_param(ex->fn, e->name)) {
+				/* A captured Uarch: its `%u_` param holds the enclosing slot's address; deref it. */
+				int t = ex->tmp++;
+				fprintf(out, "\t%%t%d =l loadl %%u_%s\n", t, e->name);
+				snprintf(dst, cap, "%%t%d", t);
+			} else if (e->rtype.kind == TY_UARCH && !is_param_name(ex->fn, e->name)) {
 				int t = ex->tmp++;
 				fprintf(out, "\t%%t%d =l loadl %%s_%s\n", t, e->name);
 				snprintf(dst, cap, "%%t%d", t);
@@ -8831,18 +8882,19 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 			return;
 		}
 		if (e->rtype.kind == TY_STR) {
-			/* A Str local: load its header pointer from its `l` slot. */
+			/* A Str local: load its header pointer from its `l` slot. A captured Str reads through
+			 * its `%u_` capture pointer (the enclosing slot's address) instead. */
 			int t = ex->tmp++;
-			fprintf(out, "\t%%t%d =l loadl %%s_%s\n", t, e->name);
+			fprintf(out, "\t%%t%d =l loadl %s%s\n", t, is_capture_param(ex->fn, e->name) ? "%u_" : "%s_", e->name);
 			snprintf(dst, cap, "%%t%d", t);
 			return;
 		}
 		if (is_float_type(e->rtype)) {
 			/* A float local/param lives in its own slot (params spill there like words), so a
-			 * read is a `load<qt>` (`loads`/`loadd`). */
+			 * read is a `load<qt>` (`loads`/`loadd`); a captured float reads through its `%u_` pointer. */
 			char qt = qtype_of(e->rtype);
 			int t = ex->tmp++;
-			fprintf(out, "\t%%t%d =%c load%c %%s_%s\n", t, qt, qt, e->name);
+			fprintf(out, "\t%%t%d =%c load%c %s%s\n", t, qt, qt, is_capture_param(ex->fn, e->name) ? "%u_" : "%s_", e->name);
 			snprintf(dst, cap, "%%t%d", t);
 			return;
 		}
@@ -9718,7 +9770,8 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 			 * slot with the store matching its type (`stored` for a Float64, else `storew`). */
 			Type tt;
 			resolve_name((Func *)ex->fn, s->name, &tt);
-			char st = (is_float_type(tt) || is_fixed_type(tt) || tt.kind == TY_UARCH) ? qtype_of(tt) : 'w'; /* stores/stored/storel/storew */
+			char st = qtype_of(tt); /* the local's store width (storew/storel/stores/stored) — from the
+			                         * declared type uniformly, so any assignable scalar stores correctly */
 			if (is_capture_param(ex->fn, s->name))
 				fprintf(out, "\tstore%c %s, %%u_%s\n", st, v, s->name);
 			else
