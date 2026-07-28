@@ -572,6 +572,10 @@ typedef struct {
 	int in_closure; /* 1 while parsing a closure body (no nested closures in v1) */
 	int for_id;     /* monotonic id minting each `for` loop's hidden counter-local name */
 	int dest_id;    /* monotonic id minting each destructure's hidden tuple-temp name */
+	int saw_dest_import; /* 1 once a destructured `import … as { … }` is seen: a bare name may then
+	                      * be an imported value (a function or a top-level const) not yet in `prog`,
+	                      * so an unknown bare name defers to typecheck (resolved after flatten) rather
+	                      * than dying at parse. */
 	Program *prog;  /* the program under construction — lets a closure binding append its
 	                 * lifted top-level function (set by the top-level parse loop) */
 } Parser;
@@ -1031,6 +1035,9 @@ struct Expr {
 	 * (not a param/local) — emit reads its value from the `%pb<bind_id>` storage temp. */
 	int is_bind;
 	int bind_id;
+	/* EX_VAR: set by typecheck when the name resolves to a top-level VALUE CONST (C1) — the
+	 * const is a nullary function, so emit materializes its value with `call $<name>()`. */
+	int is_const_ref;
 	/* EX_CALL: explicit type arguments `f[Int, Point](…)`. The monomorphization pass
 	 * uses them to select the instantiation, then rewrites `name` to the mangled clone. */
 	char typeargs[MAX_TYPARAMS][64];
@@ -1564,6 +1571,17 @@ typedef struct Func {
 	int nabinds;
 	int next_bind_id;
 	Stmt *body;             /* the statement/expression body — NULL for an asm function */
+	/* A TOP-LEVEL VALUE CONST (C1): `[pub] const NAME = <expr>` with no `(params) ->`. Modeled as
+	 * a nullary function whose body is `return <expr>`; a bare reference to NAME auto-calls it (see
+	 * is_const_ref). `cval_type` is the body's inferred value type, computed in a typecheck pre-pass
+	 * so func_ret_type reports it. ⚠ THROWAWAY — cf0 must NOT inherit: cfcc RE-EVALUATES the body at
+	 * every reference, whereas the spec binds a const's value ONCE (a comptime-known const is folded;
+	 * a runtime const like `const x = read_line()` is evaluated once at binding — type_system §9.1),
+	 * and the value must be a SCALAR or Str (an aggregate const — record/tuple/boxed union — is a
+	 * later brick). */
+	int is_const_val;
+	Type cval_type;
+	int cval_set;
 	int is_asm;             /* 1 if the body is an `asm "..."` block (see asm_body) */
 	Token *asm_body;        /* is_asm: the asm string token, whose segments are emitted
 	                         * verbatim (with `${param}` → arg register) into the .s */
@@ -2996,9 +3014,11 @@ static Expr *parse_primary(Parser *p, Func *fn) {
 		 * body (never typechecked/emitted) and is folded to its literal in each clone. */
 		if (resolve_name(fn, e->name, &ty) == R_NONE && find_active_bind(fn, e->name) < 0 &&
 		    func_valparam_index(fn, e->name) < 0) {
-			/* A bare name that is a closure or a top-level function is a function VALUE
-			 * (a fnref) — legal only as a `(…) Int` argument; typecheck validates that. */
-			if (func_find_closure(fn, e->name) >= 0 || prog_find_func(p->prog, e->name))
+			/* A bare name that is a closure or a top-level function/const is a VALUE — a function
+			 * value (a fnref) or a top-level `const`'s value. Typecheck resolves which and validates
+			 * the position. In a module with a destructured import the name may be an imported value
+			 * not yet in `prog` (flatten renames it into scope later), so defer that too. */
+			if (func_find_closure(fn, e->name) >= 0 || prog_find_func(p->prog, e->name) || p->saw_dest_import)
 				e->is_fnref = 1;
 			else
 				die(line, "unknown name (M0 expressions use integers, parameters, locals, and calls)");
@@ -4946,6 +4966,25 @@ static Func *parse_func(Parser *p, Program *prog) {
 		expect(p, TK_RBRACKET, "expected `]` to close the generic parameters");
 	}
 
+	/* A TOP-LEVEL VALUE CONST (C1): `const NAME = <expr>` with no parameter list. Anything
+	 * that is NOT a `(` opens a value, not a function — so the const's value expression may not
+	 * begin with `(` (a parenthesized/tuple value const is a disclaimed narrowing; write the
+	 * value without the leading parens). The body reuses parse_body's single-expression form
+	 * (`return <expr>`); the value type is inferred in a typecheck pre-pass. */
+	if (peek(p)->kind != TK_LPAREN) {
+		if (fn->ntyparams > 0)
+			die(peek(p)->line, "a top-level value `const` cannot be generic (it names a value, not a function)");
+		if (peek(p)->kind == TK_LBRACE)
+			die(peek(p)->line, "a top-level value `const` takes a single expression, not a `{…}` block "
+			                   "(a block/aggregate-literal const is a later brick)");
+		fn->is_const_val = 1;
+		/* A single expression, wrapped as `return <expr>` — NOT parse_body (which would divert a
+		 * leading `{` to a statement block, leaving fn->body a non-ST_RETURN the pre-pass mis-reads). */
+		fn->body = new_stmt(ST_RETURN);
+		fn->body->expr = parse_expr(p, fn);
+		return fn;
+	}
+
 	parse_paren_params(p, fn);
 
 	/* Optional return type `: <type>` — an `Int` (a word), `Uarch`, a record (returned by
@@ -5800,6 +5839,7 @@ static Import parse_import(Parser *p) {
 		expect(p, TK_RBRACE, "expected `}` to close the import list");
 		if (im.nnames == 0)
 			die(im.line, "an import list cannot be empty");
+		p->saw_dest_import = 1; /* bare references may now name an imported value (resolved post-flatten) */
 	} else if (peek(p)->kind == TK_IDENT) {
 		/* A namespace alias: lowercase `as mem` binds the module's VALUES (reached `mem.foo()`),
 		 * PascalCase `as Math` binds its TYPES (reached `Math.Point`). */
@@ -7568,6 +7608,24 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 				if (g->ntyparams > 0)
 					die(e->line, "a generic function cannot be passed as a value (instantiate it first)");
 			}
+			/* A bare reference to a top-level VALUE CONST (C1) is not a function value — it is the
+			 * const's value, materialized by auto-calling its nullary function. A const must be
+			 * DEFINED BEFORE USE: the pre-pass types consts in source order, so an un-typed target
+			 * (`cval_set == 0`) is a forward or self reference — reject it (else it would take the
+			 * default Iarch type and, for a self reference, silently emit infinite recursion). The
+			 * parse-time "unknown name" guard already catches this except in a module with a
+			 * destructured import, where an unknown bare name is deferred to here.
+			 * ⚠ cf0 must NOT inherit the define-before-use rule — the spec resolves top-level
+			 * declarations order-independently (ebnf § Modules; comptime-known-ness is transitive
+			 * over const bindings, type_system §9.1). */
+			if (g->is_const_val) {
+				if (!g->cval_set)
+					die(e->line, "a top-level `const` is referenced before it is defined (define it earlier)");
+				e->is_const_ref = 1;
+				snprintf(e->name, sizeof e->name, "%s", g->name); /* the emit symbol ($<name>) */
+				e->callee = g;
+				return func_ret_type(g);
+			}
 			/* No Int-only restriction: a function value carries its full signature, checked
 			 * structurally where it is passed to a function-type parameter (a mismatch — say a
 			 * record-taking function into a scalar slot — is reported there, at the call). */
@@ -8373,6 +8431,8 @@ static Type typeof_expr(Program *prog, Func *fn, Expr *e) {
 /* A function's declared return type: a tuple, record, or boxed union (all returned by
  * pointer), a Uarch, or Int. */
 static Type func_ret_type(const Func *fn) {
+	if (fn->is_const_val && fn->cval_set) /* a value const's inferred type (C1) */
+		return fn->cval_type;
 	if (fn->ret_tup)
 		return (Type){TY_TUPLE, NULL, NULL, 0, fn->ret_tup};
 	if (strcmp(fn->ret_type_name, "Uarch") == 0)
@@ -9277,6 +9337,21 @@ static void typecheck(Program *prog) {
 			for (int j = 0; j < u->arity[m]; j++)
 				resolve_member_type(prog, u->payload_types[m][j], 0);
 	}
+	/* Infer every top-level value const's type BEFORE any function body is checked (C1), so a
+	 * reference to a const — resolved via func_ret_type in the EX_VAR path — sees its value type.
+	 * Source order: a const must be defined before use (its bare reference resolves at parse only
+	 * once the const's Func exists), so each const's dependencies are already typed here. */
+	for (int i = 0; i < prog->nfuncs; i++) {
+		Func *fn = prog->funcs[i];
+		if (!fn->is_const_val)
+			continue;
+		Type vt = typeof_expr(prog, fn, fn->body->expr);
+		if (!is_mergeable_scalar(vt))
+			die(fn->body->expr->line, "a top-level value `const` must be a scalar or Str (an aggregate "
+			                          "const — record/tuple/boxed union — is a later brick)");
+		fn->cval_type = vt;
+		fn->cval_set = 1;
+	}
 	for (int i = 0; i < prog->nfuncs; i++)
 		if (prog->funcs[i]->ntyparams == 0) /* skip generic templates (only clones checked) */
 			check_func(prog, prog->funcs[i]);
@@ -9581,6 +9656,15 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		return;
 	}
 	case EX_VAR: {
+		/* A top-level VALUE CONST reference (C1): materialize its value by calling its nullary
+		 * function `$<name>()` (typecheck rewrote `name` to the emit symbol). */
+		if (e->is_const_ref) {
+			char q = qtype_of(e->rtype);
+			int t = ex->tmp++;
+			fprintf(out, "\t%%t%d =%c call $%s()\n", t, q, e->name);
+			snprintf(dst, cap, "%%t%d", t);
+			return;
+		}
 		/* A function reference: materialize the callee's code address ($<symbol>) into an
 		 * `l` temp (typecheck rewrote `name` to the emit symbol). A function-VALUE parameter
 		 * (a PK_FN param, TY_FN) is its incoming `%u_<name>` pointer, used directly. */
