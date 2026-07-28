@@ -1462,6 +1462,16 @@ together in a file is the `module` rule below.
 
 A **module is a `.cf` file**. Its top level is a sequence of imports and
 declarations in any order; there is no separate module keyword or wrapper.
+The "any order" here is about **layout** — imports and declarations may interleave freely,
+with no forced grouping; it does not mean every *reference* resolves regardless of position.
+**Reference-resolution caveat:** a binding to a **lambda** (a *function*, `const f = (…) -> …`)
+may be referenced before its declaration — functions resolve whole-module, so mutual and
+forward calls are fine. A binding to a **non-function value** (`const x = <value>`, `let x =
+<value>`) must be **declared before it is referenced** — a deliberately orthodox rule that
+keeps value-initialization order legible and rules out a class of confusing forward-reference
+bugs. The axis is *function-ness*, not the keyword: `const`/`let` chooses mutability, while
+being a lambda is what grants order-independence. A genuine **cycle** among value bindings
+(`const a = b`, `const b = a`) is an error.
 
 ```ebnf
 module        = { module_item } ;
