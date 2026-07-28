@@ -7636,9 +7636,11 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 			 * default Iarch type and, for a self reference, silently emit infinite recursion). The
 			 * parse-time "unknown name" guard already catches this except in a module with a
 			 * destructured import, where an unknown bare name is deferred to here.
-			 * ⚠ cf0 must NOT inherit the define-before-use rule — the spec resolves top-level
-			 * declarations order-independently (ebnf § Modules; comptime-known-ness is transitive
-			 * over const bindings, type_system §9.1). */
+			 * Owner-ruled (谢尔盖): cf0 KEEPS define-before-use for VALUE consts (orthodox, avoids
+			 * confusion) while FUNCTIONS resolve in any order — which is exactly cfcc's split (a
+			 * `const f = (…) -> …` is a whole-program-resolved Func; a value const is sequential).
+			 * The one cf0 addition: a genuine const CYCLE (`const a = b`, `const b = a`) must be
+			 * rejected as a cycle, not merely by source order. */
 			if (g->is_const_val) {
 				if (!g->cval_set)
 					die(e->line, "a top-level `const` is referenced before it is defined (define it earlier)");
