@@ -831,7 +831,10 @@ rules make the frame explicit:
 - **The container qualifier is required** — `Int.Int32(x)`, never bare `Int32(x)`,
   and when matching a `Number` it is `Number.Int32` — so the syntax names the member
   *as a case of that union*, not as any-int. Narrowing binds the **precise member
-  type**: in the arm the scrutinee *is* that member.
+  type**: in the arm the scrutinee *is* that member. (This applies to the **arm head**.
+  A member matched inside a *nested* payload sub-pattern follows its field's rule instead
+  — bare-or-qualified for a standalone union, always-qualified for an inline one; see
+  [[ebnf.md]] § match, "Payload sub-patterns recurse".)
 
 For a **compose-over** member the payload *is the value itself* (`Int.Int8(v)` binds
 `v` to the `Int8`, since a compose-over member is not a wrapper — §8.1); for an

@@ -1235,7 +1235,14 @@ Points:
   destructuring pattern (`Shape.Point({ x, y })`, `Shape.Rect({ w, h })`) that pulls the
   payload's fields apart by name. The parenthesized list is positional; a
   `record_pattern` inside it is non-exhaustive as usual (name only the fields you
-  want). Deeper nesting composes the same way.
+  want). Deeper nesting composes the same way. A **nested** `type_pattern` head — a
+  member matched inside a payload position (`Expr.Bin(Op.Add, l, r)`) — follows the
+  qualifier rule of *its* field's type, not the outer scrutinee's: when the field names a
+  **standalone union** declared separately and pulled into the payload, the nested member
+  may be written **either bare (`Add`) or qualified by that union (`Op.Add`)**; when the
+  variants are **declared inline within the enclosing union**, the nested head is **always
+  qualified by that union**. (The outer arm head is always qualified — it is a case of the
+  scrutinee's own union, above.)
 - **Arms are ordered; the first match wins.** Put specific patterns before
   general ones and a `_` (or a bare binding) last. Whether a `match` must be
   **exhaustive** — cover every member of the **scrutinee's union** or carry a
