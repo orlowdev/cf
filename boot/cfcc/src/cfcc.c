@@ -4605,19 +4605,60 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 		tok_copy(t, target, sizeof target);
 		advance(p);
 		if (peek(p)->kind == TK_DOT) {
-			/* Field mutation: `name.field = expr`. The target must be a mutable
-			 * record; the field and offset are resolved in typecheck. */
+			/* Field mutation: `name.field = expr` (one level), or a DEEP chain `a.b.c… = expr`.
+			 * One level keeps the compact name+field form (compound `op=` supported); a deep chain
+			 * (≥2 fields) builds an EX_FIELD lvalue (s->name left empty as the deep marker; `=` only).
+			 * The field(s) and offset(s) are resolved in typecheck. */
 			advance(p);
 			Token *f = peek(p);
 			if (f->kind != TK_IDENT || is_type_ident(f))
 				die(f->line, "expected a field name after `.`");
 			if (f->text[f->len - 1] == '!')
 				die(f->line, "M0 does not support `!` in a field name");
+			char f1[64];
+			tok_copy(f, f1, sizeof f1);
+			advance(p); /* past the first field */
+			if (peek(p)->kind == TK_DOT) {
+				/* DEEP chain `a.b.c… = v`: build the EX_FIELD lvalue. The store goes through the
+				 * parent record's pointer at the final field's offset (typecheck resolves each
+				 * level; emit stores through `emit(lval->lhs) + lval->foff`). `=` only for now. */
+				Expr *lval = new_expr(EX_VAR);
+				lval->line = t->line;
+				snprintf(lval->name, sizeof lval->name, "%s", target);
+				Expr *fe1 = new_expr(EX_FIELD);
+				fe1->line = t->line;
+				fe1->lhs = lval;
+				snprintf(fe1->name, sizeof fe1->name, "%s", f1);
+				lval = fe1;
+				while (peek(p)->kind == TK_DOT) {
+					advance(p);
+					Token *fn2 = peek(p);
+					if (fn2->kind != TK_IDENT || is_type_ident(fn2))
+						die(fn2->line, "expected a field name after `.`");
+					if (fn2->text[fn2->len - 1] == '!')
+						die(fn2->line, "M0 does not support `!` in a field name");
+					Expr *fe = new_expr(EX_FIELD);
+					fe->line = fn2->line;
+					fe->lhs = lval;
+					tok_copy(fn2, fe->name, sizeof fe->name);
+					advance(p);
+					lval = fe;
+				}
+				Stmt *s = new_stmt(ST_FIELD_ASSIGN);
+				s->line = t->line;
+				s->expr = lval; /* the lvalue; s->name stays empty ⇒ the deep-chain marker */
+				ExprKind dcop;
+				if (compound_assign_op(peek(p)->kind, &dcop))
+					die(peek(p)->line, "compound assignment on a deep field (`a.b.c op= …`) is not "
+					                   "supported yet (write `a.b.c = a.b.c op …`)");
+				expect(p, TK_EQ, "expected `=`");
+				s->yval = parse_expr(p, fn);
+				return s;
+			}
 			Stmt *s = new_stmt(ST_FIELD_ASSIGN);
 			s->line = t->line;
 			snprintf(s->name, sizeof s->name, "%s", target);
-			tok_copy(f, s->field, sizeof s->field);
-			advance(p);
+			snprintf(s->field, sizeof s->field, "%s", f1);
 			ExprKind cop;
 			if (compound_assign_op(peek(p)->kind, &cop)) {
 				/* `p.f op= y` desugars to `p.f = p.f op y`. The target has no
@@ -8691,6 +8732,16 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 					 * ⚠ cf0 must NOT inherit: cfcc infers ONLY Iarch here (a fixed-width `Int8`
 					 * value still needs an annotation) — §3 infers any scalar's precise type. */
 					set_local_scalar(fn, s->name, it);
+				} else if (it.kind == TY_PTR && (it.rec || it.uni)) {
+					/* `const p = n.next` — bind a `*Record`/`*Union` pointer FIELD (or any `*T` value)
+					 * to a local, inferring the pointer type (the annotated `const *Node p = n.next`
+					 * already works; this drops the annotation). A pointer alias is a borrow (like a
+					 * pointer param), so sound; const-only — no `let` repointing, the same rule as the
+					 * annotated `*Aggregate` local. The natural AST/list-traversal binding. */
+					Type mt;
+					if (resolve_name(fn, s->name, &mt) == R_LET)
+						die(s->line, "a `*Aggregate` local binds `const` (repointing a `let` pointer is a later brick)");
+					set_local_ptr(fn, s->name, it);
 				} else {
 					die(s->expr->line, "expected an Int value (a record is used only via field "
 					                   "access, and a string only via `.len`, in M0)");
@@ -8698,6 +8749,32 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 			}
 			break;
 		case ST_FIELD_ASSIGN: {
+			if (s->name[0] == '\0') {
+				/* DEEP chain `a.b.c… = v`: `s->expr` is the EX_FIELD lvalue. Type it (resolves each
+				 * level's rec/offset and validates every base is a record), then require the ROOT to
+				 * be mutable (a `let` local, or a writable `*Record` param) — the same rule as the
+				 * one-level case, applied to the chain's root. The final field's type governs the
+				 * value. Intermediate record/pointer fields are written THROUGH (shared storage), so
+				 * only the root's mutability gates the write. */
+				Type lt = typeof_expr(prog, fn, s->expr); /* resolves the chain (foff on the final EX_FIELD) */
+				Expr *root = s->expr;
+				while (root->kind == EX_FIELD)
+					root = root->lhs;
+				if (root->kind != EX_VAR)
+					die(s->line, "a deep field assignment's root must be a record variable");
+				Type rty;
+				Resolution rr = resolve_name(fn, root->name, &rty);
+				if (rr == R_NONE)
+					die(s->line, "unknown name in a field assignment");
+				/* A `const` by-value root is read-only; a `const *Record` root is a fixed pointer to
+				 * mutable storage (write through it is fine, like a `*Record` param). */
+				if (rr == R_CONST && rty.kind != TY_PTR)
+					die(s->line, "cannot mutate through a `const` record (declare the root with `let`)");
+				if (rr == R_PARAM && rty.kind != TY_PTR)
+					die(s->line, "cannot mutate through a by-value record parameter (take a `*Record`)");
+				check_member_value(prog, fn, s->yval, lt, s->line); /* the value fits the final field */
+				break;
+			}
 			/* `name.field = expr` — target must be a mutable (`let`) record local,
 			 * the field must exist, and the value is Int. */
 			Type ty;
@@ -8719,7 +8796,14 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 			int through_ptr = ty.kind == TY_PTR;
 			if (r == R_PARAM && !through_ptr)
 				die(s->line, "cannot mutate a by-value parameter's field (take a `*Record` to mutate through it)");
-			if (r == R_CONST)
+			/* A `const` BY-VALUE record is read-only; but a `const *Record` local is a fixed POINTER
+			 * to mutable storage — writing THROUGH it (`q.v = …` after `const q = n.next`) is sound,
+			 * exactly like a `*Record` param (type_system §6.4 / memory_model §6: `const` fixes the
+			 * POINTER, not the pointee; writability is inferred from the referent's home). So `const`
+			 * bars a field write only for a by-value record. ⚠ Same pre-existing laxity as the disclaimer
+			 * above: with `&`-of-a-`const` (`const q = &c`), this write reaches a `const` referent —
+			 * cf0's borrow check (a `*T` referent must live in a `let`, §6) closes that; cfcc doesn't. */
+			if (r == R_CONST && !through_ptr)
 				die(s->line, "cannot mutate a `const` record's field (declare it with `let`)");
 			int idx = data_field_index(trec, s->field);
 			if (idx < 0)
@@ -10493,6 +10577,25 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 			break;
 		}
 		case ST_FIELD_ASSIGN:
+			if (s->name[0] == '\0') {
+				/* DEEP chain `a.b.c… = v`: emit the PARENT record pointer (`emit(lval->lhs)` — a
+				 * record field loads as an 8-byte arena pointer), add the final field's offset, and
+				 * store the value there. Works to any depth. */
+				Expr *lval = s->expr;
+				char base[96];
+				emit_expr(out, lval->lhs, ex, base, sizeof base);
+				char dv[96];
+				emit_expr(out, s->yval, ex, dv, sizeof dv);
+				char dfst = qtype_of(lval->rtype);
+				if (lval->foff == 0) {
+					fprintf(out, "\tstore%c %s, %s\n", dfst, dv, base);
+				} else {
+					int da = ex->tmp++;
+					fprintf(out, "\t%%t%d =l add %s, %d\n", da, base, lval->foff);
+					fprintf(out, "\tstore%c %s, %%t%d\n", dfst, dv, da);
+				}
+				break;
+			}
 			/* Mutate a record field: store through the record's arena pointer
 			 * (`%r_<name>`) at the field's offset. */
 			emit_expr(out, s->expr, ex, v, sizeof v);
