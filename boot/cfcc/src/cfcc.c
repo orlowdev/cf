@@ -939,10 +939,26 @@ typedef struct {
 	int bind_word[MAX_ARM_ALTS]; /* the bound payload field's REGISTER-WIDTH char (qtype_of): 'w' for
 	                              * an Int/tag-only-union/sub-word-fixed field, 'l' for a 64-bit int or
 	                              * an aggregate pointer. Set in typecheck; the arm load reads at it. */
+	/* NESTED payload sub-patterns (A2): each payload position is one of four kinds (`sub_kind[i]`).
+	 * A BIND position names the field (the `binds[i]`/`bind_ids[i]` machinery above); a WILD ignores
+	 * it; an INT/MEMBER position is a GUARD — it does not bind but tests the field at runtime, and a
+	 * failed guard falls the arm through to the next (so a guarded arm never fully covers its tag —
+	 * coverage of that member then needs a later UN-guarded arm or a `_`). One level only: an INT
+	 * matches an integer field's value (`sub_ival`), a
+	 * MEMBER matches a NULLARY member of a union field (name in `binds[i]`, tag in `sub_tag[i]`, the
+	 * field's union in `sub_uni[i]`). ⚠ cf0 must NOT inherit the one-level limit — cf0 recurses fully
+	 * (a nested member may carry its own payload sub-pattern). */
+	int sub_kind[MAX_ARM_ALTS];      /* SP_BIND / SP_WILD / SP_INT / SP_MEMBER */
+	long sub_ival[MAX_ARM_ALTS];     /* SP_INT: the literal to compare the field against */
+	int sub_tag[MAX_ARM_ALTS];       /* SP_MEMBER: the nested member's tag (resolved in typecheck) */
+	UnionDecl *sub_uni[MAX_ARM_ALTS];/* SP_MEMBER: the field's union type (has_payload → boxed field) */
+	int guarded;                     /* 1 if any position is SP_INT/SP_MEMBER (set in typecheck) */
 	int nbinds;
 	Expr *body;
 	int line;
 } MatchArm;
+
+enum { SP_BIND, SP_WILD, SP_INT, SP_MEMBER }; /* MatchArm.sub_kind[i] — a payload position's sub-pattern */
 
 struct Expr {
 	ExprKind kind;
@@ -3487,14 +3503,55 @@ static Expr *parse_match(Parser *p, Func *fn) {
 						die(peek(p)->line, "an empty payload pattern `()` — omit the parens to match the tag only");
 					for (;;) {
 						Token *bt = peek(p);
-						if (!is_ident(bt, "_") && (bt->kind != TK_IDENT || is_type_ident(bt)))
-							die(bt->line, "a payload pattern binds lowercase names or `_` (literal/nested patterns are a later brick)");
-						if (bt->text[bt->len - 1] == '!')
-							die(bt->line, "M0 does not support `!` in a binding name");
-						if (arm.nbinds == MAX_ARM_ALTS)
-							die(bt->line, "too many payload bindings");
-						tok_copy(bt, arm.binds[arm.nbinds++], sizeof arm.binds[0]);
-						advance(p);
+						int idx = arm.nbinds;
+						if (idx == MAX_ARM_ALTS)
+							die(bt->line, "too many payload positions");
+						if (is_ident(bt, "_")) {
+							/* WILD: ignore this field. */
+							arm.sub_kind[idx] = SP_WILD;
+							tok_copy(bt, arm.binds[idx], sizeof arm.binds[0]); /* "_" */
+							advance(p);
+						} else if (bt->kind == TK_INT || bt->kind == TK_MINUS) {
+							/* INT guard: `M.A(0)` matches only when the field equals the literal. */
+							int neg = 0;
+							if (bt->kind == TK_MINUS) { neg = 1; advance(p); bt = peek(p); }
+							if (bt->kind != TK_INT)
+								die(bt->line, "an integer sub-pattern is an integer literal (e.g. `0` or `-1`)");
+							arm.sub_kind[idx] = SP_INT;
+							arm.sub_ival[idx] = neg ? -bt->ival : bt->ival;
+							advance(p);
+						} else if (bt->kind == TK_IDENT && is_type_ident(bt)) {
+							/* MEMBER guard: `BinOp(Add, l, r)` — `Add` matches a nullary member of the
+							 * field's union (one level; its own payload cannot be sub-matched yet). */
+							if (bt->text[bt->len - 1] == '!')
+								die(bt->line, "M0 does not support `!` in a name");
+							arm.sub_kind[idx] = SP_MEMBER;
+							tok_copy(bt, arm.binds[idx], sizeof arm.binds[0]);
+							advance(p);
+							/* ⚠ SPEC-SILENT (surfaced to the owner): the top-level arm head is qualified by
+							 * the scrutinee's union ("never bare", ebnf § match / type_system §8.3), but the
+							 * NESTED member here is written BARE (`Add`), resolved against the field's known
+							 * union. The spec shows no nested type_pattern example, so whether the qualifier
+							 * rule reaches inward is undecided — cf0 must pin the nested surface (bare vs
+							 * `FieldUnion.Add`) before inheriting this. */
+							if (peek(p)->kind == TK_DOT)
+								die(peek(p)->line, "a nested member sub-pattern names a bare member (`Add`) of the "
+								                   "field's union — a namespaced/qualified nested pattern is a later brick");
+							if (peek(p)->kind == TK_LPAREN)
+								die(peek(p)->line, "a nested member sub-pattern matches the tag only — its OWN payload "
+								                   "sub-pattern is a later brick (bind the field, then match it separately)");
+						} else if (bt->kind == TK_IDENT) {
+							/* BIND: name the field, in scope for the arm body. */
+							if (bt->text[bt->len - 1] == '!')
+								die(bt->line, "M0 does not support `!` in a binding name");
+							arm.sub_kind[idx] = SP_BIND;
+							tok_copy(bt, arm.binds[idx], sizeof arm.binds[0]);
+							advance(p);
+						} else {
+							die(bt->line, "a payload sub-pattern binds a lowercase name, `_`, an integer literal, "
+							              "or a nested member name");
+						}
+						arm.nbinds++;
 						if (peek(p)->kind == TK_COMMA) {
 							advance(p);
 							continue;
@@ -3560,7 +3617,7 @@ static Expr *parse_match(Parser *p, Func *fn) {
 		 * variable names eagerly); ids are assigned in typecheck. Pop after the body. */
 		int saved_pb = fn->nabinds;
 		for (int b = 0; b < arm.nbinds; b++) {
-			if (strcmp(arm.binds[b], "_") == 0)
+			if (arm.sub_kind[b] != SP_BIND) /* WILD/INT/MEMBER positions bind no name */
 				continue;
 			if (fn->nabinds == (int)(sizeof fn->abinds / sizeof fn->abinds[0]))
 				die(arm.line, "too many active payload bindings");
@@ -7195,7 +7252,9 @@ static Type check_numeric_typeswitch(Program *prog, Func *fn, Expr *e, Type st) 
 	 * width. Only the live arm's body is typechecked (the rest are comptime-dead). */
 	MatchArm *a = &e->arms[live];
 	int saved = fn->nabinds;
-	if (!a->is_wild && a->nbinds == 1 && strcmp(a->binds[0], "_") != 0) {
+	if (!a->is_wild && a->nbinds == 1 && (a->sub_kind[0] == SP_INT || a->sub_kind[0] == SP_MEMBER))
+		die(a->line, "a numeric type-switch arm binds the value or ignores it — not an integer/nested guard");
+	if (!a->is_wild && a->nbinds == 1 && a->sub_kind[0] == SP_BIND) {
 		a->bind_word[0] = qtype_of(st); /* qtype char; the numeric-switch emit uses qtype_of directly */
 		int id = fn->next_bind_id++;
 		a->bind_ids[0] = id;
@@ -7203,6 +7262,8 @@ static Type check_numeric_typeswitch(Program *prog, Func *fn, Expr *e, Type st) 
 		fn->abinds[fn->nabinds].id = id;
 		fn->abinds[fn->nabinds].type = st;
 		fn->nabinds++;
+	} else if (!a->is_wild && a->nbinds == 1) {
+		a->bind_ids[0] = -1; /* a `_` binds nothing — mark it so emit skips the value copy */
 	}
 	Type bt = typeof_expr(prog, fn, a->body);
 	fn->nabinds = saved;
@@ -8020,13 +8081,20 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 					int tag = union_member_tag(u, a->members[k]);
 					if (tag < 0)
 						die(a->line, "this union has no such member");
+					/* A member may not repeat within one arm's or-pattern (`A | A`). */
+					for (int j = 0; j < k; j++)
+						if (a->tags[j] == tag)
+							die(a->line, "duplicate match arm for this member");
+					/* A member is fully covered only by an UN-guarded arm (a guarded arm's
+					 * sub-pattern may not match, so it never marks `covered`). A later arm for
+					 * an already-fully-covered member is unreachable. */
 					if (covered[tag])
-						die(a->line, "duplicate match arm for this member");
-					covered[tag] = 1;
+						die(a->line, "an earlier arm already covers this member");
 					a->tags[k] = tag;
 				}
-				/* A payload sub-pattern (single-member arm) binds each field to an Int
-				 * scoped to this arm's body; `_` ignores a field. */
+				/* A payload sub-pattern (single-member arm) matches each field positionally:
+				 * BIND names it (scoped to the body), WILD ignores it, INT/MEMBER guard it (a
+				 * failed guard falls the arm through — so the arm becomes `guarded`). */
 				if (a->nbinds > 0) {
 					int tag = a->tags[0];
 					if (a->nbinds != u->arity[tag])
@@ -8036,12 +8104,34 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 						 * type and repr — a word (Int/tag-only union) or a pointer. */
 						Type pt = union_payload_type(prog, u, tag, b);
 						a->bind_word[b] = qtype_of(pt); /* the payload's register width char (w/l) */
-						if (strcmp(a->binds[b], "_") == 0) {
-							a->bind_ids[b] = -1;
+						a->bind_ids[b] = -1;
+						if (a->sub_kind[b] == SP_WILD)
+							continue;
+						if (a->sub_kind[b] == SP_INT) {
+							if (!is_int_scalar(pt))
+								die(a->line, "an integer sub-pattern matches an integer payload field");
+							a->guarded = 1;
 							continue;
 						}
+						if (a->sub_kind[b] == SP_MEMBER) {
+							UnionDecl *fu = aggregate_union(pt);
+							if (!fu)
+								die(a->line, "a nested member sub-pattern matches a union-typed payload field");
+							int ntag = union_member_tag(fu, a->binds[b]);
+							if (ntag < 0)
+								die(a->line, "the field's union has no such member");
+							if (fu->arity[ntag] != 0)
+								die(a->line, "a nested member sub-pattern names a NULLARY member — a member "
+								             "carrying its own payload cannot be sub-matched yet (bind the field "
+								             "and match it separately)");
+							a->sub_tag[b] = ntag;
+							a->sub_uni[b] = fu;
+							a->guarded = 1;
+							continue;
+						}
+						/* SP_BIND */
 						for (int j = 0; j < b; j++)
-							if (strcmp(a->binds[j], a->binds[b]) == 0)
+							if (a->sub_kind[j] == SP_BIND && strcmp(a->binds[j], a->binds[b]) == 0)
 								die(a->line, "duplicate payload binding name");
 						if (fn->nabinds == (int)(sizeof fn->abinds / sizeof fn->abinds[0]))
 							die(a->line, "too many active payload bindings");
@@ -8053,6 +8143,10 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 						fn->nabinds++;
 					}
 				}
+				/* Only an un-guarded arm marks its member(s) covered. */
+				if (!a->guarded)
+					for (int k = 0; k < a->nalts; k++)
+						covered[a->tags[k]] = 1;
 			}
 			/* Arm bodies unify to one type — a mergeable scalar, or an aggregate (boxed union/
 			 * record/tuple `l` pointer) merged through the `%m` slot like a scalar. An aggregate
@@ -10206,18 +10300,41 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 					int nxt = ex->lbl++;
 					fprintf(out, "\tjnz %%t%d, @marm%d, @mnext%d\n", c, hit, nxt);
 					fprintf(out, "@marm%d\n", hit);
-					/* Load each bound payload field into its `%pb<id>` temp (the scrutinee
-					 * `sc` is the boxed union's pointer; field b sits at 8 + b*8). */
+					/* Match each payload position (the scrutinee `sc` is the boxed union's
+					 * pointer; field bi sits at 8 + bi*8). A BIND loads the field into its
+					 * `%pb<id>` temp; an INT/MEMBER guard loads it, compares, and — on a miss —
+					 * jumps to this arm's `@mnext%d` (falling through to the next arm); a WILD
+					 * does nothing. */
 					for (int bi = 0; bi < a->nbinds; bi++) {
-						if (a->bind_ids[bi] < 0) /* `_` */
+						if (a->sub_kind[bi] == SP_WILD)
 							continue;
 						int addr = ex->tmp++;
 						fprintf(out, "\t%%t%d =l add %s, %d\n", addr, sc, union_payload_offset(bi));
-						/* Load the payload at its type's width: a word (Int/tag-only union) or a
-						 * sub-word fixed `IntN`/`UintN` → `w`, a 64-bit int / 8-byte pointer → `l`
-						 * (`bind_word` holds the qtype char, set in typecheck). */
-						fprintf(out, "\t%%pb%d =%c load%c %%t%d\n",
-						        a->bind_ids[bi], a->bind_word[bi], a->bind_word[bi], addr);
+						if (a->sub_kind[bi] == SP_BIND) {
+							/* Load the payload at its type's width: a word (Int/tag-only union) or a
+							 * sub-word fixed `IntN`/`UintN` → `w`, a 64-bit int / 8-byte pointer → `l`
+							 * (`bind_word` holds the qtype char, set in typecheck). */
+							fprintf(out, "\t%%pb%d =%c load%c %%t%d\n",
+							        a->bind_ids[bi], a->bind_word[bi], a->bind_word[bi], addr);
+							continue;
+						}
+						int fld = ex->tmp++;
+						fprintf(out, "\t%%t%d =%c load%c %%t%d\n", fld, a->bind_word[bi], a->bind_word[bi], addr);
+						int g = ex->tmp++;
+						if (a->sub_kind[bi] == SP_INT) {
+							/* Compare the field's value against the literal at the field's width. */
+							fprintf(out, "\t%%t%d =w ceq%c %%t%d, %ld\n", g, a->bind_word[bi], fld, a->sub_ival[bi]);
+						} else { /* SP_MEMBER: compare the field-union's tag against the nested member's */
+							int tg = fld;
+							if (a->sub_uni[bi]->has_payload) { /* a boxed field — tag sits at offset 0 */
+								tg = ex->tmp++;
+								fprintf(out, "\t%%t%d =w loadw %%t%d\n", tg, fld);
+							}
+							fprintf(out, "\t%%t%d =w ceqw %%t%d, %d\n", g, tg, a->sub_tag[bi]);
+						}
+						int gok = ex->lbl++;
+						fprintf(out, "\tjnz %%t%d, @gok%d, @mnext%d\n", g, gok, nxt);
+						fprintf(out, "@gok%d\n", gok);
 					}
 					char b[96];
 					emit_expr(out, a->body, ex, b, sizeof b);
