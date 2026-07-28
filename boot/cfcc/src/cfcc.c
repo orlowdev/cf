@@ -949,12 +949,19 @@ typedef struct {
 	 * failed guard falls the arm through to the next (so a guarded arm never fully covers its tag —
 	 * coverage of that member then needs a later UN-guarded arm or a `_`). One level only: an INT
 	 * matches an integer field's value (`sub_ival`), a
-	 * MEMBER matches a NULLARY member of a union field (name in `binds[i]`, tag in `sub_tag[i]`, the
-	 * field's union in `sub_uni[i]`). ⚠ cf0 must NOT inherit the one-level limit — cf0 recurses fully
-	 * (a nested member may carry its own payload sub-pattern). */
+	 * MEMBER matches a NULLARY member of a union field (member name in `binds[i]`, tag in `sub_tag[i]`,
+	 * the field's union in `sub_uni[i]`). A nested MEMBER may be written BARE (`Add`) or QUALIFIED by
+	 * the field's standalone union type (`Op.Add`) — owner-ruled BOTH forms are valid when the field
+	 * names a standalone union pulled into the payload (`sub_qual[i]` holds the written qualifier, ""
+	 * when bare; validated against the field's union in typecheck). ⚠ cf0 must NOT inherit the
+	 * one-level limit — cf0 recurses fully (a nested member may carry its own payload sub-pattern);
+	 * and for a union DECLARED INLINE in the enclosing union, cf0 requires the qualifier (cfcc has no
+	 * inline-union payloads, so only the standalone case — both forms — arises here). */
 	int sub_kind[MAX_ARM_ALTS];      /* SP_BIND / SP_WILD / SP_INT / SP_MEMBER */
 	long sub_ival[MAX_ARM_ALTS];     /* SP_INT: the literal to compare the field against */
 	int sub_tag[MAX_ARM_ALTS];       /* SP_MEMBER: the nested member's tag (resolved in typecheck) */
+	char sub_qual[MAX_ARM_ALTS][64]; /* SP_MEMBER: the written field-union qualifier (`Op` in `Op.Add`),
+	                                  * "" when bare; typecheck checks it names the field's union */
 	UnionDecl *sub_uni[MAX_ARM_ALTS];/* SP_MEMBER: the field's union type (has_payload → boxed field) */
 	int guarded;                     /* 1 if any position is SP_INT/SP_MEMBER (set in typecheck) */
 	int nbinds;
@@ -3541,22 +3548,36 @@ static Expr *parse_match(Parser *p, Func *fn) {
 							arm.sub_ival[idx] = neg ? -bt->ival : bt->ival;
 							advance(p);
 						} else if (bt->kind == TK_IDENT && is_type_ident(bt)) {
-							/* MEMBER guard: `BinOp(Add, l, r)` — `Add` matches a nullary member of the
-							 * field's union (one level; its own payload cannot be sub-matched yet). */
+							/* MEMBER guard: `Bin(Add, l, r)` — matches a nullary member of the field's
+							 * union (one level; its own payload cannot be sub-matched yet). The member may
+							 * be BARE (`Add`) or QUALIFIED by the field's standalone union (`Op.Add`) —
+							 * owner-ruled both are valid for a standalone-union field (which is the only
+							 * kind cfcc has). */
 							if (bt->text[bt->len - 1] == '!')
 								die(bt->line, "M0 does not support `!` in a name");
 							arm.sub_kind[idx] = SP_MEMBER;
-							tok_copy(bt, arm.binds[idx], sizeof arm.binds[0]);
+							char firstnm[64];
+							tok_copy(bt, firstnm, sizeof firstnm);
 							advance(p);
-							/* ⚠ SPEC-SILENT (surfaced to the owner): the top-level arm head is qualified by
-							 * the scrutinee's union ("never bare", ebnf § match / type_system §8.3), but the
-							 * NESTED member here is written BARE (`Add`), resolved against the field's known
-							 * union. The spec shows no nested type_pattern example, so whether the qualifier
-							 * rule reaches inward is undecided — cf0 must pin the nested surface (bare vs
-							 * `FieldUnion.Add`) before inheriting this. */
-							if (peek(p)->kind == TK_DOT)
-								die(peek(p)->line, "a nested member sub-pattern names a bare member (`Add`) of the "
-								                   "field's union — a namespaced/qualified nested pattern is a later brick");
+							if (peek(p)->kind == TK_DOT) {
+								/* Qualified `Op.Add`: the first name is the field-union qualifier, the
+								 * next is the member. A deeper `Ns.Op.Add` namespacing is not supported. */
+								advance(p); /* . */
+								Token *mt = peek(p);
+								if (mt->kind != TK_IDENT || !is_type_ident(mt))
+									die(mt->line, "expected a PascalCase member name after `.` in a nested pattern");
+								if (mt->text[mt->len - 1] == '!')
+									die(mt->line, "M0 does not support `!` in a name");
+								snprintf(arm.sub_qual[idx], sizeof arm.sub_qual[0], "%s", firstnm);
+								tok_copy(mt, arm.binds[idx], sizeof arm.binds[0]);
+								advance(p);
+								if (peek(p)->kind == TK_DOT)
+									die(peek(p)->line, "a namespaced nested pattern (`Ns.Union.Member`) is not supported yet — "
+									                   "qualify by the field's union only (`Op.Add`), or write it bare (`Add`)");
+							} else {
+								/* Bare `Add`: resolved against the field's known union in typecheck. */
+								snprintf(arm.binds[idx], sizeof arm.binds[0], "%s", firstnm);
+							}
 							if (peek(p)->kind == TK_LPAREN)
 								die(peek(p)->line, "a nested member sub-pattern matches the tag only — its OWN payload "
 								                   "sub-pattern is a later brick (bind the field, then match it separately)");
@@ -8175,6 +8196,11 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 							UnionDecl *fu = aggregate_union(pt);
 							if (!fu)
 								die(a->line, "a nested member sub-pattern matches a union-typed payload field");
+							/* A written qualifier (`Op.Add`) must name the field's own union — its base
+							 * (template) name or its exact instance, mirroring the top-level arm-head rule. */
+							if (a->sub_qual[b][0] &&
+							    strcmp(a->sub_qual[b], fu->base_name) != 0 && strcmp(a->sub_qual[b], fu->name) != 0)
+								die(a->line, "a nested member qualifier must name the field's union (or write the member bare)");
 							int ntag = union_member_tag(fu, a->binds[b]);
 							if (ntag < 0)
 								die(a->line, "the field's union has no such member");
