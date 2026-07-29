@@ -186,13 +186,15 @@ const stmt_mut = (Stmt s): Bool -> match s {
 	Stmt.Assign(n, e) -> false,
 	Stmt.Return(e) -> false
 }
-# Emit the statement's expression and return its operand. (A `match` arm cannot
-# YIELD a bare aggregate payload — that would alias it, §6 — but it may PASS the
-# payload to `emit_expr`, whose call result is a fresh `Str` operand.)
-const emit_stmt_expr = (*Emit ctx, Stmt s, [Binding] env): Str -> match s {
-	Stmt.Let(n, m, e) -> emit_expr(e, ctx, env),
-	Stmt.Assign(n, e) -> emit_expr(e, ctx, env),
-	Stmt.Return(e) -> emit_expr(e, ctx, env)
+# Extract a statement's sub-expression: the initializer of a `Let`, the value of an
+# `Assign`, the returned value of a `Return`. Each arm YIELDS the bound payload `e`
+# directly — an arena-borrowed alias, sound in cfcc's single never-freed arena — so
+# the caller reads it out cleanly rather than the arm having to launder it through
+# `emit_expr`.
+const stmt_expr = (Stmt s): Expr -> match s {
+	Stmt.Let(n, m, e) -> e,
+	Stmt.Assign(n, e) -> e,
+	Stmt.Return(e) -> e
 }
 
 # Emit a block's statements in order, growing the binding environment as `let`/`const`
@@ -212,7 +214,7 @@ const emit_block = (*Emit ctx, [Stmt] stmts): Iarch -> {
 		if k == 0 then {
 			# `const`/`let name = init` — evaluate the initializer (against the env so far),
 			# allocate a word slot, and store; then bind the name to that slot.
-			const Str let_v = emit_stmt_expr(ctx, s, env)
+			const Str let_v = emit_expr(stmt_expr(s), ctx, env)
 			const Iarch let_slot = ctx.next
 			ctx.next = ctx.next + 1
 			write_str(ctx.fd, "\t%t${let_slot} =l alloc4 4\n")
@@ -223,11 +225,11 @@ const emit_block = (*Emit ctx, [Stmt] stmts): Iarch -> {
 			# `name = value` — reassign an existing local's slot.
 			const Iarch asn_slot = lookup_slot(env, stmt_name(s))
 			if asn_slot < 0 then die("cf0: emit: assignment to an undeclared variable\n")
-			const Str asn_v = emit_stmt_expr(ctx, s, env)
+			const Str asn_v = emit_expr(stmt_expr(s), ctx, env)
 			write_str(ctx.fd, "\tstorew ${asn_v}, %t${asn_slot}\n")
 		}
 		if k == 2 then {
-			const Str ret_v = emit_stmt_expr(ctx, s, env)
+			const Str ret_v = emit_expr(stmt_expr(s), ctx, env)
 			write_str(ctx.fd, "\tret ${ret_v}\n")
 			did_return = 1
 		}
