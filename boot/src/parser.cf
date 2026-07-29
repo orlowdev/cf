@@ -11,7 +11,7 @@
 # mutated accumulator.
 
 import "io" as { die }
-import "token" as { Token, TokKind, is_ident, is_intlit, is_lparen, is_rparen, is_lbrace, is_rbrace, is_eq, is_arrow, is_minus, is_plus, is_star, is_slash, is_percent }
+import "token" as { Token, TokKind, is_ident, is_intlit, is_lparen, is_rparen, is_lbrace, is_rbrace, is_eq, is_arrow, is_minus, is_plus, is_star, is_slash, is_percent, is_amp, is_pipe, is_caret, is_shl, is_shr }
 import "ast" as { Expr }
 
 # The parse cursor: the token stream, the source (for keyword text), a position.
@@ -38,9 +38,54 @@ const slice_eq = (*[Uint8] src, Iarch start, Iarch len, Str word): Bool -> {
 	return true
 }
 
-# --- expression grammar (precedence: additive < multiplicative < unary < primary) -----
+# --- expression grammar --------------------------------------------------------------
+# precedence, loosest to tightest:
+#   bit-or `|` < bit-xor `^` < bit-and `&` < shift `<< >>` < additive `+ -`
+#     < multiplicative `* / %` < unary `-` < primary
+# every binary level is left-associative, folded by a tail-recursive `_tail` helper
+# (a `union` value cannot be reassigned, so the left-fold recurses on a fresh acc).
 
-const parse_expr = (*Parser p): Expr -> parse_additive(p)
+const parse_expr = (*Parser p): Expr -> parse_bitor(p)
+
+const parse_bitor = (*Parser p): Expr -> parse_bitor_tail(p, parse_bitxor(p))
+const parse_bitor_tail = (*Parser p, Expr acc): Expr -> {
+	if is_pipe(peek(p)) then {
+		p.pos = p.pos + 1
+		return parse_bitor_tail(p, Expr.BitOr(acc, parse_bitxor(p)))
+	}
+	return acc
+}
+
+const parse_bitxor = (*Parser p): Expr -> parse_bitxor_tail(p, parse_bitand(p))
+const parse_bitxor_tail = (*Parser p, Expr acc): Expr -> {
+	if is_caret(peek(p)) then {
+		p.pos = p.pos + 1
+		return parse_bitxor_tail(p, Expr.BitXor(acc, parse_bitand(p)))
+	}
+	return acc
+}
+
+const parse_bitand = (*Parser p): Expr -> parse_bitand_tail(p, parse_shift(p))
+const parse_bitand_tail = (*Parser p, Expr acc): Expr -> {
+	if is_amp(peek(p)) then {
+		p.pos = p.pos + 1
+		return parse_bitand_tail(p, Expr.BitAnd(acc, parse_shift(p)))
+	}
+	return acc
+}
+
+const parse_shift = (*Parser p): Expr -> parse_shift_tail(p, parse_additive(p))
+const parse_shift_tail = (*Parser p, Expr acc): Expr -> {
+	if is_shl(peek(p)) then {
+		p.pos = p.pos + 1
+		return parse_shift_tail(p, Expr.Shl(acc, parse_additive(p)))
+	}
+	if is_shr(peek(p)) then {
+		p.pos = p.pos + 1
+		return parse_shift_tail(p, Expr.Shr(acc, parse_additive(p)))
+	}
+	return acc
+}
 
 const parse_additive = (*Parser p): Expr -> parse_additive_tail(p, parse_multiplicative(p))
 const parse_additive_tail = (*Parser p, Expr acc): Expr -> {
