@@ -25,11 +25,11 @@ import "ast" as { Expr, Stmt, Param, Func, Call }
 # symbol). `next`/`label` reset per function; `funcs` is constant across the program.
 data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs }
 
-# A local binding in scope: its interned name, the temp holding its stack slot
-# pointer, whether it was declared `let` (mutable) or `const`, and whether it is a
-# pointer parameter (argv/envp) — which carries no integer value, so `slot` is
-# unused and a reference is an error.
-data Binding = { Str name, Iarch slot, Bool mutable, Bool is_ptr }
+# A word local/parameter in scope: its interned name and the temp holding its stack
+# slot pointer. Only word-valued names are bound (a pointer parameter carries no
+# value and — the typecheck phase guarantees — is never referenced), so codegen
+# needs nothing but the name→slot map.
+data Binding = { Str name, Iarch slot }
 
 # Byte-wise `Str` equality (variable-name lookup).
 const str_eq = (Str a, Str b): Bool -> {
@@ -43,13 +43,13 @@ const str_eq = (Str a, Str b): Bool -> {
 	return true
 }
 
-# The index of `name`'s binding in `env`, or -1 if unbound. The caller reads the
-# binding's slot / mutability / pointer-ness from that index.
-const lookup_index = ([Binding] env, Str name): Iarch -> {
+# The stack-slot temp of `name` in `env`. The typecheck phase has already resolved
+# every reference, so a hit is guaranteed for well-typed input.
+const lookup_slot = ([Binding] env, Str name): Iarch -> {
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(env.len) then break
-		if str_eq(env[i].name, name) then return i
+		if str_eq(env[i].name, name) then return env[i].slot
 		i = i + 1
 	}
 	return 0 - 1
@@ -78,13 +78,9 @@ const emit_neg = (*Emit ctx, Expr x, [Binding] env): Str -> {
 	return "%t${t}"
 }
 
-# Emit a variable reference: load its stack slot. A pointer parameter (argv/envp)
-# has no integer value, so referencing it as one is rejected.
+# Emit a variable reference: load its stack slot.
 const emit_var = (*Emit ctx, [Binding] env, Str name): Str -> {
-	const Iarch idx = lookup_index(env, name)
-	if idx < 0 then die("cf0: emit: reference to an undeclared variable\n")
-	if env[idx].is_ptr then die("cf0: emit: a pointer parameter is not an integer value\n")
-	const Iarch slot = env[idx].slot
+	const Iarch slot = lookup_slot(env, name)
 	const Iarch t = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${t} =w loadw %t${slot}\n")
@@ -161,18 +157,16 @@ const find_func = ([Func] funcs, Str name): Iarch -> {
 	return 0 - 1
 }
 
-# Emit a call `callee(args)`. The callee is resolved whole-program (by name to a
-# function index, so forward references and recursion work) and its argument count
-# is checked. Each argument is evaluated into a fresh numbered temp first — so the
-# call line references temp NUMBERS, not Str operands (which cannot be stored and
-# reread) — then the call is emitted. main's QBE symbol is `$main`; every other
-# function is `$f<i>` (positional, so a user name can never collide with `_start`).
+# Emit a call `callee(args)`. The callee (existence and arity already checked by the
+# typecheck phase) is mapped by name to its function index for the QBE symbol. Each
+# argument is evaluated into a fresh numbered temp first — so the call line
+# references temp NUMBERS, not Str operands (which cannot be stored and reread) —
+# then the call is emitted. main's QBE symbol is `$main`; every other function is
+# `$f<i>` (positional, so a user name can never collide with `_start`).
 const emit_call = (*Emit ctx, Call cl, [Binding] env): Str -> {
 	const Iarch fidx = find_func(ctx.funcs, cl.callee)
-	if fidx < 0 then die("cf0: emit: call to an undefined function\n")
-	const Iarch nparams = Iarch(ctx.funcs[fidx].params.len)
+	if fidx < 0 then die("cf0: emit: internal: unresolved call (should be caught by typecheck)\n")
 	const Iarch nargs = Iarch(cl.args.len)
-	if nparams != nargs then die("cf0: emit: wrong number of call arguments\n")
 	let [Iarch] tnums = []
 	let Iarch i = 0
 	loop {
@@ -244,11 +238,6 @@ const stmt_name = (Stmt s): Str -> match s {
 	Stmt.Assign(n, e) -> n,
 	Stmt.Return(e) -> ""
 }
-const stmt_mut = (Stmt s): Bool -> match s {
-	Stmt.Let(n, m, e) -> m,
-	Stmt.Assign(n, e) -> false,
-	Stmt.Return(e) -> false
-}
 # Extract a statement's sub-expression: the initializer of a `Let`, the value of an
 # `Assign`, the returned value of a `Return`. Each arm YIELDS the bound payload `e`
 # directly — an arena-borrowed alias, sound in cfcc's single never-freed arena — so
@@ -261,11 +250,11 @@ const stmt_expr = (Stmt s): Expr -> match s {
 }
 
 # Emit a block's statements in order, growing the binding environment as `let`/`const`
-# locals are declared — so a binding's initializer sees only PRIOR bindings (a
-# self-reference `const a = a` fails the variable lookup, as it should). The env is
-# seeded with the function's parameters, so a local cannot shadow a parameter and a
-# parameter cannot be reassigned (it is bound immutable). The `Return` emits the
-# function's `ret`; a block with none is rejected.
+# locals are declared. The env is seeded with the function's word parameters. Every
+# semantic rule (no shadowing, only a mutable name reassigns, a reassignment keeps
+# its type, the body returns) was enforced by the typecheck phase, so this walk just
+# generates code: a `Let`/`const` allocates a slot and stores; an `Assign` stores
+# into the existing slot; a `Return` emits the `ret`.
 const emit_block = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 	let [Binding] env = []
 	let Iarch pi = 0
@@ -274,73 +263,40 @@ const emit_block = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 		# rebuild each parameter binding as a fresh record literal — an array element
 		# must be fresh, not an alias of the passed-in vector's storage. The field
 		# values are read inline (a `Str` cannot be copy-bound to a local).
-		env = [...env, Binding({ name: params[pi].name, slot: params[pi].slot, mutable: params[pi].mutable, is_ptr: params[pi].is_ptr })]
+		env = [...env, Binding({ name: params[pi].name, slot: params[pi].slot })]
 		pi = pi + 1
 	}
-	let Bool did_return = false
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(stmts.len) then break
 		const Stmt s = stmts[i]
 		const Iarch k = stmt_kind(s)
 		if k == 0 then {
-			# `const`/`let name = init` — a name may not shadow a parameter or an earlier
-			# local. Evaluate the initializer (against the env so far), allocate a word
-			# slot, and store; then bind the name to that slot.
-			if lookup_index(env, stmt_name(s)) >= 0 then die("cf0: emit: a binding cannot shadow an existing name\n")
+			# `const`/`let name = init` — evaluate the initializer (against the env so
+			# far), allocate a word slot and store, then bind the name to that slot.
 			const Str v = emit_expr(stmt_expr(s), ctx, env)
 			const Iarch slot = ctx.next
 			ctx.next = ctx.next + 1
 			write_str(ctx.fd, "\t%t${slot} =l alloc4 4\n")
 			write_str(ctx.fd, "\tstorew ${v}, %t${slot}\n")
-			env = [...env, Binding({ name: stmt_name(s), slot: slot, mutable: stmt_mut(s), is_ptr: false })]
+			env = [...env, Binding({ name: stmt_name(s), slot: slot })]
 		}
 		if k == 1 then {
-			# `name = value` — reassign an existing local's slot. A `const` binding and a
-			# parameter are immutable; a pointer parameter has no slot.
-			const Iarch idx = lookup_index(env, stmt_name(s))
-			if idx < 0 then die("cf0: emit: assignment to an undeclared variable\n")
-			if env[idx].is_ptr then die("cf0: emit: cannot reassign a pointer parameter\n")
-			if !env[idx].mutable then die("cf0: emit: cannot reassign a `const` binding or a parameter\n")
-			const Iarch slot = env[idx].slot
+			# `name = value` — reassign an existing local's slot.
+			const Iarch slot = lookup_slot(env, stmt_name(s))
 			const Str v = emit_expr(stmt_expr(s), ctx, env)
 			write_str(ctx.fd, "\tstorew ${v}, %t${slot}\n")
 		}
 		if k == 2 then {
 			const Str v = emit_expr(stmt_expr(s), ctx, env)
 			write_str(ctx.fd, "\tret ${v}\n")
-			did_return = true
 		}
 		i = i + 1
 	}
-	if !did_return then die("cf0: emit: a function body must end with `return`\n")
 	return 0
 }
 
 # Whole-program checks before emit: exactly one `pub const main` (the entry) with at
-# most three parameters, and no two functions sharing a name.
-const resolve_program = ([Func] funcs): Iarch -> {
-	let Iarch mains = 0
-	let Iarch i = 0
-	loop {
-		if i >= Iarch(funcs.len) then break
-		let Iarch j = 0
-		loop {
-			if j >= i then break
-			if str_eq(funcs[j].name, funcs[i].name) then die("cf0: resolve: two functions share a name\n")
-			j = j + 1
-		}
-		if str_eq(funcs[i].name, "main") then {
-			if !funcs[i].is_pub then die("cf0: resolve: `main` must be `pub`\n")
-			if Iarch(funcs[i].params.len) > 3 then die("cf0: resolve: `main` takes at most three parameters\n")
-			mains = mains + 1
-		}
-		i = i + 1
-	}
-	if mains == 0 then die("cf0: resolve: no `pub const main` entry point\n")
-	return 0
-}
-
 # Emit one function: its signature, parameter spills, and body. main is the exported
 # `$main` (the entry the floor calls); every other function `idx` is the internal
 # `$f<idx>` (positional, so a user name can never collide with `_start`/`_main`).
@@ -348,8 +304,9 @@ const resolve_program = ([Func] funcs): Iarch -> {
 # Parameters are named POSITIONALLY in QBE (`%p<i>`), not by source name — the temp
 # only has to match between the signature and the spill, and a Str name cannot be
 # interpolated (cfcc interpolates bare identifiers only). A word parameter (Iarch)
-# is `w` and spills to a stack slot so it reads like a local; a pointer parameter
-# (*[Str]) is `l` and rides the signature unused. All returns are words.
+# is `w` and spills to a stack slot so it reads like a local, and is bound in the
+# env; a pointer parameter (*[Str]) is `l`, rides the signature unused, and is NOT
+# bound (the typecheck phase guarantees it is never referenced). All returns are words.
 const emit_func = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 	const Bool is_main = str_eq(fn.name, "main")
 	if is_main then write_str(ctx.fd, "export function w $main(")
@@ -368,13 +325,12 @@ const emit_func = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 	let Iarch pi = 0
 	loop {
 		if pi >= Iarch(fn.params.len) then break
-		if fn.params[pi].is_ptr then params = [...params, Binding({ name: fn.params[pi].name, slot: 0 - 1, mutable: false, is_ptr: true })]
 		if !fn.params[pi].is_ptr then {
 			const Iarch slot = ctx.next
 			ctx.next = ctx.next + 1
 			write_str(ctx.fd, "\t%t${slot} =l alloc4 4\n")
 			write_str(ctx.fd, "\tstorew %p${pi}, %t${slot}\n")
-			params = [...params, Binding({ name: fn.params[pi].name, slot: slot, mutable: false, is_ptr: false })]
+			params = [...params, Binding({ name: fn.params[pi].name, slot: slot })]
 		}
 		pi = pi + 1
 	}
@@ -384,13 +340,13 @@ const emit_func = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 }
 
 # Emit the whole program: every function (main exported, the rest internal), each
-# with a fresh temp/label counter, then the freestanding entry floor once.
+# with a fresh temp/label counter, then the freestanding entry floor once. Runs only
+# on programs the typecheck phase has accepted.
 #
 # darwin hands `main` its (argc, argv, envp) in x0/x1/x2 at the entry point, and the
 # `_start` floor does nothing before `bl _main`, so those registers flow straight
 # through — QBE reads them as `$main`'s declared arguments.
 pub const emit_program = ([Func] funcs, Uarch qbe_fd, Uarch asm_fd): Iarch -> {
-	resolve_program(funcs)
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(funcs.len) then break
