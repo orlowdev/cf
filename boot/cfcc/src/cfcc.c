@@ -2213,6 +2213,24 @@ static int is_param_name(const Func *fn, const char *name) {
 	return 0;
 }
 
+/* True if `name` is a `let` LOCAL holding a BOXED aggregate (record / tuple / boxed union). cfcc
+ * stores such a local in a REASSIGNABLE `l` pointer slot `%s_<name>` (loadl to read, storel to
+ * reassign) — not the write-once `%r_<name>` SSA temp a `const` aggregate / a param / a captured
+ * record / an array or `[T]` vector uses. Reassigning it orphans the old value in the arena (never
+ * freed — sound in the throwaway single-arena model; ⚠ cf0's memory arc reclaims/rehomes instead).
+ * This is what lets cf0 write `let Expr acc = …; acc = Expr.Add(acc, r)`. (A tag-only union is a
+ * plain word slot and needs no special handling — it reassigns like an Int. Params/captures are
+ * excluded: a captured record resolves to R_LET but is a borrow through `%u_`/`%r_`, not a slot.) */
+static int local_is_reassignable_agg(const Func *fn, const char *name) {
+	Type t;
+	if (!fn || is_param_name(fn, name))
+		return 0;
+	if (resolve_name((Func *)fn, name, &t) != R_LET)
+		return 0;
+	return t.kind == TY_RECORD || t.kind == TY_TUPLE ||
+	       (t.kind == TY_UNION && t.uni->has_payload);
+}
+
 /* If `name` is a match-arm payload binding currently in scope, return its storage id
  * (`%pb<id>`); else -1. Innermost binding wins, so a binding shadows an outer name. */
 static int find_active_bind(Func *fn, const char *name) {
@@ -4849,10 +4867,11 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 		/* Only a scalar `let` in a slot (an Int word, a float, or a fixed-width IntN/UintN) can
 		 * be reassigned as a unit; a whole record/aggregate cannot — mutate its fields with `.`.
 		 * (Aggregate copy-binding is a later concern — memory_model §6 requires an explicit copy.) */
-		if (ty.kind != TY_INT && !is_float_type(ty) && !is_fixed_type(ty) && ty.kind != TY_UARCH && ty.kind != TY_DYN) {
+		if (ty.kind != TY_INT && !is_float_type(ty) && !is_fixed_type(ty) && ty.kind != TY_UARCH &&
+		    ty.kind != TY_DYN && ty.kind != TY_UNION && ty.kind != TY_RECORD && ty.kind != TY_TUPLE) {
 			if (ty.kind == TY_ARRAY)
 				die(t->line, "cannot reassign a whole array (mutate an element with `xs[i] = …`)");
-			die(t->line, "cannot assign to a whole record (mutate a field with `.`)");
+			die(t->line, "cannot reassign this binding (a pointer, byte buffer, or `Str` local is fixed)");
 		}
 		/* A `let [T]` dynamic array accepts ONLY the grow-in-place form `xs = [...xs, e]` (validated
 		 * in the ST_ASSIGN typecheck); it never takes a compound `op=`. */
@@ -9319,6 +9338,21 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 				 * else the value must already be a Uarch (cast with `Uarch(x)`). */
 				if (s->expr->kind != EX_INT && typeof_expr(prog, fn, s->expr).kind != TY_UARCH)
 					die(s->line, "a `Uarch` `let` is reassigned a Uarch value (a literal, or cast with `Uarch(x)`)");
+			} else if (tt.kind == TY_UNION) {
+				/* A union `let` (tag-only in a word slot, or boxed in a reassignable pointer slot) is
+				 * reassigned a value of the SAME union — a member construction (`E.Add(acc, r)`), or
+				 * another union value. Aliasing is arena-safe, so no freshness gate. */
+				Type et = typeof_expr(prog, fn, s->expr);
+				if (et.kind != TY_UNION || et.uni != tt.uni)
+					die(s->line, "a union `let` is reassigned a value of its own union type");
+			} else if (tt.kind == TY_RECORD) {
+				Type et = typeof_expr(prog, fn, s->expr);
+				if (et.kind != TY_RECORD || et.rec != tt.rec)
+					die(s->line, "a record `let` is reassigned a value of its own record type");
+			} else if (tt.kind == TY_TUPLE) {
+				Type et = typeof_expr(prog, fn, s->expr);
+				if (et.kind != TY_TUPLE || !types_equal(et, tt))
+					die(s->line, "a tuple `let` is reassigned a value of its own tuple shape");
 			} else {
 				expect_int(prog, fn, s->expr);
 			}
@@ -9951,7 +9985,15 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		}
 		/* A record, byte-buffer, fixed-array, tuple, or boxed (payload) union name is an
 		 * arena pointer (`%r_<name>`), used directly as an operand; a word name (Int or
-		 * tag-only union) is a `loadw` from its slot. */
+		 * tag-only union) is a `loadw` from its slot. A `let` boxed aggregate instead holds its
+		 * pointer in a reassignable `l` slot `%s_<name>` — loadl it (so a reassignment that
+		 * repointed the slot is observed). */
+		if (local_is_reassignable_agg(ex->fn, e->name)) {
+			int t = ex->tmp++;
+			fprintf(out, "\t%%t%d =l loadl %%s_%s\n", t, e->name);
+			snprintf(dst, cap, "%%t%d", t);
+			return;
+		}
 		if (e->rtype.kind == TY_RECORD || e->rtype.kind == TY_BUF || e->rtype.kind == TY_ARRAY ||
 		    e->rtype.kind == TY_DYN || e->rtype.kind == TY_TUPLE ||
 		    (e->rtype.kind == TY_UNION && e->rtype.uni->has_payload)) {
@@ -10923,6 +10965,14 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 				fprintf(out, "\t%%r_%s =l call $cf_alloc(w %d)\n", s->name, s->bufsize);
 				break;
 			}
+			if (local_is_reassignable_agg(ex->fn, s->name)) {
+				/* A `let` boxed aggregate (record/tuple/boxed-union): build the initializer into a
+				 * temp (its own fresh arena object, via the value-position emit) and store that
+				 * pointer into the reassignable `l` slot `%s_<name>`. A later `x = …` re-stores. */
+				emit_expr(out, s->expr, ex, v, sizeof v);
+				fprintf(out, "\tstorel %s, %%s_%s\n", v, s->name);
+				break;
+			}
 			if (s->is_dyn && s->expr->kind == EX_ARRAY && !s->expr->spread) {
 				/* A `[T]` dynamic array bound to a literal (`[]` or `[e0, …]`): `%r_<name>` is the
 				 * 24-byte header `{ data@0, len@8, cap@16 }`. (A `[T]`-returning call initializer
@@ -11057,10 +11107,12 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 			}
 			emit_expr(out, s->expr, ex, v, sizeof v);
 			/* Assigning a captured word writes through its `%u_<name>` pointer (mutating the
-			 * enclosing scope's slot); a plain word/float local writes its own `%s_<name>`
-			 * slot with the store matching its type (`stored` for a Float64, else `storew`). */
-			char st = qtype_of(tt); /* the local's store width (storew/storel/stores/stored) — from the
-			                         * declared type uniformly, so any assignable scalar stores correctly */
+			 * enclosing scope's slot); any other `let` writes its own `%s_<name>` slot with the
+			 * store matching its type — `storew` for a word / tag-only union, `stored`/`stores` for
+			 * a float, and `storel` for a `Uarch` or a boxed aggregate (whose slot holds its arena
+			 * pointer; a reassignment repoints it, orphaning the old value). */
+			char st = qtype_of(tt); /* the local's store width (storew/storel/stores/stored), from its
+			                         * declared type uniformly, so any reassignable local stores correctly */
 			if (is_capture_param(ex->fn, s->name))
 				fprintf(out, "\tstore%c %s, %%u_%s\n", st, v, s->name);
 			else
@@ -11087,15 +11139,24 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 				}
 				break;
 			}
-			/* Mutate a record field: store through the record's arena pointer
-			 * (`%r_<name>`) at the field's offset. */
+			/* Mutate a record field: store through the record's arena pointer at the field's
+			 * offset. Most record locals/params name their pointer directly in `%r_<name>`; a
+			 * `let` boxed aggregate holds it in the reassignable slot `%s_<name>`, so load it first. */
 			emit_expr(out, s->expr, ex, v, sizeof v);
+			char rbase[96];
+			if (local_is_reassignable_agg(ex->fn, s->name)) {
+				int rt = ex->tmp++;
+				fprintf(out, "\t%%t%d =l loadl %%s_%s\n", rt, s->name);
+				snprintf(rbase, sizeof rbase, "%%t%d", rt);
+			} else {
+				snprintf(rbase, sizeof rbase, "%%r_%s", s->name);
+			}
 			char fst = qtype_of(s->expr->rtype); /* store the new value at the field's width (fixed → w/l) */
 			if (s->foff == 0) {
-				fprintf(out, "\tstore%c %s, %%r_%s\n", fst, v, s->name);
+				fprintf(out, "\tstore%c %s, %s\n", fst, v, rbase);
 			} else {
 				int a = ex->tmp++;
-				fprintf(out, "\t%%t%d =l add %%r_%s, %d\n", a, s->name, s->foff);
+				fprintf(out, "\t%%t%d =l add %s, %d\n", a, rbase, s->foff);
 				fprintf(out, "\tstore%c %s, %%t%d\n", fst, v, a);
 			}
 			break;
@@ -11492,6 +11553,10 @@ static void emit_func(FILE *out, const Func *fn) {
 			fprintf(out, "\t%%s_%s =l alloc%d %d\n", fn->locals[i].name,
 			        qtype_of(fn->locals[i].type) == 'l' ? 8 : 4, qtype_of(fn->locals[i].type) == 'l' ? 8 : 4);
 		else if (fn->locals[i].type.kind == TY_UARCH) /* a Uarch local: a 64-bit `l` slot */
+			fprintf(out, "\t%%s_%s =l alloc8 8\n", fn->locals[i].name);
+		else if (local_is_reassignable_agg(fn, fn->locals[i].name))
+			/* A `let` boxed aggregate (record/tuple/boxed-union): an `l` slot holds its arena
+			 * pointer, so a reassignment is a `storel` of a new pointer (the old value orphaned). */
 			fprintf(out, "\t%%s_%s =l alloc8 8\n", fn->locals[i].name);
 	}
 
