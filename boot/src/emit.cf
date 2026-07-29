@@ -17,15 +17,17 @@
 # not yet enforced (that is the typecheck brick).
 
 import "io" as { write_str, die }
-import "ast" as { Expr, Stmt }
+import "ast" as { Expr, Stmt, Param, Func }
 
 # The emit context: the QBE-IL output fd, the next free temp number, and the next
 # free basic-block label id.
 data Emit = { Uarch fd, Iarch next, Iarch label }
 
 # A local binding in scope: its interned name, the temp holding its stack slot
-# pointer, and whether it was declared `let` (mutable) or `const`.
-data Binding = { Str name, Iarch slot, Bool mutable }
+# pointer, whether it was declared `let` (mutable) or `const`, and whether it is a
+# pointer parameter (argv/envp) — which carries no integer value, so `slot` is
+# unused and a reference is an error.
+data Binding = { Str name, Iarch slot, Bool mutable, Bool is_ptr }
 
 # Byte-wise `Str` equality (variable-name lookup).
 const str_eq = (Str a, Str b): Bool -> {
@@ -39,12 +41,13 @@ const str_eq = (Str a, Str b): Bool -> {
 	return true
 }
 
-# The slot temp for `name` in `env`, or -1 if unbound.
-const lookup_slot = ([Binding] env, Str name): Iarch -> {
+# The index of `name`'s binding in `env`, or -1 if unbound. The caller reads the
+# binding's slot / mutability / pointer-ness from that index.
+const lookup_index = ([Binding] env, Str name): Iarch -> {
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(env.len) then break
-		if str_eq(env[i].name, name) then return env[i].slot
+		if str_eq(env[i].name, name) then return i
 		i = i + 1
 	}
 	return 0 - 1
@@ -73,10 +76,13 @@ const emit_neg = (*Emit ctx, Expr x, [Binding] env): Str -> {
 	return "%t${t}"
 }
 
-# Emit a variable reference: load its stack slot.
+# Emit a variable reference: load its stack slot. A pointer parameter (argv/envp)
+# has no integer value, so referencing it as one is rejected.
 const emit_var = (*Emit ctx, [Binding] env, Str name): Str -> {
-	const Iarch slot = lookup_slot(env, name)
-	if slot < 0 then die("cf0: emit: reference to an undeclared variable\n")
+	const Iarch idx = lookup_index(env, name)
+	if idx < 0 then die("cf0: emit: reference to an undeclared variable\n")
+	if env[idx].is_ptr then die("cf0: emit: a pointer parameter is not an integer value\n")
+	const Iarch slot = env[idx].slot
 	const Iarch t = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${t} =w loadw %t${slot}\n")
@@ -199,10 +205,21 @@ const stmt_expr = (Stmt s): Expr -> match s {
 
 # Emit a block's statements in order, growing the binding environment as `let`/`const`
 # locals are declared — so a binding's initializer sees only PRIOR bindings (a
-# self-reference `const a = a` fails the variable lookup, as it should). The `Return`
-# emits the function's `ret`; a block with none is rejected.
-const emit_block = (*Emit ctx, [Stmt] stmts): Iarch -> {
+# self-reference `const a = a` fails the variable lookup, as it should). The env is
+# seeded with the function's parameters, so a local cannot shadow a parameter and a
+# parameter cannot be reassigned (it is bound immutable). The `Return` emits the
+# function's `ret`; a block with none is rejected.
+const emit_block = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 	let [Binding] env = []
+	let Iarch pi = 0
+	loop {
+		if pi >= Iarch(params.len) then break
+		# rebuild each parameter binding as a fresh record literal — an array element
+		# must be fresh, not an alias of the passed-in vector's storage. The field
+		# values are read inline (a `Str` cannot be copy-bound to a local).
+		env = [...env, Binding({ name: params[pi].name, slot: params[pi].slot, mutable: params[pi].mutable, is_ptr: params[pi].is_ptr })]
+		pi = pi + 1
+	}
 	let Bool did_return = false
 	let Iarch i = 0
 	loop {
@@ -210,19 +227,25 @@ const emit_block = (*Emit ctx, [Stmt] stmts): Iarch -> {
 		const Stmt s = stmts[i]
 		const Iarch k = stmt_kind(s)
 		if k == 0 then {
-			# `const`/`let name = init` — evaluate the initializer (against the env so far),
-			# allocate a word slot, and store; then bind the name to that slot.
+			# `const`/`let name = init` — a name may not shadow a parameter or an earlier
+			# local. Evaluate the initializer (against the env so far), allocate a word
+			# slot, and store; then bind the name to that slot.
+			if lookup_index(env, stmt_name(s)) >= 0 then die("cf0: emit: a binding cannot shadow an existing name\n")
 			const Str v = emit_expr(stmt_expr(s), ctx, env)
 			const Iarch slot = ctx.next
 			ctx.next = ctx.next + 1
 			write_str(ctx.fd, "\t%t${slot} =l alloc4 4\n")
 			write_str(ctx.fd, "\tstorew ${v}, %t${slot}\n")
-			env = [...env, Binding({ name: stmt_name(s), slot: slot, mutable: stmt_mut(s) })]
+			env = [...env, Binding({ name: stmt_name(s), slot: slot, mutable: stmt_mut(s), is_ptr: false })]
 		}
 		if k == 1 then {
-			# `name = value` — reassign an existing local's slot.
-			const Iarch slot = lookup_slot(env, stmt_name(s))
-			if slot < 0 then die("cf0: emit: assignment to an undeclared variable\n")
+			# `name = value` — reassign an existing local's slot. A `const` binding and a
+			# parameter are immutable; a pointer parameter has no slot.
+			const Iarch idx = lookup_index(env, stmt_name(s))
+			if idx < 0 then die("cf0: emit: assignment to an undeclared variable\n")
+			if env[idx].is_ptr then die("cf0: emit: cannot reassign a pointer parameter\n")
+			if !env[idx].mutable then die("cf0: emit: cannot reassign a `const` binding or a parameter\n")
+			const Iarch slot = env[idx].slot
 			const Str v = emit_expr(stmt_expr(s), ctx, env)
 			write_str(ctx.fd, "\tstorew ${v}, %t${slot}\n")
 		}
@@ -237,16 +260,52 @@ const emit_block = (*Emit ctx, [Stmt] stmts): Iarch -> {
 	return 0
 }
 
-# Emit the whole program: the exported `main` (its body's statements) plus the
+# Emit the whole program: the exported `main` (its parameters + body) plus the
 # freestanding entry floor.
-pub const emit_program = ([Stmt] body, Uarch qbe_fd, Uarch asm_fd): Iarch -> {
-	write_str(qbe_fd, "export function w $main() {\n")
-	write_str(qbe_fd, "@start\n")
+#
+# darwin hands `main` its (argc, argv, envp) in x0/x1/x2 at the entry point, and
+# the `_start` floor does nothing before `bl _main`, so those registers flow
+# straight through — QBE reads them as `$main`'s declared arguments. Each word
+# parameter (argc) spills to a stack slot so it reads like a local; the pointer
+# parameters (argv/envp) ride in the signature but carry no integer value.
+pub const emit_program = (Func prog, Uarch qbe_fd, Uarch asm_fd): Iarch -> {
 	let Emit ctx = Emit({ fd: qbe_fd, next: 0, label: 0 })
-	emit_block(&ctx, body)
+	# signature: `export function w $main(w %p0, l %p1, …)`. Parameters are named
+	# POSITIONALLY (`%p<i>`), not by source name — the QBE temp only has to match
+	# between the signature and the spill, and a Str name cannot be interpolated
+	# (cfcc interpolates bare identifiers only). A word parameter (Iarch, argc) is
+	# `w`; a pointer parameter (*[Str], argv/envp) is `l`.
+	write_str(qbe_fd, "export function w $main(")
+	let Iarch si = 0
+	loop {
+		if si >= Iarch(prog.params.len) then break
+		if si > 0 then write_str(qbe_fd, ", ")
+		if prog.params[si].is_ptr then write_str(qbe_fd, "l %p${si}")
+		if !prog.params[si].is_ptr then write_str(qbe_fd, "w %p${si}")
+		si = si + 1
+	}
+	write_str(qbe_fd, ") {\n")
+	write_str(qbe_fd, "@start\n")
+	# spill each word parameter into a stack slot and build the parameter bindings;
+	# a pointer parameter carries no slot. All parameters are immutable.
+	let [Binding] params = []
+	let Iarch pi = 0
+	loop {
+		if pi >= Iarch(prog.params.len) then break
+		if prog.params[pi].is_ptr then params = [...params, Binding({ name: prog.params[pi].name, slot: 0 - 1, mutable: false, is_ptr: true })]
+		if !prog.params[pi].is_ptr then {
+			const Iarch slot = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(qbe_fd, "\t%t${slot} =l alloc4 4\n")
+			write_str(qbe_fd, "\tstorew %p${pi}, %t${slot}\n")
+			params = [...params, Binding({ name: prog.params[pi].name, slot: slot, mutable: false, is_ptr: false })]
+		}
+		pi = pi + 1
+	}
+	emit_block(&ctx, prog.body, params)
 	write_str(qbe_fd, "}\n")
-	# asm floor: the freestanding entry. `_start` forwards argc/argv/envp (unused),
-	# calls `_main`, then exit-syscalls its return (in x0).
+	# asm floor: the freestanding entry. `_start` calls `_main` (argc/argv/envp still
+	# in x0/x1/x2 from the kernel), then exit-syscalls its return (in x0).
 	write_str(asm_fd, ".globl _start\n")
 	write_str(asm_fd, ".p2align 2\n")
 	write_str(asm_fd, "_start:\n")

@@ -9,8 +9,8 @@
 # (`acc = Expr.Add(acc, rhs)`) — one function per precedence level.
 
 import "io" as { die }
-import "token" as { Token, TokKind, is_ident, is_intlit, is_lparen, is_rparen, is_lbrace, is_rbrace, is_eq, is_arrow, is_minus, is_plus, is_star, is_slash, is_percent, is_amp, is_pipe, is_caret, is_shl, is_shr, is_eqeq, is_ne, is_lt, is_gt, is_le, is_ge, is_logand, is_logor }
-import "ast" as { Expr, Stmt }
+import "token" as { Token, TokKind, is_ident, is_intlit, is_lparen, is_rparen, is_lbrace, is_rbrace, is_lbracket, is_rbracket, is_comma, is_eq, is_arrow, is_minus, is_plus, is_star, is_slash, is_percent, is_amp, is_pipe, is_caret, is_shl, is_shr, is_eqeq, is_ne, is_lt, is_gt, is_le, is_ge, is_logand, is_logor }
+import "ast" as { Expr, Stmt, Param, Func }
 
 # The parse cursor: the token stream, the source (for keyword text), a position.
 pub data Parser = { [Token] toks, *[Uint8] src, Iarch pos }
@@ -298,9 +298,76 @@ const parse_block = (*Parser p): [Stmt] -> {
 	return stmts
 }
 
-# --- the whole program: `[pub] const main = () -> <body>` -----------------------------
+# --- parameters -----------------------------------------------------------------------
 
-pub const parse_program = (*Parser p): [Stmt] -> {
+# Byte-wise `Str` equality (duplicate-parameter detection).
+const str_eq = (Str a, Str b): Bool -> {
+	if a.len != b.len then return false
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(a.len) then break
+		if Iarch(a[i]) != Iarch(b[i]) then return false
+		i = i + 1
+	}
+	return true
+}
+
+# Is `name` already among the parameters parsed so far?
+const params_has = ([Param] params, Str name): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(params.len) then break
+		if str_eq(params[i].name, name) then return true
+		i = i + 1
+	}
+	return false
+}
+
+# A single parameter: `<type> <name>`. The type is either a word type-name
+# identifier (e.g. `Iarch`) or a pointer type `*[Elem]` (e.g. `*[Str]`). Only the
+# word/pointer split is retained (in `Param.is_ptr`); the element type is skipped.
+const parse_param = (*Parser p): Param -> {
+	let Bool is_ptr = false
+	if is_star(peek(p)) then {
+		is_ptr = true
+		p.pos = p.pos + 1
+		if !is_lbracket(peek(p)) then die("cf0: parse: expected `[` in a pointer parameter type\n")
+		p.pos = p.pos + 1
+		if !is_ident(peek(p)) then die("cf0: parse: expected an element type name\n")
+		p.pos = p.pos + 1
+		if !is_rbracket(peek(p)) then die("cf0: parse: expected `]`\n")
+		p.pos = p.pos + 1
+	} else {
+		if !is_ident(peek(p)) then die("cf0: parse: expected a parameter type\n")
+		p.pos = p.pos + 1
+	}
+	if !is_ident(peek(p)) then die("cf0: parse: expected a parameter name\n")
+	const Str name = cur_name(p)
+	p.pos = p.pos + 1
+	return Param({ name: name, is_ptr: is_ptr })
+}
+
+# The parenthesised parameter list. `main`'s entry arity is a prefix of
+# `(argc, argv, envp)`, so at most three; a repeated name is rejected.
+const parse_params = (*Parser p): [Param] -> {
+	let [Param] params = []
+	if is_rparen(peek(p)) then return params
+	loop {
+		const Param pm = parse_param(p)
+		if params_has(params, pm.name) then die("cf0: parse: duplicate parameter name\n")
+		# append a fresh record literal (an array element must be fresh, not the
+		# alias `pm`); the field values are read inline.
+		params = [...params, Param({ name: pm.name, is_ptr: pm.is_ptr })]
+		if Iarch(params.len) > 3 then die("cf0: parse: `main` takes at most three parameters\n")
+		if !is_comma(peek(p)) then break
+		p.pos = p.pos + 1
+	}
+	return params
+}
+
+# --- the whole program: `[pub] const main = (params) -> <body>` -----------------------
+
+pub const parse_program = (*Parser p): Func -> {
 	# optional `pub`
 	if kw(p, "pub") then p.pos = p.pos + 1
 	# `const`
@@ -312,10 +379,11 @@ pub const parse_program = (*Parser p): [Stmt] -> {
 	# `=`
 	if !is_eq(peek(p)) then die("cf0: parse: expected `=`\n")
 	p.pos = p.pos + 1
-	# `(` `)` — empty parameter list (this brick)
+	# `(` params `)`
 	if !is_lparen(peek(p)) then die("cf0: parse: expected `(`\n")
 	p.pos = p.pos + 1
-	if !is_rparen(peek(p)) then die("cf0: parse: expected `)` (main takes no parameters yet)\n")
+	const [Param] params = parse_params(p)
+	if !is_rparen(peek(p)) then die("cf0: parse: expected `)`\n")
 	p.pos = p.pos + 1
 	# `->`
 	if !is_arrow(peek(p)) then die("cf0: parse: expected `->`\n")
@@ -323,8 +391,10 @@ pub const parse_program = (*Parser p): [Stmt] -> {
 	# body: a block `{ … }`, or a bare expression (sugar for `{ return <expr> }`)
 	if is_lbrace(peek(p)) then {
 		p.pos = p.pos + 1
-		return parse_block(p)
+		const [Stmt] body = parse_block(p)
+		return Func({ params: params, body: body })
 	}
 	const [Stmt] empty = []
-	return [...empty, Stmt.Return(parse_expr(p))]
+	const [Stmt] one = [...empty, Stmt.Return(parse_expr(p))]
+	return Func({ params: params, body: one })
 }
