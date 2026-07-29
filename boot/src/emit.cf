@@ -17,8 +17,9 @@
 import "io" as { write_str }
 import "ast" as { Expr }
 
-# The emit context: the QBE-IL output fd and the next free temp number.
-data Emit = { Uarch fd, Iarch next }
+# The emit context: the QBE-IL output fd, the next free temp number, and the next
+# free basic-block label id.
+data Emit = { Uarch fd, Iarch next, Iarch label }
 
 # Emit a binary operator node: evaluate both operands, then combine into a fresh
 # temp. Operands are bound (not passed as call arguments) so evaluation order —
@@ -41,6 +42,33 @@ const emit_neg = (*Emit ctx, Expr x): Str -> {
 	return "%t${t}"
 }
 
+# Emit an `if <cond> then <a> else <b>` value. The branches merge through a stack
+# slot (not a phi): evaluate the condition, branch, each arm stores its value into
+# the slot, and the join block loads it. Robust under nesting; QBE accepts an
+# `alloc` in a non-entry block.
+const emit_if = (*Emit ctx, Expr cond, Expr thenE, Expr elseE): Str -> {
+	const Str c = emit_expr(cond, ctx)
+	const Iarch slot = ctx.next
+	ctx.next = ctx.next + 1
+	const Iarch lid = ctx.label
+	ctx.label = ctx.label + 1
+	write_str(ctx.fd, "\t%t${slot} =l alloc4 4\n")
+	write_str(ctx.fd, "\tjnz ${c}, @then${lid}, @else${lid}\n")
+	write_str(ctx.fd, "@then${lid}\n")
+	const Str a = emit_expr(thenE, ctx)
+	write_str(ctx.fd, "\tstorew ${a}, %t${slot}\n")
+	write_str(ctx.fd, "\tjmp @end${lid}\n")
+	write_str(ctx.fd, "@else${lid}\n")
+	const Str b = emit_expr(elseE, ctx)
+	write_str(ctx.fd, "\tstorew ${b}, %t${slot}\n")
+	write_str(ctx.fd, "\tjmp @end${lid}\n")
+	write_str(ctx.fd, "@end${lid}\n")
+	const Iarch rt = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${rt} =w loadw %t${slot}\n")
+	return "%t${rt}"
+}
+
 const emit_expr = (Expr e, *Emit ctx): Str -> match e {
 	Expr.Lit(v) -> "${v}",
 	Expr.Neg(x) -> emit_neg(ctx, x),
@@ -53,7 +81,14 @@ const emit_expr = (Expr e, *Emit ctx): Str -> match e {
 	Expr.BitOr(l, r) -> emit_binop(ctx, "or", l, r),
 	Expr.BitXor(l, r) -> emit_binop(ctx, "xor", l, r),
 	Expr.Shl(l, r) -> emit_binop(ctx, "shl", l, r),
-	Expr.Shr(l, r) -> emit_binop(ctx, "sar", l, r)
+	Expr.Shr(l, r) -> emit_binop(ctx, "sar", l, r),
+	Expr.CmpEq(l, r) -> emit_binop(ctx, "ceqw", l, r),
+	Expr.CmpNe(l, r) -> emit_binop(ctx, "cnew", l, r),
+	Expr.CmpLt(l, r) -> emit_binop(ctx, "csltw", l, r),
+	Expr.CmpGt(l, r) -> emit_binop(ctx, "csgtw", l, r),
+	Expr.CmpLe(l, r) -> emit_binop(ctx, "cslew", l, r),
+	Expr.CmpGe(l, r) -> emit_binop(ctx, "csgew", l, r),
+	Expr.If(cond, thenE, elseE) -> emit_if(ctx, cond, thenE, elseE)
 }
 
 # Emit the whole program: the exported `main` (returning the body's word value)
@@ -61,7 +96,7 @@ const emit_expr = (Expr e, *Emit ctx): Str -> match e {
 pub const emit_program = (Expr body, Uarch qbe_fd, Uarch asm_fd): Iarch -> {
 	write_str(qbe_fd, "export function w $main() {\n")
 	write_str(qbe_fd, "@start\n")
-	let Emit ctx = Emit({ fd: qbe_fd, next: 0 })
+	let Emit ctx = Emit({ fd: qbe_fd, next: 0, label: 0 })
 	const Str result = emit_expr(body, &ctx)
 	write_str(qbe_fd, "\tret ${result}\n")
 	write_str(qbe_fd, "}\n")

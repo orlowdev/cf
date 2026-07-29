@@ -11,7 +11,7 @@
 # mutated accumulator.
 
 import "io" as { die }
-import "token" as { Token, TokKind, is_ident, is_intlit, is_lparen, is_rparen, is_lbrace, is_rbrace, is_eq, is_arrow, is_minus, is_plus, is_star, is_slash, is_percent, is_amp, is_pipe, is_caret, is_shl, is_shr }
+import "token" as { Token, TokKind, is_ident, is_intlit, is_lparen, is_rparen, is_lbrace, is_rbrace, is_eq, is_arrow, is_minus, is_plus, is_star, is_slash, is_percent, is_amp, is_pipe, is_caret, is_shl, is_shr, is_eqeq, is_ne, is_lt, is_gt, is_le, is_ge }
 import "ast" as { Expr }
 
 # The parse cursor: the token stream, the source (for keyword text), a position.
@@ -40,12 +40,42 @@ const slice_eq = (*[Uint8] src, Iarch start, Iarch len, Str word): Bool -> {
 
 # --- expression grammar --------------------------------------------------------------
 # precedence, loosest to tightest:
-#   bit-or `|` < bit-xor `^` < bit-and `&` < shift `<< >>` < additive `+ -`
-#     < multiplicative `* / %` < unary `-` < primary
-# every binary level is left-associative, folded by a tail-recursive `_tail` helper
-# (a `union` value cannot be reassigned, so the left-fold recurses on a fresh acc).
+#   comparison `== != < > <= >=` < bit-or `|` < bit-xor `^` < bit-and `&`
+#     < shift `<< >>` < additive `+ -` < multiplicative `* / %` < unary `-` < primary
+# every binary level except comparison is left-associative, folded by a tail-recursive
+# `_tail` helper (a `union` value cannot be reassigned, so the left-fold recurses on a
+# fresh acc). Comparison is NON-associative — a single compare, no chaining.
 
-const parse_expr = (*Parser p): Expr -> parse_bitor(p)
+const parse_expr = (*Parser p): Expr -> parse_comparison(p)
+
+const parse_comparison = (*Parser p): Expr -> {
+	const Expr lhs = parse_bitor(p)
+	if is_eqeq(peek(p)) then {
+		p.pos = p.pos + 1
+		return Expr.CmpEq(lhs, parse_bitor(p))
+	}
+	if is_ne(peek(p)) then {
+		p.pos = p.pos + 1
+		return Expr.CmpNe(lhs, parse_bitor(p))
+	}
+	if is_lt(peek(p)) then {
+		p.pos = p.pos + 1
+		return Expr.CmpLt(lhs, parse_bitor(p))
+	}
+	if is_gt(peek(p)) then {
+		p.pos = p.pos + 1
+		return Expr.CmpGt(lhs, parse_bitor(p))
+	}
+	if is_le(peek(p)) then {
+		p.pos = p.pos + 1
+		return Expr.CmpLe(lhs, parse_bitor(p))
+	}
+	if is_ge(peek(p)) then {
+		p.pos = p.pos + 1
+		return Expr.CmpGe(lhs, parse_bitor(p))
+	}
+	return lhs
+}
 
 const parse_bitor = (*Parser p): Expr -> parse_bitor_tail(p, parse_bitxor(p))
 const parse_bitor_tail = (*Parser p, Expr acc): Expr -> {
@@ -125,7 +155,23 @@ const parse_unary = (*Parser p): Expr -> {
 	return parse_primary(p)
 }
 
+# `if <cond> then <a> else <b>` — a value-producing conditional expression. `else`
+# is required (an else-less `if` is an `Option`, a later brick). The condition is a
+# `Bool` (a comparison); no truthiness (§5).
+const parse_if = (*Parser p): Expr -> {
+	p.pos = p.pos + 1 # `if`
+	const Expr cond = parse_expr(p)
+	if !kw(p, "then") then die("cf0: parse: expected `then`\n")
+	p.pos = p.pos + 1
+	const Expr thenE = parse_expr(p)
+	if !kw(p, "else") then die("cf0: parse: expected `else` (an else-less `if` is a later brick)\n")
+	p.pos = p.pos + 1
+	const Expr elseE = parse_expr(p)
+	return Expr.If(cond, thenE, elseE)
+}
+
 const parse_primary = (*Parser p): Expr -> {
+	if kw(p, "if") then return parse_if(p)
 	if is_intlit(peek(p)) then {
 		const Iarch v = p.toks[p.pos].ival
 		p.pos = p.pos + 1
