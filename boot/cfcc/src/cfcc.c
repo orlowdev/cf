@@ -2265,23 +2265,26 @@ static int find_active_bind_type(Func *fn, const char *name, Type *ty) {
 static void func_add_local(Func *fn, const char *name, int mutable, Type ty, const char *type_name) {
 	/* Block scoping: an in-scope collision is rejected earlier (name_in_scope); any same-name local
 	 * still here is a CLOSED sibling reusing the name. Reuse shares ONE stack slot (deduped in
-	 * emit_func), so it is sound only when (a) the type matches — a differing type would need a
-	 * distinct slot — and (b) the local is slot-backed (`%s_<name>`): a word, Str, float, fixed-
-	 * width int, Uarch, or a `let` boxed aggregate. A `const` record/tuple/buffer/array/`[T]` lives
-	 * in a write-once `%r_<name>` temp, which reusing across two blocks would assign twice (illegal
-	 * SSA), so it keeps a unique name. ⚠ cf0 must NOT inherit: cf0 gives each block binding its own
-	 * storage regardless of type. */
-	int slot_backed = type_is_word(ty) || ty.kind == TY_STR || is_float_type(ty) || is_fixed_type(ty) ||
-	                  ty.kind == TY_UARCH ||
-	                  (mutable && (ty.kind == TY_RECORD || ty.kind == TY_TUPLE ||
-	                               (ty.kind == TY_UNION && ty.uni->has_payload)));
+	 * emit_func); post-parse resolve_name returns the FIRST such entry, so the reuse is sound only
+	 * when the two are indistinguishable by everything resolve_name reports — same TYPE and same
+	 * const/`let` MUTABILITY. Restrict reuse to a SCALAR slot type (word, Str, float, fixed-width
+	 * int, Uarch): those have a concrete parse-time type (so types_equal is meaningful) and a single
+	 * `%s_<name>` slot. An aggregate keeps a unique name — its parse-time type is provisional
+	 * (TY_RECORD/rec=NULL, so types_equal can't tell two record types apart), a `const` one lives in
+	 * a write-once `%r_<name>` temp (reuse would double-assign, illegal SSA), and a mismatched
+	 * mutability would make resolve_name mis-report const-vs-let. ⚠ cf0 must NOT inherit: cf0 gives
+	 * each block binding its own storage regardless of type. */
+	int scalar_slot = type_is_word(ty) || ty.kind == TY_STR || is_float_type(ty) ||
+	                  is_fixed_type(ty) || ty.kind == TY_UARCH;
 	for (int i = 0; i < fn->nlocals; i++)
 		if (fn->locals[i].closed && strcmp(fn->locals[i].name, name) == 0) {
+			if (!scalar_slot)
+				die(0, "cfcc reuses only a SCALAR block-local name across sibling blocks "
+				       "(a record/tuple/union/buffer/array keeps a unique name)");
 			if (!types_equal(fn->locals[i].type, ty))
 				die(0, "a reused block-local name must keep its type in cfcc (a sibling block gave it a different type)");
-			if (!slot_backed)
-				die(0, "cfcc reuses only a scalar / slot-backed block-local name across sibling blocks "
-				       "(a `const` record/tuple/buffer/array keeps a unique name)");
+			if (fn->locals[i].mutable != mutable)
+				die(0, "a reused block-local name must keep the same `const`/`let` in cfcc (a sibling block changed it)");
 		}
 	if (fn->nlocals == fn->cap_locals) {
 		fn->cap_locals = fn->cap_locals ? fn->cap_locals * 2 : 16;
@@ -9397,15 +9400,27 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 			} else if (tt.kind == TY_UNION) {
 				/* A union `let` (tag-only in a word slot, or boxed in a reassignable pointer slot) is
 				 * reassigned a value of the SAME union — a member construction (`E.Add(acc, r)`), or
-				 * another union value. Aliasing is arena-safe, so no freshness gate. */
+				 * another union value. Aliasing is arena-safe, so no freshness gate. A BOXED union
+				 * needs a genuine reassignable slot: a captured/param boxed union has none (its
+				 * storage is a `%r_`/`%u_` borrow), so whole-reassigning it would emit into an
+				 * unreserved slot — reject it here. */
+				if (tt.uni->has_payload && !local_is_reassignable_agg(fn, s->name))
+					die(s->line, "cannot reassign a whole captured or parameter union (only a `let` local has reassignable storage)");
 				Type et = typeof_expr(prog, fn, s->expr);
 				if (et.kind != TY_UNION || et.uni != tt.uni)
 					die(s->line, "a union `let` is reassigned a value of its own union type");
 			} else if (tt.kind == TY_RECORD) {
+				/* Whole-record reassignment needs a `let` local's reassignable `%s_` slot; a captured
+				 * or parameter record has only a `%r_`/`%u_` borrow (no `%s_` slot), so reject it
+				 * rather than emit `storel` into an unreserved slot (invalid QBE). */
+				if (!local_is_reassignable_agg(fn, s->name))
+					die(s->line, "cannot reassign a whole captured or parameter record (only a `let` local has reassignable storage)");
 				Type et = typeof_expr(prog, fn, s->expr);
 				if (et.kind != TY_RECORD || et.rec != tt.rec)
 					die(s->line, "a record `let` is reassigned a value of its own record type");
 			} else if (tt.kind == TY_TUPLE) {
+				if (!local_is_reassignable_agg(fn, s->name))
+					die(s->line, "cannot reassign a whole captured or parameter tuple (only a `let` local has reassignable storage)");
 				Type et = typeof_expr(prog, fn, s->expr);
 				if (et.kind != TY_TUPLE || !types_equal(et, tt))
 					die(s->line, "a tuple `let` is reassigned a value of its own tuple shape");
