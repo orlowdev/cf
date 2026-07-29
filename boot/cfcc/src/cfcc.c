@@ -5756,6 +5756,22 @@ static void rename_apply(const Renames *r, char *name, size_t cap) {
 static void rename_type(const Renames *r, char *name, size_t cap) {
 	if (name[0] == '\0')
 		return;
+	if (name[0] == '[') {
+		/* A `[Elem]` dynamic-array field/payload marker — rename the element inside the brackets
+		 * (a cross-module element type must map like any other), then rewrap. */
+		size_t n = strlen(name);
+		if (n >= 3 && name[n - 1] == ']') {
+			char inner[128];
+			snprintf(inner, sizeof inner, "%.*s", (int)(n - 2), name + 1);
+			rename_type(r, inner, sizeof inner);
+			char out[128];
+			int w = snprintf(out, sizeof out, "[%s]", inner);
+			if (w < 0 || (size_t)w >= cap)
+				die(0, "mangled type name too long");
+			snprintf(name, cap, "%s", out);
+		}
+		return;
+	}
 	int star = name[0] == '*';
 	const char *body = star ? name + 1 : name;
 	if (strchr(body, '.') && strlen(body) < 256) {
@@ -5831,6 +5847,7 @@ static void rename_expr(const Renames *r, Expr *e) {
 static void rename_stmt(const Renames *r, Stmt *s) {
 	for (; s; s = s->next) {
 		rename_type(r, s->type_name, sizeof s->type_name); /* ST_LOCAL record/union annotation */
+		rename_type(r, s->arr_elem, sizeof s->arr_elem);   /* ST_LOCAL `[N T]`/`[T]` element type */
 		rename_expr(r, s->expr);
 		rename_expr(r, s->yval);
 		rename_stmt(r, s->body);
@@ -5842,6 +5859,7 @@ static void rename_stmt(const Renames *r, Stmt *s) {
  * types, and a function-type param's component/return descriptors (recursively). */
 static void rename_param(const Renames *r, Param *p) {
 	rename_type(r, p->type_name, sizeof p->type_name);
+	rename_type(r, p->arr_elem, sizeof p->arr_elem); /* a `[N T]`/`[T]` param's element type */
 	for (int i = 0; i < p->tuple_n; i++)
 		rename_type(r, p->tuple_types[i], sizeof p->tuple_types[i]);
 	for (int i = 0; i < p->fn_arity; i++)
@@ -5857,6 +5875,7 @@ static void rename_func(const Renames *r, Func *f) {
 	for (int i = 0; i < f->nparams; i++)
 		rename_param(r, &f->params[i]);
 	rename_type(r, f->ret_type_name, sizeof f->ret_type_name);
+	rename_type(r, f->ret_elem, sizeof f->ret_elem); /* a `[N T]`/`[T]` return's element type */
 	for (int i = 0; i < f->ret_tuple_n; i++)
 		rename_type(r, f->ret_tuple_types[i], sizeof f->ret_tuple_types[i]);
 	for (int i = 0; i < f->ntyparams; i++)
