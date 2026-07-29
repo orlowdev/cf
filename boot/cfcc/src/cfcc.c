@@ -2221,6 +2221,14 @@ static int is_param_name(const Func *fn, const char *name) {
 	return 0;
 }
 
+/* An aggregate that is an `l` arena pointer and so CAN merge through the 8-byte `%m` slot (storel/
+ * loadl) exactly like a Str — a record, a tuple, or a BOXED (payload) union. A tag-only union is a
+ * word (already a mergeable scalar); a by-value aggregate is only mergeable when every branch is a
+ * fresh producer (see is_fresh_producer), which the if/match typecheck enforces. */
+static int is_aggregate_pointer(Type t) {
+	return t.kind == TY_RECORD || t.kind == TY_TUPLE || (t.kind == TY_UNION && t.uni->has_payload);
+}
+
 /* True if `name` is a `let` LOCAL holding a BOXED aggregate (record / tuple / boxed union). cfcc
  * stores such a local in a REASSIGNABLE `l` pointer slot `%s_<name>` (loadl to read, storel to
  * reassign) — not the write-once `%r_<name>` SSA temp a `const` aggregate / a param / a captured
@@ -2235,8 +2243,7 @@ static int local_is_reassignable_agg(const Func *fn, const char *name) {
 		return 0;
 	if (resolve_name((Func *)fn, name, &t) != R_LET)
 		return 0;
-	return t.kind == TY_RECORD || t.kind == TY_TUPLE ||
-	       (t.kind == TY_UNION && t.uni->has_payload);
+	return is_aggregate_pointer(t);
 }
 
 /* If `name` is a match-arm payload binding currently in scope, return its storage id
@@ -7368,7 +7375,6 @@ static Type typeof_expr(Program *prog, Func *fn, Expr *e);
 static Type func_ret_type(const Func *fn);
 static int is_fresh_producer(const Expr *e);  /* forward: aggregate array/tuple element freshness gate */
 static int is_mergeable_arm(const Expr *e);   /* forward: aggregate if/match/`<- v` merge gate (laxer than fresh) */
-static int is_aggregate_pointer(Type t);      /* forward: a record/tuple/boxed-union `l` pointer */
 static void resolve_record_literal(Program *prog, Func *fn, Expr *e, DataDecl *d);
 static void resolve_array_literal(Program *prog, Func *fn, Expr *e, Type elem); /* forward: `[N T]` literal vs an element type */
 
@@ -7806,14 +7812,6 @@ static int is_mergeable_arm(const Expr *e) {
 	default:
 		return 0;
 	}
-}
-
-/* An aggregate that is an `l` arena pointer and so CAN merge through the 8-byte `%m` slot (storel/
- * loadl) exactly like a Str — a record, a tuple, or a BOXED (payload) union. A tag-only union is a
- * word (already a mergeable scalar); a by-value aggregate is only mergeable when every branch is a
- * fresh producer (see is_fresh_producer), which the if/match typecheck enforces. */
-static int is_aggregate_pointer(Type t) {
-	return t.kind == TY_RECORD || t.kind == TY_TUPLE || (t.kind == TY_UNION && t.uni->has_payload);
 }
 
 /* Compute and validate the type of an expression, resolving field accesses and
@@ -9409,21 +9407,16 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 				Type et = typeof_expr(prog, fn, s->expr);
 				if (et.kind != TY_UNION || et.uni != tt.uni)
 					die(s->line, "a union `let` is reassigned a value of its own union type");
-			} else if (tt.kind == TY_RECORD) {
-				/* Whole-record reassignment needs a `let` local's reassignable `%s_` slot; a captured
-				 * or parameter record has only a `%r_`/`%u_` borrow (no `%s_` slot), so reject it
-				 * rather than emit `storel` into an unreserved slot (invalid QBE). */
+			} else if (tt.kind == TY_RECORD || tt.kind == TY_TUPLE) {
+				/* Whole-record/tuple reassignment needs a `let` local's reassignable `%s_` slot; a
+				 * captured or parameter aggregate has only a `%r_`/`%u_` borrow (no `%s_` slot), so
+				 * reject it rather than emit `storel` into an unreserved slot (invalid QBE). The value
+				 * must be the SAME aggregate — types_equal covers both a record's nominal identity and
+				 * a tuple's structural shape. */
 				if (!local_is_reassignable_agg(fn, s->name))
-					die(s->line, "cannot reassign a whole captured or parameter record (only a `let` local has reassignable storage)");
-				Type et = typeof_expr(prog, fn, s->expr);
-				if (et.kind != TY_RECORD || et.rec != tt.rec)
-					die(s->line, "a record `let` is reassigned a value of its own record type");
-			} else if (tt.kind == TY_TUPLE) {
-				if (!local_is_reassignable_agg(fn, s->name))
-					die(s->line, "cannot reassign a whole captured or parameter tuple (only a `let` local has reassignable storage)");
-				Type et = typeof_expr(prog, fn, s->expr);
-				if (et.kind != TY_TUPLE || !types_equal(et, tt))
-					die(s->line, "a tuple `let` is reassigned a value of its own tuple shape");
+					die(s->line, "cannot reassign a whole captured or parameter aggregate (only a `let` local has reassignable storage)");
+				if (!types_equal(typeof_expr(prog, fn, s->expr), tt))
+					die(s->line, "an aggregate `let` is reassigned a value of its own type");
 			} else {
 				expect_int(prog, fn, s->expr);
 			}
