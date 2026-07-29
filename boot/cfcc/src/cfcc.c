@@ -7288,7 +7288,8 @@ static void desugar_group_calls(Program *prog) {
 
 static Type typeof_expr(Program *prog, Func *fn, Expr *e);
 static Type func_ret_type(const Func *fn);
-static int is_fresh_producer(const Expr *e);  /* forward: aggregate if/match/loop merge freshness gate */
+static int is_fresh_producer(const Expr *e);  /* forward: aggregate array/tuple element freshness gate */
+static int is_mergeable_arm(const Expr *e);   /* forward: aggregate if/match/`<- v` merge gate (laxer than fresh) */
 static int is_aggregate_pointer(Type t);      /* forward: a record/tuple/boxed-union `l` pointer */
 static void resolve_record_literal(Program *prog, Func *fn, Expr *e, DataDecl *d);
 static void resolve_array_literal(Program *prog, Func *fn, Expr *e, Type elem); /* forward: `[N T]` literal vs an element type */
@@ -7340,8 +7341,8 @@ static Type check_int_match(Program *prog, Func *fn, Expr *e, Type st) {
 		if (!is_mergeable_scalar(bt)) {
 			if (!is_aggregate_pointer(bt))
 				die(a->line, "a match arm yields a scalar or aggregate value");
-			if (!is_fresh_producer(a->body))
-				die(a->line, "an aggregate-valued match arm must build a FRESH value (a call or construction)");
+			if (!is_mergeable_arm(a->body))
+				die(a->line, "an aggregate-valued match arm yields a value or a bound payload, not a temporary sub-expression");
 		}
 		if (!have_rt) {
 			rt = bt;
@@ -7387,8 +7388,8 @@ static Type check_str_match(Program *prog, Func *fn, Expr *e, Type st) {
 		if (!is_mergeable_scalar(bt)) {
 			if (!is_aggregate_pointer(bt))
 				die(a->line, "a match arm yields a scalar or aggregate value");
-			if (!is_fresh_producer(a->body))
-				die(a->line, "an aggregate-valued match arm must build a FRESH value (a call or construction)");
+			if (!is_mergeable_arm(a->body))
+				die(a->line, "an aggregate-valued match arm yields a value or a bound payload, not a temporary sub-expression");
 		}
 		if (!have_rt) { rt = bt; have_rt = 1; }
 		else if (!types_equal(bt, rt)) die(a->line, "match arms must all yield the same type");
@@ -7656,8 +7657,8 @@ static void loop_yield_scan(Program *prog, Func *fn, Stmt *body, Type *rt, int *
 			 * FRESH value — no aliasing of mutable storage through the merge (§6). */
 			if (!is_aggregate_pointer(yt))
 				die(s->line, "a value-yielding loop yields a scalar or aggregate value");
-			if (!is_fresh_producer(s->yval))
-				die(s->line, "an aggregate `<- v` must build a FRESH value (a call or construction)");
+			if (!is_mergeable_arm(s->yval))
+				die(s->line, "an aggregate `<- v` yields a value or a bound payload, not a temporary sub-expression");
 		}
 		if (!*have) {
 			*rt = yt;
@@ -7694,6 +7695,34 @@ static int is_fresh_producer(const Expr *e) {
 	case EX_MATCH:
 		for (int i = 0; i < e->narms; i++)
 			if (!is_fresh_producer(e->arms[i].body))
+				return 0;
+		return e->narms > 0;
+	default:
+		return 0;
+	}
+}
+
+/* An aggregate value that may merge through the `%m` slot from an `if`/`match` branch or a `<- v`
+ * loop yield: a FRESH producer (is_fresh_producer), OR a bare aggregate variable / match-arm
+ * payload binding (an `l` arena pointer to an already-owned aggregate). Aliasing that pointer
+ * through the merge is memory-SAFE in cfcc: the single bump arena never frees, so a second pointer
+ * to an arena aggregate can never dangle — the memory_model §6 no-second-bind rule guards
+ * ownership/teardown in the FULL model (aggregates freed/rehomed), not actual safety in this
+ * throwaway tool (owner ruling, 2026-07-29). This is why a `match` arm may yield the payload it
+ * bound (`match s { Foo(e) -> e, … }`) without an explicit `copy`. ⚠ cf0 must NOT inherit: cf0's
+ * memory arc copies/rehomes an aliased aggregate; array/tuple ELEMENTS stay strict (is_fresh_producer,
+ * an element takes over distinct storage). */
+static int is_mergeable_arm(const Expr *e) {
+	if (is_fresh_producer(e))
+		return 1;
+	switch (e->kind) {
+	case EX_VAR: case EX_FIELD: /* a bare aggregate var / payload binding / aggregate field — aliases, arena-safe */
+		return 1;
+	case EX_IF:
+		return is_mergeable_arm(e->rhs) && is_mergeable_arm(e->els);
+	case EX_MATCH:
+		for (int i = 0; i < e->narms; i++)
+			if (!is_mergeable_arm(e->arms[i].body))
 				return 0;
 		return e->narms > 0;
 	default:
@@ -8402,9 +8431,9 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 			if (!is_mergeable_scalar(bt)) {
 				if (!is_aggregate_pointer(bt))
 					die(a->line, "a match arm yields a scalar or aggregate value");
-				if (!is_fresh_producer(a->body))
-					die(a->line, "an aggregate-valued match arm must build a FRESH value (a call or "
-					             "construction) — a bare aggregate variable would alias it (§6)");
+				if (!is_mergeable_arm(a->body))
+					die(a->line, "an aggregate-valued match arm yields a value or a bound payload, not a "
+					             "temporary sub-expression");
 			}
 			if (!have_rt) {
 				rt = bt;
@@ -8467,9 +8496,9 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 			 * pointer never aliases a mutable aggregate (§6 survivability). */
 			if (!is_aggregate_pointer(tb))
 				die(e->line, "an if-branch yields a scalar or aggregate value");
-			if (!is_fresh_producer(e->rhs) || !is_fresh_producer(e->els))
-				die(e->line, "an aggregate-valued if needs BOTH branches to build a FRESH value "
-				             "(a call or construction) — a bare aggregate variable would alias it (§6)");
+			if (!is_mergeable_arm(e->rhs) || !is_mergeable_arm(e->els))
+				die(e->line, "an aggregate-valued if yields a value or a bound payload in each branch, "
+				             "not a temporary sub-expression");
 		}
 		if (!types_equal(tb, eb))
 			die(e->line, "an if's `then` and `else` branches must yield the same type");
