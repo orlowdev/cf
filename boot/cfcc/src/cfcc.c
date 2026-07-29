@@ -4471,8 +4471,8 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 			s->expr = parse_expr(p, fn);
 			if (s->expr->kind != EX_ARRAY && s->expr->kind != EX_CALL)
 				die(name->line, "a `[T]` dynamic array binds an array literal (`[]` or `[e0, …]`) or a `[T]`-returning call");
-			if (s->expr->kind == EX_ARRAY && s->expr->spread)
-				die(name->line, "a `[T]` initializer is a plain literal — a `[...xs, e]` spread is only for growth `xs = [...xs, e]`");
+			/* A spread-headed initializer `= [...src, e]` is the general value-level copy-append
+			 * (typechecked/emitted via $cf_dyn_copy) — no longer restricted to in-place growth. */
 			s->is_dyn = 1;
 			snprintf(s->arr_elem, sizeof s->arr_elem, "%s", arrelem); /* "" ⇒ Iarch; resolved in typecheck */
 			Type dt = {TY_DYN, NULL, NULL, 0, NULL};
@@ -4981,7 +4981,8 @@ static Func *parse_func(Parser *p, Program *prog) {
 	if (strcmp(fn->name, "start") == 0 || strcmp(fn->name, "cf_alloc") == 0 ||
 	    strcmp(fn->name, "cf_top") == 0 || strcmp(fn->name, "cf_limit") == 0 ||
 	    strcmp(fn->name, "cf_oom") == 0 || strcmp(fn->name, "cf_mmap_fail") == 0 ||
-	    strcmp(fn->name, "cf_dyn_push") == 0 || strcmp(fn->name, "cf_uint_append") == 0 ||
+	    strcmp(fn->name, "cf_dyn_push") == 0 || strcmp(fn->name, "cf_dyn_copy") == 0 ||
+	    strcmp(fn->name, "cf_uint_append") == 0 ||
 	    strcmp(fn->name, "cf_int_append") == 0 || strcmp(fn->name, "cf_str_append") == 0 ||
 	    strcmp(fn->name, "cf_bool_append") == 0 || strcmp(fn->name, "cf_streq_bytes") == 0)
 		die(name->line, "that name is reserved for the runtime");
@@ -7910,8 +7911,21 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 		 * freshness). An annotated binding/return instead routes through resolve_array_literal
 		 * (which also ADOPTS bare int literals to a fixed-width element); this inference path is
 		 * the fallback. ⚠ cf0 must NOT inherit: uniform-8 element slots (cf0 packs). */
-		if (e->spread)
-			die(e->line, "a `[...src, e]` spread is only valid as dynamic-array growth `xs = [...xs, e]`");
+		if (e->spread) {
+			/* A value-level spread `[...src, e0, …]`: COPY the dynamic-array source and append the
+			 * trailing elements — a fresh `[T]` vector usable in any value position (return, binding,
+			 * argument). The source must be a `[T]` dynamic array; each appended element is checked
+			 * against its element type. (An in-place `xs = [...xs, e]` reassignment is optimized
+			 * separately in the ST_ASSIGN typecheck/emit — no copy; this is the general copy-append,
+			 * which emits a $cf_dyn_copy of the source before the pushes.) */
+			Type st = typeof_expr(prog, fn, e->spread);
+			if (st.kind != TY_DYN)
+				die(e->line, "a `[...src, e]` spread source must be a `[T]` dynamic array");
+			Type selem = array_elem(st);
+			for (int i = 0; i < e->nargs; i++)
+				check_member_value(prog, fn, e->args[i], selem, e->args[i]->line);
+			return st;
+		}
 		if (e->nargs == 0)
 			die(e->line, "an empty array literal `[]` needs a `[N T]` annotation (not supported yet)");
 		Type elem = typeof_expr(prog, fn, e->args[0]);
@@ -8807,6 +8821,14 @@ static void resolve_array_literal(Program *prog, Func *fn, Expr *e, Type elem) {
  * resolve_array_literal but the result type is TY_DYN (runtime length) and an empty
  * literal is legal (nargs==0 ⇒ a zero-length vector). */
 static void resolve_dyn_literal(Program *prog, Func *fn, Expr *e, Type elem) {
+	if (e->spread) {
+		/* A spread-headed initializer `const [T] xs = [...src, e0, …]`: the source must be a
+		 * `[T]` of this element type (copied by $cf_dyn_copy at emit); the trailing elements are
+		 * checked below. */
+		Type st = typeof_expr(prog, fn, e->spread);
+		if (st.kind != TY_DYN || !types_equal(array_elem(st), elem))
+			die(e->line, "a `[...src, e]` spread source must be a `[T]` dynamic array of the annotated element type");
+	}
 	for (int i = 0; i < e->nargs; i++)
 		check_member_value(prog, fn, e->args[i], elem, e->args[i]->line);
 	e->rtype = mk_dyn(elem);
@@ -10109,6 +10131,27 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		 * storew, a 64-bit int / aggregate pointer → storel) — then yield the base pointer. The
 		 * arena outlives the frame, so the pointer escapes soundly. ⚠ cf0 must NOT inherit: uniform-8
 		 * slots (cf0 packs by real element size). */
+		if (e->spread) {
+			/* A value-level spread `[...src, e0, …]`: clone the source vector into a FRESH
+			 * `{data,len,cap}` header ($cf_dyn_copy), then append each trailing element via
+			 * $cf_dyn_push (packed at the real element stride). Yields the fresh header pointer —
+			 * a distinct `[T]` value the source is not aliased by (memory_model §6). */
+			int esz = elem_size(array_elem(e->rtype));
+			const char *pstore = packed_store_op(esz);
+			char sp[96];
+			emit_expr(out, e->spread, ex, sp, sizeof sp); /* the source header pointer */
+			int hdr = ex->tmp++;
+			fprintf(out, "\t%%t%d =l call $cf_dyn_copy(l %s, w %d)\n", hdr, sp, esz);
+			for (int i = 0; i < e->nargs; i++) {
+				char ev[96];
+				emit_expr(out, e->args[i], ex, ev, sizeof ev);
+				int slot = ex->tmp++;
+				fprintf(out, "\t%%t%d =l call $cf_dyn_push(l %%t%d, w %d)\n", slot, hdr, esz);
+				fprintf(out, "\t%s %s, %%t%d\n", pstore, ev, slot);
+			}
+			snprintf(dst, cap, "%%t%d", hdr);
+			return;
+		}
 		int base = ex->tmp++;
 		fprintf(out, "\t%%t%d =l call $cf_alloc(w %d)\n", base, e->nargs * 8);
 		for (int i = 0; i < e->nargs; i++) {
@@ -10851,7 +10894,7 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 				fprintf(out, "\t%%r_%s =l call $cf_alloc(w %d)\n", s->name, s->bufsize);
 				break;
 			}
-			if (s->is_dyn && s->expr->kind == EX_ARRAY) {
+			if (s->is_dyn && s->expr->kind == EX_ARRAY && !s->expr->spread) {
 				/* A `[T]` dynamic array bound to a literal (`[]` or `[e0, …]`): `%r_<name>` is the
 				 * 24-byte header `{ data@0, len@8, cap@16 }`. (A `[T]`-returning call initializer
 				 * instead adopts the returned header pointer via the TY_DYN adopt path below.)
@@ -10891,7 +10934,7 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 				fprintf(out, "\tstorel %d, %%t%d\n", n, hc); /* cap = n */
 				break;
 			}
-			if (s->expr->kind == EX_ARRAY) {
+			if (s->expr->kind == EX_ARRAY && !s->expr->spread) {
 				/* A fixed-array local lives in the arena: bump-allocate N*8 bytes
 				 * (`%r_<name>` = the base pointer) and store each element word at
 				 * offset i*8 (uniform 8-byte slots, like a record). */
@@ -11535,6 +11578,44 @@ static void emit_runtime_qbe(FILE *out) {
 	fprintf(out, "\t%%len3 =l add %%len2, 1\n");
 	fprintf(out, "\tstorel %%len3, %%hlen\n");            /* len++ */
 	fprintf(out, "\tret %%slot\n");
+	fprintf(out, "}\n");
+	/* `[T]` value-level spread copy (the `[...src, e]` general copy-append primitive). Given a
+	 * source 24-byte header `{ l data@0, l len@8, l cap@16 }` and the element stride, allocate a
+	 * FRESH header + a fresh backing block of exactly `len` elements, byte-copy the live bytes, and
+	 * RETURN the new header — a distinct vector the source no longer aliases (memory_model §6). The
+	 * caller then $cf_dyn_push-es the trailing elements onto the fresh header. ⚠ THROWAWAY arena:
+	 * no reclaim (cf0's arc frees via `on_realloc`). */
+	fprintf(out, "function l $cf_dyn_copy(l %%shdr, w %%esize) {\n");
+	fprintf(out, "@start\n");
+	fprintf(out, "\t%%es =l extuw %%esize\n");
+	fprintf(out, "\t%%fresh =l call $cf_alloc(w 24)\n");
+	fprintf(out, "\t%%shlen =l add %%shdr, 8\n");
+	fprintf(out, "\t%%slen =l loadl %%shlen\n");
+	fprintf(out, "\t%%sdata =l loadl %%shdr\n");
+	fprintf(out, "\t%%nbytes =l mul %%slen, %%es\n");     /* live bytes (== cap bytes: fresh is exact-fit) */
+	fprintf(out, "\t%%nbw =w copy %%nbytes\n");           /* cf_alloc takes a `w` size (throwaway: huge caps truncate) */
+	fprintf(out, "\t%%ndata =l call $cf_alloc(w %%nbw)\n");
+	fprintf(out, "\t%%ip =l alloc8 8\n");
+	fprintf(out, "\tstorel 0, %%ip\n");
+	fprintf(out, "@ctop\n");
+	fprintf(out, "\t%%i =l loadl %%ip\n");
+	fprintf(out, "\t%%cdone =w cugel %%i, %%nbytes\n");   /* byte-granular copy: i >= nbytes ? */
+	fprintf(out, "\tjnz %%cdone, @cdone, @cbody\n");
+	fprintf(out, "@cbody\n");
+	fprintf(out, "\t%%sp =l add %%sdata, %%i\n");
+	fprintf(out, "\t%%dp =l add %%ndata, %%i\n");
+	fprintf(out, "\t%%b =w loadub %%sp\n");
+	fprintf(out, "\tstoreb %%b, %%dp\n");
+	fprintf(out, "\t%%i1 =l add %%i, 1\n");
+	fprintf(out, "\tstorel %%i1, %%ip\n");
+	fprintf(out, "\tjmp @ctop\n");
+	fprintf(out, "@cdone\n");
+	fprintf(out, "\tstorel %%ndata, %%fresh\n");          /* data = ndata */
+	fprintf(out, "\t%%fhlen =l add %%fresh, 8\n");
+	fprintf(out, "\tstorel %%slen, %%fhlen\n");           /* len = slen */
+	fprintf(out, "\t%%fhcap =l add %%fresh, 16\n");
+	fprintf(out, "\tstorel %%slen, %%fhcap\n");           /* cap = slen (exact fit) */
+	fprintf(out, "\tret %%fresh\n");
 	fprintf(out, "}\n");
 	/* String-interpolation append helpers (all append into a `[Uint8]` vector via $cf_dyn_push,
 	 * stride 1). itoa is a two-pass extract-then-reverse over a 24-byte stack digit buffer. These
