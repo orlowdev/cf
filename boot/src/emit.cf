@@ -1,28 +1,67 @@
-# emit — the program's exit code to QBE IL + an asm floor.
+# emit — the AST to QBE IL + an asm floor.
 #
-# cf0 cannot yet spawn `qbe`/`cc` (process-spawn is deferred to the external
-# driver), so it EMITS two text artifacts to explicit file descriptors and the
-# driver assembles them: the QBE IL (the user code, run through `qbe`) and the
-# arm64 asm floor (`_start`, emitted verbatim beside the `qbe` output, since QBE
-# has no `svc`). Tracer-bullet scope: `main` returns a constant exit code and
-# allocates nothing, so no arena/runtime is needed — just the entry stub.
+# `emit_expr` walks the expression tree with `match`, writing one QBE
+# instruction per interior node and returning the operand (`%tN`, or an inline
+# literal) that holds the node's value. A `*Emit` context threads the output fd
+# and the temp counter through the recursion. `emit_program` wraps the body in
+# the exported `main` and appends the freestanding `_start` floor.
+#
+# cf0 cannot yet spawn `qbe`/`cc`, so it emits the QBE IL and the arm64 asm floor
+# to two file descriptors and the external driver runs the `qbe`→`cc` tail.
 #
 # ⚠ THROWAWAY codegen — NOT the cf0 `%node`/`%ret` ABI or the real page/arena
-# runtime (both reintroduced at the M6/M9 representation gate). This is the
-# minimal thing that runs, mirroring cfcc's own tracer-bullet emit.
+# runtime (reintroduced at the M6/M9 representation gate). Integer ops are word
+# (`w`) ops; `/`/`%` do not yet apply the §5.6 divide-by-zero guard (added when a
+# `%0`/`/0` test enters the manifest).
 
 import "io" as { write_str }
+import "ast" as { Expr }
 
-# Emit the whole program (currently just `main -> <code>`).
-pub const emit_program = (Iarch code, Uarch qbe_fd, Uarch asm_fd): Iarch -> {
-	# QBE IL: `main` is the exported entry, returning the Int exit code (a word).
+# The emit context: the QBE-IL output fd and the next free temp number.
+data Emit = { Uarch fd, Iarch next }
+
+# Emit a binary operator node: evaluate both operands, then combine into a fresh
+# temp. Operands are bound (not passed as call arguments) so evaluation order —
+# left before right — is explicit.
+const emit_binop = (*Emit ctx, Str op, Expr l, Expr r): Str -> {
+	const Str a = emit_expr(l, ctx)
+	const Str b = emit_expr(r, ctx)
+	const Iarch t = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${t} =w ${op} ${a}, ${b}\n")
+	return "%t${t}"
+}
+
+# Emit unary negation as `0 - x` (no dependence on a QBE `neg`).
+const emit_neg = (*Emit ctx, Expr x): Str -> {
+	const Str a = emit_expr(x, ctx)
+	const Iarch t = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${t} =w sub 0, ${a}\n")
+	return "%t${t}"
+}
+
+const emit_expr = (Expr e, *Emit ctx): Str -> match e {
+	Expr.Lit(v) -> "${v}",
+	Expr.Neg(x) -> emit_neg(ctx, x),
+	Expr.Add(l, r) -> emit_binop(ctx, "add", l, r),
+	Expr.Sub(l, r) -> emit_binop(ctx, "sub", l, r),
+	Expr.Mul(l, r) -> emit_binop(ctx, "mul", l, r),
+	Expr.Div(l, r) -> emit_binop(ctx, "div", l, r),
+	Expr.Mod(l, r) -> emit_binop(ctx, "rem", l, r)
+}
+
+# Emit the whole program: the exported `main` (returning the body's word value)
+# plus the freestanding entry floor.
+pub const emit_program = (Expr body, Uarch qbe_fd, Uarch asm_fd): Iarch -> {
 	write_str(qbe_fd, "export function w $main() {\n")
 	write_str(qbe_fd, "@start\n")
-	write_str(qbe_fd, "\tret ${code}\n")
+	let Emit ctx = Emit({ fd: qbe_fd, next: 0 })
+	const Str result = emit_expr(body, &ctx)
+	write_str(qbe_fd, "\tret ${result}\n")
 	write_str(qbe_fd, "}\n")
-	# asm floor: the freestanding entry. darwin hands argc/argv/envp in x0-x2 at
-	# LC_MAIN entry; `_start` forwards them (unused here), calls `_main`, then
-	# exit-syscalls its return (in x0). `--libc none` links `-nostdlib -lSystem`.
+	# asm floor: the freestanding entry. `_start` forwards argc/argv/envp (unused),
+	# calls `_main`, then exit-syscalls its return (in x0).
 	write_str(asm_fd, ".globl _start\n")
 	write_str(asm_fd, ".p2align 2\n")
 	write_str(asm_fd, "_start:\n")

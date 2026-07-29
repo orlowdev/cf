@@ -1,67 +1,133 @@
-# parser — token stream to the program's exit code.
+# parser — token stream to an expression AST.
 #
-# Tracer-bullet scope: parse exactly `[pub] const main = () -> <body>` where the
-# body is an integer literal or a `{ return <int> }` block, and yield that
-# integer (cf0's whole "program" for now is `main`'s constant exit code). It
-# grows into the real recursive-descent parser + AST as the front end fills in.
+# Recursive descent with a `*Parser` cursor over the token stream. `main`'s body
+# is an integer arithmetic expression with the usual precedence: additive over
+# multiplicative over unary over primary (a literal or a parenthesised
+# expression). It grows a level per construct as the grammar fills in.
 #
-# The parser walks the `[Token]` stream (a borrow) with a local cursor, matching
-# each token's KIND via the `is_*` predicates and reading identifier text back
-# out of the source buffer to recognise keywords.
+# Left-associative operators fold via a tail-recursive `_tail` helper that
+# threads the accumulated left operand as a parameter — a `union` value cannot be
+# reassigned in place, so the left-fold is expressed as recursion rather than a
+# mutated accumulator.
 
 import "io" as { die }
-import "token" as { Token, is_ident, is_intlit, is_lparen, is_rparen, is_lbrace, is_rbrace, is_eq, is_arrow }
+import "token" as { Token, TokKind, is_ident, is_intlit, is_lparen, is_rparen, is_lbrace, is_rbrace, is_eq, is_arrow, is_minus, is_plus, is_star, is_slash, is_percent }
+import "ast" as { Expr }
 
-# Does token `t`'s source slice equal the keyword `kw`?
-const slice_eq = (*[Uint8] src, Iarch start, Iarch len, Str kw): Bool -> {
-	if len != Iarch(kw.len) then return false
+# The parse cursor: the token stream, the source (for keyword text), a position.
+pub data Parser = { [Token] toks, *[Uint8] src, Iarch pos }
+
+# The current token's kind.
+const peek = (*Parser p): TokKind -> p.toks[p.pos].kind
+
+# Is the current token the identifier `kw`?
+const kw = (*Parser p, Str word): Bool -> {
+	if !is_ident(peek(p)) then return false
+	return slice_eq(p.src, p.toks[p.pos].start, p.toks[p.pos].len, word)
+}
+
+# Does the token slice at (start, len) equal the keyword `word`?
+const slice_eq = (*[Uint8] src, Iarch start, Iarch len, Str word): Bool -> {
+	if len != Iarch(word.len) then return false
 	let Iarch i = 0
 	loop {
 		if i >= len then break
-		if Iarch(src[start + i]) != Iarch(kw[i]) then return false
+		if Iarch(src[start + i]) != Iarch(word[i]) then return false
 		i = i + 1
 	}
 	return true
 }
 
-# Parse the whole program and return `main`'s constant exit code.
-pub const parse_program = ([Token] toks, *[Uint8] src): Iarch -> {
-	let Iarch pos = 0
+# --- expression grammar (precedence: additive < multiplicative < unary < primary) -----
+
+const parse_expr = (*Parser p): Expr -> parse_additive(p)
+
+const parse_additive = (*Parser p): Expr -> parse_additive_tail(p, parse_multiplicative(p))
+const parse_additive_tail = (*Parser p, Expr acc): Expr -> {
+	if is_plus(peek(p)) then {
+		p.pos = p.pos + 1
+		return parse_additive_tail(p, Expr.Add(acc, parse_multiplicative(p)))
+	}
+	if is_minus(peek(p)) then {
+		p.pos = p.pos + 1
+		return parse_additive_tail(p, Expr.Sub(acc, parse_multiplicative(p)))
+	}
+	return acc
+}
+
+const parse_multiplicative = (*Parser p): Expr -> parse_multiplicative_tail(p, parse_unary(p))
+const parse_multiplicative_tail = (*Parser p, Expr acc): Expr -> {
+	if is_star(peek(p)) then {
+		p.pos = p.pos + 1
+		return parse_multiplicative_tail(p, Expr.Mul(acc, parse_unary(p)))
+	}
+	if is_slash(peek(p)) then {
+		p.pos = p.pos + 1
+		return parse_multiplicative_tail(p, Expr.Div(acc, parse_unary(p)))
+	}
+	if is_percent(peek(p)) then {
+		p.pos = p.pos + 1
+		return parse_multiplicative_tail(p, Expr.Mod(acc, parse_unary(p)))
+	}
+	return acc
+}
+
+const parse_unary = (*Parser p): Expr -> {
+	if is_minus(peek(p)) then {
+		p.pos = p.pos + 1
+		return Expr.Neg(parse_unary(p))
+	}
+	return parse_primary(p)
+}
+
+const parse_primary = (*Parser p): Expr -> {
+	if is_intlit(peek(p)) then {
+		const Iarch v = p.toks[p.pos].ival
+		p.pos = p.pos + 1
+		return Expr.Lit(v)
+	}
+	if is_lparen(peek(p)) then {
+		p.pos = p.pos + 1
+		const Expr inner = parse_expr(p)
+		if !is_rparen(peek(p)) then die("cf0: parse: expected `)`\n")
+		p.pos = p.pos + 1
+		return inner
+	}
+	die("cf0: parse: expected an integer or `(`\n")
+	return Expr.Lit(0)
+}
+
+# --- the whole program: `[pub] const main = () -> <body>` -----------------------------
+
+pub const parse_program = (*Parser p): Expr -> {
 	# optional `pub`
-	if is_ident(toks[pos].kind) then {
-		if slice_eq(src, toks[pos].start, toks[pos].len, "pub") then pos = pos + 1
-	}
+	if kw(p, "pub") then p.pos = p.pos + 1
 	# `const`
-	if !is_ident(toks[pos].kind) then die("cf0: parse: expected `const`\n")
-	if !slice_eq(src, toks[pos].start, toks[pos].len, "const") then die("cf0: parse: expected `const`\n")
-	pos = pos + 1
+	if !kw(p, "const") then die("cf0: parse: expected `const`\n")
+	p.pos = p.pos + 1
 	# `main`
-	if !is_ident(toks[pos].kind) then die("cf0: parse: expected `main`\n")
-	if !slice_eq(src, toks[pos].start, toks[pos].len, "main") then die("cf0: parse: the entry declaration must be `main`\n")
-	pos = pos + 1
+	if !kw(p, "main") then die("cf0: parse: the entry declaration must be `main`\n")
+	p.pos = p.pos + 1
 	# `=`
-	if !is_eq(toks[pos].kind) then die("cf0: parse: expected `=`\n")
-	pos = pos + 1
-	# `(` `)` — empty parameter list (tracer-bullet scope)
-	if !is_lparen(toks[pos].kind) then die("cf0: parse: expected `(`\n")
-	pos = pos + 1
-	if !is_rparen(toks[pos].kind) then die("cf0: parse: expected `)` (main takes no parameters yet)\n")
-	pos = pos + 1
+	if !is_eq(peek(p)) then die("cf0: parse: expected `=`\n")
+	p.pos = p.pos + 1
+	# `(` `)` — empty parameter list (this brick)
+	if !is_lparen(peek(p)) then die("cf0: parse: expected `(`\n")
+	p.pos = p.pos + 1
+	if !is_rparen(peek(p)) then die("cf0: parse: expected `)` (main takes no parameters yet)\n")
+	p.pos = p.pos + 1
 	# `->`
-	if !is_arrow(toks[pos].kind) then die("cf0: parse: expected `->`\n")
-	pos = pos + 1
-	# body: an integer literal, or `{ return <int> }`
-	if is_intlit(toks[pos].kind) then return toks[pos].ival
-	if is_lbrace(toks[pos].kind) then {
-		pos = pos + 1
-		if !is_ident(toks[pos].kind) then die("cf0: parse: expected `return`\n")
-		if !slice_eq(src, toks[pos].start, toks[pos].len, "return") then die("cf0: parse: expected `return`\n")
-		pos = pos + 1
-		if !is_intlit(toks[pos].kind) then die("cf0: parse: expected an integer after `return`\n")
-		const Iarch v = toks[pos].ival
-		pos = pos + 1
-		if !is_rbrace(toks[pos].kind) then die("cf0: parse: expected `}`\n")
-		return v
+	if !is_arrow(peek(p)) then die("cf0: parse: expected `->`\n")
+	p.pos = p.pos + 1
+	# body: an expression, or `{ return <expr> }`
+	if is_lbrace(peek(p)) then {
+		p.pos = p.pos + 1
+		if !kw(p, "return") then die("cf0: parse: expected `return`\n")
+		p.pos = p.pos + 1
+		const Expr body = parse_expr(p)
+		if !is_rbrace(peek(p)) then die("cf0: parse: expected `}`\n")
+		p.pos = p.pos + 1
+		return body
 	}
-	return die("cf0: parse: expected an integer or a `{ return <int> }` block\n")
+	return parse_expr(p)
 }
