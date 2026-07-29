@@ -11,7 +11,7 @@
 # mutated accumulator.
 
 import "io" as { die }
-import "token" as { Token, TokKind, is_ident, is_intlit, is_lparen, is_rparen, is_lbrace, is_rbrace, is_eq, is_arrow, is_minus, is_plus, is_star, is_slash, is_percent, is_amp, is_pipe, is_caret, is_shl, is_shr, is_eqeq, is_ne, is_lt, is_gt, is_le, is_ge }
+import "token" as { Token, TokKind, is_ident, is_intlit, is_lparen, is_rparen, is_lbrace, is_rbrace, is_eq, is_arrow, is_minus, is_plus, is_star, is_slash, is_percent, is_amp, is_pipe, is_caret, is_shl, is_shr, is_eqeq, is_ne, is_lt, is_gt, is_le, is_ge, is_logand, is_logor }
 import "ast" as { Expr }
 
 # The parse cursor: the token stream, the source (for keyword text), a position.
@@ -40,13 +40,32 @@ const slice_eq = (*[Uint8] src, Iarch start, Iarch len, Str word): Bool -> {
 
 # --- expression grammar --------------------------------------------------------------
 # precedence, loosest to tightest:
-#   comparison `== != < > <= >=` < bit-or `|` < bit-xor `^` < bit-and `&`
-#     < shift `<< >>` < additive `+ -` < multiplicative `* / %` < unary `-` < primary
+#   logical-or `||` < logical-and `&&` < comparison `== != < > <= >=`
+#     < bit-or `|` < bit-xor `^` < bit-and `&` < shift `<< >>` < additive `+ -`
+#     < multiplicative `* / %` < unary `-` < primary
 # every binary level except comparison is left-associative, folded by a tail-recursive
 # `_tail` helper (a `union` value cannot be reassigned, so the left-fold recurses on a
 # fresh acc). Comparison is NON-associative — a single compare, no chaining.
 
-const parse_expr = (*Parser p): Expr -> parse_comparison(p)
+const parse_expr = (*Parser p): Expr -> parse_or(p)
+
+const parse_or = (*Parser p): Expr -> parse_or_tail(p, parse_and(p))
+const parse_or_tail = (*Parser p, Expr acc): Expr -> {
+	if is_logor(peek(p)) then {
+		p.pos = p.pos + 1
+		return parse_or_tail(p, Expr.Or(acc, parse_and(p)))
+	}
+	return acc
+}
+
+const parse_and = (*Parser p): Expr -> parse_and_tail(p, parse_comparison(p))
+const parse_and_tail = (*Parser p, Expr acc): Expr -> {
+	if is_logand(peek(p)) then {
+		p.pos = p.pos + 1
+		return parse_and_tail(p, Expr.And(acc, parse_comparison(p)))
+	}
+	return acc
+}
 
 const parse_comparison = (*Parser p): Expr -> {
 	const Expr lhs = parse_bitor(p)
@@ -172,6 +191,17 @@ const parse_if = (*Parser p): Expr -> {
 
 const parse_primary = (*Parser p): Expr -> {
 	if kw(p, "if") then return parse_if(p)
+	# `true`/`false` — Bool sugar. Without a typecheck phase yet, cf0 lowers them to
+	# the 1/0 words a Bool is represented by (runtime-identical to cfcc). The Bool
+	# TYPE (and rejecting `&&`/`if` on a non-Bool) arrives with the typecheck brick.
+	if kw(p, "true") then {
+		p.pos = p.pos + 1
+		return Expr.Lit(1)
+	}
+	if kw(p, "false") then {
+		p.pos = p.pos + 1
+		return Expr.Lit(0)
+	}
 	if is_intlit(peek(p)) then {
 		const Iarch v = p.toks[p.pos].ival
 		p.pos = p.pos + 1

@@ -69,6 +69,41 @@ const emit_if = (*Emit ctx, Expr cond, Expr thenE, Expr elseE): Str -> {
 	return "%t${rt}"
 }
 
+# Emit a short-circuit `&&`/`||`. The right operand is emitted in its own block,
+# reached only when the left operand does not already settle the result — so a
+# side-effecting or non-terminating RHS is genuinely skipped. The result (0/1)
+# merges through a slot, like `if`. For `&&`: a false lhs short-circuits to 0; for
+# `||`: a true lhs short-circuits to 1; otherwise the result is `rhs != 0`.
+const emit_logical = (*Emit ctx, Bool is_and, Expr l, Expr r): Str -> {
+	const Str a = emit_expr(l, ctx)
+	const Iarch slot = ctx.next
+	ctx.next = ctx.next + 1
+	const Iarch lid = ctx.label
+	ctx.label = ctx.label + 1
+	write_str(ctx.fd, "\t%t${slot} =l alloc4 4\n")
+	# A true lhs takes @rhs for `&&` (must check rhs) but @sc for `||` (already 1).
+	if is_and then write_str(ctx.fd, "\tjnz ${a}, @rhs${lid}, @sc${lid}\n")
+	if !is_and then write_str(ctx.fd, "\tjnz ${a}, @sc${lid}, @rhs${lid}\n")
+	# short-circuit block: the result is settled by the lhs (0 for `&&`, 1 for `||`).
+	write_str(ctx.fd, "@sc${lid}\n")
+	if is_and then write_str(ctx.fd, "\tstorew 0, %t${slot}\n")
+	if !is_and then write_str(ctx.fd, "\tstorew 1, %t${slot}\n")
+	write_str(ctx.fd, "\tjmp @end${lid}\n")
+	# rhs block: evaluate the right operand and normalise it to 0/1.
+	write_str(ctx.fd, "@rhs${lid}\n")
+	const Str b = emit_expr(r, ctx)
+	const Iarch bb = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${bb} =w cnew ${b}, 0\n")
+	write_str(ctx.fd, "\tstorew %t${bb}, %t${slot}\n")
+	write_str(ctx.fd, "\tjmp @end${lid}\n")
+	write_str(ctx.fd, "@end${lid}\n")
+	const Iarch rt = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${rt} =w loadw %t${slot}\n")
+	return "%t${rt}"
+}
+
 const emit_expr = (Expr e, *Emit ctx): Str -> match e {
 	Expr.Lit(v) -> "${v}",
 	Expr.Neg(x) -> emit_neg(ctx, x),
@@ -88,6 +123,8 @@ const emit_expr = (Expr e, *Emit ctx): Str -> match e {
 	Expr.CmpGt(l, r) -> emit_binop(ctx, "csgtw", l, r),
 	Expr.CmpLe(l, r) -> emit_binop(ctx, "cslew", l, r),
 	Expr.CmpGe(l, r) -> emit_binop(ctx, "csgew", l, r),
+	Expr.And(l, r) -> emit_logical(ctx, true, l, r),
+	Expr.Or(l, r) -> emit_logical(ctx, false, l, r),
 	Expr.If(cond, thenE, elseE) -> emit_if(ctx, cond, thenE, elseE)
 }
 
