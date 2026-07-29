@@ -10,7 +10,7 @@
 
 import "io" as { die }
 import "token" as { Token, TokKind, is_eof, is_ident, is_intlit, is_lparen, is_rparen, is_lbrace, is_rbrace, is_lbracket, is_rbracket, is_comma, is_colon, is_eq, is_arrow, is_minus, is_plus, is_star, is_slash, is_percent, is_amp, is_pipe, is_caret, is_shl, is_shr, is_eqeq, is_ne, is_lt, is_gt, is_le, is_ge, is_logand, is_logor }
-import "ast" as { Expr, Stmt, Param, Func, Call }
+import "ast" as { Expr, Stmt, Param, Func, Call, Ty }
 
 # The parse cursor: the token stream, the source (for keyword text), a position.
 pub data Parser = { [Token] toks, *[Uint8] src, Iarch pos }
@@ -230,16 +230,15 @@ const parse_call = (*Parser p, Str name): Expr -> {
 
 const parse_primary = (*Parser p): Expr -> {
 	if kw(p, "if") then return parse_if(p)
-	# `true`/`false` — Bool sugar. Without a typecheck phase yet, cf0 lowers them to
-	# the 1/0 words a Bool is represented by (runtime-identical to cfcc). The Bool
-	# TYPE (and rejecting `&&`/`if` on a non-Bool) arrives with the typecheck brick.
+	# `true`/`false` — Bool literals. Typed `Bool` by the typecheck phase; lowered to
+	# the 1/0 words a Bool is represented by at emit.
 	if kw(p, "true") then {
 		p.pos = p.pos + 1
-		return Expr.Lit(1)
+		return Expr.BoolLit(true)
 	}
 	if kw(p, "false") then {
 		p.pos = p.pos + 1
-		return Expr.Lit(0)
+		return Expr.BoolLit(false)
 	}
 	# an identifier — a call `name(args)` if followed by `(`, else a reference to a
 	# local binding / parameter.
@@ -343,11 +342,10 @@ const params_has = ([Param] params, Str name): Bool -> {
 	return false
 }
 
-# Consume a type reference. cf0 does not track types yet beyond a parameter's
-# word/pointer split, so this skips the tokens and reports only whether it was a
-# pointer type: a word type-name identifier (`Iarch`, `Bool`), a pointer type
-# `*[Elem]` (`*[Str]`), or a dynamic-array type `[Elem]` (forward-compatible).
-const skip_type = (*Parser p): Bool -> {
+# Parse a type reference into the `Ty` the typecheck phase tracks: a pointer type
+# `*[Elem]` (`*[Str]`) or a dynamic-array type `[Elem]` → `TPtr`; a bare `Bool` →
+# `TBool`; any other type-name identifier (`Iarch`, `Int`, …) → `TInt`.
+const parse_type = (*Parser p): Ty -> {
 	if is_star(peek(p)) then {
 		p.pos = p.pos + 1
 		if !is_lbracket(peek(p)) then die("cf0: parse: expected `[` in a pointer type\n")
@@ -356,7 +354,7 @@ const skip_type = (*Parser p): Bool -> {
 		p.pos = p.pos + 1
 		if !is_rbracket(peek(p)) then die("cf0: parse: expected `]`\n")
 		p.pos = p.pos + 1
-		return true
+		return Ty.TPtr
 	}
 	if is_lbracket(peek(p)) then {
 		p.pos = p.pos + 1
@@ -364,17 +362,21 @@ const skip_type = (*Parser p): Bool -> {
 		p.pos = p.pos + 1
 		if !is_rbracket(peek(p)) then die("cf0: parse: expected `]`\n")
 		p.pos = p.pos + 1
-		return false
+		return Ty.TPtr
 	}
 	if !is_ident(peek(p)) then die("cf0: parse: expected a type\n")
+	const Bool is_bool = kw(p, "Bool")
 	p.pos = p.pos + 1
-	return false
+	if is_bool then return Ty.TBool
+	return Ty.TInt
 }
 
 # A single parameter: `<type> <name>`. Only the type's word/pointer split is
-# retained (in `Param.is_ptr`).
+# retained (in `Param.is_ptr`); a `Bool` parameter (none in the corpus) rides as a
+# word like an integer.
 const parse_param = (*Parser p): Param -> {
-	const Bool is_ptr = skip_type(p)
+	const Ty ty = parse_type(p)
+	const Bool is_ptr = match ty { Ty.TPtr -> true, _ -> false }
 	if !is_ident(peek(p)) then die("cf0: parse: expected a parameter name\n")
 	const Str name = cur_name(p)
 	p.pos = p.pos + 1
@@ -421,20 +423,22 @@ const parse_func = (*Parser p): Func -> {
 	const [Param] params = parse_params(p)
 	if !is_rparen(peek(p)) then die("cf0: parse: expected `)`\n")
 	p.pos = p.pos + 1
+	# `: RetType` names the return type; `main` omits it (the implicit `Int` exit code).
+	let Ty ret_ty = Ty.TInt
 	if is_colon(peek(p)) then {
 		p.pos = p.pos + 1
-		skip_type(p)
+		ret_ty = parse_type(p)
 	}
 	if !is_arrow(peek(p)) then die("cf0: parse: expected `->`\n")
 	p.pos = p.pos + 1
 	if is_lbrace(peek(p)) then {
 		p.pos = p.pos + 1
 		const [Stmt] body = parse_block(p)
-		return Func({ name: name, is_pub: is_pub, params: params, body: body })
+		return Func({ name: name, is_pub: is_pub, ret_ty: ret_ty, params: params, body: body })
 	}
 	const [Stmt] empty = []
 	const [Stmt] one = [...empty, Stmt.Return(parse_expr(p))]
-	return Func({ name: name, is_pub: is_pub, params: params, body: one })
+	return Func({ name: name, is_pub: is_pub, ret_ty: ret_ty, params: params, body: one })
 }
 
 # The whole program: a sequence of top-level functions. One must be `pub const main`

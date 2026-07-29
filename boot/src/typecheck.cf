@@ -1,0 +1,246 @@
+# typecheck — the type-checking phase (lex → parse → TYPECHECK → emit).
+#
+# cf0's first real type discipline. It assigns every expression a type — an integer
+# (`Int`/`Iarch`, a word), a `Bool`, or an opaque pointer (`Ptr`, argv/envp) — and
+# rejects programs that misuse them: a non-Bool `if`/`&&`/`||` condition (there is
+# NO truthiness, §5), a non-integer arithmetic or comparison operand, an integer
+# literal beyond the 32-bit word, an `if` whose branches disagree, a pointer used as
+# a value, a call to an undefined function or with the wrong arity, and the binding
+# errors an environment surfaces (an undeclared / duplicate / self-referential name,
+# a `const`/parameter reassignment, a return not matching the declared type).
+#
+# Types flow bottom-up (`type_of`); a call's result uses the callee's DECLARED
+# return type, so forward references and recursion type without walking the callee.
+# The emitter runs only on programs this phase accepts — its own resolution dies are
+# a redundant safety net, not the authority.
+
+import "io" as { die }
+import "ast" as { Expr, Stmt, Param, Func, Call, Ty }
+
+# A name in scope during checking: its type and whether it is reassignable (`let`).
+data VarTy = { Str name, Ty ty, Bool mutable }
+
+# --- small helpers --------------------------------------------------------------------
+
+const is_tint = (Ty t): Bool -> match t { Ty.TInt -> true, _ -> false }
+const is_tbool = (Ty t): Bool -> match t { Ty.TBool -> true, _ -> false }
+
+# Structural equality of two types (both tag-only, so a member-wise match).
+const ty_eq = (Ty a, Ty b): Bool -> match a {
+	Ty.TInt -> is_tint(b),
+	Ty.TBool -> is_tbool(b),
+	Ty.TPtr -> match b { Ty.TPtr -> true, _ -> false }
+}
+
+# Byte-wise `Str` equality (name lookup).
+const str_eq = (Str a, Str b): Bool -> {
+	if a.len != b.len then return false
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(a.len) then break
+		if Iarch(a[i]) != Iarch(b[i]) then return false
+		i = i + 1
+	}
+	return true
+}
+
+# The index of the function named `name`, or -1.
+const find_func = ([Func] funcs, Str name): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(funcs.len) then break
+		if str_eq(funcs[i].name, name) then return i
+		i = i + 1
+	}
+	return 0 - 1
+}
+
+# The index of `name` in the checking environment, or -1.
+const env_index = ([VarTy] env, Str name): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(env.len) then break
+		if str_eq(env[i].name, name) then return i
+		i = i + 1
+	}
+	return 0 - 1
+}
+
+# --- expression typing ----------------------------------------------------------------
+# `type_of` and these operator helpers are mutually recursive: an operator helper
+# types its operands (validating them) and yields the result type.
+
+# An integer literal must fit the 32-bit signed word — 0..2147483647. cf0 has no
+# negative literals (unary `-` negates a non-negative literal).
+const lit_type = (Iarch v): Ty -> {
+	if v > 2147483647 then die("cf0: type: integer literal out of range (0..2147483647)\n")
+	return Ty.TInt
+}
+
+const var_type = ([VarTy] env, Str name): Ty -> {
+	const Iarch idx = env_index(env, name)
+	if idx < 0 then die("cf0: type: reference to an undeclared name\n")
+	return env[idx].ty
+}
+
+# `-x` — an integer operand, an integer result.
+const int_unop = (Expr x, [VarTy] env, [Func] funcs): Ty -> {
+	if !is_tint(type_of(x, env, funcs)) then die("cf0: type: the operand of unary `-` must be an integer\n")
+	return Ty.TInt
+}
+
+# `+ - * / % & | ^ << >>` — integer operands, an integer result.
+const int_binop = (Expr l, Expr r, [VarTy] env, [Func] funcs): Ty -> {
+	if !is_tint(type_of(l, env, funcs)) then die("cf0: type: an arithmetic operand must be an integer\n")
+	if !is_tint(type_of(r, env, funcs)) then die("cf0: type: an arithmetic operand must be an integer\n")
+	return Ty.TInt
+}
+
+# `== != < > <= >=` — integer operands, a Bool result.
+const cmp_op = (Expr l, Expr r, [VarTy] env, [Func] funcs): Ty -> {
+	if !is_tint(type_of(l, env, funcs)) then die("cf0: type: a comparison operand must be an integer\n")
+	if !is_tint(type_of(r, env, funcs)) then die("cf0: type: a comparison operand must be an integer\n")
+	return Ty.TBool
+}
+
+# `&& ||` — Bool operands (no truthiness), a Bool result.
+const bool_binop = (Expr l, Expr r, [VarTy] env, [Func] funcs): Ty -> {
+	if !is_tbool(type_of(l, env, funcs)) then die("cf0: type: an operand of `&&`/`||` must be a Bool (no truthiness)\n")
+	if !is_tbool(type_of(r, env, funcs)) then die("cf0: type: an operand of `&&`/`||` must be a Bool (no truthiness)\n")
+	return Ty.TBool
+}
+
+# `if c then t else e` — a Bool condition (no truthiness), and both branches must
+# have the same type, which is the result type.
+const if_type = (Expr c, Expr t, Expr e, [VarTy] env, [Func] funcs): Ty -> {
+	if !is_tbool(type_of(c, env, funcs)) then die("cf0: type: an `if` condition must be a Bool (no truthiness)\n")
+	const Ty tt = type_of(t, env, funcs)
+	const Ty te = type_of(e, env, funcs)
+	if !ty_eq(tt, te) then die("cf0: type: the branches of an `if` must have the same type\n")
+	return tt
+}
+
+# `callee(args)` — the callee must exist, the argument count must match, and each
+# argument must be an integer (parameters ride as words). The result type is the
+# callee's declared return type.
+const call_type = (Call cl, [VarTy] env, [Func] funcs): Ty -> {
+	const Iarch fidx = find_func(funcs, cl.callee)
+	if fidx < 0 then die("cf0: type: call to an undefined function\n")
+	const Iarch np = Iarch(funcs[fidx].params.len)
+	const Iarch na = Iarch(cl.args.len)
+	if np != na then die("cf0: type: wrong number of call arguments\n")
+	let Iarch i = 0
+	loop {
+		if i >= na then break
+		if !is_tint(type_of(cl.args[i], env, funcs)) then die("cf0: type: a call argument must be an integer\n")
+		i = i + 1
+	}
+	return funcs[fidx].ret_ty
+}
+
+const type_of = (Expr e, [VarTy] env, [Func] funcs): Ty -> match e {
+	Expr.Lit(v) -> lit_type(v),
+	Expr.BoolLit(b) -> Ty.TBool,
+	Expr.Var(name) -> var_type(env, name),
+	Expr.Neg(x) -> int_unop(x, env, funcs),
+	Expr.Add(l, r) -> int_binop(l, r, env, funcs),
+	Expr.Sub(l, r) -> int_binop(l, r, env, funcs),
+	Expr.Mul(l, r) -> int_binop(l, r, env, funcs),
+	Expr.Div(l, r) -> int_binop(l, r, env, funcs),
+	Expr.Mod(l, r) -> int_binop(l, r, env, funcs),
+	Expr.BitAnd(l, r) -> int_binop(l, r, env, funcs),
+	Expr.BitOr(l, r) -> int_binop(l, r, env, funcs),
+	Expr.BitXor(l, r) -> int_binop(l, r, env, funcs),
+	Expr.Shl(l, r) -> int_binop(l, r, env, funcs),
+	Expr.Shr(l, r) -> int_binop(l, r, env, funcs),
+	Expr.CmpEq(l, r) -> cmp_op(l, r, env, funcs),
+	Expr.CmpNe(l, r) -> cmp_op(l, r, env, funcs),
+	Expr.CmpLt(l, r) -> cmp_op(l, r, env, funcs),
+	Expr.CmpGt(l, r) -> cmp_op(l, r, env, funcs),
+	Expr.CmpLe(l, r) -> cmp_op(l, r, env, funcs),
+	Expr.CmpGe(l, r) -> cmp_op(l, r, env, funcs),
+	Expr.And(l, r) -> bool_binop(l, r, env, funcs),
+	Expr.Or(l, r) -> bool_binop(l, r, env, funcs),
+	Expr.If(c, t, e2) -> if_type(c, t, e2, env, funcs),
+	Expr.Call(cl) -> call_type(cl, env, funcs)
+}
+
+# --- statement / function checking ----------------------------------------------------
+# A `Stmt` is dispatched by shape (match arms are expressions, so the components are
+# pulled out and handled inline — mirroring the emitter).
+
+const stmt_kind = (Stmt s): Iarch -> match s {
+	Stmt.Let(n, m, e) -> 0,
+	Stmt.Assign(n, e) -> 1,
+	Stmt.Return(e) -> 2
+}
+const stmt_name = (Stmt s): Str -> match s {
+	Stmt.Let(n, m, e) -> n,
+	Stmt.Assign(n, e) -> n,
+	Stmt.Return(e) -> ""
+}
+const stmt_mut = (Stmt s): Bool -> match s {
+	Stmt.Let(n, m, e) -> m,
+	Stmt.Assign(n, e) -> false,
+	Stmt.Return(e) -> false
+}
+const stmt_expr = (Stmt s): Expr -> match s {
+	Stmt.Let(n, m, e) -> e,
+	Stmt.Assign(n, e) -> e,
+	Stmt.Return(e) -> e
+}
+
+# Check one function: seed the environment with its parameters (immutable; a word
+# `Iarch` is `Int`, a `*[Str]` is `Ptr`), then walk the body growing the environment
+# as `let`/`const` locals bind. A `Let` initializer is typed against the env WITHOUT
+# its own name (so a self-reference is an undeclared-name error); a name may not
+# shadow an existing one; an `Assign` targets an existing mutable name and keeps its
+# type; every `Return` must match the function's declared return type.
+const check_func = (Func fn, [Func] funcs): Iarch -> {
+	let [VarTy] env = []
+	let Iarch pi = 0
+	loop {
+		if pi >= Iarch(fn.params.len) then break
+		let Ty pty = Ty.TInt
+		if fn.params[pi].is_ptr then pty = Ty.TPtr
+		env = [...env, VarTy({ name: fn.params[pi].name, ty: pty, mutable: false })]
+		pi = pi + 1
+	}
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(fn.body.len) then break
+		const Stmt s = fn.body[i]
+		const Iarch k = stmt_kind(s)
+		if k == 0 then {
+			if env_index(env, stmt_name(s)) >= 0 then die("cf0: type: a binding cannot shadow an existing name\n")
+			const Ty ty = type_of(stmt_expr(s), env, funcs)
+			env = [...env, VarTy({ name: stmt_name(s), ty: ty, mutable: stmt_mut(s) })]
+		}
+		if k == 1 then {
+			const Iarch idx = env_index(env, stmt_name(s))
+			if idx < 0 then die("cf0: type: assignment to an undeclared name\n")
+			if !env[idx].mutable then die("cf0: type: cannot reassign a `const` binding or a parameter\n")
+			const Ty vty = type_of(stmt_expr(s), env, funcs)
+			if !ty_eq(vty, env[idx].ty) then die("cf0: type: a reassignment must keep the binding's type\n")
+		}
+		if k == 2 then {
+			const Ty rty = type_of(stmt_expr(s), env, funcs)
+			if !ty_eq(rty, fn.ret_ty) then die("cf0: type: a returned value's type must match the function's return type\n")
+		}
+		i = i + 1
+	}
+	return 0
+}
+
+# Typecheck the whole program (every function). Whole-program structure — a single
+# `pub const main`, ≤3 parameters, no duplicate names — is checked in the emitter's
+# resolve pass; this phase owns the per-function type and binding discipline.
+pub const check_program = ([Func] funcs): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(funcs.len) then break
+		check_func(funcs[i], funcs)
+		i = i + 1
+	}
+	return 0
+}
