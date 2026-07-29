@@ -12,7 +12,7 @@
 
 import "io" as { die }
 import "token" as { Token, TokKind, is_ident, is_intlit, is_lparen, is_rparen, is_lbrace, is_rbrace, is_eq, is_arrow, is_minus, is_plus, is_star, is_slash, is_percent, is_amp, is_pipe, is_caret, is_shl, is_shr, is_eqeq, is_ne, is_lt, is_gt, is_le, is_ge, is_logand, is_logor }
-import "ast" as { Expr }
+import "ast" as { Expr, Stmt }
 
 # The parse cursor: the token stream, the source (for keyword text), a position.
 pub data Parser = { [Token] toks, *[Uint8] src, Iarch pos }
@@ -37,6 +37,22 @@ const slice_eq = (*[Uint8] src, Iarch start, Iarch len, Str word): Bool -> {
 	}
 	return true
 }
+
+# Intern a source slice into an owned `Str` (a binding name / a variable reference),
+# copying the bytes so the name outlives the source buffer.
+const intern = (*[Uint8] src, Iarch start, Iarch len): Str -> {
+	let [Uint8] v = []
+	let Iarch i = 0
+	loop {
+		if i >= len then break
+		v = [...v, src[start + i]]
+		i = i + 1
+	}
+	return Str(v)
+}
+
+# The current token's interned text (for a binding name or a variable reference).
+const cur_name = (*Parser p): Str -> intern(p.src, p.toks[p.pos].start, p.toks[p.pos].len)
 
 # --- expression grammar --------------------------------------------------------------
 # precedence, loosest to tightest:
@@ -202,6 +218,12 @@ const parse_primary = (*Parser p): Expr -> {
 		p.pos = p.pos + 1
 		return Expr.Lit(0)
 	}
+	# a bare identifier — a reference to a local binding
+	if is_ident(peek(p)) then {
+		const Str name = cur_name(p)
+		p.pos = p.pos + 1
+		return Expr.Var(name)
+	}
 	if is_intlit(peek(p)) then {
 		const Iarch v = p.toks[p.pos].ival
 		p.pos = p.pos + 1
@@ -218,9 +240,62 @@ const parse_primary = (*Parser p): Expr -> {
 	return Expr.Lit(0)
 }
 
+# --- statements & block bodies --------------------------------------------------------
+
+# A `const`/`let` binding. cf0 has no typecheck yet, so an optional type annotation
+# (`const Iarch x = …`) is accepted and ignored — a `TYPE name` pair (two identifiers)
+# before the `=`, versus a bare `name`.
+const parse_let = (*Parser p, Bool mutable): Stmt -> {
+	if !is_ident(peek(p)) then die("cf0: parse: expected a binding name\n")
+	# `TYPE name` (skip the type) vs `name` — the token after the first ident decides.
+	if is_ident(p.toks[p.pos + 1].kind) then p.pos = p.pos + 1
+	const Str name = cur_name(p)
+	p.pos = p.pos + 1
+	if !is_eq(peek(p)) then die("cf0: parse: expected `=` in a binding\n")
+	p.pos = p.pos + 1
+	return Stmt.Let(name, mutable, parse_expr(p))
+}
+
+const parse_stmt = (*Parser p): Stmt -> {
+	if kw(p, "const") then {
+		p.pos = p.pos + 1
+		return parse_let(p, false)
+	}
+	if kw(p, "let") then {
+		p.pos = p.pos + 1
+		return parse_let(p, true)
+	}
+	if kw(p, "return") then {
+		p.pos = p.pos + 1
+		return Stmt.Return(parse_expr(p))
+	}
+	# otherwise a reassignment `name = expr` (a `let` local)
+	if is_ident(peek(p)) then {
+		const Str name = cur_name(p)
+		p.pos = p.pos + 1
+		if !is_eq(peek(p)) then die("cf0: parse: expected `=` in an assignment\n")
+		p.pos = p.pos + 1
+		return Stmt.Assign(name, parse_expr(p))
+	}
+	die("cf0: parse: expected a statement\n")
+	return Stmt.Return(Expr.Lit(0))
+}
+
+# Parse a `{ … }` block into its statement list (statement boundaries are implicit —
+# cf0 does not yet track newlines, so a statement ends where its expression does).
+const parse_block = (*Parser p): [Stmt] -> {
+	let [Stmt] stmts = []
+	loop {
+		if is_rbrace(peek(p)) then break
+		stmts = [...stmts, parse_stmt(p)]
+	}
+	p.pos = p.pos + 1 # `}`
+	return stmts
+}
+
 # --- the whole program: `[pub] const main = () -> <body>` -----------------------------
 
-pub const parse_program = (*Parser p): Expr -> {
+pub const parse_program = (*Parser p): [Stmt] -> {
 	# optional `pub`
 	if kw(p, "pub") then p.pos = p.pos + 1
 	# `const`
@@ -240,15 +315,13 @@ pub const parse_program = (*Parser p): Expr -> {
 	# `->`
 	if !is_arrow(peek(p)) then die("cf0: parse: expected `->`\n")
 	p.pos = p.pos + 1
-	# body: an expression, or `{ return <expr> }`
+	# body: a block `{ … }`, or a bare expression (sugar for `{ return <expr> }`)
 	if is_lbrace(peek(p)) then {
 		p.pos = p.pos + 1
-		if !kw(p, "return") then die("cf0: parse: expected `return`\n")
-		p.pos = p.pos + 1
-		const Expr body = parse_expr(p)
-		if !is_rbrace(peek(p)) then die("cf0: parse: expected `}`\n")
-		p.pos = p.pos + 1
-		return body
+		return parse_block(p)
 	}
-	return parse_expr(p)
+	let [Stmt] one = []
+	const Stmt r = Stmt.Return(parse_expr(p))
+	one = [...one, r]
+	return one
 }

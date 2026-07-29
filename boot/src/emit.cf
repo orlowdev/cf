@@ -3,30 +3,61 @@
 # `emit_expr` walks the expression tree with `match`, writing one QBE
 # instruction per interior node and returning the operand (`%tN`, or an inline
 # literal) that holds the node's value. A `*Emit` context threads the output fd
-# and the temp counter through the recursion. `emit_program` wraps the body in
-# the exported `main` and appends the freestanding `_start` floor.
+# and the temp/label counters; a `[Binding]` environment (a read-only borrow)
+# resolves variable references to their stack slots. `emit_program` walks the
+# body's statement list and appends the freestanding `_start` floor.
 #
 # cf0 cannot yet spawn `qbe`/`cc`, so it emits the QBE IL and the arm64 asm floor
 # to two file descriptors and the external driver runs the `qbe`→`cc` tail.
 #
 # ⚠ THROWAWAY codegen — NOT the cf0 `%node`/`%ret` ABI or the real page/arena
 # runtime (reintroduced at the M6/M9 representation gate). Integer ops are word
-# (`w`) ops; `/`/`%` do not yet apply the §5.6 divide-by-zero guard (added when a
-# `%0`/`/0` test enters the manifest).
+# (`w`) ops; every local is a word stack slot (`alloc4`/`storew`/`loadw`); `/`/`%`
+# do not yet apply the §5.6 divide-by-zero guard; `const` vs `let` mutability is
+# not yet enforced (that is the typecheck brick).
 
-import "io" as { write_str }
-import "ast" as { Expr }
+import "io" as { write_str, die }
+import "ast" as { Expr, Stmt }
 
 # The emit context: the QBE-IL output fd, the next free temp number, and the next
 # free basic-block label id.
 data Emit = { Uarch fd, Iarch next, Iarch label }
 
+# A local binding in scope: its interned name, the temp holding its stack slot
+# pointer, and whether it was declared `let` (mutable) or `const`.
+data Binding = { Str name, Iarch slot, Bool mutable }
+
+# Byte-wise `Str` equality (variable-name lookup).
+const str_eq = (Str a, Str b): Bool -> {
+	if a.len != b.len then return false
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(a.len) then break
+		if Iarch(a[i]) != Iarch(b[i]) then return false
+		i = i + 1
+	}
+	return true
+}
+
+# The slot temp for `name` in `env`, or -1 if unbound.
+const lookup_slot = ([Binding] env, Str name): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(env.len) then break
+		if str_eq(env[i].name, name) then return env[i].slot
+		i = i + 1
+	}
+	return 0 - 1
+}
+
+# --- expression emit ------------------------------------------------------------------
+
 # Emit a binary operator node: evaluate both operands, then combine into a fresh
 # temp. Operands are bound (not passed as call arguments) so evaluation order —
 # left before right — is explicit.
-const emit_binop = (*Emit ctx, Str op, Expr l, Expr r): Str -> {
-	const Str a = emit_expr(l, ctx)
-	const Str b = emit_expr(r, ctx)
+const emit_binop = (*Emit ctx, Str op, Expr l, Expr r, [Binding] env): Str -> {
+	const Str a = emit_expr(l, ctx, env)
+	const Str b = emit_expr(r, ctx, env)
 	const Iarch t = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${t} =w ${op} ${a}, ${b}\n")
@@ -34,11 +65,21 @@ const emit_binop = (*Emit ctx, Str op, Expr l, Expr r): Str -> {
 }
 
 # Emit unary negation as `0 - x` (no dependence on a QBE `neg`).
-const emit_neg = (*Emit ctx, Expr x): Str -> {
-	const Str a = emit_expr(x, ctx)
+const emit_neg = (*Emit ctx, Expr x, [Binding] env): Str -> {
+	const Str a = emit_expr(x, ctx, env)
 	const Iarch t = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${t} =w sub 0, ${a}\n")
+	return "%t${t}"
+}
+
+# Emit a variable reference: load its stack slot.
+const emit_var = (*Emit ctx, [Binding] env, Str name): Str -> {
+	const Iarch slot = lookup_slot(env, name)
+	if slot < 0 then die("cf0: emit: reference to an undeclared variable\n")
+	const Iarch t = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${t} =w loadw %t${slot}\n")
 	return "%t${t}"
 }
 
@@ -46,8 +87,8 @@ const emit_neg = (*Emit ctx, Expr x): Str -> {
 # slot (not a phi): evaluate the condition, branch, each arm stores its value into
 # the slot, and the join block loads it. Robust under nesting; QBE accepts an
 # `alloc` in a non-entry block.
-const emit_if = (*Emit ctx, Expr cond, Expr thenE, Expr elseE): Str -> {
-	const Str c = emit_expr(cond, ctx)
+const emit_if = (*Emit ctx, Expr cond, Expr thenE, Expr elseE, [Binding] env): Str -> {
+	const Str c = emit_expr(cond, ctx, env)
 	const Iarch slot = ctx.next
 	ctx.next = ctx.next + 1
 	const Iarch lid = ctx.label
@@ -55,11 +96,11 @@ const emit_if = (*Emit ctx, Expr cond, Expr thenE, Expr elseE): Str -> {
 	write_str(ctx.fd, "\t%t${slot} =l alloc4 4\n")
 	write_str(ctx.fd, "\tjnz ${c}, @then${lid}, @else${lid}\n")
 	write_str(ctx.fd, "@then${lid}\n")
-	const Str a = emit_expr(thenE, ctx)
+	const Str a = emit_expr(thenE, ctx, env)
 	write_str(ctx.fd, "\tstorew ${a}, %t${slot}\n")
 	write_str(ctx.fd, "\tjmp @end${lid}\n")
 	write_str(ctx.fd, "@else${lid}\n")
-	const Str b = emit_expr(elseE, ctx)
+	const Str b = emit_expr(elseE, ctx, env)
 	write_str(ctx.fd, "\tstorew ${b}, %t${slot}\n")
 	write_str(ctx.fd, "\tjmp @end${lid}\n")
 	write_str(ctx.fd, "@end${lid}\n")
@@ -74,24 +115,21 @@ const emit_if = (*Emit ctx, Expr cond, Expr thenE, Expr elseE): Str -> {
 # side-effecting or non-terminating RHS is genuinely skipped. The result (0/1)
 # merges through a slot, like `if`. For `&&`: a false lhs short-circuits to 0; for
 # `||`: a true lhs short-circuits to 1; otherwise the result is `rhs != 0`.
-const emit_logical = (*Emit ctx, Bool is_and, Expr l, Expr r): Str -> {
-	const Str a = emit_expr(l, ctx)
+const emit_logical = (*Emit ctx, Bool is_and, Expr l, Expr r, [Binding] env): Str -> {
+	const Str a = emit_expr(l, ctx, env)
 	const Iarch slot = ctx.next
 	ctx.next = ctx.next + 1
 	const Iarch lid = ctx.label
 	ctx.label = ctx.label + 1
 	write_str(ctx.fd, "\t%t${slot} =l alloc4 4\n")
-	# A true lhs takes @rhs for `&&` (must check rhs) but @sc for `||` (already 1).
 	if is_and then write_str(ctx.fd, "\tjnz ${a}, @rhs${lid}, @sc${lid}\n")
 	if !is_and then write_str(ctx.fd, "\tjnz ${a}, @sc${lid}, @rhs${lid}\n")
-	# short-circuit block: the result is settled by the lhs (0 for `&&`, 1 for `||`).
 	write_str(ctx.fd, "@sc${lid}\n")
 	if is_and then write_str(ctx.fd, "\tstorew 0, %t${slot}\n")
 	if !is_and then write_str(ctx.fd, "\tstorew 1, %t${slot}\n")
 	write_str(ctx.fd, "\tjmp @end${lid}\n")
-	# rhs block: evaluate the right operand and normalise it to 0/1.
 	write_str(ctx.fd, "@rhs${lid}\n")
-	const Str b = emit_expr(r, ctx)
+	const Str b = emit_expr(r, ctx, env)
 	const Iarch bb = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${bb} =w cnew ${b}, 0\n")
@@ -104,38 +142,108 @@ const emit_logical = (*Emit ctx, Bool is_and, Expr l, Expr r): Str -> {
 	return "%t${rt}"
 }
 
-const emit_expr = (Expr e, *Emit ctx): Str -> match e {
+const emit_expr = (Expr e, *Emit ctx, [Binding] env): Str -> match e {
 	Expr.Lit(v) -> "${v}",
-	Expr.Neg(x) -> emit_neg(ctx, x),
-	Expr.Add(l, r) -> emit_binop(ctx, "add", l, r),
-	Expr.Sub(l, r) -> emit_binop(ctx, "sub", l, r),
-	Expr.Mul(l, r) -> emit_binop(ctx, "mul", l, r),
-	Expr.Div(l, r) -> emit_binop(ctx, "div", l, r),
-	Expr.Mod(l, r) -> emit_binop(ctx, "rem", l, r),
-	Expr.BitAnd(l, r) -> emit_binop(ctx, "and", l, r),
-	Expr.BitOr(l, r) -> emit_binop(ctx, "or", l, r),
-	Expr.BitXor(l, r) -> emit_binop(ctx, "xor", l, r),
-	Expr.Shl(l, r) -> emit_binop(ctx, "shl", l, r),
-	Expr.Shr(l, r) -> emit_binop(ctx, "sar", l, r),
-	Expr.CmpEq(l, r) -> emit_binop(ctx, "ceqw", l, r),
-	Expr.CmpNe(l, r) -> emit_binop(ctx, "cnew", l, r),
-	Expr.CmpLt(l, r) -> emit_binop(ctx, "csltw", l, r),
-	Expr.CmpGt(l, r) -> emit_binop(ctx, "csgtw", l, r),
-	Expr.CmpLe(l, r) -> emit_binop(ctx, "cslew", l, r),
-	Expr.CmpGe(l, r) -> emit_binop(ctx, "csgew", l, r),
-	Expr.And(l, r) -> emit_logical(ctx, true, l, r),
-	Expr.Or(l, r) -> emit_logical(ctx, false, l, r),
-	Expr.If(cond, thenE, elseE) -> emit_if(ctx, cond, thenE, elseE)
+	Expr.Var(name) -> emit_var(ctx, env, name),
+	Expr.Neg(x) -> emit_neg(ctx, x, env),
+	Expr.Add(l, r) -> emit_binop(ctx, "add", l, r, env),
+	Expr.Sub(l, r) -> emit_binop(ctx, "sub", l, r, env),
+	Expr.Mul(l, r) -> emit_binop(ctx, "mul", l, r, env),
+	Expr.Div(l, r) -> emit_binop(ctx, "div", l, r, env),
+	Expr.Mod(l, r) -> emit_binop(ctx, "rem", l, r, env),
+	Expr.BitAnd(l, r) -> emit_binop(ctx, "and", l, r, env),
+	Expr.BitOr(l, r) -> emit_binop(ctx, "or", l, r, env),
+	Expr.BitXor(l, r) -> emit_binop(ctx, "xor", l, r, env),
+	Expr.Shl(l, r) -> emit_binop(ctx, "shl", l, r, env),
+	Expr.Shr(l, r) -> emit_binop(ctx, "sar", l, r, env),
+	Expr.CmpEq(l, r) -> emit_binop(ctx, "ceqw", l, r, env),
+	Expr.CmpNe(l, r) -> emit_binop(ctx, "cnew", l, r, env),
+	Expr.CmpLt(l, r) -> emit_binop(ctx, "csltw", l, r, env),
+	Expr.CmpGt(l, r) -> emit_binop(ctx, "csgtw", l, r, env),
+	Expr.CmpLe(l, r) -> emit_binop(ctx, "cslew", l, r, env),
+	Expr.CmpGe(l, r) -> emit_binop(ctx, "csgew", l, r, env),
+	Expr.And(l, r) -> emit_logical(ctx, true, l, r, env),
+	Expr.Or(l, r) -> emit_logical(ctx, false, l, r, env),
+	Expr.If(cond, thenE, elseE) -> emit_if(ctx, cond, thenE, elseE, env)
 }
 
-# Emit the whole program: the exported `main` (returning the body's word value)
-# plus the freestanding entry floor.
-pub const emit_program = (Expr body, Uarch qbe_fd, Uarch asm_fd): Iarch -> {
+# --- statement / block emit -----------------------------------------------------------
+# A `Stmt` is dispatched by extracting its shape (`match` arms are expressions, so the
+# per-kind handling is inlined in `emit_block` after pulling the components out).
+
+const stmt_kind = (Stmt s): Iarch -> match s {
+	Stmt.Let(n, m, e) -> 0,
+	Stmt.Assign(n, e) -> 1,
+	Stmt.Return(e) -> 2
+}
+const stmt_name = (Stmt s): Str -> match s {
+	Stmt.Let(n, m, e) -> n,
+	Stmt.Assign(n, e) -> n,
+	Stmt.Return(e) -> ""
+}
+const stmt_mut = (Stmt s): Bool -> match s {
+	Stmt.Let(n, m, e) -> m,
+	Stmt.Assign(n, e) -> false,
+	Stmt.Return(e) -> false
+}
+# Emit the statement's expression and return its operand. (A `match` arm cannot
+# YIELD a bare aggregate payload — that would alias it, §6 — but it may PASS the
+# payload to `emit_expr`, whose call result is a fresh `Str` operand.)
+const emit_stmt_expr = (*Emit ctx, Stmt s, [Binding] env): Str -> match s {
+	Stmt.Let(n, m, e) -> emit_expr(e, ctx, env),
+	Stmt.Assign(n, e) -> emit_expr(e, ctx, env),
+	Stmt.Return(e) -> emit_expr(e, ctx, env)
+}
+
+# Emit a block's statements in order, growing the binding environment as `let`/`const`
+# locals are declared — so a binding's initializer sees only PRIOR bindings (a
+# self-reference `const a = a` fails the variable lookup, as it should). The `Return`
+# emits the function's `ret`; a block with none is rejected.
+const emit_block = (*Emit ctx, [Stmt] stmts): Iarch -> {
+	let [Binding] env = []
+	# an Iarch flag, not a Bool — a `Bool` is a union and cf0 cannot reassign a union
+	# local (the same tail-recursion/flag workaround the parser uses).
+	let Iarch did_return = 0
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(stmts.len) then break
+		const Stmt s = stmts[i]
+		const Iarch k = stmt_kind(s)
+		if k == 0 then {
+			# `const`/`let name = init` — evaluate the initializer (against the env so far),
+			# allocate a word slot, and store; then bind the name to that slot.
+			const Str let_v = emit_stmt_expr(ctx, s, env)
+			const Iarch let_slot = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${let_slot} =l alloc4 4\n")
+			write_str(ctx.fd, "\tstorew ${let_v}, %t${let_slot}\n")
+			env = [...env, Binding({ name: stmt_name(s), slot: let_slot, mutable: stmt_mut(s) })]
+		}
+		if k == 1 then {
+			# `name = value` — reassign an existing local's slot.
+			const Iarch asn_slot = lookup_slot(env, stmt_name(s))
+			if asn_slot < 0 then die("cf0: emit: assignment to an undeclared variable\n")
+			const Str asn_v = emit_stmt_expr(ctx, s, env)
+			write_str(ctx.fd, "\tstorew ${asn_v}, %t${asn_slot}\n")
+		}
+		if k == 2 then {
+			const Str ret_v = emit_stmt_expr(ctx, s, env)
+			write_str(ctx.fd, "\tret ${ret_v}\n")
+			did_return = 1
+		}
+		i = i + 1
+	}
+	if did_return == 0 then die("cf0: emit: `main`'s body must end with `return`\n")
+	return 0
+}
+
+# Emit the whole program: the exported `main` (its body's statements) plus the
+# freestanding entry floor.
+pub const emit_program = ([Stmt] body, Uarch qbe_fd, Uarch asm_fd): Iarch -> {
 	write_str(qbe_fd, "export function w $main() {\n")
 	write_str(qbe_fd, "@start\n")
 	let Emit ctx = Emit({ fd: qbe_fd, next: 0, label: 0 })
-	const Str result = emit_expr(body, &ctx)
-	write_str(qbe_fd, "\tret ${result}\n")
+	emit_block(&ctx, body)
 	write_str(qbe_fd, "}\n")
 	# asm floor: the freestanding entry. `_start` forwards argc/argv/envp (unused),
 	# calls `_main`, then exit-syscalls its return (in x0).
