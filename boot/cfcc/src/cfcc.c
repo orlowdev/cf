@@ -1191,6 +1191,9 @@ typedef struct {
 	int mutable;
 	char type_name[64]; /* the declared nominal type name (record/union/Str); empty for a
 	                     * word (Int) local. Available pre-typecheck for generic inference. */
+	int closed;         /* parse-time block scoping: set when the local's `{ }` block has closed,
+	                     * so a sibling/sequential block may reuse the name (a fresh entry sharing
+	                     * the one deduped stack slot). Reset to 0 for a fresh function. */
 } Binding;
 
 #define MAX_PARAMS 32
@@ -1588,6 +1591,11 @@ typedef struct Func {
 	TupleDecl *ret_tup;
 	Binding *locals;
 	int nlocals, cap_locals;
+	/* Parse-time block-scope stack: `sc_mark[d]` is `nlocals` when the depth-`d` `{ }` block
+	 * opened; on close, locals with index >= that mark are marked `closed` (out of scope), freeing
+	 * their names for reuse by a sibling block. Balanced push/pop, so it self-resets per function. */
+	int sc_mark[64];
+	int sc_depth;
 	/* Match-arm payload bindings currently in scope (a stack, pushed/popped around each
 	 * binding arm's body during typecheck; nested matches nest). `next_bind_id` mints a
 	 * per-function unique storage id (`%pb<id>`). */
@@ -2255,6 +2263,26 @@ static int find_active_bind_type(Func *fn, const char *name, Type *ty) {
  * record local parse passes {TY_RECORD, NULL, NULL, 0}; the typecheck pass backfills rec
  * (see resolve_record_binding). */
 static void func_add_local(Func *fn, const char *name, int mutable, Type ty, const char *type_name) {
+	/* Block scoping: an in-scope collision is rejected earlier (name_in_scope); any same-name local
+	 * still here is a CLOSED sibling reusing the name. Reuse shares ONE stack slot (deduped in
+	 * emit_func), so it is sound only when (a) the type matches — a differing type would need a
+	 * distinct slot — and (b) the local is slot-backed (`%s_<name>`): a word, Str, float, fixed-
+	 * width int, Uarch, or a `let` boxed aggregate. A `const` record/tuple/buffer/array/`[T]` lives
+	 * in a write-once `%r_<name>` temp, which reusing across two blocks would assign twice (illegal
+	 * SSA), so it keeps a unique name. ⚠ cf0 must NOT inherit: cf0 gives each block binding its own
+	 * storage regardless of type. */
+	int slot_backed = type_is_word(ty) || ty.kind == TY_STR || is_float_type(ty) || is_fixed_type(ty) ||
+	                  ty.kind == TY_UARCH ||
+	                  (mutable && (ty.kind == TY_RECORD || ty.kind == TY_TUPLE ||
+	                               (ty.kind == TY_UNION && ty.uni->has_payload)));
+	for (int i = 0; i < fn->nlocals; i++)
+		if (fn->locals[i].closed && strcmp(fn->locals[i].name, name) == 0) {
+			if (!types_equal(fn->locals[i].type, ty))
+				die(0, "a reused block-local name must keep its type in cfcc (a sibling block gave it a different type)");
+			if (!slot_backed)
+				die(0, "cfcc reuses only a scalar / slot-backed block-local name across sibling blocks "
+				       "(a `const` record/tuple/buffer/array keeps a unique name)");
+		}
 	if (fn->nlocals == fn->cap_locals) {
 		fn->cap_locals = fn->cap_locals ? fn->cap_locals * 2 : 16;
 		fn->locals = realloc(fn->locals, fn->cap_locals * sizeof *fn->locals);
@@ -2265,7 +2293,27 @@ static void func_add_local(Func *fn, const char *name, int mutable, Type ty, con
 	snprintf(b->name, sizeof b->name, "%s", name);
 	b->type = ty;
 	b->mutable = mutable;
+	b->closed = 0;
 	snprintf(b->type_name, sizeof b->type_name, "%s", type_name ? type_name : "");
+}
+
+/* Index of the local named `name` in `fn->locals` (last match wins so a reused sibling name
+ * resolves to its most recent declaration), or -1. */
+static int find_local_index(const Func *fn, const char *name) {
+	for (int i = fn->nlocals - 1; i >= 0; i--)
+		if (strcmp(fn->locals[i].name, name) == 0)
+			return i;
+	return -1;
+}
+
+/* True if `name` is currently IN SCOPE at parse: a parameter, a closure, or an OPEN (not-closed)
+ * local. A local whose `{ }` block has closed does not count — a sibling/sequential block may
+ * reuse the name. Used by the declaration collision checks in place of a flat resolve_name. */
+static int name_in_scope(Func *fn, const char *name) {
+	if (is_param_name(fn, name) || func_find_closure(fn, name) >= 0)
+		return 1;
+	int i = find_local_index(fn, name);
+	return i >= 0 && !fn->locals[i].closed;
 }
 
 static Token *peek(Parser *p) {
@@ -4211,9 +4259,8 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 						die(pt->line, "too many pattern positions");
 					char nm[64];
 					tok_copy(pt, nm, sizeof nm);
-					Type tmp;
-					if (resolve_name(fn, nm, &tmp) != R_NONE || func_find_closure(fn, nm) >= 0)
-						die(pt->line, "name already defined (no shadowing in M0)");
+					if (name_in_scope(fn, nm))
+						die(pt->line, "name already defined in this scope (no shadowing)");
 					for (int i = 0; i < nnames; i++)
 						if (strcmp(names[i]->name, nm) == 0)
 							die(pt->line, "duplicate name in the tuple pattern");
@@ -4393,9 +4440,8 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 		s->line = name->line;
 		tok_copy(name, s->name, sizeof s->name);
 		advance(p);
-		Type ty;
-		if (resolve_name(fn, s->name, &ty) != R_NONE || func_find_closure(fn, s->name) >= 0)
-			die(name->line, "name already defined (no shadowing in M0)");
+		if (name_in_scope(fn, s->name))
+			die(name->line, "name already defined in this scope (no shadowing)");
 		if (is_buf) {
 			/* A byte buffer has no initializer: `let [N Uint8] name`. Its N arena bytes
 			 * are allocated at emit; the local names the base `*[Uint8]` pointer. */
@@ -4610,9 +4656,8 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 		/* The loop var is a const `Iarch` local (an array element — the operable default, 64-bit
 		 * `l`); a hidden counter local (a 32-bit word `%s_` slot) carries the index 0..N-1. */
 		Type tword = {TY_INT, NULL, NULL, 0, NULL};
-		Type tmp;
-		if (resolve_name(fn, varname, &tmp) != R_NONE || func_find_closure(fn, varname) >= 0)
-			die(vt->line, "name already defined (no shadowing in M0)");
+		if (name_in_scope(fn, varname))
+			die(vt->line, "name already defined in this scope (no shadowing)");
 		func_add_local(fn, varname, 0, mk_iarch(), "Iarch"); /* const Iarch loop variable */
 		snprintf(s->field, sizeof s->field, "for.i%d", p->for_id++); /* hidden counter name (`.` = untypeable) */
 		func_add_local(fn, s->field, 1, tword, "");    /* let word hidden counter */
@@ -4904,6 +4949,11 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
  * end with `return` (require_return); a loop body has no such requirement. */
 static Stmt *parse_stmt_seq(Parser *p, Func *fn, int require_return, int open_line) {
 	skip_newlines(p);
+	/* Open a block scope: record the local high-water mark so it can be rewound at the `}`. Locals
+	 * declared inside this block go out of scope when it closes, freeing their names for a sibling. */
+	if (fn->sc_depth >= (int)(sizeof fn->sc_mark / sizeof fn->sc_mark[0]))
+		die(open_line, "blocks nested too deep");
+	fn->sc_mark[fn->sc_depth++] = fn->nlocals;
 	Stmt *head = NULL, *tail = NULL;
 	int saw_return = 0;
 	while (peek(p)->kind != TK_RBRACE) {
@@ -4927,6 +4977,12 @@ static Stmt *parse_stmt_seq(Parser *p, Func *fn, int require_return, int open_li
 		}
 	}
 	advance(p); /* consume `}` */
+	/* Close the block scope: mark every local declared inside as out of scope (its name is now
+	 * free for a sibling/sequential block). The entries stay in `fn->locals` for typecheck/emit;
+	 * only parse-time name resolution (name_in_scope) honours `closed`. */
+	int mark = fn->sc_mark[--fn->sc_depth];
+	for (int i = mark; i < fn->nlocals; i++)
+		fn->locals[i].closed = 1;
 	if (require_return && !saw_return)
 		die(open_line, "a function's block must end with `return`");
 	return head;
@@ -11540,6 +11596,13 @@ static void emit_func(FILE *out, const Func *fn) {
 	 * `alloca` that would overflow the stack). The `let` then only stores. Flat
 	 * scoping makes this sound: each name has exactly one slot for the whole body. */
 	for (int i = 0; i < fn->nlocals; i++) {
+		/* Block scoping lets a name be reused across sibling blocks — those entries share ONE
+		 * slot (same name + type, enforced in func_add_local), so reserve it only for the first. */
+		int dup = 0;
+		for (int j = 0; j < i; j++)
+			if (strcmp(fn->locals[j].name, fn->locals[i].name) == 0) { dup = 1; break; }
+		if (dup)
+			continue;
 		/* An Int or tag-only union shares the word-slot path; a boxed union (like a
 		 * record) needs no slot — it lives in the arena via its `%r_` pointer. */
 		if (type_is_word(fn->locals[i].type))
