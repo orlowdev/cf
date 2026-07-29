@@ -5,10 +5,8 @@
 # multiplicative over unary over primary (a literal or a parenthesised
 # expression). It grows a level per construct as the grammar fills in.
 #
-# Left-associative operators fold via a tail-recursive `_tail` helper that
-# threads the accumulated left operand as a parameter — a `union` value cannot be
-# reassigned in place, so the left-fold is expressed as recursion rather than a
-# mutated accumulator.
+# Left-associative operators fold in a loop that reassigns an `Expr` accumulator
+# (`acc = Expr.Add(acc, rhs)`) — one function per precedence level.
 
 import "io" as { die }
 import "token" as { Token, TokKind, is_ident, is_intlit, is_lparen, is_rparen, is_lbrace, is_rbrace, is_eq, is_arrow, is_minus, is_plus, is_star, is_slash, is_percent, is_amp, is_pipe, is_caret, is_shl, is_shr, is_eqeq, is_ne, is_lt, is_gt, is_le, is_ge, is_logand, is_logor }
@@ -59,26 +57,28 @@ const cur_name = (*Parser p): Str -> intern(p.src, p.toks[p.pos].start, p.toks[p
 #   logical-or `||` < logical-and `&&` < comparison `== != < > <= >=`
 #     < bit-or `|` < bit-xor `^` < bit-and `&` < shift `<< >>` < additive `+ -`
 #     < multiplicative `* / %` < unary `-` < primary
-# every binary level except comparison is left-associative, folded by a tail-recursive
-# `_tail` helper (a `union` value cannot be reassigned, so the left-fold recurses on a
-# fresh acc). Comparison is NON-associative — a single compare, no chaining.
+# every binary level except comparison is left-associative, folded by a loop that reassigns
+# an `Expr` accumulator (`acc = Expr.Add(acc, rhs)`). Comparison is NON-associative — a single
+# compare, no chaining.
 
 const parse_expr = (*Parser p): Expr -> parse_or(p)
 
-const parse_or = (*Parser p): Expr -> parse_or_tail(p, parse_and(p))
-const parse_or_tail = (*Parser p, Expr acc): Expr -> {
-	if is_logor(peek(p)) then {
+const parse_or = (*Parser p): Expr -> {
+	let Expr acc = parse_and(p)
+	loop {
+		if !is_logor(peek(p)) then break
 		p.pos = p.pos + 1
-		return parse_or_tail(p, Expr.Or(acc, parse_and(p)))
+		acc = Expr.Or(acc, parse_and(p))
 	}
 	return acc
 }
 
-const parse_and = (*Parser p): Expr -> parse_and_tail(p, parse_comparison(p))
-const parse_and_tail = (*Parser p, Expr acc): Expr -> {
-	if is_logand(peek(p)) then {
+const parse_and = (*Parser p): Expr -> {
+	let Expr acc = parse_comparison(p)
+	loop {
+		if !is_logand(peek(p)) then break
 		p.pos = p.pos + 1
-		return parse_and_tail(p, Expr.And(acc, parse_comparison(p)))
+		acc = Expr.And(acc, parse_comparison(p))
 	}
 	return acc
 }
@@ -112,72 +112,77 @@ const parse_comparison = (*Parser p): Expr -> {
 	return lhs
 }
 
-const parse_bitor = (*Parser p): Expr -> parse_bitor_tail(p, parse_bitxor(p))
-const parse_bitor_tail = (*Parser p, Expr acc): Expr -> {
-	if is_pipe(peek(p)) then {
+const parse_bitor = (*Parser p): Expr -> {
+	let Expr acc = parse_bitxor(p)
+	loop {
+		if !is_pipe(peek(p)) then break
 		p.pos = p.pos + 1
-		return parse_bitor_tail(p, Expr.BitOr(acc, parse_bitxor(p)))
+		acc = Expr.BitOr(acc, parse_bitxor(p))
 	}
 	return acc
 }
 
-const parse_bitxor = (*Parser p): Expr -> parse_bitxor_tail(p, parse_bitand(p))
-const parse_bitxor_tail = (*Parser p, Expr acc): Expr -> {
-	if is_caret(peek(p)) then {
+const parse_bitxor = (*Parser p): Expr -> {
+	let Expr acc = parse_bitand(p)
+	loop {
+		if !is_caret(peek(p)) then break
 		p.pos = p.pos + 1
-		return parse_bitxor_tail(p, Expr.BitXor(acc, parse_bitand(p)))
+		acc = Expr.BitXor(acc, parse_bitand(p))
 	}
 	return acc
 }
 
-const parse_bitand = (*Parser p): Expr -> parse_bitand_tail(p, parse_shift(p))
-const parse_bitand_tail = (*Parser p, Expr acc): Expr -> {
-	if is_amp(peek(p)) then {
+const parse_bitand = (*Parser p): Expr -> {
+	let Expr acc = parse_shift(p)
+	loop {
+		if !is_amp(peek(p)) then break
 		p.pos = p.pos + 1
-		return parse_bitand_tail(p, Expr.BitAnd(acc, parse_shift(p)))
+		acc = Expr.BitAnd(acc, parse_shift(p))
 	}
 	return acc
 }
 
-const parse_shift = (*Parser p): Expr -> parse_shift_tail(p, parse_additive(p))
-const parse_shift_tail = (*Parser p, Expr acc): Expr -> {
-	if is_shl(peek(p)) then {
-		p.pos = p.pos + 1
-		return parse_shift_tail(p, Expr.Shl(acc, parse_additive(p)))
-	}
-	if is_shr(peek(p)) then {
-		p.pos = p.pos + 1
-		return parse_shift_tail(p, Expr.Shr(acc, parse_additive(p)))
-	}
-	return acc
-}
-
-const parse_additive = (*Parser p): Expr -> parse_additive_tail(p, parse_multiplicative(p))
-const parse_additive_tail = (*Parser p, Expr acc): Expr -> {
-	if is_plus(peek(p)) then {
-		p.pos = p.pos + 1
-		return parse_additive_tail(p, Expr.Add(acc, parse_multiplicative(p)))
-	}
-	if is_minus(peek(p)) then {
-		p.pos = p.pos + 1
-		return parse_additive_tail(p, Expr.Sub(acc, parse_multiplicative(p)))
+const parse_shift = (*Parser p): Expr -> {
+	let Expr acc = parse_additive(p)
+	loop {
+		if is_shl(peek(p)) then {
+			p.pos = p.pos + 1
+			acc = Expr.Shl(acc, parse_additive(p))
+		} else if is_shr(peek(p)) then {
+			p.pos = p.pos + 1
+			acc = Expr.Shr(acc, parse_additive(p))
+		} else break
 	}
 	return acc
 }
 
-const parse_multiplicative = (*Parser p): Expr -> parse_multiplicative_tail(p, parse_unary(p))
-const parse_multiplicative_tail = (*Parser p, Expr acc): Expr -> {
-	if is_star(peek(p)) then {
-		p.pos = p.pos + 1
-		return parse_multiplicative_tail(p, Expr.Mul(acc, parse_unary(p)))
+const parse_additive = (*Parser p): Expr -> {
+	let Expr acc = parse_multiplicative(p)
+	loop {
+		if is_plus(peek(p)) then {
+			p.pos = p.pos + 1
+			acc = Expr.Add(acc, parse_multiplicative(p))
+		} else if is_minus(peek(p)) then {
+			p.pos = p.pos + 1
+			acc = Expr.Sub(acc, parse_multiplicative(p))
+		} else break
 	}
-	if is_slash(peek(p)) then {
-		p.pos = p.pos + 1
-		return parse_multiplicative_tail(p, Expr.Div(acc, parse_unary(p)))
-	}
-	if is_percent(peek(p)) then {
-		p.pos = p.pos + 1
-		return parse_multiplicative_tail(p, Expr.Mod(acc, parse_unary(p)))
+	return acc
+}
+
+const parse_multiplicative = (*Parser p): Expr -> {
+	let Expr acc = parse_unary(p)
+	loop {
+		if is_star(peek(p)) then {
+			p.pos = p.pos + 1
+			acc = Expr.Mul(acc, parse_unary(p))
+		} else if is_slash(peek(p)) then {
+			p.pos = p.pos + 1
+			acc = Expr.Div(acc, parse_unary(p))
+		} else if is_percent(peek(p)) then {
+			p.pos = p.pos + 1
+			acc = Expr.Mod(acc, parse_unary(p))
+		} else break
 	}
 	return acc
 }
