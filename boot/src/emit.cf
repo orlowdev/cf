@@ -17,11 +17,13 @@
 # not yet enforced (that is the typecheck brick).
 
 import "io" as { write_str, die }
-import "ast" as { Expr, Stmt, Param, Func }
+import "ast" as { Expr, Stmt, Param, Func, Call }
 
-# The emit context: the QBE-IL output fd, the next free temp number, and the next
-# free basic-block label id.
-data Emit = { Uarch fd, Iarch next, Iarch label }
+# The emit context: the QBE-IL output fd, the next free temp number, the next free
+# basic-block label id, and the whole program's function list (so a call resolves
+# its callee — by name to a function index — for the arity check and the `$f<i>`
+# symbol). `next`/`label` reset per function; `funcs` is constant across the program.
+data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs }
 
 # A local binding in scope: its interned name, the temp holding its stack slot
 # pointer, whether it was declared `let` (mutable) or `const`, and whether it is a
@@ -148,6 +150,59 @@ const emit_logical = (*Emit ctx, Bool is_and, Expr l, Expr r, [Binding] env): St
 	return "%t${rt}"
 }
 
+# The index of the function named `name` in `funcs`, or -1 if none.
+const find_func = ([Func] funcs, Str name): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(funcs.len) then break
+		if str_eq(funcs[i].name, name) then return i
+		i = i + 1
+	}
+	return 0 - 1
+}
+
+# Emit a call `callee(args)`. The callee is resolved whole-program (by name to a
+# function index, so forward references and recursion work) and its argument count
+# is checked. Each argument is evaluated into a fresh numbered temp first — so the
+# call line references temp NUMBERS, not Str operands (which cannot be stored and
+# reread) — then the call is emitted. main's QBE symbol is `$main`; every other
+# function is `$f<i>` (positional, so a user name can never collide with `_start`).
+const emit_call = (*Emit ctx, Call cl, [Binding] env): Str -> {
+	const Iarch fidx = find_func(ctx.funcs, cl.callee)
+	if fidx < 0 then die("cf0: emit: call to an undefined function\n")
+	const Iarch nparams = Iarch(ctx.funcs[fidx].params.len)
+	const Iarch nargs = Iarch(cl.args.len)
+	if nparams != nargs then die("cf0: emit: wrong number of call arguments\n")
+	let [Iarch] tnums = []
+	let Iarch i = 0
+	loop {
+		if i >= nargs then break
+		const Str op = emit_expr(cl.args[i], ctx, env)
+		const Iarch tt = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${tt} =w copy ${op}\n")
+		tnums = [...tnums, tt]
+		i = i + 1
+	}
+	const Iarch rt = ctx.next
+	ctx.next = ctx.next + 1
+	const Bool is_main = str_eq(ctx.funcs[fidx].name, "main")
+	write_str(ctx.fd, "\t%t${rt} =w call $")
+	if is_main then write_str(ctx.fd, "main")
+	if !is_main then write_str(ctx.fd, "f${fidx}")
+	write_str(ctx.fd, "(")
+	let Iarch j = 0
+	loop {
+		if j >= Iarch(tnums.len) then break
+		if j > 0 then write_str(ctx.fd, ", ")
+		const Iarch tj = tnums[j]
+		write_str(ctx.fd, "w %t${tj}")
+		j = j + 1
+	}
+	write_str(ctx.fd, ")\n")
+	return "%t${rt}"
+}
+
 const emit_expr = (Expr e, *Emit ctx, [Binding] env): Str -> match e {
 	Expr.Lit(v) -> "${v}",
 	Expr.Var(name) -> emit_var(ctx, env, name),
@@ -170,7 +225,8 @@ const emit_expr = (Expr e, *Emit ctx, [Binding] env): Str -> match e {
 	Expr.CmpGe(l, r) -> emit_binop(ctx, "csgew", l, r, env),
 	Expr.And(l, r) -> emit_logical(ctx, true, l, r, env),
 	Expr.Or(l, r) -> emit_logical(ctx, false, l, r, env),
-	Expr.If(cond, thenE, elseE) -> emit_if(ctx, cond, thenE, elseE, env)
+	Expr.If(cond, thenE, elseE) -> emit_if(ctx, cond, thenE, elseE, env),
+	Expr.Call(cl) -> emit_call(ctx, cl, env)
 }
 
 # --- statement / block emit -----------------------------------------------------------
@@ -256,54 +312,91 @@ const emit_block = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 		}
 		i = i + 1
 	}
-	if !did_return then die("cf0: emit: `main`'s body must end with `return`\n")
+	if !did_return then die("cf0: emit: a function body must end with `return`\n")
 	return 0
 }
 
-# Emit the whole program: the exported `main` (its parameters + body) plus the
-# freestanding entry floor.
+# Whole-program checks before emit: exactly one `pub const main` (the entry) with at
+# most three parameters, and no two functions sharing a name.
+const resolve_program = ([Func] funcs): Iarch -> {
+	let Iarch mains = 0
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(funcs.len) then break
+		let Iarch j = 0
+		loop {
+			if j >= i then break
+			if str_eq(funcs[j].name, funcs[i].name) then die("cf0: resolve: two functions share a name\n")
+			j = j + 1
+		}
+		if str_eq(funcs[i].name, "main") then {
+			if !funcs[i].is_pub then die("cf0: resolve: `main` must be `pub`\n")
+			if Iarch(funcs[i].params.len) > 3 then die("cf0: resolve: `main` takes at most three parameters\n")
+			mains = mains + 1
+		}
+		i = i + 1
+	}
+	if mains == 0 then die("cf0: resolve: no `pub const main` entry point\n")
+	return 0
+}
+
+# Emit one function: its signature, parameter spills, and body. main is the exported
+# `$main` (the entry the floor calls); every other function `idx` is the internal
+# `$f<idx>` (positional, so a user name can never collide with `_start`/`_main`).
 #
-# darwin hands `main` its (argc, argv, envp) in x0/x1/x2 at the entry point, and
-# the `_start` floor does nothing before `bl _main`, so those registers flow
-# straight through — QBE reads them as `$main`'s declared arguments. Each word
-# parameter (argc) spills to a stack slot so it reads like a local; the pointer
-# parameters (argv/envp) ride in the signature but carry no integer value.
-pub const emit_program = (Func prog, Uarch qbe_fd, Uarch asm_fd): Iarch -> {
-	let Emit ctx = Emit({ fd: qbe_fd, next: 0, label: 0 })
-	# signature: `export function w $main(w %p0, l %p1, …)`. Parameters are named
-	# POSITIONALLY (`%p<i>`), not by source name — the QBE temp only has to match
-	# between the signature and the spill, and a Str name cannot be interpolated
-	# (cfcc interpolates bare identifiers only). A word parameter (Iarch, argc) is
-	# `w`; a pointer parameter (*[Str], argv/envp) is `l`.
-	write_str(qbe_fd, "export function w $main(")
+# Parameters are named POSITIONALLY in QBE (`%p<i>`), not by source name — the temp
+# only has to match between the signature and the spill, and a Str name cannot be
+# interpolated (cfcc interpolates bare identifiers only). A word parameter (Iarch)
+# is `w` and spills to a stack slot so it reads like a local; a pointer parameter
+# (*[Str]) is `l` and rides the signature unused. All returns are words.
+const emit_func = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
+	const Bool is_main = str_eq(fn.name, "main")
+	if is_main then write_str(ctx.fd, "export function w $main(")
+	if !is_main then write_str(ctx.fd, "function w $f${idx}(")
 	let Iarch si = 0
 	loop {
-		if si >= Iarch(prog.params.len) then break
-		if si > 0 then write_str(qbe_fd, ", ")
-		if prog.params[si].is_ptr then write_str(qbe_fd, "l %p${si}")
-		if !prog.params[si].is_ptr then write_str(qbe_fd, "w %p${si}")
+		if si >= Iarch(fn.params.len) then break
+		if si > 0 then write_str(ctx.fd, ", ")
+		if fn.params[si].is_ptr then write_str(ctx.fd, "l %p${si}")
+		if !fn.params[si].is_ptr then write_str(ctx.fd, "w %p${si}")
 		si = si + 1
 	}
-	write_str(qbe_fd, ") {\n")
-	write_str(qbe_fd, "@start\n")
-	# spill each word parameter into a stack slot and build the parameter bindings;
-	# a pointer parameter carries no slot. All parameters are immutable.
+	write_str(ctx.fd, ") {\n")
+	write_str(ctx.fd, "@start\n")
 	let [Binding] params = []
 	let Iarch pi = 0
 	loop {
-		if pi >= Iarch(prog.params.len) then break
-		if prog.params[pi].is_ptr then params = [...params, Binding({ name: prog.params[pi].name, slot: 0 - 1, mutable: false, is_ptr: true })]
-		if !prog.params[pi].is_ptr then {
+		if pi >= Iarch(fn.params.len) then break
+		if fn.params[pi].is_ptr then params = [...params, Binding({ name: fn.params[pi].name, slot: 0 - 1, mutable: false, is_ptr: true })]
+		if !fn.params[pi].is_ptr then {
 			const Iarch slot = ctx.next
 			ctx.next = ctx.next + 1
-			write_str(qbe_fd, "\t%t${slot} =l alloc4 4\n")
-			write_str(qbe_fd, "\tstorew %p${pi}, %t${slot}\n")
-			params = [...params, Binding({ name: prog.params[pi].name, slot: slot, mutable: false, is_ptr: false })]
+			write_str(ctx.fd, "\t%t${slot} =l alloc4 4\n")
+			write_str(ctx.fd, "\tstorew %p${pi}, %t${slot}\n")
+			params = [...params, Binding({ name: fn.params[pi].name, slot: slot, mutable: false, is_ptr: false })]
 		}
 		pi = pi + 1
 	}
-	emit_block(&ctx, prog.body, params)
-	write_str(qbe_fd, "}\n")
+	emit_block(ctx, fn.body, params)
+	write_str(ctx.fd, "}\n")
+	return 0
+}
+
+# Emit the whole program: every function (main exported, the rest internal), each
+# with a fresh temp/label counter, then the freestanding entry floor once.
+#
+# darwin hands `main` its (argc, argv, envp) in x0/x1/x2 at the entry point, and the
+# `_start` floor does nothing before `bl _main`, so those registers flow straight
+# through — QBE reads them as `$main`'s declared arguments.
+pub const emit_program = ([Func] funcs, Uarch qbe_fd, Uarch asm_fd): Iarch -> {
+	resolve_program(funcs)
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(funcs.len) then break
+		let Emit ctx = Emit({ fd: qbe_fd, next: 0, label: 0, funcs: funcs })
+		emit_func(&ctx, funcs[i], i)
+		i = i + 1
+	}
 	# asm floor: the freestanding entry. `_start` calls `_main` (argc/argv/envp still
 	# in x0/x1/x2 from the kernel), then exit-syscalls its return (in x0).
 	write_str(asm_fd, ".globl _start\n")
