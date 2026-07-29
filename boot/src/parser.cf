@@ -1,0 +1,67 @@
+# parser — token stream to the program's exit code.
+#
+# Tracer-bullet scope: parse exactly `[pub] const main = () -> <body>` where the
+# body is an integer literal or a `{ return <int> }` block, and yield that
+# integer (cf0's whole "program" for now is `main`'s constant exit code). It
+# grows into the real recursive-descent parser + AST as the front end fills in.
+#
+# The parser walks the `[Token]` stream (a borrow) with a local cursor, matching
+# each token's KIND via the `is_*` predicates and reading identifier text back
+# out of the source buffer to recognise keywords.
+
+import "io" as { die }
+import "token" as { Token, is_ident, is_intlit, is_lparen, is_rparen, is_lbrace, is_rbrace, is_eq, is_arrow }
+
+# Does token `t`'s source slice equal the keyword `kw`?
+const slice_eq = (*[Uint8] src, Iarch start, Iarch len, Str kw): Bool -> {
+	if len != Iarch(kw.len) then return false
+	let Iarch i = 0
+	loop {
+		if i >= len then break
+		if Iarch(src[start + i]) != Iarch(kw[i]) then return false
+		i = i + 1
+	}
+	return true
+}
+
+# Parse the whole program and return `main`'s constant exit code.
+pub const parse_program = ([Token] toks, *[Uint8] src): Iarch -> {
+	let Iarch pos = 0
+	# optional `pub`
+	if is_ident(toks[pos].kind) then {
+		if slice_eq(src, toks[pos].start, toks[pos].len, "pub") then pos = pos + 1
+	}
+	# `const`
+	if !is_ident(toks[pos].kind) then die("cf0: parse: expected `const`\n")
+	if !slice_eq(src, toks[pos].start, toks[pos].len, "const") then die("cf0: parse: expected `const`\n")
+	pos = pos + 1
+	# `main`
+	if !is_ident(toks[pos].kind) then die("cf0: parse: expected `main`\n")
+	if !slice_eq(src, toks[pos].start, toks[pos].len, "main") then die("cf0: parse: the entry declaration must be `main`\n")
+	pos = pos + 1
+	# `=`
+	if !is_eq(toks[pos].kind) then die("cf0: parse: expected `=`\n")
+	pos = pos + 1
+	# `(` `)` — empty parameter list (tracer-bullet scope)
+	if !is_lparen(toks[pos].kind) then die("cf0: parse: expected `(`\n")
+	pos = pos + 1
+	if !is_rparen(toks[pos].kind) then die("cf0: parse: expected `)` (main takes no parameters yet)\n")
+	pos = pos + 1
+	# `->`
+	if !is_arrow(toks[pos].kind) then die("cf0: parse: expected `->`\n")
+	pos = pos + 1
+	# body: an integer literal, or `{ return <int> }`
+	if is_intlit(toks[pos].kind) then return toks[pos].ival
+	if is_lbrace(toks[pos].kind) then {
+		pos = pos + 1
+		if !is_ident(toks[pos].kind) then die("cf0: parse: expected `return`\n")
+		if !slice_eq(src, toks[pos].start, toks[pos].len, "return") then die("cf0: parse: expected `return`\n")
+		pos = pos + 1
+		if !is_intlit(toks[pos].kind) then die("cf0: parse: expected an integer after `return`\n")
+		const Iarch v = toks[pos].ival
+		pos = pos + 1
+		if !is_rbrace(toks[pos].kind) then die("cf0: parse: expected `}`\n")
+		return v
+	}
+	return die("cf0: parse: expected an integer or a `{ return <int> }` block\n")
+}

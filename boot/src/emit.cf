@@ -1,0 +1,33 @@
+# emit — the program's exit code to QBE IL + an asm floor.
+#
+# cf0 cannot yet spawn `qbe`/`cc` (process-spawn is deferred to the external
+# driver), so it EMITS two text artifacts to explicit file descriptors and the
+# driver assembles them: the QBE IL (the user code, run through `qbe`) and the
+# arm64 asm floor (`_start`, emitted verbatim beside the `qbe` output, since QBE
+# has no `svc`). Tracer-bullet scope: `main` returns a constant exit code and
+# allocates nothing, so no arena/runtime is needed — just the entry stub.
+#
+# ⚠ THROWAWAY codegen — NOT the cf0 `%node`/`%ret` ABI or the real page/arena
+# runtime (both reintroduced at the M6/M9 representation gate). This is the
+# minimal thing that runs, mirroring cfcc's own tracer-bullet emit.
+
+import "io" as { write_str }
+
+# Emit the whole program (currently just `main -> <code>`).
+pub const emit_program = (Iarch code, Uarch qbe_fd, Uarch asm_fd): Iarch -> {
+	# QBE IL: `main` is the exported entry, returning the Int exit code (a word).
+	write_str(qbe_fd, "export function w $main() {\n")
+	write_str(qbe_fd, "@start\n")
+	write_str(qbe_fd, "\tret ${code}\n")
+	write_str(qbe_fd, "}\n")
+	# asm floor: the freestanding entry. darwin hands argc/argv/envp in x0-x2 at
+	# LC_MAIN entry; `_start` forwards them (unused here), calls `_main`, then
+	# exit-syscalls its return (in x0). `--libc none` links `-nostdlib -lSystem`.
+	write_str(asm_fd, ".globl _start\n")
+	write_str(asm_fd, ".p2align 2\n")
+	write_str(asm_fd, "_start:\n")
+	write_str(asm_fd, "\tbl _main\n")
+	write_str(asm_fd, "\tmov x16, #1\n")
+	write_str(asm_fd, "\tsvc #0x80\n")
+	return 0
+}
