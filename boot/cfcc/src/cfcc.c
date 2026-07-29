@@ -2010,6 +2010,17 @@ static Type resolve_member_type(Program *prog, const char *name, int line) {
 		return (Type){TY_STR, NULL, NULL, 0, NULL};
 	if (strcmp(name, "Uarch") == 0) /* a `Uarch` field — a 64-bit `l` word */
 		return (Type){TY_UARCH, NULL, NULL, 0, NULL};
+	if (name[0] == '[') {
+		/* A `[T]` dynamic-array field/payload type stored as `[Elem]` (parse_member_type): strip
+		 * the brackets, resolve the element recursively, and build a TY_DYN. The stored value is
+		 * the `l` `{data,len,cap}` header pointer (an 8-byte slot, like a Str/pointer field). */
+		size_t n = strlen(name);
+		if (n < 3 || name[n - 1] != ']')
+			die(line, "malformed dynamic-array field type");
+		char inner[64];
+		snprintf(inner, sizeof inner, "%.*s", (int)(n - 2), name + 1);
+		return mk_dyn(resolve_member_type(prog, inner, line));
+	}
 	if (name[0] == '(') {
 		/* A tuple field/payload type stored as `(T0,T1,…)` (parse_member_type): split the
 		 * element names on TOP-LEVEL commas (a comma inside a nested `(…)` stays part of the
@@ -5243,8 +5254,32 @@ static void parse_member_type(Parser *p, char *out, size_t cap) {
 		parse_type_arg(p, out + 1, cap - 1); /* the (possibly generic) pointee name */
 		return;
 	}
-	if (t->kind == TK_LBRACKET)
-		die(t->line, "a field/payload type is `Int`, an aggregate, or `'T`, not an array/buffer");
+	if (t->kind == TK_LBRACKET) {
+		/* A `[T]` DYNAMIC-array field/payload (a growable vector bundled in a record/union —
+		 * a compiler context holding a token/AST list). Stored as the marker `[Elem]`;
+		 * resolve_member_type turns it into TY_DYN{elem}. The element is any ordinary
+		 * field/payload type (a scalar, Str, aggregate, or `*Aggregate`); a fixed-array `[N T]`
+		 * field is NOT a thing (arrays-with-length aren't fields), so a leading length is
+		 * rejected. ⚠ cf0 must NOT inherit: cf0 also admits fixed-array and slice fields with a
+		 * length, bounds-checked; cfcc has only the unbounded `[T]` vector field here (and the
+		 * `*[Uint8]`/`*[Iarch]` element-pointer fields above). */
+		advance(p); /* [ */
+		if (peek(p)->kind == TK_INT)
+			die(peek(p)->line, "a fixed-array `[N T]` is not a field type — use a `[T]` dynamic array or a `*[Uint8]`/`*[Iarch]` pointer");
+		if (peek(p)->kind == TK_LBRACKET)
+			die(peek(p)->line, "a nested array field `[[T]]` is not supported");
+		if (cap < 3)
+			die(t->line, "type name too long");
+		out[0] = '[';
+		parse_member_type(p, out + 1, cap - 2); /* the element type (scalar/Str/aggregate/`*Aggregate`) */
+		size_t n = strlen(out);
+		if (n + 1 >= cap)
+			die(t->line, "type name too long");
+		out[n] = ']';
+		out[n + 1] = '\0';
+		expect(p, TK_RBRACKET, "expected `]` to close the `[T]` dynamic-array field type");
+		return;
+	}
 	if (t->kind == TK_LPAREN) {
 		/* A tuple field/payload type `(T0, …)`, stored canonically as `(T0,T1,…)` (no spaces);
 		 * resolve_member_type interns it. Elements may themselves be tuples (nested). The `(…)`
@@ -5582,6 +5617,14 @@ static UnionDecl *parse_union_decl(Parser *p, Program *prog) {
 			maxarity = u->arity[i];
 	}
 	u->size = 8 + maxarity * 8;
+	for (int i = 0; i < u->nmembers; i++)
+		for (int j = 0; j < u->arity[i]; j++)
+			if (u->payload_types[i][j][0] == '[')
+				/* A `[T]` dynamic-array UNION payload is a later brick — the boxed-payload storage,
+				 * construction, and match binding for a growable-vector payload are unbuilt. Record
+				 * FIELDS carry `[T]` (a context struct); a union payload does not yet. Rejected at the
+				 * declaration so no half-wired construct/match path opens. ⚠ cf0 supports it. */
+				die(nm->line, "a `[T]` dynamic-array union payload is a later brick — use a record field, or a `*[Iarch]`/`*[Uint8]` pointer payload");
 	for (int i = 0; i < u->nmembers; i++) /* every `'T` payload must name a declared type parameter */
 		for (int j = 0; j < u->arity[i]; j++)
 			check_tyvars_declared(u->payload_types[i][j], u->typarams, u->ntyparams, nm->line);
@@ -6232,6 +6275,24 @@ static void subst_mangled(char *dst, size_t cap, const char *src,
 		}
 		dst[off++] = ')';
 		dst[off] = '\0';
+		return;
+	}
+	if (src[0] == '[') {
+		/* A `[T]` dynamic-array field/payload type string `[Elem]` — substitute the element so a
+		 * generic element `['T]` picks up its concrete arg (`['T]` → `[Int]`), mirroring the tuple
+		 * branch. A `[…]` has exactly one element, so no comma split. */
+		size_t n = strlen(src);
+		if (n < 3 || src[n - 1] != ']')
+			die(0, "malformed dynamic-array type name");
+		char el[256], sub[256];
+		if (n - 2 >= sizeof el)
+			die(0, "dynamic-array element type too long");
+		memcpy(el, src + 1, n - 2);
+		el[n - 2] = '\0';
+		subst_mangled(sub, sizeof sub, el, typarams, args, ntp);
+		int w = snprintf(dst, cap, "[%s]", sub);
+		if (w < 0 || (size_t)w >= cap)
+			die(0, "dynamic-array type name too long");
 		return;
 	}
 	char buf[512];
@@ -7523,6 +7584,17 @@ static void check_member_value(Program *prog, Func *fn, Expr *val, Type want, in
 		 * cf0 rehomes/copies the aggregate. */
 		if (at.kind != TY_STR)
 			die(line, "expected a `Str` value for this field/payload");
+	} else if (want.kind == TY_DYN) {
+		/* A `[T]` dynamic-array field/payload — the `l` `{data,len,cap}` header pointer. Takes a
+		 * dynamic array of the same element type (a local, a `[T]` param, or a `[T]`-returning
+		 * call). ⚠ cf0 must NOT inherit: a `[T]` field from an existing vector VAR is a genuine
+		 * §9.2 second-bind — a `[T]` is a growable pointer-carrying aggregate, so aliasing its
+		 * header lets two names grow one vector; cf0 rehomes/copies it. cfcc aliases the header
+		 * (a genesis shortcut, like the Str/union field alias above). */
+		if (at.kind != TY_DYN)
+			die(line, "expected a `[T]` dynamic-array value for this field/payload");
+		if (!types_equal(array_elem(at), array_elem(want)))
+			die(line, "field/payload dynamic-array element type differs");
 	} else {
 		die(line, "unsupported field/payload type");
 	}
@@ -9006,6 +9078,13 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 				 * value. Intermediate record/pointer fields are written THROUGH (shared storage), so
 				 * only the root's mutability gates the write. */
 				Type lt = typeof_expr(prog, fn, s->expr); /* resolves the chain (foff on the final EX_FIELD) */
+				/* The final selector must be a REAL stored field. A synthetic computed property
+				 * (`.len` on an array/`[T]`/Str, `.bytes` on a Str) returns from typeof_expr WITHOUT
+				 * setting the EX_FIELD's `rec`/`foff`, so assigning to it would `store` through the
+				 * unset offset 0 — corrupting the header's data pointer. Reject it: computed
+				 * properties are read-only. (Closes the hole for `[T]`, Str, and array fields alike.) */
+				if (s->expr->rec == NULL)
+					die(s->line, "cannot assign to a computed property (`.len`/`.bytes` are read-only)");
 				Expr *root = s->expr;
 				while (root->kind == EX_FIELD)
 					root = root->lhs;
@@ -9021,6 +9100,8 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 					die(s->line, "cannot mutate through a `const` record (declare the root with `let`)");
 				if (rr == R_PARAM && rty.kind != TY_PTR)
 					die(s->line, "cannot mutate through a by-value record parameter (take a `*Record`)");
+				if (lt.kind == TY_DYN) /* writing a `[T]` field is a later brick (see the one-level path) */
+					die(s->line, "assigning a `[T]` dynamic-array field is a later brick — build the vector before construction (a field is read-only here)");
 				check_member_value(prog, fn, s->yval, lt, s->line); /* the value fits the final field */
 				break;
 			}
@@ -9058,6 +9139,12 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 			if (idx < 0)
 				die(s->line, "this data type has no such field");
 			s->foff = data_field_offset(idx);
+			if (data_field_type(prog, trec, idx).kind == TY_DYN)
+				/* Writing a `[T]` field (whole reassign OR in-place grow `c.f = [...c.f, e]`) is a
+				 * later brick: build the vector as a local first, store it at construction, then read
+				 * it. Rejected cleanly so no aliasing/growth path opens without the value-semantics
+				 * work. ⚠ cf0 supports mutable vector fields (with §9.2 ownership rules). */
+				die(s->line, "assigning a `[T]` dynamic-array field is a later brick — build the vector before construction (a field is read-only here)");
 			check_member_value(prog, fn, s->expr, data_field_type(prog, trec, idx), s->line);
 			break;
 		}
