@@ -781,6 +781,20 @@ typedef enum {
 	            * or a long by width; the incoming value is canonical. */
 	PK_STR,    /* a `Str` param — an `l` pointer to a `{bytes*, len}` header (TY_STR). Spilled to
 	            * an `l` slot `%s_<name>` at entry, then read exactly like a Str local (loadl). */
+	PK_DYN,    /* a `[T]` DYNAMIC-array param — an `l` pointer to the `{data, len, cap}` header
+	            * (TY_DYN), like a record/Str pointer. `arr_elem`/`arr_elem_t` carry the element
+	            * type (resolved in resolve_signatures). Copied into `%r_<name>` at entry, so the
+	            * body indexes (`xs[i]`), reads `.len`, and iterates (`for x in xs`) exactly like a
+	            * dynamic-array local. A READ-ONLY borrow: the callee cannot grow/reassign it (the
+	            * same value-semantics as a by-value record/`[N T]` param — build a fresh vector
+	            * and RETURN it instead). ⚠ cf0 must NOT inherit: cf0 tracks the borrow's element
+	            * type/length precisely and applies the §9.2 no-second-bind + copy rules. In
+	            * particular cfcc lets a body `return` a borrowed `[T]` param (the caller's header
+	            * pointer rides back out), so `const b = id(a)` aliases `a`'s `{data,len,cap}` header —
+	            * a §9.2 no-second-bind hazard cf0 closes (it is the same no-deep-copy degeneracy as
+	            * cfcc's record/`[N T]` pointer adoption). Generic `['T]` element types are also
+	            * unsupported (parse_member_type rejects a `'T` element — a later brick, shared with
+	            * the `[N T]` and fixed-array element paths). */
 } ParamKind;
 
 typedef struct Param {
@@ -1559,6 +1573,9 @@ typedef struct Func {
 	UnionDecl *ret_uni;     /* resolved union return type (typecheck) */
 	int ret_alen;           /* >0 ⇒ a `[N T]` fixed-array return of N elements (an `l` arena
 	                         * pointer, returned copy-free like a record); 0 otherwise */
+	int ret_dyn;            /* 1 ⇒ a `[T]` DYNAMIC-array return (an `l` `{data,len,cap}` header
+	                         * pointer, returned copy-free like a record). The element type NAME
+	                         * rides in `ret_elem` (resolved to `ret_elem_t`), shared with `[N T]`. */
 	char ret_elem[64];      /* the `[N T]` return's element type NAME ("" ⇒ Iarch); resolved to
 	                         * ret_elem_t by resolve_signatures (which has `prog`) */
 	struct Type *ret_elem_t; /* the resolved `[N T]` return element type (NULL ⇒ Iarch); func_ret_type
@@ -1732,6 +1749,7 @@ static void sig_append_param(const Param *pm, char *buf, size_t cap) {
 	case PK_UNION:  sig_append(buf, cap, 'U'); return;
 	case PK_TUPLE:  sig_append(buf, cap, 'T'); return;
 	case PK_STR:    sig_append(buf, cap, 'S'); return;
+	case PK_DYN:    sig_append(buf, cap, 'A'); return;
 	case PK_VAR:    sig_append(buf, cap, 'V'); return;
 	case PK_FN:
 		sig_append(buf, cap, '(');
@@ -2106,6 +2124,10 @@ static Resolution resolve_name(Func *fn, const char *name, Type *ty) {
 				else if (fn->params[i].is_words) { ty->kind = TY_ARRAY; ty->alen = fn->params[i].arr_len > 0 ? fn->params[i].arr_len : -1; ty->elem = fn->params[i].arr_elem_t; } /* by-value `[N T]` → alen=N + element type; `*[Iarch]` → alen<0 (a pointer, no comptime length, Iarch element) */
 				else { ty->kind = TY_PTR; }
 				ty->rec = NULL; break;
+			case PK_DYN:     /* a `[T]` dynamic-array param — a TY_DYN header pointer, element on `elem` */
+				ty->kind = TY_DYN; ty->rec = NULL;
+				ty->elem = fn->params[i].arr_elem_t; /* NULL ⇒ Iarch (array_elem default) */
+				break;
 			case PK_UARCH:   ty->kind = TY_UARCH;  ty->rec = NULL; break;
 			case PK_UNION: /* is_ptr → an explicit `*Union` pointer (TY_PTR to the pointee union) */
 				ty->kind = fn->params[i].is_ptr ? TY_PTR : TY_UNION;
@@ -2535,7 +2557,17 @@ static void parse_param_type(Parser *p, Param *out) {
 		 * borrow, not a value copy); uniform-8 element slots. */
 		advance(p); /* [ */
 		Token *nt = peek(p);
-		if (nt->kind != TK_INT || nt->ival <= 0)
+		if (nt->kind != TK_INT) {
+			/* No leading length ⇒ a `[T]` DYNAMIC-array param (a growable vector passed by its
+			 * `{data,len,cap}` header pointer), mirroring the `[T]` vs `[N T]` local
+			 * disambiguation. The element type is read as a member-type name and resolved to
+			 * arr_elem_t in resolve_signatures; the body sees a TY_DYN, read-only borrow. */
+			parse_member_type(p, out->arr_elem, sizeof out->arr_elem);
+			expect(p, TK_RBRACKET, "expected `]` to close the `[T]` dynamic-array param type");
+			out->kind = PK_DYN;
+			return;
+		}
+		if (nt->ival <= 0)
 			die(nt->line, "a `[N T]` param needs a positive comptime length");
 		advance(p);
 		parse_member_type(p, out->arr_elem, sizeof out->arr_elem); /* the element type name */
@@ -4034,7 +4066,16 @@ static int parse_return_type(Parser *p, Func *fn) {
 		fn->ret_line = rt->line;
 		advance(p); /* [ */
 		Token *nt = peek(p);
-		if (nt->kind != TK_INT || nt->ival <= 0)
+		if (nt->kind != TK_INT) {
+			/* No leading length ⇒ a `[T]` DYNAMIC-array return (a growable vector returned by its
+			 * `{data,len,cap}` header pointer, copy-free like a record — the arena outlives the
+			 * frame). The element type NAME rides in ret_elem (resolved to ret_elem_t). */
+			parse_member_type(p, fn->ret_elem, sizeof fn->ret_elem);
+			expect(p, TK_RBRACKET, "expected `]` to close the `[T]` dynamic-array return type");
+			fn->ret_dyn = 1;
+			return 1;
+		}
+		if (nt->ival <= 0)
 			die(nt->line, "a `[N T]` return type needs a positive comptime length");
 		fn->ret_alen = (int)nt->ival;
 		advance(p);
@@ -4417,9 +4458,9 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 			 * The initializer is an array literal (possibly empty); elements are checked/adopted
 			 * against the element type in the ST_LOCAL typecheck, growth via `xs = [...xs, e]`. */
 			s->expr = parse_expr(p, fn);
-			if (s->expr->kind != EX_ARRAY)
-				die(name->line, "a `[T]` dynamic array binds an array literal (`[]` or `[e0, …]`)");
-			if (s->expr->spread)
+			if (s->expr->kind != EX_ARRAY && s->expr->kind != EX_CALL)
+				die(name->line, "a `[T]` dynamic array binds an array literal (`[]` or `[e0, …]`) or a `[T]`-returning call");
+			if (s->expr->kind == EX_ARRAY && s->expr->spread)
 				die(name->line, "a `[T]` initializer is a plain literal — a `[...xs, e]` spread is only for growth `xs = [...xs, e]`");
 			s->is_dyn = 1;
 			snprintf(s->arr_elem, sizeof s->arr_elem, "%s", arrelem); /* "" ⇒ Iarch; resolved in typecheck */
@@ -6667,6 +6708,7 @@ static const char *shallow_type_name(Program *prog, Func *fn, Expr *e) {
 				case PK_CAPTURE_REC: return fn->params[i].type_name; /* a captured record */
 				case PK_FN: return ""; /* a function value — no simple nominal type name */
 				case PK_TUPLE: return ""; /* a structural tuple — no nominal name to infer from */
+				case PK_DYN: return ""; /* a `[T]` dynamic array — no simple nominal name to infer from */
 				case PK_UNIT: return "Unit"; /* the unit type */
 				case PK_F64: return "Float64";
 				case PK_F32: return "Float32";
@@ -8019,6 +8061,19 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 				if (at.kind != TY_STR)
 					die(e->line, "argument type mismatch (a `Str` parameter expects a string)");
 				break;
+			case PK_DYN: {
+				/* A `[T]` dynamic-array param: the argument is a dynamic array whose element type
+				 * matches. Passed as the `l` `{data,len,cap}` header pointer (a read-only borrow).
+				 * ⚠ cf0 must NOT inherit: cfcc requires an argument that is ALREADY a `[T]` value
+				 * (bind a literal to a `let [T]` first) — a bare `[…]` literal arg is rejected here,
+				 * whereas §6.2 lets a literal in a dynamic-expected position become a `[T]`. */
+				Type pelem = pm->arr_elem_t ? *pm->arr_elem_t : mk_iarch();
+				if (at.kind != TY_DYN)
+					die(e->line, "argument type mismatch (a `[T]` dynamic-array parameter expects a dynamic array)");
+				if (!types_equal(array_elem(at), pelem))
+					die(e->line, "argument type mismatch (a `[T]` parameter's element type differs)");
+				break;
+			}
 			case PK_UNION:
 				if (pm->is_ptr) {
 					/* A `*Union` parameter needs a POINTER — `&x` or another `*Union`. */
@@ -8484,6 +8539,8 @@ static Type func_ret_type(const Func *fn) {
 		t.elem = fn->ret_elem_t; /* NULL ⇒ Iarch (array_elem default) */
 		return t;
 	}
+	if (fn->ret_dyn) /* a `[T]` dynamic-array return — an `l` `{data,len,cap}` header pointer */
+		return mk_dyn(fn->ret_elem_t ? *fn->ret_elem_t : mk_iarch());
 	if (fn->ret_is_ptr) /* an explicit `*Aggregate` return — a TY_PTR to the pointee decl */
 		return (Type){TY_PTR, fn->ret_rec, fn->ret_uni, 0, NULL};
 	if (fn->ret_uni)
@@ -8796,11 +8853,21 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 				else
 					resolve_record_expr_binding(prog, fn, s); /* a record-valued call */
 			} else if (s->is_dyn) {                           /* a `[T]` dynamic-array binding */
-				/* Resolve the annotated element type, pin the local's TY_DYN{elem}, and
-				 * check/adopt each initializer element (empty `[]` is fine). */
+				/* Resolve the annotated element type and pin the local's TY_DYN{elem}. The
+				 * initializer is either an array literal (check/adopt each element; empty `[]` is
+				 * fine) or a `[T]`-returning call (adopt its fresh header pointer — a move, like a
+				 * record/array call result; the element type must match). */
 				Type elem = s->arr_elem[0] ? resolve_member_type(prog, s->arr_elem, s->line) : mk_iarch();
 				set_local_scalar(fn, s->name, mk_dyn(elem));
-				resolve_dyn_literal(prog, fn, s->expr, elem);
+				if (s->expr->kind == EX_ARRAY) {
+					resolve_dyn_literal(prog, fn, s->expr, elem);
+				} else {
+					Type it = typeof_expr(prog, fn, s->expr);
+					if (it.kind != TY_DYN)
+						die(s->line, "a `[T]` dynamic-array binding needs a dynamic-array-valued initializer");
+					if (!types_equal(array_elem(it), elem))
+						die(s->line, "dynamic-array return element type does not match the `[T]` annotation");
+				}
 			} else if (s->expr->kind == EX_ARRAY) {           /* a `[N T]` fixed-array binding */
 				Type dt;
 				resolve_name(fn, s->name, &dt);
@@ -9202,6 +9269,17 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 					if (!types_equal(array_elem(et), elem))
 						die(s->expr->line, "returned array element type does not match the `[N T]` return type");
 				}
+			} else if (rt.kind == TY_DYN) {
+				/* A `[T]` dynamic-array return — an `l` `{data,len,cap}` header pointer, copy-free
+				 * like a record (the arena outlives the frame). The value must be a `[T]` of the same
+				 * element type: a dynamic-array local, a `[T]`-returning call, or a `[T]` param. A bare
+				 * `[…]` literal is NOT accepted here (bind it to a `let [T]` first), mirroring the
+				 * `[N T]` array's non-literal return path. */
+				Type et = typeof_expr(prog, fn, s->expr);
+				if (et.kind != TY_DYN)
+					die(s->expr->line, "a `[T]` function returns a dynamic-array value");
+				if (!types_equal(array_elem(et), array_elem(rt)))
+					die(s->expr->line, "returned dynamic-array element type does not match the `[T]` return type");
 			} else {
 				expect_int(prog, fn, s->expr);
 			}
@@ -9333,7 +9411,7 @@ static void resolve_signatures(Program *prog) {
 		}
 		if (fn->ret_tuple_n > 0) /* a tuple return type: resolve + intern its shape */
 			fn->ret_tup = resolve_tuple_shape(prog, fn->ret_tuple_types, fn->ret_tuple_n, fn->ret_line);
-		if (fn->ret_alen > 0 && fn->ret_elem[0]) /* a `[N T]` array return: resolve its element type */
+		if ((fn->ret_alen > 0 || fn->ret_dyn) && fn->ret_elem[0]) /* a `[N T]`/`[T]` array return: resolve its element type */
 			fn->ret_elem_t = intern_type(resolve_member_type(prog, fn->ret_elem, fn->ret_line));
 		for (int j = 0; j < fn->nparams; j++) { /* a tuple parameter: resolve + intern its shape */
 			if (fn->params[j].kind == PK_TUPLE)
@@ -9341,6 +9419,8 @@ static void resolve_signatures(Program *prog) {
 				                                         fn->params[j].tuple_n, fn->params[j].line);
 			if (fn->params[j].kind == PK_LONG && fn->params[j].is_words &&
 			    fn->params[j].arr_len > 0 && fn->params[j].arr_elem[0]) /* a by-value `[N T]` array param */
+				fn->params[j].arr_elem_t = intern_type(resolve_member_type(prog, fn->params[j].arr_elem, fn->params[j].line));
+			if (fn->params[j].kind == PK_DYN && fn->params[j].arr_elem[0]) /* a `[T]` dynamic-array param */
 				fn->params[j].arr_elem_t = intern_type(resolve_member_type(prog, fn->params[j].arr_elem, fn->params[j].line));
 		}
 	}
@@ -10665,8 +10745,10 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 				fprintf(out, "\t%%r_%s =l call $cf_alloc(w %d)\n", s->name, s->bufsize);
 				break;
 			}
-			if (s->is_dyn) {
-				/* A `[T]` dynamic array: `%r_<name>` is the 24-byte header `{ data@0, len@8, cap@16 }`.
+			if (s->is_dyn && s->expr->kind == EX_ARRAY) {
+				/* A `[T]` dynamic array bound to a literal (`[]` or `[e0, …]`): `%r_<name>` is the
+				 * 24-byte header `{ data@0, len@8, cap@16 }`. (A `[T]`-returning call initializer
+				 * instead adopts the returned header pointer via the TY_DYN adopt path below.)
 				 * An empty `[]` leaves data=0/len=0/cap=0; initial elements get a fresh cap=len=n
 				 * backing block (uniform 8-byte slots), each stored at its width. Growth (via
 				 * $cf_dyn_push) later reallocs the backing, leaving this header pointer valid. */
@@ -10746,11 +10828,13 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 				}
 			} else if (s->expr->rtype.kind == TY_RECORD || s->expr->rtype.kind == TY_TUPLE ||
 			           s->expr->rtype.kind == TY_PTR || s->expr->rtype.kind == TY_ARRAY ||
+			           s->expr->rtype.kind == TY_DYN ||
 			           (s->expr->rtype.kind == TY_UNION && s->expr->rtype.uni->has_payload)) {
-				/* A record, tuple, boxed-union, `*Aggregate`-pointer, or `[N Iarch]`-array local:
-				 * adopt the initializer's arena pointer as this local's `%r_<name>` storage (a
-				 * move/alias, no copy). For a pointer local the initializer is `&x`/a `*T` — the
-				 * same pointer; for an array it is an array-returning call's fresh pointer. */
+				/* A record, tuple, boxed-union, `*Aggregate`-pointer, `[N Iarch]`-array, or `[T]`
+				 * dynamic-array local: adopt the initializer's arena pointer as this local's
+				 * `%r_<name>` storage (a move/alias, no copy). For a pointer local the initializer
+				 * is `&x`/a `*T` — the same pointer; for an array/vector it is an array-returning
+				 * call's fresh `{data,len,cap}`/element pointer. */
 				emit_expr(out, s->expr, ex, v, sizeof v);
 				fprintf(out, "\t%%r_%s =l copy %s\n", s->name, v);
 			} else if (s->expr->rtype.kind == TY_STR) {
@@ -11194,12 +11278,15 @@ static void emit_func(FILE *out, const Func *fn) {
 			fprintf(out, "\tstorel %%u_%s, %%s_%s\n", n, n);
 		} else if (fn->params[i].kind == PK_RECORD ||
 		           fn->params[i].kind == PK_CAPTURE_REC || fn->params[i].kind == PK_TUPLE ||
+		           fn->params[i].kind == PK_DYN ||
 		           (fn->params[i].kind == PK_LONG && (fn->params[i].is_bytes || fn->params[i].is_words)) ||
 		           (fn->params[i].kind == PK_UNION && fn->params[i].uni->has_payload &&
 		            !fn->params[i].is_ptr)) {
-			/* A record (by-value OR a `*Record` pointer), captured-record, tuple, byte-buffer
-			 * (`*[Uint8]`), word-array (`*[Iarch]`), or boxed-union param arrives as an arena
-			 * pointer, copied into the `%r_<name>` form field/index access uses. A captured
+			/* A record (by-value OR a `*Record` pointer), captured-record, tuple, `[T]` dynamic
+			 * array, byte-buffer (`*[Uint8]`), word-array (`*[Iarch]`), or boxed-union param
+			 * arrives as an arena pointer, copied into the `%r_<name>` form field/index access
+			 * uses. (A `[T]` param's `%r_<name>` is its `{data,len,cap}` header — a read-only
+			 * borrow; `.len`/`xs[i]`/`for` read through it.) A captured
 			 * record aliases the enclosing scope's storage, so field writes there are visible;
 			 * a `*Record` param likewise is a writable borrow (field-write through `%r_` mutates
 			 * the caller's record); a `*[Uint8]`/`*[Iarch]` param indexes/writes the caller's
