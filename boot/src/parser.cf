@@ -375,7 +375,18 @@ const parse_primary = (*Parser p): Expr -> {
 	if is_ident(peek(p)) then {
 		const Str name = cur_name(p)
 		p.pos = p.pos + 1
-		if is_lparen(peek(p)) then return parse_call(p, name)
+		if is_lparen(peek(p)) then {
+			# `Type({ … })` — an explicit record construction (the same `Expr.Record` the
+			# annotated brace form builds); a `(` followed by anything else is a call.
+			if is_lbrace(p.toks[p.pos + 1].kind) then {
+				p.pos = p.pos + 1
+				const Expr rec = parse_record_lit(p, name)
+				if !is_rparen(peek(p)) then die("cf0: parse: expected `)` after a record construction\n")
+				p.pos = p.pos + 1
+				return rec
+			}
+			return parse_call(p, name)
+		}
 		if is_dot(peek(p)) then {
 			p.pos = p.pos + 1
 			if !is_ident(peek(p)) then die("cf0: parse: expected a field name after `.`\n")
@@ -416,7 +427,8 @@ const parse_primary = (*Parser p): Expr -> {
 
 # `{ field: value, … }` — a data literal for a record of type `type_name`. Fields
 # may be given in any order (mapped to declaration order at typecheck); each is
-# `name: expr`. A trailing comma is allowed.
+# `name: expr`, or a pun `name` (shorthand for `name: name`, binding the field to the
+# like-named local). A trailing comma is allowed.
 const parse_record_lit = (*Parser p, Str type_name): Expr -> {
 	p.pos = p.pos + 1 # `{`
 	let [FieldInit] inits = []
@@ -425,9 +437,12 @@ const parse_record_lit = (*Parser p, Str type_name): Expr -> {
 		if !is_ident(peek(p)) then die("cf0: parse: expected a field name in a data literal\n")
 		const Str field = cur_name(p)
 		p.pos = p.pos + 1
-		if !is_colon(peek(p)) then die("cf0: parse: expected `:` after a field name\n")
-		p.pos = p.pos + 1
-		inits = [...inits, FieldInit({ field: field, value: parse_expr(p) })]
+		if is_colon(peek(p)) then {
+			p.pos = p.pos + 1
+			inits = [...inits, FieldInit({ field: field, value: parse_expr(p) })]
+		} else {
+			inits = [...inits, FieldInit({ field: field, value: Expr.Var(field) })]
+		}
 		if !is_comma(peek(p)) then break
 		p.pos = p.pos + 1
 	}
