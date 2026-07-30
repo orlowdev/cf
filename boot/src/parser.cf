@@ -9,8 +9,8 @@
 # (`acc = Expr.Add(acc, rhs)`) — one function per precedence level.
 
 import "io" as { die }
-import "token" as { Token, TokKind, is_eof, is_ident, is_intlit, is_lparen, is_rparen, is_lbrace, is_rbrace, is_lbracket, is_rbracket, is_comma, is_colon, is_dot, is_ellipsis, is_eq, is_arrow, is_minus, is_plus, is_star, is_slash, is_percent, is_amp, is_pipe, is_caret, is_tilde, is_bang, is_shl, is_shr, is_eqeq, is_ne, is_lt, is_gt, is_le, is_ge, is_logand, is_logor }
-import "ast" as { Expr, Stmt, Param, Func, Call, Ty, FieldInit, RecLit, RecDecl, UnionMember, UnionDecl, UnionMkE, MatchArm, MatchExpr, ArrLit, Body, Program }
+import "token" as { Token, TokKind, is_eof, is_ident, is_intlit, is_strlit, is_lparen, is_rparen, is_lbrace, is_rbrace, is_lbracket, is_rbracket, is_comma, is_colon, is_dot, is_ellipsis, is_eq, is_arrow, is_minus, is_plus, is_star, is_slash, is_percent, is_amp, is_pipe, is_caret, is_tilde, is_bang, is_shl, is_shr, is_eqeq, is_ne, is_lt, is_gt, is_le, is_ge, is_logand, is_logor }
+import "ast" as { Expr, Stmt, Param, Func, Call, Ty, FieldInit, RecLit, RecDecl, UnionMember, UnionDecl, UnionMkE, MatchArm, MatchExpr, ArrLit, StrData, Body, Program }
 
 # The parse cursor: the token stream, the source (for keyword text), a position.
 pub data Parser = { [Token] toks, *[Uint8] src, Iarch pos }
@@ -51,6 +51,44 @@ const intern = (*[Uint8] src, Iarch start, Iarch len): Str -> {
 
 # The current token's interned text (for a binding name or a variable reference).
 const cur_name = (*Parser p): Str -> intern(p.src, p.toks[p.pos].start, p.toks[p.pos].len)
+
+# The single byte an escape `\<e>` decodes to (`\n \t \r \0 \\ \" \$`); an unknown
+# escape is rejected.
+const escape_byte = (Iarch e): Iarch -> {
+	if e == 110 then return 10  # \n
+	if e == 116 then return 9   # \t
+	if e == 114 then return 13  # \r
+	if e == 48 then return 0    # \0
+	if e == 92 then return 92   # backslash
+	if e == 34 then return 34   # quote
+	if e == 36 then return 36   # dollar
+	die("cf0: parse: unknown string escape (allowed: \\n \\t \\r \\0 \\\\ \\\" \\$)\n")
+	return 0
+}
+
+# Decode a string literal's RAW content slice (src[start .. start+len]) into its
+# bytes: escapes collapse to one byte, a raw newline is content, a lone/trailing `$`
+# is literal. `${…}` interpolation is a later brick (rejected here).
+const decode_str = (*[Uint8] src, Iarch start, Iarch len): [Uint8] -> {
+	let [Uint8] out = []
+	let Iarch i = 0
+	loop {
+		if i >= len then break
+		const Iarch c = Iarch(src[start + i])
+		if c == 92 then {
+			if i + 1 >= len then die("cf0: parse: a dangling `\\` in a string\n")
+			out = [...out, Uint8(escape_byte(Iarch(src[start + i + 1])))]
+			i = i + 2
+			continue
+		}
+		if c == 36 then {
+			if i + 1 < len && Iarch(src[start + i + 1]) == 123 then die("cf0: parse: string interpolation is not yet supported\n")
+		}
+		out = [...out, Uint8(c)]
+		i = i + 1
+	}
+	return out
+}
 
 # --- expression grammar --------------------------------------------------------------
 # precedence, loosest to tightest:
@@ -356,6 +394,17 @@ const parse_match = (*Parser p): Expr -> {
 	return Expr.Match(MatchExpr({ scrut: scrut, arms: arms }))
 }
 
+# An optional postfix `.field` on a non-name primary — a string literal or a
+# parenthesised expression (`"ab".len`, `("ab").len`). A bare-name base uses `Field`.
+const postfix_field = (*Parser p, Expr base): Expr -> {
+	if !is_dot(peek(p)) then return base
+	p.pos = p.pos + 1
+	if !is_ident(peek(p)) then die("cf0: parse: expected a field name after `.`\n")
+	const Str f = cur_name(p)
+	p.pos = p.pos + 1
+	return Expr.FieldExpr(base, f)
+}
+
 const parse_primary = (*Parser p): Expr -> {
 	if kw(p, "if") then return parse_if(p)
 	if kw(p, "match") then return parse_match(p)
@@ -420,12 +469,20 @@ const parse_primary = (*Parser p): Expr -> {
 		p.pos = p.pos + 1
 		return Expr.Lit(v)
 	}
+	# a string literal — decode its bytes now; an optional `.len` rides as a postfix.
+	if is_strlit(peek(p)) then {
+		const Iarch start = p.toks[p.pos].start
+		const Iarch len = p.toks[p.pos].len
+		p.pos = p.pos + 1
+		const Expr s = Expr.StrLit(StrData({ bytes: decode_str(p.src, start, len) }))
+		return postfix_field(p, s)
+	}
 	if is_lparen(peek(p)) then {
 		p.pos = p.pos + 1
 		const Expr inner = parse_expr(p)
 		if !is_rparen(peek(p)) then die("cf0: parse: expected `)`\n")
 		p.pos = p.pos + 1
-		return inner
+		return postfix_field(p, inner)
 	}
 	die("cf0: parse: expected an integer or `(`\n")
 	return Expr.Lit(0)
@@ -678,8 +735,10 @@ const parse_type = (*Parser p): Ty -> {
 	}
 	if !is_ident(peek(p)) then die("cf0: parse: expected a type\n")
 	const Bool is_bool = kw(p, "Bool")
+	const Bool is_str = kw(p, "Str")
 	p.pos = p.pos + 1
 	if is_bool then return Ty.TBool
+	if is_str then return Ty.TStr
 	return Ty.TInt
 }
 

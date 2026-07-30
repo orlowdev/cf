@@ -16,7 +16,7 @@
 # The emitter runs only on programs this phase accepts.
 
 import "io" as { die }
-import "ast" as { Expr, Stmt, Param, Func, Call, Ty, FieldInit, RecLit, RecDecl, UnionMember, UnionDecl, UnionMkE, MatchArm, MatchExpr, ArrLit, Body, Program }
+import "ast" as { Expr, Stmt, Param, Func, Call, Ty, FieldInit, RecLit, RecDecl, UnionMember, UnionDecl, UnionMkE, MatchArm, MatchExpr, ArrLit, StrData, Body, Program }
 
 # A name in scope during checking: its type and whether it is reassignable (`let`).
 data VarTy = { Str name, Ty ty, Bool mutable }
@@ -30,6 +30,7 @@ data Ctx = { [Func] funcs, [RecDecl] recs, [UnionDecl] unions }
 
 const is_tint = (Ty t): Bool -> match t { Ty.TInt -> true, _ -> false }
 const is_tbool = (Ty t): Bool -> match t { Ty.TBool -> true, _ -> false }
+const is_tstr = (Ty t): Bool -> match t { Ty.TStr -> true, _ -> false }
 
 # The record / union / dynamic-array-element type name of a type, or "" otherwise.
 const rec_of = (Ty t): Str -> match t { Ty.TRec(n) -> n, _ -> "" }
@@ -43,7 +44,8 @@ const ty_eq = (Ty a, Ty b): Bool -> match a {
 	Ty.TPtr -> match b { Ty.TPtr -> true, _ -> false },
 	Ty.TRec(an) -> str_eq(an, rec_of(b)),
 	Ty.TUnion(an) -> str_eq(an, union_of(b)),
-	Ty.TDyn(an) -> str_eq(an, dyn_of(b))
+	Ty.TDyn(an) -> str_eq(an, dyn_of(b)),
+	Ty.TStr -> is_tstr(b)
 }
 
 # Byte-wise `Str` equality (name lookup).
@@ -108,6 +110,7 @@ const param_ty = (Param p, [RecDecl] recs, [UnionDecl] unions): Ty -> {
 	if find_rec(recs, p.type_name) >= 0 then return Ty.TRec(p.type_name)
 	if find_union(unions, p.type_name) >= 0 then return Ty.TUnion(p.type_name)
 	if str_eq(p.type_name, "Bool") then return Ty.TBool
+	if str_eq(p.type_name, "Str") then return Ty.TStr
 	if str_eq(p.type_name, "Iarch") then return Ty.TInt
 	if str_eq(p.type_name, "Int") then return Ty.TInt
 	die("cf0: type: a parameter names an undeclared type\n")
@@ -121,6 +124,7 @@ const func_ret_ty = (Func fn, [RecDecl] recs, [UnionDecl] unions): Ty -> {
 	if find_rec(recs, fn.ret_name) >= 0 then return Ty.TRec(fn.ret_name)
 	if find_union(unions, fn.ret_name) >= 0 then return Ty.TUnion(fn.ret_name)
 	if str_eq(fn.ret_name, "Bool") then return Ty.TBool
+	if str_eq(fn.ret_name, "Str") then return Ty.TStr
 	return Ty.TInt
 }
 
@@ -279,6 +283,11 @@ const field_type = (Str base, Str field, [VarTy] env, Ctx ctx): Ty -> {
 	}
 	const Iarch vi = env_index(env, base)
 	if vi < 0 then die("cf0: type: reference to an undeclared name\n")
+	# a string exposes only `.len` (an Int byte count) in this brick
+	if is_tstr(env[vi].ty) then {
+		if !str_eq(field, "len") then die("cf0: type: a string has only `.len`\n")
+		return Ty.TInt
+	}
 	# a dynamic array exposes only `.len` (an Int)
 	if !str_eq(dyn_of(env[vi].ty), "") then {
 		if !str_eq(field, "len") then die("cf0: type: a dynamic array has only `.len`\n")
@@ -448,10 +457,23 @@ const indexfield_type = (Str arr, Expr idx, Str field, [VarTy] env, Ctx ctx): Ty
 	return Ty.TInt
 }
 
+# A string literal is a `Str`.
+const strlit_type = (StrData sd): Ty -> Ty.TStr
+
+# `e.field` on a general (non-name) base — only `.len` on a `Str` in this brick, its
+# byte count (an Int).
+const fieldexpr_type = (Expr base, Str field, [VarTy] env, Ctx ctx): Ty -> {
+	if !is_tstr(type_of(base, env, ctx)) then die("cf0: type: field access `.` needs a string on the left\n")
+	if !str_eq(field, "len") then die("cf0: type: a string has only `.len`\n")
+	return Ty.TInt
+}
+
 const type_of = (Expr e, [VarTy] env, Ctx ctx): Ty -> match e {
 	Expr.Lit(v) -> lit_type(v),
 	Expr.BoolLit(b) -> Ty.TBool,
+	Expr.StrLit(sd) -> strlit_type(sd),
 	Expr.Var(name) -> var_type(env, name),
+	Expr.FieldExpr(base, f) -> fieldexpr_type(base, f, env, ctx),
 	Expr.Record(rl) -> record_type(rl, env, ctx),
 	Expr.Field(base, f) -> field_type(base, f, env, ctx),
 	Expr.UnionMk(mk) -> unionmk_type(mk, env, ctx),
@@ -601,6 +623,7 @@ const check_stmts = (Func fn, [Stmt] stmts, [VarTy] env0, Ctx ctx, Ty frt, Bool 
 		if k == 0 then {
 			if env_index(env, stmt_name(s)) >= 0 then die("cf0: type: a binding cannot shadow an existing name\n")
 			const Ty ty = type_of(stmt_expr(s), env, ctx)
+			if is_tstr(ty) && stmt_mut(s) then die("cf0: type: a Str local must be `const` (no Str reassignment)\n")
 			env = [...env, VarTy({ name: stmt_name(s), ty: ty, mutable: stmt_mut(s) })]
 		}
 		if k == 1 then {
