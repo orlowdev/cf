@@ -143,10 +143,13 @@ const emit_unop = (*Emit ctx, Str pre, Expr x, Str post, [Binding] env): Str -> 
 	return "%t${t}"
 }
 
-# Emit a variable reference: load its stack slot.
+# Emit a variable reference. A record local's slot IS its base pointer (returned as
+# an `l` value — e.g. a record being returned); a word local's slot points to its
+# cell, so it is loaded.
 const emit_var = (*Emit ctx, [Binding] env, Str name): Str -> {
 	const Iarch idx = lookup_index(env, name)
 	const Iarch slot = env[idx].slot
+	if !str_eq(env[idx].rec_type, "") then return "%t${slot}"
 	const Iarch t = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${t} =w loadw %t${slot}\n")
@@ -175,15 +178,16 @@ const emit_field = (*Emit ctx, [Binding] env, Str base, Str field): Str -> {
 	return "%t${t}"
 }
 
-# Emit a data literal: allocate the record on the stack (`alloc4`, 4 bytes/field),
-# store each initializer at its field's offset, and return the base-pointer temp.
-# Field initializers may be given in any order; each maps to its declared offset.
+# Emit a data literal: allocate the record in the ARENA (`cf_alloc`, 4 bytes/field —
+# so it outlives the current stack frame and may be returned), store each
+# initializer at its field's offset, and return the base-pointer temp. Field
+# initializers may be given in any order; each maps to its declared offset.
 const emit_record_lit = (*Emit ctx, RecLit rl, [Binding] env): Iarch -> {
 	const Iarch ri = find_rec(ctx.recs, rl.type_name)
 	const Iarch size = Iarch(ctx.recs[ri].fields.len) * 4
 	const Iarch base = ctx.next
 	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${base} =l alloc4 ${size}\n")
+	write_str(ctx.fd, "\t%t${base} =l call $cf_alloc(w ${size})\n")
 	let Iarch a = 0
 	loop {
 		if a >= Iarch(rl.inits.len) then break
@@ -205,15 +209,37 @@ const emit_record_val = (*Emit ctx, RecLit rl, [Binding] env): Str -> {
 	return ""
 }
 
-# The record type name of a binding initializer if it is a data literal, else "".
-const init_rec_type = (Expr e): Str -> match e {
+# The record type name a call returns, or "" if the callee does not return a record.
+const call_ret_rec = (*Emit ctx, Call cl): Str -> {
+	const Iarch fidx = find_func(ctx.funcs, cl.callee)
+	if fidx < 0 then return ""
+	if find_rec(ctx.recs, ctx.funcs[fidx].ret_name) >= 0 then return ctx.funcs[fidx].ret_name
+	return ""
+}
+
+# The record type name of a binding initializer that yields a record — a data
+# literal `{…}` or a record-returning call — else "".
+const init_rec_type = (*Emit ctx, Expr e): Str -> match e {
 	Expr.Record(rl) -> rl.type_name,
+	Expr.Call(cl) -> call_ret_rec(ctx, cl),
 	_ -> ""
 }
 
-# Emit a data-literal binding initializer, returning the record's base-pointer temp.
-const emit_record_init = (*Emit ctx, Expr e, [Binding] env): Iarch -> match e {
+# Emit a record-returning call and copy its result pointer into a fresh temp — the
+# caller ADOPTS the returned arena record as its own base pointer.
+const emit_call_adopt = (*Emit ctx, Call cl, [Binding] env): Iarch -> {
+	const Str v = emit_call(ctx, cl, env)
+	const Iarch t = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${t} =l copy ${v}\n")
+	return t
+}
+
+# Emit a record binding initializer, returning the record's base-pointer temp: a
+# data literal builds it in the arena; a record-returning call adopts its result.
+const emit_record_binding = (*Emit ctx, Expr e, [Binding] env): Iarch -> match e {
 	Expr.Record(rl) -> emit_record_lit(ctx, rl, env),
+	Expr.Call(cl) -> emit_call_adopt(ctx, cl, env),
 	_ -> 0 - 1
 }
 
@@ -327,7 +353,9 @@ const emit_call = (*Emit ctx, Call cl, [Binding] env): Str -> {
 	const Iarch rt = ctx.next
 	ctx.next = ctx.next + 1
 	const Bool is_main = str_eq(ctx.funcs[fidx].name, "main")
-	write_str(ctx.fd, "\t%t${rt} =w call $")
+	# a record-returning callee yields an `l` arena pointer; every other returns a word
+	if find_rec(ctx.recs, ctx.funcs[fidx].ret_name) >= 0 then write_str(ctx.fd, "\t%t${rt} =l call $")
+	if find_rec(ctx.recs, ctx.funcs[fidx].ret_name) < 0 then write_str(ctx.fd, "\t%t${rt} =w call $")
 	if is_main then write_str(ctx.fd, "main")
 	if !is_main then write_str(ctx.fd, "f${fidx}")
 	write_str(ctx.fd, "(")
@@ -477,7 +505,7 @@ const emit_block = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 			# `const`/`let name = init`. A record initializer (`{…}`) allocates the record
 			# and binds the name to its base pointer; a scalar allocates a word slot,
 			# stores the value, and binds the name to that slot.
-			const Str rt = init_rec_type(stmt_expr(s))
+			const Str rt = init_rec_type(ctx, stmt_expr(s))
 			if str_eq(rt, "") then {
 				const Str v = emit_expr(stmt_expr(s), ctx, env)
 				const Iarch slot = ctx.next
@@ -486,7 +514,7 @@ const emit_block = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 				write_str(ctx.fd, "\tstorew ${v}, %t${slot}\n")
 				env = [...env, Binding({ name: stmt_name(s), slot: slot, rec_type: "" })]
 			} else {
-				const Iarch base = emit_record_init(ctx, stmt_expr(s), env)
+				const Iarch base = emit_record_binding(ctx, stmt_expr(s), env)
 				env = [...env, Binding({ name: stmt_name(s), slot: base, rec_type: rt })]
 			}
 		}
@@ -531,8 +559,13 @@ const emit_block = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 # bound (the typecheck phase guarantees it is never referenced). All returns are words.
 const emit_func = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 	const Bool is_main = str_eq(fn.name, "main")
+	# main always returns a word (its Int exit code); a helper returning a record
+	# returns an `l` arena pointer, else a word.
 	if is_main then write_str(ctx.fd, "export function w $main(")
-	if !is_main then write_str(ctx.fd, "function w $f${idx}(")
+	if !is_main then {
+		if find_rec(ctx.recs, fn.ret_name) >= 0 then write_str(ctx.fd, "function l $f${idx}(")
+		if find_rec(ctx.recs, fn.ret_name) < 0 then write_str(ctx.fd, "function w $f${idx}(")
+	}
 	let Iarch si = 0
 	loop {
 		if si >= Iarch(fn.params.len) then break
@@ -571,14 +604,88 @@ const emit_func = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 	return 0
 }
 
-# Emit the whole program: every function (main exported, the rest internal), each
-# with a fresh temp/label counter, then the freestanding entry floor once. Runs only
-# on programs the typecheck phase has accepted.
+# The arena's QBE side: a single global bump cursor `{cf_top, cf_limit}` over one OS
+# mapping, and `cf_alloc(n)` — lazily mints the page on the first call (if cf_limit
+# is 0, call the asm `cf_arena_init`), 8-aligns the request, bumps the cursor, and
+# traps via `cf_oom` on overflow. Records (which may escape via a return) live here;
+# scalars stay in stack slots. (⚠ THROWAWAY: one bounded 64 MiB mapping, no teardown
+# or remap — the M6 std runtime does the real page/arena arc.)
+const emit_arena_qbe = (Uarch fd): Iarch -> {
+	write_str(fd, "export data $cf_top = { l 0 }\n")
+	write_str(fd, "export data $cf_limit = { l 0 }\n")
+	write_str(fd, "function l $cf_alloc(w %n) {\n")
+	write_str(fd, "@start\n")
+	write_str(fd, "\t%lim0 =l loadl $cf_limit\n")
+	write_str(fd, "\t%uninit =w ceql %lim0, 0\n")
+	write_str(fd, "\tjnz %uninit, @init, @ready\n")
+	write_str(fd, "@init\n")
+	write_str(fd, "\tcall $cf_arena_init()\n")
+	write_str(fd, "\tjmp @ready\n")
+	write_str(fd, "@ready\n")
+	write_str(fd, "\t%r7 =w add %n, 7\n")
+	write_str(fd, "\t%ra =w and %r7, -8\n")
+	write_str(fd, "\t%sz =l extuw %ra\n")
+	write_str(fd, "\t%p =l loadl $cf_top\n")
+	write_str(fd, "\t%nt =l add %p, %sz\n")
+	write_str(fd, "\t%lim =l loadl $cf_limit\n")
+	write_str(fd, "\t%ok =w culel %nt, %lim\n")
+	write_str(fd, "\tjnz %ok, @ok, @oom\n")
+	write_str(fd, "@oom\n")
+	write_str(fd, "\tcall $cf_oom()\n")
+	write_str(fd, "\tret %p\n")
+	write_str(fd, "@ok\n")
+	write_str(fd, "\tstorel %nt, $cf_top\n")
+	write_str(fd, "\tret %p\n")
+	write_str(fd, "}\n")
+	return 0
+}
+
+# The arena's asm side: `cf_arena_init` mmaps 64 MiB (SYS_mmap=197) and seeds the
+# cursor; `cf_oom`/`cf_mmap_fail` exit with distinct nonzero codes. Leaf routines
+# (no `bl`), so calling `cf_arena_init` lazily from `cf_alloc` needs no arg saving.
+const emit_arena_floor = (Uarch fd): Iarch -> {
+	write_str(fd, ".globl _cf_arena_init\n")
+	write_str(fd, ".globl _cf_oom\n")
+	write_str(fd, ".p2align 2\n")
+	write_str(fd, "_cf_arena_init:\n")
+	write_str(fd, "\tmov x0, #0\n")
+	write_str(fd, "\tmov x1, #0x4000000\n")
+	write_str(fd, "\tmov x2, #3\n")
+	write_str(fd, "\tmov x3, #0x1002\n")
+	write_str(fd, "\tmov x4, #-1\n")
+	write_str(fd, "\tmov x5, #0\n")
+	write_str(fd, "\tmov x16, #197\n")
+	write_str(fd, "\tsvc #0x80\n")
+	write_str(fd, "\tb.cs _cf_mmap_fail\n")
+	write_str(fd, "\tadrp x9, _cf_top@PAGE\n")
+	write_str(fd, "\tadd x9, x9, _cf_top@PAGEOFF\n")
+	write_str(fd, "\tstr x0, [x9]\n")
+	write_str(fd, "\tmov x1, #0x4000000\n")
+	write_str(fd, "\tadd x11, x0, x1\n")
+	write_str(fd, "\tadrp x10, _cf_limit@PAGE\n")
+	write_str(fd, "\tadd x10, x10, _cf_limit@PAGEOFF\n")
+	write_str(fd, "\tstr x11, [x10]\n")
+	write_str(fd, "\tret\n")
+	write_str(fd, "_cf_mmap_fail:\n")
+	write_str(fd, "\tmov x0, #71\n")
+	write_str(fd, "\tmov x16, #1\n")
+	write_str(fd, "\tsvc #0x80\n")
+	write_str(fd, "_cf_oom:\n")
+	write_str(fd, "\tmov x0, #70\n")
+	write_str(fd, "\tmov x16, #1\n")
+	write_str(fd, "\tsvc #0x80\n")
+	return 0
+}
+
+# Emit the whole program: the arena runtime, every function (main exported, the rest
+# internal, each with a fresh temp/label counter), then the freestanding entry floor
+# plus the arena's asm side. Runs only on programs the typecheck phase has accepted.
 #
 # darwin hands `main` its (argc, argv, envp) in x0/x1/x2 at the entry point, and the
 # `_start` floor does nothing before `bl _main`, so those registers flow straight
 # through — QBE reads them as `$main`'s declared arguments.
 pub const emit_program = (Program prog, Uarch qbe_fd, Uarch asm_fd): Iarch -> {
+	emit_arena_qbe(qbe_fd)
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(prog.funcs.len) then break
@@ -594,5 +701,6 @@ pub const emit_program = (Program prog, Uarch qbe_fd, Uarch asm_fd): Iarch -> {
 	write_str(asm_fd, "\tbl _main\n")
 	write_str(asm_fd, "\tmov x16, #1\n")
 	write_str(asm_fd, "\tsvc #0x80\n")
+	emit_arena_floor(asm_fd)
 	return 0
 }
