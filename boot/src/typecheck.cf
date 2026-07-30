@@ -244,21 +244,31 @@ const type_of = (Expr e, [VarTy] env, Ctx ctx): Ty -> match e {
 const stmt_kind = (Stmt s): Iarch -> match s {
 	Stmt.Let(n, m, e) -> 0,
 	Stmt.Assign(n, e) -> 1,
+	Stmt.FieldAssign(b, f, e) -> 3,
 	Stmt.Return(e) -> 2
 }
 const stmt_name = (Stmt s): Str -> match s {
 	Stmt.Let(n, m, e) -> n,
 	Stmt.Assign(n, e) -> n,
+	Stmt.FieldAssign(b, f, e) -> b,
 	Stmt.Return(e) -> ""
 }
 const stmt_mut = (Stmt s): Bool -> match s {
 	Stmt.Let(n, m, e) -> m,
 	Stmt.Assign(n, e) -> false,
+	Stmt.FieldAssign(b, f, e) -> false,
 	Stmt.Return(e) -> false
+}
+const stmt_field = (Stmt s): Str -> match s {
+	Stmt.Let(n, m, e) -> "",
+	Stmt.Assign(n, e) -> "",
+	Stmt.FieldAssign(b, f, e) -> f,
+	Stmt.Return(e) -> ""
 }
 const stmt_expr = (Stmt s): Expr -> match s {
 	Stmt.Let(n, m, e) -> e,
 	Stmt.Assign(n, e) -> e,
+	Stmt.FieldAssign(b, f, e) -> e,
 	Stmt.Return(e) -> e
 }
 
@@ -297,6 +307,18 @@ const check_func = (Func fn, Ctx ctx): Iarch -> {
 			const Ty vty = type_of(stmt_expr(s), env, ctx)
 			if !ty_eq(vty, env[idx].ty) then die("cf0: type: a reassignment must keep the binding's type\n")
 		}
+		if k == 3 then {
+			# `base.field = value` — `base` must be a mutable (`let`) record that
+			# declares `field`, and the value must be an integer.
+			const Iarch idx = env_index(env, stmt_name(s))
+			if idx < 0 then die("cf0: type: field assignment to an undeclared name\n")
+			if !env[idx].mutable then die("cf0: type: cannot mutate a `const` record's fields\n")
+			const Str tn = rec_of(env[idx].ty)
+			if str_eq(tn, "") then die("cf0: type: field assignment needs a record on the left\n")
+			const Iarch ri = find_rec(ctx.recs, tn)
+			if field_index(ctx.recs[ri].fields, stmt_field(s)) < 0 then die("cf0: type: mutating a field the record does not declare\n")
+			if !is_tint(type_of(stmt_expr(s), env, ctx)) then die("cf0: type: a field value must be an integer\n")
+		}
 		if k == 2 then {
 			const Ty rty = type_of(stmt_expr(s), env, ctx)
 			if !ty_eq(rty, fn.ret_ty) then die("cf0: type: a returned value's type must match the function's return type\n")
@@ -319,6 +341,20 @@ const check_whole = (Program prog): Iarch -> {
 			if q >= r then break
 			if str_eq(prog.recs[q].name, prog.recs[r].name) then die("cf0: type: two records share a name\n")
 			q = q + 1
+		}
+		# a record needs at least one field, and its field names must be distinct
+		const Iarch nf = Iarch(prog.recs[r].fields.len)
+		if nf == 0 then die("cf0: type: a record needs at least one field\n")
+		let Iarch a = 0
+		loop {
+			if a >= nf then break
+			let Iarch b = 0
+			loop {
+				if b >= a then break
+				if str_eq(prog.recs[r].fields[b], prog.recs[r].fields[a]) then die("cf0: type: a record declares a field twice\n")
+				b = b + 1
+			}
+			a = a + 1
 		}
 		r = r + 1
 	}
