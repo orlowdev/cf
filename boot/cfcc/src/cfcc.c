@@ -8977,11 +8977,19 @@ static void resolve_record_expr_binding(Program *prog, Func *fn, Stmt *s) {
 	 * existing storage — an aggregate copy needs an explicit copy (memory_model §6). A
 	 * `defer` tap forwards its tapped argument unchanged, so it is fresh exactly when that
 	 * argument is (`of(N) |> defer destroy` binds the fresh arena, schedules its teardown).
-	 * (A data literal takes the resolve_record_binding path.) */
-	if (!is_fresh_producer(s->expr))
+	 * (A data literal takes the resolve_record_binding path.)
+	 *   EXCEPTION — a record ARRAY ELEMENT `const R r = arr[i]`: the local aliases the
+	 * element's 8-byte arena pointer (a read-only borrow, no copy). Memory-SAFE here (the
+	 * single bump arena never frees, so a second pointer to an arena record can never
+	 * dangle); emitted by the generic aggregate-pointer adoption below. A vector of records
+	 * (token stream, symbol table) walked `for`-style needs to bind each element, so this
+	 * un-workarounds cf0's `const Seg sg = segs[i]`. ⚠ cf0/cf re-enforce §6 ownership via
+	 * the real memory arc once it lands; borrowing an element into a `const` is the M0
+	 * surface (owner ruling 2026-07-29 — §6 guards teardown, not this throwaway alias). */
+	if (!is_fresh_producer(s->expr) && s->expr->kind != EX_INDEX)
 		die(s->line, "a record binding's initializer must be a fresh record (a record-returning call, "
-		             "or a fresh-branch `if`/`match`); aliasing existing record storage needs an "
-		             "explicit copy — not in M0");
+		             "a `[…]`-array element, or a fresh-branch `if`/`match`); aliasing existing record "
+		             "storage needs an explicit copy — not in M0");
 	set_local_rec(fn, s->name, d);
 }
 
