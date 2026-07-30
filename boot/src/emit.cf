@@ -17,7 +17,7 @@
 # not yet enforced (that is the typecheck brick).
 
 import "io" as { write_str, die }
-import "ast" as { Expr, Stmt, Param, Func, Call, FieldInit, RecLit, RecDecl, UnionMember, UnionDecl, UnionMkE, MatchArm, MatchExpr, ArrLit, StrData, Body, Program }
+import "ast" as { Expr, Stmt, Param, Func, Call, FieldInit, RecLit, RecDecl, UnionMember, UnionDecl, UnionMkE, MatchArm, MatchExpr, ArrLit, StrData, Seg, InterpData, Body, Program }
 
 # The emit context: the QBE-IL output fd, the next free temp number, the next free
 # basic-block label id, the program's functions (a call resolves its callee — by
@@ -292,6 +292,77 @@ const emit_field_expr = (*Emit ctx, [Binding] env, Expr base, Str field): Str ->
 	return "%t${v}"
 }
 
+# Emit an interpolated string `"…${name}…"`: build a fresh `[Uint8]` byte vector
+# (`{data,len,cap}` zeroed), append each segment — a literal run byte-by-byte via
+# `cf_dyn_push`, a hole via `cf_str_append` (a Str, its bytes) or `cf_int_append` (an
+# integer, sign-extended then itoa) — then seal a `{bytes@0, len@8}` Str header
+# borrowing the vector's backing. Returns the header pointer. (Bool holes are a later
+# brick; the typecheck phase rejects them.)
+const emit_interp = (*Emit ctx, InterpData id, [Binding] env): Str -> {
+	const Iarch vh = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${vh} =l call $cf_alloc(w 24)\n")
+	write_str(ctx.fd, "\tstorel 0, %t${vh}\n")
+	const Iarch v8 = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${v8} =l add %t${vh}, 8\n")
+	write_str(ctx.fd, "\tstorel 0, %t${v8}\n")
+	const Iarch v16 = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${v16} =l add %t${vh}, 16\n")
+	write_str(ctx.fd, "\tstorel 0, %t${v16}\n")
+	let Iarch si = 0
+	loop {
+		if si >= Iarch(id.segs.len) then break
+		if id.segs[si].is_hole then {
+			const Str hname = id.segs[si].name
+			const Iarch bi = lookup_index(env, hname)
+			const Str hv = emit_var(ctx, env, hname)
+			if str_eq(env[bi].rec_type, "Str") then {
+				write_str(ctx.fd, "\tcall $cf_str_append(l %t${vh}, l ${hv})\n")
+			} else {
+				const Iarch ext = ctx.next
+				ctx.next = ctx.next + 1
+				write_str(ctx.fd, "\t%t${ext} =l extsw ${hv}\n")
+				write_str(ctx.fd, "\tcall $cf_int_append(l %t${vh}, l %t${ext})\n")
+			}
+		} else {
+			let Iarch bj = 0
+			loop {
+				if bj >= Iarch(id.segs[si].lit.len) then break
+				const Iarch b = Iarch(id.segs[si].lit[bj])
+				const Iarch slot = ctx.next
+				ctx.next = ctx.next + 1
+				write_str(ctx.fd, "\t%t${slot} =l call $cf_dyn_push(l %t${vh}, w 1)\n")
+				write_str(ctx.fd, "\tstoreb ${b}, %t${slot}\n")
+				bj = bj + 1
+			}
+		}
+		si = si + 1
+	}
+	const Iarch data = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${data} =l loadl %t${vh}\n")
+	const Iarch lp = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${lp} =l add %t${vh}, 8\n")
+	const Iarch ll = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${ll} =l loadl %t${lp}\n")
+	const Iarch lw = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${lw} =w copy %t${ll}\n")
+	const Iarch hdr = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${hdr} =l call $cf_alloc(w 16)\n")
+	write_str(ctx.fd, "\tstorel %t${data}, %t${hdr}\n")
+	const Iarch hl = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${hl} =l add %t${hdr}, 8\n")
+	write_str(ctx.fd, "\tstorew %t${lw}, %t${hl}\n")
+	return "%t${hdr}"
+}
+
 # Emit a data literal: allocate the record in the ARENA (`cf_alloc`, 4 bytes/field —
 # so it outlives the current stack frame and may be returned), store each
 # initializer at its field's offset, and return the base-pointer temp. Field
@@ -383,6 +454,7 @@ const init_agg_type = (*Emit ctx, [Binding] env, Expr e): Str -> match e {
 	Expr.Call(cl) -> call_agg_type(ctx, cl),
 	Expr.ArrayLit(al) -> "$dyn",
 	Expr.StrLit(sd) -> "Str",
+	Expr.Interp(id) -> "Str",
 	Expr.Var(name) -> var_agg_type(env, name),
 	_ -> ""
 }
@@ -798,6 +870,7 @@ const emit_expr = (Expr e, *Emit ctx, [Binding] env): Str -> match e {
 	Expr.BoolLit(b) -> if b then "1" else "0",
 	Expr.Var(name) -> emit_var(ctx, env, name),
 	Expr.StrLit(sd) -> emit_str_lit(ctx, sd),
+	Expr.Interp(id) -> emit_interp(ctx, id, env),
 	Expr.Record(rl) -> emit_record_val(ctx, rl, env),
 	Expr.Field(base, f) -> emit_field(ctx, env, base, f),
 	Expr.FieldExpr(base, f) -> emit_field_expr(ctx, env, base, f),
@@ -1237,6 +1310,94 @@ const emit_arena_qbe = (Uarch fd): Iarch -> {
 	write_str(fd, "\t%len3 =l add %len2, 1\n")
 	write_str(fd, "\tstorel %len3, %hlen\n")
 	write_str(fd, "\tret %slot\n")
+	write_str(fd, "}\n")
+	# Interpolation append helpers — push a value's TEXT onto a `[Uint8]` vector (via
+	# cf_dyn_push, stride 1). cf_uint_append: unsigned itoa (two-pass extract-then-reverse
+	# over a stack digit buffer). cf_int_append: a sign, then the magnitude. cf_str_append:
+	# a Str's bytes. (Void functions — they mutate the vector and return nothing.)
+	write_str(fd, "function $cf_uint_append(l %vhdr, l %val) {\n")
+	write_str(fd, "@start\n")
+	write_str(fd, "\t%buf =l alloc4 24\n")
+	write_str(fd, "\t%ip =l alloc8 8\n")
+	write_str(fd, "\t%vp =l alloc8 8\n")
+	write_str(fd, "\tstorel %val, %vp\n")
+	write_str(fd, "\tstorel 0, %ip\n")
+	write_str(fd, "\t%z =w ceql %val, 0\n")
+	write_str(fd, "\tjnz %z, @zero, @extract\n")
+	write_str(fd, "@zero\n")
+	write_str(fd, "\t%sz =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb 48, %sz\n")
+	write_str(fd, "\tret\n")
+	write_str(fd, "@extract\n")
+	write_str(fd, "\t%v =l loadl %vp\n")
+	write_str(fd, "\t%done =w ceql %v, 0\n")
+	write_str(fd, "\tjnz %done, @emit, @digit\n")
+	write_str(fd, "@digit\n")
+	write_str(fd, "\t%q =l udiv %v, 10\n")
+	write_str(fd, "\t%r =l urem %v, 10\n")
+	write_str(fd, "\t%rc =w copy %r\n")
+	write_str(fd, "\t%ch =w add %rc, 48\n")
+	write_str(fd, "\t%i =l loadl %ip\n")
+	write_str(fd, "\t%da =l add %buf, %i\n")
+	write_str(fd, "\tstoreb %ch, %da\n")
+	write_str(fd, "\t%i1 =l add %i, 1\n")
+	write_str(fd, "\tstorel %i1, %ip\n")
+	write_str(fd, "\tstorel %q, %vp\n")
+	write_str(fd, "\tjmp @extract\n")
+	write_str(fd, "@emit\n")
+	write_str(fd, "\t%cnt =l loadl %ip\n")
+	write_str(fd, "\tstorel %cnt, %vp\n")
+	write_str(fd, "@eloop\n")
+	write_str(fd, "\t%k =l loadl %vp\n")
+	write_str(fd, "\t%kz =w ceql %k, 0\n")
+	write_str(fd, "\tjnz %kz, @edone, @estep\n")
+	write_str(fd, "@estep\n")
+	write_str(fd, "\t%k1 =l sub %k, 1\n")
+	write_str(fd, "\t%dap =l add %buf, %k1\n")
+	write_str(fd, "\t%dch =w loadub %dap\n")
+	write_str(fd, "\t%es =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb %dch, %es\n")
+	write_str(fd, "\tstorel %k1, %vp\n")
+	write_str(fd, "\tjmp @eloop\n")
+	write_str(fd, "@edone\n")
+	write_str(fd, "\tret\n")
+	write_str(fd, "}\n")
+	write_str(fd, "function $cf_int_append(l %vhdr, l %val) {\n")
+	write_str(fd, "@start\n")
+	write_str(fd, "\t%neg =w csltl %val, 0\n")
+	write_str(fd, "\tjnz %neg, @isneg, @pos\n")
+	write_str(fd, "@isneg\n")
+	write_str(fd, "\t%s =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb 45, %s\n")
+	write_str(fd, "\t%nv =l sub 0, %val\n")
+	write_str(fd, "\tcall $cf_uint_append(l %vhdr, l %nv)\n")
+	write_str(fd, "\tret\n")
+	write_str(fd, "@pos\n")
+	write_str(fd, "\tcall $cf_uint_append(l %vhdr, l %val)\n")
+	write_str(fd, "\tret\n")
+	write_str(fd, "}\n")
+	write_str(fd, "function $cf_str_append(l %vhdr, l %str) {\n")
+	write_str(fd, "@start\n")
+	write_str(fd, "\t%bytes =l loadl %str\n")
+	write_str(fd, "\t%la =l add %str, 8\n")
+	write_str(fd, "\t%lenw =w loadw %la\n")
+	write_str(fd, "\t%len =l extuw %lenw\n")
+	write_str(fd, "\t%ip =l alloc8 8\n")
+	write_str(fd, "\tstorel 0, %ip\n")
+	write_str(fd, "@sloop\n")
+	write_str(fd, "\t%i =l loadl %ip\n")
+	write_str(fd, "\t%d =w cugel %i, %len\n")
+	write_str(fd, "\tjnz %d, @sdone, @sstep\n")
+	write_str(fd, "@sstep\n")
+	write_str(fd, "\t%ba =l add %bytes, %i\n")
+	write_str(fd, "\t%b =w loadub %ba\n")
+	write_str(fd, "\t%sl =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb %b, %sl\n")
+	write_str(fd, "\t%i1 =l add %i, 1\n")
+	write_str(fd, "\tstorel %i1, %ip\n")
+	write_str(fd, "\tjmp @sloop\n")
+	write_str(fd, "@sdone\n")
+	write_str(fd, "\tret\n")
 	write_str(fd, "}\n")
 	return 0
 }

@@ -10,7 +10,7 @@
 
 import "io" as { die }
 import "token" as { Token, TokKind, is_eof, is_ident, is_intlit, is_strlit, is_lparen, is_rparen, is_lbrace, is_rbrace, is_lbracket, is_rbracket, is_comma, is_colon, is_dot, is_ellipsis, is_eq, is_arrow, is_minus, is_plus, is_star, is_slash, is_percent, is_amp, is_pipe, is_caret, is_tilde, is_bang, is_shl, is_shr, is_eqeq, is_ne, is_lt, is_gt, is_le, is_ge, is_logand, is_logor }
-import "ast" as { Expr, Stmt, Param, Func, Call, Ty, FieldInit, RecLit, RecDecl, UnionMember, UnionDecl, UnionMkE, MatchArm, MatchExpr, ArrLit, StrData, RetSig, Body, Program }
+import "ast" as { Expr, Stmt, Param, Func, Call, Ty, FieldInit, RecLit, RecDecl, UnionMember, UnionDecl, UnionMkE, MatchArm, MatchExpr, ArrLit, StrData, Seg, InterpData, RetSig, Body, Program }
 
 # The parse cursor: the token stream, the source (for keyword text), a position.
 pub data Parser = { [Token] toks, *[Uint8] src, Iarch pos }
@@ -66,28 +66,77 @@ const escape_byte = (Iarch e): Iarch -> {
 	return 0
 }
 
-# Decode a string literal's RAW content slice (src[start .. start+len]) into its
-# bytes: escapes collapse to one byte, a raw newline is content, a lone/trailing `$`
-# is literal. `${…}` interpolation is a later brick (rejected here).
-const decode_str = (*[Uint8] src, Iarch start, Iarch len): [Uint8] -> {
-	let [Uint8] out = []
-	let Iarch i = 0
+# Is a byte a valid interpolation-name character (`[A-Za-z0-9_]`)?
+const is_name_byte = (Iarch c): Bool -> (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95
+
+# A decoded literal run and the raw offset just past it (at a `${` hole or end). A fresh
+# run per call sidesteps cfcc's rule that a `[T]` local is only reassigned by growth.
+data ScanRun = { [Uint8] bytes, Iarch next }
+
+# Decode a literal run from raw offset `off` up to a `${` hole or the end of content.
+# Escapes collapse to one byte; a raw newline is content; `\$` / a lone `$` are literal.
+const scan_lit = (*[Uint8] src, Iarch start, Iarch len, Iarch off): ScanRun -> {
+	let [Uint8] run = []
+	let Iarch i = off
 	loop {
 		if i >= len then break
 		const Iarch c = Iarch(src[start + i])
+		if c == 36 && i + 1 < len && Iarch(src[start + i + 1]) == 123 then break
 		if c == 92 then {
 			if i + 1 >= len then die("cf0: parse: a dangling `\\` in a string\n")
-			out = [...out, Uint8(escape_byte(Iarch(src[start + i + 1])))]
+			run = [...run, Uint8(escape_byte(Iarch(src[start + i + 1])))]
 			i = i + 2
 			continue
 		}
-		if c == 36 then {
-			if i + 1 < len && Iarch(src[start + i + 1]) == 123 then die("cf0: parse: string interpolation is not yet supported\n")
-		}
-		out = [...out, Uint8(c)]
+		run = [...run, Uint8(c)]
 		i = i + 1
 	}
-	return out
+	return ScanRun({ bytes: run, next: i })
+}
+
+# Read a `${name}` hole starting at the `${` (raw offset `at`); returns the bare name.
+# An empty hole, a non-name body, or a missing `}` (unterminated) is rejected.
+const scan_hole = (*[Uint8] src, Iarch start, Iarch len, Iarch at): Str -> {
+	const Iarch nstart = at + 2
+	let Iarch j = nstart
+	loop {
+		if j >= len then die("cf0: parse: an unterminated interpolation hole (missing `}`)\n")
+		const Iarch d = Iarch(src[start + j])
+		if d == 125 then break
+		if !is_name_byte(d) then die("cf0: parse: an interpolation hole must be a bare name\n")
+		j = j + 1
+	}
+	if j == nstart then die("cf0: parse: an empty interpolation hole\n")
+	return intern(src, start + nstart, j - nstart)
+}
+
+# Parse a string literal's RAW content slice (src[start .. start+len]) into an Expr: a
+# plain `StrLit` (its decoded bytes) when there is no interpolation, else an `Interp`
+# (alternating literal-run / hole segments, assembled at runtime).
+const parse_string = (*[Uint8] src, Iarch start, Iarch len): Expr -> {
+	const ScanRun first = scan_lit(src, start, len, 0)
+	if first.next >= len then return Expr.StrLit(StrData({ bytes: first.bytes }))
+	# there is at least one hole — build the segment list
+	const [Uint8] empty = []
+	let [Seg] segs = []
+	segs = [...segs, Seg({ is_hole: false, lit: first.bytes, name: "" })]
+	let Iarch i = first.next
+	loop {
+		# `i` sits at a `${` hole here
+		segs = [...segs, Seg({ is_hole: true, lit: empty, name: scan_hole(src, start, len, i) })]
+		# advance past `${name}` by rescanning the name length (cheap; names are short)
+		const Iarch nstart = i + 2
+		let Iarch j = nstart
+		loop {
+			if Iarch(src[start + j]) == 125 then break
+			j = j + 1
+		}
+		const ScanRun run = scan_lit(src, start, len, j + 1)
+		segs = [...segs, Seg({ is_hole: false, lit: run.bytes, name: "" })]
+		i = run.next
+		if i >= len then break
+	}
+	return Expr.Interp(InterpData({ segs: segs }))
 }
 
 # --- expression grammar --------------------------------------------------------------
@@ -469,13 +518,13 @@ const parse_primary = (*Parser p): Expr -> {
 		p.pos = p.pos + 1
 		return Expr.Lit(v)
 	}
-	# a string literal — decode its bytes now; an optional `.len` rides as a postfix.
+	# a string literal — split into literal/hole segments now (a plain string is one
+	# `StrLit`, an interpolated one an `Interp`); an optional `.len` rides as a postfix.
 	if is_strlit(peek(p)) then {
 		const Iarch start = p.toks[p.pos].start
 		const Iarch len = p.toks[p.pos].len
 		p.pos = p.pos + 1
-		const Expr s = Expr.StrLit(StrData({ bytes: decode_str(p.src, start, len) }))
-		return postfix_field(p, s)
+		return postfix_field(p, parse_string(p.src, start, len))
 	}
 	if is_lparen(peek(p)) then {
 		p.pos = p.pos + 1
