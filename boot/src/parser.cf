@@ -10,7 +10,7 @@
 
 import "io" as { die }
 import "token" as { Token, TokKind, is_eof, is_ident, is_intlit, is_lparen, is_rparen, is_lbrace, is_rbrace, is_lbracket, is_rbracket, is_comma, is_colon, is_dot, is_eq, is_arrow, is_minus, is_plus, is_star, is_slash, is_percent, is_amp, is_pipe, is_caret, is_tilde, is_bang, is_shl, is_shr, is_eqeq, is_ne, is_lt, is_gt, is_le, is_ge, is_logand, is_logor }
-import "ast" as { Expr, Stmt, Param, Func, Call, Ty, FieldInit, RecLit, RecDecl, UnionDecl, MatchArm, MatchExpr, Program }
+import "ast" as { Expr, Stmt, Param, Func, Call, Ty, FieldInit, RecLit, RecDecl, UnionMember, UnionDecl, UnionMkE, MatchArm, MatchExpr, Program }
 
 # The parse cursor: the token stream, the source (for keyword text), a position.
 pub data Parser = { [Token] toks, *[Uint8] src, Iarch pos }
@@ -236,6 +236,22 @@ const parse_call = (*Parser p, Str name): Expr -> {
 	return Expr.Call(Call({ callee: name, args: args }))
 }
 
+# `Type.member(args)` — a payload-member union construction. `(` is the current token.
+const parse_union_mk = (*Parser p, Str type_name, Str member): Expr -> {
+	p.pos = p.pos + 1 # `(`
+	let [Expr] args = []
+	if !is_rparen(peek(p)) then {
+		loop {
+			args = [...args, parse_expr(p)]
+			if !is_comma(peek(p)) then break
+			p.pos = p.pos + 1
+		}
+	}
+	if !is_rparen(peek(p)) then die("cf0: parse: expected `)` in a union construction\n")
+	p.pos = p.pos + 1
+	return Expr.UnionMk(UnionMkE({ type_name: type_name, member: member, args: args }))
+}
+
 # One `match` arm: a wildcard `_ -> body`, or an or-pattern `Type.a | Type.b -> body`
 # (one or more `Type.member` alternatives sharing the union qualifier).
 const parse_arm = (*Parser p): MatchArm -> {
@@ -316,6 +332,9 @@ const parse_primary = (*Parser p): Expr -> {
 			if !is_ident(peek(p)) then die("cf0: parse: expected a field name after `.`\n")
 			const Str field = cur_name(p)
 			p.pos = p.pos + 1
+			# `Type.member(args)` is a payload-member construction; `base.field` (no
+			# args) is a field read or a tag-only-member construction.
+			if is_lparen(peek(p)) then return parse_union_mk(p, name, field)
 			return Expr.Field(name, field)
 		}
 		return Expr.Var(name)
@@ -622,12 +641,27 @@ const parse_union = (*Parser p): UnionDecl -> {
 	p.pos = p.pos + 1
 	if !is_lbrace(peek(p)) then die("cf0: parse: expected `{` in a union declaration\n")
 	p.pos = p.pos + 1
-	let [Str] members = []
+	let [UnionMember] members = []
 	loop {
 		if is_rbrace(peek(p)) then break
 		if !is_ident(peek(p)) then die("cf0: parse: expected a member name\n")
-		members = [...members, cur_name(p)]
+		const Str mname = cur_name(p)
 		p.pos = p.pos + 1
+		# an optional payload `(T, T, …)` — the field type names (Iarch in M1.2a)
+		let [Str] payloads = []
+		if is_lparen(peek(p)) then {
+			p.pos = p.pos + 1
+			loop {
+				if !is_ident(peek(p)) then die("cf0: parse: expected a payload type\n")
+				payloads = [...payloads, cur_name(p)]
+				p.pos = p.pos + 1
+				if !is_comma(peek(p)) then break
+				p.pos = p.pos + 1
+			}
+			if !is_rparen(peek(p)) then die("cf0: parse: expected `)` after a payload\n")
+			p.pos = p.pos + 1
+		}
+		members = [...members, UnionMember({ name: mname, payloads: payloads })]
 		if !is_comma(peek(p)) then break
 		p.pos = p.pos + 1
 	}

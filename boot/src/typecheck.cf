@@ -16,7 +16,7 @@
 # The emitter runs only on programs this phase accepts.
 
 import "io" as { die }
-import "ast" as { Expr, Stmt, Param, Func, Call, Ty, FieldInit, RecLit, RecDecl, UnionDecl, MatchArm, MatchExpr, Program }
+import "ast" as { Expr, Stmt, Param, Func, Call, Ty, FieldInit, RecLit, RecDecl, UnionMember, UnionDecl, UnionMkE, MatchArm, MatchExpr, Program }
 
 # A name in scope during checking: its type and whether it is reassignable (`let`).
 data VarTy = { Str name, Ty ty, Bool mutable }
@@ -81,6 +81,17 @@ const find_union = ([UnionDecl] unions, Str name): Iarch -> {
 	loop {
 		if i >= Iarch(unions.len) then break
 		if str_eq(unions[i].name, name) then return i
+		i = i + 1
+	}
+	return 0 - 1
+}
+
+# The index (tag) of member `name` among a union's members, or -1.
+const union_member_index = ([UnionMember] members, Str name): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(members.len) then break
+		if str_eq(members[i].name, name) then return i
 		i = i + 1
 	}
 	return 0 - 1
@@ -235,10 +246,31 @@ const record_type = (RecLit rl, [VarTy] env, Ctx ctx): Ty -> {
 # `base.field` — either a tag-only union construction (`base` is a union type name,
 # `field` a member → a `TUnion` value) or a record field read (`base` is a record
 # local, `field` a declared field → an `Int`).
+# `Type.member(args)` — the union must exist, the member must exist, and the argument
+# count and (integer) types must match the member's declared payload.
+const unionmk_type = (UnionMkE mk, [VarTy] env, Ctx ctx): Ty -> {
+	const Iarch ui = find_union(ctx.unions, mk.type_name)
+	if ui < 0 then die("cf0: type: unknown union type in a construction\n")
+	const Iarch mi = union_member_index(ctx.unions[ui].members, mk.member)
+	if mi < 0 then die("cf0: type: unknown union member in a construction\n")
+	const Iarch np = Iarch(ctx.unions[ui].members[mi].payloads.len)
+	const Iarch na = Iarch(mk.args.len)
+	if np != na then die("cf0: type: union member payload arity mismatch\n")
+	let Iarch a = 0
+	loop {
+		if a >= na then break
+		if !is_tint(type_of(mk.args[a], env, ctx)) then die("cf0: type: a union payload must be an integer\n")
+		a = a + 1
+	}
+	return Ty.TUnion(mk.type_name)
+}
+
 const field_type = (Str base, Str field, [VarTy] env, Ctx ctx): Ty -> {
 	const Iarch ui = find_union(ctx.unions, base)
 	if ui >= 0 then {
-		if field_index(ctx.unions[ui].members, field) < 0 then die("cf0: type: `${base}` has no such union member\n")
+		const Iarch mi = union_member_index(ctx.unions[ui].members, field)
+		if mi < 0 then die("cf0: type: `${base}` has no such union member\n")
+		if Iarch(ctx.unions[ui].members[mi].payloads.len) > 0 then die("cf0: type: this member needs a payload — write `${base}.${field}(...)`\n")
 		return Ty.TUnion(base)
 	}
 	const Iarch vi = env_index(env, base)
@@ -275,7 +307,7 @@ const match_type = (MatchExpr me, [VarTy] env, Ctx ctx): Ty -> {
 			let Iarch mj = 0
 			loop {
 				if mj >= Iarch(me.arms[i].members.len) then break
-				const Iarch mi = field_index(ctx.unions[ui].members, me.arms[i].members[mj])
+				const Iarch mi = union_member_index(ctx.unions[ui].members, me.arms[i].members[mj])
 				if mi < 0 then die("cf0: type: a match arm names a nonexistent union member\n")
 				let Iarch d = 0
 				loop {
@@ -302,6 +334,7 @@ const type_of = (Expr e, [VarTy] env, Ctx ctx): Ty -> match e {
 	Expr.Var(name) -> var_type(env, name),
 	Expr.Record(rl) -> record_type(rl, env, ctx),
 	Expr.Field(base, f) -> field_type(base, f, env, ctx),
+	Expr.UnionMk(mk) -> unionmk_type(mk, env, ctx),
 	Expr.Match(me) -> match_type(me, env, ctx),
 	Expr.Neg(x) -> int_unop(x, env, ctx),
 	Expr.BitNot(x) -> int_unop(x, env, ctx),

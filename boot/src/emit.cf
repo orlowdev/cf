@@ -17,7 +17,7 @@
 # not yet enforced (that is the typecheck brick).
 
 import "io" as { write_str, die }
-import "ast" as { Expr, Stmt, Param, Func, Call, FieldInit, RecLit, RecDecl, UnionDecl, MatchArm, MatchExpr, Program }
+import "ast" as { Expr, Stmt, Param, Func, Call, FieldInit, RecLit, RecDecl, UnionMember, UnionDecl, UnionMkE, MatchArm, MatchExpr, Program }
 
 # The emit context: the QBE-IL output fd, the next free temp number, the next free
 # basic-block label id, the program's functions (a call resolves its callee — by
@@ -96,22 +96,45 @@ const member_tag = ([UnionDecl] unions, Str type_name, Str member): Iarch -> {
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(unions[ui].members.len) then break
-		if str_eq(unions[ui].members[i], member) then return i
+		if str_eq(unions[ui].members[i].name, member) then return i
 		i = i + 1
 	}
 	return 0
 }
 
-# Is a parameter a record (passed by pointer, fields readable through it)?
-const is_rec_param = (Param p, [RecDecl] recs): Bool -> {
-	if p.is_ptr then return false
-	return find_rec(recs, p.type_name) >= 0
+# Is a union boxed (any member carries a payload)? A boxed union value is a pointer
+# to an arena `{tag, payload…}`; a tag-only union value is a bare word tag.
+const union_is_boxed = ([UnionDecl] unions, Str name): Bool -> {
+	const Iarch ui = find_union(unions, name)
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(unions[ui].members.len) then break
+		if Iarch(unions[ui].members[i].payloads.len) > 0 then return true
+		i = i + 1
+	}
+	return false
 }
 
-# Does a parameter ride in an `l` register — a pointer (argv/envp) or a record?
-const param_l = (Param p, [RecDecl] recs): Bool -> {
+# Is a parameter an aggregate passed by pointer — a record or a BOXED union (a
+# tag-only union rides as a word tag, not an aggregate)?
+const is_agg_param = (Param p, [RecDecl] recs, [UnionDecl] unions): Bool -> {
+	if p.is_ptr then return false
+	if find_rec(recs, p.type_name) >= 0 then return true
+	if find_union(unions, p.type_name) >= 0 then return union_is_boxed(unions, p.type_name)
+	return false
+}
+
+# Does a parameter ride in an `l` register — a raw pointer (argv/envp) or an aggregate?
+const param_l = (Param p, [RecDecl] recs, [UnionDecl] unions): Bool -> {
 	if p.is_ptr then return true
-	return is_rec_param(p, recs)
+	return is_agg_param(p, recs, unions)
+}
+
+# Does a return type ride in an `l` register — a record or a boxed union pointer?
+const ret_is_l = (Str ret_name, [RecDecl] recs, [UnionDecl] unions): Bool -> {
+	if find_rec(recs, ret_name) >= 0 then return true
+	if find_union(unions, ret_name) >= 0 then return union_is_boxed(unions, ret_name)
+	return false
 }
 
 # A call argument's operand: the temp holding it, and whether it is a record pointer
@@ -163,7 +186,13 @@ const emit_var = (*Emit ctx, [Binding] env, Str name): Str -> {
 const emit_field = (*Emit ctx, [Binding] env, Str base, Str field): Str -> {
 	if find_union(ctx.unions, base) >= 0 then {
 		const Iarch tag = member_tag(ctx.unions, base, field)
-		return "${tag}"
+		if !union_is_boxed(ctx.unions, base) then return "${tag}"
+		# a boxed union's tag-only member is still a one-word arena box holding the tag
+		const Iarch b = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${b} =l call $cf_alloc(w 4)\n")
+		write_str(ctx.fd, "\tstorew ${tag}, %t${b}\n")
+		return "%t${b}"
 	}
 	const Iarch idx = lookup_index(env, base)
 	const Iarch slot = env[idx].slot
@@ -209,38 +238,70 @@ const emit_record_val = (*Emit ctx, RecLit rl, [Binding] env): Str -> {
 	return ""
 }
 
-# The record type name a call returns, or "" if the callee does not return a record.
-const call_ret_rec = (*Emit ctx, Call cl): Str -> {
+# Emit `Type.member(args)` — a payload-member union construction: an arena box
+# `{tag@0, arg0@4, arg1@8, …}`, returned as its base pointer.
+const emit_union_mk = (*Emit ctx, UnionMkE mk, [Binding] env): Str -> {
+	const Iarch tag = member_tag(ctx.unions, mk.type_name, mk.member)
+	const Iarch na = Iarch(mk.args.len)
+	const Iarch size = 4 + na * 4
+	const Iarch b = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${b} =l call $cf_alloc(w ${size})\n")
+	write_str(ctx.fd, "\tstorew ${tag}, %t${b}\n")
+	let Iarch i = 0
+	loop {
+		if i >= na then break
+		const Str v = emit_expr(mk.args[i], ctx, env)
+		const Iarch off = 4 + i * 4
+		const Iarch addr = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${addr} =l add %t${b}, ${off}\n")
+		write_str(ctx.fd, "\tstorew ${v}, %t${addr}\n")
+		i = i + 1
+	}
+	return "%t${b}"
+}
+
+# The aggregate type name a call returns (a record or a BOXED union), or "".
+const call_agg_type = (*Emit ctx, Call cl): Str -> {
 	const Iarch fidx = find_func(ctx.funcs, cl.callee)
 	if fidx < 0 then return ""
-	if find_rec(ctx.recs, ctx.funcs[fidx].ret_name) >= 0 then return ctx.funcs[fidx].ret_name
+	if ret_is_l(ctx.funcs[fidx].ret_name, ctx.recs, ctx.unions) then return ctx.funcs[fidx].ret_name
 	return ""
 }
 
-# The record type name of a binding initializer that yields a record — a data
-# literal `{…}` or a record-returning call — else "".
-const init_rec_type = (*Emit ctx, Expr e): Str -> match e {
+# The aggregate type name a `base.field` yields — a boxed union's tag-only member
+# (`Node.Nil`) yields the union; a tag-only union member or a record field does not.
+const field_agg_type = (*Emit ctx, Str base): Str -> {
+	if find_union(ctx.unions, base) < 0 then return ""
+	if union_is_boxed(ctx.unions, base) then return base
+	return ""
+}
+
+# The aggregate type name of a binding initializer that yields an aggregate (a
+# record or a boxed union) — so its binding holds a base pointer — else "".
+const init_agg_type = (*Emit ctx, Expr e): Str -> match e {
 	Expr.Record(rl) -> rl.type_name,
-	Expr.Call(cl) -> call_ret_rec(ctx, cl),
+	Expr.UnionMk(mk) -> mk.type_name,
+	Expr.Field(base, f) -> field_agg_type(ctx, base),
+	Expr.Call(cl) -> call_agg_type(ctx, cl),
 	_ -> ""
 }
 
-# Emit a record-returning call and copy its result pointer into a fresh temp — the
-# caller ADOPTS the returned arena record as its own base pointer.
-const emit_call_adopt = (*Emit ctx, Call cl, [Binding] env): Iarch -> {
-	const Str v = emit_call(ctx, cl, env)
+# Copy an aggregate operand (a base pointer) into a fresh temp the binding owns.
+const copy_agg = (*Emit ctx, Str v): Iarch -> {
 	const Iarch t = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${t} =l copy ${v}\n")
 	return t
 }
 
-# Emit a record binding initializer, returning the record's base-pointer temp: a
-# data literal builds it in the arena; a record-returning call adopts its result.
-const emit_record_binding = (*Emit ctx, Expr e, [Binding] env): Iarch -> match e {
+# Emit an aggregate binding initializer, returning the base-pointer temp. A data
+# literal builds directly; anything else (a union construction, a boxed tag-only
+# member, an aggregate-returning call) yields a pointer that the binding adopts.
+const emit_agg_binding = (*Emit ctx, Expr e, [Binding] env): Iarch -> match e {
 	Expr.Record(rl) -> emit_record_lit(ctx, rl, env),
-	Expr.Call(cl) -> emit_call_adopt(ctx, cl, env),
-	_ -> 0 - 1
+	_ -> copy_agg(ctx, emit_expr(e, ctx, env))
 }
 
 # Emit an `if <cond> then <a> else <b>` value. The branches merge through a stack
@@ -313,23 +374,13 @@ const find_func = ([Func] funcs, Str name): Iarch -> {
 	return 0 - 1
 }
 
-# The base-pointer slot of a record argument. A record argument is always a record
-# local/parameter referenced by name (a `Var`), whose slot holds the base pointer.
-const slot_of = ([Binding] env, Str name): Iarch -> {
-	const Iarch idx = lookup_index(env, name)
-	return env[idx].slot
-}
-const arg_rec_slot = ([Binding] env, Expr e): Iarch -> match e {
-	Expr.Var(name) -> slot_of(env, name),
-	_ -> 0 - 1
-}
-
 # Emit a call `callee(args)`. The callee (existence, arity, and argument types
 # already checked by the typecheck phase) is mapped by name to its function index
-# for the QBE symbol. A word argument is evaluated into a fresh temp (`w`); a record
-# argument passes the record's base pointer directly (`l`, no copy). main's QBE
-# symbol is `$main`; every other function is `$f<i>` (positional, so a user name can
-# never collide with `_start`).
+# for the QBE symbol. A word argument is evaluated into a fresh temp (`w`); an
+# aggregate argument (a record or boxed union — any expression yielding a base
+# pointer) is copied into a temp and passed by pointer (`l`). main's QBE symbol is
+# `$main`; every other function is `$f<i>` (positional, so a user name can never
+# collide with `_start`).
 const emit_call = (*Emit ctx, Call cl, [Binding] env): Str -> {
 	const Iarch fidx = find_func(ctx.funcs, cl.callee)
 	if fidx < 0 then die("cf0: emit: internal: unresolved call (should be caught by typecheck)\n")
@@ -338,9 +389,10 @@ const emit_call = (*Emit ctx, Call cl, [Binding] env): Str -> {
 	let Iarch i = 0
 	loop {
 		if i >= nargs then break
-		if is_rec_param(ctx.funcs[fidx].params[i], ctx.recs) then {
-			const Iarch slot = arg_rec_slot(env, cl.args[i])
-			aops = [...aops, ArgOp({ temp: slot, is_rec: true })]
+		if is_agg_param(ctx.funcs[fidx].params[i], ctx.recs, ctx.unions) then {
+			const Str av = emit_expr(cl.args[i], ctx, env)
+			const Iarch tt = copy_agg(ctx, av)
+			aops = [...aops, ArgOp({ temp: tt, is_rec: true })]
 		} else {
 			const Str op = emit_expr(cl.args[i], ctx, env)
 			const Iarch tt = ctx.next
@@ -354,8 +406,8 @@ const emit_call = (*Emit ctx, Call cl, [Binding] env): Str -> {
 	ctx.next = ctx.next + 1
 	const Bool is_main = str_eq(ctx.funcs[fidx].name, "main")
 	# a record-returning callee yields an `l` arena pointer; every other returns a word
-	if find_rec(ctx.recs, ctx.funcs[fidx].ret_name) >= 0 then write_str(ctx.fd, "\t%t${rt} =l call $")
-	if find_rec(ctx.recs, ctx.funcs[fidx].ret_name) < 0 then write_str(ctx.fd, "\t%t${rt} =w call $")
+	if ret_is_l(ctx.funcs[fidx].ret_name, ctx.recs, ctx.unions) then write_str(ctx.fd, "\t%t${rt} =l call $")
+	if !ret_is_l(ctx.funcs[fidx].ret_name, ctx.recs, ctx.unions) then write_str(ctx.fd, "\t%t${rt} =w call $")
 	if is_main then write_str(ctx.fd, "main")
 	if !is_main then write_str(ctx.fd, "f${fidx}")
 	write_str(ctx.fd, "(")
@@ -372,13 +424,37 @@ const emit_call = (*Emit ctx, Call cl, [Binding] env): Str -> {
 	return "%t${rt}"
 }
 
-# Emit a `match` on a tag-only union. Evaluate the scrutinee to its tag word, then a
-# compare-chain: each member arm tests the tag and, on a hit, evaluates its body into
-# the result slot and jumps to the end; the LAST arm (a `_` wildcard, or — for an
-# exhaustive match — the final member) is the unconditional else. The result merges
-# through a stack slot, like `if`.
+# The scrutinee's union (the first member arm's type name), or "" if all arms are `_`.
+const match_union = (MatchExpr me): Str -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(me.arms.len) then break
+		if !me.arms[i].is_wild then return me.arms[i].type_name
+		i = i + 1
+	}
+	return ""
+}
+
+# The scrutinee's tag operand: for a boxed union the tag lives at the box's offset 0
+# (loaded here); a tag-only union value IS its tag.
+const scrut_tag = (*Emit ctx, MatchExpr me, Str s): Str -> {
+	const Str un = match_union(me)
+	if str_eq(un, "") then return s
+	if !union_is_boxed(ctx.unions, un) then return s
+	const Iarch t = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${t} =w loadw ${s}\n")
+	return "%t${t}"
+}
+
+# Emit a `match` on a union. Evaluate the scrutinee to its tag (loading it from the
+# box for a boxed union), then a compare-chain: each member arm tests the tag and, on
+# a hit, evaluates its body into the result slot and jumps to the end; the LAST arm (a
+# `_` wildcard, or — for an exhaustive match — the final member) is the unconditional
+# else. The result merges through a stack slot, like `if`.
 const emit_match = (*Emit ctx, MatchExpr me, [Binding] env): Str -> {
 	const Str s = emit_expr(me.scrut, ctx, env)
+	const Str tagop = scrut_tag(ctx, me, s)
 	const Iarch slot = ctx.next
 	ctx.next = ctx.next + 1
 	const Iarch lid = ctx.label
@@ -402,7 +478,7 @@ const emit_match = (*Emit ctx, MatchExpr me, [Binding] env): Str -> {
 				const Iarch tag = member_tag(ctx.unions, me.arms[i].type_name, me.arms[i].members[j])
 				const Iarch c = ctx.next
 				ctx.next = ctx.next + 1
-				write_str(ctx.fd, "\t%t${c} =w ceqw ${s}, ${tag}\n")
+				write_str(ctx.fd, "\t%t${c} =w ceqw ${tagop}, ${tag}\n")
 				if j == k - 1 then write_str(ctx.fd, "\tjnz %t${c}, @marm${lid}_${i}, @mnext${lid}_${i}\n")
 				if j != k - 1 then {
 					write_str(ctx.fd, "\tjnz %t${c}, @marm${lid}_${i}, @malt${lid}_${i}_${j}\n")
@@ -431,6 +507,7 @@ const emit_expr = (Expr e, *Emit ctx, [Binding] env): Str -> match e {
 	Expr.Var(name) -> emit_var(ctx, env, name),
 	Expr.Record(rl) -> emit_record_val(ctx, rl, env),
 	Expr.Field(base, f) -> emit_field(ctx, env, base, f),
+	Expr.UnionMk(mk) -> emit_union_mk(ctx, mk, env),
 	Expr.Match(me) -> emit_match(ctx, me, env),
 	Expr.Neg(x) -> emit_unop(ctx, "sub 0, ", x, "", env),
 	Expr.Not(x) -> emit_unop(ctx, "ceqw ", x, ", 0", env),
@@ -517,7 +594,7 @@ const emit_block = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 			# `const`/`let name = init`. A record initializer (`{…}`) allocates the record
 			# and binds the name to its base pointer; a scalar allocates a word slot,
 			# stores the value, and binds the name to that slot.
-			const Str rt = init_rec_type(ctx, stmt_expr(s))
+			const Str rt = init_agg_type(ctx, stmt_expr(s))
 			if str_eq(rt, "") then {
 				const Str v = emit_expr(stmt_expr(s), ctx, env)
 				const Iarch slot = ctx.next
@@ -526,7 +603,7 @@ const emit_block = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 				write_str(ctx.fd, "\tstorew ${v}, %t${slot}\n")
 				env = [...env, Binding({ name: stmt_name(s), slot: slot, rec_type: "" })]
 			} else {
-				const Iarch base = emit_record_binding(ctx, stmt_expr(s), env)
+				const Iarch base = emit_agg_binding(ctx, stmt_expr(s), env)
 				env = [...env, Binding({ name: stmt_name(s), slot: base, rec_type: rt })]
 			}
 		}
@@ -575,15 +652,15 @@ const emit_func = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 	# returns an `l` arena pointer, else a word.
 	if is_main then write_str(ctx.fd, "export function w $main(")
 	if !is_main then {
-		if find_rec(ctx.recs, fn.ret_name) >= 0 then write_str(ctx.fd, "function l $f${idx}(")
-		if find_rec(ctx.recs, fn.ret_name) < 0 then write_str(ctx.fd, "function w $f${idx}(")
+		if ret_is_l(fn.ret_name, ctx.recs, ctx.unions) then write_str(ctx.fd, "function l $f${idx}(")
+		if !ret_is_l(fn.ret_name, ctx.recs, ctx.unions) then write_str(ctx.fd, "function w $f${idx}(")
 	}
 	let Iarch si = 0
 	loop {
 		if si >= Iarch(fn.params.len) then break
 		if si > 0 then write_str(ctx.fd, ", ")
-		if param_l(fn.params[si], ctx.recs) then write_str(ctx.fd, "l %p${si}")
-		if !param_l(fn.params[si], ctx.recs) then write_str(ctx.fd, "w %p${si}")
+		if param_l(fn.params[si], ctx.recs, ctx.unions) then write_str(ctx.fd, "l %p${si}")
+		if !param_l(fn.params[si], ctx.recs, ctx.unions) then write_str(ctx.fd, "w %p${si}")
 		si = si + 1
 	}
 	write_str(ctx.fd, ") {\n")
@@ -593,7 +670,7 @@ const emit_func = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 	loop {
 		if pi >= Iarch(fn.params.len) then break
 		if !fn.params[pi].is_ptr then {
-			if is_rec_param(fn.params[pi], ctx.recs) then {
+			if is_agg_param(fn.params[pi], ctx.recs, ctx.unions) then {
 				# a record parameter arrives as a pointer to the caller's record; copy it
 				# into a temp used as the record's base for field reads.
 				const Iarch slot = ctx.next
