@@ -4645,20 +4645,21 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 			Type rt = {TY_RECORD, NULL, NULL, 0, NULL};
 			func_add_local(fn, s->name, mutable, rt, rectype);
 		} else if (is_str) {
-			/* `const Str name = <str expr>` — a Str local binds ANY Str-valued expression: a
-			 * literal, another Str var/param/field, a Str-returning call, or a `Str(buf, n)`
-			 * construction. Str is IMMUTABLE, so aliasing one is memory-safe (no freshness rule
-			 * needed). `const`-only (`let Str` reassignment is a later brick). typecheck verifies TY_STR.
+			/* `[const|let] Str name = <str expr>` — a Str local binds ANY Str-valued expression: a
+			 * literal, another Str var/param/field, a Str-returning call, an interpolation, or a
+			 * `Str(buf, n)` construction. A Str lives in a reassignable `l` header-pointer slot
+			 * `%s_<name>`, so a `let Str` may be REASSIGNED (`s = <str expr>` repoints the slot; the
+			 * old header stays valid for anything that aliased it — arena-safe here). typecheck
+			 * verifies TY_STR (and, for a reassignment, a Str-typed RHS).
 			 * ⚠ cf0 must NOT inherit: binding an existing Str VAR/param/field to a new name is an
-			 * ALIAS, which type_system §6's no-second-bind rule forbids. §6 is about a value's
+			 * ALIAS, which type_system §6's no-second-bind rule forbids, and a reassignment orphans
+			 * the old Str's header (leaked in this never-freed arena). §6 is about a value's
 			 * SURVIVABILITY under multiple pointers (ownership/teardown — the memory arc), NOT
 			 * mutability: a tag-only union is a bare SCALAR word (no pointer, so aliasing it is a
 			 * non-issue — why the bare-union-var shortcut is benign), but a Str is a POINTER to a
 			 * header + borrowed bytes, a real multi-pointer aggregate the arc governs — so this IS a
 			 * genuine second-bind. cfcc allows it (no `copy`/arc); cf0 requires an explicit `copy`
-			 * (or `"${s}"`). Owner ruling (谢尔盖): KEEP DISCLAIMED — no §6 carve-out. */
-			if (mutable)
-				die(name->line, "a Str local must be `const` (M0 has no Str reassignment)");
+			 * (or `"${s}"`) and reclaims the orphaned header. Owner ruling (谢尔盖): KEEP DISCLAIMED. */
 			s->expr = parse_expr(p, fn);
 			snprintf(s->type_name, sizeof s->type_name, "Str");
 			Type st = {TY_STR, NULL, NULL, 0, NULL};
@@ -5077,14 +5078,16 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 		case R_CONST: die(t->line, "cannot reassign a `const` binding (declare it with `let`)");
 		case R_LET: break; /* ok */
 		}
-		/* Only a scalar `let` in a slot (an Int word, a float, or a fixed-width IntN/UintN) can
-		 * be reassigned as a unit; a whole record/aggregate cannot — mutate its fields with `.`.
-		 * (Aggregate copy-binding is a later concern — memory_model §6 requires an explicit copy.) */
+		/* A scalar `let` in a slot (an Int word, a float, a fixed-width IntN/UintN, a `Uarch`), a
+		 * `let Str`/aggregate/`[T]` (an `l` header-pointer slot, repointed on reassign), or a `let`
+		 * union may be reassigned as a unit; a fixed array cannot (mutate an element with `xs[i]`),
+		 * nor a pointer/byte buffer. */
 		if (ty.kind != TY_INT && !is_float_type(ty) && !is_fixed_type(ty) && ty.kind != TY_UARCH &&
-		    ty.kind != TY_DYN && ty.kind != TY_UNION && ty.kind != TY_RECORD && ty.kind != TY_TUPLE) {
+		    ty.kind != TY_DYN && ty.kind != TY_UNION && ty.kind != TY_RECORD && ty.kind != TY_TUPLE &&
+		    ty.kind != TY_STR) {
 			if (ty.kind == TY_ARRAY)
 				die(t->line, "cannot reassign a whole array (mutate an element with `xs[i] = …`)");
-			die(t->line, "cannot reassign this binding (a pointer, byte buffer, or `Str` local is fixed)");
+			die(t->line, "cannot reassign this binding (a pointer or byte buffer is fixed)");
 		}
 		/* A `let [T]` dynamic array accepts ONLY the grow-in-place form `xs = [...xs, e]` (validated
 		 * in the ST_ASSIGN typecheck); it never takes a compound `op=`. */
@@ -9606,6 +9609,13 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 					die(s->line, "cannot reassign a whole captured or parameter aggregate (only a `let` local has reassignable storage)");
 				if (!types_equal(typeof_expr(prog, fn, s->expr), tt))
 					die(s->line, "an aggregate `let` is reassigned a value of its own type");
+			} else if (tt.kind == TY_STR) {
+				/* A `let Str` is reassigned any Str-valued expression (a literal, another Str, a
+				 * Str-returning call, an interpolation, or a `Str(buf, n)`). Emit `storel`s the new
+				 * header pointer into the `%s_` slot, repointing it (the old header is orphaned in the
+				 * arena — ⚠ cf0's arc reclaims it). A `let Str` local always has its own `%s_` slot. */
+				if (typeof_expr(prog, fn, s->expr).kind != TY_STR)
+					die(s->line, "a `Str` `let` is reassigned a Str value");
 			} else {
 				expect_int(prog, fn, s->expr);
 			}
