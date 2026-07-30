@@ -30,8 +30,10 @@ data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs, [RecDecl] recs, [
 # A local/parameter in scope: its interned name, the temp holding its stack slot
 # pointer, and — for a record local — its record type name (`""` for a word). A word
 # slot points to a 4-byte cell (read with `loadw`); a record slot points to the
-# record's base (a field is read at base + offset).
-data Binding = { Str name, Iarch slot, Str rec_type }
+# record's base (a field is read at base + offset). `elem` is the element type name of
+# a dynamic-array binding (`rec_type` is then `"$dyn"`): a record name marks a
+# `[Record]` (8-byte pointer elements), else "" / `Iarch` marks word elements.
+data Binding = { Str name, Iarch slot, Str rec_type, Str elem }
 
 # Byte-wise `Str` equality (variable-name lookup).
 const str_eq = (Str a, Str b): Bool -> {
@@ -305,6 +307,14 @@ const init_agg_type = (*Emit ctx, Expr e): Str -> match e {
 	_ -> ""
 }
 
+# The element type name of a dynamic-array binding initializer — the array literal's
+# `elem_type` (a `let [Elem]` annotation), else "". A record name marks `[Record]`
+# elements (8-byte pointer slots); "" / `Iarch` marks word elements.
+const init_elem = (Expr e): Str -> match e {
+	Expr.ArrayLit(al) -> al.elem_type,
+	_ -> ""
+}
+
 # Copy an aggregate operand (a base pointer) into a fresh temp the binding owns.
 const copy_agg = (*Emit ctx, Str v): Iarch -> {
 	const Iarch t = ctx.next
@@ -461,7 +471,7 @@ const arm_body_env = (*Emit ctx, [Binding] env, MatchArm arm, Str s): [Binding] 
 	let Iarch k = 0
 	loop {
 		if k >= Iarch(env.len) then break
-		benv = [...benv, Binding({ name: env[k].name, slot: env[k].slot, rec_type: env[k].rec_type })]
+		benv = [...benv, Binding({ name: env[k].name, slot: env[k].slot, rec_type: env[k].rec_type, elem: env[k].elem })]
 		k = k + 1
 	}
 	let Iarch bi = 0
@@ -479,7 +489,7 @@ const arm_body_env = (*Emit ctx, [Binding] env, MatchArm arm, Str s): [Binding] 
 			ctx.next = ctx.next + 1
 			write_str(ctx.fd, "\t%t${bslot} =l alloc4 4\n")
 			write_str(ctx.fd, "\tstorew %t${val}, %t${bslot}\n")
-			benv = [...benv, Binding({ name: arm.binds[bi], slot: bslot, rec_type: "" })]
+			benv = [...benv, Binding({ name: arm.binds[bi], slot: bslot, rec_type: "", elem: "" })]
 		}
 		bi = bi + 1
 	}
@@ -573,6 +583,9 @@ const emit_array_lit = (*Emit ctx, ArrLit al, [Binding] env): Str -> {
 		write_str(ctx.fd, "\t%t${ca} =l add %t${hdr}, 16\n")
 		write_str(ctx.fd, "\tstorel 0, %t${ca}\n")
 	} else {
+		# a record element is an 8-byte arena pointer (`storel`); a word element rides in
+		# the low half of its 8-byte slot (`storew`).
+		const Bool agg = find_rec(ctx.recs, al.elem_type) >= 0
 		const Iarch bytes = n * 8
 		const Iarch data = ctx.next
 		ctx.next = ctx.next + 1
@@ -585,7 +598,8 @@ const emit_array_lit = (*Emit ctx, ArrLit al, [Binding] env): Str -> {
 			const Iarch addr = ctx.next
 			ctx.next = ctx.next + 1
 			write_str(ctx.fd, "\t%t${addr} =l add %t${data}, ${off}\n")
-			write_str(ctx.fd, "\tstorew ${v}, %t${addr}\n")
+			if agg then write_str(ctx.fd, "\tstorel ${v}, %t${addr}\n")
+			if !agg then write_str(ctx.fd, "\tstorew ${v}, %t${addr}\n")
 			i = i + 1
 		}
 		write_str(ctx.fd, "\tstorel %t${data}, %t${hdr}\n")
@@ -624,9 +638,41 @@ const emit_index = (*Emit ctx, [Binding] env, Str arr, Expr idx): Str -> {
 	return "%t${val}"
 }
 
+# Emit `arr[i].field` — load the i-th slot's 8-byte record pointer (`loadl` at
+# data + i*8), then read `field` off that record (base + the field's offset). The
+# element record type is the array binding's `elem`.
+const emit_index_field = (*Emit ctx, [Binding] env, Str arr, Expr idx, Str field): Str -> {
+	const Iarch ai = lookup_index(env, arr)
+	const Iarch hdr = env[ai].slot
+	const Str iv = emit_expr(idx, ctx, env)
+	const Iarch data = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${data} =l loadl %t${hdr}\n")
+	const Iarch il = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${il} =l extuw ${iv}\n")
+	const Iarch off = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${off} =l mul %t${il}, 8\n")
+	const Iarch slot = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${slot} =l add %t${data}, %t${off}\n")
+	const Iarch recp = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${recp} =l loadl %t${slot}\n")
+	const Iarch foff = field_offset(ctx.recs, env[ai].elem, field)
+	const Iarch faddr = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${faddr} =l add %t${recp}, ${foff}\n")
+	const Iarch val = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${val} =w loadw %t${faddr}\n")
+	return "%t${val}"
+}
+
 # Emit the elements of a `xs = [...xs, e…]` self-growth append: each `cf_dyn_push`es
 # a slot onto the header (growing as needed, bumping len) and stores the element.
-const emit_append = (*Emit ctx, [Binding] env, Iarch hdr, ArrLit al): Iarch -> {
+const emit_append = (*Emit ctx, [Binding] env, Iarch hdr, ArrLit al, Bool agg): Iarch -> {
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(al.elems.len) then break
@@ -634,13 +680,15 @@ const emit_append = (*Emit ctx, [Binding] env, Iarch hdr, ArrLit al): Iarch -> {
 		const Iarch slot = ctx.next
 		ctx.next = ctx.next + 1
 		write_str(ctx.fd, "\t%t${slot} =l call $cf_dyn_push(l %t${hdr}, w 8)\n")
-		write_str(ctx.fd, "\tstorew ${v}, %t${slot}\n")
+		# a record element rides as its 8-byte arena pointer; a word in its slot's low half.
+		if agg then write_str(ctx.fd, "\tstorel ${v}, %t${slot}\n")
+		if !agg then write_str(ctx.fd, "\tstorew ${v}, %t${slot}\n")
 		i = i + 1
 	}
 	return 0
 }
-const emit_append_expr = (*Emit ctx, [Binding] env, Iarch hdr, Expr e): Iarch -> match e {
-	Expr.ArrayLit(al) -> emit_append(ctx, env, hdr, al),
+const emit_append_expr = (*Emit ctx, [Binding] env, Iarch hdr, Expr e, Bool agg): Iarch -> match e {
+	Expr.ArrayLit(al) -> emit_append(ctx, env, hdr, al, agg),
 	_ -> 0 - 1
 }
 
@@ -652,6 +700,7 @@ const emit_expr = (Expr e, *Emit ctx, [Binding] env): Str -> match e {
 	Expr.Field(base, f) -> emit_field(ctx, env, base, f),
 	Expr.ArrayLit(al) -> emit_array_lit(ctx, al, env),
 	Expr.Index(arr, idx) -> emit_index(ctx, env, arr, idx),
+	Expr.IndexField(arr, idx, f) -> emit_index_field(ctx, env, arr, idx, f),
 	Expr.UnionMk(mk) -> emit_union_mk(ctx, mk, env),
 	Expr.Match(me) -> emit_match(ctx, me, env),
 	Expr.Neg(x) -> emit_unop(ctx, "sub 0, ", x, "", env),
@@ -788,7 +837,7 @@ const emit_for_body = (*Emit ctx, [Binding] env, Str lv, Str arr, [Stmt] body): 
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${xcell} =l alloc4 4\n")
 	write_str(ctx.fd, "\tstorew %t${xval}, %t${xcell}\n")
-	const [Binding] benv = [...env, Binding({ name: lv, slot: xcell, rec_type: "" })]
+	const [Binding] benv = [...env, Binding({ name: lv, slot: xcell, rec_type: "", elem: "" })]
 	emit_block(ctx, body, benv)
 	const Iarch iv2 = ctx.next
 	ctx.next = ctx.next + 1
@@ -834,7 +883,7 @@ const emit_block = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 		# rebuild each parameter binding as a fresh record literal — an array element
 		# must be fresh, not an alias of the passed-in vector's storage. The field
 		# values are read inline (a `Str` cannot be copy-bound to a local).
-		env = [...env, Binding({ name: params[pi].name, slot: params[pi].slot, rec_type: params[pi].rec_type })]
+		env = [...env, Binding({ name: params[pi].name, slot: params[pi].slot, rec_type: params[pi].rec_type, elem: params[pi].elem })]
 		pi = pi + 1
 	}
 	let Iarch terminal = 0
@@ -882,10 +931,10 @@ const emit_block = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 				ctx.next = ctx.next + 1
 				write_str(ctx.fd, "\t%t${slot} =l alloc4 4\n")
 				write_str(ctx.fd, "\tstorew ${v}, %t${slot}\n")
-				env = [...env, Binding({ name: stmt_name(s), slot: slot, rec_type: "" })]
+				env = [...env, Binding({ name: stmt_name(s), slot: slot, rec_type: "", elem: "" })]
 			} else {
 				const Iarch base = emit_agg_binding(ctx, stmt_expr(s), env)
-				env = [...env, Binding({ name: stmt_name(s), slot: base, rec_type: rt })]
+				env = [...env, Binding({ name: stmt_name(s), slot: base, rec_type: rt, elem: init_elem(stmt_expr(s)) })]
 			}
 		}
 		if k == 1 then {
@@ -893,7 +942,8 @@ const emit_block = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 			# grows in place; a scalar reassignment stores into the existing slot.
 			const Iarch idx = lookup_index(env, stmt_name(s))
 			if str_eq(env[idx].rec_type, "$dyn") then {
-				emit_append_expr(ctx, env, env[idx].slot, stmt_expr(s))
+				const Bool agg = find_rec(ctx.recs, env[idx].elem) >= 0
+				emit_append_expr(ctx, env, env[idx].slot, stmt_expr(s), agg)
 			} else {
 				const Iarch slot = env[idx].slot
 				const Str v = emit_expr(stmt_expr(s), ctx, env)
@@ -984,14 +1034,14 @@ const emit_func = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 				const Iarch slot = ctx.next
 				ctx.next = ctx.next + 1
 				write_str(ctx.fd, "\t%t${slot} =l copy %p${pi}\n")
-				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: fn.params[pi].type_name })]
+				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: fn.params[pi].type_name, elem: "" })]
 			} else {
 				# a word parameter spills into a stack slot so it reads like a local.
 				const Iarch slot = ctx.next
 				ctx.next = ctx.next + 1
 				write_str(ctx.fd, "\t%t${slot} =l alloc4 4\n")
 				write_str(ctx.fd, "\tstorew %p${pi}, %t${slot}\n")
-				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: "" })]
+				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: "", elem: "" })]
 			}
 		}
 		pi = pi + 1

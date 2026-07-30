@@ -253,7 +253,7 @@ const parse_array_lit = (*Parser p): Expr -> {
 		}
 		if !is_rbracket(peek(p)) then die("cf0: parse: expected `]` in an array spread\n")
 		p.pos = p.pos + 1
-		return Expr.ArrayLit(ArrLit({ has_spread: true, spread_name: src, elems: sp_elems }))
+		return Expr.ArrayLit(ArrLit({ has_spread: true, spread_name: src, elems: sp_elems, elem_type: "" }))
 	}
 	let [Expr] lit_elems = []
 	if !is_rbracket(peek(p)) then {
@@ -265,7 +265,7 @@ const parse_array_lit = (*Parser p): Expr -> {
 	}
 	if !is_rbracket(peek(p)) then die("cf0: parse: expected `]` in an array literal\n")
 	p.pos = p.pos + 1
-	return Expr.ArrayLit(ArrLit({ has_spread: false, spread_name: "", elems: lit_elems }))
+	return Expr.ArrayLit(ArrLit({ has_spread: false, spread_name: "", elems: lit_elems, elem_type: "" }))
 }
 
 # `Type.member(args)` — a payload-member union construction. `(` is the current token.
@@ -397,12 +397,20 @@ const parse_primary = (*Parser p): Expr -> {
 			if is_lparen(peek(p)) then return parse_union_mk(p, name, field)
 			return Expr.Field(name, field)
 		}
-		# `name[i]` — a dynamic-array index
+		# `name[i]` — a dynamic-array index, optionally followed by `.field` to read a
+		# field off a record element (`name[i].field`).
 		if is_lbracket(peek(p)) then {
 			p.pos = p.pos + 1
 			const Expr idx = parse_expr(p)
 			if !is_rbracket(peek(p)) then die("cf0: parse: expected `]` in an index\n")
 			p.pos = p.pos + 1
+			if is_dot(peek(p)) then {
+				p.pos = p.pos + 1
+				if !is_ident(peek(p)) then die("cf0: parse: expected a field name after `.`\n")
+				const Str ifield = cur_name(p)
+				p.pos = p.pos + 1
+				return Expr.IndexField(name, idx, ifield)
+			}
 			return Expr.Index(name, idx)
 		}
 		return Expr.Var(name)
@@ -462,16 +470,32 @@ const parse_init = (*Parser p, Str type_name): Expr -> {
 	return parse_expr(p)
 }
 
+# The element type name of a `[Elem]` type, or "" otherwise — pulls the annotation's
+# element type out of `parse_type`'s `Ty` for a dynamic-array `let`.
+const dyn_elem_of = (Ty t): Str -> match t {
+	Ty.TDyn(n) -> n,
+	_ -> ""
+}
+
+# Stamp an array literal's element type from a `let [Elem] x = …` annotation, so an
+# empty `[]` (which has no element to infer from) still carries its element layout.
+# Non-array initializers pass through unchanged.
+const set_arr_elem = (Expr e, Str elem): Expr -> match e {
+	Expr.ArrayLit(al) -> Expr.ArrayLit(ArrLit({ has_spread: al.has_spread, spread_name: al.spread_name, elems: al.elems, elem_type: elem })),
+	_ -> e
+}
+
 const parse_let = (*Parser p, Bool mutable): Stmt -> {
-	# `[Elem] name` — a dynamic-array annotation (consumed; the initializer types it).
+	# `[Elem] name` — a dynamic-array annotation. The element type is carried onto the
+	# initializer's array literal (an empty `[]` cannot infer it from elements).
 	if is_lbracket(peek(p)) then {
-		parse_type(p)
+		const Str elem = dyn_elem_of(parse_type(p))
 		if !is_ident(peek(p)) then die("cf0: parse: expected a binding name\n")
 		const Str dname = cur_name(p)
 		p.pos = p.pos + 1
 		if !is_eq(peek(p)) then die("cf0: parse: expected `=` in a binding\n")
 		p.pos = p.pos + 1
-		return Stmt.Let(dname, mutable, parse_init(p, ""))
+		return Stmt.Let(dname, mutable, set_arr_elem(parse_init(p, ""), elem))
 	}
 	if !is_ident(peek(p)) then die("cf0: parse: expected a binding name\n")
 	# `TYPE name` (an annotation) vs a bare `name` — the token after the first decides.

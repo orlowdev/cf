@@ -376,29 +376,75 @@ const match_type = (MatchExpr me, [VarTy] env, Ctx ctx): Ty -> {
 	return rty
 }
 
-# `[a, b]` / `[]` — a dynamic-array literal (Iarch elements in this brick). A spread
-# `[...src, e]` needs a dynamic-array source; every element must be an integer.
-const arraylit_type = (ArrLit al, [VarTy] env, Ctx ctx): Ty -> {
+# The `Ty` of a dynamic array's element, given the element type NAME: a record name
+# yields `TRec` (the element is an arena pointer), anything else (`Iarch`, `Int`, …) an
+# `Int` word.
+const elem_ty = (Str en, Ctx ctx): Ty -> {
+	if find_rec(ctx.recs, en) >= 0 then return Ty.TRec(en)
+	return Ty.TInt
+}
+
+# The element type NAME for a value used as a dynamic-array element — a record's name,
+# else `Iarch` (a word element).
+const elem_name_of = (Ty t): Str -> {
+	const Str rn = rec_of(t)
+	if str_eq(rn, "") then return "Iarch"
+	return rn
+}
+
+# The element type name of an array literal: a spread `[...src, e]` takes the source's
+# element type (and the source must be a dynamic array); otherwise a `let [Elem]`
+# annotation (`al.elem_type`), else the first element's type, else `Iarch` for an empty
+# `[]`.
+const arraylit_elem = (ArrLit al, [VarTy] env, Ctx ctx): Str -> {
 	if al.has_spread then {
 		const Iarch vi = env_index(env, al.spread_name)
 		if vi < 0 then die("cf0: type: undeclared spread source\n")
-		if str_eq(dyn_of(env[vi].ty), "") then die("cf0: type: a spread source must be a dynamic array\n")
+		const Str sen = dyn_of(env[vi].ty)
+		if str_eq(sen, "") then die("cf0: type: a spread source must be a dynamic array\n")
+		return sen
 	}
+	if !str_eq(al.elem_type, "") then return al.elem_type
+	if Iarch(al.elems.len) > 0 then return elem_name_of(type_of(al.elems[0], env, ctx))
+	return "Iarch"
+}
+
+# `[a, b]` / `[]` — a dynamic-array literal. Every listed element must match the array's
+# element type (records or words alike).
+const arraylit_type = (ArrLit al, [VarTy] env, Ctx ctx): Ty -> {
+	const Str en = arraylit_elem(al, env, ctx)
+	const Ty ety = elem_ty(en, ctx)
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(al.elems.len) then break
-		if !is_tint(type_of(al.elems[i], env, ctx)) then die("cf0: type: a dynamic-array element must be an integer\n")
+		if !ty_eq(type_of(al.elems[i], env, ctx), ety) then die("cf0: type: a dynamic-array element's type must match the array's element type\n")
 		i = i + 1
 	}
-	return Ty.TDyn("Iarch")
+	return Ty.TDyn(en)
 }
 
-# `xs[i]` — a dynamic array indexed by an integer, yielding an integer element.
+# `xs[i]` — a dynamic array indexed by an integer, yielding its element type (an `Int`
+# word, or a record for a `[Record]`).
 const index_type = (Str arr, Expr idx, [VarTy] env, Ctx ctx): Ty -> {
 	const Iarch vi = env_index(env, arr)
 	if vi < 0 then die("cf0: type: index of an undeclared name\n")
-	if str_eq(dyn_of(env[vi].ty), "") then die("cf0: type: indexing a non-array value\n")
+	const Str en = dyn_of(env[vi].ty)
+	if str_eq(en, "") then die("cf0: type: indexing a non-array value\n")
 	if !is_tint(type_of(idx, env, ctx)) then die("cf0: type: an array index must be an integer\n")
+	return elem_ty(en, ctx)
+}
+
+# `arr[i].field` — `arr` must be a dynamic array of records and `field` must be declared
+# on that element record. Yields the field's type (an `Int` word in this brick).
+const indexfield_type = (Str arr, Expr idx, Str field, [VarTy] env, Ctx ctx): Ty -> {
+	const Iarch vi = env_index(env, arr)
+	if vi < 0 then die("cf0: type: index of an undeclared name\n")
+	const Str en = dyn_of(env[vi].ty)
+	if str_eq(en, "") then die("cf0: type: indexing a non-array value\n")
+	if !is_tint(type_of(idx, env, ctx)) then die("cf0: type: an array index must be an integer\n")
+	const Iarch ri = find_rec(ctx.recs, en)
+	if ri < 0 then die("cf0: type: a field read needs a record element\n")
+	if field_index(ctx.recs[ri].fields, field) < 0 then die("cf0: type: the element record has no such field\n")
 	return Ty.TInt
 }
 
@@ -412,6 +458,7 @@ const type_of = (Expr e, [VarTy] env, Ctx ctx): Ty -> match e {
 	Expr.Match(me) -> match_type(me, env, ctx),
 	Expr.ArrayLit(al) -> arraylit_type(al, env, ctx),
 	Expr.Index(arr, idx) -> index_type(arr, idx, env, ctx),
+	Expr.IndexField(arr, idx, f) -> indexfield_type(arr, idx, f, env, ctx),
 	Expr.Neg(x) -> int_unop(x, env, ctx),
 	Expr.BitNot(x) -> int_unop(x, env, ctx),
 	Expr.Not(x) -> not_op(x, env, ctx),
