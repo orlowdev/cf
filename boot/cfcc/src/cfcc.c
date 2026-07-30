@@ -2243,7 +2243,12 @@ static int local_is_reassignable_agg(const Func *fn, const char *name) {
 		return 0;
 	if (resolve_name((Func *)fn, name, &t) != R_LET)
 		return 0;
-	return is_aggregate_pointer(t);
+	/* A `let [T]` dynamic array is ALSO reassignable: its `%s_<name>` slot holds the header
+	 * pointer, so `xs = []` / `xs = ys` REPOINTS it to a fresh/other header (leaving the old
+	 * one intact for any aggregate that aliased it — necessary now that a record element may
+	 * alias). In-place growth `xs = [...xs, e]` keeps the same header pointer, so the slot is
+	 * unchanged. (A `const [T]` / a `[T]` param uses the write-once `%r_<name>` header pointer.) */
+	return is_aggregate_pointer(t) || t.kind == TY_DYN;
 }
 
 /* If `name` is a match-arm payload binding currently in scope, return its storage id
@@ -9360,21 +9365,33 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 			Type tt;
 			resolve_name(fn, s->name, &tt);
 			if (tt.kind == TY_DYN) {
-				/* The ONLY reassignment a `[T]` accepts is grow-in-place `xs = [...xs, e0, …]`
-				 * (ebnf § Aggregate Literals): the RHS is a spread-headed array literal whose
-				 * spread source is THIS same name (an in-place append — amortized doubling). The
-				 * appended elements are checked against the element type. A fresh copy-append
-				 * (source ≠ name) or a plain literal reassign is rejected. */
-				Expr *rhs = s->expr;
-				if (rhs->kind != EX_ARRAY || !rhs->spread)
-					die(s->line, "a `[T]` dynamic array is only reassigned by growth `xs = [...xs, e]`");
-				if (rhs->spread->kind != EX_VAR || strcmp(rhs->spread->name, s->name) != 0)
-					die(s->line, "cfcc grows a `[T]` only in place: the spread source must be the assigned name (`xs = [...xs, e]`)");
 				Type elem = array_elem(tt);
-				for (int i = 0; i < rhs->nargs; i++)
-					check_member_value(prog, fn, rhs->args[i], elem, rhs->args[i]->line);
-				rhs->rtype = tt;
-				rhs->spread->rtype = tt; /* the source is this dynamic array */
+				Expr *rhs = s->expr;
+				/* Grow-in-place `xs = [...xs, e0, …]` (spread source IS this name): the optimized
+				 * append — amortized doubling, the `%s_` header pointer stays put, no copy. */
+				if (rhs->kind == EX_ARRAY && rhs->spread &&
+				    rhs->spread->kind == EX_VAR && strcmp(rhs->spread->name, s->name) == 0) {
+					for (int i = 0; i < rhs->nargs; i++)
+						check_member_value(prog, fn, rhs->args[i], elem, rhs->args[i]->line);
+					rhs->rtype = tt;
+					rhs->spread->rtype = tt; /* the source is this dynamic array */
+					break;
+				}
+				/* Otherwise a WHOLE reassignment to another `[T]` of the same element type — an
+				 * empty `[]` (reset), a copy-append `[...src, e]` (source ≠ name), or another vector
+				 * value. It REPOINTS the `let` local's `%s_` slot to a fresh/other header (the old
+				 * header stays valid for anything that aliased it). A bare non-empty element list
+				 * `[a, b]` has no `{data,len,cap}` header in value position, so it is rejected — use
+				 * `[]`, a spread, or another vector. (Params/`const` were rejected at parse time.) */
+				if (rhs->kind == EX_ARRAY && !rhs->spread && rhs->nargs > 0)
+					die(s->line, "reassign a `[T]` with `[]`, a `[...src, e]` spread, or another vector — not a bare `[a, b]` literal");
+				if (rhs->kind == EX_ARRAY && !rhs->spread) {
+					rhs->rtype = tt; /* an empty `[]` reset — adopt the element type */
+				} else {
+					Type et = typeof_expr(prog, fn, rhs);
+					if (et.kind != TY_DYN || !types_equal(array_elem(et), elem))
+						die(s->line, "a `[T]` `let` is reassigned a `[T]` of its own element type");
+				}
 				break;
 			}
 			if (is_float_type(tt)) {
@@ -11028,10 +11045,13 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 				fprintf(out, "\t%%r_%s =l call $cf_alloc(w %d)\n", s->name, s->bufsize);
 				break;
 			}
-			if (local_is_reassignable_agg(ex->fn, s->name)) {
+			if (local_is_reassignable_agg(ex->fn, s->name) && !s->is_dyn) {
 				/* A `let` boxed aggregate (record/tuple/boxed-union): build the initializer into a
 				 * temp (its own fresh arena object, via the value-position emit) and store that
-				 * pointer into the reassignable `l` slot `%s_<name>`. A later `x = …` re-stores. */
+				 * pointer into the reassignable `l` slot `%s_<name>`. A later `x = …` re-stores.
+				 * (A `let [T]` is also reassignable but builds its header via the `[T]` paths below,
+				 * then mirrors the pointer into `%s_<name>` — the value-position emit of a bare `[T]`
+				 * literal yields a fixed-array base, not a `{data,len,cap}` header.) */
 				emit_expr(out, s->expr, ex, v, sizeof v);
 				fprintf(out, "\tstorel %s, %%s_%s\n", v, s->name);
 				break;
@@ -11074,6 +11094,10 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 				int hc = ex->tmp++;
 				fprintf(out, "\t%%t%d =l add %%r_%s, 16\n", hc, s->name);
 				fprintf(out, "\tstorel %d, %%t%d\n", n, hc); /* cap = n */
+				/* A `let [T]` mirrors the header pointer into its reassignable slot so reads (which
+				 * loadl `%s_`) and later reassignments see it; a `const [T]` uses `%r_` directly. */
+				if (local_is_reassignable_agg(ex->fn, s->name))
+					fprintf(out, "\tstorel %%r_%s, %%s_%s\n", s->name, s->name);
 				break;
 			}
 			if (s->expr->kind == EX_ARRAY && !s->expr->spread) {
@@ -11128,6 +11152,10 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 				 * call's fresh `{data,len,cap}`/element pointer. */
 				emit_expr(out, s->expr, ex, v, sizeof v);
 				fprintf(out, "\t%%r_%s =l copy %s\n", s->name, v);
+				/* A `let [T]` (an adopted vector) mirrors the header pointer into its reassignable
+				 * `%s_` slot too, so reads and later reassignments observe it. */
+				if (local_is_reassignable_agg(ex->fn, s->name))
+					fprintf(out, "\tstorel %%r_%s, %%s_%s\n", s->name, s->name);
 			} else if (s->expr->rtype.kind == TY_STR) {
 				/* A Str local holds its header pointer in an `l` slot (reserved in the
 				 * entry block); store the literal's static header address into it. */
@@ -11158,14 +11186,42 @@ static void emit_stmts(FILE *out, Stmt *list, Emit *ex) {
 				 * pointer, stable across the reallocs. */
 				Expr *rhs = s->expr; /* EX_ARRAY with a spread head (validated in typecheck) */
 				int esz = elem_size(array_elem(tt));
-				const char *pstore = packed_store_op(esz);
-				for (int i = 0; i < rhs->nargs; i++) {
-					char ev[96];
-					emit_expr(out, rhs->args[i], ex, ev, sizeof ev);
-					int slot = ex->tmp++;
-					fprintf(out, "\t%%t%d =l call $cf_dyn_push(l %%r_%s, w %d)\n", slot, s->name, esz);
-					fprintf(out, "\t%s %s, %%t%d\n", pstore, ev, slot);
+				/* Grow-in-place `xs = [...xs, e0, …]`: append onto the CURRENT header (loaded from the
+				 * reassignable `%s_` slot, so growth after a reassignment appends to the right vector).
+				 * The header pointer is stable across the push's reallocs, so the slot needs no re-store. */
+				if (rhs->kind == EX_ARRAY && rhs->spread &&
+				    rhs->spread->kind == EX_VAR && strcmp(rhs->spread->name, s->name) == 0) {
+					const char *pstore = packed_store_op(esz);
+					int ghdr = ex->tmp++;
+					fprintf(out, "\t%%t%d =l loadl %%s_%s\n", ghdr, s->name);
+					for (int i = 0; i < rhs->nargs; i++) {
+						char ev[96];
+						emit_expr(out, rhs->args[i], ex, ev, sizeof ev);
+						int slot = ex->tmp++;
+						fprintf(out, "\t%%t%d =l call $cf_dyn_push(l %%t%d, w %d)\n", slot, ghdr, esz);
+						fprintf(out, "\t%s %s, %%t%d\n", pstore, ev, slot);
+					}
+					break;
 				}
+				/* An empty `[]` reset: allocate a fresh zeroed `{data,len,cap}` header and REPOINT the slot
+				 * at it — the old header stays valid for anything that aliased it. */
+				if (rhs->kind == EX_ARRAY && !rhs->spread) {
+					int nh = ex->tmp++;
+					fprintf(out, "\t%%t%d =l call $cf_alloc(w 24)\n", nh);
+					fprintf(out, "\tstorel 0, %%t%d\n", nh);
+					int a8 = ex->tmp++;
+					fprintf(out, "\t%%t%d =l add %%t%d, 8\n", a8, nh);
+					fprintf(out, "\tstorel 0, %%t%d\n", a8);
+					int a16 = ex->tmp++;
+					fprintf(out, "\t%%t%d =l add %%t%d, 16\n", a16, nh);
+					fprintf(out, "\tstorel 0, %%t%d\n", a16);
+					fprintf(out, "\tstorel %%t%d, %%s_%s\n", nh, s->name);
+					break;
+				}
+				/* A whole reassignment to another vector value (a var, or a copy-append `[...src, e]`):
+				 * emit it to a header pointer and REPOINT the slot at it. */
+				emit_expr(out, rhs, ex, v, sizeof v);
+				fprintf(out, "\tstorel %s, %%s_%s\n", v, s->name);
 				break;
 			}
 			emit_expr(out, s->expr, ex, v, sizeof v);
