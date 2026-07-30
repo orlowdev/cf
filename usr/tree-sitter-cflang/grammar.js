@@ -37,8 +37,10 @@ module.exports = grammar({
   supertypes: $ => [$._expression, $._statement, $._type, $._literal],
 
   conflicts: $ => [
-    // `() T` — a lambda's param_list + return type, or a func type.
-    [$.func_type, $.param_list],
+    // `(A, B) …` — a lambda's param_list, a tuple type, or a func type; all
+    // three open with `(` and fork only at the `)` (a following `->` → func).
+    [$.func_type, $.tuple_type, $.param_list],
+    [$.tuple_type, $.param_list],
     // `(x)` — a bare param of a lambda, or a parenthesized value (→ `->` lookahead).
     [$.param, $._primary],
     // `[n …]` fixed-array-type size vs a bracketed literal/index element.
@@ -55,6 +57,16 @@ module.exports = grammar({
     // receiver's type, unknown here — bias toward indexing (the common case).
     [$._type_arg, $._literal],
     [$._type_arg, $._primary],
+    // `Foo` / `Foo[T]` / `Foo.Bar` — a named type, a member-access type/callee,
+    // or a bare type_name construction callee; forked by a trailing `.`/`[`.
+    [$.named_type, $.member_access],
+    [$.named_type, $._primary],
+    [$.member_access, $._primary],
+    // `Name(T)` / `Name['V]` / `Name = …` union member vs a bare `type` member.
+    [$.union_member, $.named_type],
+    [$.union_member, $._type],
+    // `if … then …` shared by the value expression and the statement form.
+    [$.if_expression, $.if_statement],
   ],
 
   rules: {
@@ -70,12 +82,14 @@ module.exports = grammar({
     type_var: $ => seq("'", $.type_name),
 
     // ---- types -------------------------------------------------------------
+    // No `&T` type — `&` is only the address-of operator on a value (see EBNF).
     _type: $ => choice(
       $.pointer_type,
-      $.reference_type,
       $.bracket_type,
       $.named_type,
+      $.member_access,
       $.type_var,
+      $.tuple_type,
       $.func_type,
     ),
 
@@ -84,21 +98,30 @@ module.exports = grammar({
       optional(seq('[', commaSep1($._type_arg), ']')),
     )),
 
-    pointer_type: $ => prec.right(seq('*', $._type)),
-    reference_type: $ => prec.right(seq('&', $._type)),
-
-    func_type: $ => prec.right(seq(
-      '(', optional(commaSep1($._type)), ')', $._type,
+    // A qualified member type/callee: `Maybe.Just`, `Maybe[Int32].Just`,
+    // `Tree.Node[Int32]` — usable as a type, a construction callee, and a
+    // `type_pattern` head.
+    member_access: $ => prec.left(seq(
+      $.named_type, '.', $.type_name,
+      optional(seq('[', commaSep1($._type_arg), ']')),
     )),
+
+    pointer_type: $ => prec.right(seq('*', $._type)),
+
+    // `(A, B) -> R` — parameter types, `->`, return type (a tuple type + arrow).
+    func_type: $ => prec.right(seq(
+      '(', optional(commaSep1($._type)), ')', '->', $._type,
+    )),
+
+    // `(A, B)` — a positional product; `()` is unit, `(T)` is just `T`.
+    tuple_type: $ => seq('(', optional(commaSep1($._type)), ')'),
 
     bracket_type: $ => seq('[', optional(choice(
       $.fixed_array_type,
-      $.tuple_type,
       $._type, // array
     )), ']'),
 
     fixed_array_type: $ => seq(choice($.integer, $.var_name), $._type),
-    tuple_type: $ => seq($._type, ',', commaSep1($._type)),
 
     // A type argument is a type or a comptime value (`[Int]`, `[8, Int]`).
     // Narrowed to types + simple comptime literals/names rather than the full

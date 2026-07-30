@@ -692,17 +692,23 @@ const stmt_kind = (Stmt s): Iarch -> match s {
 	Stmt.Continue -> 7,
 	Stmt.BreakIf(c) -> 8,
 	Stmt.ContinueIf(c) -> 9,
+	Stmt.IndexAssign(a, i, v) -> 10,
 	Stmt.Return(e) -> 2
 }
 const stmt_name = (Stmt s): Str -> match s {
 	Stmt.Let(n, m, e) -> n,
 	Stmt.Assign(n, e) -> n,
 	Stmt.FieldAssign(b, f, e) -> b,
+	Stmt.IndexAssign(a, i, v) -> a,
 	_ -> ""
 }
 const stmt_field = (Stmt s): Str -> match s {
 	Stmt.FieldAssign(b, f, e) -> f,
 	_ -> ""
+}
+const stmt_idx = (Stmt s): Expr -> match s {
+	Stmt.IndexAssign(a, i, v) -> i,
+	_ -> Expr.Lit(0)
 }
 # Extract a statement's sub-expression: the initializer of a `Let`, the value of an
 # `Assign`, the returned value of a `Return`. Each arm YIELDS the bound payload `e`
@@ -713,6 +719,7 @@ const stmt_expr = (Stmt s): Expr -> match s {
 	Stmt.Let(n, m, e) -> e,
 	Stmt.Assign(n, e) -> e,
 	Stmt.FieldAssign(b, f, e) -> e,
+	Stmt.IndexAssign(a, i, v) -> v,
 	Stmt.BreakIf(c) -> c,
 	Stmt.ContinueIf(c) -> c,
 	Stmt.Return(e) -> e,
@@ -906,6 +913,26 @@ const emit_block = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 			write_str(ctx.fd, "\tstorew ${v}, %t${addr}\n")
 		}
 		if k == 4 then emit_for(ctx, env, s)
+		if k == 10 then {
+			# `arr[idx] = val` — store the value at data + idx*8
+			const Iarch ai = lookup_index(env, stmt_name(s))
+			const Iarch hdr = env[ai].slot
+			const Str iv = emit_expr(stmt_idx(s), ctx, env)
+			const Str vv = emit_expr(stmt_expr(s), ctx, env)
+			const Iarch data = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${data} =l loadl %t${hdr}\n")
+			const Iarch il = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${il} =l extuw ${iv}\n")
+			const Iarch off = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${off} =l mul %t${il}, 8\n")
+			const Iarch slot = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${slot} =l add %t${data}, %t${off}\n")
+			write_str(ctx.fd, "\tstorew ${vv}, %t${slot}\n")
+		}
 		if k == 2 then {
 			const Str v = emit_expr(stmt_expr(s), ctx, env)
 			write_str(ctx.fd, "\tret ${v}\n")
