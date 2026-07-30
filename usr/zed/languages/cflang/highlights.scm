@@ -20,7 +20,9 @@
 (type_name) @type
 (type_var) @type
 (pointer_type "*" @operator)
-(reference_type "&" @operator)
+
+; a qualified member `Union.Member` — the member reads as a constructor/variant
+(member_access "." (type_name) @constructor)
 
 ; ---- identifiers -------------------------------------------------------------
 (var_name) @variable
@@ -36,12 +38,19 @@
 ; field access `a.b` — the accessed member is a property
 (field_expression (var_name) @property)
 
+; union member names in a declaration are constructors/variants
+(union_member (member_name (type_name) @constructor))
+
 ; ---- functions ---------------------------------------------------------------
 ; a call's callee, whether a bare name or a `.`-path method
 (call_expression
   (var_name) @function)
 (call_expression
   (field_expression (var_name) @function .))
+
+; a PascalCase callee is a construction/cast (`Point(1, 2)`, `Uarch(fd)`)
+(call_expression
+  (type_name) @constructor)
 
 ; a `const`/`let` bound to a lambda is a function definition
 (const_declaration
@@ -102,3 +111,5 @@
 ; ---- pattern matching --------------------------------------------------------
 (wildcard_pattern) @variable.special
 (type_pattern (named_type (type_name) @type))
+; a negated number pattern (`-5`) — the sign is an operator
+(negative_pattern "-" @operator)

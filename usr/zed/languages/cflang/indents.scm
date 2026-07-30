@@ -3,8 +3,11 @@
 [
   (block)
   (record_body)
+  (union_body)
+  (struct_body)
   (data_literal)
   (aggregate)
+  (tuple)
   (match_expression)
   (param_list)
   (arguments)
