@@ -16,7 +16,7 @@
 # The emitter runs only on programs this phase accepts.
 
 import "io" as { die }
-import "ast" as { Expr, Stmt, Param, Func, Call, Ty, FieldInit, RecLit, RecDecl, UnionMember, UnionDecl, UnionMkE, MatchArm, MatchExpr, Program }
+import "ast" as { Expr, Stmt, Param, Func, Call, Ty, FieldInit, RecLit, RecDecl, UnionMember, UnionDecl, UnionMkE, MatchArm, MatchExpr, ArrLit, Body, Program }
 
 # A name in scope during checking: its type and whether it is reassignable (`let`).
 data VarTy = { Str name, Ty ty, Bool mutable }
@@ -31,17 +31,19 @@ data Ctx = { [Func] funcs, [RecDecl] recs, [UnionDecl] unions }
 const is_tint = (Ty t): Bool -> match t { Ty.TInt -> true, _ -> false }
 const is_tbool = (Ty t): Bool -> match t { Ty.TBool -> true, _ -> false }
 
-# The record / union type name of a type, or "" if it is neither.
+# The record / union / dynamic-array-element type name of a type, or "" otherwise.
 const rec_of = (Ty t): Str -> match t { Ty.TRec(n) -> n, _ -> "" }
 const union_of = (Ty t): Str -> match t { Ty.TUnion(n) -> n, _ -> "" }
+const dyn_of = (Ty t): Str -> match t { Ty.TDyn(n) -> n, _ -> "" }
 
-# Structural equality of two types (records/unions are equal iff same declaration name).
+# Structural equality of two types (records/unions/arrays equal iff same name/element).
 const ty_eq = (Ty a, Ty b): Bool -> match a {
 	Ty.TInt -> is_tint(b),
 	Ty.TBool -> is_tbool(b),
 	Ty.TPtr -> match b { Ty.TPtr -> true, _ -> false },
 	Ty.TRec(an) -> str_eq(an, rec_of(b)),
-	Ty.TUnion(an) -> str_eq(an, union_of(b))
+	Ty.TUnion(an) -> str_eq(an, union_of(b)),
+	Ty.TDyn(an) -> str_eq(an, dyn_of(b))
 }
 
 # Byte-wise `Str` equality (name lookup).
@@ -275,6 +277,11 @@ const field_type = (Str base, Str field, [VarTy] env, Ctx ctx): Ty -> {
 	}
 	const Iarch vi = env_index(env, base)
 	if vi < 0 then die("cf0: type: reference to an undeclared name\n")
+	# a dynamic array exposes only `.len` (an Int)
+	if !str_eq(dyn_of(env[vi].ty), "") then {
+		if !str_eq(field, "len") then die("cf0: type: a dynamic array has only `.len`\n")
+		return Ty.TInt
+	}
 	const Str tn = rec_of(env[vi].ty)
 	if str_eq(tn, "") then die("cf0: type: field access on a non-record value\n")
 	const Iarch ri = find_rec(ctx.recs, tn)
@@ -367,6 +374,32 @@ const match_type = (MatchExpr me, [VarTy] env, Ctx ctx): Ty -> {
 	return rty
 }
 
+# `[a, b]` / `[]` — a dynamic-array literal (Iarch elements in this brick). A spread
+# `[...src, e]` needs a dynamic-array source; every element must be an integer.
+const arraylit_type = (ArrLit al, [VarTy] env, Ctx ctx): Ty -> {
+	if al.has_spread then {
+		const Iarch vi = env_index(env, al.spread_name)
+		if vi < 0 then die("cf0: type: undeclared spread source\n")
+		if str_eq(dyn_of(env[vi].ty), "") then die("cf0: type: a spread source must be a dynamic array\n")
+	}
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(al.elems.len) then break
+		if !is_tint(type_of(al.elems[i], env, ctx)) then die("cf0: type: a dynamic-array element must be an integer\n")
+		i = i + 1
+	}
+	return Ty.TDyn("Iarch")
+}
+
+# `xs[i]` — a dynamic array indexed by an integer, yielding an integer element.
+const index_type = (Str arr, Expr idx, [VarTy] env, Ctx ctx): Ty -> {
+	const Iarch vi = env_index(env, arr)
+	if vi < 0 then die("cf0: type: index of an undeclared name\n")
+	if str_eq(dyn_of(env[vi].ty), "") then die("cf0: type: indexing a non-array value\n")
+	if !is_tint(type_of(idx, env, ctx)) then die("cf0: type: an array index must be an integer\n")
+	return Ty.TInt
+}
+
 const type_of = (Expr e, [VarTy] env, Ctx ctx): Ty -> match e {
 	Expr.Lit(v) -> lit_type(v),
 	Expr.BoolLit(b) -> Ty.TBool,
@@ -375,6 +408,8 @@ const type_of = (Expr e, [VarTy] env, Ctx ctx): Ty -> match e {
 	Expr.Field(base, f) -> field_type(base, f, env, ctx),
 	Expr.UnionMk(mk) -> unionmk_type(mk, env, ctx),
 	Expr.Match(me) -> match_type(me, env, ctx),
+	Expr.ArrayLit(al) -> arraylit_type(al, env, ctx),
+	Expr.Index(arr, idx) -> index_type(arr, idx, env, ctx),
 	Expr.Neg(x) -> int_unop(x, env, ctx),
 	Expr.BitNot(x) -> int_unop(x, env, ctx),
 	Expr.Not(x) -> not_op(x, env, ctx),
@@ -408,31 +443,50 @@ const stmt_kind = (Stmt s): Iarch -> match s {
 	Stmt.Let(n, m, e) -> 0,
 	Stmt.Assign(n, e) -> 1,
 	Stmt.FieldAssign(b, f, e) -> 3,
+	Stmt.ForIn(v, a, bd) -> 4,
 	Stmt.Return(e) -> 2
 }
 const stmt_name = (Stmt s): Str -> match s {
 	Stmt.Let(n, m, e) -> n,
 	Stmt.Assign(n, e) -> n,
 	Stmt.FieldAssign(b, f, e) -> b,
+	Stmt.ForIn(v, a, bd) -> "",
 	Stmt.Return(e) -> ""
 }
 const stmt_mut = (Stmt s): Bool -> match s {
 	Stmt.Let(n, m, e) -> m,
 	Stmt.Assign(n, e) -> false,
 	Stmt.FieldAssign(b, f, e) -> false,
+	Stmt.ForIn(v, a, bd) -> false,
 	Stmt.Return(e) -> false
 }
 const stmt_field = (Stmt s): Str -> match s {
 	Stmt.Let(n, m, e) -> "",
 	Stmt.Assign(n, e) -> "",
 	Stmt.FieldAssign(b, f, e) -> f,
+	Stmt.ForIn(v, a, bd) -> "",
 	Stmt.Return(e) -> ""
 }
 const stmt_expr = (Stmt s): Expr -> match s {
 	Stmt.Let(n, m, e) -> e,
 	Stmt.Assign(n, e) -> e,
 	Stmt.FieldAssign(b, f, e) -> e,
+	Stmt.ForIn(v, a, bd) -> Expr.Lit(0),
 	Stmt.Return(e) -> e
+}
+# Check a `for lv in arr { body }`: `arr` must be a dynamic array, and the body is
+# checked with `lv` bound as an `Int`. (A match arm cannot YIELD a `[T]`, so the body
+# statements are PASSED to a helper from within the arm.)
+const check_for_body = (Func fn, Str lv, Str arr, [Stmt] body, [VarTy] env, Ctx ctx, Ty frt): Iarch -> {
+	const Iarch ai = env_index(env, arr)
+	if ai < 0 then die("cf0: type: `for` over an undeclared name\n")
+	if str_eq(dyn_of(env[ai].ty), "") then die("cf0: type: `for` needs a dynamic array\n")
+	const [VarTy] benv = [...env, VarTy({ name: lv, ty: Ty.TInt, mutable: false })]
+	return check_stmts(fn, body, benv, ctx, frt)
+}
+const check_for = (Func fn, Stmt s, [VarTy] env, Ctx ctx, Ty frt): Iarch -> match s {
+	Stmt.ForIn(v, a, bd) -> check_for_body(fn, v, a, bd.stmts, env, ctx, frt),
+	_ -> 0
 }
 
 # Check one function: seed the environment with its parameters (immutable; a word
@@ -442,21 +496,25 @@ const stmt_expr = (Stmt s): Expr -> match s {
 # shadow an existing one; an `Assign` targets an existing mutable name and keeps its
 # type; every `Return` must match the function's declared return type; the body must
 # return.
-const check_func = (Func fn, Ctx ctx): Iarch -> {
-	const Ty frt = func_ret_ty(fn, ctx.recs, ctx.unions)
+# Check a statement list against a starting environment (reconstructed into a local
+# so a nested block's bindings do not leak). Returns 1 if the list ends up returning,
+# else 0. A `Let` initializer is typed without its own name (a self-reference is
+# undeclared) and may not shadow; an `Assign`/`FieldAssign` targets a mutable name of
+# the same type; a `for` iterates a dynamic array with its loop variable an `Int`
+# bound in the (recursively checked) body; a `Return` must match `frt`.
+const check_stmts = (Func fn, [Stmt] stmts, [VarTy] env0, Ctx ctx, Ty frt): Iarch -> {
 	let [VarTy] env = []
-	let Iarch pi = 0
+	let Iarch e0 = 0
 	loop {
-		if pi >= Iarch(fn.params.len) then break
-		const Ty pty = param_ty(fn.params[pi], ctx.recs, ctx.unions)
-		env = [...env, VarTy({ name: fn.params[pi].name, ty: pty, mutable: false })]
-		pi = pi + 1
+		if e0 >= Iarch(env0.len) then break
+		env = [...env, VarTy({ name: env0[e0].name, ty: env0[e0].ty, mutable: env0[e0].mutable })]
+		e0 = e0 + 1
 	}
 	let Bool did_return = false
 	let Iarch i = 0
 	loop {
-		if i >= Iarch(fn.body.len) then break
-		const Stmt s = fn.body[i]
+		if i >= Iarch(stmts.len) then break
+		const Stmt s = stmts[i]
 		const Iarch k = stmt_kind(s)
 		if k == 0 then {
 			if env_index(env, stmt_name(s)) >= 0 then die("cf0: type: a binding cannot shadow an existing name\n")
@@ -471,8 +529,6 @@ const check_func = (Func fn, Ctx ctx): Iarch -> {
 			if !ty_eq(vty, env[idx].ty) then die("cf0: type: a reassignment must keep the binding's type\n")
 		}
 		if k == 3 then {
-			# `base.field = value` — `base` must be a mutable (`let`) record that
-			# declares `field`, and the value must be an integer.
 			const Iarch idx = env_index(env, stmt_name(s))
 			if idx < 0 then die("cf0: type: field assignment to an undeclared name\n")
 			if !env[idx].mutable then die("cf0: type: cannot mutate a `const` record's fields\n")
@@ -482,6 +538,7 @@ const check_func = (Func fn, Ctx ctx): Iarch -> {
 			if field_index(ctx.recs[ri].fields, stmt_field(s)) < 0 then die("cf0: type: mutating a field the record does not declare\n")
 			if !is_tint(type_of(stmt_expr(s), env, ctx)) then die("cf0: type: a field value must be an integer\n")
 		}
+		if k == 4 then check_for(fn, s, env, ctx, frt)
 		if k == 2 then {
 			const Ty rty = type_of(stmt_expr(s), env, ctx)
 			if !ty_eq(rty, frt) then die("cf0: type: a returned value's type must match the function's return type\n")
@@ -489,7 +546,24 @@ const check_func = (Func fn, Ctx ctx): Iarch -> {
 		}
 		i = i + 1
 	}
-	if !did_return then die("cf0: type: a function body must end with `return`\n")
+	if did_return then return 1
+	return 0
+}
+
+# Check one function: seed the environment with its parameters (immutable), then
+# check the body — which must return.
+const check_func = (Func fn, Ctx ctx): Iarch -> {
+	const Ty frt = func_ret_ty(fn, ctx.recs, ctx.unions)
+	let [VarTy] env = []
+	let Iarch pi = 0
+	loop {
+		if pi >= Iarch(fn.params.len) then break
+		const Ty pty = param_ty(fn.params[pi], ctx.recs, ctx.unions)
+		env = [...env, VarTy({ name: fn.params[pi].name, ty: pty, mutable: false })]
+		pi = pi + 1
+	}
+	const Iarch dr = check_stmts(fn, fn.body, env, ctx, frt)
+	if dr == 0 then die("cf0: type: a function body must end with `return`\n")
 	return 0
 }
 

@@ -9,8 +9,8 @@
 # (`acc = Expr.Add(acc, rhs)`) — one function per precedence level.
 
 import "io" as { die }
-import "token" as { Token, TokKind, is_eof, is_ident, is_intlit, is_lparen, is_rparen, is_lbrace, is_rbrace, is_lbracket, is_rbracket, is_comma, is_colon, is_dot, is_eq, is_arrow, is_minus, is_plus, is_star, is_slash, is_percent, is_amp, is_pipe, is_caret, is_tilde, is_bang, is_shl, is_shr, is_eqeq, is_ne, is_lt, is_gt, is_le, is_ge, is_logand, is_logor }
-import "ast" as { Expr, Stmt, Param, Func, Call, Ty, FieldInit, RecLit, RecDecl, UnionMember, UnionDecl, UnionMkE, MatchArm, MatchExpr, Program }
+import "token" as { Token, TokKind, is_eof, is_ident, is_intlit, is_lparen, is_rparen, is_lbrace, is_rbrace, is_lbracket, is_rbracket, is_comma, is_colon, is_dot, is_ellipsis, is_eq, is_arrow, is_minus, is_plus, is_star, is_slash, is_percent, is_amp, is_pipe, is_caret, is_tilde, is_bang, is_shl, is_shr, is_eqeq, is_ne, is_lt, is_gt, is_le, is_ge, is_logand, is_logor }
+import "ast" as { Expr, Stmt, Param, Func, Call, Ty, FieldInit, RecLit, RecDecl, UnionMember, UnionDecl, UnionMkE, MatchArm, MatchExpr, ArrLit, Body, Program }
 
 # The parse cursor: the token stream, the source (for keyword text), a position.
 pub data Parser = { [Token] toks, *[Uint8] src, Iarch pos }
@@ -236,6 +236,38 @@ const parse_call = (*Parser p, Str name): Expr -> {
 	return Expr.Call(Call({ callee: name, args: args }))
 }
 
+# A `[…]` dynamic-array literal: `[]`, `[a, b]`, or a spread `[...src, e, …]`. `[` is
+# the current token.
+const parse_array_lit = (*Parser p): Expr -> {
+	p.pos = p.pos + 1 # `[`
+	if is_ellipsis(peek(p)) then {
+		p.pos = p.pos + 1
+		if !is_ident(peek(p)) then die("cf0: parse: expected a spread source name after `...`\n")
+		const Str src = cur_name(p)
+		p.pos = p.pos + 1
+		let [Expr] sp_elems = []
+		loop {
+			if !is_comma(peek(p)) then break
+			p.pos = p.pos + 1
+			sp_elems = [...sp_elems, parse_expr(p)]
+		}
+		if !is_rbracket(peek(p)) then die("cf0: parse: expected `]` in an array spread\n")
+		p.pos = p.pos + 1
+		return Expr.ArrayLit(ArrLit({ has_spread: true, spread_name: src, elems: sp_elems }))
+	}
+	let [Expr] lit_elems = []
+	if !is_rbracket(peek(p)) then {
+		loop {
+			lit_elems = [...lit_elems, parse_expr(p)]
+			if !is_comma(peek(p)) then break
+			p.pos = p.pos + 1
+		}
+	}
+	if !is_rbracket(peek(p)) then die("cf0: parse: expected `]` in an array literal\n")
+	p.pos = p.pos + 1
+	return Expr.ArrayLit(ArrLit({ has_spread: false, spread_name: "", elems: lit_elems }))
+}
+
 # `Type.member(args)` — a payload-member union construction. `(` is the current token.
 const parse_union_mk = (*Parser p, Str type_name, Str member): Expr -> {
 	p.pos = p.pos + 1 # `(`
@@ -327,6 +359,7 @@ const parse_match = (*Parser p): Expr -> {
 const parse_primary = (*Parser p): Expr -> {
 	if kw(p, "if") then return parse_if(p)
 	if kw(p, "match") then return parse_match(p)
+	if is_lbracket(peek(p)) then return parse_array_lit(p)
 	# `true`/`false` — Bool literals. Typed `Bool` by the typecheck phase; lowered to
 	# the 1/0 words a Bool is represented by at emit.
 	if kw(p, "true") then {
@@ -352,6 +385,14 @@ const parse_primary = (*Parser p): Expr -> {
 			# args) is a field read or a tag-only-member construction.
 			if is_lparen(peek(p)) then return parse_union_mk(p, name, field)
 			return Expr.Field(name, field)
+		}
+		# `name[i]` — a dynamic-array index
+		if is_lbracket(peek(p)) then {
+			p.pos = p.pos + 1
+			const Expr idx = parse_expr(p)
+			if !is_rbracket(peek(p)) then die("cf0: parse: expected `]` in an index\n")
+			p.pos = p.pos + 1
+			return Expr.Index(name, idx)
 		}
 		return Expr.Var(name)
 	}
@@ -407,6 +448,16 @@ const parse_init = (*Parser p, Str type_name): Expr -> {
 }
 
 const parse_let = (*Parser p, Bool mutable): Stmt -> {
+	# `[Elem] name` — a dynamic-array annotation (consumed; the initializer types it).
+	if is_lbracket(peek(p)) then {
+		parse_type(p)
+		if !is_ident(peek(p)) then die("cf0: parse: expected a binding name\n")
+		const Str dname = cur_name(p)
+		p.pos = p.pos + 1
+		if !is_eq(peek(p)) then die("cf0: parse: expected `=` in a binding\n")
+		p.pos = p.pos + 1
+		return Stmt.Let(dname, mutable, parse_init(p, ""))
+	}
 	if !is_ident(peek(p)) then die("cf0: parse: expected a binding name\n")
 	# `TYPE name` (an annotation) vs a bare `name` — the token after the first decides.
 	# A `Str` local cannot be reassigned, so the annotated and bare paths are separate.
@@ -426,6 +477,23 @@ const parse_let = (*Parser p, Bool mutable): Stmt -> {
 	return Stmt.Let(name, mutable, parse_init(p, ""))
 }
 
+# `for <var> in <arr> { body }` — iterate a dynamic array's elements.
+const parse_for = (*Parser p): Stmt -> {
+	p.pos = p.pos + 1 # `for`
+	if !is_ident(peek(p)) then die("cf0: parse: expected a loop variable after `for`\n")
+	const Str lv = cur_name(p)
+	p.pos = p.pos + 1
+	if !kw(p, "in") then die("cf0: parse: expected `in` in a for-loop\n")
+	p.pos = p.pos + 1
+	if !is_ident(peek(p)) then die("cf0: parse: expected an array name after `in`\n")
+	const Str arr = cur_name(p)
+	p.pos = p.pos + 1
+	if !is_lbrace(peek(p)) then die("cf0: parse: expected `{` for a for-loop body\n")
+	p.pos = p.pos + 1
+	const [Stmt] body = parse_block(p)
+	return Stmt.ForIn(lv, arr, Body({ stmts: body }))
+}
+
 const parse_stmt = (*Parser p): Stmt -> {
 	if kw(p, "const") then {
 		p.pos = p.pos + 1
@@ -435,6 +503,7 @@ const parse_stmt = (*Parser p): Stmt -> {
 		p.pos = p.pos + 1
 		return parse_let(p, true)
 	}
+	if kw(p, "for") then return parse_for(p)
 	if kw(p, "return") then {
 		p.pos = p.pos + 1
 		return Stmt.Return(parse_expr(p))
@@ -515,10 +584,11 @@ const parse_type = (*Parser p): Ty -> {
 	if is_lbracket(peek(p)) then {
 		p.pos = p.pos + 1
 		if !is_ident(peek(p)) then die("cf0: parse: expected an element type name\n")
+		const Str elem = cur_name(p)
 		p.pos = p.pos + 1
 		if !is_rbracket(peek(p)) then die("cf0: parse: expected `]`\n")
 		p.pos = p.pos + 1
-		return Ty.TPtr
+		return Ty.TDyn(elem)
 	}
 	if !is_ident(peek(p)) then die("cf0: parse: expected a type\n")
 	const Bool is_bool = kw(p, "Bool")
