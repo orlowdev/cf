@@ -921,52 +921,8 @@ const emit_expr = (Expr e, *Emit ctx, [Binding] env): Str -> match e {
 }
 
 # --- statement / block emit -----------------------------------------------------------
-# A `Stmt` is dispatched by extracting its shape (`match` arms are expressions, so the
-# per-kind handling is inlined in `emit_block` after pulling the components out).
-
-const stmt_kind = (Stmt s): Iarch -> match s {
-	Stmt.Let(n, m, e) -> 0,
-	Stmt.Assign(n, e) -> 1,
-	Stmt.FieldAssign(b, f, e) -> 3,
-	Stmt.ForIn(v, a, bd) -> 4,
-	Stmt.Loop(bd) -> 5,
-	Stmt.Break -> 6,
-	Stmt.Continue -> 7,
-	Stmt.BreakIf(c) -> 8,
-	Stmt.ContinueIf(c) -> 9,
-	Stmt.IndexAssign(a, i, v) -> 10,
-	Stmt.Return(e) -> 2
-}
-const stmt_name = (Stmt s): Str -> match s {
-	Stmt.Let(n, m, e) -> n,
-	Stmt.Assign(n, e) -> n,
-	Stmt.FieldAssign(b, f, e) -> b,
-	Stmt.IndexAssign(a, i, v) -> a,
-	_ -> ""
-}
-const stmt_field = (Stmt s): Str -> match s {
-	Stmt.FieldAssign(b, f, e) -> f,
-	_ -> ""
-}
-const stmt_idx = (Stmt s): Expr -> match s {
-	Stmt.IndexAssign(a, i, v) -> i,
-	_ -> Expr.Lit(0)
-}
-# Extract a statement's sub-expression: the initializer of a `Let`, the value of an
-# `Assign`, the returned value of a `Return`. Each arm YIELDS the bound payload `e`
-# directly — an arena-borrowed alias, sound in cfcc's single never-freed arena — so
-# the caller reads it out cleanly rather than the arm having to launder it through
-# `emit_expr`.
-const stmt_expr = (Stmt s): Expr -> match s {
-	Stmt.Let(n, m, e) -> e,
-	Stmt.Assign(n, e) -> e,
-	Stmt.FieldAssign(b, f, e) -> e,
-	Stmt.IndexAssign(a, i, v) -> v,
-	Stmt.BreakIf(c) -> c,
-	Stmt.ContinueIf(c) -> c,
-	Stmt.Return(e) -> e,
-	_ -> Expr.Lit(0)
-}
+# A `Stmt` is dispatched directly by a statement-position `match` in `emit_block`, whose
+# block arms bind each variant's payload and run for effect (no extractor helpers needed).
 
 # Emit a block's statements in order, growing the binding environment as `let`/`const`
 # locals are declared. The env is seeded with the function's word parameters. Every
@@ -1081,98 +1037,99 @@ const emit_block = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 		if i >= Iarch(stmts.len) then break
 		terminal = 0
 		const Stmt s = stmts[i]
-		const Iarch k = stmt_kind(s)
-		if k == 5 then emit_loop(ctx, env, s)
-		if k == 6 then {
-			write_str(ctx.fd, "\tjmp @lend${ctx.cur_loop}\n")
-			terminal = 1
-		}
-		if k == 7 then {
-			write_str(ctx.fd, "\tjmp @ltop${ctx.cur_loop}\n")
-			terminal = 1
-		}
-		if k == 8 then {
-			const Str c = emit_expr(stmt_expr(s), ctx, env)
-			const Iarch gid = ctx.label
-			ctx.label = ctx.label + 1
-			write_str(ctx.fd, "\tjnz ${c}, @lend${ctx.cur_loop}, @g${gid}\n")
-			write_str(ctx.fd, "@g${gid}\n")
-		}
-		if k == 9 then {
-			const Str c = emit_expr(stmt_expr(s), ctx, env)
-			const Iarch gid = ctx.label
-			ctx.label = ctx.label + 1
-			write_str(ctx.fd, "\tjnz ${c}, @ltop${ctx.cur_loop}, @g${gid}\n")
-			write_str(ctx.fd, "@g${gid}\n")
-		}
-		if k == 0 then {
-			# `const`/`let name = init`. A record initializer (`{…}`) allocates the record
-			# and binds the name to its base pointer; a scalar allocates a word slot,
-			# stores the value, and binds the name to that slot.
-			const Str rt = init_agg_type(ctx, env, stmt_expr(s))
-			if str_eq(rt, "") then {
-				const Str v = emit_expr(stmt_expr(s), ctx, env)
+		match s {
+			Stmt.Loop(bd) -> { emit_loop(ctx, env, s) },
+			Stmt.Break -> {
+				write_str(ctx.fd, "\tjmp @lend${ctx.cur_loop}\n")
+				terminal = 1
+			},
+			Stmt.Continue -> {
+				write_str(ctx.fd, "\tjmp @ltop${ctx.cur_loop}\n")
+				terminal = 1
+			},
+			Stmt.BreakIf(c) -> {
+				const Str cc = emit_expr(c, ctx, env)
+				const Iarch gid = ctx.label
+				ctx.label = ctx.label + 1
+				write_str(ctx.fd, "\tjnz ${cc}, @lend${ctx.cur_loop}, @g${gid}\n")
+				write_str(ctx.fd, "@g${gid}\n")
+			},
+			Stmt.ContinueIf(c) -> {
+				const Str cc = emit_expr(c, ctx, env)
+				const Iarch gid = ctx.label
+				ctx.label = ctx.label + 1
+				write_str(ctx.fd, "\tjnz ${cc}, @ltop${ctx.cur_loop}, @g${gid}\n")
+				write_str(ctx.fd, "@g${gid}\n")
+			},
+			Stmt.Let(n, m, e) -> {
+				# `const`/`let name = init`. A record initializer (`{…}`) allocates the record
+				# and binds the name to its base pointer; a scalar allocates a word slot,
+				# stores the value, and binds the name to that slot.
+				const Str rt = init_agg_type(ctx, env, e)
+				if str_eq(rt, "") then {
+					const Str v = emit_expr(e, ctx, env)
+					const Iarch slot = ctx.next
+					ctx.next = ctx.next + 1
+					write_str(ctx.fd, "\t%t${slot} =l alloc4 4\n")
+					write_str(ctx.fd, "\tstorew ${v}, %t${slot}\n")
+					env = [...env, Binding({ name: n, slot: slot, rec_type: "", elem: "" })]
+				} else {
+					const Iarch base = emit_agg_binding(ctx, e, env)
+					env = [...env, Binding({ name: n, slot: base, rec_type: rt, elem: init_elem(e) })]
+				}
+			},
+			Stmt.Assign(n, e) -> {
+				# `name = value` — a dynamic-array self-growth append `xs = [...xs, e]`
+				# grows in place; a scalar reassignment stores into the existing slot.
+				const Iarch idx = lookup_index(env, n)
+				if str_eq(env[idx].rec_type, "$dyn") then {
+					const Bool agg = elem_is_agg(ctx, env[idx].elem)
+					emit_append_expr(ctx, env, env[idx].slot, e, agg)
+				} else {
+					const Iarch slot = env[idx].slot
+					const Str v = emit_expr(e, ctx, env)
+					write_str(ctx.fd, "\tstorew ${v}, %t${slot}\n")
+				}
+			},
+			Stmt.FieldAssign(b, f, e) -> {
+				# `base.field = value` — store the value into the record's field in place.
+				# Evaluate the value first (it may read the record's current fields).
+				const Str v = emit_expr(e, ctx, env)
+				const Iarch idx = lookup_index(env, b)
+				const Iarch slot = env[idx].slot
+				const Str rt = env[idx].rec_type
+				const Iarch off = field_offset(ctx.recs, rt, f)
+				const Iarch addr = ctx.next
+				ctx.next = ctx.next + 1
+				write_str(ctx.fd, "\t%t${addr} =l add %t${slot}, ${off}\n")
+				write_str(ctx.fd, "\tstorew ${v}, %t${addr}\n")
+			},
+			Stmt.ForIn(fv, fa, fbd) -> { emit_for(ctx, env, s) },
+			Stmt.IndexAssign(a, ix, val) -> {
+				# `arr[idx] = val` — store the value at data + idx*8
+				const Iarch ai = lookup_index(env, a)
+				const Iarch hdr = env[ai].slot
+				const Str iv = emit_expr(ix, ctx, env)
+				const Str vv = emit_expr(val, ctx, env)
+				const Iarch data = ctx.next
+				ctx.next = ctx.next + 1
+				write_str(ctx.fd, "\t%t${data} =l loadl %t${hdr}\n")
+				const Iarch il = ctx.next
+				ctx.next = ctx.next + 1
+				write_str(ctx.fd, "\t%t${il} =l extuw ${iv}\n")
+				const Iarch off = ctx.next
+				ctx.next = ctx.next + 1
+				write_str(ctx.fd, "\t%t${off} =l mul %t${il}, 8\n")
 				const Iarch slot = ctx.next
 				ctx.next = ctx.next + 1
-				write_str(ctx.fd, "\t%t${slot} =l alloc4 4\n")
-				write_str(ctx.fd, "\tstorew ${v}, %t${slot}\n")
-				env = [...env, Binding({ name: stmt_name(s), slot: slot, rec_type: "", elem: "" })]
-			} else {
-				const Iarch base = emit_agg_binding(ctx, stmt_expr(s), env)
-				env = [...env, Binding({ name: stmt_name(s), slot: base, rec_type: rt, elem: init_elem(stmt_expr(s)) })]
-			}
-		}
-		if k == 1 then {
-			# `name = value` — a dynamic-array self-growth append `xs = [...xs, e]`
-			# grows in place; a scalar reassignment stores into the existing slot.
-			const Iarch idx = lookup_index(env, stmt_name(s))
-			if str_eq(env[idx].rec_type, "$dyn") then {
-				const Bool agg = elem_is_agg(ctx, env[idx].elem)
-				emit_append_expr(ctx, env, env[idx].slot, stmt_expr(s), agg)
-			} else {
-				const Iarch slot = env[idx].slot
-				const Str v = emit_expr(stmt_expr(s), ctx, env)
-				write_str(ctx.fd, "\tstorew ${v}, %t${slot}\n")
-			}
-		}
-		if k == 3 then {
-			# `base.field = value` — store the value into the record's field in place.
-			# Evaluate the value first (it may read the record's current fields).
-			const Str v = emit_expr(stmt_expr(s), ctx, env)
-			const Iarch idx = lookup_index(env, stmt_name(s))
-			const Iarch slot = env[idx].slot
-			const Str rt = env[idx].rec_type
-			const Iarch off = field_offset(ctx.recs, rt, stmt_field(s))
-			const Iarch addr = ctx.next
-			ctx.next = ctx.next + 1
-			write_str(ctx.fd, "\t%t${addr} =l add %t${slot}, ${off}\n")
-			write_str(ctx.fd, "\tstorew ${v}, %t${addr}\n")
-		}
-		if k == 4 then emit_for(ctx, env, s)
-		if k == 10 then {
-			# `arr[idx] = val` — store the value at data + idx*8
-			const Iarch ai = lookup_index(env, stmt_name(s))
-			const Iarch hdr = env[ai].slot
-			const Str iv = emit_expr(stmt_idx(s), ctx, env)
-			const Str vv = emit_expr(stmt_expr(s), ctx, env)
-			const Iarch data = ctx.next
-			ctx.next = ctx.next + 1
-			write_str(ctx.fd, "\t%t${data} =l loadl %t${hdr}\n")
-			const Iarch il = ctx.next
-			ctx.next = ctx.next + 1
-			write_str(ctx.fd, "\t%t${il} =l extuw ${iv}\n")
-			const Iarch off = ctx.next
-			ctx.next = ctx.next + 1
-			write_str(ctx.fd, "\t%t${off} =l mul %t${il}, 8\n")
-			const Iarch slot = ctx.next
-			ctx.next = ctx.next + 1
-			write_str(ctx.fd, "\t%t${slot} =l add %t${data}, %t${off}\n")
-			write_str(ctx.fd, "\tstorew ${vv}, %t${slot}\n")
-		}
-		if k == 2 then {
-			const Str v = emit_expr(stmt_expr(s), ctx, env)
-			write_str(ctx.fd, "\tret ${v}\n")
-			terminal = 1
+				write_str(ctx.fd, "\t%t${slot} =l add %t${data}, %t${off}\n")
+				write_str(ctx.fd, "\tstorew ${vv}, %t${slot}\n")
+			},
+			Stmt.Return(e) -> {
+				const Str v = emit_expr(e, ctx, env)
+				write_str(ctx.fd, "\tret ${v}\n")
+				terminal = 1
+			},
 		}
 		i = i + 1
 	}

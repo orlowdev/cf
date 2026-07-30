@@ -568,68 +568,15 @@ const type_of = (Expr e, [VarTy] env, Ctx ctx): Ty -> match e {
 # A `Stmt` is dispatched by shape (match arms are expressions, so the components are
 # pulled out and handled inline — mirroring the emitter).
 
-const stmt_kind = (Stmt s): Iarch -> match s {
-	Stmt.Let(n, m, e) -> 0,
-	Stmt.Assign(n, e) -> 1,
-	Stmt.FieldAssign(b, f, e) -> 3,
-	Stmt.ForIn(v, a, bd) -> 4,
-	Stmt.Loop(bd) -> 5,
-	Stmt.Break -> 6,
-	Stmt.Continue -> 7,
-	Stmt.BreakIf(c) -> 8,
-	Stmt.ContinueIf(c) -> 9,
-	Stmt.IndexAssign(a, i, v) -> 10,
-	Stmt.Return(e) -> 2
-}
-const stmt_name = (Stmt s): Str -> match s {
-	Stmt.Let(n, m, e) -> n,
-	Stmt.Assign(n, e) -> n,
-	Stmt.FieldAssign(b, f, e) -> b,
-	Stmt.IndexAssign(a, i, v) -> a,
-	_ -> ""
-}
-const stmt_mut = (Stmt s): Bool -> match s {
-	Stmt.Let(n, m, e) -> m,
-	_ -> false
-}
-const stmt_field = (Stmt s): Str -> match s {
-	Stmt.FieldAssign(b, f, e) -> f,
-	_ -> ""
-}
-const stmt_expr = (Stmt s): Expr -> match s {
-	Stmt.Let(n, m, e) -> e,
-	Stmt.Assign(n, e) -> e,
-	Stmt.FieldAssign(b, f, e) -> e,
-	Stmt.IndexAssign(a, i, v) -> v,
-	Stmt.BreakIf(c) -> c,
-	Stmt.ContinueIf(c) -> c,
-	Stmt.Return(e) -> e,
-	_ -> Expr.Lit(0)
-}
-const stmt_idx = (Stmt s): Expr -> match s {
-	Stmt.IndexAssign(a, i, v) -> i,
-	_ -> Expr.Lit(0)
-}
 # Check a `for lv in arr { body }`: `arr` must be a dynamic array, and the body is
-# checked with `lv` bound as an `Int`. (A match arm cannot YIELD a `[T]`, so the body
-# statements are PASSED to a helper from within the arm.)
+# checked with `lv` bound as an `Int`. Called directly from `check_stmts`'s `ForIn`
+# match arm, which binds the loop variable, array name, and body.
 const check_for_body = (Func fn, Str lv, Str arr, [Stmt] body, [VarTy] env, Ctx ctx, Ty frt): Iarch -> {
 	const Iarch ai = env_index(env, arr)
 	if ai < 0 then die("cf0: type: `for` over an undeclared name\n")
 	if str_eq(dyn_of(env[ai].ty), "") then die("cf0: type: `for` needs a dynamic array\n")
 	const [VarTy] benv = [...env, VarTy({ name: lv, ty: Ty.TInt, mutable: false })]
 	return check_stmts(fn, body, benv, ctx, frt, true)
-}
-const check_for = (Func fn, Stmt s, [VarTy] env, Ctx ctx, Ty frt): Iarch -> match s {
-	Stmt.ForIn(v, a, bd) -> check_for_body(fn, v, a, bd.stmts, env, ctx, frt),
-	_ -> 0
-}
-
-# Check a `loop { body }` body — in-loop (so `break`/`continue` are allowed); a loop
-# body needn't return. (The body `[Stmt]` is PASSED from the match arm, not yielded.)
-const check_loop = (Func fn, Stmt s, [VarTy] env, Ctx ctx, Ty frt): Iarch -> match s {
-	Stmt.Loop(bd) -> check_stmts(fn, bd.stmts, env, ctx, frt, true),
-	_ -> 0
 }
 
 # Check one function: seed the environment with its parameters (immutable; a word
@@ -660,62 +607,63 @@ const check_stmts = (Func fn, [Stmt] stmts, [VarTy] env0, Ctx ctx, Ty frt, Bool 
 		if i >= Iarch(stmts.len) then break
 		if terminated then die("cf0: type: unreachable statement after `break`/`continue`/`return`\n")
 		const Stmt s = stmts[i]
-		const Iarch k = stmt_kind(s)
-		if k == 5 then check_loop(fn, s, env, ctx, frt)
-		if k == 6 then {
-			if !in_loop then die("cf0: type: `break` is only valid inside a loop\n")
-			terminated = true
-		}
-		if k == 7 then {
-			if !in_loop then die("cf0: type: `continue` is only valid inside a loop\n")
-			terminated = true
-		}
-		if k == 8 then {
-			if !in_loop then die("cf0: type: `break` is only valid inside a loop\n")
-			if !is_tbool(type_of(stmt_expr(s), env, ctx)) then die("cf0: type: a guard condition must be a Bool\n")
-		}
-		if k == 9 then {
-			if !in_loop then die("cf0: type: `continue` is only valid inside a loop\n")
-			if !is_tbool(type_of(stmt_expr(s), env, ctx)) then die("cf0: type: a guard condition must be a Bool\n")
-		}
-		if k == 0 then {
-			if env_index(env, stmt_name(s)) >= 0 then die("cf0: type: a binding cannot shadow an existing name\n")
-			const Ty ty = type_of(stmt_expr(s), env, ctx)
-			if is_tstr(ty) && stmt_mut(s) then die("cf0: type: a Str local must be `const` (no Str reassignment)\n")
-			env = [...env, VarTy({ name: stmt_name(s), ty: ty, mutable: stmt_mut(s) })]
-		}
-		if k == 1 then {
-			const Iarch idx = env_index(env, stmt_name(s))
-			if idx < 0 then die("cf0: type: assignment to an undeclared name\n")
-			if !env[idx].mutable then die("cf0: type: cannot reassign a `const` binding or a parameter\n")
-			const Ty vty = type_of(stmt_expr(s), env, ctx)
-			if !ty_eq(vty, env[idx].ty) then die("cf0: type: a reassignment must keep the binding's type\n")
-		}
-		if k == 3 then {
-			const Iarch idx = env_index(env, stmt_name(s))
-			if idx < 0 then die("cf0: type: field assignment to an undeclared name\n")
-			if !env[idx].mutable then die("cf0: type: cannot mutate a `const` record's fields\n")
-			const Str tn = rec_of(env[idx].ty)
-			if str_eq(tn, "") then die("cf0: type: field assignment needs a record on the left\n")
-			const Iarch ri = find_rec(ctx.recs, tn)
-			if field_index(ctx.recs[ri].fields, stmt_field(s)) < 0 then die("cf0: type: mutating a field the record does not declare\n")
-			if !is_tint(type_of(stmt_expr(s), env, ctx)) then die("cf0: type: a field value must be an integer\n")
-		}
-		if k == 4 then check_for(fn, s, env, ctx, frt)
-		if k == 10 then {
-			# `arr[idx] = val` — a mutable dynamic array, an integer index and value
-			const Iarch idx = env_index(env, stmt_name(s))
-			if idx < 0 then die("cf0: type: element assignment to an undeclared name\n")
-			if !env[idx].mutable then die("cf0: type: cannot write to a `const`/borrowed array\n")
-			if str_eq(dyn_of(env[idx].ty), "") then die("cf0: type: element assignment needs a dynamic array\n")
-			if !is_tint(type_of(stmt_idx(s), env, ctx)) then die("cf0: type: an array index must be an integer\n")
-			if !is_tint(type_of(stmt_expr(s), env, ctx)) then die("cf0: type: an array element must be an integer\n")
-		}
-		if k == 2 then {
-			const Ty rty = type_of(stmt_expr(s), env, ctx)
-			if !ty_eq(rty, frt) then die("cf0: type: a returned value's type must match the function's return type\n")
-			did_return = true
-			terminated = true
+		match s {
+			Stmt.Loop(bd) -> { check_stmts(fn, bd.stmts, env, ctx, frt, true) },
+			Stmt.Break -> {
+				if !in_loop then die("cf0: type: `break` is only valid inside a loop\n")
+				terminated = true
+			},
+			Stmt.Continue -> {
+				if !in_loop then die("cf0: type: `continue` is only valid inside a loop\n")
+				terminated = true
+			},
+			Stmt.BreakIf(c) -> {
+				if !in_loop then die("cf0: type: `break` is only valid inside a loop\n")
+				if !is_tbool(type_of(c, env, ctx)) then die("cf0: type: a guard condition must be a Bool\n")
+			},
+			Stmt.ContinueIf(c) -> {
+				if !in_loop then die("cf0: type: `continue` is only valid inside a loop\n")
+				if !is_tbool(type_of(c, env, ctx)) then die("cf0: type: a guard condition must be a Bool\n")
+			},
+			Stmt.Let(n, m, e) -> {
+				if env_index(env, n) >= 0 then die("cf0: type: a binding cannot shadow an existing name\n")
+				const Ty ty = type_of(e, env, ctx)
+				if is_tstr(ty) && m then die("cf0: type: a Str local must be `const` (no Str reassignment)\n")
+				env = [...env, VarTy({ name: n, ty: ty, mutable: m })]
+			},
+			Stmt.Assign(n, e) -> {
+				const Iarch idx = env_index(env, n)
+				if idx < 0 then die("cf0: type: assignment to an undeclared name\n")
+				if !env[idx].mutable then die("cf0: type: cannot reassign a `const` binding or a parameter\n")
+				const Ty vty = type_of(e, env, ctx)
+				if !ty_eq(vty, env[idx].ty) then die("cf0: type: a reassignment must keep the binding's type\n")
+			},
+			Stmt.FieldAssign(b, f, e) -> {
+				const Iarch idx = env_index(env, b)
+				if idx < 0 then die("cf0: type: field assignment to an undeclared name\n")
+				if !env[idx].mutable then die("cf0: type: cannot mutate a `const` record's fields\n")
+				const Str tn = rec_of(env[idx].ty)
+				if str_eq(tn, "") then die("cf0: type: field assignment needs a record on the left\n")
+				const Iarch ri = find_rec(ctx.recs, tn)
+				if field_index(ctx.recs[ri].fields, f) < 0 then die("cf0: type: mutating a field the record does not declare\n")
+				if !is_tint(type_of(e, env, ctx)) then die("cf0: type: a field value must be an integer\n")
+			},
+			Stmt.ForIn(fv, fa, fbd) -> { check_for_body(fn, fv, fa, fbd.stmts, env, ctx, frt) },
+			Stmt.IndexAssign(a, ix, val) -> {
+				# `arr[idx] = val` — a mutable dynamic array, an integer index and value
+				const Iarch idx = env_index(env, a)
+				if idx < 0 then die("cf0: type: element assignment to an undeclared name\n")
+				if !env[idx].mutable then die("cf0: type: cannot write to a `const`/borrowed array\n")
+				if str_eq(dyn_of(env[idx].ty), "") then die("cf0: type: element assignment needs a dynamic array\n")
+				if !is_tint(type_of(ix, env, ctx)) then die("cf0: type: an array index must be an integer\n")
+				if !is_tint(type_of(val, env, ctx)) then die("cf0: type: an array element must be an integer\n")
+			},
+			Stmt.Return(e) -> {
+				const Ty rty = type_of(e, env, ctx)
+				if !ty_eq(rty, frt) then die("cf0: type: a returned value's type must match the function's return type\n")
+				did_return = true
+				terminated = true
+			},
 		}
 		i = i + 1
 	}
