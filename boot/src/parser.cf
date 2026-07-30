@@ -236,7 +236,8 @@ const parse_call = (*Parser p, Str name): Expr -> {
 	return Expr.Call(Call({ callee: name, args: args }))
 }
 
-# One `match` arm: a wildcard `_ -> body`, or a member `Type.member -> body`.
+# One `match` arm: a wildcard `_ -> body`, or an or-pattern `Type.a | Type.b -> body`
+# (one or more `Type.member` alternatives sharing the union qualifier).
 const parse_arm = (*Parser p): MatchArm -> {
 	if !is_ident(peek(p)) then die("cf0: parse: expected a match-arm pattern\n")
 	const Str first = cur_name(p)
@@ -244,16 +245,33 @@ const parse_arm = (*Parser p): MatchArm -> {
 	if is_dot(peek(p)) then {
 		p.pos = p.pos + 1
 		if !is_ident(peek(p)) then die("cf0: parse: expected a member name after `.`\n")
-		const Str member = cur_name(p)
+		let [Str] members = []
+		members = [...members, cur_name(p)]
 		p.pos = p.pos + 1
+		loop {
+			if !is_pipe(peek(p)) then break
+			p.pos = p.pos + 1
+			# each further alternative is `Type.member`, sharing the qualifier `first`
+			if !is_ident(peek(p)) then die("cf0: parse: expected `Type.member` after `|`\n")
+			const Str q = cur_name(p)
+			p.pos = p.pos + 1
+			if !str_eq(q, first) then die("cf0: parse: or-pattern alternatives must share the union qualifier\n")
+			if !is_dot(peek(p)) then die("cf0: parse: expected `.` in an or-pattern alternative\n")
+			p.pos = p.pos + 1
+			if !is_ident(peek(p)) then die("cf0: parse: expected a member name after `.`\n")
+			members = [...members, cur_name(p)]
+			p.pos = p.pos + 1
+		}
 		if !is_arrow(peek(p)) then die("cf0: parse: expected `->` in a match arm\n")
 		p.pos = p.pos + 1
-		return MatchArm({ is_wild: false, type_name: first, member: member, body: parse_expr(p) })
+		return MatchArm({ is_wild: false, type_name: first, members: members, body: parse_expr(p) })
 	}
 	if !str_eq(first, "_") then die("cf0: parse: a match-arm pattern is `_` or `Type.member`\n")
+	if is_pipe(peek(p)) then die("cf0: parse: `_` is a standalone wildcard, not an or-pattern alternative\n")
 	if !is_arrow(peek(p)) then die("cf0: parse: expected `->` after `_`\n")
 	p.pos = p.pos + 1
-	return MatchArm({ is_wild: true, type_name: "", member: "", body: parse_expr(p) })
+	const [Str] none = []
+	return MatchArm({ is_wild: true, type_name: "", members: none, body: parse_expr(p) })
 }
 
 # `match <scrutinee> { arm, arm, … }` — dispatch on a union value's tag.
