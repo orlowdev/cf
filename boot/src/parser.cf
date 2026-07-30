@@ -9,8 +9,8 @@
 # (`acc = Expr.Add(acc, rhs)`) — one function per precedence level.
 
 import "io" as { die }
-import "token" as { Token, TokKind, is_eof, is_ident, is_intlit, is_lparen, is_rparen, is_lbrace, is_rbrace, is_lbracket, is_rbracket, is_comma, is_colon, is_eq, is_arrow, is_minus, is_plus, is_star, is_slash, is_percent, is_amp, is_pipe, is_caret, is_tilde, is_bang, is_shl, is_shr, is_eqeq, is_ne, is_lt, is_gt, is_le, is_ge, is_logand, is_logor }
-import "ast" as { Expr, Stmt, Param, Func, Call, Ty }
+import "token" as { Token, TokKind, is_eof, is_ident, is_intlit, is_lparen, is_rparen, is_lbrace, is_rbrace, is_lbracket, is_rbracket, is_comma, is_colon, is_dot, is_eq, is_arrow, is_minus, is_plus, is_star, is_slash, is_percent, is_amp, is_pipe, is_caret, is_tilde, is_bang, is_shl, is_shr, is_eqeq, is_ne, is_lt, is_gt, is_le, is_ge, is_logand, is_logor }
+import "ast" as { Expr, Stmt, Param, Func, Call, Ty, FieldInit, RecLit, RecDecl, Program }
 
 # The parse cursor: the token stream, the source (for keyword text), a position.
 pub data Parser = { [Token] toks, *[Uint8] src, Iarch pos }
@@ -248,12 +248,19 @@ const parse_primary = (*Parser p): Expr -> {
 		p.pos = p.pos + 1
 		return Expr.BoolLit(false)
 	}
-	# an identifier — a call `name(args)` if followed by `(`, else a reference to a
-	# local binding / parameter.
+	# an identifier — a call `name(args)` if followed by `(`, a field read `name.f` if
+	# followed by `.`, else a reference to a local binding / parameter.
 	if is_ident(peek(p)) then {
 		const Str name = cur_name(p)
 		p.pos = p.pos + 1
 		if is_lparen(peek(p)) then return parse_call(p, name)
+		if is_dot(peek(p)) then {
+			p.pos = p.pos + 1
+			if !is_ident(peek(p)) then die("cf0: parse: expected a field name after `.`\n")
+			const Str field = cur_name(p)
+			p.pos = p.pos + 1
+			return Expr.Field(name, field)
+		}
 		return Expr.Var(name)
 	}
 	if is_intlit(peek(p)) then {
@@ -274,18 +281,57 @@ const parse_primary = (*Parser p): Expr -> {
 
 # --- statements & block bodies --------------------------------------------------------
 
-# A `const`/`let` binding. cf0 has no typecheck yet, so an optional type annotation
-# (`const Iarch x = …`) is accepted and ignored — a `TYPE name` pair (two identifiers)
-# before the `=`, versus a bare `name`.
+# `{ field: value, … }` — a data literal for a record of type `type_name`. Fields
+# may be given in any order (mapped to declaration order at typecheck); each is
+# `name: expr`. A trailing comma is allowed.
+const parse_record_lit = (*Parser p, Str type_name): Expr -> {
+	p.pos = p.pos + 1 # `{`
+	let [FieldInit] inits = []
+	loop {
+		if is_rbrace(peek(p)) then break
+		if !is_ident(peek(p)) then die("cf0: parse: expected a field name in a data literal\n")
+		const Str field = cur_name(p)
+		p.pos = p.pos + 1
+		if !is_colon(peek(p)) then die("cf0: parse: expected `:` after a field name\n")
+		p.pos = p.pos + 1
+		inits = [...inits, FieldInit({ field: field, value: parse_expr(p) })]
+		if !is_comma(peek(p)) then break
+		p.pos = p.pos + 1
+	}
+	if !is_rbrace(peek(p)) then die("cf0: parse: expected `}` in a data literal\n")
+	p.pos = p.pos + 1
+	return Expr.Record(RecLit({ type_name: type_name, inits: inits }))
+}
+
+# A `const`/`let` binding. An optional type annotation (`const Iarch x = …`, or
+# `const Point p = …`) is a `TYPE name` pair before the `=`. The type name is
+# ignored for a scalar, but names the record type for a data-literal initializer.
+# The initializer after `=`: a data literal `{ … }` (a record of type `type_name`,
+# which is `""` when there is no annotation — an error caught at typecheck) or an
+# ordinary expression.
+const parse_init = (*Parser p, Str type_name): Expr -> {
+	if is_lbrace(peek(p)) then return parse_record_lit(p, type_name)
+	return parse_expr(p)
+}
+
 const parse_let = (*Parser p, Bool mutable): Stmt -> {
 	if !is_ident(peek(p)) then die("cf0: parse: expected a binding name\n")
-	# `TYPE name` (skip the type) vs `name` — the token after the first ident decides.
-	if is_ident(p.toks[p.pos + 1].kind) then p.pos = p.pos + 1
+	# `TYPE name` (an annotation) vs a bare `name` — the token after the first decides.
+	# A `Str` local cannot be reassigned, so the annotated and bare paths are separate.
+	if is_ident(p.toks[p.pos + 1].kind) then {
+		const Str type_name = cur_name(p)
+		p.pos = p.pos + 1
+		const Str name = cur_name(p)
+		p.pos = p.pos + 1
+		if !is_eq(peek(p)) then die("cf0: parse: expected `=` in a binding\n")
+		p.pos = p.pos + 1
+		return Stmt.Let(name, mutable, parse_init(p, type_name))
+	}
 	const Str name = cur_name(p)
 	p.pos = p.pos + 1
 	if !is_eq(peek(p)) then die("cf0: parse: expected `=` in a binding\n")
 	p.pos = p.pos + 1
-	return Stmt.Let(name, mutable, parse_expr(p))
+	return Stmt.Let(name, mutable, parse_init(p, ""))
 }
 
 const parse_stmt = (*Parser p): Stmt -> {
@@ -449,13 +495,45 @@ const parse_func = (*Parser p): Func -> {
 	return Func({ name: name, is_pub: is_pub, ret_ty: ret_ty, params: params, body: one })
 }
 
-# The whole program: a sequence of top-level functions. One must be `pub const main`
-# (checked at resolve time). Functions may appear in any order.
-pub const parse_program = (*Parser p): [Func] -> {
+# `data Name = { Iarch a, Iarch b }` — a record declaration (Iarch fields only, at
+# least one; a trailing comma is allowed). The field types are consumed and ignored
+# (part 1 assumes every field is an `Iarch` word).
+const parse_data = (*Parser p): RecDecl -> {
+	p.pos = p.pos + 1 # `data`
+	if !is_ident(peek(p)) then die("cf0: parse: expected a record type name\n")
+	const Str name = cur_name(p)
+	p.pos = p.pos + 1
+	if !is_eq(peek(p)) then die("cf0: parse: expected `=` in a data declaration\n")
+	p.pos = p.pos + 1
+	if !is_lbrace(peek(p)) then die("cf0: parse: expected `{` in a data declaration\n")
+	p.pos = p.pos + 1
+	let [Str] fields = []
+	loop {
+		if is_rbrace(peek(p)) then break
+		parse_type(p) # the field type (Iarch), consumed and ignored
+		if !is_ident(peek(p)) then die("cf0: parse: expected a field name\n")
+		fields = [...fields, cur_name(p)]
+		p.pos = p.pos + 1
+		if !is_comma(peek(p)) then break
+		p.pos = p.pos + 1
+	}
+	if !is_rbrace(peek(p)) then die("cf0: parse: expected `}` in a data declaration\n")
+	p.pos = p.pos + 1
+	return RecDecl({ name: name, fields: fields })
+}
+
+# The whole program: a sequence of top-level `data` declarations and functions, in
+# any order. One function must be `pub const main` (checked at typecheck time).
+pub const parse_program = (*Parser p): Program -> {
+	let [RecDecl] recs = []
 	let [Func] funcs = []
 	loop {
 		if is_eof(peek(p)) then break
-		funcs = [...funcs, parse_func(p)]
+		if kw(p, "data") then {
+			recs = [...recs, parse_data(p)]
+		} else {
+			funcs = [...funcs, parse_func(p)]
+		}
 	}
-	return funcs
+	return Program({ recs: recs, funcs: funcs })
 }
