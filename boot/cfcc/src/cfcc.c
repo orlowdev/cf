@@ -135,16 +135,18 @@ typedef enum {
 	TK_YIELD, /* <- yield: `<- v` yields a block/loop value (ebnf § Control Flow) */
 } TokKind;
 
-/* A string breaks into segments: literal byte-runs and `${name}` interpolations,
- * in source order (ebnf § Strings). A plain string is a single SEG_LIT. cfcc
- * restricts interpolation content to a bare identifier — enough for asm bodies'
- * `${param}`/`${CONST}` — a disclaimed narrowing of the grammar's `${ expression }`. */
+/* A string breaks into segments: literal byte-runs and `${ expr }` interpolations,
+ * in source order (ebnf § Strings). A plain string is a single SEG_LIT. An
+ * interpolation hole holds the RAW source text of its expression (`expr`), sub-parsed
+ * into an Expr by the parser; a hole that is a single bare identifier also fills `name`
+ * so an asm body (which admits only `${param}`) can resolve it to a parameter register. */
 typedef enum { SEG_LIT, SEG_INTERP } StrSegKind;
 typedef struct {
 	StrSegKind kind;
 	char *lit;   /* SEG_LIT: decoded bytes (heap-owned; may embed NULs) */
 	int litlen;
-	char name[64]; /* SEG_INTERP: the interpolated bare name */
+	char *expr;    /* SEG_INTERP: the raw hole expression text (heap-owned, NUL-terminated) */
+	char name[64]; /* SEG_INTERP: the bare-identifier hole, or "" if the hole is a compound expr */
 } StrSeg;
 
 typedef struct {
@@ -263,8 +265,9 @@ static void lex(Lexer *lx) {
 			 * `{`) is literal, and `\$` forces a literal `$`.
 			 *
 			 * cfcc narrowings (throwaway; cf0.cf must not inherit — it takes the full
-			 * grammar): interpolation content is a bare identifier only (the grammar
-			 * allows any `${ expression }`); the escape set is the provisional
+			 * grammar): a hole holds a full `${ expression }`, sub-parsed by the parser
+			 * (an asm body still admits only a bare `${param}`); the escape set is
+			 * the provisional
 			 * `\n \t \r \0 \\ \" \$`; and the {bytes*,len} header / `.len` are
 			 * provisional, re-pinned at the M6/M9 representation gate. Whether an
 			 * interpolated string is usable (asm body) or a deferred error (an ordinary
@@ -310,25 +313,66 @@ static void lex(Lexer *lx) {
 					continue;
 				}
 				if (ch == '$' && s[lx->pos + 1] == '{') {
-					/* `${name}` — flush the pending literal run, then read a bare name. */
+					/* `${ expr }` — flush the pending literal run, then capture the RAW hole
+					 * text up to the matching `}`. The scan balances nested `{ }` (a record
+					 * literal inside the hole) and skips a nested `"…"` so a `}` inside it does
+					 * not close the hole early; the parser sub-parses `expr` into an Expr. */
 					flush_lit(&segs, &nsegs, &capsegs, buf, n);
 					n = 0;
 					has_interp = 1;
 					lx->pos += 2; /* past `${` */
+					size_t hstart = lx->pos;
+					int depth = 0;
+					for (;;) {
+						int hc = (unsigned char)s[lx->pos];
+						if (hc == '\0')
+							die(startline, "unterminated `${…}` interpolation");
+						if (hc == '"') { /* skip a nested string literal wholesale */
+							lx->pos++;
+							while (s[lx->pos] && s[lx->pos] != '"') {
+								if (s[lx->pos] == '\\' && s[lx->pos + 1])
+									lx->pos++;
+								lx->pos++;
+							}
+							if (s[lx->pos] != '"')
+								die(lx->line, "unterminated string inside `${…}`");
+							lx->pos++;
+							continue;
+						}
+						if (hc == '{') { depth++; lx->pos++; continue; }
+						if (hc == '}') {
+							if (depth == 0)
+								break;
+							depth--; lx->pos++; continue;
+						}
+						if (hc == '\n')
+							lx->line++;
+						lx->pos++;
+					}
+					size_t hlen = lx->pos - hstart;
+					lx->pos++; /* past the closing `}` */
 					StrSeg *sg = push_seg(&segs, &nsegs, &capsegs);
 					sg->kind = SEG_INTERP;
-					int nl = 0;
-					while (ident_char((unsigned char)s[lx->pos])) {
-						if (nl >= (int)sizeof sg->name - 1)
-							die(lx->line, "interpolation name too long");
-						sg->name[nl++] = s[lx->pos++];
-					}
-					sg->name[nl] = '\0';
-					if (nl == 0)
+					/* trim surrounding blanks so `${ x }` reads as `x` */
+					size_t a = hstart, b = hstart + hlen;
+					while (a < b && (s[a] == ' ' || s[a] == '\t')) a++;
+					while (b > a && (s[b - 1] == ' ' || s[b - 1] == '\t' || s[b - 1] == '\n')) b--;
+					if (a == b)
 						die(lx->line, "empty `${}` interpolation");
-					if (s[lx->pos] != '}')
-						die(lx->line, "M0 interpolation must be a bare name: `${name}`");
-					lx->pos++; /* past `}` */
+					size_t elen = b - a;
+					sg->expr = xmalloc(elen + 1);
+					memcpy(sg->expr, s + a, elen);
+					sg->expr[elen] = '\0';
+					/* If the whole hole is a single bare identifier, record it in `name` too so
+					 * an asm body can resolve `${param}` to a parameter register. */
+					sg->name[0] = '\0';
+					if (elen < sizeof sg->name && !isdigit((unsigned char)sg->expr[0])) {
+						int bare = 1;
+						for (size_t k = 0; k < elen; k++)
+							if (!ident_char((unsigned char)sg->expr[k])) { bare = 0; break; }
+						if (bare)
+							memcpy(sg->name, sg->expr, elen + 1);
+					}
 					continue;
 				}
 				/* a lone `$` (not `${`) is a literal byte, like any other char */
@@ -2884,6 +2928,29 @@ static void parse_call_tail(Parser *p, Func *fn, Expr *e) {
 	expect(p, TK_RPAREN, "expected `)`");
 }
 
+/* Sub-parse an interpolation hole's raw expression text into an Expr. The lexer
+ * captured the hole verbatim; here it is lexed and parsed as a standalone expression
+ * in the enclosing function `fn`'s context (so its names resolve against the same
+ * locals/params). Anything past a single expression is a syntax error. */
+static Expr *parse_hole_expr(Parser *outer, Func *fn, const char *text, int line) {
+	Lexer hlx = {0};
+	hlx.src = text;
+	hlx.line = line;
+	lex(&hlx);
+	Parser hp = {0};
+	hp.toks = hlx.toks;
+	hp.prog = outer->prog;
+	hp.saw_dest_import = outer->saw_dest_import;
+	hp.in_closure = outer->in_closure;
+	hp.in_defer = outer->in_defer;
+	Expr *e = parse_expr(&hp, fn);
+	while (hp.toks[hp.pos].kind == TK_NEWLINE)
+		hp.pos++;
+	if (hp.toks[hp.pos].kind != TK_EOF)
+		die(line, "an interpolation hole `${…}` must be a single expression");
+	return e;
+}
+
 /* primary = INT | call | var_name | "(" expr ")"
  * call    = var_name "(" [ expr { "," expr } ] ")"
  * A bare name resolves to an Int parameter or local; a name followed by `(` is a
@@ -2908,12 +2975,11 @@ static Expr *parse_primary(Parser *p, Func *fn) {
 	}
 	if (t->kind == TK_STR) {
 		if (t->has_interp) {
-			/* A runtime-interpolated string `"…${name}…"`. Build an EX_INTERP holding the
-			 * ordered segments (shared from the Token) plus one EX_VAR per `${name}` hole (in
+			/* A runtime-interpolated string `"…${ expr }…"`. Build an EX_INTERP holding the
+			 * ordered segments (shared from the Token) plus one sub-parsed Expr per hole (in
 			 * order) in args[]; typecheck/emit stringify each hole by its type. ⚠ cf0 must NOT
-			 * inherit: a hole is a BARE NAME (the grammar allows any `${ expression }`); floats
-			 * are not yet stringifiable (deferred — need a dtoa); the builder lowers via a
-			 * `[Uint8]` vector (a genesis representation, not cf0's `Str` builder). */
+			 * inherit: floats are not yet stringifiable (deferred — need a dtoa); the builder
+			 * lowers via a `[Uint8]` vector (a genesis representation, not cf0's `Str` builder). */
 			advance(p);
 			Expr *e = new_expr(EX_INTERP);
 			e->line = t->line;
@@ -2923,9 +2989,7 @@ static Expr *parse_primary(Parser *p, Func *fn) {
 			for (int i = 0; i < t->nsegs; i++) {
 				if (t->segs[i].kind != SEG_INTERP)
 					continue;
-				Expr *v = new_expr(EX_VAR);
-				v->line = t->line;
-				snprintf(v->name, sizeof v->name, "%s", t->segs[i].name);
+				Expr *v = parse_hole_expr(p, fn, t->segs[i].expr, t->line);
 				if (e->nargs == cap) {
 					cap = cap ? cap * 2 : 4;
 					e->args = realloc(e->args, cap * sizeof *e->args);
