@@ -69,73 +69,50 @@ const escape_byte = (Iarch e): Iarch -> {
 # Is a byte a valid interpolation-name character (`[A-Za-z0-9_]`)?
 const is_name_byte = (Iarch c): Bool -> (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95
 
-# A decoded literal run and the raw offset just past it (at a `${` hole or end). A fresh
-# run per call sidesteps cfcc's rule that a `[T]` local is only reassigned by growth.
-data ScanRun = { [Uint8] bytes, Iarch next }
-
-# Decode a literal run from raw offset `off` up to a `${` hole or the end of content.
-# Escapes collapse to one byte; a raw newline is content; `\$` / a lone `$` are literal.
-const scan_lit = (*[Uint8] src, Iarch start, Iarch len, Iarch off): ScanRun -> {
-	let [Uint8] run = []
-	let Iarch i = off
+# Parse a string literal's RAW content slice (src[start .. start+len]) into an Expr: a
+# plain `StrLit` (its decoded bytes) when there is no interpolation, else an `Interp`
+# (alternating literal-run / hole segments, assembled at runtime). Escapes collapse to
+# one byte; a raw newline is content; `\$` / a lone `$` are literal; `${name}` is a hole
+# (a bare identifier — an empty `${}`, a non-name, or a missing `}` is an error). The
+# accumulated literal run `cur` is flushed to a segment and RESET at each hole.
+const parse_string = (*[Uint8] src, Iarch start, Iarch len): Expr -> {
+	let [Seg] segs = []
+	let [Uint8] cur = []
+	let Bool any_hole = false
+	let Iarch i = 0
 	loop {
 		if i >= len then break
 		const Iarch c = Iarch(src[start + i])
-		if c == 36 && i + 1 < len && Iarch(src[start + i + 1]) == 123 then break
 		if c == 92 then {
 			if i + 1 >= len then die("cf0: parse: a dangling `\\` in a string\n")
-			run = [...run, Uint8(escape_byte(Iarch(src[start + i + 1])))]
+			cur = [...cur, Uint8(escape_byte(Iarch(src[start + i + 1])))]
 			i = i + 2
 			continue
 		}
-		run = [...run, Uint8(c)]
+		if c == 36 && i + 1 < len && Iarch(src[start + i + 1]) == 123 then {
+			# `${name}` — flush the pending literal run, reset it, then read the bare name
+			segs = [...segs, Seg({ is_hole: false, lit: cur, name: "" })]
+			cur = []
+			const Iarch nstart = i + 2
+			let Iarch j = nstart
+			loop {
+				if j >= len then die("cf0: parse: an unterminated interpolation hole (missing `}`)\n")
+				const Iarch d = Iarch(src[start + j])
+				if d == 125 then break
+				if !is_name_byte(d) then die("cf0: parse: an interpolation hole must be a bare name\n")
+				j = j + 1
+			}
+			if j == nstart then die("cf0: parse: an empty interpolation hole\n")
+			segs = [...segs, Seg({ is_hole: true, lit: cur, name: intern(src, start + nstart, j - nstart) })]
+			any_hole = true
+			i = j + 1
+			continue
+		}
+		cur = [...cur, Uint8(c)]
 		i = i + 1
 	}
-	return ScanRun({ bytes: run, next: i })
-}
-
-# Read a `${name}` hole starting at the `${` (raw offset `at`); returns the bare name.
-# An empty hole, a non-name body, or a missing `}` (unterminated) is rejected.
-const scan_hole = (*[Uint8] src, Iarch start, Iarch len, Iarch at): Str -> {
-	const Iarch nstart = at + 2
-	let Iarch j = nstart
-	loop {
-		if j >= len then die("cf0: parse: an unterminated interpolation hole (missing `}`)\n")
-		const Iarch d = Iarch(src[start + j])
-		if d == 125 then break
-		if !is_name_byte(d) then die("cf0: parse: an interpolation hole must be a bare name\n")
-		j = j + 1
-	}
-	if j == nstart then die("cf0: parse: an empty interpolation hole\n")
-	return intern(src, start + nstart, j - nstart)
-}
-
-# Parse a string literal's RAW content slice (src[start .. start+len]) into an Expr: a
-# plain `StrLit` (its decoded bytes) when there is no interpolation, else an `Interp`
-# (alternating literal-run / hole segments, assembled at runtime).
-const parse_string = (*[Uint8] src, Iarch start, Iarch len): Expr -> {
-	const ScanRun first = scan_lit(src, start, len, 0)
-	if first.next >= len then return Expr.StrLit(StrData({ bytes: first.bytes }))
-	# there is at least one hole — build the segment list
-	const [Uint8] empty = []
-	let [Seg] segs = []
-	segs = [...segs, Seg({ is_hole: false, lit: first.bytes, name: "" })]
-	let Iarch i = first.next
-	loop {
-		# `i` sits at a `${` hole here
-		segs = [...segs, Seg({ is_hole: true, lit: empty, name: scan_hole(src, start, len, i) })]
-		# advance past `${name}` by rescanning the name length (cheap; names are short)
-		const Iarch nstart = i + 2
-		let Iarch j = nstart
-		loop {
-			if Iarch(src[start + j]) == 125 then break
-			j = j + 1
-		}
-		const ScanRun run = scan_lit(src, start, len, j + 1)
-		segs = [...segs, Seg({ is_hole: false, lit: run.bytes, name: "" })]
-		i = run.next
-		if i >= len then break
-	}
+	if !any_hole then return Expr.StrLit(StrData({ bytes: cur }))
+	segs = [...segs, Seg({ is_hole: false, lit: cur, name: "" })]
 	return Expr.Interp(InterpData({ segs: segs }))
 }
 
