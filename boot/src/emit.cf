@@ -934,11 +934,8 @@ const emit_expr = (Expr e, *Emit ctx, [Binding] env): Str -> match e {
 # each element into a fresh word cell bound as the loop variable, then emit the body
 # with that binding in scope. The counter is a stack slot; the element cell is
 # reallocated per iteration (a bounded arena/stack cost for these small loops).
-# (A match arm cannot YIELD a `[T]`, so the body statements are PASSED from the arm.)
-const emit_for = (*Emit ctx, [Binding] env, Stmt s): Iarch -> match s {
-	Stmt.ForIn(v, a, bd) -> emit_for_body(ctx, env, v, a, bd.stmts),
-	_ -> 0
-}
+# Called directly from `emit_block`'s `ForIn` arm, which binds the loop variable, array
+# name, and body.
 const emit_for_body = (*Emit ctx, [Binding] env, Str lv, Str arr, [Stmt] body): Iarch -> {
 	const Iarch ai = lookup_index(env, arr)
 	const Iarch hdr = env[ai].slot
@@ -1002,12 +999,8 @@ const emit_for_body = (*Emit ctx, [Binding] env, Str lv, Str arr, [Stmt] body): 
 # Emit a `loop { body }`: `@ltop` / body / a back-edge `jmp @ltop` (omitted when the
 # body tail is terminal — a bare break/continue/return) / `@lend`. The loop's id is
 # the nearest-loop target for break (`@lend`) and continue (`@ltop`); it is saved and
-# restored around the body so a nested loop targets itself. (The body `[Stmt]` is
-# PASSED from the match arm, not yielded.)
-const emit_loop = (*Emit ctx, [Binding] env, Stmt s): Iarch -> match s {
-	Stmt.Loop(bd) -> emit_loop_body(ctx, env, bd.stmts),
-	_ -> 0
-}
+# restored around the body so a nested loop targets itself. Called directly from
+# `emit_block`'s `Loop` arm, which binds the body.
 const emit_loop_body = (*Emit ctx, [Binding] env, [Stmt] body): Iarch -> {
 	const Iarch lid = ctx.label
 	ctx.label = ctx.label + 1
@@ -1038,7 +1031,7 @@ const emit_block = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 		terminal = 0
 		const Stmt s = stmts[i]
 		match s {
-			Stmt.Loop(bd) -> { emit_loop(ctx, env, s) },
+			Stmt.Loop(bd) -> { emit_loop_body(ctx, env, bd.stmts) },
 			Stmt.Break -> {
 				write_str(ctx.fd, "\tjmp @lend${ctx.cur_loop}\n")
 				terminal = 1
@@ -1104,7 +1097,7 @@ const emit_block = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 				write_str(ctx.fd, "\t%t${addr} =l add %t${slot}, ${off}\n")
 				write_str(ctx.fd, "\tstorew ${v}, %t${addr}\n")
 			},
-			Stmt.ForIn(fv, fa, fbd) -> { emit_for(ctx, env, s) },
+			Stmt.ForIn(fv, fa, fbd) -> { emit_for_body(ctx, env, fv, fa, fbd.stmts) },
 			Stmt.IndexAssign(a, ix, val) -> {
 				# `arr[idx] = val` — store the value at data + idx*8
 				const Iarch ai = lookup_index(env, a)
