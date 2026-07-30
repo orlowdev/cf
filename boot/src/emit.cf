@@ -80,6 +80,22 @@ const field_offset = ([RecDecl] recs, Str rt, Str field): Iarch -> {
 	return 0
 }
 
+# Is a parameter a record (passed by pointer, fields readable through it)?
+const is_rec_param = (Param p, [RecDecl] recs): Bool -> {
+	if p.is_ptr then return false
+	return find_rec(recs, p.type_name) >= 0
+}
+
+# Does a parameter ride in an `l` register — a pointer (argv/envp) or a record?
+const param_l = (Param p, [RecDecl] recs): Bool -> {
+	if p.is_ptr then return true
+	return is_rec_param(p, recs)
+}
+
+# A call argument's operand: the temp holding it, and whether it is a record pointer
+# (emitted `l`) rather than a word (`w`).
+data ArgOp = { Iarch temp, Bool is_rec }
+
 # --- expression emit ------------------------------------------------------------------
 
 # Emit a binary operator node: evaluate both operands, then combine into a fresh
@@ -243,25 +259,41 @@ const find_func = ([Func] funcs, Str name): Iarch -> {
 	return 0 - 1
 }
 
-# Emit a call `callee(args)`. The callee (existence and arity already checked by the
-# typecheck phase) is mapped by name to its function index for the QBE symbol. Each
-# argument is evaluated into a fresh numbered temp first — so the call line
-# references temp NUMBERS, not Str operands (which cannot be stored and reread) —
-# then the call is emitted. main's QBE symbol is `$main`; every other function is
-# `$f<i>` (positional, so a user name can never collide with `_start`).
+# The base-pointer slot of a record argument. A record argument is always a record
+# local/parameter referenced by name (a `Var`), whose slot holds the base pointer.
+const slot_of = ([Binding] env, Str name): Iarch -> {
+	const Iarch idx = lookup_index(env, name)
+	return env[idx].slot
+}
+const arg_rec_slot = ([Binding] env, Expr e): Iarch -> match e {
+	Expr.Var(name) -> slot_of(env, name),
+	_ -> 0 - 1
+}
+
+# Emit a call `callee(args)`. The callee (existence, arity, and argument types
+# already checked by the typecheck phase) is mapped by name to its function index
+# for the QBE symbol. A word argument is evaluated into a fresh temp (`w`); a record
+# argument passes the record's base pointer directly (`l`, no copy). main's QBE
+# symbol is `$main`; every other function is `$f<i>` (positional, so a user name can
+# never collide with `_start`).
 const emit_call = (*Emit ctx, Call cl, [Binding] env): Str -> {
 	const Iarch fidx = find_func(ctx.funcs, cl.callee)
 	if fidx < 0 then die("cf0: emit: internal: unresolved call (should be caught by typecheck)\n")
 	const Iarch nargs = Iarch(cl.args.len)
-	let [Iarch] tnums = []
+	let [ArgOp] aops = []
 	let Iarch i = 0
 	loop {
 		if i >= nargs then break
-		const Str op = emit_expr(cl.args[i], ctx, env)
-		const Iarch tt = ctx.next
-		ctx.next = ctx.next + 1
-		write_str(ctx.fd, "\t%t${tt} =w copy ${op}\n")
-		tnums = [...tnums, tt]
+		if is_rec_param(ctx.funcs[fidx].params[i], ctx.recs) then {
+			const Iarch slot = arg_rec_slot(env, cl.args[i])
+			aops = [...aops, ArgOp({ temp: slot, is_rec: true })]
+		} else {
+			const Str op = emit_expr(cl.args[i], ctx, env)
+			const Iarch tt = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${tt} =w copy ${op}\n")
+			aops = [...aops, ArgOp({ temp: tt, is_rec: false })]
+		}
 		i = i + 1
 	}
 	const Iarch rt = ctx.next
@@ -273,10 +305,11 @@ const emit_call = (*Emit ctx, Call cl, [Binding] env): Str -> {
 	write_str(ctx.fd, "(")
 	let Iarch j = 0
 	loop {
-		if j >= Iarch(tnums.len) then break
+		if j >= Iarch(aops.len) then break
 		if j > 0 then write_str(ctx.fd, ", ")
-		const Iarch tj = tnums[j]
-		write_str(ctx.fd, "w %t${tj}")
+		const Iarch tj = aops[j].temp
+		if aops[j].is_rec then write_str(ctx.fd, "l %t${tj}")
+		if !aops[j].is_rec then write_str(ctx.fd, "w %t${tj}")
 		j = j + 1
 	}
 	write_str(ctx.fd, ")\n")
@@ -362,7 +395,7 @@ const emit_block = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 		# rebuild each parameter binding as a fresh record literal — an array element
 		# must be fresh, not an alias of the passed-in vector's storage. The field
 		# values are read inline (a `Str` cannot be copy-bound to a local).
-		env = [...env, Binding({ name: params[pi].name, slot: params[pi].slot, rec_type: "" })]
+		env = [...env, Binding({ name: params[pi].name, slot: params[pi].slot, rec_type: params[pi].rec_type })]
 		pi = pi + 1
 	}
 	let Iarch i = 0
@@ -434,8 +467,8 @@ const emit_func = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 	loop {
 		if si >= Iarch(fn.params.len) then break
 		if si > 0 then write_str(ctx.fd, ", ")
-		if fn.params[si].is_ptr then write_str(ctx.fd, "l %p${si}")
-		if !fn.params[si].is_ptr then write_str(ctx.fd, "w %p${si}")
+		if param_l(fn.params[si], ctx.recs) then write_str(ctx.fd, "l %p${si}")
+		if !param_l(fn.params[si], ctx.recs) then write_str(ctx.fd, "w %p${si}")
 		si = si + 1
 	}
 	write_str(ctx.fd, ") {\n")
@@ -445,11 +478,21 @@ const emit_func = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 	loop {
 		if pi >= Iarch(fn.params.len) then break
 		if !fn.params[pi].is_ptr then {
-			const Iarch slot = ctx.next
-			ctx.next = ctx.next + 1
-			write_str(ctx.fd, "\t%t${slot} =l alloc4 4\n")
-			write_str(ctx.fd, "\tstorew %p${pi}, %t${slot}\n")
-			params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: "" })]
+			if is_rec_param(fn.params[pi], ctx.recs) then {
+				# a record parameter arrives as a pointer to the caller's record; copy it
+				# into a temp used as the record's base for field reads.
+				const Iarch slot = ctx.next
+				ctx.next = ctx.next + 1
+				write_str(ctx.fd, "\t%t${slot} =l copy %p${pi}\n")
+				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: fn.params[pi].type_name })]
+			} else {
+				# a word parameter spills into a stack slot so it reads like a local.
+				const Iarch slot = ctx.next
+				ctx.next = ctx.next + 1
+				write_str(ctx.fd, "\t%t${slot} =l alloc4 4\n")
+				write_str(ctx.fd, "\tstorew %p${pi}, %t${slot}\n")
+				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: "" })]
+			}
 		}
 		pi = pi + 1
 	}
