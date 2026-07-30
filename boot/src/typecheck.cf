@@ -283,17 +283,38 @@ const field_type = (Str base, Str field, [VarTy] env, Ctx ctx): Ty -> {
 	return Ty.TInt
 }
 
+# Type an arm's body, extending the environment with the arm's payload bindings
+# (each an `Int`; `_` binds nothing). Non-binding arms type against the outer env.
+const type_arm_body = (MatchArm arm, [VarTy] env, Ctx ctx): Ty -> {
+	if Iarch(arm.binds.len) == 0 then return type_of(arm.body, env, ctx)
+	let [VarTy] benv = []
+	let Iarch e0 = 0
+	loop {
+		if e0 >= Iarch(env.len) then break
+		benv = [...benv, VarTy({ name: env[e0].name, ty: env[e0].ty, mutable: env[e0].mutable })]
+		e0 = e0 + 1
+	}
+	let Iarch bi = 0
+	loop {
+		if bi >= Iarch(arm.binds.len) then break
+		if !str_eq(arm.binds[bi], "_") then benv = [...benv, VarTy({ name: arm.binds[bi], ty: Ty.TInt, mutable: false })]
+		bi = bi + 1
+	}
+	return type_of(arm.body, benv, ctx)
+}
+
 # `match scrut { arms }` — the scrutinee must be a union; every arm must name that
 # union and one of its members (no member twice), no arm may follow a `_` wildcard,
-# every member must be covered (unless a `_` is present), and all arm bodies must
-# share a type — which is the match's type.
+# every member must be covered (unless a `_` is present), a payload pattern's arity
+# must match its member with no repeated binding name, and all arm bodies must share
+# a type — which is the match's type.
 const match_type = (MatchExpr me, [VarTy] env, Ctx ctx): Ty -> {
 	const Str un = union_of(type_of(me.scrut, env, ctx))
 	if str_eq(un, "") then die("cf0: type: a match scrutinee must be a union\n")
 	const Iarch ui = find_union(ctx.unions, un)
 	const Iarch na = Iarch(me.arms.len)
 	if na == 0 then die("cf0: type: a match needs at least one arm\n")
-	const Ty rty = type_of(me.arms[0].body, env, ctx)
+	const Ty rty = type_arm_body(me.arms[0], env, ctx)
 	let [Iarch] covered = []
 	let Bool wild_seen = false
 	let Iarch i = 0
@@ -318,8 +339,26 @@ const match_type = (MatchExpr me, [VarTy] env, Ctx ctx): Ty -> {
 				covered = [...covered, mi]
 				mj = mj + 1
 			}
+			# a payload-binding arm (single member): arity must match, no repeated name
+			if Iarch(me.arms[i].binds.len) > 0 then {
+				const Iarch mi0 = union_member_index(ctx.unions[ui].members, me.arms[i].members[0])
+				if Iarch(me.arms[i].binds.len) != Iarch(ctx.unions[ui].members[mi0].payloads.len) then die("cf0: type: a payload pattern's arity must match the member\n")
+				let Iarch di = 0
+				loop {
+					if di >= Iarch(me.arms[i].binds.len) then break
+					if !str_eq(me.arms[i].binds[di], "_") then {
+						let Iarch dj = 0
+						loop {
+							if dj >= di then break
+							if str_eq(me.arms[i].binds[dj], me.arms[i].binds[di]) then die("cf0: type: a payload binding name may not repeat\n")
+							dj = dj + 1
+						}
+					}
+					di = di + 1
+				}
+			}
 		}
-		if !ty_eq(type_of(me.arms[i].body, env, ctx), rty) then die("cf0: type: all match arms must have the same type\n")
+		if !ty_eq(type_arm_body(me.arms[i], env, ctx), rty) then die("cf0: type: all match arms must have the same type\n")
 		i = i + 1
 	}
 	if !wild_seen then {

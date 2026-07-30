@@ -252,8 +252,8 @@ const parse_union_mk = (*Parser p, Str type_name, Str member): Expr -> {
 	return Expr.UnionMk(UnionMkE({ type_name: type_name, member: member, args: args }))
 }
 
-# One `match` arm: a wildcard `_ -> body`, or an or-pattern `Type.a | Type.b -> body`
-# (one or more `Type.member` alternatives sharing the union qualifier).
+# One `match` arm: a wildcard `_ -> body`; an or-pattern `Type.a | Type.b -> body`;
+# or a single member with a positional payload binding `Type.m(v, _) -> body`.
 const parse_arm = (*Parser p): MatchArm -> {
 	if !is_ident(peek(p)) then die("cf0: parse: expected a match-arm pattern\n")
 	const Str first = cur_name(p)
@@ -264,30 +264,46 @@ const parse_arm = (*Parser p): MatchArm -> {
 		let [Str] members = []
 		members = [...members, cur_name(p)]
 		p.pos = p.pos + 1
-		loop {
-			if !is_pipe(peek(p)) then break
+		let [Str] binds = []
+		if is_lparen(peek(p)) then {
+			# a payload binding pattern (single member): names or `_`, positionally
 			p.pos = p.pos + 1
-			# each further alternative is `Type.member`, sharing the qualifier `first`
-			if !is_ident(peek(p)) then die("cf0: parse: expected `Type.member` after `|`\n")
-			const Str q = cur_name(p)
+			loop {
+				if !is_ident(peek(p)) then die("cf0: parse: expected a binding name or `_`\n")
+				binds = [...binds, cur_name(p)]
+				p.pos = p.pos + 1
+				if !is_comma(peek(p)) then break
+				p.pos = p.pos + 1
+			}
+			if !is_rparen(peek(p)) then die("cf0: parse: expected `)` in a payload pattern\n")
 			p.pos = p.pos + 1
-			if !str_eq(q, first) then die("cf0: parse: or-pattern alternatives must share the union qualifier\n")
-			if !is_dot(peek(p)) then die("cf0: parse: expected `.` in an or-pattern alternative\n")
-			p.pos = p.pos + 1
-			if !is_ident(peek(p)) then die("cf0: parse: expected a member name after `.`\n")
-			members = [...members, cur_name(p)]
-			p.pos = p.pos + 1
+		} else {
+			# an or-pattern: further `Type.member` alternatives sharing the qualifier
+			loop {
+				if !is_pipe(peek(p)) then break
+				p.pos = p.pos + 1
+				if !is_ident(peek(p)) then die("cf0: parse: expected `Type.member` after `|`\n")
+				const Str q = cur_name(p)
+				p.pos = p.pos + 1
+				if !str_eq(q, first) then die("cf0: parse: or-pattern alternatives must share the union qualifier\n")
+				if !is_dot(peek(p)) then die("cf0: parse: expected `.` in an or-pattern alternative\n")
+				p.pos = p.pos + 1
+				if !is_ident(peek(p)) then die("cf0: parse: expected a member name after `.`\n")
+				members = [...members, cur_name(p)]
+				p.pos = p.pos + 1
+			}
 		}
 		if !is_arrow(peek(p)) then die("cf0: parse: expected `->` in a match arm\n")
 		p.pos = p.pos + 1
-		return MatchArm({ is_wild: false, type_name: first, members: members, body: parse_expr(p) })
+		return MatchArm({ is_wild: false, type_name: first, members: members, binds: binds, body: parse_expr(p) })
 	}
 	if !str_eq(first, "_") then die("cf0: parse: a match-arm pattern is `_` or `Type.member`\n")
 	if is_pipe(peek(p)) then die("cf0: parse: `_` is a standalone wildcard, not an or-pattern alternative\n")
 	if !is_arrow(peek(p)) then die("cf0: parse: expected `->` after `_`\n")
 	p.pos = p.pos + 1
-	const [Str] none = []
-	return MatchArm({ is_wild: true, type_name: "", members: none, body: parse_expr(p) })
+	const [Str] no_members = []
+	const [Str] no_binds = []
+	return MatchArm({ is_wild: true, type_name: "", members: no_members, binds: no_binds, body: parse_expr(p) })
 }
 
 # `match <scrutinee> { arm, arm, … }` — dispatch on a union value's tag.

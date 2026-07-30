@@ -435,6 +435,40 @@ const match_union = (MatchExpr me): Str -> {
 	return ""
 }
 
+# The environment for an arm body: the outer env plus a fresh word slot per named
+# payload binding, loaded from the box (`s` is the boxed scrutinee's base pointer;
+# payload field `i` sits at offset 4 + i*4). `_` binds nothing. Non-binding arms
+# just get a copy of the outer env.
+const arm_body_env = (*Emit ctx, [Binding] env, MatchArm arm, Str s): [Binding] -> {
+	let [Binding] benv = []
+	let Iarch k = 0
+	loop {
+		if k >= Iarch(env.len) then break
+		benv = [...benv, Binding({ name: env[k].name, slot: env[k].slot, rec_type: env[k].rec_type })]
+		k = k + 1
+	}
+	let Iarch bi = 0
+	loop {
+		if bi >= Iarch(arm.binds.len) then break
+		if !str_eq(arm.binds[bi], "_") then {
+			const Iarch off = 4 + bi * 4
+			const Iarch addr = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${addr} =l add ${s}, ${off}\n")
+			const Iarch val = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${val} =w loadw %t${addr}\n")
+			const Iarch bslot = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${bslot} =l alloc4 4\n")
+			write_str(ctx.fd, "\tstorew %t${val}, %t${bslot}\n")
+			benv = [...benv, Binding({ name: arm.binds[bi], slot: bslot, rec_type: "" })]
+		}
+		bi = bi + 1
+	}
+	return benv
+}
+
 # The scrutinee's tag operand: for a boxed union the tag lives at the box's offset 0
 # (loaded here); a tag-only union value IS its tag.
 const scrut_tag = (*Emit ctx, MatchExpr me, Str s): Str -> {
@@ -465,7 +499,8 @@ const emit_match = (*Emit ctx, MatchExpr me, [Binding] env): Str -> {
 	loop {
 		if i >= na then break
 		if i == na - 1 then {
-			const Str v = emit_expr(me.arms[i].body, ctx, env)
+			const [Binding] benv_e = arm_body_env(ctx, env, me.arms[i], s)
+			const Str v = emit_expr(me.arms[i].body, ctx, benv_e)
 			write_str(ctx.fd, "\tstorew ${v}, %t${slot}\n")
 			write_str(ctx.fd, "\tjmp @mend${lid}\n")
 		} else {
@@ -487,7 +522,8 @@ const emit_match = (*Emit ctx, MatchExpr me, [Binding] env): Str -> {
 				j = j + 1
 			}
 			write_str(ctx.fd, "@marm${lid}_${i}\n")
-			const Str v = emit_expr(me.arms[i].body, ctx, env)
+			const [Binding] benv_m = arm_body_env(ctx, env, me.arms[i], s)
+			const Str v = emit_expr(me.arms[i].body, ctx, benv_m)
 			write_str(ctx.fd, "\tstorew ${v}, %t${slot}\n")
 			write_str(ctx.fd, "\tjmp @mend${lid}\n")
 			write_str(ctx.fd, "@mnext${lid}_${i}\n")
