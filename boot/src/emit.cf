@@ -25,7 +25,7 @@ import "ast" as { Expr, Stmt, Param, Func, Call, FieldInit, RecLit, RecDecl, Uni
 # field read / data literal resolves a field's byte offset), and its union
 # declarations (a `Type.member` / `match` resolves a member's tag). `next`/`label`
 # reset per function; `funcs`/`recs`/`unions` are constant across the program.
-data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs, [RecDecl] recs, [UnionDecl] unions }
+data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs, [RecDecl] recs, [UnionDecl] unions, Iarch cur_loop }
 
 # A local/parameter in scope: its interned name, the temp holding its stack slot
 # pointer, and — for a record local — its record type name (`""` for a word). A word
@@ -685,21 +685,22 @@ const stmt_kind = (Stmt s): Iarch -> match s {
 	Stmt.Assign(n, e) -> 1,
 	Stmt.FieldAssign(b, f, e) -> 3,
 	Stmt.ForIn(v, a, bd) -> 4,
+	Stmt.Loop(bd) -> 5,
+	Stmt.Break -> 6,
+	Stmt.Continue -> 7,
+	Stmt.BreakIf(c) -> 8,
+	Stmt.ContinueIf(c) -> 9,
 	Stmt.Return(e) -> 2
 }
 const stmt_name = (Stmt s): Str -> match s {
 	Stmt.Let(n, m, e) -> n,
 	Stmt.Assign(n, e) -> n,
 	Stmt.FieldAssign(b, f, e) -> b,
-	Stmt.ForIn(v, a, bd) -> "",
-	Stmt.Return(e) -> ""
+	_ -> ""
 }
 const stmt_field = (Stmt s): Str -> match s {
-	Stmt.Let(n, m, e) -> "",
-	Stmt.Assign(n, e) -> "",
 	Stmt.FieldAssign(b, f, e) -> f,
-	Stmt.ForIn(v, a, bd) -> "",
-	Stmt.Return(e) -> ""
+	_ -> ""
 }
 # Extract a statement's sub-expression: the initializer of a `Let`, the value of an
 # `Assign`, the returned value of a `Return`. Each arm YIELDS the bound payload `e`
@@ -710,8 +711,10 @@ const stmt_expr = (Stmt s): Expr -> match s {
 	Stmt.Let(n, m, e) -> e,
 	Stmt.Assign(n, e) -> e,
 	Stmt.FieldAssign(b, f, e) -> e,
-	Stmt.ForIn(v, a, bd) -> Expr.Lit(0),
-	Stmt.Return(e) -> e
+	Stmt.BreakIf(c) -> c,
+	Stmt.ContinueIf(c) -> c,
+	Stmt.Return(e) -> e,
+	_ -> Expr.Lit(0)
 }
 
 # Emit a block's statements in order, growing the binding environment as `let`/`const`
@@ -789,6 +792,30 @@ const emit_for_body = (*Emit ctx, [Binding] env, Str lv, Str arr, [Stmt] body): 
 	return 0
 }
 
+# Emit a `loop { body }`: `@ltop` / body / a back-edge `jmp @ltop` (omitted when the
+# body tail is terminal — a bare break/continue/return) / `@lend`. The loop's id is
+# the nearest-loop target for break (`@lend`) and continue (`@ltop`); it is saved and
+# restored around the body so a nested loop targets itself. (The body `[Stmt]` is
+# PASSED from the match arm, not yielded.)
+const emit_loop = (*Emit ctx, [Binding] env, Stmt s): Iarch -> match s {
+	Stmt.Loop(bd) -> emit_loop_body(ctx, env, bd.stmts),
+	_ -> 0
+}
+const emit_loop_body = (*Emit ctx, [Binding] env, [Stmt] body): Iarch -> {
+	const Iarch lid = ctx.label
+	ctx.label = ctx.label + 1
+	const Iarch saved = ctx.cur_loop
+	ctx.cur_loop = lid
+	write_str(ctx.fd, "@ltop${lid}\n")
+	const Iarch term = emit_block(ctx, body, env)
+	if term == 0 then write_str(ctx.fd, "\tjmp @ltop${lid}\n")
+	write_str(ctx.fd, "@lend${lid}\n")
+	ctx.cur_loop = saved
+	return 0
+}
+
+# Emit a statement list, returning 1 if it ends terminally (a bare break/continue/
+# return), else 0 — so an enclosing loop knows whether to emit its back-edge.
 const emit_block = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 	let [Binding] env = []
 	let Iarch pi = 0
@@ -800,11 +827,40 @@ const emit_block = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 		env = [...env, Binding({ name: params[pi].name, slot: params[pi].slot, rec_type: params[pi].rec_type })]
 		pi = pi + 1
 	}
+	let Iarch terminal = 0
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(stmts.len) then break
+		terminal = 0
 		const Stmt s = stmts[i]
 		const Iarch k = stmt_kind(s)
+		if k == 5 then emit_loop(ctx, env, s)
+		if k == 6 then {
+			const Iarch cl = ctx.cur_loop
+			write_str(ctx.fd, "\tjmp @lend${cl}\n")
+			terminal = 1
+		}
+		if k == 7 then {
+			const Iarch cl = ctx.cur_loop
+			write_str(ctx.fd, "\tjmp @ltop${cl}\n")
+			terminal = 1
+		}
+		if k == 8 then {
+			const Iarch cl = ctx.cur_loop
+			const Str c = emit_expr(stmt_expr(s), ctx, env)
+			const Iarch gid = ctx.label
+			ctx.label = ctx.label + 1
+			write_str(ctx.fd, "\tjnz ${c}, @lend${cl}, @g${gid}\n")
+			write_str(ctx.fd, "@g${gid}\n")
+		}
+		if k == 9 then {
+			const Iarch cl = ctx.cur_loop
+			const Str c = emit_expr(stmt_expr(s), ctx, env)
+			const Iarch gid = ctx.label
+			ctx.label = ctx.label + 1
+			write_str(ctx.fd, "\tjnz ${c}, @ltop${cl}, @g${gid}\n")
+			write_str(ctx.fd, "@g${gid}\n")
+		}
 		if k == 0 then {
 			# `const`/`let name = init`. A record initializer (`{…}`) allocates the record
 			# and binds the name to its base pointer; a scalar allocates a word slot,
@@ -851,10 +907,11 @@ const emit_block = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 		if k == 2 then {
 			const Str v = emit_expr(stmt_expr(s), ctx, env)
 			write_str(ctx.fd, "\tret ${v}\n")
+			terminal = 1
 		}
 		i = i + 1
 	}
-	return 0
+	return terminal
 }
 
 # Emit one function: its signature, parameter spills, and body. main is the exported
@@ -1050,7 +1107,7 @@ pub const emit_program = (Program prog, Uarch qbe_fd, Uarch asm_fd): Iarch -> {
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(prog.funcs.len) then break
-		let Emit ctx = Emit({ fd: qbe_fd, next: 0, label: 0, funcs: prog.funcs, recs: prog.recs, unions: prog.unions })
+		let Emit ctx = Emit({ fd: qbe_fd, next: 0, label: 0, funcs: prog.funcs, recs: prog.recs, unions: prog.unions, cur_loop: 0 - 1 })
 		emit_func(&ctx, prog.funcs[i], i)
 		i = i + 1
 	}

@@ -444,35 +444,35 @@ const stmt_kind = (Stmt s): Iarch -> match s {
 	Stmt.Assign(n, e) -> 1,
 	Stmt.FieldAssign(b, f, e) -> 3,
 	Stmt.ForIn(v, a, bd) -> 4,
+	Stmt.Loop(bd) -> 5,
+	Stmt.Break -> 6,
+	Stmt.Continue -> 7,
+	Stmt.BreakIf(c) -> 8,
+	Stmt.ContinueIf(c) -> 9,
 	Stmt.Return(e) -> 2
 }
 const stmt_name = (Stmt s): Str -> match s {
 	Stmt.Let(n, m, e) -> n,
 	Stmt.Assign(n, e) -> n,
 	Stmt.FieldAssign(b, f, e) -> b,
-	Stmt.ForIn(v, a, bd) -> "",
-	Stmt.Return(e) -> ""
+	_ -> ""
 }
 const stmt_mut = (Stmt s): Bool -> match s {
 	Stmt.Let(n, m, e) -> m,
-	Stmt.Assign(n, e) -> false,
-	Stmt.FieldAssign(b, f, e) -> false,
-	Stmt.ForIn(v, a, bd) -> false,
-	Stmt.Return(e) -> false
+	_ -> false
 }
 const stmt_field = (Stmt s): Str -> match s {
-	Stmt.Let(n, m, e) -> "",
-	Stmt.Assign(n, e) -> "",
 	Stmt.FieldAssign(b, f, e) -> f,
-	Stmt.ForIn(v, a, bd) -> "",
-	Stmt.Return(e) -> ""
+	_ -> ""
 }
 const stmt_expr = (Stmt s): Expr -> match s {
 	Stmt.Let(n, m, e) -> e,
 	Stmt.Assign(n, e) -> e,
 	Stmt.FieldAssign(b, f, e) -> e,
-	Stmt.ForIn(v, a, bd) -> Expr.Lit(0),
-	Stmt.Return(e) -> e
+	Stmt.BreakIf(c) -> c,
+	Stmt.ContinueIf(c) -> c,
+	Stmt.Return(e) -> e,
+	_ -> Expr.Lit(0)
 }
 # Check a `for lv in arr { body }`: `arr` must be a dynamic array, and the body is
 # checked with `lv` bound as an `Int`. (A match arm cannot YIELD a `[T]`, so the body
@@ -482,10 +482,17 @@ const check_for_body = (Func fn, Str lv, Str arr, [Stmt] body, [VarTy] env, Ctx 
 	if ai < 0 then die("cf0: type: `for` over an undeclared name\n")
 	if str_eq(dyn_of(env[ai].ty), "") then die("cf0: type: `for` needs a dynamic array\n")
 	const [VarTy] benv = [...env, VarTy({ name: lv, ty: Ty.TInt, mutable: false })]
-	return check_stmts(fn, body, benv, ctx, frt)
+	return check_stmts(fn, body, benv, ctx, frt, true)
 }
 const check_for = (Func fn, Stmt s, [VarTy] env, Ctx ctx, Ty frt): Iarch -> match s {
 	Stmt.ForIn(v, a, bd) -> check_for_body(fn, v, a, bd.stmts, env, ctx, frt),
+	_ -> 0
+}
+
+# Check a `loop { body }` body — in-loop (so `break`/`continue` are allowed); a loop
+# body needn't return. (The body `[Stmt]` is PASSED from the match arm, not yielded.)
+const check_loop = (Func fn, Stmt s, [VarTy] env, Ctx ctx, Ty frt): Iarch -> match s {
+	Stmt.Loop(bd) -> check_stmts(fn, bd.stmts, env, ctx, frt, true),
 	_ -> 0
 }
 
@@ -502,7 +509,7 @@ const check_for = (Func fn, Stmt s, [VarTy] env, Ctx ctx, Ty frt): Iarch -> matc
 # undeclared) and may not shadow; an `Assign`/`FieldAssign` targets a mutable name of
 # the same type; a `for` iterates a dynamic array with its loop variable an `Int`
 # bound in the (recursively checked) body; a `Return` must match `frt`.
-const check_stmts = (Func fn, [Stmt] stmts, [VarTy] env0, Ctx ctx, Ty frt): Iarch -> {
+const check_stmts = (Func fn, [Stmt] stmts, [VarTy] env0, Ctx ctx, Ty frt, Bool in_loop): Iarch -> {
 	let [VarTy] env = []
 	let Iarch e0 = 0
 	loop {
@@ -511,11 +518,30 @@ const check_stmts = (Func fn, [Stmt] stmts, [VarTy] env0, Ctx ctx, Ty frt): Iarc
 		e0 = e0 + 1
 	}
 	let Bool did_return = false
+	let Bool terminated = false
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(stmts.len) then break
+		if terminated then die("cf0: type: unreachable statement after `break`/`continue`/`return`\n")
 		const Stmt s = stmts[i]
 		const Iarch k = stmt_kind(s)
+		if k == 5 then check_loop(fn, s, env, ctx, frt)
+		if k == 6 then {
+			if !in_loop then die("cf0: type: `break` is only valid inside a loop\n")
+			terminated = true
+		}
+		if k == 7 then {
+			if !in_loop then die("cf0: type: `continue` is only valid inside a loop\n")
+			terminated = true
+		}
+		if k == 8 then {
+			if !in_loop then die("cf0: type: `break` is only valid inside a loop\n")
+			if !is_tbool(type_of(stmt_expr(s), env, ctx)) then die("cf0: type: a guard condition must be a Bool\n")
+		}
+		if k == 9 then {
+			if !in_loop then die("cf0: type: `continue` is only valid inside a loop\n")
+			if !is_tbool(type_of(stmt_expr(s), env, ctx)) then die("cf0: type: a guard condition must be a Bool\n")
+		}
 		if k == 0 then {
 			if env_index(env, stmt_name(s)) >= 0 then die("cf0: type: a binding cannot shadow an existing name\n")
 			const Ty ty = type_of(stmt_expr(s), env, ctx)
@@ -543,6 +569,7 @@ const check_stmts = (Func fn, [Stmt] stmts, [VarTy] env0, Ctx ctx, Ty frt): Iarc
 			const Ty rty = type_of(stmt_expr(s), env, ctx)
 			if !ty_eq(rty, frt) then die("cf0: type: a returned value's type must match the function's return type\n")
 			did_return = true
+			terminated = true
 		}
 		i = i + 1
 	}
@@ -562,7 +589,7 @@ const check_func = (Func fn, Ctx ctx): Iarch -> {
 		env = [...env, VarTy({ name: fn.params[pi].name, ty: pty, mutable: false })]
 		pi = pi + 1
 	}
-	const Iarch dr = check_stmts(fn, fn.body, env, ctx, frt)
+	const Iarch dr = check_stmts(fn, fn.body, env, ctx, frt, false)
 	if dr == 0 then die("cf0: type: a function body must end with `return`\n")
 	return 0
 }
