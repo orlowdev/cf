@@ -17,14 +17,15 @@
 # not yet enforced (that is the typecheck brick).
 
 import "io" as { write_str, die }
-import "ast" as { Expr, Stmt, Param, Func, Call, FieldInit, RecLit, RecDecl, Program }
+import "ast" as { Expr, Stmt, Param, Func, Call, FieldInit, RecLit, RecDecl, UnionDecl, MatchArm, MatchExpr, Program }
 
 # The emit context: the QBE-IL output fd, the next free temp number, the next free
 # basic-block label id, the program's functions (a call resolves its callee — by
-# name to a function index — for the `$f<i>` symbol), and its record declarations (a
-# field read / data literal resolves a field's byte offset). `next`/`label` reset
-# per function; `funcs`/`recs` are constant across the program.
-data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs, [RecDecl] recs }
+# name to a function index — for the `$f<i>` symbol), its record declarations (a
+# field read / data literal resolves a field's byte offset), and its union
+# declarations (a `Type.member` / `match` resolves a member's tag). `next`/`label`
+# reset per function; `funcs`/`recs`/`unions` are constant across the program.
+data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs, [RecDecl] recs, [UnionDecl] unions }
 
 # A local/parameter in scope: its interned name, the temp holding its stack slot
 # pointer, and — for a record local — its record type name (`""` for a word). A word
@@ -80,6 +81,27 @@ const field_offset = ([RecDecl] recs, Str rt, Str field): Iarch -> {
 	return 0
 }
 
+# The index of the union declared as `name`, or -1; and a member's tag (its index).
+const find_union = ([UnionDecl] unions, Str name): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(unions.len) then break
+		if str_eq(unions[i].name, name) then return i
+		i = i + 1
+	}
+	return 0 - 1
+}
+const member_tag = ([UnionDecl] unions, Str type_name, Str member): Iarch -> {
+	const Iarch ui = find_union(unions, type_name)
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(unions[ui].members.len) then break
+		if str_eq(unions[ui].members[i], member) then return i
+		i = i + 1
+	}
+	return 0
+}
+
 # Is a parameter a record (passed by pointer, fields readable through it)?
 const is_rec_param = (Param p, [RecDecl] recs): Bool -> {
 	if p.is_ptr then return false
@@ -131,9 +153,15 @@ const emit_var = (*Emit ctx, [Binding] env, Str name): Str -> {
 	return "%t${t}"
 }
 
-# Emit a field read `base.field`: load the word at the record's base + the field's
-# offset. `base` names a record local whose slot holds the record's base pointer.
+# Emit `base.field`. If `base` is a union type name, this is a tag-only union
+# construction — the member's tag, an inline word literal. Otherwise it is a record
+# field read: load the word at the record's base + the field's offset (`base` names
+# a record local whose slot holds the base pointer).
 const emit_field = (*Emit ctx, [Binding] env, Str base, Str field): Str -> {
+	if find_union(ctx.unions, base) >= 0 then {
+		const Iarch tag = member_tag(ctx.unions, base, field)
+		return "${tag}"
+	}
 	const Iarch idx = lookup_index(env, base)
 	const Iarch slot = env[idx].slot
 	const Str rt = env[idx].rec_type
@@ -316,12 +344,54 @@ const emit_call = (*Emit ctx, Call cl, [Binding] env): Str -> {
 	return "%t${rt}"
 }
 
+# Emit a `match` on a tag-only union. Evaluate the scrutinee to its tag word, then a
+# compare-chain: each member arm tests the tag and, on a hit, evaluates its body into
+# the result slot and jumps to the end; the LAST arm (a `_` wildcard, or — for an
+# exhaustive match — the final member) is the unconditional else. The result merges
+# through a stack slot, like `if`.
+const emit_match = (*Emit ctx, MatchExpr me, [Binding] env): Str -> {
+	const Str s = emit_expr(me.scrut, ctx, env)
+	const Iarch slot = ctx.next
+	ctx.next = ctx.next + 1
+	const Iarch lid = ctx.label
+	ctx.label = ctx.label + 1
+	write_str(ctx.fd, "\t%t${slot} =l alloc4 4\n")
+	const Iarch na = Iarch(me.arms.len)
+	let Iarch i = 0
+	loop {
+		if i >= na then break
+		if i == na - 1 then {
+			const Str v = emit_expr(me.arms[i].body, ctx, env)
+			write_str(ctx.fd, "\tstorew ${v}, %t${slot}\n")
+			write_str(ctx.fd, "\tjmp @mend${lid}\n")
+		} else {
+			const Iarch tag = member_tag(ctx.unions, me.arms[i].type_name, me.arms[i].member)
+			const Iarch c = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${c} =w ceqw ${s}, ${tag}\n")
+			write_str(ctx.fd, "\tjnz %t${c}, @marm${lid}_${i}, @mnext${lid}_${i}\n")
+			write_str(ctx.fd, "@marm${lid}_${i}\n")
+			const Str v = emit_expr(me.arms[i].body, ctx, env)
+			write_str(ctx.fd, "\tstorew ${v}, %t${slot}\n")
+			write_str(ctx.fd, "\tjmp @mend${lid}\n")
+			write_str(ctx.fd, "@mnext${lid}_${i}\n")
+		}
+		i = i + 1
+	}
+	write_str(ctx.fd, "@mend${lid}\n")
+	const Iarch rt = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${rt} =w loadw %t${slot}\n")
+	return "%t${rt}"
+}
+
 const emit_expr = (Expr e, *Emit ctx, [Binding] env): Str -> match e {
 	Expr.Lit(v) -> "${v}",
 	Expr.BoolLit(b) -> if b then "1" else "0",
 	Expr.Var(name) -> emit_var(ctx, env, name),
 	Expr.Record(rl) -> emit_record_val(ctx, rl, env),
 	Expr.Field(base, f) -> emit_field(ctx, env, base, f),
+	Expr.Match(me) -> emit_match(ctx, me, env),
 	Expr.Neg(x) -> emit_unop(ctx, "sub 0, ", x, "", env),
 	Expr.Not(x) -> emit_unop(ctx, "ceqw ", x, ", 0", env),
 	Expr.BitNot(x) -> emit_unop(ctx, "xor ", x, ", -1", env),
@@ -512,7 +582,7 @@ pub const emit_program = (Program prog, Uarch qbe_fd, Uarch asm_fd): Iarch -> {
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(prog.funcs.len) then break
-		let Emit ctx = Emit({ fd: qbe_fd, next: 0, label: 0, funcs: prog.funcs, recs: prog.recs })
+		let Emit ctx = Emit({ fd: qbe_fd, next: 0, label: 0, funcs: prog.funcs, recs: prog.recs, unions: prog.unions })
 		emit_func(&ctx, prog.funcs[i], i)
 		i = i + 1
 	}

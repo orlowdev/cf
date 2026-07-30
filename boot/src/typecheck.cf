@@ -16,29 +16,32 @@
 # The emitter runs only on programs this phase accepts.
 
 import "io" as { die }
-import "ast" as { Expr, Stmt, Param, Func, Call, Ty, FieldInit, RecLit, RecDecl, Program }
+import "ast" as { Expr, Stmt, Param, Func, Call, Ty, FieldInit, RecLit, RecDecl, UnionDecl, MatchArm, MatchExpr, Program }
 
 # A name in scope during checking: its type and whether it is reassignable (`let`).
 data VarTy = { Str name, Ty ty, Bool mutable }
 
 # The whole-program context threaded through typing: the functions (a call resolves
-# its callee here) and the record declarations (a data literal / field read here).
-data Ctx = { [Func] funcs, [RecDecl] recs }
+# its callee here), the record declarations (a data literal / field read), and the
+# union declarations (a `Type.member` construction / a `match`).
+data Ctx = { [Func] funcs, [RecDecl] recs, [UnionDecl] unions }
 
 # --- small helpers --------------------------------------------------------------------
 
 const is_tint = (Ty t): Bool -> match t { Ty.TInt -> true, _ -> false }
 const is_tbool = (Ty t): Bool -> match t { Ty.TBool -> true, _ -> false }
 
-# The record type name of a type, or "" if it is not a record.
+# The record / union type name of a type, or "" if it is neither.
 const rec_of = (Ty t): Str -> match t { Ty.TRec(n) -> n, _ -> "" }
+const union_of = (Ty t): Str -> match t { Ty.TUnion(n) -> n, _ -> "" }
 
-# Structural equality of two types (records are equal iff same declaration name).
+# Structural equality of two types (records/unions are equal iff same declaration name).
 const ty_eq = (Ty a, Ty b): Bool -> match a {
 	Ty.TInt -> is_tint(b),
 	Ty.TBool -> is_tbool(b),
 	Ty.TPtr -> match b { Ty.TPtr -> true, _ -> false },
-	Ty.TRec(an) -> str_eq(an, rec_of(b))
+	Ty.TRec(an) -> str_eq(an, rec_of(b)),
+	Ty.TUnion(an) -> str_eq(an, union_of(b))
 }
 
 # Byte-wise `Str` equality (name lookup).
@@ -73,11 +76,22 @@ const find_rec = ([RecDecl] recs, Str name): Iarch -> {
 	return 0 - 1
 }
 
+const find_union = ([UnionDecl] unions, Str name): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(unions.len) then break
+		if str_eq(unions[i].name, name) then return i
+		i = i + 1
+	}
+	return 0 - 1
+}
+
 # Resolve a parameter's declared type to a `Ty`: an opaque pointer, a declared
-# record (`TRec`), a `Bool`, or an integer.
-const param_ty = (Param p, [RecDecl] recs): Ty -> {
+# record (`TRec`) or union (`TUnion`), a `Bool`, or an integer.
+const param_ty = (Param p, [RecDecl] recs, [UnionDecl] unions): Ty -> {
 	if p.is_ptr then return Ty.TPtr
 	if find_rec(recs, p.type_name) >= 0 then return Ty.TRec(p.type_name)
+	if find_union(unions, p.type_name) >= 0 then return Ty.TUnion(p.type_name)
 	if str_eq(p.type_name, "Bool") then return Ty.TBool
 	return Ty.TInt
 }
@@ -174,7 +188,7 @@ const call_type = (Call cl, [VarTy] env, Ctx ctx): Ty -> {
 	loop {
 		if i >= na then break
 		const Ty at = type_of(cl.args[i], env, ctx)
-		const Ty pt = param_ty(ctx.funcs[fidx].params[i], ctx.recs)
+		const Ty pt = param_ty(ctx.funcs[fidx].params[i], ctx.recs, ctx.unions)
 		if !ty_eq(at, pt) then die("cf0: type: a call argument's type does not match the parameter\n")
 		i = i + 1
 	}
@@ -205,8 +219,15 @@ const record_type = (RecLit rl, [VarTy] env, Ctx ctx): Ty -> {
 	return Ty.TRec(rl.type_name)
 }
 
-# `base.field` — `base` must name a record local, and `field` must be one it declares.
+# `base.field` — either a tag-only union construction (`base` is a union type name,
+# `field` a member → a `TUnion` value) or a record field read (`base` is a record
+# local, `field` a declared field → an `Int`).
 const field_type = (Str base, Str field, [VarTy] env, Ctx ctx): Ty -> {
+	const Iarch ui = find_union(ctx.unions, base)
+	if ui >= 0 then {
+		if field_index(ctx.unions[ui].members, field) < 0 then die("cf0: type: `${base}` has no such union member\n")
+		return Ty.TUnion(base)
+	}
 	const Iarch vi = env_index(env, base)
 	if vi < 0 then die("cf0: type: reference to an undeclared name\n")
 	const Str tn = rec_of(env[vi].ty)
@@ -217,12 +238,53 @@ const field_type = (Str base, Str field, [VarTy] env, Ctx ctx): Ty -> {
 	return Ty.TInt
 }
 
+# `match scrut { arms }` — the scrutinee must be a union; every arm must name that
+# union and one of its members (no member twice), no arm may follow a `_` wildcard,
+# every member must be covered (unless a `_` is present), and all arm bodies must
+# share a type — which is the match's type.
+const match_type = (MatchExpr me, [VarTy] env, Ctx ctx): Ty -> {
+	const Str un = union_of(type_of(me.scrut, env, ctx))
+	if str_eq(un, "") then die("cf0: type: a match scrutinee must be a union\n")
+	const Iarch ui = find_union(ctx.unions, un)
+	const Iarch na = Iarch(me.arms.len)
+	if na == 0 then die("cf0: type: a match needs at least one arm\n")
+	const Ty rty = type_of(me.arms[0].body, env, ctx)
+	let [Iarch] covered = []
+	let Bool wild_seen = false
+	let Iarch i = 0
+	loop {
+		if i >= na then break
+		if wild_seen then die("cf0: type: no match arm may follow a `_` wildcard\n")
+		if me.arms[i].is_wild then {
+			wild_seen = true
+		} else {
+			if !str_eq(me.arms[i].type_name, un) then die("cf0: type: a match arm must name the scrutinee's union\n")
+			const Iarch mi = field_index(ctx.unions[ui].members, me.arms[i].member)
+			if mi < 0 then die("cf0: type: a match arm names a nonexistent union member\n")
+			let Iarch d = 0
+			loop {
+				if d >= Iarch(covered.len) then break
+				if covered[d] == mi then die("cf0: type: a union member is matched twice\n")
+				d = d + 1
+			}
+			covered = [...covered, mi]
+		}
+		if !ty_eq(type_of(me.arms[i].body, env, ctx), rty) then die("cf0: type: all match arms must have the same type\n")
+		i = i + 1
+	}
+	if !wild_seen then {
+		if Iarch(covered.len) != Iarch(ctx.unions[ui].members.len) then die("cf0: type: a match must cover every union member or carry a `_`\n")
+	}
+	return rty
+}
+
 const type_of = (Expr e, [VarTy] env, Ctx ctx): Ty -> match e {
 	Expr.Lit(v) -> lit_type(v),
 	Expr.BoolLit(b) -> Ty.TBool,
 	Expr.Var(name) -> var_type(env, name),
 	Expr.Record(rl) -> record_type(rl, env, ctx),
 	Expr.Field(base, f) -> field_type(base, f, env, ctx),
+	Expr.Match(me) -> match_type(me, env, ctx),
 	Expr.Neg(x) -> int_unop(x, env, ctx),
 	Expr.BitNot(x) -> int_unop(x, env, ctx),
 	Expr.Not(x) -> not_op(x, env, ctx),
@@ -295,7 +357,7 @@ const check_func = (Func fn, Ctx ctx): Iarch -> {
 	let Iarch pi = 0
 	loop {
 		if pi >= Iarch(fn.params.len) then break
-		const Ty pty = param_ty(fn.params[pi], ctx.recs)
+		const Ty pty = param_ty(fn.params[pi], ctx.recs, ctx.unions)
 		env = [...env, VarTy({ name: fn.params[pi].name, ty: pty, mutable: false })]
 		pi = pi + 1
 	}
@@ -393,7 +455,7 @@ const check_whole = (Program prog): Iarch -> {
 # authority for all semantic validation; the emitter does no re-checking.
 pub const check_program = (Program prog): Iarch -> {
 	check_whole(prog)
-	let Ctx ctx = Ctx({ funcs: prog.funcs, recs: prog.recs })
+	let Ctx ctx = Ctx({ funcs: prog.funcs, recs: prog.recs, unions: prog.unions })
 	let Iarch f = 0
 	loop {
 		if f >= Iarch(prog.funcs.len) then break

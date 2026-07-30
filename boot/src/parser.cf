@@ -10,7 +10,7 @@
 
 import "io" as { die }
 import "token" as { Token, TokKind, is_eof, is_ident, is_intlit, is_lparen, is_rparen, is_lbrace, is_rbrace, is_lbracket, is_rbracket, is_comma, is_colon, is_dot, is_eq, is_arrow, is_minus, is_plus, is_star, is_slash, is_percent, is_amp, is_pipe, is_caret, is_tilde, is_bang, is_shl, is_shr, is_eqeq, is_ne, is_lt, is_gt, is_le, is_ge, is_logand, is_logor }
-import "ast" as { Expr, Stmt, Param, Func, Call, Ty, FieldInit, RecLit, RecDecl, Program }
+import "ast" as { Expr, Stmt, Param, Func, Call, Ty, FieldInit, RecLit, RecDecl, UnionDecl, MatchArm, MatchExpr, Program }
 
 # The parse cursor: the token stream, the source (for keyword text), a position.
 pub data Parser = { [Token] toks, *[Uint8] src, Iarch pos }
@@ -236,8 +236,47 @@ const parse_call = (*Parser p, Str name): Expr -> {
 	return Expr.Call(Call({ callee: name, args: args }))
 }
 
+# One `match` arm: a wildcard `_ -> body`, or a member `Type.member -> body`.
+const parse_arm = (*Parser p): MatchArm -> {
+	if !is_ident(peek(p)) then die("cf0: parse: expected a match-arm pattern\n")
+	const Str first = cur_name(p)
+	p.pos = p.pos + 1
+	if is_dot(peek(p)) then {
+		p.pos = p.pos + 1
+		if !is_ident(peek(p)) then die("cf0: parse: expected a member name after `.`\n")
+		const Str member = cur_name(p)
+		p.pos = p.pos + 1
+		if !is_arrow(peek(p)) then die("cf0: parse: expected `->` in a match arm\n")
+		p.pos = p.pos + 1
+		return MatchArm({ is_wild: false, type_name: first, member: member, body: parse_expr(p) })
+	}
+	if !str_eq(first, "_") then die("cf0: parse: a match-arm pattern is `_` or `Type.member`\n")
+	if !is_arrow(peek(p)) then die("cf0: parse: expected `->` after `_`\n")
+	p.pos = p.pos + 1
+	return MatchArm({ is_wild: true, type_name: "", member: "", body: parse_expr(p) })
+}
+
+# `match <scrutinee> { arm, arm, … }` — dispatch on a union value's tag.
+const parse_match = (*Parser p): Expr -> {
+	p.pos = p.pos + 1 # `match`
+	const Expr scrut = parse_expr(p)
+	if !is_lbrace(peek(p)) then die("cf0: parse: expected `{` after a match scrutinee\n")
+	p.pos = p.pos + 1
+	let [MatchArm] arms = []
+	loop {
+		if is_rbrace(peek(p)) then break
+		arms = [...arms, parse_arm(p)]
+		if !is_comma(peek(p)) then break
+		p.pos = p.pos + 1
+	}
+	if !is_rbrace(peek(p)) then die("cf0: parse: expected `}` to close a match\n")
+	p.pos = p.pos + 1
+	return Expr.Match(MatchExpr({ scrut: scrut, arms: arms }))
+}
+
 const parse_primary = (*Parser p): Expr -> {
 	if kw(p, "if") then return parse_if(p)
+	if kw(p, "match") then return parse_match(p)
 	# `true`/`false` — Bool literals. Typed `Bool` by the typecheck phase; lowered to
 	# the 1/0 words a Bool is represented by at emit.
 	if kw(p, "true") then {
@@ -547,18 +586,46 @@ const parse_data = (*Parser p): RecDecl -> {
 	return RecDecl({ name: name, fields: fields })
 }
 
-# The whole program: a sequence of top-level `data` declarations and functions, in
-# any order. One function must be `pub const main` (checked at typecheck time).
+# `union Name = { A, B, C }` — a tag-only union declaration (at least one member; a
+# trailing comma and interior newlines are fine). Payload members are a later brick.
+const parse_union = (*Parser p): UnionDecl -> {
+	p.pos = p.pos + 1 # `union`
+	if !is_ident(peek(p)) then die("cf0: parse: expected a union type name\n")
+	const Str name = cur_name(p)
+	p.pos = p.pos + 1
+	if !is_eq(peek(p)) then die("cf0: parse: expected `=` in a union declaration\n")
+	p.pos = p.pos + 1
+	if !is_lbrace(peek(p)) then die("cf0: parse: expected `{` in a union declaration\n")
+	p.pos = p.pos + 1
+	let [Str] members = []
+	loop {
+		if is_rbrace(peek(p)) then break
+		if !is_ident(peek(p)) then die("cf0: parse: expected a member name\n")
+		members = [...members, cur_name(p)]
+		p.pos = p.pos + 1
+		if !is_comma(peek(p)) then break
+		p.pos = p.pos + 1
+	}
+	if !is_rbrace(peek(p)) then die("cf0: parse: expected `}` in a union declaration\n")
+	p.pos = p.pos + 1
+	return UnionDecl({ name: name, members: members })
+}
+
+# The whole program: a sequence of top-level `data`/`union` declarations and
+# functions, in any order. One function must be `pub const main` (checked later).
 pub const parse_program = (*Parser p): Program -> {
 	let [RecDecl] recs = []
+	let [UnionDecl] unions = []
 	let [Func] funcs = []
 	loop {
 		if is_eof(peek(p)) then break
 		if kw(p, "data") then {
 			recs = [...recs, parse_data(p)]
+		} else if kw(p, "union") then {
+			unions = [...unions, parse_union(p)]
 		} else {
 			funcs = [...funcs, parse_func(p)]
 		}
 	}
-	return Program({ recs: recs, funcs: funcs })
+	return Program({ recs: recs, unions: unions, funcs: funcs })
 }
