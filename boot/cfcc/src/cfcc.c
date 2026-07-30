@@ -934,6 +934,10 @@ typedef enum {
 	EX_DEFER, /* defer <call> — a tapping expression: schedules lhs (an EX_CALL) at scope
 	           * exit (LIFO) and evaluates to the call's tapped argument (its last positional
 	           * arg). `x |> defer f` builds this too (the pipe fills the tapped slot). */
+	EX_BLOCK, /* { statements... [<- v] } — a block expression (an `if`/`match` branch body, or a
+	           * standalone statement-position `match`'s arm). `loop_body` holds the leading
+	           * statements; `els` the `<- v` yield expression (NULL for a value-less block). Emits
+	           * straight-line (no merge slot): the statements run, then `els` is the block's value. */
 	/* unary (lhs) */
 	EX_NEG,   /* - negate */
 	EX_BNOT,  /* ~ bitwise not */
@@ -1096,6 +1100,10 @@ struct Expr {
 	 * Str-equality tests (length then bytes) over the `Str` scrutinee. Set in typecheck; emit
 	 * picks the string-compare ladder. Mutually exclusive with `uni`/`numswitch`/`int_match`. */
 	int str_match;
+	/* EX_MATCH: set by parse_stmt when the match heads a STATEMENT (a standalone `match x { … }`
+	 * run for its arms' side effects, its value discarded). Its arms may be value-less blocks; the
+	 * arms need not unify to a type (typecheck skips the unify gate) and emit stores a dummy word. */
+	int is_stmt_match;
 	/* EX_VAR: set by typecheck when the name resolves to a match-arm payload binding
 	 * (not a param/local) — emit reads its value from the `%pb<bind_id>` storage temp. */
 	int is_bind;
@@ -1216,6 +1224,19 @@ static int stmt_is_terminal(const Stmt *s) {
 		return tt && stmt_is_terminal(tt) && ee && stmt_is_terminal(ee);
 	}
 	return 0;
+}
+
+/* True if a match arm's body emits its OWN terminator (its last statement is a `return`/bare
+ * `break`/`continue`), so the enclosing match must not append a `store %m; jmp @mend` after it —
+ * that would follow a QBE block terminator. Only a value-less block can be terminal; a value/
+ * expression arm always falls through carrying its value. */
+static int arm_body_terminal(const Expr *body) {
+	if (body->kind != EX_BLOCK || body->els)
+		return 0;
+	const Stmt *t = body->loop_body;
+	while (t && t->next)
+		t = t->next;
+	return t && stmt_is_terminal(t);
 }
 
 static Stmt *new_stmt(StmtKind kind) {
@@ -3650,14 +3671,69 @@ static Expr *parse_if(Parser *p, Func *fn) {
 	return e;
 }
 
+static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return); /* forward: EX_BLOCK body */
+
+/* Parse a block expression `{ statement* [ <- value ] }` used as an if/match branch body
+ * (ebnf § blocks): the leading statements go in `loop_body`, and a trailing `<- v` becomes
+ * the block's yield `els` (NULL for a value-less block — a statement-position match arm run
+ * for effect). A block opens its own scope, exactly like a statement sequence. Unlike a
+ * loop's `<- v` (a break-with-value), a block yield needs no loop context; a conditionally-
+ * yielded block (a nested `if … <- v`) is not supported — a block yields via one trailing
+ * `<- v`. */
+static Expr *parse_block_expr(Parser *p, Func *fn) {
+	Token *open = peek(p);
+	expect(p, TK_LBRACE, "expected `{` to open a block");
+	Expr *e = new_expr(EX_BLOCK);
+	e->line = open->line;
+	if (fn->sc_depth >= (int)(sizeof fn->sc_mark / sizeof fn->sc_mark[0]))
+		die(open->line, "blocks nested too deep");
+	fn->sc_mark[fn->sc_depth++] = fn->nlocals;
+	skip_newlines(p);
+	Stmt *head = NULL, *tail = NULL;
+	while (peek(p)->kind != TK_RBRACE) {
+		if (peek(p)->kind == TK_EOF)
+			die(peek(p)->line, "unterminated block (expected `}`)");
+		if (peek(p)->kind == TK_YIELD) { /* `<- v` — the block's yield value; must be last */
+			advance(p);
+			e->els = parse_expr(p, fn);
+			skip_newlines(p);
+			break;
+		}
+		if (tail && stmt_is_terminal(tail))
+			die(peek(p)->line, "unreachable statement after a terminating statement");
+		int saw_return = 0;
+		Stmt *s = parse_stmt(p, fn, &saw_return);
+		if (tail)
+			tail->next = s;
+		else
+			head = s;
+		tail = s;
+		while (tail->next) /* a destructuring desugars to a chain */
+			tail = tail->next;
+		if (peek(p)->kind != TK_RBRACE && peek(p)->kind != TK_YIELD) {
+			if (peek(p)->kind == TK_EOF)
+				die(peek(p)->line, "unterminated block (expected `}`)");
+			expect(p, TK_NEWLINE, "expected a newline (one statement per line)");
+			skip_newlines(p);
+		}
+	}
+	expect(p, TK_RBRACE, "expected `}` to close the block");
+	int mark = fn->sc_mark[--fn->sc_depth]; /* close the block scope (free names for siblings) */
+	for (int i = mark; i < fn->nlocals; i++)
+		fn->locals[i].closed = 1;
+	e->loop_body = head;
+	return e;
+}
+
 /* match_expr = "match" expr "{" match_arm { "," match_arm } [ "," ] "}"
- * match_arm  = ( "_" | or_pattern ) "->" expr
+ * match_arm  = ( "_" | or_pattern ) "->" branch      branch = expr | block
  * or_pattern = member { "|" member }      member = Union "." Member
- * An expression, like `if` (arms yield values that unify). M1 arms are tag-only: a `_`
- * wildcard, or an or-pattern of one-or-more members of the scrutinee's union, each
- * qualified (`Color.Red`) — no payload sub-pattern, no literal/binding patterns yet.
- * Interior newlines allowed so arms may span lines. Exhaustiveness + arm typing are
- * checked in the typecheck pass. */
+ * An expression, like `if` (arms yield values that unify) — or a STATEMENT when it heads a
+ * standalone `match` (parse_stmt sets is_stmt_match; its value is discarded, so arms may be
+ * value-less blocks). An arm body is a single expression or a `{ … <- v }` block. M1 arms are
+ * a `_` wildcard, or an or-pattern of one-or-more members of the scrutinee's union, each
+ * qualified (`Color.Red`). Interior newlines allowed so arms may span lines. Exhaustiveness +
+ * arm typing are checked in the typecheck pass. */
 static Expr *parse_match(Parser *p, Func *fn) {
 	Token *kw = peek(p);
 	advance(p); /* `match` */
@@ -3854,7 +3930,7 @@ static Expr *parse_match(Parser *p, Func *fn) {
 			fn->abinds[fn->nabinds].id = 0; /* placeholder; typecheck assigns the real id */
 			fn->nabinds++;
 		}
-		arm.body = parse_expr(p, fn);
+		arm.body = peek(p)->kind == TK_LBRACE ? parse_block_expr(p, fn) : parse_expr(p, fn);
 		fn->nabinds = saved_pb;
 		if (e->narms == cap) {
 			cap = cap ? cap * 2 : 4;
@@ -4772,6 +4848,19 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 		Stmt *s = new_stmt(ST_YIELD);
 		s->line = t->line;
 		s->yval = parse_expr(p, fn);
+		return s;
+	}
+	if (is_ident(t, "match")) {
+		/* A STATEMENT-position `match` — a standalone `match x { … }` run for its arms' side
+		 * effects, its value discarded (wrapped in an ST_EXPR). is_stmt_match tells typecheck to
+		 * skip the arm-unify gate and allow value-less block arms (`Member -> { … }`), and tells
+		 * emit to store a dummy word into the merge slot. The value-producing form stays an
+		 * EXPRESSION (EX_MATCH) on a binding/return RHS. */
+		Expr *m = parse_match(p, fn);
+		m->is_stmt_match = 1;
+		Stmt *s = new_stmt(ST_EXPR);
+		s->line = t->line;
+		s->expr = m;
 		return s;
 	}
 	if (is_ident(t, "if")) {
@@ -7850,6 +7939,8 @@ static int is_fresh_producer(const Expr *e) {
 			if (!is_fresh_producer(e->arms[i].body))
 				return 0;
 		return e->narms > 0;
+	case EX_BLOCK: /* a block yields via `<- v` — its yield must itself be fresh */
+		return e->els && is_fresh_producer(e->els);
 	default:
 		return 0;
 	}
@@ -7878,6 +7969,8 @@ static int is_mergeable_arm(const Expr *e) {
 			if (!is_mergeable_arm(e->arms[i].body))
 				return 0;
 		return e->narms > 0;
+	case EX_BLOCK: /* a block merges via its `<- v` yield */
+		return e->els && is_mergeable_arm(e->els);
 	default:
 		return 0;
 	}
@@ -8568,23 +8661,31 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 					for (int k = 0; k < a->nalts; k++)
 						covered[a->tags[k]] = 1;
 			}
-			/* Arm bodies unify to one type — a mergeable scalar, or an aggregate (boxed union/
-			 * record/tuple `l` pointer) merged through the `%m` slot like a scalar. An aggregate
-			 * arm must build a FRESH value (a call/construction), so the merged pointer never
-			 * aliases a mutable aggregate (§6 survivability). */
+			/* Typecheck the arm body (a block's inner statements/bindings, or an expression). A
+			 * STATEMENT-position match discards its value, so its arms need not unify or be
+			 * mergeable — a value-less block arm (`Member -> { … }`) is fine. A value-position
+			 * match's arms unify to one type: a mergeable scalar, or an aggregate (boxed union/
+			 * record/tuple `l` pointer) merged through the `%m` slot; an aggregate arm must build a
+			 * FRESH value so the merged pointer never aliases a mutable aggregate (§6). A value-less
+			 * block is rejected there — a block used as a value must yield with `<- v`. */
 			Type bt = typeof_expr(prog, fn, a->body);
-			if (!is_mergeable_scalar(bt)) {
-				if (!is_aggregate_pointer(bt))
-					die(a->line, "a match arm yields a scalar or aggregate value");
-				if (!is_mergeable_arm(a->body))
-					die(a->line, "an aggregate-valued match arm yields a value or a bound payload, not a "
-					             "temporary sub-expression");
-			}
-			if (!have_rt) {
-				rt = bt;
-				have_rt = 1;
-			} else if (!types_equal(bt, rt)) {
-				die(a->line, "match arms must all yield the same type");
+			if (!e->is_stmt_match) {
+				if (a->body->kind == EX_BLOCK && !a->body->els)
+					die(a->line, "a block match arm used as a value must yield with `<- v` "
+					             "(a value-less block is only a statement-position match arm)");
+				if (!is_mergeable_scalar(bt)) {
+					if (!is_aggregate_pointer(bt))
+						die(a->line, "a match arm yields a scalar or aggregate value");
+					if (!is_mergeable_arm(a->body))
+						die(a->line, "an aggregate-valued match arm yields a value or a bound payload, not a "
+						             "temporary sub-expression");
+				}
+				if (!have_rt) {
+					rt = bt;
+					have_rt = 1;
+				} else if (!types_equal(bt, rt)) {
+					die(a->line, "match arms must all yield the same type");
+				}
 			}
 			fn->nabinds = saved_abinds; /* pop this arm's bindings */
 		}
@@ -8658,6 +8759,14 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 			die(e->line, "a value-yielding `loop` must reach a `<- v` (add a yield, or use a "
 			             "statement `loop` if no value is needed)");
 		return loop_yield_type(prog, fn, e->loop_body);
+	case EX_BLOCK:
+		/* A block expression `{ stmts… [<- v] }` (an if/match branch body): check its leading
+		 * statements (their own scope), then its type is the `<- v` yield's type, or `Int` for a
+		 * value-less block (a statement-position match arm — its value is discarded). */
+		check_stmts(prog, fn, e->loop_body);
+		if (e->els)
+			return typeof_expr(prog, fn, e->els);
+		return (Type){TY_INT, NULL, NULL, 0, NULL};
 	case EX_DEFER: {
 		/* A `defer` tap: type its call (validates callee/args, caches the call's and
 		 * each arg's rtype for emit), then yield the *tapped argument* — the call's last
@@ -9670,11 +9779,12 @@ static void check_stmts(Program *prog, Func *fn, Stmt *list) {
 			typeof_expr(prog, fn, s->yval);
 			break;
 		case ST_EXPR:
-			/* A call or a `defer` tap evaluated for effect: type it (validates the
-			 * callee/args and, for a defer, schedules it); the tapped/result value,
-			 * whatever its type, is discarded. */
-			if (s->expr->kind != EX_CALL && s->expr->kind != EX_DEFER)
-				die(s->line, "an expression statement must be a call or a `defer`");
+			/* A call, a `defer` tap, or a statement-position `match` evaluated for effect: type it
+			 * (validates callee/args, schedules a defer, or checks the match's arms/exhaustiveness);
+			 * the result value, whatever its type, is discarded. */
+			if (s->expr->kind != EX_CALL && s->expr->kind != EX_DEFER &&
+			    !(s->expr->kind == EX_MATCH && s->expr->is_stmt_match))
+				die(s->line, "an expression statement must be a call, a `defer`, or a `match`");
 			typeof_expr(prog, fn, s->expr);
 			break;
 		case ST_DEFER:
@@ -10749,8 +10859,10 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 						fprintf(out, "@marm%d\n", hit);
 						char b[96];
 						emit_expr(out, a->body, ex, b, sizeof b);
-						fprintf(out, "\tstore%c %s, %%m%d\n", mq, b, e->slot);
-						fprintf(out, "\tjmp @mend%d\n", id);
+						if (!arm_body_terminal(a->body)) {
+							fprintf(out, "\tstore%c %s, %%m%d\n", mq, e->is_stmt_match ? zero_lit(mq) : b, e->slot);
+							fprintf(out, "\tjmp @mend%d\n", id);
+						}
 						fprintf(out, "@mnext%d\n", nxt);
 					}
 				}
@@ -10758,9 +10870,11 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 			{ /* the mandatory `_` default */
 				char b[96];
 				emit_expr(out, e->arms[wild].body, ex, b, sizeof b);
-				fprintf(out, "\tstore%c %s, %%m%d\n", mq, b, e->slot);
+				if (!arm_body_terminal(e->arms[wild].body)) {
+					fprintf(out, "\tstore%c %s, %%m%d\n", mq, e->is_stmt_match ? zero_lit(mq) : b, e->slot);
+					fprintf(out, "\tjmp @mend%d\n", id);
+				}
 			}
-			fprintf(out, "\tjmp @mend%d\n", id);
 			fprintf(out, "@mend%d\n", id);
 			int r = ex->tmp++;
 			fprintf(out, "\t%%t%d =%c load%c %%m%d\n", r, mq, mq, e->slot);
@@ -10800,8 +10914,10 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 						fprintf(out, "@marm%d\n", hit);
 						char b[96];
 						emit_expr(out, a->body, ex, b, sizeof b);
-						fprintf(out, "\tstore%c %s, %%m%d\n", mq, b, e->slot);
-						fprintf(out, "\tjmp @mend%d\n", id);
+						if (!arm_body_terminal(a->body)) {
+							fprintf(out, "\tstore%c %s, %%m%d\n", mq, e->is_stmt_match ? zero_lit(mq) : b, e->slot);
+							fprintf(out, "\tjmp @mend%d\n", id);
+						}
 						fprintf(out, "@mnext%d\n", nxt);
 					}
 				}
@@ -10809,9 +10925,11 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 			{ /* the mandatory `_` default */
 				char b[96];
 				emit_expr(out, e->arms[wild].body, ex, b, sizeof b);
-				fprintf(out, "\tstore%c %s, %%m%d\n", mq, b, e->slot);
+				if (!arm_body_terminal(e->arms[wild].body)) {
+					fprintf(out, "\tstore%c %s, %%m%d\n", mq, e->is_stmt_match ? zero_lit(mq) : b, e->slot);
+					fprintf(out, "\tjmp @mend%d\n", id);
+				}
 			}
-			fprintf(out, "\tjmp @mend%d\n", id);
 			fprintf(out, "@mend%d\n", id);
 			int r = ex->tmp++;
 			fprintf(out, "\t%%t%d =%c load%c %%m%d\n", r, mq, mq, e->slot);
@@ -10894,8 +11012,13 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 					}
 					char b[96];
 					emit_expr(out, a->body, ex, b, sizeof b);
-					fprintf(out, "\tstore%c %s, %%m%d\n", mq, b, e->slot);
-					fprintf(out, "\tjmp @mend%d\n", id);
+					/* A terminal block arm already jumped/returned — don't append a store+jmp after
+					 * its QBE terminator. A statement-position match discards the value, so store a
+					 * dummy word (the arms may not share a width). */
+					if (!arm_body_terminal(a->body)) {
+						fprintf(out, "\tstore%c %s, %%m%d\n", mq, e->is_stmt_match ? zero_lit(mq) : b, e->slot);
+						fprintf(out, "\tjmp @mend%d\n", id);
+					}
 					fprintf(out, "@mnext%d\n", nxt); /* falls into the next arm, or the default */
 				}
 			}
@@ -10903,13 +11026,16 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		if (wild >= 0) {
 			char b[96];
 			emit_expr(out, e->arms[wild].body, ex, b, sizeof b);
-			fprintf(out, "\tstore%c %s, %%m%d\n", mq, b, e->slot);
+			if (!arm_body_terminal(e->arms[wild].body)) {
+				fprintf(out, "\tstore%c %s, %%m%d\n", mq, e->is_stmt_match ? zero_lit(mq) : b, e->slot);
+				fprintf(out, "\tjmp @mend%d\n", id);
+			}
 		} else {
 			/* Exhaustive: the fall-through is unreachable for a valid value; store a
 			 * defined (type-appropriate) zero so the block has a terminator either way. */
 			fprintf(out, "\tstore%c %s, %%m%d\n", mq, zero_lit(mq), e->slot);
+			fprintf(out, "\tjmp @mend%d\n", id);
 		}
-		fprintf(out, "\tjmp @mend%d\n", id);
 		fprintf(out, "@mend%d\n", id);
 		int r = ex->tmp++;
 		fprintf(out, "\t%%t%d =%c load%c %%m%d\n", r, mq, mq, e->slot);
@@ -10965,6 +11091,18 @@ static void emit_expr(FILE *out, Expr *e, Emit *ex, char *dst, size_t cap) {
 		char mq = qtype_of(e->rtype); /* the merged yield width (w/l/s/d) */
 		fprintf(out, "\t%%t%d =%c load%c %%m%d\n", r, mq, mq, e->slot);
 		snprintf(dst, cap, "%%t%d", r);
+		return;
+	}
+	case EX_BLOCK: {
+		/* A block expression: emit its statements straight-line (their side effects), then the
+		 * block's value is its `<- v` yield (`els`). A value-less block (a statement-position match
+		 * arm) has no value — yield a dummy word `0` (the enclosing merge/discard ignores it). No
+		 * merge slot: the block does not branch, so the yield temp flows straight out as `dst`. */
+		emit_stmts(out, e->loop_body, ex);
+		if (e->els)
+			emit_expr(out, e->els, ex, dst, cap);
+		else
+			snprintf(dst, cap, "0");
 		return;
 	}
 	case EX_AND:
