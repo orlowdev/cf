@@ -70,6 +70,14 @@ const find_rec = ([RecDecl] recs, Str name): Iarch -> {
 	return 0 - 1
 }
 
+# Is a dynamic-array element an aggregate that rides as an 8-byte pointer (a record or
+# a `Str`), rather than a word? Records and strings store `storel`/`loadl`; `Iarch`/""
+# store `storew`/`loadw`.
+const elem_is_agg = (*Emit ctx, Str elem): Bool -> {
+	if str_eq(elem, "Str") then return true
+	return find_rec(ctx.recs, elem) >= 0
+}
+
 # The byte offset of field `field` in record type `rt` — its declaration index × 4
 # (every field is a 4-byte word). The typecheck phase guarantees both resolve.
 const field_offset = ([RecDecl] recs, Str rt, Str field): Iarch -> {
@@ -675,7 +683,7 @@ const emit_array_lit = (*Emit ctx, ArrLit al, [Binding] env): Str -> {
 	} else {
 		# a record element is an 8-byte arena pointer (`storel`); a word element rides in
 		# the low half of its 8-byte slot (`storew`).
-		const Bool agg = find_rec(ctx.recs, al.elem_type) >= 0
+		const Bool agg = elem_is_agg(ctx, al.elem_type)
 		const Iarch bytes = n * 8
 		const Iarch data = ctx.next
 		ctx.next = ctx.next + 1
@@ -750,7 +758,10 @@ const emit_index_field = (*Emit ctx, [Binding] env, Str arr, Expr idx, Str field
 	const Iarch recp = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${recp} =l loadl %t${slot}\n")
-	const Iarch foff = field_offset(ctx.recs, env[ai].elem, field)
+	# a `[Str]` element's `.len` is the header's len word at +8; a record element's field
+	# rides at its declared offset.
+	let Iarch foff = 8
+	if !str_eq(env[ai].elem, "Str") then foff = field_offset(ctx.recs, env[ai].elem, field)
 	const Iarch faddr = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${faddr} =l add %t${recp}, ${foff}\n")
@@ -1034,7 +1045,7 @@ const emit_block = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 			# grows in place; a scalar reassignment stores into the existing slot.
 			const Iarch idx = lookup_index(env, stmt_name(s))
 			if str_eq(env[idx].rec_type, "$dyn") then {
-				const Bool agg = find_rec(ctx.recs, env[idx].elem) >= 0
+				const Bool agg = elem_is_agg(ctx, env[idx].elem)
 				emit_append_expr(ctx, env, env[idx].slot, stmt_expr(s), agg)
 			} else {
 				const Iarch slot = env[idx].slot
@@ -1126,7 +1137,7 @@ const emit_func = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 				const Iarch slot = ctx.next
 				ctx.next = ctx.next + 1
 				write_str(ctx.fd, "\t%t${slot} =l copy %p${pi}\n")
-				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: fn.params[pi].type_name, elem: "" })]
+				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: fn.params[pi].type_name, elem: fn.params[pi].elem })]
 			} else {
 				# a word parameter spills into a stack slot so it reads like a local.
 				const Iarch slot = ctx.next

@@ -10,7 +10,7 @@
 
 import "io" as { die }
 import "token" as { Token, TokKind, is_eof, is_ident, is_intlit, is_strlit, is_lparen, is_rparen, is_lbrace, is_rbrace, is_lbracket, is_rbracket, is_comma, is_colon, is_dot, is_ellipsis, is_eq, is_arrow, is_minus, is_plus, is_star, is_slash, is_percent, is_amp, is_pipe, is_caret, is_tilde, is_bang, is_shl, is_shr, is_eqeq, is_ne, is_lt, is_gt, is_le, is_ge, is_logand, is_logor }
-import "ast" as { Expr, Stmt, Param, Func, Call, Ty, FieldInit, RecLit, RecDecl, UnionMember, UnionDecl, UnionMkE, MatchArm, MatchExpr, ArrLit, StrData, Body, Program }
+import "ast" as { Expr, Stmt, Param, Func, Call, Ty, FieldInit, RecLit, RecDecl, UnionMember, UnionDecl, UnionMkE, MatchArm, MatchExpr, ArrLit, StrData, RetSig, Body, Program }
 
 # The parse cursor: the token stream, the source (for keyword text), a position.
 pub data Parser = { [Token] toks, *[Uint8] src, Iarch pos }
@@ -751,15 +751,16 @@ const parse_param = (*Parser p): Param -> {
 		if !is_ident(peek(p)) then die("cf0: parse: expected a parameter name\n")
 		const Str name = cur_name(p)
 		p.pos = p.pos + 1
-		return Param({ name: name, is_ptr: true, type_name: "" })
+		return Param({ name: name, is_ptr: true, type_name: "", elem: "" })
 	}
 	if is_lbracket(peek(p)) then {
-		# a bare `[Elem]` is a dynamic-array parameter (a `*[Elem]` is an opaque pointer)
-		parse_type(p)
+		# a bare `[Elem]` is a dynamic-array parameter (a `*[Elem]` is an opaque pointer);
+		# its element type is kept in `elem` so the callee can index/read it.
+		const Str elem = dyn_elem_of(parse_type(p))
 		if !is_ident(peek(p)) then die("cf0: parse: expected a parameter name\n")
 		const Str name = cur_name(p)
 		p.pos = p.pos + 1
-		return Param({ name: name, is_ptr: false, type_name: "$dyn" })
+		return Param({ name: name, is_ptr: false, type_name: "$dyn", elem: elem })
 	}
 	if !is_ident(peek(p)) then die("cf0: parse: expected a parameter type\n")
 	const Str type_name = cur_name(p)
@@ -767,7 +768,7 @@ const parse_param = (*Parser p): Param -> {
 	if !is_ident(peek(p)) then die("cf0: parse: expected a parameter name\n")
 	const Str name = cur_name(p)
 	p.pos = p.pos + 1
-	return Param({ name: name, is_ptr: false, type_name: type_name })
+	return Param({ name: name, is_ptr: false, type_name: type_name, elem: "" })
 }
 
 # The parenthesised parameter list; a repeated name is rejected. Any arity is
@@ -780,7 +781,7 @@ const parse_params = (*Parser p): [Param] -> {
 		if params_has(params, pm.name) then die("cf0: parse: duplicate parameter name\n")
 		# append a fresh record literal (an array element must be fresh, not the
 		# alias `pm`); the field values are read inline.
-		params = [...params, Param({ name: pm.name, is_ptr: pm.is_ptr, type_name: pm.type_name })]
+		params = [...params, Param({ name: pm.name, is_ptr: pm.is_ptr, type_name: pm.type_name, elem: pm.elem })]
 		if !is_comma(peek(p)) then break
 		p.pos = p.pos + 1
 	}
@@ -792,18 +793,19 @@ const parse_params = (*Parser p): [Param] -> {
 # The optional `: RetType` return annotation as a raw type NAME: `""` when absent
 # (an implicit `Int`, e.g. `main`), else the bare type-name identifier (resolved to a
 # `Ty` at typecheck). Pointer/array return types are a later brick.
-const parse_ret_name = (*Parser p): Str -> {
-	if !is_colon(peek(p)) then return ""
+const parse_ret_name = (*Parser p): RetSig -> {
+	if !is_colon(peek(p)) then return RetSig({ name: "", elem: "" })
 	p.pos = p.pos + 1
-	# a `[Elem]` return is a dynamic array; a bare identifier is a named type
+	# a `[Elem]` return is a dynamic array (its element kept in `elem`); a bare
+	# identifier is a named type
 	if is_lbracket(peek(p)) then {
-		parse_type(p)
-		return "$dyn"
+		const Str elem = dyn_elem_of(parse_type(p))
+		return RetSig({ name: "$dyn", elem: elem })
 	}
 	if !is_ident(peek(p)) then die("cf0: parse: expected a return type name after `:`\n")
 	const Str n = cur_name(p)
 	p.pos = p.pos + 1
-	return n
+	return RetSig({ name: n, elem: "" })
 }
 
 # One top-level function: `[pub] const NAME = (params)[: RetType] -> body`. The body
@@ -827,17 +829,17 @@ const parse_func = (*Parser p): Func -> {
 	const [Param] params = parse_params(p)
 	if !is_rparen(peek(p)) then die("cf0: parse: expected `)`\n")
 	p.pos = p.pos + 1
-	const Str ret_name = parse_ret_name(p)
+	const RetSig rs = parse_ret_name(p)
 	if !is_arrow(peek(p)) then die("cf0: parse: expected `->`\n")
 	p.pos = p.pos + 1
 	if is_lbrace(peek(p)) then {
 		p.pos = p.pos + 1
 		const [Stmt] body = parse_block(p)
-		return Func({ name: name, is_pub: is_pub, ret_name: ret_name, params: params, body: body })
+		return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: body })
 	}
 	const [Stmt] empty = []
 	const [Stmt] one = [...empty, Stmt.Return(parse_expr(p))]
-	return Func({ name: name, is_pub: is_pub, ret_name: ret_name, params: params, body: one })
+	return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: one })
 }
 
 # `data Name = { Iarch a, Iarch b }` — a record declaration (Iarch fields only, at
