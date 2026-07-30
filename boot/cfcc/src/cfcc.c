@@ -7632,14 +7632,14 @@ static void check_member_value(Program *prog, Func *fn, Expr *val, Type want, in
 	} else if (want.kind == TY_RECORD) {
 		if (at.kind != TY_RECORD || at.rec != want.rec)
 			die(line, "field/payload type mismatch (record type differs)");
-		/* A record field/payload must be a FRESH value. Only a record-returning call (or a
-		 * data literal) allocates one; a bare variable, a field access (`rec.p`), a match/if
-		 * result, etc. would alias existing MUTABLE record storage — memory_model §6 forbids
-		 * a second binding without an explicit `copy`. Allowlist the fresh producers rather
-		 * than blocklisting one form, so newly-reachable alias shapes stay closed. */
-		if (val->kind != EX_CALL && val->kind != EX_RECORD)
-			die(line, "a record field/payload must be a fresh value (a record-returning call), "
-			          "not an alias of existing storage (an aggregate copy needs an explicit copy — not in M0)");
+		/* A record field/element/payload value may ALIAS existing storage — a bare variable, a
+		 * field access (`rec.p`), or an array element — as well as a fresh call/literal. No
+		 * explicit copy: memory-SAFE in cfcc because the single bump arena never frees, so a
+		 * second pointer to an arena record can never dangle (owner ruling 2026-07-29 — the
+		 * memory_model §6 no-second-bind rule guards ownership/teardown in the FULL model, not
+		 * this throwaway tool). This un-workarounds cf0's `[...xs, rec]` appends, which had to
+		 * rebuild a fresh record literal reading the fields inline. ⚠ cf0/cf re-enforce §6 via
+		 * the real memory arc — a stored aggregate is rehomed/copied, never aliased. */
 	} else if (want.kind == TY_UNION) {
 		if (at.kind != TY_UNION || at.uni != want.uni)
 			die(line, "field/payload type mismatch (union type differs)");
@@ -8972,24 +8972,15 @@ static void resolve_record_expr_binding(Program *prog, Func *fn, Stmt *s) {
 	Type it = typeof_expr(prog, fn, s->expr); /* validates the call/defer, sets nargs, rtype */
 	if (it.kind != TY_RECORD || it.rec != d)
 		die(s->line, "initializer type does not match the record binding");
-	/* Only a record-returning call produces a fresh record in expression position; a bare
-	 * variable OR a field access (`rec.p`, now that a field may be a record) would alias
-	 * existing storage — an aggregate copy needs an explicit copy (memory_model §6). A
-	 * `defer` tap forwards its tapped argument unchanged, so it is fresh exactly when that
-	 * argument is (`of(N) |> defer destroy` binds the fresh arena, schedules its teardown).
-	 * (A data literal takes the resolve_record_binding path.)
-	 *   EXCEPTION — a record ARRAY ELEMENT `const R r = arr[i]`: the local aliases the
-	 * element's 8-byte arena pointer (a read-only borrow, no copy). Memory-SAFE here (the
-	 * single bump arena never frees, so a second pointer to an arena record can never
-	 * dangle); emitted by the generic aggregate-pointer adoption below. A vector of records
-	 * (token stream, symbol table) walked `for`-style needs to bind each element, so this
-	 * un-workarounds cf0's `const Seg sg = segs[i]`. ⚠ cf0/cf re-enforce §6 ownership via
-	 * the real memory arc once it lands; borrowing an element into a `const` is the M0
-	 * surface (owner ruling 2026-07-29 — §6 guards teardown, not this throwaway alias). */
-	if (!is_fresh_producer(s->expr) && s->expr->kind != EX_INDEX)
-		die(s->line, "a record binding's initializer must be a fresh record (a record-returning call, "
-		             "a `[…]`-array element, or a fresh-branch `if`/`match`); aliasing existing record "
-		             "storage needs an explicit copy — not in M0");
+	/* A record local's initializer may ALIAS existing storage — a bare variable, a field
+	 * access (`rec.p`), or an array element (`arr[i]`) — as well as a record-returning call
+	 * or fresh `if`/`match`. The local becomes a read-only borrow of the same arena pointer,
+	 * no copy. Memory-SAFE in cfcc (the single bump arena never frees; a second pointer to an
+	 * arena record can't dangle — owner ruling 2026-07-29); emitted by the generic aggregate-
+	 * pointer adoption below. This un-workarounds cf0's `const Seg sg = segs[i]` element
+	 * binds. The type is already checked above, so no freshness gate remains. ⚠ cf0/cf
+	 * re-enforce memory_model §6 via the real memory arc — a bound aggregate is rehomed/
+	 * copied, not aliased; borrowing into a `const` is the M0 genesis surface. */
 	set_local_rec(fn, s->name, d);
 }
 
