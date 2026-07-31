@@ -1014,6 +1014,101 @@ const emit_loop_body = (*Emit ctx, [Binding] env, [Stmt] body): Iarch -> {
 	return 0
 }
 
+# Emit a statement-position `if cond then <body>` guard: branch on the condition into a
+# `@then` block that runs the guarded statement, then fall through to `@gnext`. When the
+# guarded statement is itself terminal (`break`/`continue`/`return` writes its own jump)
+# the `@then` block already ends, so the `jmp @gnext` is omitted (QBE forbids an
+# instruction after a block terminator). A guard is conditional, so it never terminates
+# the enclosing block — it returns 0.
+const emit_guard = (*Emit ctx, [Binding] env, Expr cond, Stmt body): Iarch -> {
+	const Str cc = emit_expr(cond, ctx, env)
+	const Iarch gid = ctx.label
+	ctx.label = ctx.label + 1
+	write_str(ctx.fd, "\tjnz ${cc}, @then${gid}, @gnext${gid}\n")
+	write_str(ctx.fd, "@then${gid}\n")
+	const Iarch term = emit_simple_stmt(ctx, env, body)
+	if term == 0 then write_str(ctx.fd, "\tjmp @gnext${gid}\n")
+	write_str(ctx.fd, "@gnext${gid}\n")
+	return 0
+}
+
+# Emit one "simple" statement — a loop exit, an early return, an assignment, or a nested
+# `if` guard. It is the fall-through case of `emit_block` and the body of every guard, so
+# it reads the environment but never extends it (a binding/block statement is a block
+# concern handled directly in `emit_block`). Returns 1 if the statement terminates the
+# block (a `break`/`continue`/`return` writes its own QBE terminator), else 0.
+const emit_simple_stmt = (*Emit ctx, [Binding] env, Stmt s): Iarch -> {
+	let Iarch term = 0
+	match s {
+		Stmt.Break -> {
+			write_str(ctx.fd, "\tjmp @lend${ctx.cur_loop}\n")
+			term = 1
+		},
+		Stmt.Continue -> {
+			write_str(ctx.fd, "\tjmp @ltop${ctx.cur_loop}\n")
+			term = 1
+		},
+		Stmt.Return(e) -> {
+			const Str v = emit_expr(e, ctx, env)
+			write_str(ctx.fd, "\tret ${v}\n")
+			term = 1
+		},
+		Stmt.Assign(n, e) -> {
+			# `name = value` — a dynamic-array self-growth append `xs = [...xs, e]`
+			# grows in place; a scalar reassignment stores into the existing slot.
+			const Iarch idx = lookup_index(env, n)
+			if str_eq(env[idx].rec_type, "$dyn") then {
+				const Bool agg = elem_is_agg(ctx, env[idx].elem)
+				emit_append_expr(ctx, env, env[idx].slot, e, agg)
+			} else {
+				const Iarch slot = env[idx].slot
+				const Str v = emit_expr(e, ctx, env)
+				write_str(ctx.fd, "\tstorew ${v}, %t${slot}\n")
+			}
+		},
+		Stmt.FieldAssign(b, f, e) -> {
+			# `base.field = value` — store the value into the record's field in place.
+			# Evaluate the value first (it may read the record's current fields).
+			const Str v = emit_expr(e, ctx, env)
+			const Iarch idx = lookup_index(env, b)
+			const Iarch slot = env[idx].slot
+			const Str rt = env[idx].rec_type
+			const Iarch off = field_offset(ctx.recs, rt, f)
+			const Iarch addr = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${addr} =l add %t${slot}, ${off}\n")
+			write_str(ctx.fd, "\tstorew ${v}, %t${addr}\n")
+		},
+		Stmt.IndexAssign(a, ix, val) -> {
+			# `arr[idx] = val` — store the value at data + idx*8
+			const Iarch ai = lookup_index(env, a)
+			const Iarch hdr = env[ai].slot
+			const Str iv = emit_expr(ix, ctx, env)
+			const Str vv = emit_expr(val, ctx, env)
+			const Iarch data = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${data} =l loadl %t${hdr}\n")
+			const Iarch il = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${il} =l extuw ${iv}\n")
+			const Iarch off = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${off} =l mul %t${il}, 8\n")
+			const Iarch slot = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${slot} =l add %t${data}, %t${off}\n")
+			write_str(ctx.fd, "\tstorew ${vv}, %t${slot}\n")
+		},
+		Stmt.IfThen(c, body) -> {
+			emit_guard(ctx, env, c, body)
+		},
+		_ -> {
+			die("cf0: emit: unexpected guarded statement\n")
+		}
+	}
+	return term
+}
+
 # Emit a statement list, returning 1 if it ends terminally (a bare break/continue/
 # return), else 0 — so an enclosing loop knows whether to emit its back-edge.
 const emit_block = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
@@ -1032,28 +1127,7 @@ const emit_block = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 		const Stmt s = stmts[i]
 		match s {
 			Stmt.Loop(bd) -> { emit_loop_body(ctx, env, bd) },
-			Stmt.Break -> {
-				write_str(ctx.fd, "\tjmp @lend${ctx.cur_loop}\n")
-				terminal = 1
-			},
-			Stmt.Continue -> {
-				write_str(ctx.fd, "\tjmp @ltop${ctx.cur_loop}\n")
-				terminal = 1
-			},
-			Stmt.BreakIf(c) -> {
-				const Str cc = emit_expr(c, ctx, env)
-				const Iarch gid = ctx.label
-				ctx.label = ctx.label + 1
-				write_str(ctx.fd, "\tjnz ${cc}, @lend${ctx.cur_loop}, @g${gid}\n")
-				write_str(ctx.fd, "@g${gid}\n")
-			},
-			Stmt.ContinueIf(c) -> {
-				const Str cc = emit_expr(c, ctx, env)
-				const Iarch gid = ctx.label
-				ctx.label = ctx.label + 1
-				write_str(ctx.fd, "\tjnz ${cc}, @ltop${ctx.cur_loop}, @g${gid}\n")
-				write_str(ctx.fd, "@g${gid}\n")
-			},
+			Stmt.ForIn(fv, fa, fbd) -> { emit_for_body(ctx, env, fv, fa, fbd) },
 			Stmt.Let(n, m, e) -> {
 				# `const`/`let name = init`. A record initializer (`{…}`) allocates the record
 				# and binds the name to its base pointer; a scalar allocates a word slot,
@@ -1071,58 +1145,7 @@ const emit_block = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 					env = [...env, Binding({ name: n, slot: base, rec_type: rt, elem: init_elem(e) })]
 				}
 			},
-			Stmt.Assign(n, e) -> {
-				# `name = value` — a dynamic-array self-growth append `xs = [...xs, e]`
-				# grows in place; a scalar reassignment stores into the existing slot.
-				const Iarch idx = lookup_index(env, n)
-				if str_eq(env[idx].rec_type, "$dyn") then {
-					const Bool agg = elem_is_agg(ctx, env[idx].elem)
-					emit_append_expr(ctx, env, env[idx].slot, e, agg)
-				} else {
-					const Iarch slot = env[idx].slot
-					const Str v = emit_expr(e, ctx, env)
-					write_str(ctx.fd, "\tstorew ${v}, %t${slot}\n")
-				}
-			},
-			Stmt.FieldAssign(b, f, e) -> {
-				# `base.field = value` — store the value into the record's field in place.
-				# Evaluate the value first (it may read the record's current fields).
-				const Str v = emit_expr(e, ctx, env)
-				const Iarch idx = lookup_index(env, b)
-				const Iarch slot = env[idx].slot
-				const Str rt = env[idx].rec_type
-				const Iarch off = field_offset(ctx.recs, rt, f)
-				const Iarch addr = ctx.next
-				ctx.next = ctx.next + 1
-				write_str(ctx.fd, "\t%t${addr} =l add %t${slot}, ${off}\n")
-				write_str(ctx.fd, "\tstorew ${v}, %t${addr}\n")
-			},
-			Stmt.ForIn(fv, fa, fbd) -> { emit_for_body(ctx, env, fv, fa, fbd) },
-			Stmt.IndexAssign(a, ix, val) -> {
-				# `arr[idx] = val` — store the value at data + idx*8
-				const Iarch ai = lookup_index(env, a)
-				const Iarch hdr = env[ai].slot
-				const Str iv = emit_expr(ix, ctx, env)
-				const Str vv = emit_expr(val, ctx, env)
-				const Iarch data = ctx.next
-				ctx.next = ctx.next + 1
-				write_str(ctx.fd, "\t%t${data} =l loadl %t${hdr}\n")
-				const Iarch il = ctx.next
-				ctx.next = ctx.next + 1
-				write_str(ctx.fd, "\t%t${il} =l extuw ${iv}\n")
-				const Iarch off = ctx.next
-				ctx.next = ctx.next + 1
-				write_str(ctx.fd, "\t%t${off} =l mul %t${il}, 8\n")
-				const Iarch slot = ctx.next
-				ctx.next = ctx.next + 1
-				write_str(ctx.fd, "\t%t${slot} =l add %t${data}, %t${off}\n")
-				write_str(ctx.fd, "\tstorew ${vv}, %t${slot}\n")
-			},
-			Stmt.Return(e) -> {
-				const Str v = emit_expr(e, ctx, env)
-				write_str(ctx.fd, "\tret ${v}\n")
-				terminal = 1
-			},
+			_ -> { terminal = emit_simple_stmt(ctx, env, s) }
 		}
 		i = i + 1
 	}

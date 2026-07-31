@@ -586,12 +586,72 @@ const check_for_body = (Func fn, Str lv, Str arr, [Stmt] body, [VarTy] env, Ctx 
 # shadow an existing one; an `Assign` targets an existing mutable name and keeps its
 # type; every `Return` must match the function's declared return type; the body must
 # return.
+# Check a single "simple" statement — one that neither binds a name nor opens a block:
+# a loop exit, an early `return`, an assignment, or a statement-position `if` guard.
+# It is the body of every `IfThen` guard and the fall-through case of `check_stmts`.
+# Returns a reachability code: 2 = an unconditional `return`, 1 = `break`/`continue`,
+# 0 = falls through (an assignment, or a guard — the guarded statement is conditional,
+# so a guard never terminates the enclosing flow). A binding or block statement in a
+# guard body is rejected.
+const check_simple_stmt = (Func fn, Stmt s, [VarTy] env, Ctx ctx, Ty frt, Bool in_loop): Iarch -> {
+	let Iarch code = 0
+	match s {
+		Stmt.Break -> {
+			if !in_loop then die("cf0: type: `break` is only valid inside a loop\n")
+			code = 1
+		},
+		Stmt.Continue -> {
+			if !in_loop then die("cf0: type: `continue` is only valid inside a loop\n")
+			code = 1
+		},
+		Stmt.Return(e) -> {
+			const Ty rty = type_of(e, env, ctx)
+			if !ty_eq(rty, frt) then die("cf0: type: a returned value's type must match the function's return type\n")
+			code = 2
+		},
+		Stmt.Assign(n, e) -> {
+			const Iarch idx = env_index(env, n)
+			if idx < 0 then die("cf0: type: assignment to an undeclared name\n")
+			if !env[idx].mutable then die("cf0: type: cannot reassign a `const` binding or a parameter\n")
+			const Ty vty = type_of(e, env, ctx)
+			if !ty_eq(vty, env[idx].ty) then die("cf0: type: a reassignment must keep the binding's type\n")
+		},
+		Stmt.FieldAssign(b, f, e) -> {
+			const Iarch idx = env_index(env, b)
+			if idx < 0 then die("cf0: type: field assignment to an undeclared name\n")
+			if !env[idx].mutable then die("cf0: type: cannot mutate a `const` record's fields\n")
+			const Str tn = rec_of(env[idx].ty)
+			if str_eq(tn, "") then die("cf0: type: field assignment needs a record on the left\n")
+			const Iarch ri = find_rec(ctx.recs, tn)
+			if field_index(ctx.recs[ri].fields, f) < 0 then die("cf0: type: mutating a field the record does not declare\n")
+			if !is_tint(type_of(e, env, ctx)) then die("cf0: type: a field value must be an integer\n")
+		},
+		Stmt.IndexAssign(a, ix, val) -> {
+			const Iarch idx = env_index(env, a)
+			if idx < 0 then die("cf0: type: element assignment to an undeclared name\n")
+			if !env[idx].mutable then die("cf0: type: cannot write to a `const`/borrowed array\n")
+			if str_eq(dyn_of(env[idx].ty), "") then die("cf0: type: element assignment needs a dynamic array\n")
+			if !is_tint(type_of(ix, env, ctx)) then die("cf0: type: an array index must be an integer\n")
+			if !is_tint(type_of(val, env, ctx)) then die("cf0: type: an array element must be an integer\n")
+		},
+		Stmt.IfThen(c, body) -> {
+			if !is_tbool(type_of(c, env, ctx)) then die("cf0: type: an `if` condition must be a Bool (no truthiness)\n")
+			check_simple_stmt(fn, body, env, ctx, frt, in_loop)
+		},
+		_ -> {
+			die("cf0: type: a statement `if` may guard only a `return`, an assignment, or `break`/`continue`\n")
+		}
+	}
+	return code
+}
+
 # Check a statement list against a starting environment (reconstructed into a local
 # so a nested block's bindings do not leak). Returns 1 if the list ends up returning,
 # else 0. A `Let` initializer is typed without its own name (a self-reference is
-# undeclared) and may not shadow; an `Assign`/`FieldAssign` targets a mutable name of
-# the same type; a `for` iterates a dynamic array with its loop variable an `Int`
-# bound in the (recursively checked) body; a `Return` must match `frt`.
+# undeclared) and may not shadow; a `for` iterates a dynamic array with its loop
+# variable an `Int` bound in the (recursively checked) body; every other statement is
+# a "simple" one delegated to `check_simple_stmt`, whose reachability code drives the
+# unreachable-after-terminator and must-return checks.
 const check_stmts = (Func fn, [Stmt] stmts, [VarTy] env0, Ctx ctx, Ty frt, Bool in_loop): Iarch -> {
 	let [VarTy] env = []
 	let Iarch e0 = 0
@@ -609,61 +669,18 @@ const check_stmts = (Func fn, [Stmt] stmts, [VarTy] env0, Ctx ctx, Ty frt, Bool 
 		const Stmt s = stmts[i]
 		match s {
 			Stmt.Loop(bd) -> { check_stmts(fn, bd, env, ctx, frt, true) },
-			Stmt.Break -> {
-				if !in_loop then die("cf0: type: `break` is only valid inside a loop\n")
-				terminated = true
-			},
-			Stmt.Continue -> {
-				if !in_loop then die("cf0: type: `continue` is only valid inside a loop\n")
-				terminated = true
-			},
-			Stmt.BreakIf(c) -> {
-				if !in_loop then die("cf0: type: `break` is only valid inside a loop\n")
-				if !is_tbool(type_of(c, env, ctx)) then die("cf0: type: a guard condition must be a Bool\n")
-			},
-			Stmt.ContinueIf(c) -> {
-				if !in_loop then die("cf0: type: `continue` is only valid inside a loop\n")
-				if !is_tbool(type_of(c, env, ctx)) then die("cf0: type: a guard condition must be a Bool\n")
-			},
+			Stmt.ForIn(fv, fa, fbd) -> { check_for_body(fn, fv, fa, fbd, env, ctx, frt) },
 			Stmt.Let(n, m, e) -> {
 				if env_index(env, n) >= 0 then die("cf0: type: a binding cannot shadow an existing name\n")
 				const Ty ty = type_of(e, env, ctx)
 				if is_tstr(ty) && m then die("cf0: type: a Str local must be `const` (no Str reassignment)\n")
 				env = [...env, VarTy({ name: n, ty: ty, mutable: m })]
 			},
-			Stmt.Assign(n, e) -> {
-				const Iarch idx = env_index(env, n)
-				if idx < 0 then die("cf0: type: assignment to an undeclared name\n")
-				if !env[idx].mutable then die("cf0: type: cannot reassign a `const` binding or a parameter\n")
-				const Ty vty = type_of(e, env, ctx)
-				if !ty_eq(vty, env[idx].ty) then die("cf0: type: a reassignment must keep the binding's type\n")
-			},
-			Stmt.FieldAssign(b, f, e) -> {
-				const Iarch idx = env_index(env, b)
-				if idx < 0 then die("cf0: type: field assignment to an undeclared name\n")
-				if !env[idx].mutable then die("cf0: type: cannot mutate a `const` record's fields\n")
-				const Str tn = rec_of(env[idx].ty)
-				if str_eq(tn, "") then die("cf0: type: field assignment needs a record on the left\n")
-				const Iarch ri = find_rec(ctx.recs, tn)
-				if field_index(ctx.recs[ri].fields, f) < 0 then die("cf0: type: mutating a field the record does not declare\n")
-				if !is_tint(type_of(e, env, ctx)) then die("cf0: type: a field value must be an integer\n")
-			},
-			Stmt.ForIn(fv, fa, fbd) -> { check_for_body(fn, fv, fa, fbd, env, ctx, frt) },
-			Stmt.IndexAssign(a, ix, val) -> {
-				# `arr[idx] = val` — a mutable dynamic array, an integer index and value
-				const Iarch idx = env_index(env, a)
-				if idx < 0 then die("cf0: type: element assignment to an undeclared name\n")
-				if !env[idx].mutable then die("cf0: type: cannot write to a `const`/borrowed array\n")
-				if str_eq(dyn_of(env[idx].ty), "") then die("cf0: type: element assignment needs a dynamic array\n")
-				if !is_tint(type_of(ix, env, ctx)) then die("cf0: type: an array index must be an integer\n")
-				if !is_tint(type_of(val, env, ctx)) then die("cf0: type: an array element must be an integer\n")
-			},
-			Stmt.Return(e) -> {
-				const Ty rty = type_of(e, env, ctx)
-				if !ty_eq(rty, frt) then die("cf0: type: a returned value's type must match the function's return type\n")
-				did_return = true
-				terminated = true
-			},
+			_ -> {
+				const Iarch t = check_simple_stmt(fn, s, env, ctx, frt, in_loop)
+				if t >= 1 then terminated = true
+				if t == 2 then did_return = true
+			}
 		}
 		i = i + 1
 	}
