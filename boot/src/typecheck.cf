@@ -677,19 +677,24 @@ const check_simple_stmt = (Func fn, Stmt s, [VarTy] env, Ctx ctx, Ty frt, Bool i
 			# a call-for-effect: type it (validates the callee and arguments), discard the result
 			type_of(e, env, ctx)
 		},
+		Stmt.Block(stmts) -> {
+			# a `{ … }` guard body — its own scope; its terminal code is the block's.
+			code = check_stmts(fn, stmts, env, ctx, frt, in_loop)
+		},
 		_ -> {
-			die("cf0: type: a statement `if` may guard only a `return`, an assignment, or `break`/`continue`\n")
+			die("cf0: type: a statement `if` may guard only a block, a `return`, an assignment, a call, or `break`/`continue`\n")
 		}
 	}
 	return code
 }
 
 # Check a statement list against a starting environment (reconstructed into a local
-# so a nested block's bindings do not leak). Returns 1 if the list ends up returning,
-# else 0. A `Let` initializer is typed without its own name (a self-reference is
-# undeclared) and may not shadow; a `for` iterates a dynamic array with its loop
-# variable an `Int` bound in the (recursively checked) body; every other statement is
-# a "simple" one delegated to `check_simple_stmt`, whose reachability code drives the
+# so a nested block's bindings do not leak). Returns the list's terminal code — 2 if it
+# ends by returning, 1 by `break`/`continue`, 0 if it falls through — the same code
+# `check_simple_stmt` uses. A `Let` initializer is typed without its own name (a
+# self-reference is undeclared) and may not shadow; a `for` iterates a dynamic array with
+# its loop variable an `Int` bound in the (recursively checked) body; every other statement
+# is a "simple" one delegated to `check_simple_stmt`, whose reachability code drives the
 # unreachable-after-terminator and must-return checks.
 const check_stmts = (Func fn, [Stmt] stmts, [VarTy] env0, Ctx ctx, Ty frt, Bool in_loop): Iarch -> {
 	let [VarTy] env = []
@@ -699,8 +704,8 @@ const check_stmts = (Func fn, [Stmt] stmts, [VarTy] env0, Ctx ctx, Ty frt, Bool 
 		env = [...env, env0[e0]]
 		e0 = e0 + 1
 	}
-	let Bool did_return = false
 	let Bool terminated = false
+	let Iarch term_code = 0
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(stmts.len) then break
@@ -717,14 +722,15 @@ const check_stmts = (Func fn, [Stmt] stmts, [VarTy] env0, Ctx ctx, Ty frt, Bool 
 			},
 			_ -> {
 				const Iarch t = check_simple_stmt(fn, s, env, ctx, frt, in_loop)
-				if t >= 1 then terminated = true
-				if t == 2 then did_return = true
+				if t >= 1 then {
+					terminated = true
+					term_code = t
+				}
 			}
 		}
 		i = i + 1
 	}
-	if did_return then return 1
-	return 0
+	return term_code
 }
 
 # Check one function: seed the environment with its parameters (immutable), then
@@ -740,7 +746,7 @@ const check_func = (Func fn, Ctx ctx): Iarch -> {
 		pi = pi + 1
 	}
 	const Iarch dr = check_stmts(fn, fn.body, env, ctx, frt, false)
-	if dr == 0 then die("cf0: type: a function body must end with `return`\n")
+	if dr != 2 then die("cf0: type: a function body must end with `return`\n")
 	return 0
 }
 
