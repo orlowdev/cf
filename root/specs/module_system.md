@@ -16,9 +16,9 @@ one file, mangles module-qualified names, and prunes what no longer applies — 
 tree of `.cf` files into a single import-free `.cf` for the typecheck gate ([[type_system.md]])
 to run on.
 
-Status: complete draft — **reviewed, ratification-ready** (a three-reviewer gate ran against
-the sibling specs, cfcc's implementation, and internal/decision fidelity; all findings and
-owner rulings are folded; a final owner sign-off is pending). Grounded in the ratified
+Status: **ratified**. A three-reviewer gate ran against the sibling specs, cfcc's
+implementation, and internal/decision fidelity; all findings and owner rulings are folded,
+and the owner has signed off. Grounded in the ratified
 grammar/pipeline and in the behavior of the `cfcc` genesis tool, which already implements
 the resolver (destructured + namespace imports, transitive loads, cycles, `pub import`
 barrels, comptime conditional imports, `std/` root, flatten-and-mangle, DCE). Where this
