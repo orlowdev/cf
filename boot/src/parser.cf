@@ -10,7 +10,7 @@
 
 import "io" as { die }
 import "token" as { Token, TokKind, is_eof, is_ident, is_intlit, is_strlit, is_lparen, is_rparen, is_lbrace, is_rbrace, is_lbracket, is_rbracket, is_comma, is_colon, is_dot, is_ellipsis, is_eq, is_arrow, is_minus, is_plus, is_star, is_slash, is_percent, is_amp, is_pipe, is_caret, is_tilde, is_bang, is_shl, is_shr, is_eqeq, is_ne, is_lt, is_gt, is_le, is_ge, is_logand, is_logor }
-import "ast" as { Expr, Stmt, Param, Func, Ty, FieldInit, RecDecl, UnionMember, UnionDecl, MatchArm, Seg, RetSig, Program }
+import "ast" as { Expr, Stmt, Param, Func, Ty, FieldInit, RecDecl, UnionMember, UnionDecl, MatchArm, Seg, RetSig, Import, Program }
 
 # The parse cursor: the token stream, the source (for keyword text), a position.
 pub data Parser = { [Token] toks, *[Uint8] src, Iarch pos }
@@ -931,15 +931,44 @@ const parse_union = (*Parser p): UnionDecl -> {
 	return UnionDecl({ name: name, members: members })
 }
 
-# The whole program: a sequence of top-level `data`/`union` declarations and
-# functions, in any order. One function must be `pub const main` (checked later).
+# A top-level import `import "path" as { a, b, … }` (module_system §4). The path is a
+# string literal; the members are a brace-enclosed, comma-separated list of names (value
+# or type). Brick 1 accepts the destructured form only — a namespace alias (`as ns`) is
+# rejected. The path's raw content is interned (module paths carry no escapes).
+const parse_import = (*Parser p): Import -> {
+	p.pos = p.pos + 1 # `import`
+	if !is_strlit(peek(p)) then die("cf0: parse: expected a module path string after `import`\n")
+	const Str path = cur_name(p)
+	p.pos = p.pos + 1
+	if !kw(p, "as") then die("cf0: parse: expected `as` after the import path\n")
+	p.pos = p.pos + 1
+	if !is_lbrace(peek(p)) then die("cf0: parse: cf0 imports only the destructured form `import \"m\" as { names }`\n")
+	p.pos = p.pos + 1
+	let [Str] names = []
+	loop {
+		if is_rbrace(peek(p)) then break
+		if !is_ident(peek(p)) then die("cf0: parse: expected an imported member name\n")
+		names = [...names, cur_name(p)]
+		p.pos = p.pos + 1
+		if is_comma(peek(p)) then p.pos = p.pos + 1
+	}
+	p.pos = p.pos + 1 # `}`
+	return Import({ path: path, names: names })
+}
+
+# The whole program: a sequence of top-level imports, `data`/`union` declarations, and
+# functions, in any order. One function must be `pub const main` (checked later). Imports
+# are resolved and flattened away before typecheck (module_system §8).
 pub const parse_program = (*Parser p): Program -> {
+	let [Import] imports = []
 	let [RecDecl] recs = []
 	let [UnionDecl] unions = []
 	let [Func] funcs = []
 	loop {
 		if is_eof(peek(p)) then break
-		if kw(p, "data") then {
+		if kw(p, "import") then {
+			imports = [...imports, parse_import(p)]
+		} else if kw(p, "data") then {
 			recs = [...recs, parse_data(p)]
 		} else if kw(p, "union") then {
 			unions = [...unions, parse_union(p)]
@@ -947,5 +976,5 @@ pub const parse_program = (*Parser p): Program -> {
 			funcs = [...funcs, parse_func(p)]
 		}
 	}
-	return Program({ recs: recs, unions: unions, funcs: funcs })
+	return Program({ imports: imports, recs: recs, unions: unions, funcs: funcs })
 }

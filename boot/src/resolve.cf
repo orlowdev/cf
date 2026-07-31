@@ -1,0 +1,183 @@
+# resolve — module resolution and flattening (module_system §8), brick 1.
+#
+# Loads the entry module and, transitively, every module it imports, then flattens all
+# their declarations into one Program for the typecheck and emit phases. Each `import
+# "m"` resolves to a file `<dir>/m.cf` and its declarations join the program.
+#
+# Brick-1 scope (narrowings, each a later brick): destructured imports only; paths
+# resolve relative to the ENTRY file's directory — correct for a flat layout, where
+# every module sits beside the entry, as cf0's own sources do (the spec resolves each
+# import relative to its own importer's directory); no name mangling, so imported
+# modules must not collide on a private top-level name; no visibility filtering, so every
+# merged declaration is visible (the typecheck phase still rejects a reference to a name
+# no module declares); no `std/` root, no namespace aliases, no comptime conditional
+# imports.
+
+import "io" as { open, read, close, die, o_rdonly }
+import "token" as { Token }
+import "ast" as { RecDecl, UnionDecl, Func, Import, Program }
+import "lexer" as { lex }
+import "parser" as { Parser, parse_program }
+
+# One module's read buffer size. Matches the entry buffer; large enough for cf0's own
+# sources. A growable read arrives when a module outgrows it.
+pub const mod_cap = 65536
+
+# Byte-wise Str equality (used to dedup already-loaded module paths).
+const str_eq = (Str a, Str b): Bool -> {
+	if a.len != b.len then return false
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(a.len) then break
+		if Iarch(a[i]) != Iarch(b[i]) then return false
+		i = i + 1
+	}
+	return true
+}
+
+# The directory prefix of a path: its bytes up to and INCLUDING the last `/` (empty when
+# the path has no `/`). `import "m"` from `dir/entry.cf` resolves against this prefix.
+const dir_of = (Str path): Str -> {
+	let Iarch last = 0 - 1
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(path.len) then break
+		if Iarch(path[i]) == 47 then last = i
+		i = i + 1
+	}
+	let [Uint8] v = []
+	let Iarch k = 0
+	loop {
+		if k > last then break
+		v = [...v, path[k]]
+		k = k + 1
+	}
+	return Str(v)
+}
+
+# Build a module file path `<dir><name>.cf`, NUL-terminated for `open` (which reads a C
+# string). `dir` already ends in `/` (or is empty). The trailing NUL rides in the sealed
+# Str's bytes; `open` stops at it, so the one extra length byte is harmless.
+const build_path = (Str dir, Str name): Str -> {
+	let [Uint8] v = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(dir.len) then break
+		v = [...v, dir[i]]
+		i = i + 1
+	}
+	let Iarch j = 0
+	loop {
+		if j >= Iarch(name.len) then break
+		v = [...v, name[j]]
+		j = j + 1
+	}
+	v = [...v, Uint8(46)]  # '.'
+	v = [...v, Uint8(99)]  # 'c'
+	v = [...v, Uint8(102)] # 'f'
+	v = [...v, Uint8(0)]   # NUL terminator for `open`
+	return Str(v)
+}
+
+# Read, lex, and parse one module file into its Program. Its read buffer is a local, and
+# the parser interns every name into the arena, so the returned Program is self-contained
+# and the buffer can be discarded.
+const load_module = (Str path): Program -> {
+	let [65536 Uint8] buf
+	const Iarch fd = open(path.bytes, Uarch(o_rdonly), 0)
+	if fd < 0 then die("cf0: cannot open an imported module\n")
+	const Iarch n = read(Uarch(fd), buf, Uarch(mod_cap))
+	close(Uarch(fd))
+	if n < 0 then die("cf0: reading an imported module failed\n")
+	const [Token] toks = lex(buf, n)
+	let Parser p = Parser({ toks: toks, src: buf, pos: 0 })
+	return parse_program(&p)
+}
+
+# Has this module path already been loaded (dedup + cycle break)?
+const seen = ([Str] loaded, Str path): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(loaded.len) then break
+		if str_eq(loaded[i], path) then return true
+		i = i + 1
+	}
+	return false
+}
+
+# Append every element of `src` onto `dst` (cf0 has no two-spread merge, so grow one at a
+# time). One helper per declaration list — the payload types differ.
+const cat_recs = ([RecDecl] dst, [RecDecl] src): [RecDecl] -> {
+	let [RecDecl] out = dst
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(src.len) then break
+		out = [...out, src[i]]
+		i = i + 1
+	}
+	return out
+}
+const cat_unions = ([UnionDecl] dst, [UnionDecl] src): [UnionDecl] -> {
+	let [UnionDecl] out = dst
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(src.len) then break
+		out = [...out, src[i]]
+		i = i + 1
+	}
+	return out
+}
+const cat_funcs = ([Func] dst, [Func] src): [Func] -> {
+	let [Func] out = dst
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(src.len) then break
+		out = [...out, src[i]]
+		i = i + 1
+	}
+	return out
+}
+const cat_imports = ([Import] dst, [Import] src): [Import] -> {
+	let [Import] out = dst
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(src.len) then break
+		out = [...out, src[i]]
+		i = i + 1
+	}
+	return out
+}
+
+# Load the entry module and flatten its transitive import graph into one Program. The
+# work list grows as newly loaded modules contribute imports; `loaded` dedups by resolved
+# path so a diamond or a cycle loads each module once.
+pub const resolve_program = (Str entry): Program -> {
+	const Str dir = dir_of(entry)
+	const Program root = load_module(entry)
+	let [RecDecl] recs = []
+	let [UnionDecl] unions = []
+	let [Func] funcs = []
+	recs = cat_recs(recs, root.recs)
+	unions = cat_unions(unions, root.unions)
+	funcs = cat_funcs(funcs, root.funcs)
+	let [Str] loaded = []
+	let [Import] work = []
+	work = cat_imports(work, root.imports)
+	let Iarch wi = 0
+	loop {
+		if wi >= Iarch(work.len) then break
+		const Import im = work[wi]
+		const Str mpath = build_path(dir, im.path)
+		if !seen(loaded, mpath) then {
+			loaded = [...loaded, mpath]
+			const Program m = load_module(mpath)
+			recs = cat_recs(recs, m.recs)
+			unions = cat_unions(unions, m.unions)
+			funcs = cat_funcs(funcs, m.funcs)
+			work = cat_imports(work, m.imports)
+		}
+		wi = wi + 1
+	}
+	let [Import] none = []
+	return Program({ imports: none, recs: recs, unions: unions, funcs: funcs })
+}
