@@ -1456,9 +1456,47 @@ const emit_arena_floor = (Uarch fd): Iarch -> {
 	return 0
 }
 
-# Emit the whole program: the arena runtime, every function (main exported, the rest
-# internal, each with a fresh temp/label counter), then the freestanding entry floor
-# plus the arena's asm side. Runs only on programs the typecheck phase has accepted.
+# The index of the parameter named `name`, or -1 — resolves an asm `${param}` hole.
+const param_index = ([Param] params, Str name): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(params.len) then break
+		if str_eq(params[i].name, name) then return i
+		i = i + 1
+	}
+	return 0 - 1
+}
+
+# Emit one asm-bodied function naked into the asm floor (ebnf § Assembly): `.globl` so the
+# QBE-lowered callers can `bl` it, then the body's segments verbatim, each `${param}`
+# replaced by the argument register `x<index>` that parameter occupies (arm64 C ABI: param
+# i is in x<i>; the function is naked — no prologue — and supplies its own `ret`). Labeled
+# `_f<idx>` to match the positional symbol QBE-lowered callers reference (`$f<idx>`).
+const emit_asm_func = (Uarch fd, Func fn, Iarch idx): Iarch -> {
+	write_str(fd, ".globl _f${idx}\n")
+	write_str(fd, ".p2align 2\n")
+	write_str(fd, "_f${idx}:")
+	let Iarch si = 0
+	loop {
+		if si >= Iarch(fn.asm_body.len) then break
+		const Seg sg = fn.asm_body[si]
+		if sg.is_hole then {
+			const Iarch pidx = param_index(fn.params, sg.name)
+			if pidx < 0 then die("cf0: emit: an asm interpolation hole must name a parameter\n")
+			write_str(fd, "x${pidx}")
+		} else {
+			write_str(fd, Str(sg.lit))
+		}
+		si = si + 1
+	}
+	write_str(fd, "\n")
+	return 0
+}
+
+# Emit the whole program: the arena runtime, every NON-asm function (main exported, the
+# rest internal, each with a fresh temp/label counter), then the freestanding entry floor
+# plus the arena's asm side, and finally the asm-bodied functions naked beside the floor.
+# Runs only on programs the typecheck phase has accepted.
 #
 # darwin hands `main` its (argc, argv, envp) in x0/x1/x2 at the entry point, and the
 # `_start` floor does nothing before `bl _main`, so those registers flow straight
@@ -1468,8 +1506,11 @@ pub const emit_program = (Program prog, Uarch qbe_fd, Uarch asm_fd): Iarch -> {
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(prog.funcs.len) then break
-		let Emit ctx = Emit({ fd: qbe_fd, next: 0, label: 0, funcs: prog.funcs, recs: prog.recs, unions: prog.unions, cur_loop: 0 - 1 })
-		emit_func(&ctx, prog.funcs[i], i)
+		# an asm function is emitted into the floor, not through QBE
+		if !prog.funcs[i].is_asm then {
+			let Emit ctx = Emit({ fd: qbe_fd, next: 0, label: 0, funcs: prog.funcs, recs: prog.recs, unions: prog.unions, cur_loop: 0 - 1 })
+			emit_func(&ctx, prog.funcs[i], i)
+		}
 		i = i + 1
 	}
 	# asm floor: the freestanding entry. `_start` calls `_main` (argc/argv/envp still
@@ -1481,5 +1522,12 @@ pub const emit_program = (Program prog, Uarch qbe_fd, Uarch asm_fd): Iarch -> {
 	write_str(asm_fd, "\tmov x16, #1\n")
 	write_str(asm_fd, "\tsvc #0x80\n")
 	emit_arena_floor(asm_fd)
+	# the user's asm-bodied functions, naked beside the floor (QBE has no asm/`svc` path)
+	let Iarch k = 0
+	loop {
+		if k >= Iarch(prog.funcs.len) then break
+		if prog.funcs[k].is_asm then emit_asm_func(asm_fd, prog.funcs[k], k)
+		k = k + 1
+	}
 	return 0
 }

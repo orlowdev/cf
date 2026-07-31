@@ -844,9 +844,44 @@ const parse_ret_name = (*Parser p): RetSig -> {
 	return RetSig({ name: n, elem: "" })
 }
 
+# Split an `asm "…"` body string into segments — literal runs and `${param}` holes —
+# VERBATIM (no escape decoding; the assembler wants the raw bytes). A hole names a
+# parameter, resolved to its argument register at emit. Mirrors `parse_string`'s segment
+# loop but keeps every byte literal.
+const scan_asm_segs = (*[Uint8] src, Iarch start, Iarch len): [Seg] -> {
+	let [Seg] segs = []
+	let [Uint8] cur = []
+	let Iarch i = 0
+	loop {
+		if i >= len then break
+		const Iarch c = Iarch(src[start + i])
+		if c == 36 && i + 1 < len && Iarch(src[start + i + 1]) == 123 then {
+			# `${name}` — flush the literal run, then read the bare name up to `}`
+			segs = [...segs, Seg({ is_hole: false, lit: cur, name: "" })]
+			cur = []
+			let Iarch j = i + 2
+			loop {
+				if j >= len then die("cf0: parse: an unterminated asm hole (missing `}`)\n")
+				if Iarch(src[start + j]) == 125 then break
+				j = j + 1
+			}
+			const Str nm = intern(src, start + i + 2, j - i - 2)
+			segs = [...segs, Seg({ is_hole: true, lit: cur, name: nm })]
+			cur = []
+			i = j + 1
+		} else {
+			cur = [...cur, src[start + i]]
+			i = i + 1
+		}
+	}
+	segs = [...segs, Seg({ is_hole: false, lit: cur, name: "" })]
+	return segs
+}
+
 # One top-level function: `[pub] const NAME = (params)[: RetType] -> body`. The body
-# is a block `{ … }` or a bare expression (sugar for `{ return <expr> }`). The
-# return type is parsed and ignored (no typecheck yet; every function returns a word).
+# is a block `{ … }`, a bare expression (sugar for `{ return <expr> }`), or an `asm "…"`
+# naked assembly body. The return type is parsed and ignored (no typecheck yet; every
+# function returns a word).
 const parse_func = (*Parser p): Func -> {
 	let Bool is_pub = false
 	if kw(p, "pub") then {
@@ -868,14 +903,24 @@ const parse_func = (*Parser p): Func -> {
 	const RetSig rs = parse_ret_name(p)
 	if !is_arrow(peek(p)) then die("cf0: parse: expected `->`\n")
 	p.pos = p.pos + 1
+	const [Stmt] nobody = []
+	const [Seg] noasm = []
+	# `-> asm "…"` — a naked assembly-bodied function (ebnf § Assembly). The string's
+	# segments (literal runs + `${param}` holes) are emitted verbatim into the asm floor.
+	if kw(p, "asm") then {
+		p.pos = p.pos + 1
+		if !is_strlit(peek(p)) then die("cf0: parse: expected a string after `asm`\n")
+		const [Seg] segs = scan_asm_segs(p.src, p.toks[p.pos].start, p.toks[p.pos].len)
+		p.pos = p.pos + 1
+		return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: nobody, is_asm: true, asm_body: segs })
+	}
 	if is_lbrace(peek(p)) then {
 		p.pos = p.pos + 1
 		const [Stmt] body = parse_block(p)
-		return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: body })
+		return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: body, is_asm: false, asm_body: noasm })
 	}
-	const [Stmt] empty = []
-	const [Stmt] one = [...empty, Stmt.Return(parse_expr(p))]
-	return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: one })
+	const [Stmt] one = [...nobody, Stmt.Return(parse_expr(p))]
+	return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: one, is_asm: false, asm_body: noasm })
 }
 
 # `data Name = { Iarch a, Iarch b }` — a record declaration (Iarch fields only, at
