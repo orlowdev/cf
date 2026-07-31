@@ -10,7 +10,7 @@
 
 import "io" as { die }
 import "token" as { Token, TokKind, is_eof, is_ident, is_intlit, is_strlit, is_lparen, is_rparen, is_lbrace, is_rbrace, is_lbracket, is_rbracket, is_comma, is_colon, is_dot, is_ellipsis, is_eq, is_arrow, is_minus, is_plus, is_star, is_slash, is_percent, is_amp, is_pipe, is_caret, is_tilde, is_bang, is_shl, is_shr, is_eqeq, is_ne, is_lt, is_gt, is_le, is_ge, is_logand, is_logor }
-import "ast" as { Expr, Stmt, Param, Func, Call, Ty, FieldInit, RecLit, RecDecl, UnionMember, UnionDecl, UnionMkE, MatchArm, MatchExpr, ArrLit, StrData, Seg, InterpData, RetSig, Body, Program }
+import "ast" as { Expr, Stmt, Param, Func, Ty, FieldInit, RecDecl, UnionMember, UnionDecl, MatchArm, Seg, RetSig, Program }
 
 # The parse cursor: the token stream, the source (for keyword text), a position.
 pub data Parser = { [Token] toks, *[Uint8] src, Iarch pos }
@@ -111,9 +111,9 @@ const parse_string = (*[Uint8] src, Iarch start, Iarch len): Expr -> {
 		cur = [...cur, Uint8(c)]
 		i = i + 1
 	}
-	if !any_hole then return Expr.StrLit(StrData({ bytes: cur }))
+	if !any_hole then return Expr.StrLit(cur)
 	segs = [...segs, Seg({ is_hole: false, lit: cur, name: "" })]
-	return Expr.Interp(InterpData({ segs: segs }))
+	return Expr.Interp(segs)
 }
 
 # --- expression grammar --------------------------------------------------------------
@@ -297,7 +297,7 @@ const parse_call = (*Parser p, Str name): Expr -> {
 	}
 	if !is_rparen(peek(p)) then die("cf0: parse: expected `)` in a call\n")
 	p.pos = p.pos + 1
-	return Expr.Call(Call({ callee: name, args: args }))
+	return Expr.Call(name, args)
 }
 
 # A `[…]` dynamic-array literal: `[]`, `[a, b]`, or a spread `[...src, e, …]`. `[` is
@@ -317,7 +317,7 @@ const parse_array_lit = (*Parser p): Expr -> {
 		}
 		if !is_rbracket(peek(p)) then die("cf0: parse: expected `]` in an array spread\n")
 		p.pos = p.pos + 1
-		return Expr.ArrayLit(ArrLit({ has_spread: true, spread_name: src, elems: sp_elems, elem_type: "" }))
+		return Expr.ArrayLit(true, src, sp_elems, "")
 	}
 	let [Expr] lit_elems = []
 	if !is_rbracket(peek(p)) then {
@@ -329,7 +329,7 @@ const parse_array_lit = (*Parser p): Expr -> {
 	}
 	if !is_rbracket(peek(p)) then die("cf0: parse: expected `]` in an array literal\n")
 	p.pos = p.pos + 1
-	return Expr.ArrayLit(ArrLit({ has_spread: false, spread_name: "", elems: lit_elems, elem_type: "" }))
+	return Expr.ArrayLit(false, "", lit_elems, "")
 }
 
 # `Type.member(args)` — a payload-member union construction. `(` is the current token.
@@ -345,7 +345,7 @@ const parse_union_mk = (*Parser p, Str type_name, Str member): Expr -> {
 	}
 	if !is_rparen(peek(p)) then die("cf0: parse: expected `)` in a union construction\n")
 	p.pos = p.pos + 1
-	return Expr.UnionMk(UnionMkE({ type_name: type_name, member: member, args: args }))
+	return Expr.UnionMk(type_name, member, args)
 }
 
 # One `match` arm: a wildcard `_ -> body`; an or-pattern `Type.a | Type.b -> body`;
@@ -417,7 +417,7 @@ const parse_match = (*Parser p): Expr -> {
 	}
 	if !is_rbrace(peek(p)) then die("cf0: parse: expected `}` to close a match\n")
 	p.pos = p.pos + 1
-	return Expr.Match(MatchExpr({ scrut: scrut, arms: arms }))
+	return Expr.Match(scrut, arms)
 }
 
 # An optional postfix `.field` on a non-name primary — a string literal or a
@@ -539,7 +539,7 @@ const parse_record_lit = (*Parser p, Str type_name): Expr -> {
 	}
 	if !is_rbrace(peek(p)) then die("cf0: parse: expected `}` in a data literal\n")
 	p.pos = p.pos + 1
-	return Expr.Record(RecLit({ type_name: type_name, inits: inits }))
+	return Expr.Record(type_name, inits)
 }
 
 # A `const`/`let` binding. An optional type annotation (`const Iarch x = …`, or
@@ -564,7 +564,7 @@ const dyn_elem_of = (Ty t): Str -> match t {
 # empty `[]` (which has no element to infer from) still carries its element layout.
 # Non-array initializers pass through unchanged.
 const set_arr_elem = (Expr e, Str elem): Expr -> match e {
-	Expr.ArrayLit(al) -> Expr.ArrayLit(ArrLit({ has_spread: al.has_spread, spread_name: al.spread_name, elems: al.elems, elem_type: elem })),
+	Expr.ArrayLit(hs, sn, elems, et) -> Expr.ArrayLit(hs, sn, elems, elem),
 	_ -> e
 }
 
@@ -602,7 +602,7 @@ const parse_loop = (*Parser p): Stmt -> {
 	if !is_lbrace(peek(p)) then die("cf0: parse: expected `{` after `loop`\n")
 	p.pos = p.pos + 1
 	const [Stmt] body = parse_block(p)
-	return Stmt.Loop(Body({ stmts: body }))
+	return Stmt.Loop(body)
 }
 
 # A statement-position `if <cond> then break|continue` — guards a loop exit only.
@@ -637,7 +637,7 @@ const parse_for = (*Parser p): Stmt -> {
 	if !is_lbrace(peek(p)) then die("cf0: parse: expected `{` for a for-loop body\n")
 	p.pos = p.pos + 1
 	const [Stmt] body = parse_block(p)
-	return Stmt.ForIn(lv, arr, Body({ stmts: body }))
+	return Stmt.ForIn(lv, arr, body)
 }
 
 const parse_stmt = (*Parser p): Stmt -> {

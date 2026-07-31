@@ -17,7 +17,7 @@
 # not yet enforced (that is the typecheck brick).
 
 import "io" as { write_str, die }
-import "ast" as { Expr, Stmt, Param, Func, Call, FieldInit, RecLit, RecDecl, UnionMember, UnionDecl, UnionMkE, MatchArm, MatchExpr, ArrLit, StrData, Seg, InterpData, Body, Program }
+import "ast" as { Expr, Stmt, Param, Func, FieldInit, RecDecl, UnionMember, UnionDecl, MatchArm, Seg, Program }
 
 # The emit context: the QBE-IL output fd, the next free temp number, the next free
 # basic-block label id, the program's functions (a call resolves its callee — by
@@ -248,15 +248,15 @@ const emit_field = (*Emit ctx, [Binding] env, Str base, Str field): Str -> {
 # `storeb` at a time, plus a trailing NUL) and a `{bytes*@0, len@8}` header the Str
 # value points at (matching the throwaway `{bytes, len}` layout). Returns the header
 # pointer. `.len` reads the len word at +8; `.bytes` (a later brick) the ptr at +0.
-const emit_str_lit = (*Emit ctx, StrData sd): Str -> {
-	const Iarch n = Iarch(sd.bytes.len)
+const emit_str_lit = (*Emit ctx, [Uint8] bytes): Str -> {
+	const Iarch n = Iarch(bytes.len)
 	const Iarch buf = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${buf} =l call $cf_alloc(w ${n + 1})\n")
 	let Iarch i = 0
 	loop {
 		if i >= n then break
-		const Iarch b = Iarch(sd.bytes[i])
+		const Iarch b = Iarch(bytes[i])
 		const Iarch a = ctx.next
 		ctx.next = ctx.next + 1
 		write_str(ctx.fd, "\t%t${a} =l add %t${buf}, ${i}\n")
@@ -297,7 +297,7 @@ const emit_field_expr = (*Emit ctx, [Binding] env, Expr base, Str field): Str ->
 # integer, sign-extended then itoa) — then seal a `{bytes@0, len@8}` Str header
 # borrowing the vector's backing. Returns the header pointer. (Bool holes are a later
 # brick; the typecheck phase rejects them.)
-const emit_interp = (*Emit ctx, InterpData id, [Binding] env): Str -> {
+const emit_interp = (*Emit ctx, [Seg] segs, [Binding] env): Str -> {
 	const Iarch vh = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${vh} =l call $cf_alloc(w 24)\n")
@@ -312,8 +312,8 @@ const emit_interp = (*Emit ctx, InterpData id, [Binding] env): Str -> {
 	write_str(ctx.fd, "\tstorel 0, %t${v16}\n")
 	let Iarch si = 0
 	loop {
-		if si >= Iarch(id.segs.len) then break
-		const Seg sg = id.segs[si]
+		if si >= Iarch(segs.len) then break
+		const Seg sg = segs[si]
 		if sg.is_hole then {
 			const Iarch bi = lookup_index(env, sg.name)
 			const Str hv = emit_var(ctx, env, sg.name)
@@ -366,17 +366,17 @@ const emit_interp = (*Emit ctx, InterpData id, [Binding] env): Str -> {
 # so it outlives the current stack frame and may be returned), store each
 # initializer at its field's offset, and return the base-pointer temp. Field
 # initializers may be given in any order; each maps to its declared offset.
-const emit_record_lit = (*Emit ctx, RecLit rl, [Binding] env): Iarch -> {
-	const Iarch ri = find_rec(ctx.recs, rl.type_name)
+const emit_record_lit = (*Emit ctx, Str type_name, [FieldInit] inits, [Binding] env): Iarch -> {
+	const Iarch ri = find_rec(ctx.recs, type_name)
 	const Iarch size = Iarch(ctx.recs[ri].fields.len) * 4
 	const Iarch base = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${base} =l call $cf_alloc(w ${size})\n")
 	let Iarch a = 0
 	loop {
-		if a >= Iarch(rl.inits.len) then break
-		const Str v = emit_expr(rl.inits[a].value, ctx, env)
-		const Iarch off = field_offset(ctx.recs, rl.type_name, rl.inits[a].field)
+		if a >= Iarch(inits.len) then break
+		const Str v = emit_expr(inits[a].value, ctx, env)
+		const Iarch off = field_offset(ctx.recs, type_name, inits[a].field)
 		const Iarch addr = ctx.next
 		ctx.next = ctx.next + 1
 		write_str(ctx.fd, "\t%t${addr} =l add %t${base}, ${off}\n")
@@ -389,16 +389,16 @@ const emit_record_lit = (*Emit ctx, RecLit rl, [Binding] env): Iarch -> {
 # A record literal as a value expression — an explicit construction `Type({ … })` in a
 # return, call argument, or array element. Builds the record in the arena and yields
 # its base pointer (a binding initializer takes the faster direct path in emit_block).
-const emit_record_val = (*Emit ctx, RecLit rl, [Binding] env): Str -> {
-	const Iarch base = emit_record_lit(ctx, rl, env)
+const emit_record_val = (*Emit ctx, Str type_name, [FieldInit] inits, [Binding] env): Str -> {
+	const Iarch base = emit_record_lit(ctx, type_name, inits, env)
 	return "%t${base}"
 }
 
 # Emit `Type.member(args)` — a payload-member union construction: an arena box
 # `{tag@0, arg0@4, arg1@8, …}`, returned as its base pointer.
-const emit_union_mk = (*Emit ctx, UnionMkE mk, [Binding] env): Str -> {
-	const Iarch tag = member_tag(ctx.unions, mk.type_name, mk.member)
-	const Iarch na = Iarch(mk.args.len)
+const emit_union_mk = (*Emit ctx, Str type_name, Str member, [Expr] args, [Binding] env): Str -> {
+	const Iarch tag = member_tag(ctx.unions, type_name, member)
+	const Iarch na = Iarch(args.len)
 	const Iarch size = 4 + na * 4
 	const Iarch b = ctx.next
 	ctx.next = ctx.next + 1
@@ -407,7 +407,7 @@ const emit_union_mk = (*Emit ctx, UnionMkE mk, [Binding] env): Str -> {
 	let Iarch i = 0
 	loop {
 		if i >= na then break
-		const Str v = emit_expr(mk.args[i], ctx, env)
+		const Str v = emit_expr(args[i], ctx, env)
 		const Iarch off = 4 + i * 4
 		const Iarch addr = ctx.next
 		ctx.next = ctx.next + 1
@@ -419,8 +419,8 @@ const emit_union_mk = (*Emit ctx, UnionMkE mk, [Binding] env): Str -> {
 }
 
 # The aggregate type name a call returns (a record or a BOXED union), or "".
-const call_agg_type = (*Emit ctx, Call cl): Str -> {
-	const Iarch fidx = find_func(ctx.funcs, cl.callee)
+const call_agg_type = (*Emit ctx, Str callee): Str -> {
+	const Iarch fidx = find_func(ctx.funcs, callee)
 	if fidx < 0 then return ""
 	if ret_is_l(ctx.funcs[fidx].ret_name, ctx.recs, ctx.unions) then return ctx.funcs[fidx].ret_name
 	return ""
@@ -447,12 +447,12 @@ const var_agg_type = ([Binding] env, Str name): Str -> {
 # a boxed union, a dynamic array, a string, or an aggregate variable copied) — so its
 # binding holds a base pointer — else "".
 const init_agg_type = (*Emit ctx, [Binding] env, Expr e): Str -> match e {
-	Expr.Record(rl) -> rl.type_name,
-	Expr.UnionMk(mk) -> mk.type_name,
+	Expr.Record(tn, inits) -> tn,
+	Expr.UnionMk(tn, mem, args) -> tn,
 	Expr.Field(base, f) -> field_agg_type(ctx, base),
-	Expr.Call(cl) -> call_agg_type(ctx, cl),
-	Expr.ArrayLit(al) -> "$dyn",
-	Expr.StrLit(sd) -> "Str",
+	Expr.Call(callee, args) -> call_agg_type(ctx, callee),
+	Expr.ArrayLit(hs, sn, elems, et) -> "$dyn",
+	Expr.StrLit(bytes) -> "Str",
 	Expr.Interp(id) -> "Str",
 	Expr.Var(name) -> var_agg_type(env, name),
 	_ -> ""
@@ -462,7 +462,7 @@ const init_agg_type = (*Emit ctx, [Binding] env, Expr e): Str -> match e {
 # `elem_type` (a `let [Elem]` annotation), else "". A record name marks `[Record]`
 # elements (8-byte pointer slots); "" / `Iarch` marks word elements.
 const init_elem = (Expr e): Str -> match e {
-	Expr.ArrayLit(al) -> al.elem_type,
+	Expr.ArrayLit(hs, sn, elems, et) -> et,
 	_ -> ""
 }
 
@@ -478,7 +478,7 @@ const copy_agg = (*Emit ctx, Str v): Iarch -> {
 # literal builds directly; anything else (a union construction, a boxed tag-only
 # member, an aggregate-returning call) yields a pointer that the binding adopts.
 const emit_agg_binding = (*Emit ctx, Expr e, [Binding] env): Iarch -> match e {
-	Expr.Record(rl) -> emit_record_lit(ctx, rl, env),
+	Expr.Record(tn, inits) -> emit_record_lit(ctx, tn, inits, env),
 	_ -> copy_agg(ctx, emit_expr(e, ctx, env))
 }
 
@@ -576,21 +576,21 @@ const is_cast_type = (Str name): Bool -> {
 	return false
 }
 
-const emit_call = (*Emit ctx, Call cl, [Binding] env): Str -> {
-	if is_cast_type(cl.callee) then return emit_expr(cl.args[0], ctx, env)
-	const Iarch fidx = find_func(ctx.funcs, cl.callee)
+const emit_call = (*Emit ctx, Str callee, [Expr] args, [Binding] env): Str -> {
+	if is_cast_type(callee) then return emit_expr(args[0], ctx, env)
+	const Iarch fidx = find_func(ctx.funcs, callee)
 	if fidx < 0 then die("cf0: emit: internal: unresolved call (should be caught by typecheck)\n")
-	const Iarch nargs = Iarch(cl.args.len)
+	const Iarch nargs = Iarch(args.len)
 	let [ArgOp] aops = []
 	let Iarch i = 0
 	loop {
 		if i >= nargs then break
 		if is_agg_param(ctx.funcs[fidx].params[i], ctx.recs, ctx.unions) then {
-			const Str av = emit_expr(cl.args[i], ctx, env)
+			const Str av = emit_expr(args[i], ctx, env)
 			const Iarch tt = copy_agg(ctx, av)
 			aops = [...aops, ArgOp({ temp: tt, is_rec: true })]
 		} else {
-			const Str op = emit_expr(cl.args[i], ctx, env)
+			const Str op = emit_expr(args[i], ctx, env)
 			const Iarch tt = ctx.next
 			ctx.next = ctx.next + 1
 			write_str(ctx.fd, "\t%t${tt} =w copy ${op}\n")
@@ -621,11 +621,11 @@ const emit_call = (*Emit ctx, Call cl, [Binding] env): Str -> {
 }
 
 # The scrutinee's union (the first member arm's type name), or "" if all arms are `_`.
-const match_union = (MatchExpr me): Str -> {
+const match_union = ([MatchArm] arms): Str -> {
 	let Iarch i = 0
 	loop {
-		if i >= Iarch(me.arms.len) then break
-		if !me.arms[i].is_wild then return me.arms[i].type_name
+		if i >= Iarch(arms.len) then break
+		if !arms[i].is_wild then return arms[i].type_name
 		i = i + 1
 	}
 	return ""
@@ -667,8 +667,8 @@ const arm_body_env = (*Emit ctx, [Binding] env, MatchArm arm, Str s): [Binding] 
 
 # The scrutinee's tag operand: for a boxed union the tag lives at the box's offset 0
 # (loaded here); a tag-only union value IS its tag.
-const scrut_tag = (*Emit ctx, MatchExpr me, Str s): Str -> {
-	const Str un = match_union(me)
+const scrut_tag = (*Emit ctx, [MatchArm] arms, Str s): Str -> {
+	const Str un = match_union(arms)
 	if str_eq(un, "") then return s
 	if !union_is_boxed(ctx.unions, un) then return s
 	const Iarch t = ctx.next
@@ -682,31 +682,31 @@ const scrut_tag = (*Emit ctx, MatchExpr me, Str s): Str -> {
 # a hit, evaluates its body into the result slot and jumps to the end; the LAST arm (a
 # `_` wildcard, or — for an exhaustive match — the final member) is the unconditional
 # else. The result merges through a stack slot, like `if`.
-const emit_match = (*Emit ctx, MatchExpr me, [Binding] env): Str -> {
-	const Str s = emit_expr(me.scrut, ctx, env)
-	const Str tagop = scrut_tag(ctx, me, s)
+const emit_match = (*Emit ctx, Expr scrut, [MatchArm] arms, [Binding] env): Str -> {
+	const Str s = emit_expr(scrut, ctx, env)
+	const Str tagop = scrut_tag(ctx, arms, s)
 	const Iarch slot = ctx.next
 	ctx.next = ctx.next + 1
 	const Iarch lid = ctx.label
 	ctx.label = ctx.label + 1
 	write_str(ctx.fd, "\t%t${slot} =l alloc4 4\n")
-	const Iarch na = Iarch(me.arms.len)
+	const Iarch na = Iarch(arms.len)
 	let Iarch i = 0
 	loop {
 		if i >= na then break
 		if i == na - 1 then {
-			const [Binding] benv_e = arm_body_env(ctx, env, me.arms[i], s)
-			const Str v = emit_expr(me.arms[i].body, ctx, benv_e)
+			const [Binding] benv_e = arm_body_env(ctx, env, arms[i], s)
+			const Str v = emit_expr(arms[i].body, ctx, benv_e)
 			write_str(ctx.fd, "\tstorew ${v}, %t${slot}\n")
 			write_str(ctx.fd, "\tjmp @mend${lid}\n")
 		} else {
 			# test each or-pattern alternative: a hit jumps to the arm body, a miss to
 			# the next alternative, and after the last to the next arm.
-			const Iarch k = Iarch(me.arms[i].members.len)
+			const Iarch k = Iarch(arms[i].members.len)
 			let Iarch j = 0
 			loop {
 				if j >= k then break
-				const Iarch tag = member_tag(ctx.unions, me.arms[i].type_name, me.arms[i].members[j])
+				const Iarch tag = member_tag(ctx.unions, arms[i].type_name, arms[i].members[j])
 				const Iarch c = ctx.next
 				ctx.next = ctx.next + 1
 				write_str(ctx.fd, "\t%t${c} =w ceqw ${tagop}, ${tag}\n")
@@ -718,8 +718,8 @@ const emit_match = (*Emit ctx, MatchExpr me, [Binding] env): Str -> {
 				j = j + 1
 			}
 			write_str(ctx.fd, "@marm${lid}_${i}\n")
-			const [Binding] benv_m = arm_body_env(ctx, env, me.arms[i], s)
-			const Str v = emit_expr(me.arms[i].body, ctx, benv_m)
+			const [Binding] benv_m = arm_body_env(ctx, env, arms[i], s)
+			const Str v = emit_expr(arms[i].body, ctx, benv_m)
 			write_str(ctx.fd, "\tstorew ${v}, %t${slot}\n")
 			write_str(ctx.fd, "\tjmp @mend${lid}\n")
 			write_str(ctx.fd, "@mnext${lid}_${i}\n")
@@ -736,8 +736,8 @@ const emit_match = (*Emit ctx, MatchExpr me, [Binding] env): Str -> {
 # Emit a `[…]` array literal: a fresh {data@0, len@8, cap@16} header in the arena,
 # its backing block (n × 8-byte slots) filled with the elements, len = cap = n. `[]`
 # is data=0, len=0, cap=0. Returns the header pointer.
-const emit_array_lit = (*Emit ctx, ArrLit al, [Binding] env): Str -> {
-	const Iarch n = Iarch(al.elems.len)
+const emit_array_lit = (*Emit ctx, [Expr] elems, Str elem_type, [Binding] env): Str -> {
+	const Iarch n = Iarch(elems.len)
 	const Iarch hdr = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${hdr} =l call $cf_alloc(w 24)\n")
@@ -754,7 +754,7 @@ const emit_array_lit = (*Emit ctx, ArrLit al, [Binding] env): Str -> {
 	} else {
 		# a record element is an 8-byte arena pointer (`storel`); a word element rides in
 		# the low half of its 8-byte slot (`storew`).
-		const Bool agg = elem_is_agg(ctx, al.elem_type)
+		const Bool agg = elem_is_agg(ctx, elem_type)
 		const Iarch bytes = n * 8
 		const Iarch data = ctx.next
 		ctx.next = ctx.next + 1
@@ -762,7 +762,7 @@ const emit_array_lit = (*Emit ctx, ArrLit al, [Binding] env): Str -> {
 		let Iarch i = 0
 		loop {
 			if i >= n then break
-			const Str v = emit_expr(al.elems[i], ctx, env)
+			const Str v = emit_expr(elems[i], ctx, env)
 			const Iarch off = i * 8
 			const Iarch addr = ctx.next
 			ctx.next = ctx.next + 1
@@ -861,11 +861,11 @@ const emit_index_field = (*Emit ctx, [Binding] env, Str arr, Expr idx, Str field
 
 # Emit the elements of a `xs = [...xs, e…]` self-growth append: each `cf_dyn_push`es
 # a slot onto the header (growing as needed, bumping len) and stores the element.
-const emit_append = (*Emit ctx, [Binding] env, Iarch hdr, ArrLit al, Bool agg): Iarch -> {
+const emit_append = (*Emit ctx, [Binding] env, Iarch hdr, [Expr] elems, Bool agg): Iarch -> {
 	let Iarch i = 0
 	loop {
-		if i >= Iarch(al.elems.len) then break
-		const Str v = emit_expr(al.elems[i], ctx, env)
+		if i >= Iarch(elems.len) then break
+		const Str v = emit_expr(elems[i], ctx, env)
 		const Iarch slot = ctx.next
 		ctx.next = ctx.next + 1
 		write_str(ctx.fd, "\t%t${slot} =l call $cf_dyn_push(l %t${hdr}, w 8)\n")
@@ -877,7 +877,7 @@ const emit_append = (*Emit ctx, [Binding] env, Iarch hdr, ArrLit al, Bool agg): 
 	return 0
 }
 const emit_append_expr = (*Emit ctx, [Binding] env, Iarch hdr, Expr e, Bool agg): Iarch -> match e {
-	Expr.ArrayLit(al) -> emit_append(ctx, env, hdr, al, agg),
+	Expr.ArrayLit(hs, sn, elems, et) -> emit_append(ctx, env, hdr, elems, agg),
 	_ -> 0 - 1
 }
 
@@ -885,16 +885,16 @@ const emit_expr = (Expr e, *Emit ctx, [Binding] env): Str -> match e {
 	Expr.Lit(v) -> "${v}",
 	Expr.BoolLit(b) -> if b then "1" else "0",
 	Expr.Var(name) -> emit_var(ctx, env, name),
-	Expr.StrLit(sd) -> emit_str_lit(ctx, sd),
-	Expr.Interp(id) -> emit_interp(ctx, id, env),
-	Expr.Record(rl) -> emit_record_val(ctx, rl, env),
+	Expr.StrLit(bytes) -> emit_str_lit(ctx, bytes),
+	Expr.Interp(segs) -> emit_interp(ctx, segs, env),
+	Expr.Record(tn, inits) -> emit_record_val(ctx, tn, inits, env),
 	Expr.Field(base, f) -> emit_field(ctx, env, base, f),
 	Expr.FieldExpr(base, f) -> emit_field_expr(ctx, env, base, f),
-	Expr.ArrayLit(al) -> emit_array_lit(ctx, al, env),
+	Expr.ArrayLit(hs, sn, elems, et) -> emit_array_lit(ctx, elems, et, env),
 	Expr.Index(arr, idx) -> emit_index(ctx, env, arr, idx),
 	Expr.IndexField(arr, idx, f) -> emit_index_field(ctx, env, arr, idx, f),
-	Expr.UnionMk(mk) -> emit_union_mk(ctx, mk, env),
-	Expr.Match(me) -> emit_match(ctx, me, env),
+	Expr.UnionMk(tn, mem, args) -> emit_union_mk(ctx, tn, mem, args, env),
+	Expr.Match(scrut, arms) -> emit_match(ctx, scrut, arms, env),
 	Expr.Neg(x) -> emit_unop(ctx, "sub 0, ", x, "", env),
 	Expr.Not(x) -> emit_unop(ctx, "ceqw ", x, ", 0", env),
 	Expr.BitNot(x) -> emit_unop(ctx, "xor ", x, ", -1", env),
@@ -917,7 +917,7 @@ const emit_expr = (Expr e, *Emit ctx, [Binding] env): Str -> match e {
 	Expr.And(l, r) -> emit_logical(ctx, true, l, r, env),
 	Expr.Or(l, r) -> emit_logical(ctx, false, l, r, env),
 	Expr.If(cond, thenE, elseE) -> emit_if(ctx, cond, thenE, elseE, env),
-	Expr.Call(cl) -> emit_call(ctx, cl, env)
+	Expr.Call(callee, args) -> emit_call(ctx, callee, args, env)
 }
 
 # --- statement / block emit -----------------------------------------------------------
@@ -1031,7 +1031,7 @@ const emit_block = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 		terminal = 0
 		const Stmt s = stmts[i]
 		match s {
-			Stmt.Loop(bd) -> { emit_loop_body(ctx, env, bd.stmts) },
+			Stmt.Loop(bd) -> { emit_loop_body(ctx, env, bd) },
 			Stmt.Break -> {
 				write_str(ctx.fd, "\tjmp @lend${ctx.cur_loop}\n")
 				terminal = 1
@@ -1097,7 +1097,7 @@ const emit_block = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 				write_str(ctx.fd, "\t%t${addr} =l add %t${slot}, ${off}\n")
 				write_str(ctx.fd, "\tstorew ${v}, %t${addr}\n")
 			},
-			Stmt.ForIn(fv, fa, fbd) -> { emit_for_body(ctx, env, fv, fa, fbd.stmts) },
+			Stmt.ForIn(fv, fa, fbd) -> { emit_for_body(ctx, env, fv, fa, fbd) },
 			Stmt.IndexAssign(a, ix, val) -> {
 				# `arr[idx] = val` — store the value at data + idx*8
 				const Iarch ai = lookup_index(env, a)

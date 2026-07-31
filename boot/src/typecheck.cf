@@ -16,7 +16,7 @@
 # The emitter runs only on programs this phase accepts.
 
 import "io" as { die }
-import "ast" as { Expr, Stmt, Param, Func, Call, Ty, FieldInit, RecLit, RecDecl, UnionMember, UnionDecl, UnionMkE, MatchArm, MatchExpr, ArrLit, StrData, Seg, InterpData, Body, Program }
+import "ast" as { Expr, Stmt, Param, Func, Ty, FieldInit, RecDecl, UnionMember, UnionDecl, MatchArm, Seg, Program }
 
 # A name in scope during checking: its type and whether it is reassignable (`let`).
 data VarTy = { Str name, Ty ty, Bool mutable }
@@ -230,23 +230,23 @@ const is_cast_type = (Str name): Bool -> {
 
 # `T(x)` — a numeric cast. It takes exactly one SCALAR INTEGER (a Bool, pointer, or
 # aggregate is rejected — type_system §4) and yields an integer.
-const cast_type = (Call cl, [VarTy] env, Ctx ctx): Ty -> {
-	if Iarch(cl.args.len) != 1 then die("cf0: type: a numeric cast takes exactly one argument\n")
-	if !is_tint(type_of(cl.args[0], env, ctx)) then die("cf0: type: a numeric cast takes a scalar integer\n")
+const cast_type = (Str callee, [Expr] args, [VarTy] env, Ctx ctx): Ty -> {
+	if Iarch(args.len) != 1 then die("cf0: type: a numeric cast takes exactly one argument\n")
+	if !is_tint(type_of(args[0], env, ctx)) then die("cf0: type: a numeric cast takes a scalar integer\n")
 	return Ty.TInt
 }
 
-const call_type = (Call cl, [VarTy] env, Ctx ctx): Ty -> {
-	if is_cast_type(cl.callee) then return cast_type(cl, env, ctx)
-	const Iarch fidx = find_func(ctx.funcs, cl.callee)
+const call_type = (Str callee, [Expr] args, [VarTy] env, Ctx ctx): Ty -> {
+	if is_cast_type(callee) then return cast_type(callee, args, env, ctx)
+	const Iarch fidx = find_func(ctx.funcs, callee)
 	if fidx < 0 then die("cf0: type: call to an undefined function\n")
 	const Iarch np = Iarch(ctx.funcs[fidx].params.len)
-	const Iarch na = Iarch(cl.args.len)
+	const Iarch na = Iarch(args.len)
 	if np != na then die("cf0: type: wrong number of call arguments\n")
 	let Iarch i = 0
 	loop {
 		if i >= na then break
-		const Ty at = type_of(cl.args[i], env, ctx)
+		const Ty at = type_of(args[i], env, ctx)
 		const Ty pt = param_ty(ctx.funcs[fidx].params[i], ctx.recs, ctx.unions)
 		if !ty_eq(at, pt) then die("cf0: type: a call argument's type does not match the parameter\n")
 		i = i + 1
@@ -256,26 +256,26 @@ const call_type = (Call cl, [VarTy] env, Ctx ctx): Ty -> {
 
 # `{ f: v, … }` — the record type must exist and the literal must set every declared
 # field exactly once (order-independent), each with an integer value.
-const record_type = (RecLit rl, [VarTy] env, Ctx ctx): Ty -> {
-	const Iarch ri = find_rec(ctx.recs, rl.type_name)
+const record_type = (Str type_name, [FieldInit] inits, [VarTy] env, Ctx ctx): Ty -> {
+	const Iarch ri = find_rec(ctx.recs, type_name)
 	if ri < 0 then die("cf0: type: unknown record type in a data literal\n")
 	const Iarch nf = Iarch(ctx.recs[ri].fields.len)
-	const Iarch ni = Iarch(rl.inits.len)
+	const Iarch ni = Iarch(inits.len)
 	if ni != nf then die("cf0: type: a data literal must set every field exactly once\n")
 	let Iarch a = 0
 	loop {
 		if a >= ni then break
-		if field_index(ctx.recs[ri].fields, rl.inits[a].field) < 0 then die("cf0: type: unknown field in a data literal\n")
+		if field_index(ctx.recs[ri].fields, inits[a].field) < 0 then die("cf0: type: unknown field in a data literal\n")
 		let Iarch b = 0
 		loop {
 			if b >= a then break
-			if str_eq(rl.inits[b].field, rl.inits[a].field) then die("cf0: type: a field is set twice in a data literal\n")
+			if str_eq(inits[b].field, inits[a].field) then die("cf0: type: a field is set twice in a data literal\n")
 			b = b + 1
 		}
-		if !is_tint(type_of(rl.inits[a].value, env, ctx)) then die("cf0: type: a data-literal field value must be an integer\n")
+		if !is_tint(type_of(inits[a].value, env, ctx)) then die("cf0: type: a data-literal field value must be an integer\n")
 		a = a + 1
 	}
-	return Ty.TRec(rl.type_name)
+	return Ty.TRec(type_name)
 }
 
 # `base.field` — either a tag-only union construction (`base` is a union type name,
@@ -283,21 +283,21 @@ const record_type = (RecLit rl, [VarTy] env, Ctx ctx): Ty -> {
 # local, `field` a declared field → an `Int`).
 # `Type.member(args)` — the union must exist, the member must exist, and the argument
 # count and (integer) types must match the member's declared payload.
-const unionmk_type = (UnionMkE mk, [VarTy] env, Ctx ctx): Ty -> {
-	const Iarch ui = find_union(ctx.unions, mk.type_name)
+const unionmk_type = (Str type_name, Str member, [Expr] args, [VarTy] env, Ctx ctx): Ty -> {
+	const Iarch ui = find_union(ctx.unions, type_name)
 	if ui < 0 then die("cf0: type: unknown union type in a construction\n")
-	const Iarch mi = union_member_index(ctx.unions[ui].members, mk.member)
+	const Iarch mi = union_member_index(ctx.unions[ui].members, member)
 	if mi < 0 then die("cf0: type: unknown union member in a construction\n")
 	const Iarch np = Iarch(ctx.unions[ui].members[mi].payloads.len)
-	const Iarch na = Iarch(mk.args.len)
+	const Iarch na = Iarch(args.len)
 	if np != na then die("cf0: type: union member payload arity mismatch\n")
 	let Iarch a = 0
 	loop {
 		if a >= na then break
-		if !is_tint(type_of(mk.args[a], env, ctx)) then die("cf0: type: a union payload must be an integer\n")
+		if !is_tint(type_of(args[a], env, ctx)) then die("cf0: type: a union payload must be an integer\n")
 		a = a + 1
 	}
-	return Ty.TUnion(mk.type_name)
+	return Ty.TUnion(type_name)
 }
 
 const field_type = (Str base, Str field, [VarTy] env, Ctx ctx): Ty -> {
@@ -353,27 +353,27 @@ const type_arm_body = (MatchArm arm, [VarTy] env, Ctx ctx): Ty -> {
 # every member must be covered (unless a `_` is present), a payload pattern's arity
 # must match its member with no repeated binding name, and all arm bodies must share
 # a type — which is the match's type.
-const match_type = (MatchExpr me, [VarTy] env, Ctx ctx): Ty -> {
-	const Str un = union_of(type_of(me.scrut, env, ctx))
+const match_type = (Expr scrut, [MatchArm] arms, [VarTy] env, Ctx ctx): Ty -> {
+	const Str un = union_of(type_of(scrut, env, ctx))
 	if str_eq(un, "") then die("cf0: type: a match scrutinee must be a union\n")
 	const Iarch ui = find_union(ctx.unions, un)
-	const Iarch na = Iarch(me.arms.len)
+	const Iarch na = Iarch(arms.len)
 	if na == 0 then die("cf0: type: a match needs at least one arm\n")
-	const Ty rty = type_arm_body(me.arms[0], env, ctx)
+	const Ty rty = type_arm_body(arms[0], env, ctx)
 	let [Iarch] covered = []
 	let Bool wild_seen = false
 	let Iarch i = 0
 	loop {
 		if i >= na then break
 		if wild_seen then die("cf0: type: no match arm may follow a `_` wildcard\n")
-		if me.arms[i].is_wild then {
+		if arms[i].is_wild then {
 			wild_seen = true
 		} else {
-			if !str_eq(me.arms[i].type_name, un) then die("cf0: type: a match arm must name the scrutinee's union\n")
+			if !str_eq(arms[i].type_name, un) then die("cf0: type: a match arm must name the scrutinee's union\n")
 			let Iarch mj = 0
 			loop {
-				if mj >= Iarch(me.arms[i].members.len) then break
-				const Iarch mi = union_member_index(ctx.unions[ui].members, me.arms[i].members[mj])
+				if mj >= Iarch(arms[i].members.len) then break
+				const Iarch mi = union_member_index(ctx.unions[ui].members, arms[i].members[mj])
 				if mi < 0 then die("cf0: type: a match arm names a nonexistent union member\n")
 				let Iarch d = 0
 				loop {
@@ -385,17 +385,17 @@ const match_type = (MatchExpr me, [VarTy] env, Ctx ctx): Ty -> {
 				mj = mj + 1
 			}
 			# a payload-binding arm (single member): arity must match, no repeated name
-			if Iarch(me.arms[i].binds.len) > 0 then {
-				const Iarch mi0 = union_member_index(ctx.unions[ui].members, me.arms[i].members[0])
-				if Iarch(me.arms[i].binds.len) != Iarch(ctx.unions[ui].members[mi0].payloads.len) then die("cf0: type: a payload pattern's arity must match the member\n")
+			if Iarch(arms[i].binds.len) > 0 then {
+				const Iarch mi0 = union_member_index(ctx.unions[ui].members, arms[i].members[0])
+				if Iarch(arms[i].binds.len) != Iarch(ctx.unions[ui].members[mi0].payloads.len) then die("cf0: type: a payload pattern's arity must match the member\n")
 				let Iarch di = 0
 				loop {
-					if di >= Iarch(me.arms[i].binds.len) then break
-					if !str_eq(me.arms[i].binds[di], "_") then {
+					if di >= Iarch(arms[i].binds.len) then break
+					if !str_eq(arms[i].binds[di], "_") then {
 						let Iarch dj = 0
 						loop {
 							if dj >= di then break
-							if str_eq(me.arms[i].binds[dj], me.arms[i].binds[di]) then die("cf0: type: a payload binding name may not repeat\n")
+							if str_eq(arms[i].binds[dj], arms[i].binds[di]) then die("cf0: type: a payload binding name may not repeat\n")
 							dj = dj + 1
 						}
 					}
@@ -403,7 +403,7 @@ const match_type = (MatchExpr me, [VarTy] env, Ctx ctx): Ty -> {
 				}
 			}
 		}
-		if !ty_eq(type_arm_body(me.arms[i], env, ctx), rty) then die("cf0: type: all match arms must have the same type\n")
+		if !ty_eq(type_arm_body(arms[i], env, ctx), rty) then die("cf0: type: all match arms must have the same type\n")
 		i = i + 1
 	}
 	if !wild_seen then {
@@ -432,30 +432,30 @@ const elem_name_of = (Ty t): Str -> {
 
 # The element type name of an array literal: a spread `[...src, e]` takes the source's
 # element type (and the source must be a dynamic array); otherwise a `let [Elem]`
-# annotation (`al.elem_type`), else the first element's type, else `Iarch` for an empty
+# annotation (`elem_type`), else the first element's type, else `Iarch` for an empty
 # `[]`.
-const arraylit_elem = (ArrLit al, [VarTy] env, Ctx ctx): Str -> {
-	if al.has_spread then {
-		const Iarch vi = env_index(env, al.spread_name)
+const arraylit_elem = (Bool has_spread, Str spread_name, [Expr] elems, Str elem_type, [VarTy] env, Ctx ctx): Str -> {
+	if has_spread then {
+		const Iarch vi = env_index(env, spread_name)
 		if vi < 0 then die("cf0: type: undeclared spread source\n")
 		const Str sen = dyn_of(env[vi].ty)
 		if str_eq(sen, "") then die("cf0: type: a spread source must be a dynamic array\n")
 		return sen
 	}
-	if !str_eq(al.elem_type, "") then return al.elem_type
-	if Iarch(al.elems.len) > 0 then return elem_name_of(type_of(al.elems[0], env, ctx))
+	if !str_eq(elem_type, "") then return elem_type
+	if Iarch(elems.len) > 0 then return elem_name_of(type_of(elems[0], env, ctx))
 	return "Iarch"
 }
 
 # `[a, b]` / `[]` — a dynamic-array literal. Every listed element must match the array's
 # element type (records or words alike).
-const arraylit_type = (ArrLit al, [VarTy] env, Ctx ctx): Ty -> {
-	const Str en = arraylit_elem(al, env, ctx)
+const arraylit_type = (Bool has_spread, Str spread_name, [Expr] elems, Str elem_type, [VarTy] env, Ctx ctx): Ty -> {
+	const Str en = arraylit_elem(has_spread, spread_name, elems, elem_type, env, ctx)
 	const Ty ety = elem_ty(en, ctx)
 	let Iarch i = 0
 	loop {
-		if i >= Iarch(al.elems.len) then break
-		if !ty_eq(type_of(al.elems[i], env, ctx), ety) then die("cf0: type: a dynamic-array element's type must match the array's element type\n")
+		if i >= Iarch(elems.len) then break
+		if !ty_eq(type_of(elems[i], env, ctx), ety) then die("cf0: type: a dynamic-array element's type must match the array's element type\n")
 		i = i + 1
 	}
 	return Ty.TDyn(en)
@@ -497,17 +497,17 @@ const indexfield_type = (Str arr, Expr idx, Str field, [VarTy] env, Ctx ctx): Ty
 }
 
 # A string literal is a `Str`.
-const strlit_type = (StrData sd): Ty -> Ty.TStr
+const strlit_type = ([Uint8] bytes): Ty -> Ty.TStr
 
 # An interpolated string `"…${name}…"` is a `Str`. Each hole must name a declared
 # variable that is stringifiable — an integer (itoa) or a `Str` (its bytes). A Bool,
 # aggregate, or float hole is rejected (a Bool textual form is a later brick).
-const interp_type = (InterpData id, [VarTy] env, Ctx ctx): Ty -> {
+const interp_type = ([Seg] segs, [VarTy] env, Ctx ctx): Ty -> {
 	let Iarch i = 0
 	loop {
-		if i >= Iarch(id.segs.len) then break
-		if id.segs[i].is_hole then {
-			const Iarch vi = env_index(env, id.segs[i].name)
+		if i >= Iarch(segs.len) then break
+		if segs[i].is_hole then {
+			const Iarch vi = env_index(env, segs[i].name)
 			if vi < 0 then die("cf0: type: an interpolation hole names an undeclared variable\n")
 			const Ty ht = env[vi].ty
 			if !is_tint(ht) && !is_tstr(ht) then die("cf0: type: an interpolation hole must be an integer or a string\n")
@@ -528,15 +528,15 @@ const fieldexpr_type = (Expr base, Str field, [VarTy] env, Ctx ctx): Ty -> {
 const type_of = (Expr e, [VarTy] env, Ctx ctx): Ty -> match e {
 	Expr.Lit(v) -> lit_type(v),
 	Expr.BoolLit(b) -> Ty.TBool,
-	Expr.StrLit(sd) -> strlit_type(sd),
-	Expr.Interp(id) -> interp_type(id, env, ctx),
+	Expr.StrLit(bytes) -> strlit_type(bytes),
+	Expr.Interp(segs) -> interp_type(segs, env, ctx),
 	Expr.Var(name) -> var_type(env, name),
 	Expr.FieldExpr(base, f) -> fieldexpr_type(base, f, env, ctx),
-	Expr.Record(rl) -> record_type(rl, env, ctx),
+	Expr.Record(tn, inits) -> record_type(tn, inits, env, ctx),
 	Expr.Field(base, f) -> field_type(base, f, env, ctx),
-	Expr.UnionMk(mk) -> unionmk_type(mk, env, ctx),
-	Expr.Match(me) -> match_type(me, env, ctx),
-	Expr.ArrayLit(al) -> arraylit_type(al, env, ctx),
+	Expr.UnionMk(tn, mem, args) -> unionmk_type(tn, mem, args, env, ctx),
+	Expr.Match(scrut, arms) -> match_type(scrut, arms, env, ctx),
+	Expr.ArrayLit(hs, sn, elems, et) -> arraylit_type(hs, sn, elems, et, env, ctx),
 	Expr.Index(arr, idx) -> index_type(arr, idx, env, ctx),
 	Expr.IndexField(arr, idx, f) -> indexfield_type(arr, idx, f, env, ctx),
 	Expr.Neg(x) -> int_unop(x, env, ctx),
@@ -561,7 +561,7 @@ const type_of = (Expr e, [VarTy] env, Ctx ctx): Ty -> match e {
 	Expr.And(l, r) -> bool_binop(l, r, env, ctx),
 	Expr.Or(l, r) -> bool_binop(l, r, env, ctx),
 	Expr.If(c, t, e2) -> if_type(c, t, e2, env, ctx),
-	Expr.Call(cl) -> call_type(cl, env, ctx)
+	Expr.Call(callee, args) -> call_type(callee, args, env, ctx)
 }
 
 # --- statement / function checking ----------------------------------------------------
@@ -608,7 +608,7 @@ const check_stmts = (Func fn, [Stmt] stmts, [VarTy] env0, Ctx ctx, Ty frt, Bool 
 		if terminated then die("cf0: type: unreachable statement after `break`/`continue`/`return`\n")
 		const Stmt s = stmts[i]
 		match s {
-			Stmt.Loop(bd) -> { check_stmts(fn, bd.stmts, env, ctx, frt, true) },
+			Stmt.Loop(bd) -> { check_stmts(fn, bd, env, ctx, frt, true) },
 			Stmt.Break -> {
 				if !in_loop then die("cf0: type: `break` is only valid inside a loop\n")
 				terminated = true
@@ -648,7 +648,7 @@ const check_stmts = (Func fn, [Stmt] stmts, [VarTy] env0, Ctx ctx, Ty frt, Bool 
 				if field_index(ctx.recs[ri].fields, f) < 0 then die("cf0: type: mutating a field the record does not declare\n")
 				if !is_tint(type_of(e, env, ctx)) then die("cf0: type: a field value must be an integer\n")
 			},
-			Stmt.ForIn(fv, fa, fbd) -> { check_for_body(fn, fv, fa, fbd.stmts, env, ctx, frt) },
+			Stmt.ForIn(fv, fa, fbd) -> { check_for_body(fn, fv, fa, fbd, env, ctx, frt) },
 			Stmt.IndexAssign(a, ix, val) -> {
 				# `arr[idx] = val` — a mutable dynamic array, an integer index and value
 				const Iarch idx = env_index(env, a)
