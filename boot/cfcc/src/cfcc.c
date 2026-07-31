@@ -461,6 +461,14 @@ static void lex(Lexer *lx) {
 				lx->pos++;
 			if (s[lx->pos] == '!' && s[lx->pos + 1] != '=')
 				lx->pos++;
+			/* Casing is grammar (ebnf § Identifiers): a value name (a lowercase-initial
+			 * identifier — `var_name`) is snake_case, so it may not contain an uppercase letter
+			 * (`useVal` is a mis-cased value). A PascalCase `type_name` is uppercase-initial and
+			 * not checked here. Keywords are all-lowercase, so they pass. */
+			if (c >= 'a' && c <= 'z')
+				for (size_t k = start; k < lx->pos; k++)
+					if (s[k] >= 'A' && s[k] <= 'Z')
+						die(lx->line, "a value name must be snake_case (no uppercase; types are PascalCase)");
 			push_tok(lx, TK_IDENT, s + start, (int)(lx->pos - start), 0);
 			continue;
 		}
