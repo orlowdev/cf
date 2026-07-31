@@ -15,7 +15,7 @@
 
 import "io" as { open, read, close, die, o_rdonly }
 import "token" as { Token }
-import "ast" as { RecDecl, UnionDecl, Func, Import, Program }
+import "ast" as { Expr, Stmt, MatchArm, FieldInit, RecDecl, UnionDecl, Func, Import, Program }
 import "lexer" as { lex }
 import "parser" as { Parser, parse_program }
 
@@ -148,9 +148,169 @@ const cat_imports = ([Import] dst, [Import] src): [Import] -> {
 	return out
 }
 
+# --- name mangling (module_system §8: flatten mangles module-private names apart) -------
+#
+# When two modules define a top-level name privately (a `const` helper, not `pub`), the
+# flatten would double-define it. So each module's PRIVATE names are renamed with a
+# per-module tag (`str_eq` → `str_eq__2`) and every reference to one, within that module,
+# is rewritten to match. Exported (`pub`) names are left alone — they are unique across
+# modules and are how imports resolve — so an import binds the same bare name the flatten
+# keeps. Brick scope: private FUNCTIONS only (cf0's collisions are all private helpers;
+# records/unions live once and are imported, never redefined). A private function is only
+# ever referenced by a `Call` (cf0 has no function values), so the rewrite renames each
+# private `Func` definition and every `Call` callee that names one.
+
+# Is `n` one of this module's private names?
+const in_priv = ([Str] priv, Str n): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(priv.len) then break
+		if str_eq(priv[i], n) then return true
+		i = i + 1
+	}
+	return false
+}
+
+# The mangled form of a callee/definition name: private names gain the module tag; every
+# other name (a `pub` export, an imported name, a builtin) is unchanged.
+const mangle_name = (Str n, [Str] priv, Iarch tag): Str -> {
+	if !in_priv(priv, n) then return n
+	return "${n}__${tag}"
+}
+
+# Rewrite every private-function reference in an expression tree. Only a `Call` callee can
+# name a function; every other node is rebuilt unchanged around its recursively rewritten
+# children.
+const mangle_expr = (Expr e, [Str] priv, Iarch tag): Expr -> match e {
+	Expr.Lit(v) -> Expr.Lit(v),
+	Expr.BoolLit(b) -> Expr.BoolLit(b),
+	Expr.Var(n) -> Expr.Var(n),
+	Expr.StrLit(bs) -> Expr.StrLit(bs),
+	Expr.Record(n, fs) -> Expr.Record(n, mangle_fields(fs, priv, tag)),
+	Expr.Field(b, f) -> Expr.Field(b, f),
+	Expr.FieldExpr(b, f) -> Expr.FieldExpr(mangle_expr(b, priv, tag), f),
+	Expr.UnionMk(t, m, args) -> Expr.UnionMk(t, m, mangle_exprs(args, priv, tag)),
+	Expr.Match(scrut, arms) -> Expr.Match(mangle_expr(scrut, priv, tag), mangle_arms(arms, priv, tag)),
+	Expr.ArrayLit(hs, sn, elems, et) -> Expr.ArrayLit(hs, sn, mangle_exprs(elems, priv, tag), et),
+	Expr.Index(a, i) -> Expr.Index(a, mangle_expr(i, priv, tag)),
+	Expr.IndexField(a, i, f) -> Expr.IndexField(a, mangle_expr(i, priv, tag), f),
+	Expr.Interp(segs) -> Expr.Interp(segs),
+	Expr.Neg(x) -> Expr.Neg(mangle_expr(x, priv, tag)),
+	Expr.Not(x) -> Expr.Not(mangle_expr(x, priv, tag)),
+	Expr.BitNot(x) -> Expr.BitNot(mangle_expr(x, priv, tag)),
+	Expr.Add(l, r) -> Expr.Add(mangle_expr(l, priv, tag), mangle_expr(r, priv, tag)),
+	Expr.Sub(l, r) -> Expr.Sub(mangle_expr(l, priv, tag), mangle_expr(r, priv, tag)),
+	Expr.Mul(l, r) -> Expr.Mul(mangle_expr(l, priv, tag), mangle_expr(r, priv, tag)),
+	Expr.Div(l, r) -> Expr.Div(mangle_expr(l, priv, tag), mangle_expr(r, priv, tag)),
+	Expr.Mod(l, r) -> Expr.Mod(mangle_expr(l, priv, tag), mangle_expr(r, priv, tag)),
+	Expr.BitAnd(l, r) -> Expr.BitAnd(mangle_expr(l, priv, tag), mangle_expr(r, priv, tag)),
+	Expr.BitOr(l, r) -> Expr.BitOr(mangle_expr(l, priv, tag), mangle_expr(r, priv, tag)),
+	Expr.BitXor(l, r) -> Expr.BitXor(mangle_expr(l, priv, tag), mangle_expr(r, priv, tag)),
+	Expr.Shl(l, r) -> Expr.Shl(mangle_expr(l, priv, tag), mangle_expr(r, priv, tag)),
+	Expr.Shr(l, r) -> Expr.Shr(mangle_expr(l, priv, tag), mangle_expr(r, priv, tag)),
+	Expr.CmpEq(l, r) -> Expr.CmpEq(mangle_expr(l, priv, tag), mangle_expr(r, priv, tag)),
+	Expr.CmpNe(l, r) -> Expr.CmpNe(mangle_expr(l, priv, tag), mangle_expr(r, priv, tag)),
+	Expr.CmpLt(l, r) -> Expr.CmpLt(mangle_expr(l, priv, tag), mangle_expr(r, priv, tag)),
+	Expr.CmpGt(l, r) -> Expr.CmpGt(mangle_expr(l, priv, tag), mangle_expr(r, priv, tag)),
+	Expr.CmpLe(l, r) -> Expr.CmpLe(mangle_expr(l, priv, tag), mangle_expr(r, priv, tag)),
+	Expr.CmpGe(l, r) -> Expr.CmpGe(mangle_expr(l, priv, tag), mangle_expr(r, priv, tag)),
+	Expr.And(l, r) -> Expr.And(mangle_expr(l, priv, tag), mangle_expr(r, priv, tag)),
+	Expr.Or(l, r) -> Expr.Or(mangle_expr(l, priv, tag), mangle_expr(r, priv, tag)),
+	Expr.If(c, t, e2) -> Expr.If(mangle_expr(c, priv, tag), mangle_expr(t, priv, tag), mangle_expr(e2, priv, tag)),
+	Expr.Call(n, args) -> Expr.Call(mangle_name(n, priv, tag), mangle_exprs(args, priv, tag))
+}
+
+# Rewrite a list of expressions / a data literal's field values / a match's arms.
+const mangle_exprs = ([Expr] es, [Str] priv, Iarch tag): [Expr] -> {
+	let [Expr] out = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(es.len) then break
+		out = [...out, mangle_expr(es[i], priv, tag)]
+		i = i + 1
+	}
+	return out
+}
+const mangle_fields = ([FieldInit] fs, [Str] priv, Iarch tag): [FieldInit] -> {
+	let [FieldInit] out = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(fs.len) then break
+		out = [...out, FieldInit({ field: fs[i].field, value: mangle_expr(fs[i].value, priv, tag) })]
+		i = i + 1
+	}
+	return out
+}
+const mangle_arms = ([MatchArm] arms, [Str] priv, Iarch tag): [MatchArm] -> {
+	let [MatchArm] out = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		const MatchArm a = arms[i]
+		out = [...out, MatchArm({ is_wild: a.is_wild, type_name: a.type_name, members: a.members, binds: a.binds, body: mangle_expr(a.body, priv, tag) })]
+		i = i + 1
+	}
+	return out
+}
+
+# Rewrite every private-function reference in a statement (recursing into nested blocks).
+const mangle_stmt = (Stmt s, [Str] priv, Iarch tag): Stmt -> match s {
+	Stmt.Let(n, m, e) -> Stmt.Let(n, m, mangle_expr(e, priv, tag)),
+	Stmt.Assign(n, e) -> Stmt.Assign(n, mangle_expr(e, priv, tag)),
+	Stmt.FieldAssign(b, f, e) -> Stmt.FieldAssign(b, f, mangle_expr(e, priv, tag)),
+	Stmt.IndexAssign(a, i, v) -> Stmt.IndexAssign(a, mangle_expr(i, priv, tag), mangle_expr(v, priv, tag)),
+	Stmt.Return(e) -> Stmt.Return(mangle_expr(e, priv, tag)),
+	Stmt.ForIn(v, a, body) -> Stmt.ForIn(v, a, mangle_stmts(body, priv, tag)),
+	Stmt.Loop(body) -> Stmt.Loop(mangle_stmts(body, priv, tag)),
+	Stmt.Break -> Stmt.Break,
+	Stmt.Continue -> Stmt.Continue,
+	Stmt.IfThen(c, st) -> Stmt.IfThen(mangle_expr(c, priv, tag), mangle_stmt(st, priv, tag)),
+	Stmt.IfElse(c, t, e) -> Stmt.IfElse(mangle_expr(c, priv, tag), mangle_stmt(t, priv, tag), mangle_stmt(e, priv, tag))
+}
+const mangle_stmts = ([Stmt] ss, [Str] priv, Iarch tag): [Stmt] -> {
+	let [Stmt] out = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		out = [...out, mangle_stmt(ss[i], priv, tag)]
+		i = i + 1
+	}
+	return out
+}
+
+# The private (non-`pub`) function names of a module — the set to mangle.
+const priv_names = ([Func] fs): [Str] -> {
+	let [Str] out = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(fs.len) then break
+		if !fs[i].is_pub then out = [...out, fs[i].name]
+		i = i + 1
+	}
+	return out
+}
+
+# Mangle one module's functions with tag `tag`: rename each private definition and rewrite
+# every private-function reference in every body.
+const mangle_funcs = ([Func] fs, Iarch tag): [Func] -> {
+	const [Str] priv = priv_names(fs)
+	let [Func] out = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(fs.len) then break
+		const Func f = fs[i]
+		const Str nm = mangle_name(f.name, priv, tag)
+		const [Stmt] body = mangle_stmts(f.body, priv, tag)
+		out = [...out, Func({ name: nm, is_pub: f.is_pub, ret_name: f.ret_name, ret_elem: f.ret_elem, params: f.params, body: body })]
+		i = i + 1
+	}
+	return out
+}
+
 # Load the entry module and flatten its transitive import graph into one Program. The
 # work list grows as newly loaded modules contribute imports; `loaded` dedups by resolved
-# path so a diamond or a cycle loads each module once.
+# path so a diamond or a cycle loads each module once. Each module's private functions are
+# mangled with its own tag so they cannot collide after the flatten.
 pub const resolve_program = (Str entry): Program -> {
 	const Str dir = dir_of(entry)
 	const Program root = load_module(entry)
@@ -159,10 +319,11 @@ pub const resolve_program = (Str entry): Program -> {
 	let [Func] funcs = []
 	recs = cat_recs(recs, root.recs)
 	unions = cat_unions(unions, root.unions)
-	funcs = cat_funcs(funcs, root.funcs)
+	funcs = cat_funcs(funcs, mangle_funcs(root.funcs, 0)) # the entry is module tag 0
 	let [Str] loaded = []
 	let [Import] work = []
 	work = cat_imports(work, root.imports)
+	let Iarch tag = 0
 	let Iarch wi = 0
 	loop {
 		if wi >= Iarch(work.len) then break
@@ -170,10 +331,11 @@ pub const resolve_program = (Str entry): Program -> {
 		const Str mpath = build_path(dir, im.path)
 		if !seen(loaded, mpath) then {
 			loaded = [...loaded, mpath]
+			tag = tag + 1 # a distinct tag per loaded module, so private names cannot collide
 			const Program m = load_module(mpath)
 			recs = cat_recs(recs, m.recs)
 			unions = cat_unions(unions, m.unions)
-			funcs = cat_funcs(funcs, m.funcs)
+			funcs = cat_funcs(funcs, mangle_funcs(m.funcs, tag))
 			work = cat_imports(work, m.imports)
 		}
 		wi = wi + 1
