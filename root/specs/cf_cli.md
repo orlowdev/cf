@@ -158,10 +158,11 @@ darwin-arm64  darwin-amd64  linux-arm64  linux-amd64  linux-riscv64  wasm
 ```
 
 The pair splits into the two values the `comptime` module exposes for conditional
-imports (see [[ebnf.md]], Modules): `comptime.os.target` ∈ `{darwin, linux, wasm}`
-and `comptime.arch.target` ∈ `{arm64, amd64, riscv64, wasm}`. `wasm` is the one
-token that does not split on `-`: it sets **both** `os` and `arch` to `wasm`.
-Default is the **host** pair — the os and arch `cf` itself runs on.
+imports (see [[ebnf.md]], Modules; [[module_system.md]] §7): `comptime.os.target` ∈
+`{darwin, linux}` and `comptime.arch.target` ∈ `{arm64, amd64, riscv64, wasm}`. `wasm`
+is the one token that does not split on `-`: **Wasm is not an OS**, so it sets the
+**arch** to `wasm` and leaves `os` at its default. Default is the **host** pair — the os
+and arch `cf` itself runs on (so a bare `wasm` target is the Wasm arch on the host os).
 
 Two targets carry known asterisks, both deferred (§8):
 
