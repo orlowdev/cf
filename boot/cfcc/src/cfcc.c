@@ -8858,6 +8858,19 @@ static Type typeof_expr_compute(Program *prog, Func *fn, Expr *e) {
 				die(e->line, "a numeric operator needs two operands of the same fixed-width or `Uarch` type (no mixed widths/signedness — cast explicitly)");
 			return is_cmp ? mk_bool() : lt;
 		}
+		if (lt.kind == TY_UNION || rt.kind == TY_UNION) {
+			/* `==`/`!=` on two values of the SAME tag-only union compares their tag words (a
+			 * tag-only union lowers to a plain word; both operands emit as `w` tags → `ceqw`/`cnew`).
+			 * Ordering (`<`/`>`/…) is meaningless on tags — rejected. A BOXED (payload) union is a
+			 * pointer, so `==` would compare identity, not the case — matched, not compared. */
+			if (e->kind != EX_EQ && e->kind != EX_NE)
+				die(e->line, "a union supports only `==`/`!=` (tag equality), not ordering `<`/`>`/`<=`/`>=`");
+			if (lt.kind != TY_UNION || rt.kind != TY_UNION || lt.uni != rt.uni)
+				die(e->line, "`==`/`!=` compares two values of the same union");
+			if (lt.uni->has_payload)
+				die(e->line, "`==`/`!=` compares tag-only unions; a payload union is recovered with `match`, not compared");
+			return mk_bool();
+		}
 		expect_int(prog, fn, e->lhs);
 		expect_int(prog, fn, e->rhs);
 		return is_cmp ? mk_bool() : mk_iarch();
