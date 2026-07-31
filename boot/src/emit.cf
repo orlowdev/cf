@@ -1032,6 +1032,29 @@ const emit_guard = (*Emit ctx, [Binding] env, Expr cond, Stmt body): Iarch -> {
 	return 0
 }
 
+# Emit a statement-position `if cond then <then> else <else>`: branch into `@then`/`@else`
+# blocks, each running its guarded statement and, when it falls through (a non-terminal
+# statement), jumping to a shared `@end`. `@end` is emitted only when at least one branch
+# falls through — if BOTH branches terminate (each writes its own `ret`/`jmp`), the whole
+# statement is terminal and there is no join block. Returns 1 in that both-terminal case
+# (so an enclosing loop/block sees the termination), else 0.
+const emit_ifelse = (*Emit ctx, [Binding] env, Expr cond, Stmt tb, Stmt eb): Iarch -> {
+	const Str cc = emit_expr(cond, ctx, env)
+	const Iarch gid = ctx.label
+	ctx.label = ctx.label + 1
+	write_str(ctx.fd, "\tjnz ${cc}, @then${gid}, @else${gid}\n")
+	write_str(ctx.fd, "@then${gid}\n")
+	const Iarch tterm = emit_simple_stmt(ctx, env, tb)
+	if tterm == 0 then write_str(ctx.fd, "\tjmp @end${gid}\n")
+	write_str(ctx.fd, "@else${gid}\n")
+	const Iarch eterm = emit_simple_stmt(ctx, env, eb)
+	if eterm == 0 then write_str(ctx.fd, "\tjmp @end${gid}\n")
+	let Iarch both = 0
+	if tterm == 1 then { if eterm == 1 then both = 1 }
+	if both == 0 then write_str(ctx.fd, "@end${gid}\n")
+	return both
+}
+
 # Emit one "simple" statement — a loop exit, an early return, an assignment, or a nested
 # `if` guard. It is the fall-through case of `emit_block` and the body of every guard, so
 # it reads the environment but never extends it (a binding/block statement is a block
@@ -1101,6 +1124,9 @@ const emit_simple_stmt = (*Emit ctx, [Binding] env, Stmt s): Iarch -> {
 		},
 		Stmt.IfThen(c, body) -> {
 			emit_guard(ctx, env, c, body)
+		},
+		Stmt.IfElse(c, tb, eb) -> {
+			term = emit_ifelse(ctx, env, c, tb, eb)
 		},
 		_ -> {
 			die("cf0: emit: unexpected guarded statement\n")
