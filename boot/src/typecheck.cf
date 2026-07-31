@@ -90,6 +90,20 @@ const find_union = ([UnionDecl] unions, Str name): Iarch -> {
 	return 0 - 1
 }
 
+# Does the union declared as `name` have any payload-carrying member? A union with
+# no payload anywhere is tag-only — a bare word tag, so `==`/`!=` compares the words.
+const union_has_payload = ([UnionDecl] unions, Str name): Bool -> {
+	const Iarch ui = find_union(unions, name)
+	if ui < 0 then return false
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(unions[ui].members.len) then break
+		if Iarch(unions[ui].members[i].payloads.len) > 0 then return true
+		i = i + 1
+	}
+	return false
+}
+
 # The index (tag) of member `name` among a union's members, or -1.
 const union_member_index = ([UnionMember] members, Str name): Iarch -> {
 	let Iarch i = 0
@@ -185,10 +199,22 @@ const int_binop = (Expr l, Expr r, [VarTy] env, Ctx ctx): Ty -> {
 	return Ty.TInt
 }
 
-# `== != < > <= >=` — integer operands, a Bool result.
-const cmp_op = (Expr l, Expr r, [VarTy] env, Ctx ctx): Ty -> {
-	if !is_tint(type_of(l, env, ctx)) then die("cf0: type: a comparison operand must be an integer\n")
-	if !is_tint(type_of(r, env, ctx)) then die("cf0: type: a comparison operand must be an integer\n")
+# `== != < > <= >=` — integer operands, a Bool result. `==`/`!=` (`is_eq`) also
+# compare two values of the SAME tag-only union: both lower to a word tag, so the
+# comparison is a tag compare (type_system §5 — equality is structural). Ordering
+# (`< > <= >=`) stays integer-only, and a payload-carrying union is recovered with
+# `match`, not compared by tag.
+const cmp_op = (Expr l, Expr r, [VarTy] env, Ctx ctx, Bool is_eq): Ty -> {
+	const Ty lt = type_of(l, env, ctx)
+	const Ty rt = type_of(r, env, ctx)
+	const Str lu = union_of(lt)
+	if is_eq && !str_eq(lu, "") then {
+		if !str_eq(lu, union_of(rt)) then die("cf0: type: `==`/`!=` on a union needs both operands to be the same union\n")
+		if union_has_payload(ctx.unions, lu) then die("cf0: type: a union with a payload is recovered with `match`, not compared\n")
+		return Ty.TBool
+	}
+	if !is_tint(lt) then die("cf0: type: a comparison operand must be an integer\n")
+	if !is_tint(rt) then die("cf0: type: a comparison operand must be an integer\n")
 	return Ty.TBool
 }
 
@@ -552,12 +578,12 @@ const type_of = (Expr e, [VarTy] env, Ctx ctx): Ty -> match e {
 	Expr.BitXor(l, r) -> int_binop(l, r, env, ctx),
 	Expr.Shl(l, r) -> int_binop(l, r, env, ctx),
 	Expr.Shr(l, r) -> int_binop(l, r, env, ctx),
-	Expr.CmpEq(l, r) -> cmp_op(l, r, env, ctx),
-	Expr.CmpNe(l, r) -> cmp_op(l, r, env, ctx),
-	Expr.CmpLt(l, r) -> cmp_op(l, r, env, ctx),
-	Expr.CmpGt(l, r) -> cmp_op(l, r, env, ctx),
-	Expr.CmpLe(l, r) -> cmp_op(l, r, env, ctx),
-	Expr.CmpGe(l, r) -> cmp_op(l, r, env, ctx),
+	Expr.CmpEq(l, r) -> cmp_op(l, r, env, ctx, true),
+	Expr.CmpNe(l, r) -> cmp_op(l, r, env, ctx, true),
+	Expr.CmpLt(l, r) -> cmp_op(l, r, env, ctx, false),
+	Expr.CmpGt(l, r) -> cmp_op(l, r, env, ctx, false),
+	Expr.CmpLe(l, r) -> cmp_op(l, r, env, ctx, false),
+	Expr.CmpGe(l, r) -> cmp_op(l, r, env, ctx, false),
 	Expr.And(l, r) -> bool_binop(l, r, env, ctx),
 	Expr.Or(l, r) -> bool_binop(l, r, env, ctx),
 	Expr.If(c, t, e2) -> if_type(c, t, e2, env, ctx),
