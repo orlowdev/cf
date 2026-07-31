@@ -6390,6 +6390,17 @@ static void check_entry(Program *prog) {
 		die(0, "`main` cannot be generic");
 }
 
+/* True when `main` takes the idiomatic single `[Str] args` — a `[T]` param whose element is
+ * `Str`. The freestanding `_start` then converts the raw C `(argc, argv)` into a real cf `[Str]`
+ * (a `{data,len,cap}` vector of `{bytes,len}` Str headers borrowing the argv C-strings) before
+ * calling main; the plain forms (`main()`, `main(argc, argv, envp)`) pass the registers through.
+ * ⚠ cf0 inherits the `[Str] args` shape; the raw-word argv form is the genesis fallback. */
+static int main_takes_argv_strs(Program *prog) {
+	Func *m = prog_find_func(prog, "main");
+	return m && m->nparams == 1 && m->params[0].kind == PK_DYN &&
+	       strcmp(m->params[0].arr_elem, "Str") == 0;
+}
+
 /* ---------------------------------------------------------- monomorphize - */
 
 /* Generic functions are specialized by whole-program monomorphization (the spec's
@@ -11939,7 +11950,7 @@ static void emit_func(FILE *out, const Func *fn) {
  * `_start` can initialize them after the mmap. (cfcc's own codegen — not the cf0
  * `%node`/`%ret` ABI, which cf0.cf will emit; this is a provisional throwaway
  * runtime, like the record layout it serves.) */
-static void emit_runtime_qbe(FILE *out) {
+static void emit_runtime_qbe(FILE *out, int argv_form) {
 	fprintf(out, "export data $cf_top = { l 0 }\n");
 	fprintf(out, "export data $cf_limit = { l 0 }\n");
 	fprintf(out, "function l $cf_alloc(w %%n) {\n");
@@ -12215,6 +12226,68 @@ static void emit_runtime_qbe(FILE *out) {
 	    "\tret 1\n"
 	    "}\n",
 	    out);
+	if (argv_form) {
+		/* argv → a cf `[Str]`. `cf_strlen` is the C-string length; `cf_build_args` walks the
+		 * `argc` C-strings in `argv`, wrapping each in a `{bytes, len}` Str header (BORROWING the
+		 * OS's argv bytes — already NUL-terminated) and pushing it onto a fresh `[Str]` vector.
+		 * Called once from the freestanding `_start` before `main`. */
+		fputs(
+		    "function l $cf_strlen(l %p) {\n"
+		    "@start\n"
+		    "\t%pp =l alloc8 8\n"
+		    "\tstorel %p, %pp\n"
+		    "\t%np =l alloc8 8\n"
+		    "\tstorel 0, %np\n"
+		    "@loop\n"
+		    "\t%cp =l loadl %pp\n"
+		    "\t%c =w loadub %cp\n"
+		    "\tjnz %c, @more, @done\n"
+		    "@more\n"
+		    "\t%cp2 =l loadl %pp\n"
+		    "\t%cp3 =l add %cp2, 1\n"
+		    "\tstorel %cp3, %pp\n"
+		    "\t%n0 =l loadl %np\n"
+		    "\t%n1 =l add %n0, 1\n"
+		    "\tstorel %n1, %np\n"
+		    "\tjmp @loop\n"
+		    "@done\n"
+		    "\t%r =l loadl %np\n"
+		    "\tret %r\n"
+		    "}\n"
+		    "export function l $cf_build_args(l %argc, l %argv) {\n"
+		    "@start\n"
+		    "\t%hdr =l call $cf_alloc(w 24)\n"
+		    "\tstorel 0, %hdr\n"
+		    "\t%h8 =l add %hdr, 8\n"
+		    "\tstorel 0, %h8\n"
+		    "\t%h16 =l add %hdr, 16\n"
+		    "\tstorel 0, %h16\n"
+		    "\t%ip =l alloc8 8\n"
+		    "\tstorel 0, %ip\n"
+		    "@loop\n"
+		    "\t%i =l loadl %ip\n"
+		    "\t%adone =w cugel %i, %argc\n"
+		    "\tjnz %adone, @done, @body\n"
+		    "@body\n"
+		    "\t%ao =l mul %i, 8\n"
+		    "\t%ap =l add %argv, %ao\n"
+		    "\t%cs =l loadl %ap\n"
+		    "\t%len =l call $cf_strlen(l %cs)\n"
+		    "\t%sh =l call $cf_alloc(w 16)\n"
+		    "\tstorel %cs, %sh\n"
+		    "\t%sh8 =l add %sh, 8\n"
+		    "\t%lenw =w copy %len\n"
+		    "\tstorew %lenw, %sh8\n"
+		    "\t%slot =l call $cf_dyn_push(l %hdr, w 8)\n"
+		    "\tstorel %sh, %slot\n"
+		    "\t%i1 =l add %i, 1\n"
+		    "\tstorel %i1, %ip\n"
+		    "\tjmp @loop\n"
+		    "@done\n"
+		    "\tret %hdr\n"
+		    "}\n",
+		    out);
+	}
 }
 
 /* The freestanding asm runtime, emitted beside the QBE-lowered code (asm bypasses
@@ -12278,11 +12351,18 @@ static void emit_runtime_common(FILE *out) {
  * `_start` forwards those registers straight into `main` and exits with its Int
  * return. In `--libc dynamic` this is omitted — the C runtime's own `_start` calls
  * `_main` with the same argc/argv/envp ABI. */
-static void emit_start(FILE *out) {
+static void emit_start(FILE *out, int argv_form) {
 	fprintf(out, ".globl _start\n");
 	fprintf(out, ".p2align 2\n");
 	fprintf(out, "_start:\n");
-	fprintf(out, "\tbl _main\n");          /* argc/argv/envp already in x0/x1/x2 */
+	if (argv_form) {
+		/* `main([Str] args)`: convert the raw C `(argc in x0, argv char** in x1)` into a cf
+		 * `[Str]` header via `cf_build_args`, then pass THAT pointer (in x0) to main. */
+		fprintf(out, "\tbl _cf_build_args\n");  /* (argc, argv) -> a `[Str]` header in x0 */
+		fprintf(out, "\tbl _main\n");
+	} else {
+		fprintf(out, "\tbl _main\n");          /* argc/argv/envp already in x0/x1/x2 */
+	}
 	fprintf(out, "\tmov x16, #1\n");        /* SYS_exit with main's Int return (x0) */
 	fprintf(out, "\tsvc #0x80\n");
 }
@@ -13308,7 +13388,11 @@ int main(int argc, char **argv) {
 	FILE *f = fopen(g_qbe_il, "wb");
 	if (!f)
 		die(0, "cannot write QBE IL");
-	emit_runtime_qbe(f); /* the arena allocator + bump cursor, ahead of the user code */
+	int argv_form = main_takes_argv_strs(&prog); /* main([Str] args) → build a `[Str]` in _start */
+	if (argv_form && libc != LIBC_NONE)
+		die(0, "`main([Str] args)` needs the freestanding entry (`--libc none`); the hosted C "
+		       "runtime calls `main` with raw argc/argv, so use `main(Int argc, *[…] argv)` there");
+	emit_runtime_qbe(f, argv_form); /* the arena allocator + bump cursor, ahead of the user code */
 	for (int i = 0; i < prog.nfuncs; i++)
 		if (prog.funcs[i]->ntyparams == 0) /* skip generic templates (only clones emit) */
 			collect_strlits_stmt(prog.funcs[i]->body);
@@ -13323,7 +13407,7 @@ int main(int argc, char **argv) {
 		die(0, "cannot write runtime asm");
 	emit_runtime_common(f);           /* arena init + error handlers (both link modes) */
 	if (libc == LIBC_NONE)
-		emit_start(f);            /* freestanding entry; hosted uses the C runtime's */
+		emit_start(f, argv_form); /* freestanding entry; hosted uses the C runtime's */
 	emit_asm_funcs(f, &prog); /* user asm functions, verbatim, beside the runtime */
 	fclose(f);
 
