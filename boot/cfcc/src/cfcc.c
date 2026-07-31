@@ -5864,14 +5864,6 @@ static UnionDecl *parse_union_decl(Parser *p, Program *prog) {
 			maxarity = u->arity[i];
 	}
 	u->size = 8 + maxarity * 8;
-	for (int i = 0; i < u->nmembers; i++)
-		for (int j = 0; j < u->arity[i]; j++)
-			if (u->payload_types[i][j][0] == '[')
-				/* A `[T]` dynamic-array UNION payload is a later brick — the boxed-payload storage,
-				 * construction, and match binding for a growable-vector payload are unbuilt. Record
-				 * FIELDS carry `[T]` (a context struct); a union payload does not yet. Rejected at the
-				 * declaration so no half-wired construct/match path opens. ⚠ cf0 supports it. */
-				die(nm->line, "a `[T]` dynamic-array union payload is a later brick — use a record field, or a `*[Iarch]`/`*[Uint8]` pointer payload");
 	for (int i = 0; i < u->nmembers; i++) /* every `'T` payload must name a declared type parameter */
 		for (int j = 0; j < u->arity[i]; j++)
 			check_tyvars_declared(u->payload_types[i][j], u->typarams, u->ntyparams, nm->line);
