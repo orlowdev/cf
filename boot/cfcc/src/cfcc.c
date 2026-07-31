@@ -4693,14 +4693,17 @@ static Stmt *parse_stmt(Parser *p, Func *fn, int *saw_return) {
 			at.alen = arrlen;
 			func_add_local(fn, s->name, mutable, at, "");
 		} else if (is_dyn) {
-			/* `let [T] xs = []` (empty) or `= [e0, …]` (initial elements) — a growable vector.
-			 * The initializer is an array literal (possibly empty); elements are checked/adopted
-			 * against the element type in the ST_LOCAL typecheck, growth via `xs = [...xs, e]`. */
+			/* `let [T] xs = []` / `= [e0, …]` (a literal, possibly empty), `= [...src, e]` (a
+			 * value-level copy-append), `= f()` (a `[T]`-returning call), or `= ys` (ALIASING an
+			 * existing `[T]` var/param/field/element). No parse-time kind gate: the ST_LOCAL
+			 * typecheck requires the initializer to be TY_DYN with a matching element type, and
+			 * emit builds a fresh header for a literal or adopts/aliases the existing header
+			 * pointer otherwise (the record-alias fix #1 precedent). Aliasing is arena-safe — cfcc
+			 * never frees a backing, so an aliased `{data,len,cap}` header cannot dangle; a later
+			 * `ys = [...ys, e]` growth reallocs and updates that shared header in place, which the
+			 * alias observes (a genuine second-bind cf0/cf re-enforce §6 over via the real memory
+			 * arc, taking an explicit `copy` — KEEP DISCLAIMED). Elements/growth as before. */
 			s->expr = parse_expr(p, fn);
-			if (s->expr->kind != EX_ARRAY && s->expr->kind != EX_CALL)
-				die(name->line, "a `[T]` dynamic array binds an array literal (`[]` or `[e0, …]`) or a `[T]`-returning call");
-			/* A spread-headed initializer `= [...src, e]` is the general value-level copy-append
-			 * (typechecked/emitted via $cf_dyn_copy) — no longer restricted to in-place growth. */
 			s->is_dyn = 1;
 			snprintf(s->arr_elem, sizeof s->arr_elem, "%s", arrelem); /* "" ⇒ Iarch; resolved in typecheck */
 			Type dt = {TY_DYN, NULL, NULL, 0, NULL};
