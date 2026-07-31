@@ -449,10 +449,36 @@ const emit_record_val = (*Emit ctx, Str type_name, [FieldInit] inits, [Binding] 
 
 # Emit `Type.member(args)` — a payload-member union construction: an arena box
 # `{tag@0, arg0@4, arg1@8, …}`, returned as its base pointer.
+# Is payload `i` of union member `uni.member` an 8-byte pointer (a `Str`/`[T]`/record/boxed
+# union) vs a word? And its declared type / `[T]` element (for binding a match's payload).
+const payload_is_ptr = (*Emit ctx, Str uni, Str member, Iarch i): Bool -> {
+	const Iarch ui = find_union(ctx.unions, uni)
+	const Iarch mi = member_tag(ctx.unions, uni, member)
+	const Str pt = ctx.unions[ui].members[mi].payloads[i]
+	if str_eq(pt, "$dyn") then return true
+	if str_eq(pt, "Str") then return true
+	if find_rec(ctx.recs, pt) >= 0 then return true
+	if find_union(ctx.unions, pt) >= 0 then return union_is_boxed(ctx.unions, pt)
+	return false
+}
+const payload_type = (*Emit ctx, Str uni, Str member, Iarch i): Str -> {
+	const Iarch ui = find_union(ctx.unions, uni)
+	const Iarch mi = member_tag(ctx.unions, uni, member)
+	return ctx.unions[ui].members[mi].payloads[i]
+}
+const payload_elem = (*Emit ctx, Str uni, Str member, Iarch i): Str -> {
+	const Iarch ui = find_union(ctx.unions, uni)
+	const Iarch mi = member_tag(ctx.unions, uni, member)
+	return ctx.unions[ui].members[mi].pelems[i]
+}
+
+# Construct a boxed union member: `{tag@0, payload_0@8, payload_1@16, …}` in the arena
+# (uniform 8-byte payload slots). A pointer payload stores its 8-byte pointer, a word
+# payload stores its value in the low 4 bytes.
 const emit_union_mk = (*Emit ctx, Str type_name, Str member, [Expr] args, [Binding] env): Str -> {
 	const Iarch tag = member_tag(ctx.unions, type_name, member)
 	const Iarch na = Iarch(args.len)
-	const Iarch size = 4 + na * 4
+	const Iarch size = 8 + na * 8
 	const Iarch b = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${b} =l call $cf_alloc(w ${size})\n")
@@ -461,11 +487,15 @@ const emit_union_mk = (*Emit ctx, Str type_name, Str member, [Expr] args, [Bindi
 	loop {
 		if i >= na then break
 		const Str v = emit_expr(args[i], ctx, env)
-		const Iarch off = 4 + i * 4
+		const Iarch off = 8 + i * 8
 		const Iarch addr = ctx.next
 		ctx.next = ctx.next + 1
 		write_str(ctx.fd, "\t%t${addr} =l add %t${b}, ${off}\n")
-		write_str(ctx.fd, "\tstorew ${v}, %t${addr}\n")
+		if payload_is_ptr(ctx, type_name, member, i) then {
+			write_str(ctx.fd, "\tstorel ${v}, %t${addr}\n")
+		} else {
+			write_str(ctx.fd, "\tstorew ${v}, %t${addr}\n")
+		}
 		i = i + 1
 	}
 	return "%t${b}"
@@ -725,18 +755,30 @@ const arm_body_env = (*Emit ctx, [Binding] env, MatchArm arm, Str s): [Binding] 
 	loop {
 		if bi >= Iarch(arm.binds.len) then break
 		if !str_eq(arm.binds[bi], "_") then {
-			const Iarch off = 4 + bi * 4
+			const Iarch off = 8 + bi * 8
 			const Iarch addr = ctx.next
 			ctx.next = ctx.next + 1
 			write_str(ctx.fd, "\t%t${addr} =l add ${s}, ${off}\n")
-			const Iarch val = ctx.next
-			ctx.next = ctx.next + 1
-			write_str(ctx.fd, "\t%t${val} =w loadw %t${addr}\n")
-			const Iarch bslot = ctx.next
-			ctx.next = ctx.next + 1
-			write_str(ctx.fd, "\t%t${bslot} =l alloc4 4\n")
-			write_str(ctx.fd, "\tstorew %t${val}, %t${bslot}\n")
-			benv = [...benv, Binding({ name: arm.binds[bi], slot: bslot, rec_type: "", elem: "" })]
+			if payload_is_ptr(ctx, arm.type_name, arm.members[0], bi) then {
+				# a pointer payload (Str/[T]/record/union): load the 8-byte pointer and bind it
+				# directly as an aggregate (its declared type is the binding's rec_type/elem)
+				const Iarch val = ctx.next
+				ctx.next = ctx.next + 1
+				write_str(ctx.fd, "\t%t${val} =l loadl %t${addr}\n")
+				const Str pt = payload_type(ctx, arm.type_name, arm.members[0], bi)
+				const Str pe = payload_elem(ctx, arm.type_name, arm.members[0], bi)
+				benv = [...benv, Binding({ name: arm.binds[bi], slot: val, rec_type: pt, elem: pe })]
+			} else {
+				# a word payload: load it and spill to its own 4-byte slot (read via loadw)
+				const Iarch val = ctx.next
+				ctx.next = ctx.next + 1
+				write_str(ctx.fd, "\t%t${val} =w loadw %t${addr}\n")
+				const Iarch bslot = ctx.next
+				ctx.next = ctx.next + 1
+				write_str(ctx.fd, "\t%t${bslot} =l alloc4 4\n")
+				write_str(ctx.fd, "\tstorew %t${val}, %t${bslot}\n")
+				benv = [...benv, Binding({ name: arm.binds[bi], slot: bslot, rec_type: "", elem: "" })]
+			}
 		}
 		bi = bi + 1
 	}
