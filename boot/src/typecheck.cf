@@ -118,17 +118,24 @@ const union_member_index = ([UnionMember] members, Str name): Iarch -> {
 # Resolve a parameter's declared type to a `Ty`: an opaque pointer, a declared
 # record (`TRec`) or union (`TUnion`), a `Bool`, or an integer (`Iarch`/`Int`). An
 # unrecognized type name is rejected.
+# Resolve a written type name (+ `[T]` element) to a `Ty`: a dynamic array, a declared
+# record/union, or a builtin scalar (`Bool`/`Str`/`Iarch`/`Int`). Shared by parameters,
+# record fields, and union payloads.
+const named_ty = (Str type_name, Str elem, [RecDecl] recs, [UnionDecl] unions): Ty -> {
+	if str_eq(type_name, "$dyn") then return Ty.TDyn(elem)
+	if find_rec(recs, type_name) >= 0 then return Ty.TRec(type_name)
+	if find_union(unions, type_name) >= 0 then return Ty.TUnion(type_name)
+	if str_eq(type_name, "Bool") then return Ty.TBool
+	if str_eq(type_name, "Str") then return Ty.TStr
+	if str_eq(type_name, "Iarch") then return Ty.TInt
+	if str_eq(type_name, "Int") then return Ty.TInt
+	die("cf0: type: an undeclared type name\n")
+	return Ty.TInt
+}
+
 const param_ty = (Param p, [RecDecl] recs, [UnionDecl] unions): Ty -> {
 	if p.is_ptr then return Ty.TPtr
-	if str_eq(p.type_name, "$dyn") then return Ty.TDyn(p.elem)
-	if find_rec(recs, p.type_name) >= 0 then return Ty.TRec(p.type_name)
-	if find_union(unions, p.type_name) >= 0 then return Ty.TUnion(p.type_name)
-	if str_eq(p.type_name, "Bool") then return Ty.TBool
-	if str_eq(p.type_name, "Str") then return Ty.TStr
-	if str_eq(p.type_name, "Iarch") then return Ty.TInt
-	if str_eq(p.type_name, "Int") then return Ty.TInt
-	die("cf0: type: a parameter names an undeclared type\n")
-	return Ty.TInt
+	return named_ty(p.type_name, p.elem, recs, unions)
 }
 
 # Resolve a function's declared return type to a `Ty` (`""` → the implicit `Int`).
@@ -295,14 +302,16 @@ const record_type = (Str type_name, [FieldInit] inits, [VarTy] env, Ctx ctx): Ty
 	let Iarch a = 0
 	loop {
 		if a >= ni then break
-		if field_index(ctx.recs[ri].fields, inits[a].field) < 0 then die("cf0: type: unknown field in a data literal\n")
+		const Iarch fi = field_index(ctx.recs[ri].fields, inits[a].field)
+		if fi < 0 then die("cf0: type: unknown field in a data literal\n")
 		let Iarch b = 0
 		loop {
 			if b >= a then break
 			if str_eq(inits[b].field, inits[a].field) then die("cf0: type: a field is set twice in a data literal\n")
 			b = b + 1
 		}
-		if !is_tint(type_of(inits[a].value, env, ctx)) then die("cf0: type: a data-literal field value must be an integer\n")
+		const Ty ft = named_ty(ctx.recs[ri].ftypes[fi], ctx.recs[ri].felems[fi], ctx.recs, ctx.unions)
+		if !ty_eq(type_of(inits[a].value, env, ctx), ft) then die("cf0: type: a data-literal field value's type must match the field\n")
 		a = a + 1
 	}
 	return Ty.TRec(type_name)
@@ -354,8 +363,9 @@ const field_type = (Str base, Str field, [VarTy] env, Ctx ctx): Ty -> {
 	if str_eq(tn, "") then die("cf0: type: field access on a non-record value\n")
 	const Iarch ri = find_rec(ctx.recs, tn)
 	if ri < 0 then die("cf0: type: unknown record type\n")
-	if field_index(ctx.recs[ri].fields, field) < 0 then die("cf0: type: reading a field the record does not declare\n")
-	return Ty.TInt
+	const Iarch fi = field_index(ctx.recs[ri].fields, field)
+	if fi < 0 then die("cf0: type: reading a field the record does not declare\n")
+	return named_ty(ctx.recs[ri].ftypes[fi], ctx.recs[ri].felems[fi], ctx.recs, ctx.unions)
 }
 
 # Type an arm's body, extending the environment with the arm's payload bindings
@@ -653,8 +663,10 @@ const check_simple_stmt = (Func fn, Stmt s, [VarTy] env, Ctx ctx, Ty frt, Bool i
 			const Str tn = rec_of(env[idx].ty)
 			if str_eq(tn, "") then die("cf0: type: field assignment needs a record on the left\n")
 			const Iarch ri = find_rec(ctx.recs, tn)
-			if field_index(ctx.recs[ri].fields, f) < 0 then die("cf0: type: mutating a field the record does not declare\n")
-			if !is_tint(type_of(e, env, ctx)) then die("cf0: type: a field value must be an integer\n")
+			const Iarch fi = field_index(ctx.recs[ri].fields, f)
+			if fi < 0 then die("cf0: type: mutating a field the record does not declare\n")
+			const Ty ft = named_ty(ctx.recs[ri].ftypes[fi], ctx.recs[ri].felems[fi], ctx.recs, ctx.unions)
+			if !ty_eq(type_of(e, env, ctx), ft) then die("cf0: type: a field value's type must match the field\n")
 		},
 		Stmt.IndexAssign(a, ix, val) -> {
 			const Iarch idx = env_index(env, a)

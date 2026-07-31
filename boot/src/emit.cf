@@ -78,17 +78,53 @@ const elem_is_agg = (*Emit ctx, Str elem): Bool -> {
 	return find_rec(ctx.recs, elem) >= 0
 }
 
-# The byte offset of field `field` in record type `rt` — its declaration index × 4
-# (every field is a 4-byte word). The typecheck phase guarantees both resolve.
+# The byte offset of field `field` in record type `rt` — its declaration index × 8
+# (uniform 8-byte slots; a word field rides in the low 4 bytes). Typecheck guarantees both resolve.
 const field_offset = ([RecDecl] recs, Str rt, Str field): Iarch -> {
 	const Iarch ri = find_rec(recs, rt)
 	let Iarch fi = 0
 	loop {
 		if fi >= Iarch(recs[ri].fields.len) then break
-		if str_eq(recs[ri].fields[fi], field) then return fi * 4
+		if str_eq(recs[ri].fields[fi], field) then return fi * 8
 		fi = fi + 1
 	}
 	return 0
+}
+
+# Is field `field` of record `rt` an 8-byte POINTER (a `Str`, a `[T]`, a record, or a
+# boxed union) rather than a word (`Iarch`/`Int`/`Bool`/a tag-only union)? Drives the
+# store/load width. The field's declared type name is in the record's `ftypes`.
+const field_is_ptr = (*Emit ctx, Str rt, Str field): Bool -> {
+	const Iarch ri = find_rec(ctx.recs, rt)
+	if ri < 0 then return false
+	let Iarch fi = 0
+	loop {
+		if fi >= Iarch(ctx.recs[ri].fields.len) then break
+		if str_eq(ctx.recs[ri].fields[fi], field) then {
+			const Str ft = ctx.recs[ri].ftypes[fi]
+			if str_eq(ft, "$dyn") then return true
+			if str_eq(ft, "Str") then return true
+			if find_rec(ctx.recs, ft) >= 0 then return true
+			if find_union(ctx.unions, ft) >= 0 then return union_is_boxed(ctx.unions, ft)
+			return false
+		}
+		fi = fi + 1
+	}
+	return false
+}
+
+# The `[T]` element type name of field `field` of record `rt` (its `felems` entry, "" for a
+# non-array field) — carried onto a binding that adopts the field's dynamic array.
+const field_elem = (*Emit ctx, Str rt, Str field): Str -> {
+	const Iarch ri = find_rec(ctx.recs, rt)
+	if ri < 0 then return ""
+	let Iarch fi = 0
+	loop {
+		if fi >= Iarch(ctx.recs[ri].fields.len) then break
+		if str_eq(ctx.recs[ri].fields[fi], field) then return ctx.recs[ri].felems[fi]
+		fi = fi + 1
+	}
+	return ""
 }
 
 # The index of the union declared as `name`, or -1; and a member's tag (its index).
@@ -245,7 +281,13 @@ const emit_field = (*Emit ctx, [Binding] env, Str base, Str field): Str -> {
 	write_str(ctx.fd, "\t%t${addr} =l add %t${slot}, ${off}\n")
 	const Iarch t = ctx.next
 	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${t} =w loadw %t${addr}\n")
+	# a pointer field loads the full 8-byte pointer (an aggregate value); a word field
+	# loads its low 4 bytes.
+	if field_is_ptr(ctx, rt, field) then {
+		write_str(ctx.fd, "\t%t${t} =l loadl %t${addr}\n")
+	} else {
+		write_str(ctx.fd, "\t%t${t} =w loadw %t${addr}\n")
+	}
 	return "%t${t}"
 }
 
@@ -373,7 +415,7 @@ const emit_interp = (*Emit ctx, [Seg] segs, [Binding] env): Str -> {
 # initializers may be given in any order; each maps to its declared offset.
 const emit_record_lit = (*Emit ctx, Str type_name, [FieldInit] inits, [Binding] env): Iarch -> {
 	const Iarch ri = find_rec(ctx.recs, type_name)
-	const Iarch size = Iarch(ctx.recs[ri].fields.len) * 4
+	const Iarch size = Iarch(ctx.recs[ri].fields.len) * 8
 	const Iarch base = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${base} =l call $cf_alloc(w ${size})\n")
@@ -385,7 +427,13 @@ const emit_record_lit = (*Emit ctx, Str type_name, [FieldInit] inits, [Binding] 
 		const Iarch addr = ctx.next
 		ctx.next = ctx.next + 1
 		write_str(ctx.fd, "\t%t${addr} =l add %t${base}, ${off}\n")
-		write_str(ctx.fd, "\tstorew ${v}, %t${addr}\n")
+		# a pointer field (Str/[T]/record/boxed union) stores the 8-byte pointer; a word
+		# field (Iarch/Bool/tag-only union) stores its value in the low 4 bytes.
+		if field_is_ptr(ctx, type_name, inits[a].field) then {
+			write_str(ctx.fd, "\tstorel ${v}, %t${addr}\n")
+		} else {
+			write_str(ctx.fd, "\tstorew ${v}, %t${addr}\n")
+		}
 		a = a + 1
 	}
 	return base
@@ -433,10 +481,34 @@ const call_agg_type = (*Emit ctx, Str callee): Str -> {
 
 # The aggregate type name a `base.field` yields — a boxed union's tag-only member
 # (`Node.Nil`) yields the union; a tag-only union member or a record field does not.
-const field_agg_type = (*Emit ctx, Str base): Str -> {
-	if find_union(ctx.unions, base) < 0 then return ""
-	if union_is_boxed(ctx.unions, base) then return base
+# The declared type name of field `field` of record `rt` — its aggregate marker when the
+# field is a pointer (`Str`/`$dyn`/a record/a boxed union), matching a binding's `rec_type`.
+const field_ftype = (*Emit ctx, Str rt, Str field): Str -> {
+	const Iarch ri = find_rec(ctx.recs, rt)
+	if ri < 0 then return ""
+	let Iarch fi = 0
+	loop {
+		if fi >= Iarch(ctx.recs[ri].fields.len) then break
+		if str_eq(ctx.recs[ri].fields[fi], field) then return ctx.recs[ri].ftypes[fi]
+		fi = fi + 1
+	}
 	return ""
+}
+
+# The aggregate marker of `base.field` — for binding the result of a field read / a
+# tag-only-member construction. A boxed-union member (`Color.Red`) yields the union; a
+# record field yields its declared type IF the field is a pointer aggregate, else "".
+const field_agg_type = (*Emit ctx, [Binding] env, Str base, Str field): Str -> {
+	if find_union(ctx.unions, base) >= 0 then {
+		if union_is_boxed(ctx.unions, base) then return base
+		return ""
+	}
+	const Iarch idx = lookup_index(env, base)
+	if idx < 0 then return ""
+	const Str rt = env[idx].rec_type
+	if find_rec(ctx.recs, rt) < 0 then return ""
+	if !field_is_ptr(ctx, rt, field) then return ""
+	return field_ftype(ctx, rt, field)
 }
 
 # The aggregate marker of a variable binding — its `rec_type` (a record name, `"$dyn"`,
@@ -454,7 +526,7 @@ const var_agg_type = ([Binding] env, Str name): Str -> {
 const init_agg_type = (*Emit ctx, [Binding] env, Expr e): Str -> match e {
 	Expr.Record(tn, inits) -> tn,
 	Expr.UnionMk(tn, mem, args) -> tn,
-	Expr.Field(base, f) -> field_agg_type(ctx, base),
+	Expr.Field(base, f) -> field_agg_type(ctx, env, base, f),
 	Expr.Call(callee, args) -> call_agg_type(ctx, callee),
 	Expr.ArrayLit(hs, sn, elems, et) -> "$dyn",
 	Expr.StrLit(bytes) -> "Str",
@@ -466,8 +538,9 @@ const init_agg_type = (*Emit ctx, [Binding] env, Expr e): Str -> match e {
 # The element type name of a dynamic-array binding initializer — the array literal's
 # `elem_type` (a `let [Elem]` annotation), else "". A record name marks `[Record]`
 # elements (8-byte pointer slots); "" / `Iarch` marks word elements.
-const init_elem = (Expr e): Str -> match e {
+const init_elem = (*Emit ctx, [Binding] env, Expr e): Str -> match e {
 	Expr.ArrayLit(hs, sn, elems, et) -> et,
+	Expr.Field(base, f) -> field_elem(ctx, var_agg_type(env, base), f),
 	_ -> ""
 }
 
@@ -1105,7 +1178,11 @@ const emit_simple_stmt = (*Emit ctx, [Binding] env, Stmt s): Iarch -> {
 			const Iarch addr = ctx.next
 			ctx.next = ctx.next + 1
 			write_str(ctx.fd, "\t%t${addr} =l add %t${slot}, ${off}\n")
-			write_str(ctx.fd, "\tstorew ${v}, %t${addr}\n")
+			if field_is_ptr(ctx, rt, f) then {
+				write_str(ctx.fd, "\tstorel ${v}, %t${addr}\n")
+			} else {
+				write_str(ctx.fd, "\tstorew ${v}, %t${addr}\n")
+			}
 		},
 		Stmt.IndexAssign(a, ix, val) -> {
 			# `arr[idx] = val` — store the value at data + idx*8
@@ -1182,7 +1259,7 @@ const emit_block = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 					env = [...env, Binding({ name: n, slot: slot, rec_type: "", elem: "" })]
 				} else {
 					const Iarch base = emit_agg_binding(ctx, e, env)
-					env = [...env, Binding({ name: n, slot: base, rec_type: rt, elem: init_elem(e) })]
+					env = [...env, Binding({ name: n, slot: base, rec_type: rt, elem: init_elem(ctx, env, e) })]
 				}
 			},
 			_ -> { terminal = emit_simple_stmt(ctx, env, s) }
