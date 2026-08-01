@@ -31,6 +31,7 @@ data Ctx = { [Func] funcs, [RecDecl] recs, [UnionDecl] unions }
 const is_tint = (Ty t): Bool -> match t { Ty.TInt -> true, _ -> false }
 const is_tbool = (Ty t): Bool -> match t { Ty.TBool -> true, _ -> false }
 const is_tstr = (Ty t): Bool -> match t { Ty.TStr -> true, _ -> false }
+const is_tptr = (Ty t): Bool -> match t { Ty.TPtr -> true, _ -> false }
 
 # The record / union / dynamic-array-element type name of a type, or "" otherwise.
 const rec_of = (Ty t): Str -> match t { Ty.TRec(n) -> n, _ -> "" }
@@ -123,6 +124,7 @@ const union_member_index = ([UnionMember] members, Str name): Iarch -> {
 # record fields, and union payloads.
 const named_ty = (Str type_name, Str elem, [RecDecl] recs, [UnionDecl] unions): Ty -> {
 	if str_eq(type_name, "$dyn") then return Ty.TDyn(elem)
+	if str_eq(type_name, "$ptr") then return Ty.TPtr
 	if find_rec(recs, type_name) >= 0 then return Ty.TRec(type_name)
 	if find_union(unions, type_name) >= 0 then return Ty.TUnion(type_name)
 	if str_eq(type_name, "Bool") then return Ty.TBool
@@ -269,7 +271,8 @@ const is_cast_type = (Str name): Bool -> {
 # aggregate is rejected — type_system §4) and yields an integer.
 const cast_type = (Str callee, [Expr] args, [VarTy] env, Ctx ctx): Ty -> {
 	if Iarch(args.len) != 1 then die("cf0: type: a numeric cast takes exactly one argument\n")
-	if !is_tint(type_of(args[0], env, ctx)) then die("cf0: type: a numeric cast takes a scalar integer\n")
+	const Ty ot = type_of(args[0], env, ctx)
+	if !is_tint(ot) && !is_tptr(ot) then die("cf0: type: a numeric cast takes a scalar integer or a pointer\n")
 	return Ty.TInt
 }
 
@@ -285,7 +288,10 @@ const call_type = (Str callee, [Expr] args, [VarTy] env, Ctx ctx): Ty -> {
 		if i >= na then break
 		const Ty at = type_of(args[i], env, ctx)
 		const Ty pt = param_ty(ctx.funcs[fidx].params[i], ctx.recs, ctx.unions)
-		if !ty_eq(at, pt) then die("cf0: type: a call argument's type does not match the parameter\n")
+		# a byte pointer is an address, acceptable where a `Uarch`/`Int` is expected (syscalls)
+		if !ty_eq(at, pt) then {
+			if is_tptr(at) then { if !is_tint(pt) then die("cf0: type: a call argument's type does not match the parameter\n") } else die("cf0: type: a call argument's type does not match the parameter\n")
+		}
 		i = i + 1
 	}
 	return func_ret_ty(ctx.funcs[fidx], ctx.recs, ctx.unions)
@@ -350,10 +356,11 @@ const field_type = (Str base, Str field, [VarTy] env, Ctx ctx): Ty -> {
 	}
 	const Iarch vi = env_index(env, base)
 	if vi < 0 then die("cf0: type: reference to an undeclared name\n")
-	# a string exposes only `.len` (an Int byte count) in this brick
+	# a string exposes `.len` (an Int byte count) and `.bytes` (a byte pointer)
 	if is_tstr(env[vi].ty) then {
-		if !str_eq(field, "len") then die("cf0: type: a string has only `.len`\n")
-		return Ty.TInt
+		if str_eq(field, "len") then return Ty.TInt
+		if str_eq(field, "bytes") then return Ty.TPtr
+		die("cf0: type: a string has only `.len` and `.bytes`\n")
 	}
 	# a dynamic array exposes only `.len` (an Int)
 	if !str_eq(dyn_of(env[vi].ty), "") then {
@@ -518,6 +525,11 @@ const index_type = (Str arr, Expr idx, [VarTy] env, Ctx ctx): Ty -> {
 		if !is_tint(type_of(idx, env, ctx)) then die("cf0: type: a string index must be an integer\n")
 		return Ty.TInt
 	}
+	# a byte-pointer / buffer index `p[i]` yields a byte (an Int)
+	if is_tptr(env[vi].ty) then {
+		if !is_tint(type_of(idx, env, ctx)) then die("cf0: type: a buffer index must be an integer\n")
+		return Ty.TInt
+	}
 	const Str en = dyn_of(env[vi].ty)
 	if str_eq(en, "") then die("cf0: type: indexing a non-array value\n")
 	if !is_tint(type_of(idx, env, ctx)) then die("cf0: type: an array index must be an integer\n")
@@ -595,6 +607,7 @@ const type_of = (Expr e, [VarTy] env, Ctx ctx): Ty -> match e {
 	Expr.ArrayLit(hs, sn, elems, et) -> arraylit_type(hs, sn, elems, et, env, ctx),
 	Expr.Index(arr, idx) -> index_type(arr, idx, env, ctx),
 	Expr.IndexField(arr, idx, f) -> indexfield_type(arr, idx, f, env, ctx),
+	Expr.Buffer(n) -> Ty.TPtr,
 	Expr.Neg(x) -> int_unop(x, env, ctx),
 	Expr.BitNot(x) -> int_unop(x, env, ctx),
 	Expr.Not(x) -> not_op(x, env, ctx),
@@ -688,7 +701,7 @@ const check_simple_stmt = (Func fn, Stmt s, [VarTy] env, Ctx ctx, Ty frt, Bool i
 			const Iarch idx = env_index(env, a)
 			if idx < 0 then die("cf0: type: element assignment to an undeclared name\n")
 			if !env[idx].mutable then die("cf0: type: cannot write to a `const`/borrowed array\n")
-			if str_eq(dyn_of(env[idx].ty), "") then die("cf0: type: element assignment needs a dynamic array\n")
+			if str_eq(dyn_of(env[idx].ty), "") && !is_tptr(env[idx].ty) then die("cf0: type: element assignment needs a dynamic array or a byte buffer\n")
 			if !is_tint(type_of(ix, env, ctx)) then die("cf0: type: an array index must be an integer\n")
 			if !is_tint(type_of(val, env, ctx)) then die("cf0: type: an array element must be an integer\n")
 		},

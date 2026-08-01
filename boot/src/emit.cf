@@ -103,6 +103,7 @@ const field_is_ptr = (*Emit ctx, Str rt, Str field): Bool -> {
 		if str_eq(ctx.recs[ri].fields[fi], field) then {
 			const Str ft = ctx.recs[ri].ftypes[fi]
 			if str_eq(ft, "$dyn") then return true
+			if str_eq(ft, "$ptr") then return true
 			if str_eq(ft, "Str") then return true
 			if find_rec(ctx.recs, ft) >= 0 then return true
 			if find_union(ctx.unions, ft) >= 0 then return union_is_boxed(ctx.unions, ft)
@@ -254,6 +255,14 @@ const emit_field = (*Emit ctx, [Binding] env, Str base, Str field): Str -> {
 	const Str rt = env[idx].rec_type
 	# a string's `.len` — loadl the header's len@8 (the slot holds the header pointer)
 	if str_eq(rt, "Str") then {
+		# `s.bytes` — the header's byte pointer at offset 0
+		if str_eq(field, "bytes") then {
+			const Iarch sb = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${sb} =l loadl %t${slot}\n")
+			return "%t${sb}"
+		}
+		# `s.len` — the header's byte count at offset 8
 		const Iarch sa = ctx.next
 		ctx.next = ctx.next + 1
 		write_str(ctx.fd, "\t%t${sa} =l add %t${slot}, 8\n")
@@ -572,6 +581,7 @@ const init_agg_type = (*Emit ctx, [Binding] env, Expr e): Str -> match e {
 	Expr.ArrayLit(hs, sn, elems, et) -> "$dyn",
 	Expr.StrLit(bytes) -> "Str",
 	Expr.Interp(id) -> "Str",
+	Expr.Buffer(n) -> "$ptr",
 	Expr.Var(name) -> var_agg_type(env, name),
 	_ -> ""
 }
@@ -915,10 +925,32 @@ const emit_array_lit = (*Emit ctx, [Expr] elems, Str elem_type, [Binding] env): 
 	return "%t${hdr}"
 }
 
+# Allocate an N-byte buffer in the arena; the returned pointer is a byte pointer ("$ptr").
+const emit_buffer = (*Emit ctx, Iarch n): Str -> {
+	const Iarch b = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${b} =l call $cf_alloc(w ${n})\n")
+	return "%t${b}"
+}
+
 # Emit `xs[i]` — load the i-th element (element address = data + i*8).
 const emit_index = (*Emit ctx, [Binding] env, Str arr, Expr idx): Str -> {
 	const Iarch ai = lookup_index(env, arr)
 	const Iarch hdr = env[ai].slot
+	# a byte pointer / buffer index `p[i]` reads the i-th byte at pointer + i (no header).
+	if str_eq(env[ai].rec_type, "$ptr") then {
+		const Str pv = emit_expr(idx, ctx, env)
+		const Iarch pil = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${pil} =l copy ${pv}\n")
+		const Iarch paddr = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${paddr} =l add %t${hdr}, %t${pil}\n")
+		const Iarch pval = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${pval} =l loadub %t${paddr}\n")
+		return "%t${pval}"
+	}
 	# a string index `s[i]` reads the i-th byte: the header's bytes pointer @0, then +i.
 	if str_eq(env[ai].rec_type, "Str") then {
 		const Str siv = emit_expr(idx, ctx, env)
@@ -1024,6 +1056,7 @@ const emit_expr = (Expr e, *Emit ctx, [Binding] env): Str -> match e {
 	Expr.ArrayLit(hs, sn, elems, et) -> emit_array_lit(ctx, elems, et, env),
 	Expr.Index(arr, idx) -> emit_index(ctx, env, arr, idx),
 	Expr.IndexField(arr, idx, f) -> emit_index_field(ctx, env, arr, idx, f),
+	Expr.Buffer(n) -> emit_buffer(ctx, n),
 	Expr.UnionMk(tn, mem, args) -> emit_union_mk(ctx, tn, mem, args, env),
 	Expr.Match(scrut, arms) -> emit_match(ctx, scrut, arms, env),
 	Expr.Neg(x) -> emit_unop(ctx, "sub 0, ", x, "", env),
@@ -1243,6 +1276,16 @@ const emit_simple_stmt = (*Emit ctx, [Binding] env, Stmt s): Iarch -> {
 			const Iarch hdr = env[ai].slot
 			const Str iv = emit_expr(ix, ctx, env)
 			const Str vv = emit_expr(val, ctx, env)
+			if str_eq(env[ai].rec_type, "$ptr") then {
+				const Iarch bil = ctx.next
+				ctx.next = ctx.next + 1
+				write_str(ctx.fd, "\t%t${bil} =l copy ${iv}\n")
+				const Iarch baddr = ctx.next
+				ctx.next = ctx.next + 1
+				write_str(ctx.fd, "\t%t${baddr} =l add %t${hdr}, %t${bil}\n")
+				write_str(ctx.fd, "\tstoreb ${vv}, %t${baddr}\n")
+				return 0
+			}
 			const Iarch data = ctx.next
 			ctx.next = ctx.next + 1
 			write_str(ctx.fd, "\t%t${data} =l loadl %t${hdr}\n")
@@ -1355,7 +1398,14 @@ const emit_func = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 	let Iarch pi = 0
 	loop {
 		if pi >= Iarch(fn.params.len) then break
-		if !fn.params[pi].is_ptr then {
+		if fn.params[pi].is_ptr then {
+			# a `*[Uint8]` byte-pointer parameter: copy the pointer into a temp, bound "$ptr"
+			# so the body can index it (a raw byte pointer, no header).
+			const Iarch slot = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${slot} =l copy %p${pi}\n")
+			params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: "$ptr", elem: "" })]
+		} else {
 			if is_agg_param(fn.params[pi], ctx.recs, ctx.unions) then {
 				# a record parameter arrives as a pointer to the caller's record; copy it
 				# into a temp used as the record's base for field reads.
