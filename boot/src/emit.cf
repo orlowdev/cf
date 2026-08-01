@@ -94,6 +94,14 @@ const elem_is_agg = (*Emit ctx, Str elem): Bool -> {
 	return false
 }
 
+# A dynamic array's element STRIDE in bytes: a `[Uint8]` is byte-PACKED (stride 1, so
+# `Str(v)` can borrow its backing as contiguous bytes — the string-builder finish); every
+# other element (a word, a `Str`/`[T]`/record/union pointer) rides in an 8-byte slot.
+const elem_bytes = (Str elem): Iarch -> {
+	if str_eq(elem, "Uint8") then return 1
+	return 8
+}
+
 # The byte offset of field `field` in record type `rt` — its declaration index × 8
 # (uniform 8-byte slots; a word field rides in the low 4 bytes). Typecheck guarantees both resolve.
 const field_offset = ([RecDecl] recs, Str rt, Str field): Iarch -> {
@@ -997,10 +1005,10 @@ const emit_array_lit = (*Emit ctx, [Expr] elems, Str elem_type, [Binding] env): 
 		write_str(ctx.fd, "\t%t${ca} =l add %t${hdr}, 16\n")
 		write_str(ctx.fd, "\tstorel 0, %t${ca}\n")
 	} else {
-		# a record element is an 8-byte arena pointer (`storel`); a word element rides in
-		# the low half of its 8-byte slot (`storew`).
-		const Bool agg = elem_is_agg(ctx, elem_type)
-		const Iarch bytes = n * 8
+		# a `[Uint8]` element is one byte (`storeb`, stride 1); every other element rides in an
+		# 8-byte slot (`storel`) — a record/Str/[T]/union pointer, or a word in the low half.
+		const Iarch esz = elem_bytes(elem_type)
+		const Iarch bytes = n * esz
 		const Iarch data = ctx.next
 		ctx.next = ctx.next + 1
 		write_str(ctx.fd, "\t%t${data} =l call $cf_alloc(w ${bytes})\n")
@@ -1008,12 +1016,12 @@ const emit_array_lit = (*Emit ctx, [Expr] elems, Str elem_type, [Binding] env): 
 		loop {
 			if i >= n then break
 			const Str v = emit_expr(elems[i], ctx, env)
-			const Iarch off = i * 8
+			const Iarch off = i * esz
 			const Iarch addr = ctx.next
 			ctx.next = ctx.next + 1
 			write_str(ctx.fd, "\t%t${addr} =l add %t${data}, ${off}\n")
-			if agg then write_str(ctx.fd, "\tstorel ${v}, %t${addr}\n")
-			if !agg then write_str(ctx.fd, "\tstorel ${v}, %t${addr}\n")
+			if esz == 1 then write_str(ctx.fd, "\tstoreb ${v}, %t${addr}\n")
+			if esz != 1 then write_str(ctx.fd, "\tstorel ${v}, %t${addr}\n")
 			i = i + 1
 		}
 		write_str(ctx.fd, "\tstorel %t${data}, %t${hdr}\n")
@@ -1073,6 +1081,7 @@ const emit_index = (*Emit ctx, [Binding] env, Str arr, Expr idx): Str -> {
 		return "%t${sval}"
 	}
 	const Str iv = emit_expr(idx, ctx, env)
+	const Iarch esz = elem_bytes(env[ai].elem)
 	const Iarch data = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${data} =l loadl ${hdr}\n")
@@ -1081,13 +1090,15 @@ const emit_index = (*Emit ctx, [Binding] env, Str arr, Expr idx): Str -> {
 	write_str(ctx.fd, "\t%t${il} =l copy ${iv}\n")
 	const Iarch off = ctx.next
 	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${off} =l mul %t${il}, 8\n")
+	write_str(ctx.fd, "\t%t${off} =l mul %t${il}, ${esz}\n")
 	const Iarch slot = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${slot} =l add %t${data}, %t${off}\n")
 	const Iarch val = ctx.next
 	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${val} =l loadl %t${slot}\n")
+	# a `[Uint8]` element is one byte (`loadub`); every other is an 8-byte slot (`loadl`)
+	if esz == 1 then write_str(ctx.fd, "\t%t${val} =l loadub %t${slot}\n")
+	if esz != 1 then write_str(ctx.fd, "\t%t${val} =l loadl %t${slot}\n")
 	return "%t${val}"
 }
 
@@ -1167,6 +1178,7 @@ const emit_index_expr = (*Emit ctx, [Binding] env, Expr base, Expr idx): Str -> 
 		return "%t${sval}"
 	}
 	const Str iv = emit_expr(idx, ctx, env)
+	const Iarch esz = elem_bytes(init_elem(ctx, env, base))
 	const Iarch data = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${data} =l loadl ${hv}\n")
@@ -1175,36 +1187,38 @@ const emit_index_expr = (*Emit ctx, [Binding] env, Expr base, Expr idx): Str -> 
 	write_str(ctx.fd, "\t%t${il} =l copy ${iv}\n")
 	const Iarch off = ctx.next
 	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${off} =l mul %t${il}, 8\n")
+	write_str(ctx.fd, "\t%t${off} =l mul %t${il}, ${esz}\n")
 	const Iarch slot = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${slot} =l add %t${data}, %t${off}\n")
 	const Iarch val = ctx.next
 	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${val} =l loadl %t${slot}\n")
+	if esz == 1 then write_str(ctx.fd, "\t%t${val} =l loadub %t${slot}\n")
+	if esz != 1 then write_str(ctx.fd, "\t%t${val} =l loadl %t${slot}\n")
 	return "%t${val}"
 }
 
 # Emit the elements of a `xs = [...xs, e…]` self-growth append: each `cf_dyn_push`es
 # a slot onto the header (growing as needed, bumping len) and stores the element. `hdr` is
 # the header-pointer operand (the array grows IN PLACE, so its binding is untouched).
-const emit_append = (*Emit ctx, [Binding] env, Str hdr, [Expr] elems, Bool agg): Iarch -> {
+const emit_append = (*Emit ctx, [Binding] env, Str hdr, [Expr] elems, Str elem): Iarch -> {
+	const Iarch esz = elem_bytes(elem)
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(elems.len) then break
 		const Str v = emit_expr(elems[i], ctx, env)
 		const Iarch slot = ctx.next
 		ctx.next = ctx.next + 1
-		write_str(ctx.fd, "\t%t${slot} =l call $cf_dyn_push(l ${hdr}, w 8)\n")
-		# a record element rides as its 8-byte arena pointer; a word in its slot's low half.
-		if agg then write_str(ctx.fd, "\tstorel ${v}, %t${slot}\n")
-		if !agg then write_str(ctx.fd, "\tstorel ${v}, %t${slot}\n")
+		write_str(ctx.fd, "\t%t${slot} =l call $cf_dyn_push(l ${hdr}, w ${esz})\n")
+		# a `[Uint8]` element is one byte (`storeb`); every other rides in an 8-byte slot (`storel`)
+		if esz == 1 then write_str(ctx.fd, "\tstoreb ${v}, %t${slot}\n")
+		if esz != 1 then write_str(ctx.fd, "\tstorel ${v}, %t${slot}\n")
 		i = i + 1
 	}
 	return 0
 }
-const emit_append_expr = (*Emit ctx, [Binding] env, Str hdr, Expr e, Bool agg): Iarch -> match e {
-	Expr.ArrayLit(hs, sn, elems, et) -> emit_append(ctx, env, hdr, elems, agg),
+const emit_append_expr = (*Emit ctx, [Binding] env, Str hdr, Expr e, Str elem): Iarch -> match e {
+	Expr.ArrayLit(hs, sn, elems, et) -> emit_append(ctx, env, hdr, elems, elem),
 	_ -> 0 - 1
 }
 
@@ -1306,15 +1320,17 @@ const emit_for_body = (*Emit ctx, [Binding] env, Str lv, Str arr, [Stmt] body): 
 	const Iarch ivl = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${ivl} =l copy %t${iv}\n")
+	const Iarch esz = elem_bytes(env[ai].elem)
 	const Iarch off = ctx.next
 	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${off} =l mul %t${ivl}, 8\n")
+	write_str(ctx.fd, "\t%t${off} =l mul %t${ivl}, ${esz}\n")
 	const Iarch eslot = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${eslot} =l add %t${data}, %t${off}\n")
 	const Iarch xval = ctx.next
 	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${xval} =l loadl %t${eslot}\n")
+	if esz == 1 then write_str(ctx.fd, "\t%t${xval} =l loadub %t${eslot}\n")
+	if esz != 1 then write_str(ctx.fd, "\t%t${xval} =l loadl %t${eslot}\n")
 	const Iarch xcell = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${xcell} =l alloc8 8\n")
@@ -1420,9 +1436,8 @@ const emit_simple_stmt = (*Emit ctx, [Binding] env, Stmt s): Iarch -> {
 			# `xs = ys`) — is stored into the binding's cell, replacing its contents/pointer.
 			const Iarch idx = lookup_index(env, n)
 			if str_eq(env[idx].rec_type, "$dyn") && is_self_spread(e, n) then {
-				const Bool agg = elem_is_agg(ctx, env[idx].elem)
 				const Str hdr = binding_ptr(ctx, env, idx)
-				emit_append_expr(ctx, env, hdr, e, agg)
+				emit_append_expr(ctx, env, hdr, e, env[idx].elem)
 			} else {
 				const Str v = emit_expr(e, ctx, env)
 				write_str(ctx.fd, "\tstorel ${v}, %t${env[idx].slot}\n")
@@ -1457,6 +1472,7 @@ const emit_simple_stmt = (*Emit ctx, [Binding] env, Stmt s): Iarch -> {
 				write_str(ctx.fd, "\tstoreb ${vv}, %t${baddr}\n")
 				return 0
 			}
+			const Iarch esz = elem_bytes(env[ai].elem)
 			const Iarch data = ctx.next
 			ctx.next = ctx.next + 1
 			write_str(ctx.fd, "\t%t${data} =l loadl ${hdr}\n")
@@ -1465,11 +1481,12 @@ const emit_simple_stmt = (*Emit ctx, [Binding] env, Stmt s): Iarch -> {
 			write_str(ctx.fd, "\t%t${il} =l copy ${iv}\n")
 			const Iarch off = ctx.next
 			ctx.next = ctx.next + 1
-			write_str(ctx.fd, "\t%t${off} =l mul %t${il}, 8\n")
+			write_str(ctx.fd, "\t%t${off} =l mul %t${il}, ${esz}\n")
 			const Iarch slot = ctx.next
 			ctx.next = ctx.next + 1
 			write_str(ctx.fd, "\t%t${slot} =l add %t${data}, %t${off}\n")
-			write_str(ctx.fd, "\tstorel ${vv}, %t${slot}\n")
+			if esz == 1 then write_str(ctx.fd, "\tstoreb ${vv}, %t${slot}\n")
+			if esz != 1 then write_str(ctx.fd, "\tstorel ${vv}, %t${slot}\n")
 		},
 		Stmt.IfThen(c, body) -> {
 			emit_guard(ctx, env, c, body)
