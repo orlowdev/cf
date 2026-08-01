@@ -17,7 +17,7 @@
 # not yet enforced (that is the typecheck brick).
 
 import "io" as { write_str, die }
-import "ast" as { Expr, Stmt, Param, Func, FieldInit, RecDecl, UnionMember, UnionDecl, MatchArm, Seg, Program }
+import "ast" as { Expr, Stmt, Param, Func, FieldInit, RecDecl, UnionMember, UnionDecl, MatchArm, StmtArm, Seg, Program }
 
 # The emit context: the QBE-IL output fd, the next free temp number, the next free
 # basic-block label id, the program's functions (a call resolves its callee — by
@@ -775,7 +775,7 @@ const match_union = ([MatchArm] arms): Str -> {
 # payload binding, loaded from the box (`s` is the boxed scrutinee's base pointer;
 # payload field `i` sits at offset 4 + i*4). `_` binds nothing. Non-binding arms
 # just get a copy of the outer env.
-const arm_body_env = (*Emit ctx, [Binding] env, MatchArm arm, Str s): [Binding] -> {
+const arm_body_env = (*Emit ctx, [Binding] env, Str type_name, [Str] members, [Str] binds, Str s): [Binding] -> {
 	let [Binding] benv = []
 	let Iarch k = 0
 	loop {
@@ -785,21 +785,21 @@ const arm_body_env = (*Emit ctx, [Binding] env, MatchArm arm, Str s): [Binding] 
 	}
 	let Iarch bi = 0
 	loop {
-		if bi >= Iarch(arm.binds.len) then break
-		if !str_eq(arm.binds[bi], "_") then {
+		if bi >= Iarch(binds.len) then break
+		if !str_eq(binds[bi], "_") then {
 			const Iarch off = 8 + bi * 8
 			const Iarch addr = ctx.next
 			ctx.next = ctx.next + 1
 			write_str(ctx.fd, "\t%t${addr} =l add ${s}, ${off}\n")
-			if payload_is_ptr(ctx, arm.type_name, arm.members[0], bi) then {
+			if payload_is_ptr(ctx, type_name, members[0], bi) then {
 				# a pointer payload (Str/[T]/record/union): load the 8-byte pointer and bind it
 				# directly as an aggregate (its declared type is the binding's rec_type/elem)
 				const Iarch val = ctx.next
 				ctx.next = ctx.next + 1
 				write_str(ctx.fd, "\t%t${val} =l loadl %t${addr}\n")
-				const Str pt = payload_type(ctx, arm.type_name, arm.members[0], bi)
-				const Str pe = payload_elem(ctx, arm.type_name, arm.members[0], bi)
-				benv = [...benv, Binding({ name: arm.binds[bi], slot: val, rec_type: pt, elem: pe })]
+				const Str pt = payload_type(ctx, type_name, members[0], bi)
+				const Str pe = payload_elem(ctx, type_name, members[0], bi)
+				benv = [...benv, Binding({ name: binds[bi], slot: val, rec_type: pt, elem: pe })]
 			} else {
 				# a word payload: load it and spill to its own 4-byte slot (read via loadw)
 				const Iarch val = ctx.next
@@ -809,7 +809,7 @@ const arm_body_env = (*Emit ctx, [Binding] env, MatchArm arm, Str s): [Binding] 
 				ctx.next = ctx.next + 1
 				write_str(ctx.fd, "\t%t${bslot} =l alloc8 8\n")
 				write_str(ctx.fd, "\tstorel %t${val}, %t${bslot}\n")
-				benv = [...benv, Binding({ name: arm.binds[bi], slot: bslot, rec_type: "", elem: "" })]
+				benv = [...benv, Binding({ name: binds[bi], slot: bslot, rec_type: "", elem: "" })]
 			}
 		}
 		bi = bi + 1
@@ -817,10 +817,9 @@ const arm_body_env = (*Emit ctx, [Binding] env, MatchArm arm, Str s): [Binding] 
 	return benv
 }
 
-# The scrutinee's tag operand: for a boxed union the tag lives at the box's offset 0
-# (loaded here); a tag-only union value IS its tag.
-const scrut_tag = (*Emit ctx, [MatchArm] arms, Str s): Str -> {
-	const Str un = match_union(arms)
+# The scrutinee's tag operand for union `un`: for a boxed union the tag lives at the box's
+# offset 0 (loaded here); a tag-only union value (or an all-`_` match, `un` = "") IS its tag.
+const scrut_tag = (*Emit ctx, Str un, Str s): Str -> {
 	if str_eq(un, "") then return s
 	if !union_is_boxed(ctx.unions, un) then return s
 	const Iarch t = ctx.next
@@ -836,7 +835,7 @@ const scrut_tag = (*Emit ctx, [MatchArm] arms, Str s): Str -> {
 # else. The result merges through a stack slot, like `if`.
 const emit_match = (*Emit ctx, Expr scrut, [MatchArm] arms, [Binding] env): Str -> {
 	const Str s = emit_expr(scrut, ctx, env)
-	const Str tagop = scrut_tag(ctx, arms, s)
+	const Str tagop = scrut_tag(ctx, match_union(arms), s)
 	const Iarch slot = ctx.next
 	ctx.next = ctx.next + 1
 	const Iarch lid = ctx.label
@@ -847,7 +846,7 @@ const emit_match = (*Emit ctx, Expr scrut, [MatchArm] arms, [Binding] env): Str 
 	loop {
 		if i >= na then break
 		if i == na - 1 then {
-			const [Binding] benv_e = arm_body_env(ctx, env, arms[i], s)
+			const [Binding] benv_e = arm_body_env(ctx, env, arms[i].type_name, arms[i].members, arms[i].binds, s)
 			const Str v = emit_expr(arms[i].body, ctx, benv_e)
 			write_str(ctx.fd, "\tstorel ${v}, %t${slot}\n")
 			write_str(ctx.fd, "\tjmp @mend${lid}\n")
@@ -870,7 +869,7 @@ const emit_match = (*Emit ctx, Expr scrut, [MatchArm] arms, [Binding] env): Str 
 				j = j + 1
 			}
 			write_str(ctx.fd, "@marm${lid}_${i}\n")
-			const [Binding] benv_m = arm_body_env(ctx, env, arms[i], s)
+			const [Binding] benv_m = arm_body_env(ctx, env, arms[i].type_name, arms[i].members, arms[i].binds, s)
 			const Str v = emit_expr(arms[i].body, ctx, benv_m)
 			write_str(ctx.fd, "\tstorel ${v}, %t${slot}\n")
 			write_str(ctx.fd, "\tjmp @mend${lid}\n")
@@ -883,6 +882,67 @@ const emit_match = (*Emit ctx, Expr scrut, [MatchArm] arms, [Binding] env): Str 
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${rt} =l loadl %t${slot}\n")
 	return "%t${rt}"
+}
+
+# The scrutinee's union for a statement-match (the first non-`_` arm's type name), "" if all `_`.
+const stmt_match_union = ([StmtArm] arms): Str -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		if !arms[i].is_wild then return arms[i].type_name
+		i = i + 1
+	}
+	return ""
+}
+
+# Emit a STATEMENT-position `match` on a union — the same tag-dispatch compare-chain as
+# `emit_match`, but each arm emits its statement BODY (via `emit_block`, own scope, seeing
+# the outer env plus its payload binds) for effect rather than storing a merged value. An
+# arm whose body is terminal (it writes its own `ret`/`jmp`) needs no trailing jump; a
+# fall-through arm jumps to the `@smend` join, which is always emitted as the match's
+# successor. The match is always NON-terminal (returns 0): the enclosing block/loop/guard —
+# or the explicit `return` the typecheck phase requires to follow — terminates `@smend`.
+const emit_stmt_match = (*Emit ctx, [Binding] env, Expr scrut, [StmtArm] arms): Iarch -> {
+	const Str s = emit_expr(scrut, ctx, env)
+	const Str tagop = scrut_tag(ctx, stmt_match_union(arms), s)
+	const Iarch lid = ctx.label
+	ctx.label = ctx.label + 1
+	const Iarch na = Iarch(arms.len)
+	let Iarch i = 0
+	loop {
+		if i >= na then break
+		if i == na - 1 then {
+			const [Binding] benv_e = arm_body_env(ctx, env, arms[i].type_name, arms[i].members, arms[i].binds, s)
+			const Iarch t = emit_block(ctx, arms[i].body, benv_e)
+			if t == 0 then write_str(ctx.fd, "\tjmp @smend${lid}\n")
+		} else {
+			# test each or-pattern alternative: a hit jumps to the arm body, a miss to the
+			# next alternative, and after the last to the next arm.
+			const Iarch k = Iarch(arms[i].members.len)
+			let Iarch j = 0
+			loop {
+				if j >= k then break
+				const Iarch tag = member_tag(ctx.unions, arms[i].type_name, arms[i].members[j])
+				const Iarch c = ctx.next
+				ctx.next = ctx.next + 1
+				write_str(ctx.fd, "\t%t${c} =l ceql ${tagop}, ${tag}\n")
+				if j == k - 1 then write_str(ctx.fd, "\tjnz %t${c}, @sarm${lid}_${i}, @snext${lid}_${i}\n")
+				if j != k - 1 then {
+					write_str(ctx.fd, "\tjnz %t${c}, @sarm${lid}_${i}, @salt${lid}_${i}_${j}\n")
+					write_str(ctx.fd, "@salt${lid}_${i}_${j}\n")
+				}
+				j = j + 1
+			}
+			write_str(ctx.fd, "@sarm${lid}_${i}\n")
+			const [Binding] benv_m = arm_body_env(ctx, env, arms[i].type_name, arms[i].members, arms[i].binds, s)
+			const Iarch t = emit_block(ctx, arms[i].body, benv_m)
+			if t == 0 then write_str(ctx.fd, "\tjmp @smend${lid}\n")
+			write_str(ctx.fd, "@snext${lid}_${i}\n")
+		}
+		i = i + 1
+	}
+	write_str(ctx.fd, "@smend${lid}\n")
+	return 0
 }
 
 # Emit a `[…]` array literal: a fresh {data@0, len@8, cap@16} header in the arena,
@@ -1386,6 +1446,10 @@ const emit_simple_stmt = (*Emit ctx, [Binding] env, Stmt s): Iarch -> {
 			# a `{ … }` guard body: emit it in its own scope; it is terminal iff its last
 			# statement is (so an enclosing guard/if-else knows whether to add a fall-through jump)
 			term = emit_block(ctx, stmts, env)
+		},
+		Stmt.Match(scrut, arms) -> {
+			# a statement-position `match` — tag-dispatch for effect; terminal iff every arm is
+			term = emit_stmt_match(ctx, env, scrut, arms)
 		},
 		_ -> {
 			die("cf0: emit: unexpected guarded statement\n")

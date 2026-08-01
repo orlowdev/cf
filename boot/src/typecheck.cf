@@ -16,7 +16,7 @@
 # The emitter runs only on programs this phase accepts.
 
 import "io" as { die }
-import "ast" as { Expr, Stmt, Param, Func, Ty, FieldInit, RecDecl, UnionMember, UnionDecl, MatchArm, Seg, Program }
+import "ast" as { Expr, Stmt, Param, Func, Ty, FieldInit, RecDecl, UnionMember, UnionDecl, MatchArm, StmtArm, Seg, Program }
 
 # A name in scope during checking: its type and whether it is reassignable (`let`).
 data VarTy = { Str name, Ty ty, Bool mutable }
@@ -387,10 +387,12 @@ const field_type = (Str base, Str field, [VarTy] env, Ctx ctx): Ty -> {
 	return named_ty(ctx.recs[ri].ftypes[fi], ctx.recs[ri].felems[fi], ctx.recs, ctx.unions)
 }
 
-# Type an arm's body, extending the environment with the arm's payload bindings
-# (each an `Int`; `_` binds nothing). Non-binding arms type against the outer env.
-const type_arm_body = (MatchArm arm, [VarTy] env, Ctx ctx): Ty -> {
-	if Iarch(arm.binds.len) == 0 then return type_of(arm.body, env, ctx)
+# The environment a match arm's body is checked in: the outer env extended with the arm's
+# payload bindings (each name takes its member's declared payload type; `_` binds nothing).
+# A non-binding arm (a wildcard, an or-pattern, or a tag-only member) returns the outer env
+# unchanged. Shared by the expression arm (`type_arm_body`) and the statement arm
+# (`check_stmt_match`).
+const arm_bind_env = (Str type_name, [Str] members, [Str] binds, [VarTy] env, Ctx ctx): [VarTy] -> {
 	let [VarTy] benv = []
 	let Iarch e0 = 0
 	loop {
@@ -398,19 +400,25 @@ const type_arm_body = (MatchArm arm, [VarTy] env, Ctx ctx): Ty -> {
 		benv = [...benv, env[e0]]
 		e0 = e0 + 1
 	}
+	if Iarch(binds.len) == 0 then return benv
 	# a binding arm is single-member; each bound name takes the member's declared payload type
-	const Iarch ui = find_union(ctx.unions, arm.type_name)
-	const Iarch mi = union_member_index(ctx.unions[ui].members, arm.members[0])
+	const Iarch ui = find_union(ctx.unions, type_name)
+	const Iarch mi = union_member_index(ctx.unions[ui].members, members[0])
 	let Iarch bi = 0
 	loop {
-		if bi >= Iarch(arm.binds.len) then break
-		if !str_eq(arm.binds[bi], "_") then {
+		if bi >= Iarch(binds.len) then break
+		if !str_eq(binds[bi], "_") then {
 			const Ty bt = named_ty(ctx.unions[ui].members[mi].payloads[bi], ctx.unions[ui].members[mi].pelems[bi], ctx.recs, ctx.unions)
-			benv = [...benv, VarTy({ name: arm.binds[bi], ty: bt, mutable: false })]
+			benv = [...benv, VarTy({ name: binds[bi], ty: bt, mutable: false })]
 		}
 		bi = bi + 1
 	}
-	return type_of(arm.body, benv, ctx)
+	return benv
+}
+
+# Type an arm's body, extending the environment with the arm's payload bindings.
+const type_arm_body = (MatchArm arm, [VarTy] env, Ctx ctx): Ty -> {
+	return type_of(arm.body, arm_bind_env(arm.type_name, arm.members, arm.binds, env, ctx), ctx)
 }
 
 # `match scrut { arms }` — the scrutinee must be a union; every arm must name that
@@ -759,6 +767,10 @@ const check_simple_stmt = (Func fn, Stmt s, [VarTy] env, Ctx ctx, Ty frt, Bool i
 			# a `{ … }` guard body — its own scope; its terminal code is the block's.
 			code = check_stmts(fn, stmts, env, ctx, frt, in_loop)
 		},
+		Stmt.Match(scrut, arms) -> {
+			# a statement-position `match` — dispatched for effect; terminal iff every arm is.
+			code = check_stmt_match(fn, scrut, arms, env, ctx, frt, in_loop)
+		},
 		_ -> {
 			die("cf0: type: a statement `if` may guard only a block, a `return`, an assignment, a call, or `break`/`continue`\n")
 		}
@@ -809,6 +821,74 @@ const check_stmts = (Func fn, [Stmt] stmts, [VarTy] env0, Ctx ctx, Ty frt, Bool 
 		i = i + 1
 	}
 	return term_code
+}
+
+# Check a statement-position `match scrut { arms }` — the scrutinee must be a union; the
+# same coverage rules as an expression match (every arm names that union and one of its
+# members, no member twice, no arm after `_`, exhaustive unless a `_` is present, and a
+# payload pattern's arity/uniqueness matches its member). Each arm body is a statement list
+# checked in the outer env extended with the arm's payload binds (its own scope, so its
+# locals do not leak). A statement `match` is always treated as NON-terminal (returns 0, so
+# a function still needs an explicit trailing `return` after it) — matching the genesis
+# compiler, and correct for cf0's own use where every arm falls through.
+const check_stmt_match = (Func fn, Expr scrut, [StmtArm] arms, [VarTy] env, Ctx ctx, Ty frt, Bool in_loop): Iarch -> {
+	const Str un = union_of(type_of(scrut, env, ctx))
+	if str_eq(un, "") then die("cf0: type: a match scrutinee must be a union\n")
+	const Iarch ui = find_union(ctx.unions, un)
+	const Iarch na = Iarch(arms.len)
+	if na == 0 then die("cf0: type: a match needs at least one arm\n")
+	let [Iarch] covered = []
+	let Bool wild_seen = false
+	let Iarch i = 0
+	loop {
+		if i >= na then break
+		if arms[i].is_wild then {
+			if wild_seen then die("cf0: type: a match has at most one `_`\n")
+			wild_seen = true
+		} else {
+			if wild_seen then die("cf0: type: no match arm may follow `_`\n")
+			if !str_eq(arms[i].type_name, un) then die("cf0: type: a match arm must name the scrutinee's union\n")
+			let Iarch mj = 0
+			loop {
+				if mj >= Iarch(arms[i].members.len) then break
+				const Iarch mi = union_member_index(ctx.unions[ui].members, arms[i].members[mj])
+				if mi < 0 then die("cf0: type: a match arm names a nonexistent union member\n")
+				let Iarch d = 0
+				loop {
+					if d >= Iarch(covered.len) then break
+					if covered[d] == mi then die("cf0: type: a union member is matched twice\n")
+					d = d + 1
+				}
+				covered = [...covered, mi]
+				mj = mj + 1
+			}
+			# a payload-binding arm (single member): arity must match, no repeated name
+			if Iarch(arms[i].binds.len) > 0 then {
+				const Iarch mi0 = union_member_index(ctx.unions[ui].members, arms[i].members[0])
+				if Iarch(arms[i].binds.len) != Iarch(ctx.unions[ui].members[mi0].payloads.len) then die("cf0: type: a payload pattern's arity must match the member\n")
+				let Iarch di = 0
+				loop {
+					if di >= Iarch(arms[i].binds.len) then break
+					if !str_eq(arms[i].binds[di], "_") then {
+						let Iarch dj = 0
+						loop {
+							if dj >= di then break
+							if str_eq(arms[i].binds[dj], arms[i].binds[di]) then die("cf0: type: a payload binding name may not repeat\n")
+							dj = dj + 1
+						}
+					}
+					di = di + 1
+				}
+			}
+		}
+		const [VarTy] benv = arm_bind_env(arms[i].type_name, arms[i].members, arms[i].binds, env, ctx)
+		check_stmts(fn, arms[i].body, benv, ctx, frt, in_loop)
+		i = i + 1
+	}
+	if !wild_seen then {
+		if Iarch(covered.len) != Iarch(ctx.unions[ui].members.len) then die("cf0: type: a match must cover every union member or carry a `_`\n")
+	}
+	return 0
 }
 
 # Check one function: seed the environment with its parameters (immutable), then
