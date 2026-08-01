@@ -582,6 +582,7 @@ const init_agg_type = (*Emit ctx, [Binding] env, Expr e): Str -> match e {
 	Expr.StrLit(bytes) -> "Str",
 	Expr.Interp(id) -> "Str",
 	Expr.Buffer(n) -> "$ptr",
+	Expr.Addr(name) -> var_agg_type(env, name),
 	Expr.Var(name) -> var_agg_type(env, name),
 	_ -> ""
 }
@@ -1057,6 +1058,7 @@ const emit_expr = (Expr e, *Emit ctx, [Binding] env): Str -> match e {
 	Expr.Index(arr, idx) -> emit_index(ctx, env, arr, idx),
 	Expr.IndexField(arr, idx, f) -> emit_index_field(ctx, env, arr, idx, f),
 	Expr.Buffer(n) -> emit_buffer(ctx, n),
+	Expr.Addr(name) -> emit_var(ctx, env, name),
 	Expr.UnionMk(tn, mem, args) -> emit_union_mk(ctx, tn, mem, args, env),
 	Expr.Match(scrut, arms) -> emit_match(ctx, scrut, arms, env),
 	Expr.Neg(x) -> emit_unop(ctx, "sub 0, ", x, "", env),
@@ -1399,12 +1401,17 @@ const emit_func = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 	loop {
 		if pi >= Iarch(fn.params.len) then break
 		if fn.params[pi].is_ptr then {
-			# a `*[Uint8]` byte-pointer parameter: copy the pointer into a temp, bound "$ptr"
-			# so the body can index it (a raw byte pointer, no header).
+			# a pointer parameter: copy the pointer into a temp. A `*[Uint8]` byte pointer
+			# binds "$ptr" (indexable, no header); a `*Record` pointer binds its record type
+			# (fields read/written through it).
 			const Iarch slot = ctx.next
 			ctx.next = ctx.next + 1
 			write_str(ctx.fd, "\t%t${slot} =l copy %p${pi}\n")
-			params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: "$ptr", elem: "" })]
+			if str_eq(fn.params[pi].type_name, "$ptr") then {
+				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: "$ptr", elem: "" })]
+			} else {
+				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: fn.params[pi].type_name, elem: "" })]
+			}
 		} else {
 			if is_agg_param(fn.params[pi], ctx.recs, ctx.unions) then {
 				# a record parameter arrives as a pointer to the caller's record; copy it

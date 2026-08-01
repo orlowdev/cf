@@ -136,8 +136,19 @@ const named_ty = (Str type_name, Str elem, [RecDecl] recs, [UnionDecl] unions): 
 }
 
 const param_ty = (Param p, [RecDecl] recs, [UnionDecl] unions): Ty -> {
-	if p.is_ptr then return Ty.TPtr
+	# a `*[Uint8]` byte pointer is opaque (`TPtr`); a `*Record` pointer resolves to the record
+	if p.is_ptr then {
+		if str_eq(p.type_name, "$ptr") then return Ty.TPtr
+		return named_ty(p.type_name, p.elem, recs, unions)
+	}
 	return named_ty(p.type_name, p.elem, recs, unions)
+}
+
+# Whether a parameter is a mutable `*Record` pointer (fields written through it).
+const param_is_recptr = (Param p, [RecDecl] recs): Bool -> {
+	if !p.is_ptr then return false
+	if str_eq(p.type_name, "$ptr") then return false
+	return find_rec(recs, p.type_name) >= 0
 }
 
 # Resolve a function's declared return type to a `Ty` (`""` → the implicit `Int`).
@@ -608,6 +619,7 @@ const type_of = (Expr e, [VarTy] env, Ctx ctx): Ty -> match e {
 	Expr.Index(arr, idx) -> index_type(arr, idx, env, ctx),
 	Expr.IndexField(arr, idx, f) -> indexfield_type(arr, idx, f, env, ctx),
 	Expr.Buffer(n) -> Ty.TPtr,
+	Expr.Addr(name) -> var_type(env, name, ctx),
 	Expr.Neg(x) -> int_unop(x, env, ctx),
 	Expr.BitNot(x) -> int_unop(x, env, ctx),
 	Expr.Not(x) -> not_op(x, env, ctx),
@@ -790,7 +802,9 @@ const check_func = (Func fn, Ctx ctx): Iarch -> {
 	loop {
 		if pi >= Iarch(fn.params.len) then break
 		const Ty pty = param_ty(fn.params[pi], ctx.recs, ctx.unions)
-		env = [...env, VarTy({ name: fn.params[pi].name, ty: pty, mutable: false })]
+		# a `*Record` pointer parameter is mutable — its fields are written through it
+		const Bool pmut = param_is_recptr(fn.params[pi], ctx.recs)
+		env = [...env, VarTy({ name: fn.params[pi].name, ty: pty, mutable: pmut })]
 		pi = pi + 1
 	}
 	const Iarch dr = check_stmts(fn, fn.body, env, ctx, frt, false)
