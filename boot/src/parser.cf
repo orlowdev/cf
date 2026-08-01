@@ -10,6 +10,7 @@
 
 import "io" as { die }
 import "token" as { Token, TokKind, is_eof, is_ident, is_intlit, is_strlit, is_lparen, is_rparen, is_lbrace, is_rbrace, is_lbracket, is_rbracket, is_comma, is_colon, is_dot, is_ellipsis, is_eq, is_arrow, is_minus, is_plus, is_star, is_slash, is_percent, is_amp, is_pipe, is_caret, is_tilde, is_bang, is_shl, is_shr, is_eqeq, is_ne, is_lt, is_gt, is_le, is_ge, is_logand, is_logor }
+import "lexer" as { lex }
 import "ast" as { Expr, Stmt, Param, Func, Ty, FieldInit, RecDecl, UnionMember, UnionDecl, MatchArm, StmtArm, Seg, RetSig, Import, Program }
 
 # The parse cursor: the token stream, the source (for keyword text), a position.
@@ -66,15 +67,34 @@ const escape_byte = (Iarch e): Iarch -> {
 	return 0
 }
 
-# Is a byte a valid interpolation-name character (`[A-Za-z0-9_]`)?
-const is_name_byte = (Iarch c): Bool -> (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95
+# Parse an interpolation hole's RAW byte slice (src[hstart .. hstart+hlen]) into the Expr it
+# holds. The hole is its own little source: its bytes are copied into a fresh buffer (sealed
+# as a `Str` for a `.bytes` pointer), lexed, and run through the ordinary expression parser —
+# so a hole is any expression (`a + 8`, `ctx.next`, `xs[i].f`), not just a bare name. The
+# interned names in the resulting tree are copied into the arena, so they outlive the buffer.
+# A hole must be exactly one expression (trailing tokens are an error).
+const parse_hole = (*[Uint8] src, Iarch hstart, Iarch hlen): Expr -> {
+	let [1024 Uint8] hbuf
+	if hlen >= 1024 then die("cf0: parse: an interpolation hole is too long\n")
+	let Iarch i = 0
+	loop {
+		if i >= hlen then break
+		hbuf[i] = src[hstart + i]
+		i = i + 1
+	}
+	const [Token] toks = lex(hbuf, hlen)
+	let Parser hp = Parser({ toks: toks, src: hbuf, pos: 0 })
+	const Expr e = parse_expr(&hp)
+	if !is_eof(peek(&hp)) then die("cf0: parse: an interpolation hole must be a single expression\n")
+	return e
+}
 
 # Parse a string literal's RAW content slice (src[start .. start+len]) into an Expr: a
 # plain `StrLit` (its decoded bytes) when there is no interpolation, else an `Interp`
 # (alternating literal-run / hole segments, assembled at runtime). Escapes collapse to
-# one byte; a raw newline is content; `\$` / a lone `$` are literal; `${name}` is a hole
-# (a bare identifier — an empty `${}`, a non-name, or a missing `}` is an error). The
-# accumulated literal run `cur` is flushed to a segment and RESET at each hole.
+# one byte; a raw newline is content; `\$` / a lone `$` are literal; `${expr}` is a hole
+# (an expression — an empty `${}` or a missing `}` is an error). The accumulated literal
+# run `cur` is flushed to a segment and RESET at each hole.
 const parse_string = (*[Uint8] src, Iarch start, Iarch len): Expr -> {
 	let [Seg] segs = []
 	let [Uint8] cur = []
@@ -90,20 +110,20 @@ const parse_string = (*[Uint8] src, Iarch start, Iarch len): Expr -> {
 			continue
 		}
 		if c == 36 && i + 1 < len && Iarch(src[start + i + 1]) == 123 then {
-			# `${name}` — flush the pending literal run, reset it, then read the bare name
-			segs = [...segs, Seg({ is_hole: false, lit: cur, name: "" })]
+			# `${expr}` — flush the pending literal run, reset it, then scan to the matching
+			# `}` and lex+parse the enclosed bytes as an expression hole.
+			segs = [...segs, Seg({ is_hole: false, lit: cur, name: "", expr: Expr.Lit(0) })]
 			cur = []
-			const Iarch nstart = i + 2
-			let Iarch j = nstart
+			const Iarch hstart = i + 2
+			let Iarch j = hstart
 			loop {
 				if j >= len then die("cf0: parse: an unterminated interpolation hole (missing `}`)\n")
-				const Iarch d = Iarch(src[start + j])
-				if d == 125 then break
-				if !is_name_byte(d) then die("cf0: parse: an interpolation hole must be a bare name\n")
+				if Iarch(src[start + j]) == 125 then break
 				j = j + 1
 			}
-			if j == nstart then die("cf0: parse: an empty interpolation hole\n")
-			segs = [...segs, Seg({ is_hole: true, lit: cur, name: intern(src, start + nstart, j - nstart) })]
+			if j == hstart then die("cf0: parse: an empty interpolation hole\n")
+			const Expr he = parse_hole(src, start + hstart, j - hstart)
+			segs = [...segs, Seg({ is_hole: true, lit: cur, name: "", expr: he })]
 			any_hole = true
 			i = j + 1
 			continue
@@ -112,7 +132,7 @@ const parse_string = (*[Uint8] src, Iarch start, Iarch len): Expr -> {
 		i = i + 1
 	}
 	if !any_hole then return Expr.StrLit(cur)
-	segs = [...segs, Seg({ is_hole: false, lit: cur, name: "" })]
+	segs = [...segs, Seg({ is_hole: false, lit: cur, name: "", expr: Expr.Lit(0) })]
 	return Expr.Interp(segs)
 }
 
@@ -965,7 +985,7 @@ const scan_asm_segs = (*[Uint8] src, Iarch start, Iarch len): [Seg] -> {
 		const Iarch c = Iarch(src[start + i])
 		if c == 36 && i + 1 < len && Iarch(src[start + i + 1]) == 123 then {
 			# `${name}` — flush the literal run, then read the bare name up to `}`
-			segs = [...segs, Seg({ is_hole: false, lit: cur, name: "" })]
+			segs = [...segs, Seg({ is_hole: false, lit: cur, name: "", expr: Expr.Lit(0) })]
 			cur = []
 			let Iarch j = i + 2
 			loop {
@@ -974,7 +994,7 @@ const scan_asm_segs = (*[Uint8] src, Iarch start, Iarch len): [Seg] -> {
 				j = j + 1
 			}
 			const Str nm = intern(src, start + i + 2, j - i - 2)
-			segs = [...segs, Seg({ is_hole: true, lit: cur, name: nm })]
+			segs = [...segs, Seg({ is_hole: true, lit: cur, name: nm, expr: Expr.Lit(0) })]
 			cur = []
 			i = j + 1
 		} else {
@@ -982,7 +1002,7 @@ const scan_asm_segs = (*[Uint8] src, Iarch start, Iarch len): [Seg] -> {
 			i = i + 1
 		}
 	}
-	segs = [...segs, Seg({ is_hole: false, lit: cur, name: "" })]
+	segs = [...segs, Seg({ is_hole: false, lit: cur, name: "", expr: Expr.Lit(0) })]
 	return segs
 }
 
