@@ -334,28 +334,34 @@ const emit_str_lit = (*Emit ctx, [Uint8] bytes): Str -> {
 	return "%t${hdr}"
 }
 
-# Emit `base.field` on a general expression base — only `.len` on a `Str` here: emit
-# the base (a header pointer), then loadl its len word at +8.
-const emit_field_expr = (*Emit ctx, [Binding] env, Expr base, Str field): Str -> {
-	const Str b = emit_expr(base, ctx, env)
-	const Str bt = init_agg_type(ctx, env, base)
+# Load the 8-byte value at `base + off` (a field / element slot), returning its operand.
+# A `+ 0` offset rides through as a harmless `add`.
+const load_at = (*Emit ctx, Str base, Iarch off): Str -> {
 	const Iarch a = ctx.next
 	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${a} =l add ${b}, 8\n")
-	# a dynamic array's `.len` is an `l` at offset 8 (truncate to a word); a string's is a `w`
-	if str_eq(bt, "$dyn") then {
-		const Iarch ll = ctx.next
-		ctx.next = ctx.next + 1
-		write_str(ctx.fd, "\t%t${ll} =l loadl %t${a}\n")
-		const Iarch v = ctx.next
-		ctx.next = ctx.next + 1
-		write_str(ctx.fd, "\t%t${v} =l copy %t${ll}\n")
-		return "%t${v}"
-	}
+	write_str(ctx.fd, "\t%t${a} =l add ${base}, ${off}\n")
 	const Iarch v = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${v} =l loadl %t${a}\n")
 	return "%t${v}"
+}
+
+# Emit `base.field` on a general expression base. Emit the base to a pointer, then read
+# the field: a `$dyn` array's `.len` @8; a `Str`'s `.bytes` @0 or `.len` @8; a RECORD base
+# (`p.toks[i].kind`, `prog.recs[r].name`) — the field at its declared 8-byte-slot offset.
+# All loads are `loadl` (uniform 8-byte slots).
+const emit_field_expr = (*Emit ctx, [Binding] env, Expr base, Str field): Str -> {
+	const Str b = emit_expr(base, ctx, env)
+	const Str bt = init_agg_type(ctx, env, base)
+	# a dynamic array's `.len` — the len word at offset 8
+	if str_eq(bt, "$dyn") then return load_at(ctx, b, 8)
+	# a string's `.bytes` (ptr @0) or `.len` (@8)
+	if str_eq(bt, "Str") then {
+		if str_eq(field, "bytes") then return load_at(ctx, b, 0)
+		return load_at(ctx, b, 8)
+	}
+	# a record base — read the field at its declared offset
+	return load_at(ctx, b, field_offset(ctx.recs, bt, field))
 }
 
 # Emit an interpolated string `"…${name}…"`: build a fresh `[Uint8]` byte vector
@@ -406,18 +412,23 @@ const emit_interp = (*Emit ctx, [Seg] segs, [Binding] env): Str -> {
 		}
 		si = si + 1
 	}
+	return emit_str_seal(ctx, "%t${vh}")
+}
+
+# Seal a `[Uint8]` byte-vector operand (a `{data@0, len@8, cap@16}` header) into a
+# `{bytes@0, len@8}` Str header borrowing the vector's backing bytes/len. Returns the
+# Str header operand. Shared by `emit_interp` (the string-builder finish) and the
+# `Str(v)` cast (the explicit seal in cf0's own source).
+const emit_str_seal = (*Emit ctx, Str vec): Str -> {
 	const Iarch data = ctx.next
 	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${data} =l loadl %t${vh}\n")
+	write_str(ctx.fd, "\t%t${data} =l loadl ${vec}\n")
 	const Iarch lp = ctx.next
 	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${lp} =l add %t${vh}, 8\n")
+	write_str(ctx.fd, "\t%t${lp} =l add ${vec}, 8\n")
 	const Iarch ll = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${ll} =l loadl %t${lp}\n")
-	const Iarch lw = ctx.next
-	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${lw} =l copy %t${ll}\n")
 	const Iarch hdr = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${hdr} =l call $cf_alloc(w 16)\n")
@@ -425,7 +436,7 @@ const emit_interp = (*Emit ctx, [Seg] segs, [Binding] env): Str -> {
 	const Iarch hl = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${hl} =l add %t${hdr}, 8\n")
-	write_str(ctx.fd, "\tstorel %t${lw}, %t${hl}\n")
+	write_str(ctx.fd, "\tstorel %t${ll}, %t${hl}\n")
 	return "%t${hdr}"
 }
 
@@ -521,8 +532,10 @@ const emit_union_mk = (*Emit ctx, Str type_name, Str member, [Expr] args, [Bindi
 	return "%t${b}"
 }
 
-# The aggregate type name a call returns (a record or a BOXED union), or "".
+# The aggregate type name a call returns (a record or a BOXED union), or "". A `Str(v)`
+# seal yields a Str aggregate, so a `const s = Str(v)` binding adopts the header pointer.
 const call_agg_type = (*Emit ctx, Str callee): Str -> {
+	if str_eq(callee, "Str") then return "Str"
 	const Iarch fidx = find_func(ctx.funcs, callee)
 	if fidx < 0 then return ""
 	if ret_is_l(ctx.funcs[fidx].ret_name, ctx.recs, ctx.unions) then return ctx.funcs[fidx].ret_name
@@ -585,7 +598,36 @@ const init_agg_type = (*Emit ctx, [Binding] env, Expr e): Str -> match e {
 	Expr.Addr(name) -> var_agg_type(env, name),
 	Expr.Var(name) -> var_agg_type(env, name),
 	Expr.IndexExpr(base, idx) -> indexexpr_agg_type(ctx, env, base),
+	Expr.IndexField(arr, idx, f) -> indexfield_agg_type(ctx, env, arr, f),
+	Expr.FieldExpr(base, f) -> fieldexpr_agg_type(ctx, env, base, f),
 	_ -> ""
+}
+
+# The aggregate marker of `arr[i].field` — the element record's field type when that field
+# is a pointer aggregate (a `Str`/`[T]`/record/boxed union), so a `.field` chained off it
+# (`ps[i].tag.len`) dispatches correctly and a binding of it adopts the pointer. Else "".
+const indexfield_agg_type = (*Emit ctx, [Binding] env, Str arr, Str field): Str -> {
+	const Iarch ai = lookup_index(env, arr)
+	if ai < 0 then return ""
+	const Str en = env[ai].elem
+	if find_rec(ctx.recs, en) < 0 then return ""
+	if !field_is_ptr(ctx, en, field) then return ""
+	return field_ftype(ctx, en, field)
+}
+
+# The aggregate marker of `base.field` on a general expression base — the field's type when
+# it is a pointer aggregate, so deeper chains (`a.b.c`) dispatch. A Str's `.bytes` is a
+# byte pointer; its `.len` and a `$dyn`'s `.len` are words ("").
+const fieldexpr_agg_type = (*Emit ctx, [Binding] env, Expr base, Str field): Str -> {
+	const Str bt = init_agg_type(ctx, env, base)
+	if str_eq(bt, "Str") then {
+		if str_eq(field, "bytes") then return "$ptr"
+		return ""
+	}
+	if str_eq(bt, "$dyn") then return ""
+	if find_rec(ctx.recs, bt) < 0 then return ""
+	if !field_is_ptr(ctx, bt, field) then return ""
+	return field_ftype(ctx, bt, field)
 }
 
 # The aggregate marker of a `base[i]` element — for binding `const t = p.toks[i]` (whose
@@ -718,6 +760,8 @@ const is_cast_type = (Str name): Bool -> {
 
 const emit_call = (*Emit ctx, Str callee, [Expr] args, [Binding] env): Str -> {
 	if is_cast_type(callee) then return emit_expr(args[0], ctx, env)
+	# `Str(v)` — seal a `[Uint8]` byte vector into a Str header borrowing its backing
+	if str_eq(callee, "Str") then return emit_str_seal(ctx, emit_expr(args[0], ctx, env))
 	const Iarch fidx = find_func(ctx.funcs, callee)
 	if fidx < 0 then die("cf0: emit: internal: unresolved call (should be caught by typecheck)\n")
 	const Iarch nargs = Iarch(args.len)

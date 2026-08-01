@@ -129,8 +129,9 @@ const named_ty = (Str type_name, Str elem, [RecDecl] recs, [UnionDecl] unions): 
 	if find_union(unions, type_name) >= 0 then return Ty.TUnion(type_name)
 	if str_eq(type_name, "Bool") then return Ty.TBool
 	if str_eq(type_name, "Str") then return Ty.TStr
-	if str_eq(type_name, "Iarch") then return Ty.TInt
-	if str_eq(type_name, "Int") then return Ty.TInt
+	# any integer-family name (`Iarch`/`Int`/`Uarch`/`Uint8`/… — the same set a cast names)
+	# is one word: cf0 tracks every integer width as `TInt` (a genesis narrowing).
+	if is_cast_type(type_name) then return Ty.TInt
 	die("cf0: type: an undeclared type name\n")
 	return Ty.TInt
 }
@@ -283,12 +284,22 @@ const is_cast_type = (Str name): Bool -> {
 const cast_type = (Str callee, [Expr] args, [VarTy] env, Ctx ctx): Ty -> {
 	if Iarch(args.len) != 1 then die("cf0: type: a numeric cast takes exactly one argument\n")
 	const Ty ot = type_of(args[0], env, ctx)
-	if !is_tint(ot) && !is_tptr(ot) then die("cf0: type: a numeric cast takes a scalar integer or a pointer\n")
+	if !is_tint(ot) then die("cf0: type: a numeric cast takes a scalar integer (no pointer<->integer conversion)\n")
 	return Ty.TInt
+}
+
+# `Str(v)` — seal a `[Uint8]` byte vector into a `Str`. Takes exactly one dynamic array of
+# bytes; yields a `Str` borrowing the vector's backing.
+const str_seal_type = ([Expr] args, [VarTy] env, Ctx ctx): Ty -> {
+	if Iarch(args.len) != 1 then die("cf0: type: `Str(...)` takes exactly one argument\n")
+	const Ty at = type_of(args[0], env, ctx)
+	if !str_eq(dyn_of(at), "Uint8") then die("cf0: type: `Str(...)` seals a `[Uint8]` byte vector\n")
+	return Ty.TStr
 }
 
 const call_type = (Str callee, [Expr] args, [VarTy] env, Ctx ctx): Ty -> {
 	if is_cast_type(callee) then return cast_type(callee, args, env, ctx)
+	if str_eq(callee, "Str") then return str_seal_type(args, env, ctx)
 	const Iarch fidx = find_func(ctx.funcs, callee)
 	if fidx < 0 then die("cf0: type: call to an undefined function\n")
 	const Iarch np = Iarch(ctx.funcs[fidx].params.len)
@@ -486,11 +497,13 @@ const match_type = (Expr scrut, [MatchArm] arms, [VarTy] env, Ctx ctx): Ty -> {
 }
 
 # The `Ty` of a dynamic array's element, given the element type NAME: a record name
-# yields `TRec` (the element is an arena pointer), anything else (`Iarch`, `Int`, …) an
-# `Int` word.
+# yields `TRec` and a union name `TUnion` (each element an arena pointer), a `Str` yields
+# `TStr`, anything else (`Iarch`, `Int`, …) an `Int` word. A `[Expr]` element is thus the
+# recursive union, not a truncated word — needed to index cf0's own `[Expr]`/`[Stmt]` lists.
 const elem_ty = (Str en, Ctx ctx): Ty -> {
 	if str_eq(en, "Str") then return Ty.TStr
 	if find_rec(ctx.recs, en) >= 0 then return Ty.TRec(en)
+	if find_union(ctx.unions, en) >= 0 then return Ty.TUnion(en)
 	return Ty.TInt
 }
 
@@ -576,7 +589,8 @@ const indexexpr_type = (Expr base, Expr idx, [VarTy] env, Ctx ctx): Ty -> {
 }
 
 # `arr[i].field` — `arr` must be a dynamic array of records and `field` must be declared
-# on that element record. Yields the field's type (an `Int` word in this brick).
+# on that element record. Yields the field's DECLARED type (a word, a `Str`, a `[T]`, a
+# nested record, or a union — cf0's own `[FieldInit]`/`[Param]` lists read `Str` fields).
 const indexfield_type = (Str arr, Expr idx, Str field, [VarTy] env, Ctx ctx): Ty -> {
 	const Iarch vi = env_index(env, arr)
 	if vi < 0 then die("cf0: type: index of an undeclared name\n")
@@ -590,8 +604,9 @@ const indexfield_type = (Str arr, Expr idx, Str field, [VarTy] env, Ctx ctx): Ty
 	}
 	const Iarch ri = find_rec(ctx.recs, en)
 	if ri < 0 then die("cf0: type: a field read needs a record element\n")
-	if field_index(ctx.recs[ri].fields, field) < 0 then die("cf0: type: the element record has no such field\n")
-	return Ty.TInt
+	const Iarch fi = field_index(ctx.recs[ri].fields, field)
+	if fi < 0 then die("cf0: type: the element record has no such field\n")
+	return named_ty(ctx.recs[ri].ftypes[fi], ctx.recs[ri].felems[fi], ctx.recs, ctx.unions)
 }
 
 # A string literal is a `Str`.
@@ -617,17 +632,26 @@ const interp_type = ([Seg] segs, [VarTy] env, Ctx ctx): Ty -> {
 # byte count (an Int).
 const fieldexpr_type = (Expr base, Str field, [VarTy] env, Ctx ctx): Ty -> {
 	const Ty bt = type_of(base, env, ctx)
-	# `.len` on a string or a dynamic array (chained off a field read, e.g. `fn.params.len`)
+	# a string exposes `.len` (an Int) and `.bytes` (a byte pointer)
 	if is_tstr(bt) then {
-		if !str_eq(field, "len") then die("cf0: type: a string has only `.len`\n")
-		return Ty.TInt
+		if str_eq(field, "len") then return Ty.TInt
+		if str_eq(field, "bytes") then return Ty.TPtr
+		die("cf0: type: a string has only `.len` and `.bytes`\n")
 	}
+	# a dynamic array (chained off a field read, e.g. `fn.params.len`) exposes only `.len`
 	if !str_eq(dyn_of(bt), "") then {
 		if !str_eq(field, "len") then die("cf0: type: a dynamic array has only `.len`\n")
 		return Ty.TInt
 	}
-	die("cf0: type: field access `.` needs a string or a dynamic array on the left\n")
-	return Ty.TInt
+	# a record base (a general expression yielding a record — `p.toks[i].kind`,
+	# `prog.recs[r].name`): read the field's declared type off the element record
+	const Str tn = rec_of(bt)
+	if str_eq(tn, "") then die("cf0: type: field access `.` needs a string, a dynamic array, or a record on the left\n")
+	const Iarch ri = find_rec(ctx.recs, tn)
+	if ri < 0 then die("cf0: type: unknown record type\n")
+	const Iarch fi = field_index(ctx.recs[ri].fields, field)
+	if fi < 0 then die("cf0: type: reading a field the record does not declare\n")
+	return named_ty(ctx.recs[ri].ftypes[fi], ctx.recs[ri].felems[fi], ctx.recs, ctx.unions)
 }
 
 const type_of = (Expr e, [VarTy] env, Ctx ctx): Ty -> match e {
