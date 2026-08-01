@@ -27,13 +27,15 @@ import "ast" as { Expr, Stmt, Param, Func, FieldInit, RecDecl, UnionMember, Unio
 # reset per function; `funcs`/`recs`/`unions` are constant across the program.
 data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs, [RecDecl] recs, [UnionDecl] unions, Iarch cur_loop }
 
-# A local/parameter in scope: its interned name, the temp holding its stack slot
-# pointer, and — for a record local — its record type name (`""` for a word). A word
-# slot points to a 4-byte cell (read with `loadw`); a record slot points to the
-# record's base (a field is read at base + offset). `elem` is the element type name of
-# a dynamic-array binding (`rec_type` is then `"$dyn"`): a record name marks a
-# `[Record]` (8-byte pointer elements), else "" / `Iarch` marks word elements.
-data Binding = { Str name, Iarch slot, Str rec_type, Str elem }
+# A local/parameter in scope: its interned name, `slot`, its `rec_type` (a record/union
+# type name, `"$dyn"`, `"$ptr"`, or `"Str"` — `""` for a word), and `elem` (a dynamic
+# array's element type name, `rec_type` then `"$dyn"`).
+# `is_cell` distinguishes the two slot representations. When true, `slot` is a stack cell
+# holding the value/pointer — read with `loadl`, REASSIGNED with `storel`: every word local
+# and every MUTABLE (`let`) aggregate (so `xs = []` / `acc = Expr.Add(acc, r)` repoint it).
+# When false, `slot` is a write-once temp holding the aggregate base pointer directly (read
+# as the operand): a `const` aggregate and every aggregate/pointer PARAMETER (a borrow).
+data Binding = { Str name, Iarch slot, Str rec_type, Str elem, Bool is_cell }
 
 # Byte-wise `Str` equality (variable-name lookup).
 const str_eq = (Str a, Str b): Bool -> {
@@ -57,6 +59,18 @@ const lookup_index = ([Binding] env, Str name): Iarch -> {
 		i = i + 1
 	}
 	return 0 - 1
+}
+
+# The value/base-pointer operand of binding `idx`: for a cell binding (a word or a mutable
+# aggregate — `is_cell`) load the current contents; for a write-once temp (a `const`
+# aggregate / a parameter) the temp IS the operand. Callers that need a record base, a `$dyn`
+# header, or a `$ptr` go through this so a repointed `let` aggregate reads its live pointer.
+const binding_ptr = (*Emit ctx, [Binding] env, Iarch idx): Str -> {
+	if !env[idx].is_cell then return "%t${env[idx].slot}"
+	const Iarch t = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${t} =l loadl %t${env[idx].slot}\n")
+	return "%t${t}"
 }
 
 # The index of the record declared as `name`, or -1.
@@ -217,9 +231,9 @@ const emit_unop = (*Emit ctx, Str pre, Expr x, Str post, [Binding] env): Str -> 
 	return "%t${t}"
 }
 
-# Emit a variable reference. A record local's slot IS its base pointer (returned as
-# an `l` value — e.g. a record being returned); a word local's slot points to its
-# cell, so it is loaded.
+# Emit a variable reference. A const-aggregate local's slot IS its base pointer (a temp,
+# returned directly — e.g. a record being returned); a word or a mutable-aggregate local's
+# slot is a cell, so its current value/pointer is loaded (see `binding_ptr`).
 const emit_var = (*Emit ctx, [Binding] env, Str name): Str -> {
 	const Iarch idx = lookup_index(env, name)
 	if idx < 0 then {
@@ -227,12 +241,7 @@ const emit_var = (*Emit ctx, [Binding] env, Str name): Str -> {
 		const [Expr] noargs = []
 		return emit_call(ctx, name, noargs, env)
 	}
-	const Iarch slot = env[idx].slot
-	if !str_eq(env[idx].rec_type, "") then return "%t${slot}"
-	const Iarch t = ctx.next
-	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${t} =l loadl %t${slot}\n")
-	return "%t${t}"
+	return binding_ptr(ctx, env, idx)
 }
 
 # Emit `base.field`. If `base` is a union type name, this is a tag-only union
@@ -251,53 +260,17 @@ const emit_field = (*Emit ctx, [Binding] env, Str base, Str field): Str -> {
 		return "%t${b}"
 	}
 	const Iarch idx = lookup_index(env, base)
-	const Iarch slot = env[idx].slot
+	const Str bp = binding_ptr(ctx, env, idx)
 	const Str rt = env[idx].rec_type
-	# a string's `.len` — loadl the header's len@8 (the slot holds the header pointer)
+	# a string's `.len` — loadl the header's len@8 (`bp` is the header pointer)
 	if str_eq(rt, "Str") then {
 		# `s.bytes` — the header's byte pointer at offset 0
-		if str_eq(field, "bytes") then {
-			const Iarch sb = ctx.next
-			ctx.next = ctx.next + 1
-			write_str(ctx.fd, "\t%t${sb} =l loadl %t${slot}\n")
-			return "%t${sb}"
-		}
-		# `s.len` — the header's byte count at offset 8
-		const Iarch sa = ctx.next
-		ctx.next = ctx.next + 1
-		write_str(ctx.fd, "\t%t${sa} =l add %t${slot}, 8\n")
-		const Iarch sl = ctx.next
-		ctx.next = ctx.next + 1
-		write_str(ctx.fd, "\t%t${sl} =l loadl %t${sa}\n")
-		return "%t${sl}"
+		if str_eq(field, "bytes") then return load_at(ctx, bp, 0)
+		return load_at(ctx, bp, 8)  # `s.len`
 	}
-	# a dynamic array's `.len` — loadl the header's len@8, truncate to a word
-	if str_eq(rt, "$dyn") then {
-		const Iarch la = ctx.next
-		ctx.next = ctx.next + 1
-		write_str(ctx.fd, "\t%t${la} =l add %t${slot}, 8\n")
-		const Iarch ll = ctx.next
-		ctx.next = ctx.next + 1
-		write_str(ctx.fd, "\t%t${ll} =l loadl %t${la}\n")
-		const Iarch lw = ctx.next
-		ctx.next = ctx.next + 1
-		write_str(ctx.fd, "\t%t${lw} =l copy %t${ll}\n")
-		return "%t${lw}"
-	}
-	const Iarch off = field_offset(ctx.recs, rt, field)
-	const Iarch addr = ctx.next
-	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${addr} =l add %t${slot}, ${off}\n")
-	const Iarch t = ctx.next
-	ctx.next = ctx.next + 1
-	# a pointer field loads the full 8-byte pointer (an aggregate value); a word field
-	# loads its low 4 bytes.
-	if field_is_ptr(ctx, rt, field) then {
-		write_str(ctx.fd, "\t%t${t} =l loadl %t${addr}\n")
-	} else {
-		write_str(ctx.fd, "\t%t${t} =l loadl %t${addr}\n")
-	}
-	return "%t${t}"
+	# a dynamic array's `.len` — loadl the header's len@8
+	if str_eq(rt, "$dyn") then return load_at(ctx, bp, 8)
+	return load_at(ctx, bp, field_offset(ctx.recs, rt, field))
 }
 
 # Emit a string literal: materialize its bytes in the arena (a byte buffer written one
@@ -843,7 +816,7 @@ const arm_body_env = (*Emit ctx, [Binding] env, Str type_name, [Str] members, [S
 				write_str(ctx.fd, "\t%t${val} =l loadl %t${addr}\n")
 				const Str pt = payload_type(ctx, type_name, members[0], bi)
 				const Str pe = payload_elem(ctx, type_name, members[0], bi)
-				benv = [...benv, Binding({ name: binds[bi], slot: val, rec_type: pt, elem: pe })]
+				benv = [...benv, Binding({ name: binds[bi], slot: val, rec_type: pt, elem: pe, is_cell: false })]
 			} else {
 				# a word payload: load it and spill to its own 4-byte slot (read via loadw)
 				const Iarch val = ctx.next
@@ -853,7 +826,7 @@ const arm_body_env = (*Emit ctx, [Binding] env, Str type_name, [Str] members, [S
 				ctx.next = ctx.next + 1
 				write_str(ctx.fd, "\t%t${bslot} =l alloc8 8\n")
 				write_str(ctx.fd, "\tstorel %t${val}, %t${bslot}\n")
-				benv = [...benv, Binding({ name: binds[bi], slot: bslot, rec_type: "", elem: "" })]
+				benv = [...benv, Binding({ name: binds[bi], slot: bslot, rec_type: "", elem: "", is_cell: true })]
 			}
 		}
 		bi = bi + 1
@@ -1051,7 +1024,7 @@ const emit_buffer = (*Emit ctx, Iarch n): Str -> {
 # Emit `xs[i]` — load the i-th element (element address = data + i*8).
 const emit_index = (*Emit ctx, [Binding] env, Str arr, Expr idx): Str -> {
 	const Iarch ai = lookup_index(env, arr)
-	const Iarch hdr = env[ai].slot
+	const Str hdr = binding_ptr(ctx, env, ai)
 	# a byte pointer / buffer index `p[i]` reads the i-th byte at pointer + i (no header).
 	if str_eq(env[ai].rec_type, "$ptr") then {
 		const Str pv = emit_expr(idx, ctx, env)
@@ -1060,7 +1033,7 @@ const emit_index = (*Emit ctx, [Binding] env, Str arr, Expr idx): Str -> {
 		write_str(ctx.fd, "\t%t${pil} =l copy ${pv}\n")
 		const Iarch paddr = ctx.next
 		ctx.next = ctx.next + 1
-		write_str(ctx.fd, "\t%t${paddr} =l add %t${hdr}, %t${pil}\n")
+		write_str(ctx.fd, "\t%t${paddr} =l add ${hdr}, %t${pil}\n")
 		const Iarch pval = ctx.next
 		ctx.next = ctx.next + 1
 		write_str(ctx.fd, "\t%t${pval} =l loadub %t${paddr}\n")
@@ -1071,7 +1044,7 @@ const emit_index = (*Emit ctx, [Binding] env, Str arr, Expr idx): Str -> {
 		const Str siv = emit_expr(idx, ctx, env)
 		const Iarch sbytes = ctx.next
 		ctx.next = ctx.next + 1
-		write_str(ctx.fd, "\t%t${sbytes} =l loadl %t${hdr}\n")
+		write_str(ctx.fd, "\t%t${sbytes} =l loadl ${hdr}\n")
 		const Iarch sil = ctx.next
 		ctx.next = ctx.next + 1
 		write_str(ctx.fd, "\t%t${sil} =l copy ${siv}\n")
@@ -1086,7 +1059,7 @@ const emit_index = (*Emit ctx, [Binding] env, Str arr, Expr idx): Str -> {
 	const Str iv = emit_expr(idx, ctx, env)
 	const Iarch data = ctx.next
 	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${data} =l loadl %t${hdr}\n")
+	write_str(ctx.fd, "\t%t${data} =l loadl ${hdr}\n")
 	const Iarch il = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${il} =l copy ${iv}\n")
@@ -1107,11 +1080,11 @@ const emit_index = (*Emit ctx, [Binding] env, Str arr, Expr idx): Str -> {
 # element record type is the array binding's `elem`.
 const emit_index_field = (*Emit ctx, [Binding] env, Str arr, Expr idx, Str field): Str -> {
 	const Iarch ai = lookup_index(env, arr)
-	const Iarch hdr = env[ai].slot
+	const Str hdr = binding_ptr(ctx, env, ai)
 	const Str iv = emit_expr(idx, ctx, env)
 	const Iarch data = ctx.next
 	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${data} =l loadl %t${hdr}\n")
+	write_str(ctx.fd, "\t%t${data} =l loadl ${hdr}\n")
 	const Iarch il = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${il} =l copy ${iv}\n")
@@ -1197,15 +1170,16 @@ const emit_index_expr = (*Emit ctx, [Binding] env, Expr base, Expr idx): Str -> 
 }
 
 # Emit the elements of a `xs = [...xs, e…]` self-growth append: each `cf_dyn_push`es
-# a slot onto the header (growing as needed, bumping len) and stores the element.
-const emit_append = (*Emit ctx, [Binding] env, Iarch hdr, [Expr] elems, Bool agg): Iarch -> {
+# a slot onto the header (growing as needed, bumping len) and stores the element. `hdr` is
+# the header-pointer operand (the array grows IN PLACE, so its binding is untouched).
+const emit_append = (*Emit ctx, [Binding] env, Str hdr, [Expr] elems, Bool agg): Iarch -> {
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(elems.len) then break
 		const Str v = emit_expr(elems[i], ctx, env)
 		const Iarch slot = ctx.next
 		ctx.next = ctx.next + 1
-		write_str(ctx.fd, "\t%t${slot} =l call $cf_dyn_push(l %t${hdr}, w 8)\n")
+		write_str(ctx.fd, "\t%t${slot} =l call $cf_dyn_push(l ${hdr}, w 8)\n")
 		# a record element rides as its 8-byte arena pointer; a word in its slot's low half.
 		if agg then write_str(ctx.fd, "\tstorel ${v}, %t${slot}\n")
 		if !agg then write_str(ctx.fd, "\tstorel ${v}, %t${slot}\n")
@@ -1213,9 +1187,16 @@ const emit_append = (*Emit ctx, [Binding] env, Iarch hdr, [Expr] elems, Bool agg
 	}
 	return 0
 }
-const emit_append_expr = (*Emit ctx, [Binding] env, Iarch hdr, Expr e, Bool agg): Iarch -> match e {
+const emit_append_expr = (*Emit ctx, [Binding] env, Str hdr, Expr e, Bool agg): Iarch -> match e {
 	Expr.ArrayLit(hs, sn, elems, et) -> emit_append(ctx, env, hdr, elems, agg),
 	_ -> 0 - 1
+}
+
+# Is `e` a SELF-spread `[...name, …]` — a grow-in-place append of `name` onto itself? Such an
+# assignment mutates the existing header; any other array value REPOINTS the binding.
+const is_self_spread = (Expr e, Str name): Bool -> match e {
+	Expr.ArrayLit(hs, sn, elems, et) -> if hs then str_eq(sn, name) else false,
+	_ -> false
 }
 
 const emit_expr = (Expr e, *Emit ctx, [Binding] env): Str -> match e {
@@ -1278,12 +1259,12 @@ const emit_expr = (Expr e, *Emit ctx, [Binding] env): Str -> match e {
 # name, and body.
 const emit_for_body = (*Emit ctx, [Binding] env, Str lv, Str arr, [Stmt] body): Iarch -> {
 	const Iarch ai = lookup_index(env, arr)
-	const Iarch hdr = env[ai].slot
+	const Str hdr = binding_ptr(ctx, env, ai)
 	const Iarch lid = ctx.label
 	ctx.label = ctx.label + 1
 	const Iarch la = ctx.next
 	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${la} =l add %t${hdr}, 8\n")
+	write_str(ctx.fd, "\t%t${la} =l add ${hdr}, 8\n")
 	const Iarch lenl = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${lenl} =l loadl %t${la}\n")
@@ -1305,7 +1286,7 @@ const emit_for_body = (*Emit ctx, [Binding] env, Str lv, Str arr, [Stmt] body): 
 	write_str(ctx.fd, "@fbody${lid}\n")
 	const Iarch data = ctx.next
 	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${data} =l loadl %t${hdr}\n")
+	write_str(ctx.fd, "\t%t${data} =l loadl ${hdr}\n")
 	const Iarch ivl = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${ivl} =l copy %t${iv}\n")
@@ -1322,7 +1303,7 @@ const emit_for_body = (*Emit ctx, [Binding] env, Str lv, Str arr, [Stmt] body): 
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${xcell} =l alloc8 8\n")
 	write_str(ctx.fd, "\tstorel %t${xval}, %t${xcell}\n")
-	const [Binding] benv = [...env, Binding({ name: lv, slot: xcell, rec_type: "", elem: "" })]
+	const [Binding] benv = [...env, Binding({ name: lv, slot: xcell, rec_type: "", elem: "", is_cell: true })]
 	emit_block(ctx, body, benv)
 	const Iarch iv2 = ctx.next
 	ctx.next = ctx.next + 1
@@ -1417,16 +1398,18 @@ const emit_simple_stmt = (*Emit ctx, [Binding] env, Stmt s): Iarch -> {
 			term = 1
 		},
 		Stmt.Assign(n, e) -> {
-			# `name = value` — a dynamic-array self-growth append `xs = [...xs, e]`
-			# grows in place; a scalar reassignment stores into the existing slot.
+			# `name = value`. A dynamic-array SELF-spread `xs = [...xs, e]` grows the header in
+			# place (its cell keeps the same pointer). Any other value — a word, a repointed
+			# `let` aggregate (`acc = Expr.Add(acc, r)`), or a fresh/other array (`xs = []`,
+			# `xs = ys`) — is stored into the binding's cell, replacing its contents/pointer.
 			const Iarch idx = lookup_index(env, n)
-			if str_eq(env[idx].rec_type, "$dyn") then {
+			if str_eq(env[idx].rec_type, "$dyn") && is_self_spread(e, n) then {
 				const Bool agg = elem_is_agg(ctx, env[idx].elem)
-				emit_append_expr(ctx, env, env[idx].slot, e, agg)
+				const Str hdr = binding_ptr(ctx, env, idx)
+				emit_append_expr(ctx, env, hdr, e, agg)
 			} else {
-				const Iarch slot = env[idx].slot
 				const Str v = emit_expr(e, ctx, env)
-				write_str(ctx.fd, "\tstorel ${v}, %t${slot}\n")
+				write_str(ctx.fd, "\tstorel ${v}, %t${env[idx].slot}\n")
 			}
 		},
 		Stmt.FieldAssign(b, f, e) -> {
@@ -1434,22 +1417,18 @@ const emit_simple_stmt = (*Emit ctx, [Binding] env, Stmt s): Iarch -> {
 			# Evaluate the value first (it may read the record's current fields).
 			const Str v = emit_expr(e, ctx, env)
 			const Iarch idx = lookup_index(env, b)
-			const Iarch slot = env[idx].slot
+			const Str bp = binding_ptr(ctx, env, idx)
 			const Str rt = env[idx].rec_type
 			const Iarch off = field_offset(ctx.recs, rt, f)
 			const Iarch addr = ctx.next
 			ctx.next = ctx.next + 1
-			write_str(ctx.fd, "\t%t${addr} =l add %t${slot}, ${off}\n")
-			if field_is_ptr(ctx, rt, f) then {
-				write_str(ctx.fd, "\tstorel ${v}, %t${addr}\n")
-			} else {
-				write_str(ctx.fd, "\tstorel ${v}, %t${addr}\n")
-			}
+			write_str(ctx.fd, "\t%t${addr} =l add ${bp}, ${off}\n")
+			write_str(ctx.fd, "\tstorel ${v}, %t${addr}\n")
 		},
 		Stmt.IndexAssign(a, ix, val) -> {
 			# `arr[idx] = val` — store the value at data + idx*8
 			const Iarch ai = lookup_index(env, a)
-			const Iarch hdr = env[ai].slot
+			const Str hdr = binding_ptr(ctx, env, ai)
 			const Str iv = emit_expr(ix, ctx, env)
 			const Str vv = emit_expr(val, ctx, env)
 			if str_eq(env[ai].rec_type, "$ptr") then {
@@ -1458,13 +1437,13 @@ const emit_simple_stmt = (*Emit ctx, [Binding] env, Stmt s): Iarch -> {
 				write_str(ctx.fd, "\t%t${bil} =l copy ${iv}\n")
 				const Iarch baddr = ctx.next
 				ctx.next = ctx.next + 1
-				write_str(ctx.fd, "\t%t${baddr} =l add %t${hdr}, %t${bil}\n")
+				write_str(ctx.fd, "\t%t${baddr} =l add ${hdr}, %t${bil}\n")
 				write_str(ctx.fd, "\tstoreb ${vv}, %t${baddr}\n")
 				return 0
 			}
 			const Iarch data = ctx.next
 			ctx.next = ctx.next + 1
-			write_str(ctx.fd, "\t%t${data} =l loadl %t${hdr}\n")
+			write_str(ctx.fd, "\t%t${data} =l loadl ${hdr}\n")
 			const Iarch il = ctx.next
 			ctx.next = ctx.next + 1
 			write_str(ctx.fd, "\t%t${il} =l copy ${iv}\n")
@@ -1522,9 +1501,10 @@ const emit_block = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 			Stmt.Loop(bd) -> { emit_loop_body(ctx, env, bd) },
 			Stmt.ForIn(fv, fa, fbd) -> { emit_for_body(ctx, env, fv, fa, fbd) },
 			Stmt.Let(n, m, e) -> {
-				# `const`/`let name = init`. A record initializer (`{…}`) allocates the record
-				# and binds the name to its base pointer; a scalar allocates a word slot,
-				# stores the value, and binds the name to that slot.
+				# `const`/`let name = init`. A word allocates a stack cell and stores the value.
+				# An aggregate initializer yields a base pointer: a `const` binds the pointer temp
+				# directly (a write-once borrow); a `let` (mutable) spills the pointer into a stack
+				# cell so a later `name = …` can repoint it (`xs = []`, `acc = Expr.Add(acc, r)`).
 				const Str rt = init_agg_type(ctx, env, e)
 				if str_eq(rt, "") then {
 					const Str v = emit_expr(e, ctx, env)
@@ -1532,10 +1512,18 @@ const emit_block = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 					ctx.next = ctx.next + 1
 					write_str(ctx.fd, "\t%t${slot} =l alloc8 8\n")
 					write_str(ctx.fd, "\tstorel ${v}, %t${slot}\n")
-					env = [...env, Binding({ name: n, slot: slot, rec_type: "", elem: "" })]
+					env = [...env, Binding({ name: n, slot: slot, rec_type: "", elem: "", is_cell: true })]
 				} else {
 					const Iarch base = emit_agg_binding(ctx, e, env)
-					env = [...env, Binding({ name: n, slot: base, rec_type: rt, elem: init_elem(ctx, env, e) })]
+					if m then {
+						const Iarch cell = ctx.next
+						ctx.next = ctx.next + 1
+						write_str(ctx.fd, "\t%t${cell} =l alloc8 8\n")
+						write_str(ctx.fd, "\tstorel %t${base}, %t${cell}\n")
+						env = [...env, Binding({ name: n, slot: cell, rec_type: rt, elem: init_elem(ctx, env, e), is_cell: true })]
+					} else {
+						env = [...env, Binding({ name: n, slot: base, rec_type: rt, elem: init_elem(ctx, env, e), is_cell: false })]
+					}
 				}
 			},
 			_ -> { terminal = emit_simple_stmt(ctx, env, s) }
@@ -1586,9 +1574,9 @@ const emit_func = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 			ctx.next = ctx.next + 1
 			write_str(ctx.fd, "\t%t${slot} =l copy %p${pi}\n")
 			if str_eq(fn.params[pi].type_name, "$ptr") then {
-				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: "$ptr", elem: "" })]
+				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: "$ptr", elem: "", is_cell: false })]
 			} else {
-				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: fn.params[pi].type_name, elem: "" })]
+				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: fn.params[pi].type_name, elem: "", is_cell: false })]
 			}
 		} else {
 			if is_agg_param(fn.params[pi], ctx.recs, ctx.unions) then {
@@ -1597,14 +1585,14 @@ const emit_func = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 				const Iarch slot = ctx.next
 				ctx.next = ctx.next + 1
 				write_str(ctx.fd, "\t%t${slot} =l copy %p${pi}\n")
-				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: fn.params[pi].type_name, elem: fn.params[pi].elem })]
+				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: fn.params[pi].type_name, elem: fn.params[pi].elem, is_cell: false })]
 			} else {
 				# a word parameter spills into a stack slot so it reads like a local.
 				const Iarch slot = ctx.next
 				ctx.next = ctx.next + 1
 				write_str(ctx.fd, "\t%t${slot} =l alloc8 8\n")
 				write_str(ctx.fd, "\tstorel %p${pi}, %t${slot}\n")
-				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: "", elem: "" })]
+				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: "", elem: "", is_cell: true })]
 			}
 		}
 		pi = pi + 1

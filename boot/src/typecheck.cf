@@ -533,6 +533,13 @@ const arraylit_elem = (Bool has_spread, Str spread_name, [Expr] elems, Str elem_
 	return "Iarch"
 }
 
+# Is `e` an empty `[]` literal (no spread, no elements)? Such a reset adopts its target's
+# element type rather than the `Iarch` default `arraylit_type` would assign.
+const is_empty_arraylit = (Expr e): Bool -> match e {
+	Expr.ArrayLit(hs, sn, elems, et) -> if hs then false else Iarch(elems.len) == 0,
+	_ -> false
+}
+
 # `[a, b]` / `[]` — a dynamic-array literal. Every listed element must match the array's
 # element type (records or words alike).
 const arraylit_type = (Bool has_spread, Str spread_name, [Expr] elems, Str elem_type, [VarTy] env, Ctx ctx): Ty -> {
@@ -745,8 +752,14 @@ const check_simple_stmt = (Func fn, Stmt s, [VarTy] env, Ctx ctx, Ty frt, Bool i
 			const Iarch idx = env_index(env, n)
 			if idx < 0 then die("cf0: type: assignment to an undeclared name\n")
 			if !env[idx].mutable then die("cf0: type: cannot reassign a `const` binding or a parameter\n")
-			const Ty vty = type_of(e, env, ctx)
-			if !ty_eq(vty, env[idx].ty) then die("cf0: type: a reassignment must keep the binding's type\n")
+			# an empty `[]` reset keeps a dynamic-array binding's type (its element is unknown,
+			# adopted from the target — `arraylit_type` would otherwise default it to `Iarch`)
+			if is_empty_arraylit(e) then {
+				if str_eq(dyn_of(env[idx].ty), "") then die("cf0: type: `[]` may only be assigned to a dynamic array\n")
+			} else {
+				const Ty vty = type_of(e, env, ctx)
+				if !ty_eq(vty, env[idx].ty) then die("cf0: type: a reassignment must keep the binding's type\n")
+			}
 		},
 		Stmt.FieldAssign(b, f, e) -> {
 			const Iarch idx = env_index(env, b)
@@ -829,7 +842,6 @@ const check_stmts = (Func fn, [Stmt] stmts, [VarTy] env0, Ctx ctx, Ty frt, Bool 
 			Stmt.Let(n, m, e) -> {
 				if env_index(env, n) >= 0 then die("cf0: type: a binding cannot shadow an existing name\n")
 				const Ty ty = type_of(e, env, ctx)
-				if is_tstr(ty) && m then die("cf0: type: a Str local must be `const` (no Str reassignment)\n")
 				env = [...env, VarTy({ name: n, ty: ty, mutable: m })]
 			},
 			_ -> {
