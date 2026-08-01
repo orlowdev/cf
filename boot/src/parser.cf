@@ -429,20 +429,36 @@ const parse_match = (*Parser p): Expr -> {
 	return Expr.Match(scrut, arms)
 }
 
-# An optional postfix `.field` on a non-name primary — a string literal or a
-# parenthesised expression (`"ab".len`, `("ab").len`). A bare-name base uses `Field`.
-# Apply any trailing `.field` accessors to an expression, chaining them as `FieldExpr`
-# (e.g. `fn.params.len` reads the `.len` off the `params` field's value). Loops so
-# `a.b.c` chains; a bare expression with no `.` is returned unchanged.
-const postfix_field = (*Parser p, Expr base): Expr -> {
+# The general postfix chain on a non-name primary — a string literal, a parenthesised
+# expression, or a value already carrying a base (a field read like `p.toks`). Applies
+# any run of trailing `.field` accessors (chained as `FieldExpr`, e.g. `fn.params.len`)
+# and `[i]` index accessors (chained as `IndexExpr`, e.g. `p.toks[p.pos].kind`),
+# interleaved in source order, until neither a `.` nor a `[` follows. A bare-name
+# `name[i]` is handled by the wired `Index`/`IndexField` fast paths in `parse_primary`;
+# this loop is what lets an index ride on a field base (`p.toks[p.pos]`) or another
+# index (`ctx.unions[ui].members[mi]`). A base with no trailing accessor is returned
+# unchanged.
+const postfix_chain = (*Parser p, Expr base): Expr -> {
 	let Expr acc = base
 	loop {
-		if !is_dot(peek(p)) then break
-		p.pos = p.pos + 1
-		if !is_ident(peek(p)) then die("cf0: parse: expected a field name after `.`\n")
-		const Str f = cur_name(p)
-		p.pos = p.pos + 1
-		acc = Expr.FieldExpr(acc, f)
+		let Bool advanced = false
+		if is_dot(peek(p)) then {
+			p.pos = p.pos + 1
+			if !is_ident(peek(p)) then die("cf0: parse: expected a field name after `.`\n")
+			const Str f = cur_name(p)
+			p.pos = p.pos + 1
+			acc = Expr.FieldExpr(acc, f)
+			advanced = true
+		}
+		if is_lbracket(peek(p)) then {
+			p.pos = p.pos + 1
+			const Expr idx = parse_expr(p)
+			if !is_rbracket(peek(p)) then die("cf0: parse: expected `]` in an index\n")
+			p.pos = p.pos + 1
+			acc = Expr.IndexExpr(acc, idx)
+			advanced = true
+		}
+		if !advanced then break
 	}
 	return acc
 }
@@ -486,7 +502,7 @@ const parse_primary = (*Parser p): Expr -> {
 			# `Type.member(args)` is a payload-member construction; `base.field` (no
 			# args) is a field read or a tag-only-member construction.
 			if is_lparen(peek(p)) then return parse_union_mk(p, name, field)
-			return postfix_field(p, Expr.Field(name, field))
+			return postfix_chain(p, Expr.Field(name, field))
 		}
 		# `name[i]` — a dynamic-array index, optionally followed by `.field` to read a
 		# field off a record element (`name[i].field`).
@@ -500,7 +516,7 @@ const parse_primary = (*Parser p): Expr -> {
 				if !is_ident(peek(p)) then die("cf0: parse: expected a field name after `.`\n")
 				const Str ifield = cur_name(p)
 				p.pos = p.pos + 1
-				return postfix_field(p, Expr.IndexField(name, idx, ifield))
+				return postfix_chain(p, Expr.IndexField(name, idx, ifield))
 			}
 			return Expr.Index(name, idx)
 		}
@@ -517,14 +533,14 @@ const parse_primary = (*Parser p): Expr -> {
 		const Iarch start = p.toks[p.pos].start
 		const Iarch len = p.toks[p.pos].len
 		p.pos = p.pos + 1
-		return postfix_field(p, parse_string(p.src, start, len))
+		return postfix_chain(p, parse_string(p.src, start, len))
 	}
 	if is_lparen(peek(p)) then {
 		p.pos = p.pos + 1
 		const Expr inner = parse_expr(p)
 		if !is_rparen(peek(p)) then die("cf0: parse: expected `)`\n")
 		p.pos = p.pos + 1
-		return postfix_field(p, inner)
+		return postfix_chain(p, inner)
 	}
 	die("cf0: parse: expected an integer or `(`\n")
 	return Expr.Lit(0)

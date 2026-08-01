@@ -584,7 +584,17 @@ const init_agg_type = (*Emit ctx, [Binding] env, Expr e): Str -> match e {
 	Expr.Buffer(n) -> "$ptr",
 	Expr.Addr(name) -> var_agg_type(env, name),
 	Expr.Var(name) -> var_agg_type(env, name),
+	Expr.IndexExpr(base, idx) -> indexexpr_agg_type(ctx, env, base),
 	_ -> ""
+}
+
+# The aggregate marker of a `base[i]` element — for binding `const t = p.toks[i]` (whose
+# element is a record or `Str` riding as an 8-byte pointer). The element type name comes
+# from the base's `[T]` element; a word element (`Iarch`/"") yields "".
+const indexexpr_agg_type = (*Emit ctx, [Binding] env, Expr base): Str -> {
+	const Str en = init_elem(ctx, env, base)
+	if elem_is_agg(ctx, en) then return en
+	return ""
 }
 
 # The element type name of a dynamic-array binding initializer — the array literal's
@@ -1023,6 +1033,65 @@ const emit_index_field = (*Emit ctx, [Binding] env, Str arr, Expr idx, Str field
 	return "%t${val}"
 }
 
+# Emit `base[i]` on a general expression base (`p.toks[p.pos]`, `prog.recs[r]`). The base
+# is emitted to a pointer value (a `$dyn`/`Str` header, or a raw byte pointer), then
+# indexed exactly like `emit_index` — the only difference is the header comes from an
+# emitted expression rather than a binding slot. The aggregate kind is read off the base
+# via `init_agg_type`: `$ptr` reads the i-th byte at pointer + i; `Str` reads the byte at
+# (bytes@0) + i; a `[T]` loads the 8-byte slot at (data@0) + i*8.
+const emit_index_expr = (*Emit ctx, [Binding] env, Expr base, Expr idx): Str -> {
+	const Str bt = init_agg_type(ctx, env, base)
+	const Str hv = emit_expr(base, ctx, env)
+	# a byte pointer / buffer index `p[i]` reads the i-th byte at pointer + i (no header).
+	if str_eq(bt, "$ptr") then {
+		const Str pv = emit_expr(idx, ctx, env)
+		const Iarch pil = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${pil} =l copy ${pv}\n")
+		const Iarch paddr = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${paddr} =l add ${hv}, %t${pil}\n")
+		const Iarch pval = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${pval} =l loadub %t${paddr}\n")
+		return "%t${pval}"
+	}
+	# a string index `s[i]` reads the i-th byte: the header's bytes pointer @0, then +i.
+	if str_eq(bt, "Str") then {
+		const Str siv = emit_expr(idx, ctx, env)
+		const Iarch sbytes = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${sbytes} =l loadl ${hv}\n")
+		const Iarch sil = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${sil} =l copy ${siv}\n")
+		const Iarch saddr = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${saddr} =l add %t${sbytes}, %t${sil}\n")
+		const Iarch sval = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${sval} =l loadub %t${saddr}\n")
+		return "%t${sval}"
+	}
+	const Str iv = emit_expr(idx, ctx, env)
+	const Iarch data = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${data} =l loadl ${hv}\n")
+	const Iarch il = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${il} =l copy ${iv}\n")
+	const Iarch off = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${off} =l mul %t${il}, 8\n")
+	const Iarch slot = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${slot} =l add %t${data}, %t${off}\n")
+	const Iarch val = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${val} =l loadl %t${slot}\n")
+	return "%t${val}"
+}
+
 # Emit the elements of a `xs = [...xs, e…]` self-growth append: each `cf_dyn_push`es
 # a slot onto the header (growing as needed, bumping len) and stores the element.
 const emit_append = (*Emit ctx, [Binding] env, Iarch hdr, [Expr] elems, Bool agg): Iarch -> {
@@ -1057,6 +1126,7 @@ const emit_expr = (Expr e, *Emit ctx, [Binding] env): Str -> match e {
 	Expr.ArrayLit(hs, sn, elems, et) -> emit_array_lit(ctx, elems, et, env),
 	Expr.Index(arr, idx) -> emit_index(ctx, env, arr, idx),
 	Expr.IndexField(arr, idx, f) -> emit_index_field(ctx, env, arr, idx, f),
+	Expr.IndexExpr(base, idx) -> emit_index_expr(ctx, env, base, idx),
 	Expr.Buffer(n) -> emit_buffer(ctx, n),
 	Expr.Addr(name) -> emit_var(ctx, env, name),
 	Expr.UnionMk(tn, mem, args) -> emit_union_mk(ctx, tn, mem, args, env),
