@@ -1793,6 +1793,87 @@ const emit_arena_qbe = (Uarch fd): Iarch -> {
 	return 0
 }
 
+# Does the program's `main` take a parameter — `main([Str] args)`? Then the freestanding
+# `_start` must convert the OS's raw `(argc, argv)` into a real cf `[Str]` before calling it
+# (see `emit_argv_qbe`). A bare `main()` takes the registers straight through.
+const main_takes_argv = (Program prog): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(prog.funcs.len) then break
+		if str_eq(prog.funcs[i].name, "main") then {
+			# exactly `main([Str] args)` — one dynamic-array-of-Str parameter. The old raw form
+			# `main(Iarch argc, *[Str] argv)` takes the registers straight (no argv build).
+			if Iarch(prog.funcs[i].params.len) != 1 then return false
+			if !str_eq(prog.funcs[i].params[0].type_name, "$dyn") then return false
+			return str_eq(prog.funcs[i].params[0].elem, "Str")
+		}
+		i = i + 1
+	}
+	return false
+}
+
+# The argv bridge, emitted only for `main([Str] args)`. `cf_strlen` is a C-string length;
+# `cf_build_args` walks the `argc` C-strings in `argv`, wraps each in a `{bytes@0, len@8}` Str
+# header (BORROWING the OS's already-NUL-terminated argv bytes) and pushes it onto a fresh
+# `[Str]` vector, returning the header. `_start` calls it with (argc in x0, argv in x1) — the
+# darwin C-ABI entry values — and hands the result to `main`.
+const emit_argv_qbe = (Uarch fd): Iarch -> {
+	write_str(fd, "function l $cf_strlen(l %p) {\n")
+	write_str(fd, "@start\n")
+	write_str(fd, "\t%pp =l alloc8 8\n")
+	write_str(fd, "\tstorel %p, %pp\n")
+	write_str(fd, "\t%np =l alloc8 8\n")
+	write_str(fd, "\tstorel 0, %np\n")
+	write_str(fd, "@loop\n")
+	write_str(fd, "\t%cp =l loadl %pp\n")
+	write_str(fd, "\t%c =w loadub %cp\n")
+	write_str(fd, "\tjnz %c, @more, @done\n")
+	write_str(fd, "@more\n")
+	write_str(fd, "\t%cp2 =l loadl %pp\n")
+	write_str(fd, "\t%cp3 =l add %cp2, 1\n")
+	write_str(fd, "\tstorel %cp3, %pp\n")
+	write_str(fd, "\t%n0 =l loadl %np\n")
+	write_str(fd, "\t%n1 =l add %n0, 1\n")
+	write_str(fd, "\tstorel %n1, %np\n")
+	write_str(fd, "\tjmp @loop\n")
+	write_str(fd, "@done\n")
+	write_str(fd, "\t%r =l loadl %np\n")
+	write_str(fd, "\tret %r\n")
+	write_str(fd, "}\n")
+	write_str(fd, "export function l $cf_build_args(l %argc, l %argv) {\n")
+	write_str(fd, "@start\n")
+	write_str(fd, "\t%hdr =l call $cf_alloc(w 24)\n")
+	write_str(fd, "\tstorel 0, %hdr\n")
+	write_str(fd, "\t%h8 =l add %hdr, 8\n")
+	write_str(fd, "\tstorel 0, %h8\n")
+	write_str(fd, "\t%h16 =l add %hdr, 16\n")
+	write_str(fd, "\tstorel 0, %h16\n")
+	write_str(fd, "\t%ip =l alloc8 8\n")
+	write_str(fd, "\tstorel 0, %ip\n")
+	write_str(fd, "@loop\n")
+	write_str(fd, "\t%i =l loadl %ip\n")
+	write_str(fd, "\t%adone =w cugel %i, %argc\n")
+	write_str(fd, "\tjnz %adone, @done, @body\n")
+	write_str(fd, "@body\n")
+	write_str(fd, "\t%ao =l mul %i, 8\n")
+	write_str(fd, "\t%ap =l add %argv, %ao\n")
+	write_str(fd, "\t%cs =l loadl %ap\n")
+	write_str(fd, "\t%len =l call $cf_strlen(l %cs)\n")
+	write_str(fd, "\t%sh =l call $cf_alloc(w 16)\n")
+	write_str(fd, "\tstorel %cs, %sh\n")
+	write_str(fd, "\t%sh8 =l add %sh, 8\n")
+	write_str(fd, "\tstorel %len, %sh8\n")
+	write_str(fd, "\t%slot =l call $cf_dyn_push(l %hdr, w 8)\n")
+	write_str(fd, "\tstorel %sh, %slot\n")
+	write_str(fd, "\t%i1 =l add %i, 1\n")
+	write_str(fd, "\tstorel %i1, %ip\n")
+	write_str(fd, "\tjmp @loop\n")
+	write_str(fd, "@done\n")
+	write_str(fd, "\tret %hdr\n")
+	write_str(fd, "}\n")
+	return 0
+}
+
 # The arena's asm side: `cf_arena_init` mmaps 64 MiB (SYS_mmap=197) and seeds the
 # cursor; `cf_oom`/`cf_mmap_fail` exit with distinct nonzero codes. Leaf routines
 # (no `bl`), so calling `cf_arena_init` lazily from `cf_alloc` needs no arg saving.
@@ -1872,11 +1953,14 @@ const emit_asm_func = (Uarch fd, Func fn, Iarch idx): Iarch -> {
 # plus the arena's asm side, and finally the asm-bodied functions naked beside the floor.
 # Runs only on programs the typecheck phase has accepted.
 #
-# darwin hands `main` its (argc, argv, envp) in x0/x1/x2 at the entry point, and the
-# `_start` floor does nothing before `bl _main`, so those registers flow straight
-# through — QBE reads them as `$main`'s declared arguments.
+# darwin hands the entry point the raw C `(argc, argv, envp)` in x0/x1/x2. For a bare
+# `main()` the `_start` floor does nothing before `bl _main`, so those flow straight
+# through. For `main([Str] args)` it first `bl _cf_build_args` to convert `(argc, argv)`
+# into a real cf `[Str]` header (in x0), which QBE reads as `$main`'s argument.
 pub const emit_program = (Program prog, Uarch qbe_fd, Uarch asm_fd): Iarch -> {
 	emit_arena_qbe(qbe_fd)
+	const Bool argv_form = main_takes_argv(prog)
+	if argv_form then emit_argv_qbe(qbe_fd)
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(prog.funcs.len) then break
@@ -1892,6 +1976,9 @@ pub const emit_program = (Program prog, Uarch qbe_fd, Uarch asm_fd): Iarch -> {
 	write_str(asm_fd, ".globl _start\n")
 	write_str(asm_fd, ".p2align 2\n")
 	write_str(asm_fd, "_start:\n")
+	# `main([Str] args)`: convert the raw C `(argc in x0, argv in x1)` into a `[Str]` header
+	# (returned in x0) before calling main; a bare `main()` takes the registers straight.
+	if argv_form then write_str(asm_fd, "\tbl _cf_build_args\n")
 	write_str(asm_fd, "\tbl _main\n")
 	write_str(asm_fd, "\tmov x16, #1\n")
 	write_str(asm_fd, "\tsvc #0x80\n")
