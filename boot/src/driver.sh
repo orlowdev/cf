@@ -5,9 +5,10 @@
 # external driver — seed_subset §M6), so it stops at emitting two text artifacts:
 # the QBE IL (`prog.qbe`, the user code) and the arm64 asm floor (`floor.s`,
 # `_start`, emitted verbatim since QBE has no `svc`). This driver runs the
-# `qbe`→`cc` tail the way cfcc does internally: qbe lowers the IL to assembly,
-# then `cc -nostdlib -lSystem -Wl,-e,_start` links the freestanding binary
-# (darwin needs -lSystem present for the loader even with no libc symbol used).
+# `qbe`→`cc` tail: qbe lowers the IL to assembly, then `cc -nostdlib -lSystem
+# -Wl,-e,_start` links the freestanding binary (darwin needs -lSystem present for
+# the loader even with no libc symbol used). This is the same tail boot/src/build.sh
+# uses to assemble the seed into cf0 itself.
 #
 #   driver.sh <input.cf> <out-binary>
 set -eu
