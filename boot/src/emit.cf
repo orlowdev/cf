@@ -1037,6 +1037,81 @@ const emit_array_lit = (*Emit ctx, [Expr] elems, Str elem_type, [Binding] env): 
 	return "%t${hdr}"
 }
 
+# Emit `[...src, e…]` into a FRESH binding (NOT a self-append): a new {data,len,cap} header
+# that COPIES all of `src`'s current elements at runtime, then appends the listed `elems`.
+# A self-append `xs = [...xs, e]` grows in place via the Assign path; this is the GENERAL
+# spread (e.g. `check_for_body`'s `[...env, VarTy(...)]` — extend a borrowed env into a new
+# one). Element stride follows `elem_type` (a `[Uint8]` is byte-packed).
+const emit_arraylit_spread = (*Emit ctx, Str src, [Expr] elems, Str elem_type, [Binding] env): Str -> {
+	const Iarch esz = elem_bytes(elem_type)
+	const Iarch hdr = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${hdr} =l call $cf_alloc(w 24)\n")
+	write_str(ctx.fd, "\tstorel 0, %t${hdr}\n")
+	const Iarch h8 = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${h8} =l add %t${hdr}, 8\n")
+	write_str(ctx.fd, "\tstorel 0, %t${h8}\n")
+	const Iarch h16 = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${h16} =l add %t${hdr}, 16\n")
+	write_str(ctx.fd, "\tstorel 0, %t${h16}\n")
+	# runtime copy of the source's live elements (0 .. src.len)
+	const Iarch si = lookup_index(env, src)
+	const Str shdr = binding_ptr(ctx, env, si)
+	const Iarch lid = ctx.label
+	ctx.label = ctx.label + 1
+	const Iarch lp = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${lp} =l add ${shdr}, 8\n")
+	const Iarch slen = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${slen} =l loadl %t${lp}\n")
+	const Iarch ci = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${ci} =l alloc8 8\n")
+	write_str(ctx.fd, "\tstorel 0, %t${ci}\n")
+	write_str(ctx.fd, "@cptop${lid}\n")
+	const Iarch iv = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${iv} =l loadl %t${ci}\n")
+	const Iarch cmp = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${cmp} =l csltl %t${iv}, %t${slen}\n")
+	write_str(ctx.fd, "\tjnz %t${cmp}, @cpbody${lid}, @cpend${lid}\n")
+	write_str(ctx.fd, "@cpbody${lid}\n")
+	const Iarch sdata = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${sdata} =l loadl ${shdr}\n")
+	const Iarch off = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${off} =l mul %t${iv}, ${esz}\n")
+	const Iarch saddr = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${saddr} =l add %t${sdata}, %t${off}\n")
+	const Iarch sval = ctx.next
+	ctx.next = ctx.next + 1
+	if esz == 1 then write_str(ctx.fd, "\t%t${sval} =l loadub %t${saddr}\n")
+	if esz != 1 then write_str(ctx.fd, "\t%t${sval} =l loadl %t${saddr}\n")
+	const Iarch slot = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${slot} =l call $cf_dyn_push(l %t${hdr}, w ${esz})\n")
+	if esz == 1 then write_str(ctx.fd, "\tstoreb %t${sval}, %t${slot}\n")
+	if esz != 1 then write_str(ctx.fd, "\tstorel %t${sval}, %t${slot}\n")
+	const Iarch iv2 = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${iv2} =l loadl %t${ci}\n")
+	const Iarch iv3 = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${iv3} =l add %t${iv2}, 1\n")
+	write_str(ctx.fd, "\tstorel %t${iv3}, %t${ci}\n")
+	write_str(ctx.fd, "\tjmp @cptop${lid}\n")
+	write_str(ctx.fd, "@cpend${lid}\n")
+	# append the listed elements after the copied ones
+	emit_append(ctx, env, "%t${hdr}", elems, elem_type)
+	return "%t${hdr}"
+}
+
 # Allocate an N-byte buffer in the arena; the returned pointer is a byte pointer ("$ptr").
 const emit_buffer = (*Emit ctx, Iarch n): Str -> {
 	const Iarch b = ctx.next
@@ -1238,7 +1313,7 @@ const emit_expr = (Expr e, *Emit ctx, [Binding] env): Str -> match e {
 	Expr.Record(tn, inits) -> emit_record_val(ctx, tn, inits, env),
 	Expr.Field(base, f) -> emit_field(ctx, env, base, f),
 	Expr.FieldExpr(base, f) -> emit_field_expr(ctx, env, base, f),
-	Expr.ArrayLit(hs, sn, elems, et) -> emit_array_lit(ctx, elems, et, env),
+	Expr.ArrayLit(hs, sn, elems, et) -> if hs then emit_arraylit_spread(ctx, sn, elems, et, env) else emit_array_lit(ctx, elems, et, env),
 	Expr.Index(arr, idx) -> emit_index(ctx, env, arr, idx),
 	Expr.IndexField(arr, idx, f) -> emit_index_field(ctx, env, arr, idx, f),
 	Expr.IndexExpr(base, idx) -> emit_index_expr(ctx, env, base, idx),
