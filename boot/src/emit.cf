@@ -564,14 +564,32 @@ const tuple_pos_types = (*Emit ctx, [Binding] env, [Expr] elems): [Str] -> {
 # The per-position type-name list a binding carries when its initializer is a tuple; the
 # empty list otherwise (cf0 cannot infer a bare `[]`'s element type inside a match arm, so
 # an annotated local is seeded and mutated).
-# A tuple-returning callee's declared position type names (Iarch/Bool/Str/a record). These
-# work alongside `tuple_pos_types`'s `""`-for-word convention because the tuple-access
-# emit only distinguishes record (find_rec) / `Str` / else-word — and `Iarch`/`Bool` fall
-# to else-word just like `""`.
+# Emit's SINGLE tuple-telem convention: a position is named by its record type or `"Str"`
+# when it rides as an 8-byte pointer, else `""` for a word. `emit_canon_telems` maps the
+# DECLARED names a param/return carries (`Iarch`/`Bool`/`Str`/a record) into it, so every
+# tuple binding — from a literal (`tuple_pos_types`/`init_agg_type`), a call result, or a
+# parameter — carries one form and the access code has one interpretation.
+const emit_telem = (*Emit ctx, Str name): Str -> {
+	if find_rec(ctx.recs, name) >= 0 then return name
+	if str_eq(name, "Str") then return "Str"
+	return ""
+}
+const emit_canon_telems = (*Emit ctx, [Str] telems): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(telems.len) then break
+		r = [...r, emit_telem(ctx, telems[i])]
+		i = i + 1
+	}
+	return r
+}
+
+# A tuple-returning callee's position telems, canonicalized to emit's convention.
 const call_ret_telems = (*Emit ctx, Str callee): [Str] -> {
 	const Iarch fidx = find_func(ctx.funcs, callee)
 	if fidx < 0 then return no_telems()
-	return ctx.funcs[fidx].ret_telems
+	return emit_canon_telems(ctx, ctx.funcs[fidx].ret_telems)
 }
 
 # Position type names of a bound tuple variable (empty for a non-tuple binding).
@@ -631,9 +649,9 @@ const emit_destructure = (*Emit ctx, [Binding] env, [Str] pat, Bool mutable, Exp
 		ctx.next = ctx.next + 1
 		write_str(ctx.fd, "\t%t${saddr} =l add ${base}, ${soff}\n")
 		const Str ptype = tels[pos]
-		# a record or Str position is an 8-byte pointer (a borrow); every other position is a
-		# word (`""` from a literal, `Iarch`/`Bool` from a call's declared types — both fall
-		# here) loaded into a fresh reassignable cell so a `let` position can be reassigned.
+		# a record or Str position is an 8-byte pointer (a borrow); a word position (`""` in
+		# emit's canonical telem convention) loads into a fresh reassignable cell so a `let`
+		# position can be reassigned.
 		if str_eq(ptype, "Str") || find_rec(ctx.recs, ptype) >= 0 then {
 			const Iarch ptr = ctx.next
 			ctx.next = ctx.next + 1
@@ -1941,7 +1959,7 @@ const emit_func = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 				const Iarch slot = ctx.next
 				ctx.next = ctx.next + 1
 				write_str(ctx.fd, "\t%t${slot} =l copy %p${pi}\n")
-				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: fn.params[pi].type_name, elem: fn.params[pi].elem, is_cell: false, telems: fn.params[pi].telems })]
+				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: fn.params[pi].type_name, elem: fn.params[pi].elem, is_cell: false, telems: emit_canon_telems(ctx, fn.params[pi].telems) })]
 			} else {
 				# a word parameter spills into a stack slot so it reads like a local.
 				const Iarch slot = ctx.next
