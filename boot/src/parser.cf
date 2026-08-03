@@ -601,25 +601,27 @@ const parse_primary = (*Parser p): Expr -> {
 	}
 	if is_lparen(peek(p)) then {
 		p.pos = p.pos + 1
-		const Expr inner = parse_expr(p)
-		# `(e, …)` is a tuple; `(e)` is plain grouping and `(e,)` is a one-tuple that
-		# collapses to its element (grouping and the 1-tuple coincide).
-		if is_comma(peek(p)) then {
-			let [Expr] elems = [inner]
-			loop {
-				if !is_comma(peek(p)) then break
+		# a comma-separated list of tuple elements, each `...src` (a spread of a tuple's
+		# positions) or a plain expression. `(e)` is grouping and `(e,)` a one-tuple — both
+		# collapse to `e`; a spread (even a lone `(...t)`) or ≥2 elements stays a tuple.
+		let [Expr] elems = []
+		loop {
+			if is_ellipsis(peek(p)) then {
 				p.pos = p.pos + 1
-				if is_rparen(peek(p)) then break
+				elems = [...elems, Expr.Spread(parse_expr(p))]
+			} else {
 				elems = [...elems, parse_expr(p)]
 			}
-			if !is_rparen(peek(p)) then die("cf0: parse: expected `)` in a tuple\n")
+			if !is_comma(peek(p)) then break
 			p.pos = p.pos + 1
-			if Iarch(elems.len) == 1 then return postfix_chain(p, inner)
-			return Expr.Tuple(elems)
+			if is_rparen(peek(p)) then break
 		}
-		if !is_rparen(peek(p)) then die("cf0: parse: expected `)`\n")
+		if !is_rparen(peek(p)) then die("cf0: parse: expected `)` in a tuple\n")
 		p.pos = p.pos + 1
-		return postfix_chain(p, inner)
+		if Iarch(elems.len) == 1 then {
+			if !is_spread_p(elems[0]) then return postfix_chain(p, elems[0])
+		}
+		return Expr.Tuple(elems)
 	}
 	die("cf0: parse: expected an integer or `(`\n")
 	return Expr.Lit(0)
@@ -678,6 +680,9 @@ const set_arr_elem = (Expr e, Str elem): Expr -> match e {
 	Expr.ArrayLit(hs, sn, elems, et) -> Expr.ArrayLit(hs, sn, elems, elem),
 	_ -> e
 }
+
+# Whether a tuple element is a `...src` spread (which keeps a lone `(...t)` a tuple).
+const is_spread_p = (Expr e): Bool -> match e { Expr.Spread(x) -> true, _ -> false }
 
 # Whether an initializer is a plain (non-spread) array literal of exactly `n`
 # elements — the shape a `[N Elem]` fixed-array binding requires.

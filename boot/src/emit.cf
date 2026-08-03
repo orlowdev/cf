@@ -457,23 +457,70 @@ const emit_record_lit = (*Emit ctx, Str type_name, [FieldInit] inits, [Binding] 
 	return base
 }
 
-# Build a tuple `(a, b, …)` as an arena aggregate of N 8-byte slots — element k at
-# offset k*8 (a word rides in the low bytes, an aggregate as its 8-byte pointer),
-# mirroring a record's layout. Yields the base pointer.
+# A `...src` tuple-spread element and its source. A bare `Spread` never reaches `emit_expr`
+# (the tuple emit handles it); if one does, it is a misuse outside a tuple.
+const is_spread = (Expr e): Bool -> match e { Expr.Spread(x) -> true, _ -> false }
+const spread_inner = (Expr e): Expr -> match e { Expr.Spread(x) -> x, _ -> e }
+const spread_emit_bad = (): Str -> {
+	die("cf0: emit: `...` spread is only valid inside a tuple\n")
+	return ""
+}
+
+# Build a tuple `(a, ...src, b)` as an arena aggregate of N 8-byte slots — a plain element
+# stores its value/pointer, a `...src` spread copies the source tuple's slots in order
+# (each an 8-byte word/pointer). Yields the base pointer.
 const emit_tuple = (*Emit ctx, [Expr] elems, [Binding] env): Str -> {
-	const Iarch size = Iarch(elems.len) * 8
+	# total slots: 1 per plain element + each spread source's arity (from its telems)
+	let Iarch total = 0
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(elems.len) then break
+		if is_spread(elems[i]) then {
+			const [Str] ste = init_telems(ctx, env, spread_inner(elems[i]))
+			total = total + Iarch(ste.len)
+		}
+		if !is_spread(elems[i]) then total = total + 1
+		i = i + 1
+	}
+	const Iarch size = total * 8
 	const Iarch base = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${base} =l call $cf_alloc(w ${size})\n")
+	let Iarch pos = 0
 	let Iarch k = 0
 	loop {
 		if k >= Iarch(elems.len) then break
-		const Str v = emit_expr(elems[k], ctx, env)
-		const Iarch off = k * 8
-		const Iarch addr = ctx.next
-		ctx.next = ctx.next + 1
-		write_str(ctx.fd, "\t%t${addr} =l add %t${base}, ${off}\n")
-		write_str(ctx.fd, "\tstorel ${v}, %t${addr}\n")
+		if is_spread(elems[k]) then {
+			const Str sb = emit_expr(spread_inner(elems[k]), ctx, env)
+			const [Str] ste = init_telems(ctx, env, spread_inner(elems[k]))
+			const Iarch sar = Iarch(ste.len)
+			let Iarch j = 0
+			loop {
+				if j >= sar then break
+				const Iarch soff = j * 8
+				const Iarch saddr = ctx.next
+				ctx.next = ctx.next + 1
+				write_str(ctx.fd, "\t%t${saddr} =l add ${sb}, ${soff}\n")
+				const Iarch sval = ctx.next
+				ctx.next = ctx.next + 1
+				write_str(ctx.fd, "\t%t${sval} =l loadl %t${saddr}\n")
+				const Iarch doff = pos * 8
+				const Iarch daddr = ctx.next
+				ctx.next = ctx.next + 1
+				write_str(ctx.fd, "\t%t${daddr} =l add %t${base}, ${doff}\n")
+				write_str(ctx.fd, "\tstorel %t${sval}, %t${daddr}\n")
+				pos = pos + 1
+				j = j + 1
+			}
+		} else {
+			const Str v = emit_expr(elems[k], ctx, env)
+			const Iarch off = pos * 8
+			const Iarch addr = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${addr} =l add %t${base}, ${off}\n")
+			write_str(ctx.fd, "\tstorel ${v}, %t${addr}\n")
+			pos = pos + 1
+		}
 		k = k + 1
 	}
 	return "%t${base}"
@@ -499,7 +546,17 @@ const tuple_pos_types = (*Emit ctx, [Binding] env, [Expr] elems): [Str] -> {
 	let Iarch k = 0
 	loop {
 		if k >= Iarch(elems.len) then break
-		r = [...r, init_agg_type(ctx, env, elems[k])]
+		if is_spread(elems[k]) then {
+			const [Str] se = init_telems(ctx, env, spread_inner(elems[k]))
+			let Iarch j = 0
+			loop {
+				if j >= Iarch(se.len) then break
+				r = [...r, se[j]]
+				j = j + 1
+			}
+		} else {
+			r = [...r, init_agg_type(ctx, env, elems[k])]
+		}
 		k = k + 1
 	}
 	return r
@@ -518,11 +575,19 @@ const call_ret_telems = (*Emit ctx, Str callee): [Str] -> {
 	return ctx.funcs[fidx].ret_telems
 }
 
+# Position type names of a bound tuple variable (empty for a non-tuple binding).
+const var_telems = ([Binding] env, Str name): [Str] -> {
+	const Iarch idx = lookup_index(env, name)
+	if idx < 0 then return no_telems()
+	return env[idx].telems
+}
+
 const init_telems = (*Emit ctx, [Binding] env, Expr e): [Str] -> {
 	let [Str] r = []
 	match e {
 		Expr.Tuple(elems) -> { r = tuple_pos_types(ctx, env, elems) },
 		Expr.Call(callee, args) -> { r = call_ret_telems(ctx, callee) },
+		Expr.Var(nm) -> { r = var_telems(env, nm) },
 		_ -> {}
 	}
 	return r
@@ -1513,6 +1578,7 @@ const emit_expr = (Expr e, *Emit ctx, [Binding] env): Str -> match e {
 	Expr.IndexField(arr, idx, f) -> emit_index_field(ctx, env, arr, idx, f),
 	Expr.IndexExpr(base, idx) -> emit_index_expr(ctx, env, base, idx),
 	Expr.Tuple(elems) -> emit_tuple(ctx, elems, env),
+	Expr.Spread(x) -> spread_emit_bad(),
 	Expr.Buffer(n) -> emit_buffer(ctx, n),
 	Expr.Addr(name) -> emit_var(ctx, env, name),
 	Expr.UnionMk(tn, mem, args) -> emit_union_mk(ctx, tn, mem, args, env),

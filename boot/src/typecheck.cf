@@ -637,14 +637,47 @@ const arraylit_type = (Bool has_spread, Str spread_name, [Expr] elems, Str elem_
 	return Ty.TDyn(en)
 }
 
-# `(a, b, …)` — a tuple literal. Each element's type names a position; a scalar
-# element (Iarch/Bool) only, for now. Yields a `TTuple` carrying the position types.
+# A `...src` tuple-spread element and its source. `Spread` is valid ONLY inside a tuple
+# literal (the tuple typing/emit handle it); a bare `type_of(Spread)` is a misuse.
+const is_spread = (Expr e): Bool -> match e { Expr.Spread(x) -> true, _ -> false }
+const spread_inner = (Expr e): Expr -> match e { Expr.Spread(x) -> x, _ -> e }
+# A spread source must be a form the emitter can lower slot-for-slot: a tuple name, a
+# tuple-returning call, or a tuple literal. (A `match`/`if`-valued tuple source is a later
+# brick — the emit `init_telems` has no arm for it, so the type gate rejects it here rather
+# than letting emit silently copy zero slots.)
+const is_spreadable_src = (Expr e): Bool -> match e {
+	Expr.Var(n) -> true,
+	Expr.Call(c, a) -> true,
+	Expr.Tuple(es) -> true,
+	_ -> false
+}
+const spread_bad_type = (): Ty -> {
+	die("cf0: type: `...` spread is only valid inside a tuple\n")
+	return Ty.TInt
+}
+
+# `(a, ...src, b)` — a tuple literal. Each plain element's type names a position; a
+# `...src` spread splices the source tuple's position types (the source must be a tuple).
+# Yields a `TTuple` carrying the flattened position types.
 const tuple_type = ([Expr] elems, [VarTy] env, Ctx ctx): Ty -> {
 	let [Str] names = []
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(elems.len) then break
-		names = [...names, element_type_name(type_of(elems[i], env, ctx), elems[i])]
+		if is_spread(elems[i]) then {
+			if !is_spreadable_src(spread_inner(elems[i])) then die("cf0: type: a tuple spread source must be a tuple name, a tuple-returning call, or a tuple literal\n")
+			const Ty st = type_of(spread_inner(elems[i]), env, ctx)
+			if !is_ttuple(st) then die("cf0: type: a tuple spread source must be a tuple value\n")
+			const [Str] se = tuple_elems(st)
+			let Iarch j = 0
+			loop {
+				if j >= Iarch(se.len) then break
+				names = [...names, se[j]]
+				j = j + 1
+			}
+		} else {
+			names = [...names, element_type_name(type_of(elems[i], env, ctx), elems[i])]
+		}
 		i = i + 1
 	}
 	return Ty.TTuple(names)
@@ -853,6 +886,7 @@ const type_of = (Expr e, [VarTy] env, Ctx ctx): Ty -> match e {
 	Expr.IndexField(arr, idx, f) -> indexfield_type(arr, idx, f, env, ctx),
 	Expr.IndexExpr(base, idx) -> indexexpr_type(base, idx, env, ctx),
 	Expr.Tuple(elems) -> tuple_type(elems, env, ctx),
+	Expr.Spread(x) -> spread_bad_type(),
 	Expr.Buffer(n) -> Ty.TPtr,
 	Expr.Addr(name) -> var_type(env, name, ctx),
 	Expr.Neg(x) -> int_unop(x, env, ctx),
