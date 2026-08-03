@@ -1367,38 +1367,43 @@ const emit_for_body = (*Emit ctx, [Binding] env, Str lv, Str arr, [Stmt] body): 
 	const Str hdr = binding_ptr(ctx, env, ai)
 	const Iarch lid = ctx.label
 	ctx.label = ctx.label + 1
+	# `for` is a loop, so it registers itself on the nearest-loop stack: `break` targets
+	# `@lend${lid}` and `continue` targets `@ltop${lid}` (matching `emit_loop_body`). The
+	# counter starts at -1 and is incremented at `@ltop`, BEFORE the guard test — so a
+	# `continue` jump to `@ltop` advances to the next element rather than re-reading the
+	# current one. Saved/restored around the body so a nested `for`/`loop` targets itself.
+	const Iarch saved = ctx.cur_loop
+	ctx.cur_loop = lid
 	const Iarch la = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${la} =l add ${hdr}, 8\n")
-	const Iarch lenl = ctx.next
-	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${lenl} =l loadl %t${la}\n")
 	const Iarch lenw = ctx.next
 	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${lenw} =l copy %t${lenl}\n")
+	write_str(ctx.fd, "\t%t${lenw} =l loadl %t${la}\n")
 	const Iarch ci = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${ci} =l alloc8 8\n")
-	write_str(ctx.fd, "\tstorel 0, %t${ci}\n")
-	write_str(ctx.fd, "@ftop${lid}\n")
+	write_str(ctx.fd, "\tstorel -1, %t${ci}\n")
+	write_str(ctx.fd, "@ltop${lid}\n")
+	const Iarch iv2 = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${iv2} =l loadl %t${ci}\n")
 	const Iarch iv = ctx.next
 	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${iv} =l loadl %t${ci}\n")
+	write_str(ctx.fd, "\t%t${iv} =l add %t${iv2}, 1\n")
+	write_str(ctx.fd, "\tstorel %t${iv}, %t${ci}\n")
 	const Iarch cmp = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${cmp} =l csltl %t${iv}, %t${lenw}\n")
-	write_str(ctx.fd, "\tjnz %t${cmp}, @fbody${lid}, @fend${lid}\n")
+	write_str(ctx.fd, "\tjnz %t${cmp}, @fbody${lid}, @lend${lid}\n")
 	write_str(ctx.fd, "@fbody${lid}\n")
 	const Iarch data = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${data} =l loadl ${hdr}\n")
-	const Iarch ivl = ctx.next
-	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${ivl} =l copy %t${iv}\n")
 	const Iarch esz = elem_bytes(env[ai].elem)
 	const Iarch off = ctx.next
 	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${off} =l mul %t${ivl}, ${esz}\n")
+	write_str(ctx.fd, "\t%t${off} =l mul %t${iv}, ${esz}\n")
 	const Iarch eslot = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${eslot} =l add %t${data}, %t${off}\n")
@@ -1411,16 +1416,10 @@ const emit_for_body = (*Emit ctx, [Binding] env, Str lv, Str arr, [Stmt] body): 
 	write_str(ctx.fd, "\t%t${xcell} =l alloc8 8\n")
 	write_str(ctx.fd, "\tstorel %t${xval}, %t${xcell}\n")
 	const [Binding] benv = [...env, Binding({ name: lv, slot: xcell, rec_type: "", elem: "", is_cell: true })]
-	emit_block(ctx, body, benv)
-	const Iarch iv2 = ctx.next
-	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${iv2} =l loadl %t${ci}\n")
-	const Iarch iv3 = ctx.next
-	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${iv3} =l add %t${iv2}, 1\n")
-	write_str(ctx.fd, "\tstorel %t${iv3}, %t${ci}\n")
-	write_str(ctx.fd, "\tjmp @ftop${lid}\n")
-	write_str(ctx.fd, "@fend${lid}\n")
+	const Iarch term = emit_block(ctx, body, benv)
+	if term == 0 then write_str(ctx.fd, "\tjmp @ltop${lid}\n")
+	write_str(ctx.fd, "@lend${lid}\n")
+	ctx.cur_loop = saved
 	return 0
 }
 

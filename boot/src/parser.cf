@@ -664,23 +664,42 @@ const set_arr_elem = (Expr e, Str elem): Expr -> match e {
 	_ -> e
 }
 
+# Whether an initializer is a plain (non-spread) array literal of exactly `n`
+# elements — the shape a `[N Elem]` fixed-array binding requires.
+const is_fixed_arraylit = (Expr e, Iarch n): Bool -> match e {
+	Expr.ArrayLit(hs, sn, elems, et) -> if hs then false else Iarch(elems.len) == n,
+	_ -> false
+}
+
 const parse_let = (*Parser p, Bool mutable): Stmt -> {
 	# `[Elem] name` — a dynamic-array annotation. The element type is carried onto the
 	# initializer's array literal (an empty `[]` cannot infer it from elements).
-	# `[N Elem] name` — a fixed byte buffer (uninitialized): N bytes in the arena, bound as
-	# a byte pointer. Used for read buffers (`let [65536 Uint8] buf`). No initializer.
+	# `[N Elem] name` — either a fixed-size array with an initializer (`const [4 Iarch] xs =
+	# [1,2,3,4]`) or, WITHOUT an `=`, an uninitialized N-byte read buffer (`let [65536 Uint8]
+	# buf`, bound as a byte pointer). The `=` disambiguates the two forms. A fixed array is
+	# represented as an ordinary dynamic array whose literal is length-checked here against N
+	# (a genesis narrowing: no distinct inline value type yet — a later growth reassignment is
+	# not rejected, and fixed-width elements / array params are follow-ups); index/`for`/`.len`
+	# reuse the dynamic-array machinery.
 	if is_lbracket(peek(p)) then {
 		if is_intlit(p.toks[p.pos + 1].kind) then {
 			p.pos = p.pos + 1 # `[`
 			const Iarch n = p.toks[p.pos].ival
 			p.pos = p.pos + 1 # N
-			if !is_ident(peek(p)) then die("cf0: parse: expected a buffer element type\n")
-			p.pos = p.pos + 1 # element type (e.g. Uint8)
-			if !is_rbracket(peek(p)) then die("cf0: parse: expected `]` in a buffer type\n")
+			if !is_ident(peek(p)) then die("cf0: parse: expected a fixed-array element type\n")
+			const Str felem = cur_name(p)
+			p.pos = p.pos + 1 # element type (e.g. Iarch, Uint8)
+			if !is_rbracket(peek(p)) then die("cf0: parse: expected `]` in a fixed-array type\n")
 			p.pos = p.pos + 1 # `]`
-			if !is_ident(peek(p)) then die("cf0: parse: expected a buffer name\n")
+			if !is_ident(peek(p)) then die("cf0: parse: expected a binding name\n")
 			const Str bname = cur_name(p)
 			p.pos = p.pos + 1
+			if is_eq(peek(p)) then {
+				p.pos = p.pos + 1 # `=`
+				const Expr init = set_arr_elem(parse_init(p, ""), felem)
+				if !is_fixed_arraylit(init, n) then die("cf0: parse: a fixed-array initializer must be a plain array literal of exactly N elements (no spread)\n")
+				return Stmt.Let(bname, mutable, init)
+			}
 			return Stmt.Let(bname, mutable, Expr.Buffer(n))
 		}
 		const Str elem = dyn_elem_of(parse_type(p))
