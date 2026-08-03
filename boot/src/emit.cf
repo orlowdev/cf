@@ -453,6 +453,32 @@ const emit_record_lit = (*Emit ctx, Str type_name, [FieldInit] inits, [Binding] 
 	return base
 }
 
+# Build a tuple `(a, b, …)` as an arena aggregate of N 8-byte slots — element k at
+# offset k*8 (a word rides in the low bytes, an aggregate as its 8-byte pointer),
+# mirroring a record's layout. Yields the base pointer.
+const emit_tuple = (*Emit ctx, [Expr] elems, [Binding] env): Str -> {
+	const Iarch size = Iarch(elems.len) * 8
+	const Iarch base = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${base} =l call $cf_alloc(w ${size})\n")
+	let Iarch k = 0
+	loop {
+		if k >= Iarch(elems.len) then break
+		const Str v = emit_expr(elems[k], ctx, env)
+		const Iarch off = k * 8
+		const Iarch addr = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${addr} =l add %t${base}, ${off}\n")
+		write_str(ctx.fd, "\tstorel ${v}, %t${addr}\n")
+		k = k + 1
+	}
+	return "%t${base}"
+}
+
+# The comptime literal position of a tuple index — the typecheck has already proven it
+# is a bare in-range literal, so the non-literal arm is unreachable.
+const tuple_lit_index = (Expr idx): Iarch -> match idx { Expr.Lit(v) -> v, _ -> 0 }
+
 # A record literal as a value expression — an explicit construction `Type({ … })` in a
 # return, call argument, or array element. Builds the record in the arena and yields
 # its base pointer (a binding initializer takes the faster direct path in emit_block).
@@ -584,6 +610,7 @@ const init_agg_type = (*Emit ctx, [Binding] env, Expr e): Str -> match e {
 	Expr.IndexExpr(base, idx) -> indexexpr_agg_type(ctx, env, base),
 	Expr.IndexField(arr, idx, f) -> indexfield_agg_type(ctx, env, arr, f),
 	Expr.FieldExpr(base, f) -> fieldexpr_agg_type(ctx, env, base, f),
+	Expr.Tuple(elems) -> "$tuple",
 	_ -> ""
 }
 
@@ -1124,6 +1151,18 @@ const emit_buffer = (*Emit ctx, Iarch n): Str -> {
 const emit_index = (*Emit ctx, [Binding] env, Str arr, Expr idx): Str -> {
 	const Iarch ai = lookup_index(env, arr)
 	const Str hdr = binding_ptr(ctx, env, ai)
+	# a tuple index `t[k]` (k a comptime literal) loads the k-th 8-byte slot directly — the
+	# binding IS the aggregate (no header/data indirection like a dynamic array).
+	if str_eq(env[ai].rec_type, "$tuple") then {
+		const Iarch toff = tuple_lit_index(idx) * 8
+		const Iarch taddr = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${taddr} =l add ${hdr}, ${toff}\n")
+		const Iarch tval = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${tval} =l loadl %t${taddr}\n")
+		return "%t${tval}"
+	}
 	# a byte pointer / buffer index `p[i]` reads the i-th byte at pointer + i (no header).
 	if str_eq(env[ai].rec_type, "$ptr") then {
 		const Str pv = emit_expr(idx, ctx, env)
@@ -1317,6 +1356,7 @@ const emit_expr = (Expr e, *Emit ctx, [Binding] env): Str -> match e {
 	Expr.Index(arr, idx) -> emit_index(ctx, env, arr, idx),
 	Expr.IndexField(arr, idx, f) -> emit_index_field(ctx, env, arr, idx, f),
 	Expr.IndexExpr(base, idx) -> emit_index_expr(ctx, env, base, idx),
+	Expr.Tuple(elems) -> emit_tuple(ctx, elems, env),
 	Expr.Buffer(n) -> emit_buffer(ctx, n),
 	Expr.Addr(name) -> emit_var(ctx, env, name),
 	Expr.UnionMk(tn, mem, args) -> emit_union_mk(ctx, tn, mem, args, env),

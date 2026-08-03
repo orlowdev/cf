@@ -37,6 +37,40 @@ const is_tptr = (Ty t): Bool -> match t { Ty.TPtr -> true, _ -> false }
 const rec_of = (Ty t): Str -> match t { Ty.TRec(n) -> n, _ -> "" }
 const union_of = (Ty t): Str -> match t { Ty.TUnion(n) -> n, _ -> "" }
 const dyn_of = (Ty t): Str -> match t { Ty.TDyn(n) -> n, _ -> "" }
+const is_ttuple = (Ty t): Bool -> match t { Ty.TTuple(e) -> true, _ -> false }
+const tuple_elems = (Ty t): [Str] -> {
+	let [Str] r = []
+	match t {
+		Ty.TTuple(e) -> { r = e },
+		_ -> {}
+	}
+	return r
+}
+
+# Element-wise equality of two tuples' position type-name lists.
+const tuple_elems_eq = ([Str] a, [Str] b): Bool -> {
+	if a.len != b.len then return false
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(a.len) then break
+		if !str_eq(a[i], b[i]) then return false
+		i = i + 1
+	}
+	return true
+}
+
+# The written type NAME for a scalar tuple element — `Iarch` for any integer width,
+# `Bool` for a Bool. Non-scalar elements (Str, records, arrays, nested tuples) are a
+# later tuple brick; they are rejected here.
+const scalar_type_name = (Ty t): Str -> {
+	if is_tint(t) then return "Iarch"
+	if is_tbool(t) then return "Bool"
+	die("cf0: type: a tuple element must be an Iarch or Bool (heterogeneous elements are a later brick)\n")
+	return "Iarch"
+}
+
+# The comptime literal value of an index expression, or -1 when it is not a bare literal.
+const lit_val = (Expr e): Iarch -> match e { Expr.Lit(v) -> v, _ -> 0 - 1 }
 
 # Structural equality of two types (records/unions/arrays equal iff same name/element).
 const ty_eq = (Ty a, Ty b): Bool -> match a {
@@ -46,7 +80,8 @@ const ty_eq = (Ty a, Ty b): Bool -> match a {
 	Ty.TRec(an) -> str_eq(an, rec_of(b)),
 	Ty.TUnion(an) -> str_eq(an, union_of(b)),
 	Ty.TDyn(an) -> str_eq(an, dyn_of(b)),
-	Ty.TStr -> is_tstr(b)
+	Ty.TStr -> is_tstr(b),
+	Ty.TTuple(ae) -> match b { Ty.TTuple(be) -> tuple_elems_eq(ae, be), _ -> false }
 }
 
 # Byte-wise `Str` equality (name lookup).
@@ -554,11 +589,35 @@ const arraylit_type = (Bool has_spread, Str spread_name, [Expr] elems, Str elem_
 	return Ty.TDyn(en)
 }
 
+# `(a, b, …)` — a tuple literal. Each element's type names a position; a scalar
+# element (Iarch/Bool) only, for now. Yields a `TTuple` carrying the position types.
+const tuple_type = ([Expr] elems, [VarTy] env, Ctx ctx): Ty -> {
+	let [Str] names = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(elems.len) then break
+		names = [...names, scalar_type_name(type_of(elems[i], env, ctx))]
+		i = i + 1
+	}
+	return Ty.TTuple(names)
+}
+
+# `t[k]` — a tuple indexed at a COMPTIME literal position `k`, yielding position `k`'s
+# type. A runtime (non-literal) index or an out-of-range position is rejected.
+const tuple_index_type = ([Str] names, Expr idx, Ctx ctx): Ty -> {
+	const Iarch k = lit_val(idx)
+	if k < 0 then die("cf0: type: a tuple position must be a comptime literal, not a runtime value\n")
+	if k >= Iarch(names.len) then die("cf0: type: a tuple index is out of range\n")
+	return named_ty(names[k], "", ctx.recs, ctx.unions)
+}
+
 # `xs[i]` — a dynamic array indexed by an integer, yielding its element type (an `Int`
 # word, or a record for a `[Record]`).
 const index_type = (Str arr, Expr idx, [VarTy] env, Ctx ctx): Ty -> {
 	const Iarch vi = env_index(env, arr)
 	if vi < 0 then die("cf0: type: index of an undeclared name\n")
+	# a tuple is comptime-indexed, each position independently typed
+	if is_ttuple(env[vi].ty) then return tuple_index_type(tuple_elems(env[vi].ty), idx, ctx)
 	# a string index `s[i]` yields a byte (an Int)
 	if is_tstr(env[vi].ty) then {
 		if !is_tint(type_of(idx, env, ctx)) then die("cf0: type: a string index must be an integer\n")
@@ -676,6 +735,7 @@ const type_of = (Expr e, [VarTy] env, Ctx ctx): Ty -> match e {
 	Expr.Index(arr, idx) -> index_type(arr, idx, env, ctx),
 	Expr.IndexField(arr, idx, f) -> indexfield_type(arr, idx, f, env, ctx),
 	Expr.IndexExpr(base, idx) -> indexexpr_type(base, idx, env, ctx),
+	Expr.Tuple(elems) -> tuple_type(elems, env, ctx),
 	Expr.Buffer(n) -> Ty.TPtr,
 	Expr.Addr(name) -> var_type(env, name, ctx),
 	Expr.Neg(x) -> int_unop(x, env, ctx),
@@ -843,6 +903,7 @@ const check_stmts = (Func fn, [Stmt] stmts, [VarTy] env0, Ctx ctx, Ty frt, Bool 
 			Stmt.Let(n, m, e) -> {
 				if env_index(env, n) >= 0 then die("cf0: type: a binding cannot shadow an existing name\n")
 				const Ty ty = type_of(e, env, ctx)
+				if m && is_ttuple(ty) then die("cf0: type: a tuple binds `const` only (a mutable tuple is a later brick)\n")
 				env = [...env, VarTy({ name: n, ty: ty, mutable: m })]
 			},
 			_ -> {
