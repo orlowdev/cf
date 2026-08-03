@@ -1260,7 +1260,7 @@ const emit_array_lit = (*Emit ctx, [Expr] elems, Str elem_type, [Binding] env): 
 # A self-append `xs = [...xs, e]` grows in place via the Assign path; this is the GENERAL
 # spread (e.g. `check_for_body`'s `[...env, VarTy(...)]` — extend a borrowed env into a new
 # one). Element stride follows `elem_type` (a `[Uint8]` is byte-packed).
-const emit_arraylit_spread = (*Emit ctx, Str src, [Expr] elems, Str elem_type, [Binding] env): Str -> {
+const emit_arraylit_spread = (*Emit ctx, Expr src, [Expr] elems, Str elem_type, [Binding] env): Str -> {
 	const Iarch esz = elem_bytes(elem_type)
 	const Iarch hdr = ctx.next
 	ctx.next = ctx.next + 1
@@ -1274,9 +1274,9 @@ const emit_arraylit_spread = (*Emit ctx, Str src, [Expr] elems, Str elem_type, [
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${h16} =l add %t${hdr}, 16\n")
 	write_str(ctx.fd, "\tstorel 0, %t${h16}\n")
-	# runtime copy of the source's live elements (0 .. src.len)
-	const Iarch si = lookup_index(env, src)
-	const Str shdr = binding_ptr(ctx, env, si)
+	# runtime copy of the source array's live elements (0 .. src.len) — the source is any
+	# expression yielding a dynamic-array header (a name, a field read, a call result)
+	const Str shdr = emit_expr(src, ctx, env)
 	const Iarch lid = ctx.label
 	ctx.label = ctx.label + 1
 	const Iarch lp = ctx.next
@@ -1550,11 +1550,14 @@ const emit_append_expr = (*Emit ctx, [Binding] env, Str hdr, Expr e, Str elem): 
 }
 
 # Is `e` a SELF-spread `[...name, …]` — a grow-in-place append of `name` onto itself? Such an
-# assignment mutates the existing header; any other array value REPOINTS the binding.
+# assignment mutates the existing header; any other array value (a spread of a DIFFERENT
+# name, a field/call source, or a fresh literal) REPOINTS the binding.
 const is_self_spread = (Expr e, Str name): Bool -> match e {
-	Expr.ArrayLit(hs, sn, elems, et) -> if hs then str_eq(sn, name) else false,
+	Expr.ArrayLit(hs, sn, elems, et) -> if hs then is_named_var(sn, name) else false,
 	_ -> false
 }
+# Whether an expression is exactly the variable `name`.
+const is_named_var = (Expr e, Str name): Bool -> match e { Expr.Var(n) -> str_eq(n, name), _ -> false }
 
 const emit_expr = (Expr e, *Emit ctx, [Binding] env): Str -> match e {
 	Expr.Lit(v) -> "${v}",
