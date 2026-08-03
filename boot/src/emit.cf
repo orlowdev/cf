@@ -35,7 +35,9 @@ data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs, [RecDecl] recs, [
 # and every MUTABLE (`let`) aggregate (so `xs = []` / `acc = Expr.Add(acc, r)` repoint it).
 # When false, `slot` is a write-once temp holding the aggregate base pointer directly (read
 # as the operand): a `const` aggregate and every aggregate/pointer PARAMETER (a borrow).
-data Binding = { Str name, Iarch slot, Str rec_type, Str elem, Bool is_cell }
+# `telems` carries a tuple binding's per-position element type names (a record name,
+# `"Str"`, or `""` for a word); it is the empty list for every non-tuple binding.
+data Binding = { Str name, Iarch slot, Str rec_type, Str elem, Bool is_cell, [Str] telems }
 
 # Byte-wise `Str` equality (variable-name lookup).
 const str_eq = (Str a, Str b): Bool -> {
@@ -479,6 +481,40 @@ const emit_tuple = (*Emit ctx, [Expr] elems, [Binding] env): Str -> {
 # is a bare in-range literal, so the non-literal arm is unreachable.
 const tuple_lit_index = (Expr idx): Iarch -> match idx { Expr.Lit(v) -> v, _ -> 0 }
 
+# A tuple's per-position element type NAMES — a record name, `"Str"`, or `""` for a word,
+# from `init_agg_type` of each element. A tuple binding carries this list (its `telems`),
+# so `t[k]` / `t[k].field` resolve position k uniformly through the record type-name
+# machinery (field_offset/field_ftype) — no per-type special-casing.
+# A typed empty `[Str]` for a non-tuple binding's `telems` — a bare `[]` in a construction
+# argument would default to `[Iarch]` and mismatch the `[Str]` field.
+const no_telems = (): [Str] -> {
+	let [Str] r = []
+	return r
+}
+
+const tuple_pos_types = (*Emit ctx, [Binding] env, [Expr] elems): [Str] -> {
+	let [Str] r = []
+	let Iarch k = 0
+	loop {
+		if k >= Iarch(elems.len) then break
+		r = [...r, init_agg_type(ctx, env, elems[k])]
+		k = k + 1
+	}
+	return r
+}
+
+# The per-position type-name list a binding carries when its initializer is a tuple; the
+# empty list otherwise (cf0 cannot infer a bare `[]`'s element type inside a match arm, so
+# an annotated local is seeded and mutated).
+const init_telems = (*Emit ctx, [Binding] env, Expr e): [Str] -> {
+	let [Str] r = []
+	match e {
+		Expr.Tuple(elems) -> { r = tuple_pos_types(ctx, env, elems) },
+		_ -> {}
+	}
+	return r
+}
+
 # A record literal as a value expression — an explicit construction `Type({ … })` in a
 # return, call argument, or array element. Builds the record in the arena and yields
 # its base pointer (a binding initializer takes the faster direct path in emit_block).
@@ -606,9 +642,9 @@ const init_agg_type = (*Emit ctx, [Binding] env, Expr e): Str -> match e {
 	Expr.Buffer(n) -> "$ptr",
 	Expr.Addr(name) -> var_agg_type(env, name),
 	Expr.Var(name) -> var_agg_type(env, name),
-	Expr.Index(arr, idx) -> index_agg_type(ctx, env, arr),
+	Expr.Index(arr, idx) -> index_agg_type(ctx, env, arr, idx),
 	Expr.IndexExpr(base, idx) -> indexexpr_agg_type(ctx, env, base),
-	Expr.IndexField(arr, idx, f) -> indexfield_agg_type(ctx, env, arr, f),
+	Expr.IndexField(arr, idx, f) -> indexfield_agg_type(ctx, env, arr, idx, f),
 	Expr.FieldExpr(base, f) -> fieldexpr_agg_type(ctx, env, base, f),
 	Expr.Tuple(elems) -> "$tuple",
 	_ -> ""
@@ -617,9 +653,15 @@ const init_agg_type = (*Emit ctx, [Binding] env, Expr e): Str -> match e {
 # The aggregate marker of `arr[i]` on a bare-name array — the element type name when that
 # element is an aggregate (a record, a `Str`, or a boxed union riding as an 8-byte pointer),
 # so `const sg = segs[i]` binds `sg` as its record/union and `sg.field` reads through it.
-const index_agg_type = (*Emit ctx, [Binding] env, Str arr): Str -> {
+const index_agg_type = (*Emit ctx, [Binding] env, Str arr, Expr idx): Str -> {
 	const Iarch ai = lookup_index(env, arr)
 	if ai < 0 then return ""
+	# a tuple: position idx's element type when it is an aggregate, else a word ("")
+	if str_eq(env[ai].rec_type, "$tuple") then {
+		const Str tn = env[ai].telems[tuple_lit_index(idx)]
+		if elem_is_agg(ctx, tn) then return tn
+		return ""
+	}
 	const Str en = env[ai].elem
 	if elem_is_agg(ctx, en) then return en
 	return ""
@@ -628,10 +670,12 @@ const index_agg_type = (*Emit ctx, [Binding] env, Str arr): Str -> {
 # The aggregate marker of `arr[i].field` — the element record's field type when that field
 # is a pointer aggregate (a `Str`/`[T]`/record/boxed union), so a `.field` chained off it
 # (`ps[i].tag.len`) dispatches correctly and a binding of it adopts the pointer. Else "".
-const indexfield_agg_type = (*Emit ctx, [Binding] env, Str arr, Str field): Str -> {
+const indexfield_agg_type = (*Emit ctx, [Binding] env, Str arr, Expr idx, Str field): Str -> {
 	const Iarch ai = lookup_index(env, arr)
 	if ai < 0 then return ""
-	const Str en = env[ai].elem
+	# a tuple position `t[k].field` reads its field off position k's element type
+	let Str en = env[ai].elem
+	if str_eq(env[ai].rec_type, "$tuple") then en = env[ai].telems[tuple_lit_index(idx)]
 	if find_rec(ctx.recs, en) < 0 then return ""
 	if !field_is_ptr(ctx, en, field) then return ""
 	return field_ftype(ctx, en, field)
@@ -668,7 +712,7 @@ const init_elem = (*Emit ctx, [Binding] env, Expr e): Str -> match e {
 	Expr.ArrayLit(hs, sn, elems, et) -> et,
 	Expr.Field(base, f) -> field_elem(ctx, var_agg_type(env, base), f),
 	Expr.FieldExpr(base, f) -> field_elem(ctx, init_agg_type(ctx, env, base), f),
-	Expr.IndexField(arr, idx, f) -> field_elem(ctx, index_agg_type(ctx, env, arr), f),
+	Expr.IndexField(arr, idx, f) -> field_elem(ctx, index_agg_type(ctx, env, arr, idx), f),
 	_ -> ""
 }
 
@@ -867,7 +911,7 @@ const arm_body_env = (*Emit ctx, [Binding] env, Str type_name, [Str] members, [S
 				write_str(ctx.fd, "\t%t${val} =l loadl %t${addr}\n")
 				const Str pt = payload_type(ctx, type_name, members[0], bi)
 				const Str pe = payload_elem(ctx, type_name, members[0], bi)
-				benv = [...benv, Binding({ name: binds[bi], slot: val, rec_type: pt, elem: pe, is_cell: false })]
+				benv = [...benv, Binding({ name: binds[bi], slot: val, rec_type: pt, elem: pe, is_cell: false, telems: no_telems() })]
 			} else {
 				# a word payload: load it and spill to its own 4-byte slot (read via loadw)
 				const Iarch val = ctx.next
@@ -877,7 +921,7 @@ const arm_body_env = (*Emit ctx, [Binding] env, Str type_name, [Str] members, [S
 				ctx.next = ctx.next + 1
 				write_str(ctx.fd, "\t%t${bslot} =l alloc8 8\n")
 				write_str(ctx.fd, "\tstorel %t${val}, %t${bslot}\n")
-				benv = [...benv, Binding({ name: binds[bi], slot: bslot, rec_type: "", elem: "", is_cell: true })]
+				benv = [...benv, Binding({ name: binds[bi], slot: bslot, rec_type: "", elem: "", is_cell: true, telems: no_telems() })]
 			}
 		}
 		bi = bi + 1
@@ -1222,6 +1266,28 @@ const emit_index = (*Emit ctx, [Binding] env, Str arr, Expr idx): Str -> {
 const emit_index_field = (*Emit ctx, [Binding] env, Str arr, Expr idx, Str field): Str -> {
 	const Iarch ai = lookup_index(env, arr)
 	const Str hdr = binding_ptr(ctx, env, ai)
+	# a tuple `t[k].field`: load position k's 8-byte slot DIRECTLY (base + k*8) to get the
+	# record/Str pointer, then read `field` off it (a `Str` element answers `.len` at +8).
+	if str_eq(env[ai].rec_type, "$tuple") then {
+		const Iarch tk = tuple_lit_index(idx)
+		const Iarch tsoff = tk * 8
+		const Iarch taddr = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${taddr} =l add ${hdr}, ${tsoff}\n")
+		const Iarch trecp = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${trecp} =l loadl %t${taddr}\n")
+		const Str tn = env[ai].telems[tk]
+		let Iarch tfoff = 8
+		if !str_eq(tn, "Str") then tfoff = field_offset(ctx.recs, tn, field)
+		const Iarch tfaddr = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${tfaddr} =l add %t${trecp}, ${tfoff}\n")
+		const Iarch tval = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${tval} =l loadl %t${tfaddr}\n")
+		return "%t${tval}"
+	}
 	const Str iv = emit_expr(idx, ctx, env)
 	const Iarch data = ctx.next
 	ctx.next = ctx.next + 1
@@ -1455,7 +1521,7 @@ const emit_for_body = (*Emit ctx, [Binding] env, Str lv, Str arr, [Stmt] body): 
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${xcell} =l alloc8 8\n")
 	write_str(ctx.fd, "\tstorel %t${xval}, %t${xcell}\n")
-	const [Binding] benv = [...env, Binding({ name: lv, slot: xcell, rec_type: "", elem: "", is_cell: true })]
+	const [Binding] benv = [...env, Binding({ name: lv, slot: xcell, rec_type: "", elem: "", is_cell: true, telems: no_telems() })]
 	const Iarch term = emit_block(ctx, body, benv)
 	if term == 0 then write_str(ctx.fd, "\tjmp @ltop${lid}\n")
 	write_str(ctx.fd, "@lend${lid}\n")
@@ -1659,7 +1725,7 @@ const emit_block = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 					ctx.next = ctx.next + 1
 					write_str(ctx.fd, "\t%t${slot} =l alloc8 8\n")
 					write_str(ctx.fd, "\tstorel ${v}, %t${slot}\n")
-					env = [...env, Binding({ name: n, slot: slot, rec_type: "", elem: "", is_cell: true })]
+					env = [...env, Binding({ name: n, slot: slot, rec_type: "", elem: "", is_cell: true, telems: no_telems() })]
 				} else {
 					const Iarch base = emit_agg_binding(ctx, e, env)
 					if m then {
@@ -1667,9 +1733,9 @@ const emit_block = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 						ctx.next = ctx.next + 1
 						write_str(ctx.fd, "\t%t${cell} =l alloc8 8\n")
 						write_str(ctx.fd, "\tstorel %t${base}, %t${cell}\n")
-						env = [...env, Binding({ name: n, slot: cell, rec_type: rt, elem: init_elem(ctx, env, e), is_cell: true })]
+						env = [...env, Binding({ name: n, slot: cell, rec_type: rt, elem: init_elem(ctx, env, e), is_cell: true, telems: init_telems(ctx, env, e) })]
 					} else {
-						env = [...env, Binding({ name: n, slot: base, rec_type: rt, elem: init_elem(ctx, env, e), is_cell: false })]
+						env = [...env, Binding({ name: n, slot: base, rec_type: rt, elem: init_elem(ctx, env, e), is_cell: false, telems: init_telems(ctx, env, e) })]
 					}
 				}
 			},
@@ -1721,9 +1787,9 @@ const emit_func = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 			ctx.next = ctx.next + 1
 			write_str(ctx.fd, "\t%t${slot} =l copy %p${pi}\n")
 			if str_eq(fn.params[pi].type_name, "$ptr") then {
-				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: "$ptr", elem: "", is_cell: false })]
+				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: "$ptr", elem: "", is_cell: false, telems: no_telems() })]
 			} else {
-				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: fn.params[pi].type_name, elem: "", is_cell: false })]
+				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: fn.params[pi].type_name, elem: "", is_cell: false, telems: no_telems() })]
 			}
 		} else {
 			if is_agg_param(fn.params[pi], ctx.recs, ctx.unions) then {
@@ -1732,14 +1798,14 @@ const emit_func = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 				const Iarch slot = ctx.next
 				ctx.next = ctx.next + 1
 				write_str(ctx.fd, "\t%t${slot} =l copy %p${pi}\n")
-				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: fn.params[pi].type_name, elem: fn.params[pi].elem, is_cell: false })]
+				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: fn.params[pi].type_name, elem: fn.params[pi].elem, is_cell: false, telems: no_telems() })]
 			} else {
 				# a word parameter spills into a stack slot so it reads like a local.
 				const Iarch slot = ctx.next
 				ctx.next = ctx.next + 1
 				write_str(ctx.fd, "\t%t${slot} =l alloc8 8\n")
 				write_str(ctx.fd, "\tstorel %p${pi}, %t${slot}\n")
-				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: "", elem: "", is_cell: true })]
+				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: "", elem: "", is_cell: true, telems: no_telems() })]
 			}
 		}
 		pi = pi + 1

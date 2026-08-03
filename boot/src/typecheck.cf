@@ -59,13 +59,35 @@ const tuple_elems_eq = ([Str] a, [Str] b): Bool -> {
 	return true
 }
 
-# The written type NAME for a scalar tuple element — `Iarch` for any integer width,
-# `Bool` for a Bool. Non-scalar elements (Str, records, arrays, nested tuples) are a
-# later tuple brick; they are rejected here.
-const scalar_type_name = (Ty t): Str -> {
+# Whether an expression is a freshly-constructed record — a call or a `T({…})` / union
+# construction. A record tuple element must be one of these: it rules out every alias form
+# (a bare name, a field read, an index) so the element cannot alias an owned value, AND it
+# keeps the element to a shape the emitter classifies the same way the type gate does (an
+# `if`/`match`-valued record element is a later brick).
+const is_fresh_record = (Expr e): Bool -> match e {
+	Expr.Call(c, a) -> true,
+	Expr.Record(n, fs) -> true,
+	Expr.UnionMk(t, m, args) -> true,
+	_ -> false
+}
+
+# Whether an expression is a tuple literal — the only value form a tuple binding may take
+# for now (aliasing or returning a whole tuple is a later brick).
+const is_tuple_lit = (Expr e): Bool -> match e { Expr.Tuple(es) -> true, _ -> false }
+
+# The written type NAME for a tuple element — `Iarch` for any integer width, `Bool`, `Str`,
+# or a record type. A record element must be a FRESH value (see `is_fresh_record`). Arrays,
+# unions, and nested tuples are a later tuple brick.
+const element_type_name = (Ty t, Expr e): Str -> {
 	if is_tint(t) then return "Iarch"
 	if is_tbool(t) then return "Bool"
-	die("cf0: type: a tuple element must be an Iarch or Bool (heterogeneous elements are a later brick)\n")
+	if is_tstr(t) then return "Str"
+	const Str rn = rec_of(t)
+	if !str_eq(rn, "") then {
+		if !is_fresh_record(e) then die("cf0: type: a record tuple element must be a freshly constructed value (a call or a `T({…})` construction), not an alias\n")
+		return rn
+	}
+	die("cf0: type: a tuple element must be an Iarch, Bool, Str, or a fresh record (arrays, unions, and nested tuples are a later brick)\n")
 	return "Iarch"
 }
 
@@ -596,7 +618,7 @@ const tuple_type = ([Expr] elems, [VarTy] env, Ctx ctx): Ty -> {
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(elems.len) then break
-		names = [...names, scalar_type_name(type_of(elems[i], env, ctx))]
+		names = [...names, element_type_name(type_of(elems[i], env, ctx), elems[i])]
 		i = i + 1
 	}
 	return Ty.TTuple(names)
@@ -609,6 +631,24 @@ const tuple_index_type = ([Str] names, Expr idx, Ctx ctx): Ty -> {
 	if k < 0 then die("cf0: type: a tuple position must be a comptime literal, not a runtime value\n")
 	if k >= Iarch(names.len) then die("cf0: type: a tuple index is out of range\n")
 	return named_ty(names[k], "", ctx.recs, ctx.unions)
+}
+
+# `t[k].field` — position `k` (a comptime literal) must be a `Str` (only `.len`) or a
+# record that declares `field`; yields the field's declared type.
+const tuple_indexfield_type = ([Str] names, Expr idx, Str field, Ctx ctx): Ty -> {
+	const Iarch k = lit_val(idx)
+	if k < 0 then die("cf0: type: a tuple position must be a comptime literal, not a runtime value\n")
+	if k >= Iarch(names.len) then die("cf0: type: a tuple index is out of range\n")
+	const Str tn = names[k]
+	if str_eq(tn, "Str") then {
+		if !str_eq(field, "len") then die("cf0: type: a string element has only `.len`\n")
+		return Ty.TInt
+	}
+	const Iarch ri = find_rec(ctx.recs, tn)
+	if ri < 0 then die("cf0: type: a field read needs a record or string element\n")
+	const Iarch fi = field_index(ctx.recs[ri].fields, field)
+	if fi < 0 then die("cf0: type: the element record has no such field\n")
+	return named_ty(ctx.recs[ri].ftypes[fi], ctx.recs[ri].felems[fi], ctx.recs, ctx.unions)
 }
 
 # `xs[i]` — a dynamic array indexed by an integer, yielding its element type (an `Int`
@@ -660,6 +700,8 @@ const indexexpr_type = (Expr base, Expr idx, [VarTy] env, Ctx ctx): Ty -> {
 const indexfield_type = (Str arr, Expr idx, Str field, [VarTy] env, Ctx ctx): Ty -> {
 	const Iarch vi = env_index(env, arr)
 	if vi < 0 then die("cf0: type: index of an undeclared name\n")
+	# a tuple position's field: position k (a comptime literal) is a Str or a record
+	if is_ttuple(env[vi].ty) then return tuple_indexfield_type(tuple_elems(env[vi].ty), idx, field, ctx)
 	const Str en = dyn_of(env[vi].ty)
 	if str_eq(en, "") then die("cf0: type: indexing a non-array value\n")
 	if !is_tint(type_of(idx, env, ctx)) then die("cf0: type: an array index must be an integer\n")
@@ -904,6 +946,7 @@ const check_stmts = (Func fn, [Stmt] stmts, [VarTy] env0, Ctx ctx, Ty frt, Bool 
 				if env_index(env, n) >= 0 then die("cf0: type: a binding cannot shadow an existing name\n")
 				const Ty ty = type_of(e, env, ctx)
 				if m && is_ttuple(ty) then die("cf0: type: a tuple binds `const` only (a mutable tuple is a later brick)\n")
+				if is_ttuple(ty) && !is_tuple_lit(e) then die("cf0: type: a tuple binding's value must be a tuple literal (aliasing or returning a tuple is a later brick)\n")
 				env = [...env, VarTy({ name: n, ty: ty, mutable: m })]
 			},
 			_ -> {
