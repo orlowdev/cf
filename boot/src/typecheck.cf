@@ -71,9 +71,11 @@ const is_fresh_record = (Expr e): Bool -> match e {
 	_ -> false
 }
 
-# Whether an expression is a tuple literal — the only value form a tuple binding may take
-# for now (aliasing or returning a whole tuple is a later brick).
+# Whether an expression is a tuple literal or a call — the value forms a whole-tuple
+# binding may take (a literal `(a,b)` or a tuple-returning call `f(…)`). Aliasing a tuple
+# name or a tuple from a field/index is a later brick.
 const is_tuple_lit = (Expr e): Bool -> match e { Expr.Tuple(es) -> true, _ -> false }
+const is_call_expr = (Expr e): Bool -> match e { Expr.Call(c, a) -> true, _ -> false }
 
 # The written type NAME for a tuple element — `Iarch` for any integer width, `Bool`, `Str`,
 # or a record type. A record element must be a FRESH value (see `is_fresh_record`). Arrays,
@@ -210,8 +212,30 @@ const param_is_recptr = (Param p, [RecDecl] recs): Bool -> {
 }
 
 # Resolve a function's declared return type to a `Ty` (`""` → the implicit `Int`).
+# Canonicalize a declared tuple element type name to the form a returned tuple carries
+# (`element_type_name` collapses every integer width to `Iarch`), so a declared `(Int, Int)`
+# return matches a returned `(Iarch, Iarch)`. Dies on an unknown type name.
+const canon_elem_name = (Str name, [RecDecl] recs, [UnionDecl] unions): Str -> {
+	const Ty t = named_ty(name, "", recs, unions)
+	if is_tint(t) then return "Iarch"
+	if is_tbool(t) then return "Bool"
+	if is_tstr(t) then return "Str"
+	return name
+}
+const canon_telems = ([Str] telems, [RecDecl] recs, [UnionDecl] unions): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(telems.len) then break
+		r = [...r, canon_elem_name(telems[i], recs, unions)]
+		i = i + 1
+	}
+	return r
+}
+
 const func_ret_ty = (Func fn, [RecDecl] recs, [UnionDecl] unions): Ty -> {
 	if str_eq(fn.ret_name, "") then return Ty.TInt
+	if str_eq(fn.ret_name, "$tuple") then return Ty.TTuple(canon_telems(fn.ret_telems, recs, unions))
 	if str_eq(fn.ret_name, "$dyn") then return Ty.TDyn(fn.ret_elem)
 	if find_rec(recs, fn.ret_name) >= 0 then return Ty.TRec(fn.ret_name)
 	if find_union(unions, fn.ret_name) >= 0 then return Ty.TUnion(fn.ret_name)
@@ -995,7 +1019,7 @@ const check_stmts = (Func fn, [Stmt] stmts, [VarTy] env0, Ctx ctx, Ty frt, Bool 
 				if env_index(env, n) >= 0 then die("cf0: type: a binding cannot shadow an existing name\n")
 				const Ty ty = type_of(e, env, ctx)
 				if m && is_ttuple(ty) then die("cf0: type: a tuple binds `const` only (a mutable tuple is a later brick)\n")
-				if is_ttuple(ty) && !is_tuple_lit(e) then die("cf0: type: a tuple binding's value must be a tuple literal (aliasing or returning a tuple is a later brick)\n")
+				if is_ttuple(ty) && !is_tuple_lit(e) && !is_call_expr(e) then die("cf0: type: a tuple binding's value must be a tuple literal or a tuple-returning call (aliasing a tuple name is a later brick)\n")
 				env = [...env, VarTy({ name: n, ty: ty, mutable: m })]
 			},
 			Stmt.Destructure(pat, m, e) -> { env = check_destructure(pat, m, e, env, ctx) },
@@ -1083,6 +1107,17 @@ const check_stmt_match = (Func fn, Expr scrut, [StmtArm] arms, [VarTy] env, Ctx 
 # Check one function: seed the environment with its parameters (immutable), then
 # check the body — which must return.
 const check_func = (Func fn, Ctx ctx): Iarch -> {
+	# a `(A, B, …)` tuple return: `main` yields the process exit code (an Iarch) so it may
+	# not return a tuple, and each element must name a real type (Iarch/Bool/Str/a record).
+	if str_eq(fn.ret_name, "$tuple") then {
+		if str_eq(fn.name, "main") then die("cf0: type: main must return an Iarch exit code, not a tuple\n")
+		let Iarch ti = 0
+		loop {
+			if ti >= Iarch(fn.ret_telems.len) then break
+			named_ty(fn.ret_telems[ti], "", ctx.recs, ctx.unions)
+			ti = ti + 1
+		}
+	}
 	# an asm-bodied function has no statement body to check — its parameters and return type
 	# still register it for callers (call_type resolves them); the asm is emitted verbatim.
 	if fn.is_asm then return 0

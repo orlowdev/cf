@@ -208,6 +208,7 @@ const param_l = (Param p, [RecDecl] recs, [UnionDecl] unions): Bool -> {
 # Does a return type ride in an `l` register — a record or a boxed union pointer?
 const ret_is_l = (Str ret_name, [RecDecl] recs, [UnionDecl] unions): Bool -> {
 	if str_eq(ret_name, "$dyn") then return true
+	if str_eq(ret_name, "$tuple") then return true
 	if str_eq(ret_name, "Str") then return true
 	if find_rec(recs, ret_name) >= 0 then return true
 	if find_union(unions, ret_name) >= 0 then return union_is_boxed(unions, ret_name)
@@ -506,10 +507,21 @@ const tuple_pos_types = (*Emit ctx, [Binding] env, [Expr] elems): [Str] -> {
 # The per-position type-name list a binding carries when its initializer is a tuple; the
 # empty list otherwise (cf0 cannot infer a bare `[]`'s element type inside a match arm, so
 # an annotated local is seeded and mutated).
+# A tuple-returning callee's declared position type names (Iarch/Bool/Str/a record). These
+# work alongside `tuple_pos_types`'s `""`-for-word convention because the tuple-access
+# emit only distinguishes record (find_rec) / `Str` / else-word — and `Iarch`/`Bool` fall
+# to else-word just like `""`.
+const call_ret_telems = (*Emit ctx, Str callee): [Str] -> {
+	const Iarch fidx = find_func(ctx.funcs, callee)
+	if fidx < 0 then return no_telems()
+	return ctx.funcs[fidx].ret_telems
+}
+
 const init_telems = (*Emit ctx, [Binding] env, Expr e): [Str] -> {
 	let [Str] r = []
 	match e {
 		Expr.Tuple(elems) -> { r = tuple_pos_types(ctx, env, elems) },
+		Expr.Call(callee, args) -> { r = call_ret_telems(ctx, callee) },
 		_ -> {}
 	}
 	return r
@@ -546,7 +558,11 @@ const emit_destructure = (*Emit ctx, [Binding] env, [Str] pat, Bool mutable, Exp
 			tels = tuple_pos_types(ctx, env, elems)
 			base = emit_tuple(ctx, elems, env)
 		},
-		_ -> { die("cf0: emit: a destructure source must be a tuple literal or a bound tuple\n") }
+		Expr.Call(callee, args) -> {
+			tels = call_ret_telems(ctx, callee)
+			base = emit_call(ctx, callee, args, env)
+		},
+		_ -> { die("cf0: emit: a destructure source must be a tuple literal, a bound tuple, or a tuple-returning call\n") }
 	}
 	let [Binding] e2 = env
 	let Iarch pos = 0
@@ -564,7 +580,15 @@ const emit_destructure = (*Emit ctx, [Binding] env, [Str] pat, Bool mutable, Exp
 		ctx.next = ctx.next + 1
 		write_str(ctx.fd, "\t%t${saddr} =l add ${base}, ${soff}\n")
 		const Str ptype = tels[pos]
-		if str_eq(ptype, "") then {
+		# a record or Str position is an 8-byte pointer (a borrow); every other position is a
+		# word (`""` from a literal, `Iarch`/`Bool` from a call's declared types — both fall
+		# here) loaded into a fresh reassignable cell so a `let` position can be reassigned.
+		if str_eq(ptype, "Str") || find_rec(ctx.recs, ptype) >= 0 then {
+			const Iarch ptr = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${ptr} =l loadl %t${saddr}\n")
+			e2 = [...e2, Binding({ name: tok, slot: ptr, rec_type: ptype, elem: "", is_cell: false, telems: no_telems() })]
+		} else {
 			const Iarch val = ctx.next
 			ctx.next = ctx.next + 1
 			write_str(ctx.fd, "\t%t${val} =l loadl %t${saddr}\n")
@@ -573,11 +597,6 @@ const emit_destructure = (*Emit ctx, [Binding] env, [Str] pat, Bool mutable, Exp
 			write_str(ctx.fd, "\t%t${cell} =l alloc8 8\n")
 			write_str(ctx.fd, "\tstorel %t${val}, %t${cell}\n")
 			e2 = [...e2, Binding({ name: tok, slot: cell, rec_type: "", elem: "", is_cell: true, telems: no_telems() })]
-		} else {
-			const Iarch ptr = ctx.next
-			ctx.next = ctx.next + 1
-			write_str(ctx.fd, "\t%t${ptr} =l loadl %t${saddr}\n")
-			e2 = [...e2, Binding({ name: tok, slot: ptr, rec_type: ptype, elem: "", is_cell: false, telems: no_telems() })]
 		}
 		pos = pos + 1
 		pi = pi + 1

@@ -1058,19 +1058,42 @@ const parse_params = (*Parser p): [Param] -> {
 # The optional `: RetType` return annotation as a raw type NAME: `""` when absent
 # (an implicit `Int`, e.g. `main`), else the bare type-name identifier (resolved to a
 # `Ty` at typecheck). Pointer/array return types are a later brick.
+# A typed empty `[Str]` — a bare `[]` in a `RetSig`/`Func` construction argument would
+# default to `[Iarch]` and mismatch the `[Str]` field.
+const empty_strs = (): [Str] -> {
+	let [Str] r = []
+	return r
+}
+
 const parse_ret_name = (*Parser p): RetSig -> {
-	if !is_colon(peek(p)) then return RetSig({ name: "", elem: "" })
+	if !is_colon(peek(p)) then return RetSig({ name: "", elem: "", telems: empty_strs() })
 	p.pos = p.pos + 1
 	# a `[Elem]` return is a dynamic array (its element kept in `elem`); a bare
 	# identifier is a named type
 	if is_lbracket(peek(p)) then {
 		const Str elem = dyn_elem_of(parse_type(p))
-		return RetSig({ name: "$dyn", elem: elem })
+		return RetSig({ name: "$dyn", elem: elem, telems: empty_strs() })
+	}
+	# a `(A, B, …)` tuple return type — at least two comma-separated element type names
+	if is_lparen(peek(p)) then {
+		p.pos = p.pos + 1 # `(`
+		let [Str] tel = []
+		loop {
+			if !is_ident(peek(p)) then die("cf0: parse: expected a tuple element type name\n")
+			tel = [...tel, cur_name(p)]
+			p.pos = p.pos + 1
+			if !is_comma(peek(p)) then break
+			p.pos = p.pos + 1
+		}
+		if !is_rparen(peek(p)) then die("cf0: parse: expected `)` in a tuple return type\n")
+		p.pos = p.pos + 1
+		if Iarch(tel.len) < 2 then die("cf0: parse: a tuple return type needs at least two elements\n")
+		return RetSig({ name: "$tuple", elem: "", telems: tel })
 	}
 	if !is_ident(peek(p)) then die("cf0: parse: expected a return type name after `:`\n")
 	const Str n = cur_name(p)
 	p.pos = p.pos + 1
-	return RetSig({ name: n, elem: "" })
+	return RetSig({ name: n, elem: "", telems: empty_strs() })
 }
 
 # Split an `asm "…"` body string into segments — literal runs and `${param}` holes —
@@ -1133,7 +1156,7 @@ const parse_func = (*Parser p): Func -> {
 		const [Stmt] vempty = []
 		const [Stmt] vbody = [...vempty, Stmt.Return(parse_expr(p))]
 		const [Seg] vnoasm = []
-		return Func({ name: name, is_pub: is_pub, ret_name: "", ret_elem: "", params: noparams, body: vbody, is_asm: false, asm_body: vnoasm, is_value: true })
+		return Func({ name: name, is_pub: is_pub, ret_name: "", ret_elem: "", params: noparams, body: vbody, is_asm: false, asm_body: vnoasm, is_value: true, ret_telems: empty_strs() })
 	}
 	p.pos = p.pos + 1
 	const [Param] params = parse_params(p)
@@ -1151,15 +1174,15 @@ const parse_func = (*Parser p): Func -> {
 		if !is_strlit(peek(p)) then die("cf0: parse: expected a string after `asm`\n")
 		const [Seg] segs = scan_asm_segs(p.src, p.toks[p.pos].start, p.toks[p.pos].len)
 		p.pos = p.pos + 1
-		return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: nobody, is_asm: true, asm_body: segs, is_value: false })
+		return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: nobody, is_asm: true, asm_body: segs, is_value: false, ret_telems: rs.telems })
 	}
 	if is_lbrace(peek(p)) then {
 		p.pos = p.pos + 1
 		const [Stmt] body = parse_block(p)
-		return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: body, is_asm: false, asm_body: noasm, is_value: false })
+		return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: body, is_asm: false, asm_body: noasm, is_value: false, ret_telems: rs.telems })
 	}
 	const [Stmt] one = [...nobody, Stmt.Return(parse_expr(p))]
-	return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: one, is_asm: false, asm_body: noasm, is_value: false })
+	return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: one, is_asm: false, asm_body: noasm, is_value: false, ret_telems: rs.telems })
 }
 
 # `data Name = { Iarch a, Iarch b }` — a record declaration (Iarch fields only, at
