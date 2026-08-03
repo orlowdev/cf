@@ -515,6 +515,76 @@ const init_telems = (*Emit ctx, [Binding] env, Expr e): [Str] -> {
 	return r
 }
 
+# Destructure skip helpers (mirror the type gate's): a `_`-led token drops position(s).
+const is_skip = (Str tok): Bool -> if Iarch(tok.len) == 0 then false else Iarch(tok[0]) == 95
+const skip_count = (Str tok): Iarch -> {
+	if Iarch(tok.len) == 1 then return 1
+	let Iarch n = 0
+	let Iarch i = 1
+	loop {
+		if i >= Iarch(tok.len) then break
+		n = n * 10 + (Iarch(tok[i]) - 48)
+		i = i + 1
+	}
+	return n
+}
+
+# Emit `const/let (a, _, c) = rhs`: materialize the source tuple's base pointer (a bound
+# tuple var is reused; a literal is built), then bind each pattern name to its position —
+# a scalar into a fresh cell (so a `let` position reassigns), a record/Str as the 8-byte
+# pointer (a borrow). Returns the environment extended with the pattern's bindings.
+const emit_destructure = (*Emit ctx, [Binding] env, [Str] pat, Bool mutable, Expr rhs): [Binding] -> {
+	let Str base = ""
+	let [Str] tels = no_telems()
+	match rhs {
+		Expr.Var(nm) -> {
+			const Iarch vi = lookup_index(env, nm)
+			base = binding_ptr(ctx, env, vi)
+			tels = env[vi].telems
+		},
+		Expr.Tuple(elems) -> {
+			tels = tuple_pos_types(ctx, env, elems)
+			base = emit_tuple(ctx, elems, env)
+		},
+		_ -> { die("cf0: emit: a destructure source must be a tuple literal or a bound tuple\n") }
+	}
+	let [Binding] e2 = env
+	let Iarch pos = 0
+	let Iarch pi = 0
+	loop {
+		if pi >= Iarch(pat.len) then break
+		const Str tok = pat[pi]
+		if is_skip(tok) then {
+			pos = pos + skip_count(tok)
+			pi = pi + 1
+			continue
+		}
+		const Iarch soff = pos * 8
+		const Iarch saddr = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${saddr} =l add ${base}, ${soff}\n")
+		const Str ptype = tels[pos]
+		if str_eq(ptype, "") then {
+			const Iarch val = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${val} =l loadl %t${saddr}\n")
+			const Iarch cell = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${cell} =l alloc8 8\n")
+			write_str(ctx.fd, "\tstorel %t${val}, %t${cell}\n")
+			e2 = [...e2, Binding({ name: tok, slot: cell, rec_type: "", elem: "", is_cell: true, telems: no_telems() })]
+		} else {
+			const Iarch ptr = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${ptr} =l loadl %t${saddr}\n")
+			e2 = [...e2, Binding({ name: tok, slot: ptr, rec_type: ptype, elem: "", is_cell: false, telems: no_telems() })]
+		}
+		pos = pos + 1
+		pi = pi + 1
+	}
+	return e2
+}
+
 # A record literal as a value expression — an explicit construction `Type({ … })` in a
 # return, call argument, or array element. Builds the record in the arena and yields
 # its base pointer (a binding initializer takes the faster direct path in emit_block).
@@ -1739,6 +1809,7 @@ const emit_block = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 					}
 				}
 			},
+			Stmt.Destructure(pat, m, e) -> { env = emit_destructure(ctx, env, pat, m, e) },
 			_ -> { terminal = emit_simple_stmt(ctx, env, s) }
 		}
 		i = i + 1

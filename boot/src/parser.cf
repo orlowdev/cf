@@ -686,7 +686,48 @@ const is_fixed_arraylit = (Expr e, Iarch n): Bool -> match e {
 	_ -> false
 }
 
+# Validate a destructure pattern token: a bare name binds a position; a `_`-led token is a
+# skip — `_` (one) or `_<digits>` (n) — and anything else (`_foo`) is rejected.
+const check_pat_tok = (Str tok): Iarch -> {
+	if Iarch(tok.len) == 0 then die("cf0: parse: an empty destructure pattern token\n")
+	if Iarch(tok[0]) != 95 then return 0
+	let Iarch i = 1
+	loop {
+		if i >= Iarch(tok.len) then break
+		const Iarch d = Iarch(tok[i])
+		if d < 48 then die("cf0: parse: a skip token must be `_` or `_<digits>`\n")
+		if d > 57 then die("cf0: parse: a skip token must be `_` or `_<digits>`\n")
+		i = i + 1
+	}
+	return 0
+}
+
+# `const/let (a, _, c) = <tuple>` — a tuple destructure pattern (positional names + skips).
+# The comma-separated tokens (a trailing comma allowed) are collected raw; the type gate
+# maps each to a position and checks arity/skips/duplicates.
+const parse_destructure = (*Parser p, Bool mutable): Stmt -> {
+	p.pos = p.pos + 1 # `(`
+	let [Str] pat = []
+	loop {
+		if !is_ident(peek(p)) then die("cf0: parse: expected a pattern name or `_` in a destructure\n")
+		const Str tok = cur_name(p)
+		check_pat_tok(tok)
+		pat = [...pat, tok]
+		p.pos = p.pos + 1
+		if !is_comma(peek(p)) then break
+		p.pos = p.pos + 1
+		if is_rparen(peek(p)) then break
+	}
+	if !is_rparen(peek(p)) then die("cf0: parse: expected `)` in a destructure pattern\n")
+	p.pos = p.pos + 1
+	if !is_eq(peek(p)) then die("cf0: parse: expected `=` in a destructure\n")
+	p.pos = p.pos + 1
+	return Stmt.Destructure(pat, mutable, parse_expr(p))
+}
+
 const parse_let = (*Parser p, Bool mutable): Stmt -> {
+	# `(a, b) = <tuple>` — a destructure pattern (positional binds + `_` skips)
+	if is_lparen(peek(p)) then return parse_destructure(p, mutable)
 	# `[Elem] name` — a dynamic-array annotation. The element type is carried onto the
 	# initializer's array literal (an empty `[]` cannot infer it from elements).
 	# `[N Elem] name` — either a fixed-size array with an initializer (`const [4 Iarch] xs =

@@ -651,6 +651,55 @@ const tuple_indexfield_type = ([Str] names, Expr idx, Str field, Ctx ctx): Ty ->
 	return named_ty(ctx.recs[ri].ftypes[fi], ctx.recs[ri].felems[fi], ctx.recs, ctx.unions)
 }
 
+# A destructure pattern token: a bare name binds a position; a `_`-led token is a skip.
+const is_skip = (Str tok): Bool -> if Iarch(tok.len) == 0 then false else Iarch(tok[0]) == 95
+# How many positions a skip token drops (`_`→1, `_<digits>`→n). The parser has already
+# proven the token is a well-formed skip.
+const skip_count = (Str tok): Iarch -> {
+	if Iarch(tok.len) == 1 then return 1
+	let Iarch n = 0
+	let Iarch i = 1
+	loop {
+		if i >= Iarch(tok.len) then break
+		n = n * 10 + (Iarch(tok[i]) - 48)
+		i = i + 1
+	}
+	return n
+}
+
+# Check `const/let (a, _, c) = rhs`: rhs must be a tuple; each pattern name binds its
+# position's type (no shadow/dup); a skip drops position(s); the pattern must cover the
+# whole tuple exactly; a `let` position must be a scalar (a record/Str position is const).
+# Returns the environment extended with the pattern's bindings.
+const check_destructure = ([Str] pat, Bool mutable, Expr rhs, [VarTy] env, Ctx ctx): [VarTy] -> {
+	const Ty rt = type_of(rhs, env, ctx)
+	if !is_ttuple(rt) then die("cf0: type: destructuring needs a tuple value\n")
+	const [Str] names = tuple_elems(rt)
+	let [VarTy] e2 = env
+	let Iarch pos = 0
+	let Iarch pi = 0
+	loop {
+		if pi >= Iarch(pat.len) then break
+		const Str tok = pat[pi]
+		if is_skip(tok) then {
+			pos = pos + skip_count(tok)
+			pi = pi + 1
+			continue
+		}
+		if pos >= Iarch(names.len) then die("cf0: type: a destructure pattern has more positions than the tuple\n")
+		if env_index(e2, tok) >= 0 then die("cf0: type: a destructure name cannot shadow an existing or duplicate binding\n")
+		const Ty pty = named_ty(names[pos], "", ctx.recs, ctx.unions)
+		if mutable then {
+			if !is_tint(pty) && !is_tbool(pty) then die("cf0: type: a `let` destructure position must be a scalar (a record/Str position binds `const`)\n")
+		}
+		e2 = [...e2, VarTy({ name: tok, ty: pty, mutable: mutable })]
+		pos = pos + 1
+		pi = pi + 1
+	}
+	if pos != Iarch(names.len) then die("cf0: type: a destructure pattern must cover the whole tuple\n")
+	return e2
+}
+
 # `xs[i]` — a dynamic array indexed by an integer, yielding its element type (an `Int`
 # word, or a record for a `[Record]`).
 const index_type = (Str arr, Expr idx, [VarTy] env, Ctx ctx): Ty -> {
@@ -949,6 +998,7 @@ const check_stmts = (Func fn, [Stmt] stmts, [VarTy] env0, Ctx ctx, Ty frt, Bool 
 				if is_ttuple(ty) && !is_tuple_lit(e) then die("cf0: type: a tuple binding's value must be a tuple literal (aliasing or returning a tuple is a later brick)\n")
 				env = [...env, VarTy({ name: n, ty: ty, mutable: m })]
 			},
+			Stmt.Destructure(pat, m, e) -> { env = check_destructure(pat, m, e, env, ctx) },
 			_ -> {
 				const Iarch t = check_simple_stmt(fn, s, env, ctx, frt, in_loop)
 				if t >= 1 then {
