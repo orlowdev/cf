@@ -17,7 +17,7 @@
 
 import "io" as { die }
 import "ast" as { Expr, Stmt, Param, Func, Ty, FieldInit, RecDecl, UnionMember, UnionDecl, MatchArm, StmtArm, Seg, Program }
-import "astutil" as { is_spread, spread_inner, is_skip, skip_count }
+import "astutil" as { is_spread, spread_inner, is_skip, skip_count, is_nested, nested_inner }
 
 # A name in scope during checking: its type and whether it is reassignable (`let`).
 data VarTy = { Str name, Ty ty, Bool mutable }
@@ -591,6 +591,7 @@ const match_type = (Expr scrut, [MatchArm] arms, [VarTy] env, Ctx ctx): Ty -> {
 # `TStr`, anything else (`Iarch`, `Int`, …) an `Int` word. A `[Expr]` element is thus the
 # recursive union, not a truncated word — needed to index cf0's own `[Expr]`/`[Stmt]` lists.
 const elem_ty = (Str en, Ctx ctx): Ty -> {
+	if is_nested(en) then return Ty.TDyn(nested_inner(en))
 	if str_eq(en, "Str") then return Ty.TStr
 	if find_rec(ctx.recs, en) >= 0 then return Ty.TRec(en)
 	if find_union(ctx.unions, en) >= 0 then return Ty.TUnion(en)
@@ -601,6 +602,9 @@ const elem_ty = (Str en, Ctx ctx): Ty -> {
 # name, else `Iarch` (a word element).
 const elem_name_of = (Ty t): Str -> {
 	if is_tstr(t) then return "Str"
+	# a nested-array element (`[[Str]]`'s element is a `[Str]`) is named by its spelling
+	const Str dn = dyn_of(t)
+	if !str_eq(dn, "") then return "[${dn}]"
 	const Str rn = rec_of(t)
 	if str_eq(rn, "") then return "Iarch"
 	return rn
@@ -800,9 +804,14 @@ const indexfield_type = (Str arr, Expr idx, Str field, [VarTy] env, Ctx ctx): Ty
 	const Str en = dyn_of(env[vi].ty)
 	if str_eq(en, "") then die("cf0: type: indexing a non-array value\n")
 	if !is_tint(type_of(idx, env, ctx)) then die("cf0: type: an array index must be an integer\n")
-	# a `[Str]` element exposes only `.len` (its byte count)
+	# a `[Str]` element or a nested-array element (`[[Str]]`'s element is a `[Str]`) exposes
+	# only `.len` — both ride as a header whose length word is at +8
 	if str_eq(en, "Str") then {
 		if !str_eq(field, "len") then die("cf0: type: a string element has only `.len`\n")
+		return Ty.TInt
+	}
+	if is_nested(en) then {
+		if !str_eq(field, "len") then die("cf0: type: a nested-array element has only `.len`\n")
 		return Ty.TInt
 	}
 	const Iarch ri = find_rec(ctx.recs, en)

@@ -18,7 +18,7 @@
 
 import "io" as { write_str, die }
 import "ast" as { Expr, Stmt, Param, Func, FieldInit, RecDecl, UnionMember, UnionDecl, MatchArm, StmtArm, Seg, Program }
-import "astutil" as { is_spread, spread_inner, is_skip, skip_count }
+import "astutil" as { is_spread, spread_inner, is_skip, skip_count, is_nested, nested_inner }
 
 # The emit context: the QBE-IL output fd, the next free temp number, the next free
 # basic-block label id, the program's functions (a call resolves its callee — by
@@ -91,6 +91,7 @@ const find_rec = ([RecDecl] recs, Str name): Iarch -> {
 # a `Str`), rather than a word? Records and strings store `storel`/`loadl`; `Iarch`/""
 # store `storew`/`loadw`.
 const elem_is_agg = (*Emit ctx, Str elem): Bool -> {
+	if is_nested(elem) then return true
 	if str_eq(elem, "Str") then return true
 	if find_rec(ctx.recs, elem) >= 0 then return true
 	if find_union(ctx.unions, elem) >= 0 then return union_is_boxed(ctx.unions, elem)
@@ -574,6 +575,15 @@ const emit_canon_telems = (*Emit ctx, [Str] telems): [Str] -> {
 	return r
 }
 
+# A callee's declared dynamic-array element name (`Func.ret_elem`) — so a binding of a
+# `[T]`/nested-array call result (`const rs = build()`) carries its element for later
+# `rs[i]` / `rs[i].len`; "" for a non-array or unknown callee.
+const call_ret_elem = (*Emit ctx, Str callee): Str -> {
+	const Iarch fidx = find_func(ctx.funcs, callee)
+	if fidx < 0 then return ""
+	return ctx.funcs[fidx].ret_elem
+}
+
 # A tuple-returning callee's position telems, canonicalized to emit's convention.
 const call_ret_telems = (*Emit ctx, Str callee): [Str] -> {
 	const Iarch fidx = find_func(ctx.funcs, callee)
@@ -810,7 +820,18 @@ const index_agg_type = (*Emit ctx, [Binding] env, Str arr, Expr idx): Str -> {
 		return ""
 	}
 	const Str en = env[ai].elem
+	# indexing a nested array `rs[i]` yields a dynamic array (`rs`'s element is a `[Inner]`)
+	if is_nested(en) then return "$dyn"
 	if elem_is_agg(ctx, en) then return en
+	return ""
+}
+
+# The element name of `arr[i]` when the result is itself a dynamic array (a nested array's
+# element) — the inner element name; else "" (a scalar/record element carries none).
+const index_elem = ([Binding] env, Str arr): Str -> {
+	const Iarch ai = lookup_index(env, arr)
+	if ai < 0 then return ""
+	if is_nested(env[ai].elem) then return nested_inner(env[ai].elem)
 	return ""
 }
 
@@ -846,8 +867,18 @@ const fieldexpr_agg_type = (*Emit ctx, [Binding] env, Expr base, Str field): Str
 # The aggregate marker of a `base[i]` element — for binding `const t = p.toks[i]` (whose
 # element is a record or `Str` riding as an 8-byte pointer). The element type name comes
 # from the base's `[T]` element; a word element (`Iarch`/"") yields "".
+# The element name of `base[i]` when that element is itself a nested array — the inner
+# element name; else "". Mirrors `index_elem` but takes the base as an expression.
+const indexexpr_elem = (*Emit ctx, [Binding] env, Expr base): Str -> {
+	const Str be = init_elem(ctx, env, base)
+	if is_nested(be) then return nested_inner(be)
+	return ""
+}
+
 const indexexpr_agg_type = (*Emit ctx, [Binding] env, Expr base): Str -> {
 	const Str en = init_elem(ctx, env, base)
+	# indexing a nested array yields a dynamic array, not the nested element name
+	if is_nested(en) then return "$dyn"
 	if elem_is_agg(ctx, en) then return en
 	return ""
 }
@@ -860,6 +891,9 @@ const init_elem = (*Emit ctx, [Binding] env, Expr e): Str -> match e {
 	Expr.Field(base, f) -> field_elem(ctx, var_agg_type(env, base), f),
 	Expr.FieldExpr(base, f) -> field_elem(ctx, init_agg_type(ctx, env, base), f),
 	Expr.IndexField(arr, idx, f) -> field_elem(ctx, index_agg_type(ctx, env, arr, idx), f),
+	Expr.Index(arr, idx) -> index_elem(env, arr),
+	Expr.IndexExpr(base, idx) -> indexexpr_elem(ctx, env, base),
+	Expr.Call(callee, args) -> call_ret_elem(ctx, callee),
 	_ -> ""
 }
 
@@ -1451,10 +1485,10 @@ const emit_index_field = (*Emit ctx, [Binding] env, Str arr, Expr idx, Str field
 	const Iarch recp = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${recp} =l loadl %t${slot}\n")
-	# a `[Str]` element's `.len` is the header's len word at +8; a record element's field
-	# rides at its declared offset.
+	# a `[Str]` element or a nested-array element rides as a header whose `.len` word is at
+	# +8; a record element's field rides at its declared offset.
 	let Iarch foff = 8
-	if !str_eq(env[ai].elem, "Str") then foff = field_offset(ctx.recs, env[ai].elem, field)
+	if !str_eq(env[ai].elem, "Str") && !is_nested(env[ai].elem) then foff = field_offset(ctx.recs, env[ai].elem, field)
 	const Iarch faddr = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${faddr} =l add %t${recp}, ${foff}\n")
