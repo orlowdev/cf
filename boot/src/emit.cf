@@ -17,8 +17,8 @@
 # not yet enforced (that is the typecheck brick).
 
 import "io" as { write_str, die }
-import "ast" as { Expr, Stmt, Param, Func, FieldInit, RecDecl, UnionMember, UnionDecl, MatchArm, StmtArm, Seg, Program }
-import "astutil" as { is_spread, spread_inner, is_skip, skip_count, is_nested, nested_inner }
+import "ast" as { Expr, Stmt, Param, Func, FieldInit, RecDecl, UnionMember, UnionDecl, MatchArm, StmtArm, Seg, TupElem, Program }
+import "astutil" as { is_spread, spread_inner, is_skip, skip_count, is_nested, nested_inner, tel_leaf, tel_nest, tel_is_nest }
 
 # The emit context: the QBE-IL output fd, the next free temp number, the next free
 # basic-block label id, the program's functions (a call resolves its callee — by
@@ -38,7 +38,7 @@ data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs, [RecDecl] recs, [
 # as the operand): a `const` aggregate and every aggregate/pointer PARAMETER (a borrow).
 # `telems` carries a tuple binding's per-position element type names (a record name,
 # `"Str"`, or `""` for a word); it is the empty list for every non-tuple binding.
-data Binding = { Str name, Iarch slot, Str rec_type, Str elem, Bool is_cell, [Str] telems }
+data Binding = { Str name, Iarch slot, Str rec_type, Str elem, Bool is_cell, [TupElem] telems }
 
 # Byte-wise `Str` equality (variable-name lookup).
 const str_eq = (Str a, Str b): Bool -> {
@@ -531,13 +531,22 @@ const tuple_lit_index = (Expr idx): Iarch -> match idx { Expr.Lit(v) -> v, _ -> 
 # from `init_agg_type` of each element. A tuple binding carries this list (its `telems`),
 # so `t[k]` / `t[k].field` resolve position k uniformly through the record type-name
 # machinery (field_offset/field_ftype) — no per-type special-casing.
-const tuple_pos_types = (*Emit ctx, [Binding] env, [Expr] elems): [Str] -> {
-	let [Str] r = []
+# One tuple position's emit descriptor from its initializer element: a nested tuple element
+# carries its own positions structurally (`tel_nest`); any other rides by its emit-canonical
+# aggregate name (a record / `"Str"` / `""`-for-word, via `init_agg_type`).
+const pos_telem = (*Emit ctx, [Binding] env, Expr e): TupElem -> {
+	const Str at = init_agg_type(ctx, env, e)
+	if str_eq(at, "$tuple") then return tel_nest(init_telems(ctx, env, e))
+	return tel_leaf(at)
+}
+
+const tuple_pos_types = (*Emit ctx, [Binding] env, [Expr] elems): [TupElem] -> {
+	let [TupElem] r = []
 	let Iarch k = 0
 	loop {
 		if k >= Iarch(elems.len) then break
 		if is_spread(elems[k]) then {
-			const [Str] se = init_telems(ctx, env, spread_inner(elems[k]))
+			const [TupElem] se = init_telems(ctx, env, spread_inner(elems[k]))
 			let Iarch j = 0
 			loop {
 				if j >= Iarch(se.len) then break
@@ -545,28 +554,25 @@ const tuple_pos_types = (*Emit ctx, [Binding] env, [Expr] elems): [Str] -> {
 				j = j + 1
 			}
 		} else {
-			r = [...r, init_agg_type(ctx, env, elems[k])]
+			r = [...r, pos_telem(ctx, env, elems[k])]
 		}
 		k = k + 1
 	}
 	return r
 }
 
-# The per-position type-name list a binding carries when its initializer is a tuple; the
-# empty list otherwise (cf0 cannot infer a bare `[]`'s element type inside a match arm, so
-# an annotated local is seeded and mutated).
-# Emit's SINGLE tuple-telem convention: a position is named by its record type or `"Str"`
-# when it rides as an 8-byte pointer, else `""` for a word. `emit_canon_telems` maps the
-# DECLARED names a param/return carries (`Iarch`/`Bool`/`Str`/a record) into it, so every
-# tuple binding — from a literal (`tuple_pos_types`/`init_agg_type`), a call result, or a
-# parameter — carries one form and the access code has one interpretation.
-const emit_telem = (*Emit ctx, Str name): Str -> {
-	if find_rec(ctx.recs, name) >= 0 then return name
-	if str_eq(name, "Str") then return "Str"
-	return ""
+# Emit's SINGLE tuple-telem convention: a leaf position is its record type / `"Str"` (an
+# 8-byte pointer) or `""` (a word); a nested position keeps `"$tuple"` and its sub-positions.
+# `emit_canon_telems` maps DECLARED names (`Iarch`/`Bool`/`Str`/record, recursively) into it,
+# so every tuple binding — literal, call result, param, field — carries one form.
+const emit_telem = (*Emit ctx, TupElem te): TupElem -> {
+	if tel_is_nest(te) then return tel_nest(emit_canon_telems(ctx, te.sub))
+	if find_rec(ctx.recs, te.name) >= 0 then return tel_leaf(te.name)
+	if str_eq(te.name, "Str") then return tel_leaf("Str")
+	return tel_leaf("")
 }
-const emit_canon_telems = (*Emit ctx, [Str] telems): [Str] -> {
-	let [Str] r = []
+const emit_canon_telems = (*Emit ctx, [TupElem] telems): [TupElem] -> {
+	let [TupElem] r = []
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(telems.len) then break
@@ -574,6 +580,35 @@ const emit_canon_telems = (*Emit ctx, [Str] telems): [Str] -> {
 		i = i + 1
 	}
 	return r
+}
+
+# A tuple position's binding rec_type ("$tuple" nested / record / "Str" / "" word) and the
+# telems a binding of it carries (a nested tuple's sub-positions, else empty).
+const tel_agg_type = (*Emit ctx, TupElem te): Str -> {
+	if tel_is_nest(te) then return "$tuple"
+	if elem_is_agg(ctx, te.name) then return te.name
+	return ""
+}
+const tel_sub = (TupElem te): [TupElem] -> {
+	let [TupElem] none = []
+	if tel_is_nest(te) then return te.sub
+	return none
+}
+# The k-th tuple position's leaf name ("" if out of range or nested — a nested position has
+# no leaf field name).
+const telem_name = ([TupElem] tels, Iarch k): Str -> {
+	if k < 0 then return ""
+	if k >= Iarch(tels.len) then return ""
+	return tels[k].name
+}
+# For `base[k]` on a `$tuple` value, the k-th position's sub-telems (empty unless nested).
+const index_pos_sub = (*Emit ctx, [Binding] env, Expr base, Expr idx): [TupElem] -> {
+	let [TupElem] none = []
+	if !str_eq(init_agg_type(ctx, env, base), "$tuple") then return none
+	const [TupElem] tel = init_telems(ctx, env, base)
+	const Iarch k = tuple_lit_index(idx)
+	if k >= Iarch(tel.len) then return none
+	return tel_sub(tel[k])
 }
 
 # A callee's declared dynamic-array element name (`Func.ret_elem`) — so a binding of a
@@ -586,35 +621,38 @@ const call_ret_elem = (*Emit ctx, Str callee): Str -> {
 }
 
 # A tuple-returning callee's position telems, canonicalized to emit's convention.
-const call_ret_telems = (*Emit ctx, Str callee): [Str] -> {
+const call_ret_telems = (*Emit ctx, Str callee): [TupElem] -> {
+	let [TupElem] none = []
 	const Iarch fidx = find_func(ctx.funcs, callee)
-	if fidx < 0 then return []
+	if fidx < 0 then return none
 	return emit_canon_telems(ctx, ctx.funcs[fidx].ret_telems)
 }
 
-# A record's tuple FIELD position type names, canonicalized to emit's convention (empty for
-# a non-tuple field / unknown record) — so `r.pair[k]` / `r.pair[k].field` resolve.
-const field_ftelems = (*Emit ctx, Str rectype, Str field): [Str] -> {
+# A record's tuple FIELD position telems, canonicalized to emit's convention (empty for a
+# non-tuple field / unknown record) — so `r.pair[k]` / `r.pair[k].field` resolve.
+const field_ftelems = (*Emit ctx, Str rectype, Str field): [TupElem] -> {
+	let [TupElem] none = []
 	const Iarch ri = find_rec(ctx.recs, rectype)
-	if ri < 0 then return []
+	if ri < 0 then return none
 	let Iarch fi = 0
 	loop {
 		if fi >= Iarch(ctx.recs[ri].fields.len) then break
 		if str_eq(ctx.recs[ri].fields[fi], field) then return emit_canon_telems(ctx, ctx.recs[ri].ftelems[fi])
 		fi = fi + 1
 	}
-	return []
+	return none
 }
 
-# Position type names of a bound tuple variable (empty for a non-tuple binding).
-const var_telems = ([Binding] env, Str name): [Str] -> {
+# Position telems of a bound tuple variable (empty for a non-tuple binding).
+const var_telems = ([Binding] env, Str name): [TupElem] -> {
+	let [TupElem] none = []
 	const Iarch idx = lookup_index(env, name)
-	if idx < 0 then return []
+	if idx < 0 then return none
 	return env[idx].telems
 }
 
-const init_telems = (*Emit ctx, [Binding] env, Expr e): [Str] -> {
-	let [Str] r = []
+const init_telems = (*Emit ctx, [Binding] env, Expr e): [TupElem] -> {
+	let [TupElem] r = []
 	match e {
 		Expr.Tuple(elems) -> { r = tuple_pos_types(ctx, env, elems) },
 		Expr.Call(callee, args) -> { r = call_ret_telems(ctx, callee) },
@@ -622,6 +660,8 @@ const init_telems = (*Emit ctx, [Binding] env, Expr e): [Str] -> {
 		Expr.Field(base, f) -> { r = field_ftelems(ctx, var_agg_type(env, base), f) },
 		Expr.FieldExpr(base, f) -> { r = field_ftelems(ctx, init_agg_type(ctx, env, base), f) },
 		Expr.IndexField(arr, idx, f) -> { r = field_ftelems(ctx, index_agg_type(ctx, env, arr, idx), f) },
+		Expr.Index(arr, idx) -> { r = index_pos_sub(ctx, env, Expr.Var(arr), idx) },
+		Expr.IndexExpr(base, idx) -> { r = index_pos_sub(ctx, env, base, idx) },
 		_ -> {}
 	}
 	return r
@@ -633,7 +673,7 @@ const init_telems = (*Emit ctx, [Binding] env, Expr e): [Str] -> {
 # pointer (a borrow). Returns the environment extended with the pattern's bindings.
 const emit_destructure = (*Emit ctx, [Binding] env, [Str] pat, Bool mutable, Expr rhs): [Binding] -> {
 	let Str base = ""
-	let [Str] tels = []
+	let [TupElem] tels = []
 	match rhs {
 		Expr.Var(nm) -> {
 			const Iarch vi = lookup_index(env, nm)
@@ -648,11 +688,16 @@ const emit_destructure = (*Emit ctx, [Binding] env, [Str] pat, Bool mutable, Exp
 			tels = call_ret_telems(ctx, callee)
 			base = emit_call(ctx, callee, args, env)
 		},
-		Expr.Field(fb, ff) -> {
-			tels = init_telems(ctx, env, rhs)
-			base = emit_expr(rhs, ctx, env)
-		},
-		_ -> { die("cf0: emit: a destructure source must be a tuple literal, a bound tuple, a tuple-returning call, or a record's tuple field\n") }
+		# Any other tuple-valued expression (a record's tuple field, or a nested tuple reached
+		# by index/field): position telems come from `init_telems`, and the base pointer from
+		# emitting it — a tuple-valued expr yields the 8-byte pointer to the tuple's storage,
+		# exactly the base the position loop indexes off.
+		Expr.Field(fb, ff) -> { tels = init_telems(ctx, env, rhs) base = emit_expr(rhs, ctx, env) },
+		Expr.FieldExpr(gb, gf) -> { tels = init_telems(ctx, env, rhs) base = emit_expr(rhs, ctx, env) },
+		Expr.Index(ia, ii) -> { tels = init_telems(ctx, env, rhs) base = emit_expr(rhs, ctx, env) },
+		Expr.IndexExpr(ib, ij) -> { tels = init_telems(ctx, env, rhs) base = emit_expr(rhs, ctx, env) },
+		Expr.IndexField(fa, fk, fl) -> { tels = init_telems(ctx, env, rhs) base = emit_expr(rhs, ctx, env) },
+		_ -> { die("cf0: emit: a destructure source must be a tuple literal, a bound tuple, a tuple-returning call, or a tuple field/element\n") }
 	}
 	let [Binding] e2 = env
 	let Iarch pos = 0
@@ -669,15 +714,14 @@ const emit_destructure = (*Emit ctx, [Binding] env, [Str] pat, Bool mutable, Exp
 		const Iarch saddr = ctx.next
 		ctx.next = ctx.next + 1
 		write_str(ctx.fd, "\t%t${saddr} =l add ${base}, ${soff}\n")
-		const Str ptype = tels[pos]
-		# a record or Str position is an 8-byte pointer (a borrow); a word position (`""` in
-		# emit's canonical telem convention) loads into a fresh reassignable cell so a `let`
-		# position can be reassigned.
-		if str_eq(ptype, "Str") || find_rec(ctx.recs, ptype) >= 0 then {
+		const TupElem ptype = tels[pos]
+		# a record / Str / nested-tuple position is an 8-byte pointer (a borrow); a word
+		# position (`""`) loads into a fresh reassignable cell so a `let` position can reassign.
+		if tel_is_nest(ptype) || str_eq(ptype.name, "Str") || find_rec(ctx.recs, ptype.name) >= 0 then {
 			const Iarch ptr = ctx.next
 			ctx.next = ctx.next + 1
 			write_str(ctx.fd, "\t%t${ptr} =l loadl %t${saddr}\n")
-			e2 = [...e2, Binding({ name: tok, slot: ptr, rec_type: ptype, elem: "", is_cell: false, telems: [] })]
+			e2 = [...e2, Binding({ name: tok, slot: ptr, rec_type: tel_agg_type(ctx, ptype), elem: "", is_cell: false, telems: tel_sub(ptype) })]
 		} else {
 			const Iarch val = ctx.next
 			ctx.next = ctx.next + 1
@@ -720,7 +764,7 @@ const payload_is_ptr = (*Emit ctx, Str uni, Str member, Iarch i): Bool -> {
 
 # A union member payload position's tuple element names, canonicalized to emit's convention
 # (empty for a non-tuple payload) — so a match-bound tuple payload `B.Wrap(p) -> p[k]` works.
-const payload_ptelems = (*Emit ctx, Str uni, Str member, Iarch i): [Str] -> {
+const payload_ptelems = (*Emit ctx, Str uni, Str member, Iarch i): [TupElem] -> {
 	const Iarch ui = find_union(ctx.unions, uni)
 	const Iarch mi = member_tag(ctx.unions, uni, member)
 	return emit_canon_telems(ctx, ctx.unions[ui].members[mi].ptelems[i])
@@ -846,9 +890,9 @@ const index_agg_type = (*Emit ctx, [Binding] env, Str arr, Expr idx): Str -> {
 	if ai < 0 then return ""
 	# a tuple: position idx's element type when it is an aggregate, else a word ("")
 	if str_eq(env[ai].rec_type, "$tuple") then {
-		const Str tn = env[ai].telems[tuple_lit_index(idx)]
-		if elem_is_agg(ctx, tn) then return tn
-		return ""
+		const Iarch tk = tuple_lit_index(idx)
+		if tk >= Iarch(env[ai].telems.len) then return ""
+		return tel_agg_type(ctx, env[ai].telems[tk])
 	}
 	const Str en = env[ai].elem
 	# indexing a nested array `rs[i]` yields a dynamic array (`rs`'s element is a `[Inner]`)
@@ -874,7 +918,7 @@ const indexfield_agg_type = (*Emit ctx, [Binding] env, Str arr, Expr idx, Str fi
 	if ai < 0 then return ""
 	# a tuple position `t[k].field` reads its field off position k's element type
 	let Str en = env[ai].elem
-	if str_eq(env[ai].rec_type, "$tuple") then en = env[ai].telems[tuple_lit_index(idx)]
+	if str_eq(env[ai].rec_type, "$tuple") then en = telem_name(env[ai].telems, tuple_lit_index(idx))
 	if find_rec(ctx.recs, en) < 0 then return ""
 	if !field_is_ptr(ctx, en, field) then return ""
 	return field_ftype(ctx, en, field)
@@ -909,12 +953,10 @@ const indexexpr_elem = (*Emit ctx, [Binding] env, Expr base): Str -> {
 const indexexpr_agg_type = (*Emit ctx, [Binding] env, Expr base, Expr idx): Str -> {
 	# a tuple base `r.pair[k]` — position k's element type when it is an aggregate
 	if str_eq(init_agg_type(ctx, env, base), "$tuple") then {
-		const [Str] tel = init_telems(ctx, env, base)
+		const [TupElem] tel = init_telems(ctx, env, base)
 		const Iarch k = tuple_lit_index(idx)
 		if k >= Iarch(tel.len) then return ""
-		const Str tn = tel[k]
-		if elem_is_agg(ctx, tn) then return tn
-		return ""
+		return tel_agg_type(ctx, tel[k])
 	}
 	const Str en = init_elem(ctx, env, base)
 	# indexing a nested array yields a dynamic array, not the nested element name
@@ -1498,7 +1540,7 @@ const emit_index_field = (*Emit ctx, [Binding] env, Str arr, Expr idx, Str field
 		const Iarch trecp = ctx.next
 		ctx.next = ctx.next + 1
 		write_str(ctx.fd, "\t%t${trecp} =l loadl %t${taddr}\n")
-		const Str tn = env[ai].telems[tk]
+		const Str tn = telem_name(env[ai].telems, tk)
 		let Iarch tfoff = 8
 		if !str_eq(tn, "Str") then tfoff = field_offset(ctx.recs, tn, field)
 		const Iarch tfaddr = ctx.next

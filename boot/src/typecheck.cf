@@ -16,8 +16,8 @@
 # The emitter runs only on programs this phase accepts.
 
 import "io" as { die }
-import "ast" as { Expr, Stmt, Param, Func, Ty, FieldInit, RecDecl, UnionMember, UnionDecl, MatchArm, StmtArm, Seg, Program }
-import "astutil" as { is_spread, spread_inner, is_skip, skip_count, is_nested, nested_inner }
+import "ast" as { Expr, Stmt, Param, Func, Ty, FieldInit, RecDecl, UnionMember, UnionDecl, MatchArm, StmtArm, Seg, TupElem, Program }
+import "astutil" as { is_spread, spread_inner, is_skip, skip_count, is_nested, nested_inner, tel_leaf, tel_nest, tel_is_nest }
 
 # A name in scope during checking: its type and whether it is reassignable (`let`).
 data VarTy = { Str name, Ty ty, Bool mutable }
@@ -39,8 +39,8 @@ const rec_of = (Ty t): Str -> match t { Ty.TRec(n) -> n, _ -> "" }
 const union_of = (Ty t): Str -> match t { Ty.TUnion(n) -> n, _ -> "" }
 const dyn_of = (Ty t): Str -> match t { Ty.TDyn(n) -> n, _ -> "" }
 const is_ttuple = (Ty t): Bool -> match t { Ty.TTuple(e) -> true, _ -> false }
-const tuple_elems = (Ty t): [Str] -> {
-	let [Str] r = []
+const tuple_elems = (Ty t): [TupElem] -> {
+	let [TupElem] r = []
 	match t {
 		Ty.TTuple(e) -> { r = e },
 		_ -> {}
@@ -48,16 +48,24 @@ const tuple_elems = (Ty t): [Str] -> {
 	return r
 }
 
-# Element-wise equality of two tuples' position type-name lists.
-const tuple_elems_eq = ([Str] a, [Str] b): Bool -> {
+# Structural (recursive) equality of two tuples' position lists — a leaf compares by name,
+# a nested position recurses into its sub-positions.
+const tuple_elems_eq = ([TupElem] a, [TupElem] b): Bool -> {
 	if a.len != b.len then return false
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(a.len) then break
-		if !str_eq(a[i], b[i]) then return false
+		if !str_eq(a[i].name, b[i].name) then return false
+		if !tuple_elems_eq(a[i].sub, b[i].sub) then return false
 		i = i + 1
 	}
 	return true
+}
+
+# The `Ty` a tuple position denotes: a nested position is a `TTuple`, else its named type.
+const tel_to_ty = (TupElem te, Ctx ctx): Ty -> {
+	if tel_is_nest(te) then return Ty.TTuple(te.sub)
+	return named_ty(te.name, "", ctx.recs, ctx.unions)
 }
 
 # Whether an expression is a freshly-constructed record — a call or a `T({…})` / union
@@ -77,21 +85,36 @@ const is_fresh_record = (Expr e): Bool -> match e {
 # name or a tuple from a field/index is a later brick.
 const is_tuple_lit = (Expr e): Bool -> match e { Expr.Tuple(es) -> true, _ -> false }
 const is_call_expr = (Expr e): Bool -> match e { Expr.Call(c, a) -> true, _ -> false }
+# The value forms a whole-tuple binding may take — every form emit resolves telems for: a
+# literal, a call result, a bound tuple name, a tuple element/field (indexed or via `.field`).
+const is_tuple_bindable = (Expr e): Bool -> match e {
+	Expr.Tuple(es) -> true,
+	Expr.Call(c, a) -> true,
+	Expr.Var(n) -> true,
+	Expr.Index(a, i) -> true,
+	Expr.IndexExpr(b, i) -> true,
+	Expr.Field(b, f) -> true,
+	Expr.FieldExpr(b, f) -> true,
+	Expr.IndexField(a, i, f) -> true,
+	_ -> false
+}
 
 # The written type NAME for a tuple element — `Iarch` for any integer width, `Bool`, `Str`,
 # or a record type. A record element must be a FRESH value (see `is_fresh_record`). Arrays,
 # unions, and nested tuples are a later tuple brick.
-const element_type_name = (Ty t, Expr e): Str -> {
-	if is_tint(t) then return "Iarch"
-	if is_tbool(t) then return "Bool"
-	if is_tstr(t) then return "Str"
+const element_type_name = (Ty t, Expr e): TupElem -> {
+	if is_tint(t) then return tel_leaf("Iarch")
+	if is_tbool(t) then return tel_leaf("Bool")
+	if is_tstr(t) then return tel_leaf("Str")
+	# a NESTED tuple position carries its own positions structurally (any depth)
+	if is_ttuple(t) then return tel_nest(tuple_elems(t))
 	const Str rn = rec_of(t)
 	if !str_eq(rn, "") then {
 		if !is_fresh_record(e) then die("cf0: type: a record tuple element must be a freshly constructed value (a call or a `T({…})` construction), not an alias\n")
-		return rn
+		return tel_leaf(rn)
 	}
-	die("cf0: type: a tuple element must be an Iarch, Bool, Str, or a fresh record (arrays, unions, and nested tuples are a later brick)\n")
-	return "Iarch"
+	die("cf0: type: a tuple element must be an Iarch, Bool, Str, a fresh record, or a nested tuple (arrays and unions are a later brick)\n")
+	return tel_leaf("Iarch")
 }
 
 # The comptime literal value of an index expression, or -1 when it is not a bare literal.
@@ -218,19 +241,20 @@ const param_is_recptr = (Param p, [RecDecl] recs): Bool -> {
 # Canonicalize a declared tuple element type name to the form a returned tuple carries
 # (`element_type_name` collapses every integer width to `Iarch`), so a declared `(Int, Int)`
 # return matches a returned `(Iarch, Iarch)`. Dies on an unknown type name.
-const canon_elem_name = (Str name, [RecDecl] recs, [UnionDecl] unions): Str -> {
-	const Ty t = named_ty(name, "", recs, unions)
-	if is_tint(t) then return "Iarch"
-	if is_tbool(t) then return "Bool"
-	if is_tstr(t) then return "Str"
-	return name
+const canon_elem = (TupElem te, [RecDecl] recs, [UnionDecl] unions): TupElem -> {
+	if tel_is_nest(te) then return tel_nest(canon_telems(te.sub, recs, unions))
+	const Ty t = named_ty(te.name, "", recs, unions)
+	if is_tint(t) then return tel_leaf("Iarch")
+	if is_tbool(t) then return tel_leaf("Bool")
+	if is_tstr(t) then return tel_leaf("Str")
+	return te
 }
-const canon_telems = ([Str] telems, [RecDecl] recs, [UnionDecl] unions): [Str] -> {
-	let [Str] r = []
+const canon_telems = ([TupElem] telems, [RecDecl] recs, [UnionDecl] unions): [TupElem] -> {
+	let [TupElem] r = []
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(telems.len) then break
-		r = [...r, canon_elem_name(telems[i], recs, unions)]
+		r = [...r, canon_elem(telems[i], recs, unions)]
 		i = i + 1
 	}
 	return r
@@ -681,7 +705,7 @@ const spread_bad_type = (): Ty -> {
 # `...src` spread splices the source tuple's position types (the source must be a tuple).
 # Yields a `TTuple` carrying the flattened position types.
 const tuple_type = ([Expr] elems, [VarTy] env, Ctx ctx): Ty -> {
-	let [Str] names = []
+	let [TupElem] names = []
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(elems.len) then break
@@ -689,7 +713,7 @@ const tuple_type = ([Expr] elems, [VarTy] env, Ctx ctx): Ty -> {
 			if !is_spreadable_src(spread_inner(elems[i])) then die("cf0: type: a tuple spread source must be a tuple name, a tuple-returning call, or a tuple literal\n")
 			const Ty st = type_of(spread_inner(elems[i]), env, ctx)
 			if !is_ttuple(st) then die("cf0: type: a tuple spread source must be a tuple value\n")
-			const [Str] se = tuple_elems(st)
+			const [TupElem] se = tuple_elems(st)
 			let Iarch j = 0
 			loop {
 				if j >= Iarch(se.len) then break
@@ -706,20 +730,21 @@ const tuple_type = ([Expr] elems, [VarTy] env, Ctx ctx): Ty -> {
 
 # `t[k]` — a tuple indexed at a COMPTIME literal position `k`, yielding position `k`'s
 # type. A runtime (non-literal) index or an out-of-range position is rejected.
-const tuple_index_type = ([Str] names, Expr idx, Ctx ctx): Ty -> {
+const tuple_index_type = ([TupElem] names, Expr idx, Ctx ctx): Ty -> {
 	const Iarch k = lit_val(idx)
 	if k < 0 then die("cf0: type: a tuple position must be a comptime literal, not a runtime value\n")
 	if k >= Iarch(names.len) then die("cf0: type: a tuple index is out of range\n")
-	return named_ty(names[k], "", ctx.recs, ctx.unions)
+	return tel_to_ty(names[k], ctx)
 }
 
 # `t[k].field` — position `k` (a comptime literal) must be a `Str` (only `.len`) or a
 # record that declares `field`; yields the field's declared type.
-const tuple_indexfield_type = ([Str] names, Expr idx, Str field, Ctx ctx): Ty -> {
+const tuple_indexfield_type = ([TupElem] names, Expr idx, Str field, Ctx ctx): Ty -> {
 	const Iarch k = lit_val(idx)
 	if k < 0 then die("cf0: type: a tuple position must be a comptime literal, not a runtime value\n")
 	if k >= Iarch(names.len) then die("cf0: type: a tuple index is out of range\n")
-	const Str tn = names[k]
+	if tel_is_nest(names[k]) then die("cf0: type: a nested-tuple element has no fields — index it (`t[k][j]`)\n")
+	const Str tn = names[k].name
 	if str_eq(tn, "Str") then {
 		if !str_eq(field, "len") then die("cf0: type: a string element has only `.len`\n")
 		return Ty.TInt
@@ -738,7 +763,7 @@ const tuple_indexfield_type = ([Str] names, Expr idx, Str field, Ctx ctx): Ty ->
 const check_destructure = ([Str] pat, Bool mutable, Expr rhs, [VarTy] env, Ctx ctx): [VarTy] -> {
 	const Ty rt = type_of(rhs, env, ctx)
 	if !is_ttuple(rt) then die("cf0: type: destructuring needs a tuple value\n")
-	const [Str] names = tuple_elems(rt)
+	const [TupElem] names = tuple_elems(rt)
 	let [VarTy] e2 = env
 	let Iarch pos = 0
 	let Iarch pi = 0
@@ -752,7 +777,7 @@ const check_destructure = ([Str] pat, Bool mutable, Expr rhs, [VarTy] env, Ctx c
 		}
 		if pos >= Iarch(names.len) then die("cf0: type: a destructure pattern has more positions than the tuple\n")
 		if env_index(e2, tok) >= 0 then die("cf0: type: a destructure name cannot shadow an existing or duplicate binding\n")
-		const Ty pty = named_ty(names[pos], "", ctx.recs, ctx.unions)
+		const Ty pty = tel_to_ty(names[pos], ctx)
 		if mutable then {
 			if !is_tint(pty) && !is_tbool(pty) then die("cf0: type: a `let` destructure position must be a scalar (a record/Str position binds `const`)\n")
 		}
@@ -1073,7 +1098,7 @@ const check_stmts = (Func fn, [Stmt] stmts, [VarTy] env0, Ctx ctx, Ty frt, Bool 
 				if env_index(env, n) >= 0 then die("cf0: type: a binding cannot shadow an existing name\n")
 				const Ty ty = type_of(e, env, ctx)
 				if m && is_ttuple(ty) then die("cf0: type: a tuple binds `const` only (a mutable tuple is a later brick)\n")
-				if is_ttuple(ty) && !is_tuple_lit(e) && !is_call_expr(e) then die("cf0: type: a tuple binding's value must be a tuple literal or a tuple-returning call (aliasing a tuple name is a later brick)\n")
+				if is_ttuple(ty) && !is_tuple_bindable(e) then die("cf0: type: this expression cannot bind a tuple\n")
 				env = [...env, VarTy({ name: n, ty: ty, mutable: m })]
 			},
 			Stmt.Destructure(pat, m, e) -> { env = check_destructure(pat, m, e, env, ctx) },
@@ -1165,12 +1190,9 @@ const check_func = (Func fn, Ctx ctx): Iarch -> {
 	# not return a tuple, and each element must name a real type (Iarch/Bool/Str/a record).
 	if str_eq(fn.ret_name, "$tuple") then {
 		if str_eq(fn.name, "main") then die("cf0: type: main must return an Iarch exit code, not a tuple\n")
-		let Iarch ti = 0
-		loop {
-			if ti >= Iarch(fn.ret_telems.len) then break
-			named_ty(fn.ret_telems[ti], "", ctx.recs, ctx.unions)
-			ti = ti + 1
-		}
+		# validate each element names a real type (recursing into nested tuples) — canon dies
+		# on an unknown name
+		canon_telems(fn.ret_telems, ctx.recs, ctx.unions)
 	}
 	# an asm-bodied function has no statement body to check — its parameters and return type
 	# still register it for callers (call_type resolves them); the asm is emitted verbatim.

@@ -11,7 +11,8 @@
 import "io" as { die }
 import "token" as { Token, TokKind, is_eof, is_ident, is_intlit, is_strlit, is_lparen, is_rparen, is_lbrace, is_rbrace, is_lbracket, is_rbracket, is_comma, is_colon, is_dot, is_ellipsis, is_eq, is_arrow, is_minus, is_plus, is_star, is_slash, is_percent, is_amp, is_pipe, is_caret, is_tilde, is_bang, is_shl, is_shr, is_eqeq, is_ne, is_lt, is_gt, is_le, is_ge, is_logand, is_logor }
 import "lexer" as { lex }
-import "ast" as { Expr, Stmt, Param, Func, Ty, FieldInit, RecDecl, UnionMember, UnionDecl, MatchArm, StmtArm, Seg, RetSig, Import, Program }
+import "ast" as { Expr, Stmt, Param, Func, Ty, FieldInit, RecDecl, UnionMember, UnionDecl, MatchArm, StmtArm, Seg, RetSig, TupElem, Import, Program }
+import "astutil" as { tel_leaf, tel_nest }
 
 # The parse cursor: the token stream, the source (for keyword text), a position.
 pub data Parser = { [Token] toks, *[Uint8] src, Iarch pos }
@@ -990,6 +991,33 @@ const parse_elem_name = (*Parser p): Str -> {
 	return n
 }
 
+# Parse one tuple position type into a `TupElem`: a NESTED `(A, B)` tuple (recursively) or a
+# bare type name leaf. `parse_tuple_telems` parses the comma-separated positions AFTER the
+# opening `(`, consuming the closing `)` — used by every `(A, B)` tuple type (value,
+# param, return, field, payload) so tuples nest to any depth.
+const parse_tel = (*Parser p): TupElem -> {
+	if is_lparen(peek(p)) then {
+		p.pos = p.pos + 1 # `(`
+		return tel_nest(parse_tuple_telems(p))
+	}
+	if !is_ident(peek(p)) then die("cf0: parse: expected a tuple element type name\n")
+	const Str n = cur_name(p)
+	p.pos = p.pos + 1
+	return tel_leaf(n)
+}
+const parse_tuple_telems = (*Parser p): [TupElem] -> {
+	let [TupElem] tel = []
+	loop {
+		tel = [...tel, parse_tel(p)]
+		if !is_comma(peek(p)) then break
+		p.pos = p.pos + 1
+	}
+	if !is_rparen(peek(p)) then die("cf0: parse: expected `)` in a tuple type\n")
+	p.pos = p.pos + 1
+	if Iarch(tel.len) < 2 then die("cf0: parse: a tuple type needs at least two elements\n")
+	return tel
+}
+
 const parse_type = (*Parser p): Ty -> {
 	if is_star(peek(p)) then {
 		p.pos = p.pos + 1
@@ -1057,17 +1085,7 @@ const parse_param = (*Parser p): Param -> {
 	# passed by pointer. (A `(A) -> R` function-type parameter is a later feature.)
 	if is_lparen(peek(p)) then {
 		p.pos = p.pos + 1 # `(`
-		let [Str] tel = []
-		loop {
-			if !is_ident(peek(p)) then die("cf0: parse: expected a tuple element type name\n")
-			tel = [...tel, cur_name(p)]
-			p.pos = p.pos + 1
-			if !is_comma(peek(p)) then break
-			p.pos = p.pos + 1
-		}
-		if !is_rparen(peek(p)) then die("cf0: parse: expected `)` in a tuple parameter type\n")
-		p.pos = p.pos + 1
-		if Iarch(tel.len) < 2 then die("cf0: parse: a tuple type needs at least two elements\n")
+		const [TupElem] tel = parse_tuple_telems(p)
 		if !is_ident(peek(p)) then die("cf0: parse: expected a parameter name\n")
 		const Str tname = cur_name(p)
 		p.pos = p.pos + 1
@@ -1115,16 +1133,7 @@ const parse_ret_name = (*Parser p): RetSig -> {
 	# a `(A, B, …)` tuple return type — at least two comma-separated element type names
 	if is_lparen(peek(p)) then {
 		p.pos = p.pos + 1 # `(`
-		let [Str] tel = []
-		loop {
-			if !is_ident(peek(p)) then die("cf0: parse: expected a tuple element type name\n")
-			tel = [...tel, cur_name(p)]
-			p.pos = p.pos + 1
-			if !is_comma(peek(p)) then break
-			p.pos = p.pos + 1
-		}
-		if !is_rparen(peek(p)) then die("cf0: parse: expected `)` in a tuple return type\n")
-		p.pos = p.pos + 1
+		const [TupElem] tel = parse_tuple_telems(p)
 		if Iarch(tel.len) < 2 then die("cf0: parse: a tuple return type needs at least two elements\n")
 		return RetSig({ name: "$tuple", elem: "", telems: tel })
 	}
@@ -1239,8 +1248,8 @@ const parse_data = (*Parser p): RecDecl -> {
 	let [Str] fields = []
 	let [Str] ftypes = []
 	let [Str] felems = []
-	let [[Str]] ftelems = []
-	const [Str] no_tel = []
+	let [[TupElem]] ftelems = []
+	const [TupElem] no_tel = []
 	loop {
 		if is_rbrace(peek(p)) then break
 		# the field type: a `[Elem]` dynamic array (`ftype` = "$dyn", `felem` = Elem), a
@@ -1266,17 +1275,7 @@ const parse_data = (*Parser p): RecDecl -> {
 		} else if is_lparen(peek(p)) then {
 			# a `(A, B, …) name` tuple field — at least two comma-separated element type names
 			p.pos = p.pos + 1 # `(`
-			let [Str] tel = []
-			loop {
-				if !is_ident(peek(p)) then die("cf0: parse: expected a tuple field element type name\n")
-				tel = [...tel, cur_name(p)]
-				p.pos = p.pos + 1
-				if !is_comma(peek(p)) then break
-				p.pos = p.pos + 1
-			}
-			if !is_rparen(peek(p)) then die("cf0: parse: expected `)` in a tuple field type\n")
-			p.pos = p.pos + 1
-			if Iarch(tel.len) < 2 then die("cf0: parse: a tuple type needs at least two elements\n")
+			const [TupElem] tel = parse_tuple_telems(p)
 			if !is_ident(peek(p)) then die("cf0: parse: expected a field name\n")
 			fields = [...fields, cur_name(p)]
 			ftypes = [...ftypes, "$tuple"]
@@ -1325,8 +1324,8 @@ const parse_union = (*Parser p): UnionDecl -> {
 		# `[T]` element names in `pelems`.
 		let [Str] payloads = []
 		let [Str] pelems = []
-		let [[Str]] ptelems = []
-		const [Str] no_ptel = []
+		let [[TupElem]] ptelems = []
+		const [TupElem] no_ptel = []
 		if is_lparen(peek(p)) then {
 			p.pos = p.pos + 1
 			loop {
@@ -1338,17 +1337,7 @@ const parse_union = (*Parser p): UnionDecl -> {
 				} else if is_lparen(peek(p)) then {
 					# a `(A, B)` TUPLE payload — at least two element type names
 					p.pos = p.pos + 1 # `(`
-					let [Str] tel = []
-					loop {
-						if !is_ident(peek(p)) then die("cf0: parse: expected a tuple payload element type name\n")
-						tel = [...tel, cur_name(p)]
-						p.pos = p.pos + 1
-						if !is_comma(peek(p)) then break
-						p.pos = p.pos + 1
-					}
-					if !is_rparen(peek(p)) then die("cf0: parse: expected `)` in a tuple payload type\n")
-					p.pos = p.pos + 1
-					if Iarch(tel.len) < 2 then die("cf0: parse: a tuple type needs at least two elements\n")
+					const [TupElem] tel = parse_tuple_telems(p)
 					payloads = [...payloads, "$tuple"]
 					pelems = [...pelems, ""]
 					ptelems = [...ptelems, tel]
