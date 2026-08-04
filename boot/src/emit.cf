@@ -18,7 +18,7 @@
 
 import "io" as { write_str, die }
 import "ast" as { Expr, Stmt, Param, Func, FieldInit, RecDecl, UnionMember, UnionDecl, MatchArm, StmtArm, Seg, TupElem, Program }
-import "astutil" as { is_spread, spread_inner, is_skip, skip_count, is_nested, nested_inner, tel_leaf, tel_nest, tel_is_nest }
+import "astutil" as { is_spread, spread_inner, is_skip, skip_count, is_nested, nested_inner, tel_leaf, tel_nest, tel_is_nest, is_fixed_name, fixed_bits, fixed_signed }
 
 # The emit context: the QBE-IL output fd, the next free temp number, the next free
 # basic-block label id, the program's functions (a call resolves its callee — by
@@ -1089,8 +1089,32 @@ const is_cast_type = (Str name): Bool -> {
 	return false
 }
 
+# Canonicalize a value to a fixed-width type: reduce it to the low `bits` and set the upper
+# bits to the type's canonical form (sign-extended when signed, zero when not), by a left
+# shift then an arithmetic (`sar`, signed) or logical (`shr`, unsigned) right shift of the
+# same amount. So the stored `l` register always holds the value's true signed/unsigned
+# meaning — `Iarch(x)` is then a no-op and this same reduction wraps a later arithmetic result.
+# A 64-bit type needs no reduction (the `l` register already holds it).
+const emit_fixed_canon = (*Emit ctx, Iarch bits, Bool signed, Str v): Str -> {
+	if bits >= 64 then return v
+	const Iarch sh = 64 - bits
+	const Iarch t1 = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${t1} =l shl ${v}, ${sh}\n")
+	const Iarch t2 = ctx.next
+	ctx.next = ctx.next + 1
+	if signed then write_str(ctx.fd, "\t%t${t2} =l sar %t${t1}, ${sh}\n")
+	else write_str(ctx.fd, "\t%t${t2} =l shr %t${t1}, ${sh}\n")
+	return "%t${t2}"
+}
+
 const emit_call = (*Emit ctx, Str callee, [Expr] args, [Binding] env): Str -> {
-	if is_cast_type(callee) then return emit_expr(args[0], ctx, env)
+	# `Int8(x)`… narrows to the fixed width (canonicalizing); `Iarch`/`Int`/`Uarch` are identity
+	if is_cast_type(callee) then {
+		const Str v = emit_expr(args[0], ctx, env)
+		if !is_fixed_name(callee) then return v
+		return emit_fixed_canon(ctx, fixed_bits(callee), fixed_signed(callee), v)
+	}
 	# `Str(v)` — seal a `[Uint8]` byte vector into a Str header borrowing its backing
 	if str_eq(callee, "Str") then return emit_str_seal(ctx, emit_expr(args[0], ctx, env))
 	const Iarch fidx = find_func(ctx.funcs, callee)
@@ -1992,7 +2016,7 @@ const emit_block = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 		match s {
 			Stmt.Loop(bd) -> { emit_loop_body(ctx, env, bd) },
 			Stmt.ForIn(fv, fa, fbd) -> { emit_for_body(ctx, env, fv, fa, fbd) },
-			Stmt.Let(n, m, e) -> {
+			Stmt.Let(n, m, ann, e) -> {
 				# `const`/`let name = init`. A word allocates a stack cell and stores the value.
 				# An aggregate initializer yields a base pointer: a `const` binds the pointer temp
 				# directly (a write-once borrow); a `let` (mutable) spills the pointer into a stack

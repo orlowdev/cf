@@ -17,7 +17,7 @@
 
 import "io" as { die }
 import "ast" as { Expr, Stmt, Param, Func, Ty, FieldInit, RecDecl, UnionMember, UnionDecl, MatchArm, StmtArm, Seg, TupElem, Program }
-import "astutil" as { is_spread, spread_inner, is_skip, skip_count, is_nested, nested_inner, tel_leaf, tel_nest, tel_is_nest }
+import "astutil" as { is_spread, spread_inner, is_skip, skip_count, is_nested, nested_inner, tel_leaf, tel_nest, tel_is_nest, is_fixed_name, fixed_bits, fixed_signed }
 
 # A name in scope during checking: its type and whether it is reassignable (`let`).
 data VarTy = { Str name, Ty ty, Bool mutable }
@@ -33,6 +33,9 @@ const is_tint = (Ty t): Bool -> match t { Ty.TInt -> true, _ -> false }
 const is_tbool = (Ty t): Bool -> match t { Ty.TBool -> true, _ -> false }
 const is_tstr = (Ty t): Bool -> match t { Ty.TStr -> true, _ -> false }
 const is_tunit = (Ty t): Bool -> match t { Ty.TUnit -> true, _ -> false }
+const is_tfixed = (Ty t): Bool -> match t { Ty.TFixed(b, s) -> true, _ -> false }
+# The `Ty` a fixed-width name denotes (`Int8` → signed 8-bit, …).
+const fixed_ty = (Str name): Ty -> Ty.TFixed(fixed_bits(name), fixed_signed(name))
 const is_tptr = (Ty t): Bool -> match t { Ty.TPtr -> true, _ -> false }
 
 # The record / union / dynamic-array-element type name of a type, or "" otherwise.
@@ -132,6 +135,7 @@ const ty_eq = (Ty a, Ty b): Bool -> match a {
 	Ty.TDyn(an) -> str_eq(an, dyn_of(b)),
 	Ty.TStr -> is_tstr(b),
 	Ty.TUnit -> is_tunit(b),
+	Ty.TFixed(ab, asg) -> match b { Ty.TFixed(bb, bsg) -> ab == bb && (if asg then bsg else !bsg), _ -> false },
 	Ty.TTuple(ae) -> match b { Ty.TTuple(be) -> tuple_elems_eq(ae, be), _ -> false }
 }
 
@@ -216,6 +220,8 @@ const named_ty = (Str type_name, Str elem, [RecDecl] recs, [UnionDecl] unions): 
 	if str_eq(type_name, "Bool") then return Ty.TBool
 	if str_eq(type_name, "Str") then return Ty.TStr
 	if str_eq(type_name, "Unit") then return Ty.TUnit
+	# a fixed-width leaf (`Int8`…`Uint64`) is its own width/signedness type, NOT the word `TInt`
+	if is_fixed_name(type_name) then return Ty.TFixed(fixed_bits(type_name), fixed_signed(type_name))
 	# any integer-family name (`Iarch`/`Int`/`Uarch`/`Uint8`/… — the same set a cast names)
 	# is one word: cf0 tracks every integer width as `TInt` (a genesis narrowing).
 	if is_cast_type(type_name) then return Ty.TInt
@@ -287,6 +293,7 @@ const func_ret_ty = (Func fn, [RecDecl] recs, [UnionDecl] unions): Ty -> {
 	if str_eq(fn.ret_name, "Bool") then return Ty.TBool
 	if str_eq(fn.ret_name, "Str") then return Ty.TStr
 	if str_eq(fn.ret_name, "Unit") then return Ty.TUnit
+	if is_fixed_name(fn.ret_name) then return Ty.TFixed(fixed_bits(fn.ret_name), fixed_signed(fn.ret_name))
 	return Ty.TInt
 }
 
@@ -320,6 +327,50 @@ const env_index = ([VarTy] env, Str name): Iarch -> {
 const lit_type = (Iarch v): Ty -> {
 	if v > 2147483647 then die("cf0: type: integer literal out of range (0..2147483647)\n")
 	return Ty.TInt
+}
+
+# `2^k` (k ≤ 32 at every call site — the fixed-width range bounds).
+const ipow2 = (Iarch k): Iarch -> {
+	let Iarch r = 1
+	let Iarch i = 0
+	loop { if i >= k then break r = r * 2 i = i + 1 }
+	return r
+}
+# A bare integer literal `v` or a negated one `-v` — the forms a fixed-width annotation ADOPTS
+# (type_system §3), range-checked against the target. `lit_signed_val` is its signed value.
+const is_adoptable_lit = (Expr e): Bool -> match e {
+	Expr.Lit(v) -> true,
+	Expr.Neg(x) -> match x { Expr.Lit(v) -> true, _ -> false },
+	_ -> false
+}
+const lit_signed_val = (Expr e): Iarch -> match e {
+	Expr.Lit(v) -> v,
+	Expr.Neg(x) -> match x { Expr.Lit(v) -> 0 - v, _ -> 0 },
+	_ -> 0
+}
+# Check an adopted integer literal fits a `b`-bit `s`-signed range (signed `[-2^(b-1), 2^(b-1)-1]`,
+# unsigned `[0, 2^b-1]`); dies otherwise. Widths ≥ 64 always hold a cf0 literal (capped at
+# 2^31-1), so only the sign is checked there.
+const fixed_lit_fits = (Expr e, Iarch b, Bool s): Iarch -> {
+	const Iarch sv = lit_signed_val(e)
+	if !s && sv < 0 then die("cf0: type: a negative literal does not fit an unsigned fixed-width type\n")
+	if b < 64 then {
+		if s then {
+			const Iarch half = ipow2(b - 1)
+			if sv > half - 1 then die("cf0: type: an integer literal is out of range for its fixed-width type\n")
+			if sv < 0 - half then die("cf0: type: an integer literal is out of range for its fixed-width type\n")
+		} else {
+			if sv > ipow2(b) - 1 then die("cf0: type: an integer literal is out of range for its fixed-width type\n")
+		}
+	}
+	return 0
+}
+const tfixed_bits = (Ty t): Iarch -> match t { Ty.TFixed(b, s) -> b, _ -> 0 }
+const tfixed_signed = (Ty t): Bool -> match t { Ty.TFixed(b, s) -> s, _ -> false }
+# Adopt an integer literal into a fixed-width annotation (range-checked), yielding the type.
+const adopt_fixed = (Expr e, Str ann): Ty -> {
+	fixed_lit_fits(e, fixed_bits(ann), fixed_signed(ann))
+	return fixed_ty(ann)
 }
 
 const var_type = ([VarTy] env, Str name, Ctx ctx): Ty -> {
@@ -411,7 +462,11 @@ const is_cast_type = (Str name): Bool -> {
 const cast_type = (Str callee, [Expr] args, [VarTy] env, Ctx ctx): Ty -> {
 	if Iarch(args.len) != 1 then die("cf0: type: a numeric cast takes exactly one argument\n")
 	const Ty ot = type_of(args[0], env, ctx)
-	if !is_tint(ot) then die("cf0: type: a numeric cast takes a scalar integer (no pointer<->integer conversion)\n")
+	# the operand is any integer (word or fixed-width); a pointer/Bool/aggregate is rejected
+	if !is_tint(ot) && !is_tfixed(ot) then die("cf0: type: a numeric cast takes a scalar integer (no pointer<->integer conversion)\n")
+	# `Int8(x)`… yields that fixed-width type (a truncating conversion); `Iarch`/`Int`/`Uarch`
+	# yield the register word.
+	if is_fixed_name(callee) then return fixed_ty(callee)
 	return Ty.TInt
 }
 
@@ -683,7 +738,12 @@ const arraylit_type = (Bool has_spread, Expr spread_src, [Expr] elems, Str elem_
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(elems.len) then break
-		if !ty_eq(type_of(elems[i], env, ctx), ety) then die("cf0: type: a dynamic-array element's type must match the array's element type\n")
+		const Ty evt = type_of(elems[i], env, ctx)
+		# a `[Uint8]` byte buffer stores bytes as words; besides plain word bytes it also
+		# accepts an explicit 8-bit fixed VALUE (`Uint8(x)`/`Int8(x)`) — that IS one byte. A
+		# WIDER fixed value (`Int16`/`Int64`/…) is rejected: the byte-packed store would
+		# silently truncate it. (A `[T]` array of general fixed-width elements is a later brick.)
+		if !ty_eq(evt, ety) && !(str_eq(en, "Uint8") && tfixed_bits(evt) == 8) then die("cf0: type: a dynamic-array element's type must match the array's element type\n")
 		i = i + 1
 	}
 	return Ty.TDyn(en)
@@ -1017,6 +1077,10 @@ const check_simple_stmt = (Func fn, Stmt s, [VarTy] env, Ctx ctx, Ty frt, Bool i
 			# adopted from the target — `arraylit_type` would otherwise default it to `Iarch`)
 			if is_empty_arraylit(e) then {
 				if str_eq(dyn_of(env[idx].ty), "") then die("cf0: type: `[]` may only be assigned to a dynamic array\n")
+			} else if is_tfixed(env[idx].ty) && is_adoptable_lit(e) then {
+				# a bare integer literal adopts the fixed-width binding's type (range-checked),
+				# just as at its declaration — `let Uint8 x = 5; x = 99`
+				fixed_lit_fits(e, tfixed_bits(env[idx].ty), tfixed_signed(env[idx].ty))
 			} else {
 				const Ty vty = type_of(e, env, ctx)
 				if !ty_eq(vty, env[idx].ty) then die("cf0: type: a reassignment must keep the binding's type\n")
@@ -1100,9 +1164,21 @@ const check_stmts = (Func fn, [Stmt] stmts, [VarTy] env0, Ctx ctx, Ty frt, Bool 
 		match s {
 			Stmt.Loop(bd) -> { check_stmts(fn, bd, env, ctx, frt, true) },
 			Stmt.ForIn(fv, fa, fbd) -> { check_for_body(fn, fv, fa, fbd, env, ctx, frt) },
-			Stmt.Let(n, m, e) -> {
+			Stmt.Let(n, m, ann, e) -> {
 				if env_index(env, n) >= 0 then die("cf0: type: a binding cannot shadow an existing name\n")
-				const Ty ty = type_of(e, env, ctx)
+				# a fixed-width annotation (`const Int8 x = …`) either ADOPTS a bare integer
+				# literal (range-checked, §3) or demands a value already of that exact type (no
+				# implicit widen/narrow); every other annotation is inferred from the value.
+				let Ty ty = Ty.TInt
+				if is_fixed_name(ann) then {
+					if is_adoptable_lit(e) then ty = adopt_fixed(e, ann)
+					else {
+						ty = type_of(e, env, ctx)
+						if !ty_eq(ty, fixed_ty(ann)) then die("cf0: type: a fixed-width binding needs a value of that exact type or an adopting integer literal\n")
+					}
+				} else {
+					ty = type_of(e, env, ctx)
+				}
 				if m && is_ttuple(ty) then die("cf0: type: a tuple binds `const` only (a mutable tuple is a later brick)\n")
 				if is_ttuple(ty) && !is_tuple_bindable(e) then die("cf0: type: this expression cannot bind a tuple\n")
 				env = [...env, VarTy({ name: n, ty: ty, mutable: m })]
