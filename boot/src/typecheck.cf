@@ -32,6 +32,7 @@ data Ctx = { [Func] funcs, [RecDecl] recs, [UnionDecl] unions }
 const is_tint = (Ty t): Bool -> match t { Ty.TInt -> true, _ -> false }
 const is_tbool = (Ty t): Bool -> match t { Ty.TBool -> true, _ -> false }
 const is_tstr = (Ty t): Bool -> match t { Ty.TStr -> true, _ -> false }
+const is_tunit = (Ty t): Bool -> match t { Ty.TUnit -> true, _ -> false }
 const is_tptr = (Ty t): Bool -> match t { Ty.TPtr -> true, _ -> false }
 
 # The record / union / dynamic-array-element type name of a type, or "" otherwise.
@@ -106,6 +107,7 @@ const element_type_name = (Ty t, Expr e): TupElem -> {
 	if is_tint(t) then return tel_leaf("Iarch")
 	if is_tbool(t) then return tel_leaf("Bool")
 	if is_tstr(t) then return tel_leaf("Str")
+	if is_tunit(t) then return tel_leaf("Unit")
 	# a NESTED tuple position carries its own positions structurally (any depth)
 	if is_ttuple(t) then return tel_nest(tuple_elems(t))
 	const Str rn = rec_of(t)
@@ -129,6 +131,7 @@ const ty_eq = (Ty a, Ty b): Bool -> match a {
 	Ty.TUnion(an) -> str_eq(an, union_of(b)),
 	Ty.TDyn(an) -> str_eq(an, dyn_of(b)),
 	Ty.TStr -> is_tstr(b),
+	Ty.TUnit -> is_tunit(b),
 	Ty.TTuple(ae) -> match b { Ty.TTuple(be) -> tuple_elems_eq(ae, be), _ -> false }
 }
 
@@ -212,6 +215,7 @@ const named_ty = (Str type_name, Str elem, [RecDecl] recs, [UnionDecl] unions): 
 	if find_union(unions, type_name) >= 0 then return Ty.TUnion(type_name)
 	if str_eq(type_name, "Bool") then return Ty.TBool
 	if str_eq(type_name, "Str") then return Ty.TStr
+	if str_eq(type_name, "Unit") then return Ty.TUnit
 	# any integer-family name (`Iarch`/`Int`/`Uarch`/`Uint8`/… — the same set a cast names)
 	# is one word: cf0 tracks every integer width as `TInt` (a genesis narrowing).
 	if is_cast_type(type_name) then return Ty.TInt
@@ -282,6 +286,7 @@ const func_ret_ty = (Func fn, [RecDecl] recs, [UnionDecl] unions): Ty -> {
 	if find_union(unions, fn.ret_name) >= 0 then return Ty.TUnion(fn.ret_name)
 	if str_eq(fn.ret_name, "Bool") then return Ty.TBool
 	if str_eq(fn.ret_name, "Str") then return Ty.TStr
+	if str_eq(fn.ret_name, "Unit") then return Ty.TUnit
 	return Ty.TInt
 }
 
@@ -923,6 +928,7 @@ const type_of = (Expr e, [VarTy] env, Ctx ctx): Ty -> match e {
 	Expr.IndexField(arr, idx, f) -> indexfield_type(arr, idx, f, env, ctx),
 	Expr.IndexExpr(base, idx) -> indexexpr_type(base, idx, env, ctx),
 	Expr.Tuple(elems) -> tuple_type(elems, env, ctx),
+	Expr.Unit -> Ty.TUnit,
 	Expr.Spread(x) -> spread_bad_type(),
 	Expr.Buffer(n) -> Ty.TPtr,
 	Expr.Addr(name) -> var_type(env, name, ctx),
@@ -1194,6 +1200,9 @@ const check_func = (Func fn, Ctx ctx): Iarch -> {
 		# on an unknown name
 		canon_telems(fn.ret_telems, ctx.recs, ctx.unions)
 	}
+	# `main` yields the process exit code (an Iarch), so an explicit `Unit`/`()` return type
+	# (or the valueless `return` that desugars to `()`) is rejected there.
+	if str_eq(fn.name, "main") && str_eq(fn.ret_name, "Unit") then die("cf0: type: main must return an Iarch exit code, not Unit\n")
 	# an asm-bodied function has no statement body to check — its parameters and return type
 	# still register it for callers (call_type resolves them); the asm is emitted verbatim.
 	if fn.is_asm then return 0

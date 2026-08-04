@@ -606,6 +606,11 @@ const parse_primary = (*Parser p): Expr -> {
 	}
 	if is_lparen(peek(p)) then {
 		p.pos = p.pos + 1
+		# `()` — the unit value (type_system §6.1: the zero-tuple), a zero-information word.
+		if is_rparen(peek(p)) then {
+			p.pos = p.pos + 1
+			return Expr.Unit
+		}
 		# a comma-separated list of tuple elements, each `...src` (a spread of a tuple's
 		# positions) or a plain expression. `(e)` is grouping and `(e,)` a one-tuple — both
 		# collapse to `e`; a spread (even a lone `(...t)`) or ≥2 elements stays a tuple.
@@ -888,6 +893,14 @@ const parse_stmt = (*Parser p): Stmt -> {
 	}
 	if kw(p, "return") then {
 		p.pos = p.pos + 1
+		# a valueless `return` is sugar for `return ()` — the unit value (type_system §6.1);
+		# typecheck then requires a `Unit`-returning fn. cf0's grammar has no statement
+		# separator, so a bare `return` is only unambiguous before a boundary token that
+		# cannot begin an expression: `}` (end of block / braced guard body / last match arm)
+		# or `,` (a `,`-separated statement-match arm). Everywhere else `return` greedily
+		# takes the following expression — so a valueless guarded return must be braced
+		# (`if c then { return }`), never `if c then return <more…>` (that returns the value).
+		if is_rbrace(peek(p)) || is_comma(peek(p)) then return Stmt.Return(Expr.Unit)
 		return Stmt.Return(parse_expr(p))
 	}
 	# otherwise a call-for-effect statement (`name(args)`), a field mutation
@@ -1130,9 +1143,14 @@ const parse_ret_name = (*Parser p): RetSig -> {
 		const Str elem = dyn_elem_of(parse_type(p))
 		return RetSig({ name: "$dyn", elem: elem, telems: [] })
 	}
-	# a `(A, B, …)` tuple return type — at least two comma-separated element type names
+	# a `(A, B, …)` tuple return type — at least two comma-separated element type names;
+	# `()` is the unit type (type_system §6.1: `()` and `Unit` name the same zero-tuple type).
 	if is_lparen(peek(p)) then {
 		p.pos = p.pos + 1 # `(`
+		if is_rparen(peek(p)) then {
+			p.pos = p.pos + 1
+			return RetSig({ name: "Unit", elem: "", telems: [] })
+		}
 		const [TupElem] tel = parse_tuple_telems(p)
 		if Iarch(tel.len) < 2 then die("cf0: parse: a tuple return type needs at least two elements\n")
 		return RetSig({ name: "$tuple", elem: "", telems: tel })
