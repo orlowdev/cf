@@ -131,6 +131,7 @@ const field_is_ptr = (*Emit ctx, Str rt, Str field): Bool -> {
 		if str_eq(ctx.recs[ri].fields[fi], field) then {
 			const Str ft = ctx.recs[ri].ftypes[fi]
 			if str_eq(ft, "$dyn") then return true
+			if str_eq(ft, "$tuple") then return true
 			if str_eq(ft, "$ptr") then return true
 			if str_eq(ft, "Str") then return true
 			if find_rec(ctx.recs, ft) >= 0 then return true
@@ -591,6 +592,20 @@ const call_ret_telems = (*Emit ctx, Str callee): [Str] -> {
 	return emit_canon_telems(ctx, ctx.funcs[fidx].ret_telems)
 }
 
+# A record's tuple FIELD position type names, canonicalized to emit's convention (empty for
+# a non-tuple field / unknown record) — so `r.pair[k]` / `r.pair[k].field` resolve.
+const field_ftelems = (*Emit ctx, Str rectype, Str field): [Str] -> {
+	const Iarch ri = find_rec(ctx.recs, rectype)
+	if ri < 0 then return []
+	let Iarch fi = 0
+	loop {
+		if fi >= Iarch(ctx.recs[ri].fields.len) then break
+		if str_eq(ctx.recs[ri].fields[fi], field) then return emit_canon_telems(ctx, ctx.recs[ri].ftelems[fi])
+		fi = fi + 1
+	}
+	return []
+}
+
 # Position type names of a bound tuple variable (empty for a non-tuple binding).
 const var_telems = ([Binding] env, Str name): [Str] -> {
 	const Iarch idx = lookup_index(env, name)
@@ -604,6 +619,9 @@ const init_telems = (*Emit ctx, [Binding] env, Expr e): [Str] -> {
 		Expr.Tuple(elems) -> { r = tuple_pos_types(ctx, env, elems) },
 		Expr.Call(callee, args) -> { r = call_ret_telems(ctx, callee) },
 		Expr.Var(nm) -> { r = var_telems(env, nm) },
+		Expr.Field(base, f) -> { r = field_ftelems(ctx, var_agg_type(env, base), f) },
+		Expr.FieldExpr(base, f) -> { r = field_ftelems(ctx, init_agg_type(ctx, env, base), f) },
+		Expr.IndexField(arr, idx, f) -> { r = field_ftelems(ctx, index_agg_type(ctx, env, arr, idx), f) },
 		_ -> {}
 	}
 	return r
@@ -630,7 +648,11 @@ const emit_destructure = (*Emit ctx, [Binding] env, [Str] pat, Bool mutable, Exp
 			tels = call_ret_telems(ctx, callee)
 			base = emit_call(ctx, callee, args, env)
 		},
-		_ -> { die("cf0: emit: a destructure source must be a tuple literal, a bound tuple, or a tuple-returning call\n") }
+		Expr.Field(fb, ff) -> {
+			tels = init_telems(ctx, env, rhs)
+			base = emit_expr(rhs, ctx, env)
+		},
+		_ -> { die("cf0: emit: a destructure source must be a tuple literal, a bound tuple, a tuple-returning call, or a record's tuple field\n") }
 	}
 	let [Binding] e2 = env
 	let Iarch pos = 0
@@ -800,7 +822,7 @@ const init_agg_type = (*Emit ctx, [Binding] env, Expr e): Str -> match e {
 	Expr.Addr(name) -> var_agg_type(env, name),
 	Expr.Var(name) -> var_agg_type(env, name),
 	Expr.Index(arr, idx) -> index_agg_type(ctx, env, arr, idx),
-	Expr.IndexExpr(base, idx) -> indexexpr_agg_type(ctx, env, base),
+	Expr.IndexExpr(base, idx) -> indexexpr_agg_type(ctx, env, base, idx),
 	Expr.IndexField(arr, idx, f) -> indexfield_agg_type(ctx, env, arr, idx, f),
 	Expr.FieldExpr(base, f) -> fieldexpr_agg_type(ctx, env, base, f),
 	Expr.Tuple(elems) -> "$tuple",
@@ -875,7 +897,16 @@ const indexexpr_elem = (*Emit ctx, [Binding] env, Expr base): Str -> {
 	return ""
 }
 
-const indexexpr_agg_type = (*Emit ctx, [Binding] env, Expr base): Str -> {
+const indexexpr_agg_type = (*Emit ctx, [Binding] env, Expr base, Expr idx): Str -> {
+	# a tuple base `r.pair[k]` — position k's element type when it is an aggregate
+	if str_eq(init_agg_type(ctx, env, base), "$tuple") then {
+		const [Str] tel = init_telems(ctx, env, base)
+		const Iarch k = tuple_lit_index(idx)
+		if k >= Iarch(tel.len) then return ""
+		const Str tn = tel[k]
+		if elem_is_agg(ctx, tn) then return tn
+		return ""
+	}
 	const Str en = init_elem(ctx, env, base)
 	# indexing a nested array yields a dynamic array, not the nested element name
 	if is_nested(en) then return "$dyn"
@@ -1507,6 +1538,17 @@ const emit_index_field = (*Emit ctx, [Binding] env, Str arr, Expr idx, Str field
 const emit_index_expr = (*Emit ctx, [Binding] env, Expr base, Expr idx): Str -> {
 	const Str bt = init_agg_type(ctx, env, base)
 	const Str hv = emit_expr(base, ctx, env)
+	# a tuple base `t[k]` (k a comptime literal) loads the k-th 8-byte slot directly
+	if str_eq(bt, "$tuple") then {
+		const Iarch toff = tuple_lit_index(idx) * 8
+		const Iarch taddr = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${taddr} =l add ${hv}, ${toff}\n")
+		const Iarch tval = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${tval} =l loadl %t${taddr}\n")
+		return "%t${tval}"
+	}
 	# a byte pointer / buffer index `p[i]` reads the i-th byte at pointer + i (no header).
 	if str_eq(bt, "$ptr") then {
 		const Str pv = emit_expr(idx, ctx, env)

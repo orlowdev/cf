@@ -236,6 +236,13 @@ const canon_telems = ([Str] telems, [RecDecl] recs, [UnionDecl] unions): [Str] -
 	return r
 }
 
+# The declared type of record `recs[ri]`'s field `fi` — a `TTuple` for a `(A, B)` tuple
+# field (its position types canonicalized like a tuple return), else the named type.
+const field_decl_ty = (Iarch ri, Iarch fi, Ctx ctx): Ty -> {
+	if str_eq(ctx.recs[ri].ftypes[fi], "$tuple") then return Ty.TTuple(canon_telems(ctx.recs[ri].ftelems[fi], ctx.recs, ctx.unions))
+	return named_ty(ctx.recs[ri].ftypes[fi], ctx.recs[ri].felems[fi], ctx.recs, ctx.unions)
+}
+
 const func_ret_ty = (Func fn, [RecDecl] recs, [UnionDecl] unions): Ty -> {
 	if str_eq(fn.ret_name, "") then return Ty.TInt
 	if str_eq(fn.ret_name, "$tuple") then return Ty.TTuple(canon_telems(fn.ret_telems, recs, unions))
@@ -422,7 +429,7 @@ const record_type = (Str type_name, [FieldInit] inits, [VarTy] env, Ctx ctx): Ty
 			if str_eq(inits[b].field, inits[a].field) then die("cf0: type: a field is set twice in a data literal\n")
 			b = b + 1
 		}
-		const Ty ft = named_ty(ctx.recs[ri].ftypes[fi], ctx.recs[ri].felems[fi], ctx.recs, ctx.unions)
+		const Ty ft = field_decl_ty(ri, fi, ctx)
 		# a bare `[]` field value adopts the field's declared element type (context-directed —
 		# `type_of` would default it to `[Iarch]` and spuriously mismatch a `[Str]`/`[T]` field)
 		if is_empty_arraylit(inits[a].value) then {
@@ -485,7 +492,7 @@ const field_type = (Str base, Str field, [VarTy] env, Ctx ctx): Ty -> {
 	if ri < 0 then die("cf0: type: unknown record type\n")
 	const Iarch fi = field_index(ctx.recs[ri].fields, field)
 	if fi < 0 then die("cf0: type: reading a field the record does not declare\n")
-	return named_ty(ctx.recs[ri].ftypes[fi], ctx.recs[ri].felems[fi], ctx.recs, ctx.unions)
+	return field_decl_ty(ri, fi, ctx)
 }
 
 # The environment a match arm's body is checked in: the outer env extended with the arm's
@@ -714,7 +721,7 @@ const tuple_indexfield_type = ([Str] names, Expr idx, Str field, Ctx ctx): Ty ->
 	if ri < 0 then die("cf0: type: a field read needs a record or string element\n")
 	const Iarch fi = field_index(ctx.recs[ri].fields, field)
 	if fi < 0 then die("cf0: type: the element record has no such field\n")
-	return named_ty(ctx.recs[ri].ftypes[fi], ctx.recs[ri].felems[fi], ctx.recs, ctx.unions)
+	return field_decl_ty(ri, fi, ctx)
 }
 
 # Check `const/let (a, _, c) = rhs`: rhs must be a tuple; each pattern name binds its
@@ -779,6 +786,8 @@ const index_type = (Str arr, Expr idx, [VarTy] env, Ctx ctx): Ty -> {
 # `index_type` but takes the base as an expression rather than a bare name.
 const indexexpr_type = (Expr base, Expr idx, [VarTy] env, Ctx ctx): Ty -> {
 	const Ty bt = type_of(base, env, ctx)
+	# a tuple base (`r.pair[0]`) is comptime-indexed, each position independently typed
+	if is_ttuple(bt) then return tuple_index_type(tuple_elems(bt), idx, ctx)
 	if is_tstr(bt) then {
 		if !is_tint(type_of(idx, env, ctx)) then die("cf0: type: a string index must be an integer\n")
 		return Ty.TInt
@@ -818,7 +827,7 @@ const indexfield_type = (Str arr, Expr idx, Str field, [VarTy] env, Ctx ctx): Ty
 	if ri < 0 then die("cf0: type: a field read needs a record element\n")
 	const Iarch fi = field_index(ctx.recs[ri].fields, field)
 	if fi < 0 then die("cf0: type: the element record has no such field\n")
-	return named_ty(ctx.recs[ri].ftypes[fi], ctx.recs[ri].felems[fi], ctx.recs, ctx.unions)
+	return field_decl_ty(ri, fi, ctx)
 }
 
 # A string literal is a `Str`.
@@ -863,7 +872,7 @@ const fieldexpr_type = (Expr base, Str field, [VarTy] env, Ctx ctx): Ty -> {
 	if ri < 0 then die("cf0: type: unknown record type\n")
 	const Iarch fi = field_index(ctx.recs[ri].fields, field)
 	if fi < 0 then die("cf0: type: reading a field the record does not declare\n")
-	return named_ty(ctx.recs[ri].ftypes[fi], ctx.recs[ri].felems[fi], ctx.recs, ctx.unions)
+	return field_decl_ty(ri, fi, ctx)
 }
 
 const type_of = (Expr e, [VarTy] env, Ctx ctx): Ty -> match e {
@@ -984,7 +993,7 @@ const check_simple_stmt = (Func fn, Stmt s, [VarTy] env, Ctx ctx, Ty frt, Bool i
 			const Iarch ri = find_rec(ctx.recs, tn)
 			const Iarch fi = field_index(ctx.recs[ri].fields, f)
 			if fi < 0 then die("cf0: type: mutating a field the record does not declare\n")
-			const Ty ft = named_ty(ctx.recs[ri].ftypes[fi], ctx.recs[ri].felems[fi], ctx.recs, ctx.unions)
+			const Ty ft = field_decl_ty(ri, fi, ctx)
 			if !ty_eq(type_of(e, env, ctx), ft) then die("cf0: type: a field value's type must match the field\n")
 		},
 		Stmt.IndexAssign(a, ix, val) -> {
