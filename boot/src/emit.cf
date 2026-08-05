@@ -38,7 +38,10 @@ data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs, [RecDecl] recs, [
 # as the operand): a `const` aggregate and every aggregate/pointer PARAMETER (a borrow).
 # `telems` carries a tuple binding's per-position element type names (a record name,
 # `"Str"`, or `""` for a word); it is the empty list for every non-tuple binding.
-data Binding = { Str name, Iarch slot, Str rec_type, Str elem, Bool is_cell, [TupElem] telems }
+# `fixed` is the binding's fixed-width type NAME (`Int8`…`Uint64`) or `""` for a plain word /
+# aggregate — kept SEPARATE from `rec_type` because a fixed value is a WORD (it must not read
+# as an aggregate pointer), yet emit still needs its width/signedness to drive fixed-width ops.
+data Binding = { Str name, Iarch slot, Str rec_type, Str elem, Bool is_cell, [TupElem] telems, Str fixed }
 
 # Byte-wise `Str` equality (variable-name lookup).
 const str_eq = (Str a, Str b): Bool -> {
@@ -225,27 +228,116 @@ data ArgOp = { Iarch temp, Bool is_rec }
 
 # --- expression emit ------------------------------------------------------------------
 
+# The fixed-width type NAME an expression evaluates to (`""` when it is a plain word or a
+# non-integer). cf0 has no typed AST, so emit re-derives it: a `TN(x)` cast is `TN`; a var is
+# its binding's recorded fixed type; a binary/unary op takes its fixed operand's type; a call
+# takes its callee's return type; a literal has none (it adopts). Drives the signed-vs-unsigned
+# op choice and the width to which a fixed result is wrapped.
+const call_fixed = (*Emit ctx, Str callee): Str -> {
+	if is_fixed_name(callee) then return callee
+	const Iarch fidx = find_func(ctx.funcs, callee)
+	if fidx < 0 then return ""
+	if is_fixed_name(ctx.funcs[fidx].ret_name) then return ctx.funcs[fidx].ret_name
+	return ""
+}
+const var_fixed = ([Binding] env, Str n): Str -> {
+	const Iarch idx = lookup_index(env, n)
+	if idx < 0 then return ""
+	return env[idx].fixed
+}
+# A record field / tuple position / array element type NAME, kept only when it is fixed-width.
+const fixed_only = (Str name): Str -> if is_fixed_name(name) then name else ""
+const field_fixed = (*Emit ctx, Str rt, Str field): Str -> fixed_only(field_ftype(ctx, rt, field))
+const idx_fixed = ([Binding] env, Str arr, Expr idx): Str -> {
+	const Iarch ai = lookup_index(env, arr)
+	if ai < 0 then return ""
+	return fixed_only(telem_name(env[ai].telems, tuple_lit_index(idx)))
+}
+const idxexpr_fixed = (*Emit ctx, [Binding] env, Expr base, Expr idx): Str -> fixed_only(telem_name(init_telems(ctx, env, base), tuple_lit_index(idx)))
+const match_fixed = (*Emit ctx, [Binding] env, [MatchArm] arms): Str -> {
+	if Iarch(arms.len) == 0 then return ""
+	return emit_fixed_of(ctx, env, arms[0].body)
+}
+const emit_fixed_of = (*Emit ctx, [Binding] env, Expr e): Str -> match e {
+	Expr.Call(callee, args) -> call_fixed(ctx, callee),
+	Expr.Var(n) -> var_fixed(env, n),
+	Expr.Add(l, r) -> bin_fixed(ctx, env, l, r),
+	Expr.Sub(l, r) -> bin_fixed(ctx, env, l, r),
+	Expr.Mul(l, r) -> bin_fixed(ctx, env, l, r),
+	Expr.Div(l, r) -> bin_fixed(ctx, env, l, r),
+	Expr.Mod(l, r) -> bin_fixed(ctx, env, l, r),
+	Expr.BitAnd(l, r) -> bin_fixed(ctx, env, l, r),
+	Expr.BitOr(l, r) -> bin_fixed(ctx, env, l, r),
+	Expr.BitXor(l, r) -> bin_fixed(ctx, env, l, r),
+	Expr.Shl(l, r) -> bin_fixed(ctx, env, l, r),
+	Expr.Shr(l, r) -> bin_fixed(ctx, env, l, r),
+	Expr.Neg(x) -> emit_fixed_of(ctx, env, x),
+	Expr.BitNot(x) -> emit_fixed_of(ctx, env, x),
+	# a fixed value projected out of an aggregate or a value-form: re-derive its type so the
+	# op still gets the right signed/unsigned codegen and wrap (else a Uint64 field-compare or
+	# a narrow field-arith would silently miscompile)
+	Expr.Field(base, f) -> field_fixed(ctx, var_agg_type(env, base), f),
+	Expr.FieldExpr(be, f) -> field_fixed(ctx, init_agg_type(ctx, env, be), f),
+	Expr.Index(arr, idx) -> idx_fixed(env, arr, idx),
+	Expr.IndexExpr(be, idx) -> idxexpr_fixed(ctx, env, be, idx),
+	Expr.IndexField(arr, idx, f) -> field_fixed(ctx, index_agg_type(ctx, env, arr, idx), f),
+	Expr.If(c, t, el) -> emit_fixed_of(ctx, env, t),
+	Expr.Match(scrut, arms) -> match_fixed(ctx, env, arms),
+	_ -> ""
+}
+const bin_fixed = (*Emit ctx, [Binding] env, Expr l, Expr r): Str -> {
+	const Str a = emit_fixed_of(ctx, env, l)
+	if !str_eq(a, "") then return a
+	return emit_fixed_of(ctx, env, r)
+}
+# A comparison op string (`ceq`/`cne`/`cslt`…) begins with `c` (byte 99); arithmetic
+# (`add`/`div`/`and`…) does not. Its result is a Bool word — never wrapped to a fixed width.
+const op_is_cmp = (Str op): Bool -> if Iarch(op.len) == 0 then false else Iarch(op[0]) == 99
+# The unsigned variant of an op for an unsigned fixed operand: `div`/`rem` → `udiv`/`urem`,
+# arithmetic `sar` (`>>`) → logical `shr`, and each signed ordering compare → its unsigned form.
+const unsigned_op = (Str op): Str -> {
+	if str_eq(op, "div") then return "udiv"
+	if str_eq(op, "rem") then return "urem"
+	if str_eq(op, "sar") then return "shr"
+	if str_eq(op, "csltl") then return "cultl"
+	if str_eq(op, "csgtl") then return "cugtl"
+	if str_eq(op, "cslel") then return "culel"
+	if str_eq(op, "csgel") then return "cugel"
+	return op
+}
+
 # Emit a binary operator node: evaluate both operands, then combine into a fresh
 # temp. Operands are bound (not passed as call arguments) so evaluation order —
-# left before right — is explicit.
+# left before right — is explicit. A fixed-width operation picks the unsigned op variant
+# when its type is unsigned, and wraps an arithmetic (non-comparison) result to the width.
 const emit_binop = (*Emit ctx, Str op, Expr l, Expr r, [Binding] env): Str -> {
 	const Str a = emit_expr(l, ctx, env)
 	const Str b = emit_expr(r, ctx, env)
+	const Str fx = bin_fixed(ctx, env, l, r)
+	let Str realop = op
+	if !str_eq(fx, "") && !fixed_signed(fx) then realop = unsigned_op(op)
 	const Iarch t = ctx.next
 	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${t} =l ${op} ${a}, ${b}\n")
-	return "%t${t}"
+	write_str(ctx.fd, "\t%t${t} =l ${realop} ${a}, ${b}\n")
+	# a fixed-width comparison yields a Bool (no wrap); a fixed-width arithmetic result is
+	# wrapped to the type's width; a plain word op is returned as-is.
+	if str_eq(fx, "") then return "%t${t}"
+	if op_is_cmp(op) then return "%t${t}"
+	return emit_fixed_canon(ctx, fixed_bits(fx), fixed_signed(fx), "%t${t}")
 }
 
 # Emit a unary operator whose result is `<op> <operand>` (a two-operand QBE
 # instruction with a constant): negation `sub 0, x`, logical not `ceql x, 0` (a
-# Bool 0/1 → its complement), bitwise not `xor x, -1` (all bits flipped).
+# Bool 0/1 → its complement), bitwise not `xor x, -1` (all bits flipped). A fixed-width
+# operand (`-`/`~` on a fixed value) wraps the result to the type's width.
 const emit_unop = (*Emit ctx, Str pre, Expr x, Str post, [Binding] env): Str -> {
 	const Str a = emit_expr(x, ctx, env)
 	const Iarch t = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${t} =l ${pre}${a}${post}\n")
-	return "%t${t}"
+	const Str fx = emit_fixed_of(ctx, env, x)
+	if str_eq(fx, "") then return "%t${t}"
+	return emit_fixed_canon(ctx, fixed_bits(fx), fixed_signed(fx), "%t${t}")
 }
 
 # Emit a variable reference. A const-aggregate local's slot IS its base pointer (a temp,
@@ -721,7 +813,7 @@ const emit_destructure = (*Emit ctx, [Binding] env, [Str] pat, Bool mutable, Exp
 			const Iarch ptr = ctx.next
 			ctx.next = ctx.next + 1
 			write_str(ctx.fd, "\t%t${ptr} =l loadl %t${saddr}\n")
-			e2 = [...e2, Binding({ name: tok, slot: ptr, rec_type: tel_agg_type(ctx, ptype), elem: "", is_cell: false, telems: tel_sub(ptype) })]
+			e2 = [...e2, Binding({ name: tok, slot: ptr, rec_type: tel_agg_type(ctx, ptype), elem: "", is_cell: false, telems: tel_sub(ptype), fixed: "" })]
 		} else {
 			const Iarch val = ctx.next
 			ctx.next = ctx.next + 1
@@ -730,7 +822,7 @@ const emit_destructure = (*Emit ctx, [Binding] env, [Str] pat, Bool mutable, Exp
 			ctx.next = ctx.next + 1
 			write_str(ctx.fd, "\t%t${cell} =l alloc8 8\n")
 			write_str(ctx.fd, "\tstorel %t${val}, %t${cell}\n")
-			e2 = [...e2, Binding({ name: tok, slot: cell, rec_type: "", elem: "", is_cell: true, telems: [] })]
+			e2 = [...e2, Binding({ name: tok, slot: cell, rec_type: "", elem: "", is_cell: true, telems: [], fixed: "" })]
 		}
 		pos = pos + 1
 		pi = pi + 1
@@ -1198,7 +1290,7 @@ const arm_body_env = (*Emit ctx, [Binding] env, Str type_name, [Str] members, [S
 				write_str(ctx.fd, "\t%t${val} =l loadl %t${addr}\n")
 				const Str pt = payload_type(ctx, type_name, members[0], bi)
 				const Str pe = payload_elem(ctx, type_name, members[0], bi)
-				benv = [...benv, Binding({ name: binds[bi], slot: val, rec_type: pt, elem: pe, is_cell: false, telems: payload_ptelems(ctx, type_name, members[0], bi) })]
+				benv = [...benv, Binding({ name: binds[bi], slot: val, rec_type: pt, elem: pe, is_cell: false, telems: payload_ptelems(ctx, type_name, members[0], bi), fixed: "" })]
 			} else {
 				# a word payload: load it and spill to its own 4-byte slot (read via loadw)
 				const Iarch val = ctx.next
@@ -1208,7 +1300,7 @@ const arm_body_env = (*Emit ctx, [Binding] env, Str type_name, [Str] members, [S
 				ctx.next = ctx.next + 1
 				write_str(ctx.fd, "\t%t${bslot} =l alloc8 8\n")
 				write_str(ctx.fd, "\tstorel %t${val}, %t${bslot}\n")
-				benv = [...benv, Binding({ name: binds[bi], slot: bslot, rec_type: "", elem: "", is_cell: true, telems: [] })]
+				benv = [...benv, Binding({ name: binds[bi], slot: bslot, rec_type: "", elem: "", is_cell: true, telems: [], fixed: "" })]
 			}
 		}
 		bi = bi + 1
@@ -1824,7 +1916,7 @@ const emit_for_body = (*Emit ctx, [Binding] env, Str lv, Str arr, [Stmt] body): 
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${xcell} =l alloc8 8\n")
 	write_str(ctx.fd, "\tstorel %t${xval}, %t${xcell}\n")
-	const [Binding] benv = [...env, Binding({ name: lv, slot: xcell, rec_type: "", elem: "", is_cell: true, telems: [] })]
+	const [Binding] benv = [...env, Binding({ name: lv, slot: xcell, rec_type: "", elem: "", is_cell: true, telems: [], fixed: "" })]
 	const Iarch term = emit_block(ctx, body, benv)
 	if term == 0 then write_str(ctx.fd, "\tjmp @ltop${lid}\n")
 	write_str(ctx.fd, "@lend${lid}\n")
@@ -2028,7 +2120,10 @@ const emit_block = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 					ctx.next = ctx.next + 1
 					write_str(ctx.fd, "\t%t${slot} =l alloc8 8\n")
 					write_str(ctx.fd, "\tstorel ${v}, %t${slot}\n")
-					env = [...env, Binding({ name: n, slot: slot, rec_type: "", elem: "", is_cell: true, telems: [] })]
+					# a fixed-width local records its type (from the annotation, else inferred) so
+					# later ops on it pick the right signed/unsigned codegen and wrap width
+					const Str fx = if is_fixed_name(ann) then ann else emit_fixed_of(ctx, env, e)
+					env = [...env, Binding({ name: n, slot: slot, rec_type: "", elem: "", is_cell: true, telems: [], fixed: fx })]
 				} else {
 					const Iarch base = emit_agg_binding(ctx, e, env)
 					if m then {
@@ -2036,9 +2131,9 @@ const emit_block = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 						ctx.next = ctx.next + 1
 						write_str(ctx.fd, "\t%t${cell} =l alloc8 8\n")
 						write_str(ctx.fd, "\tstorel %t${base}, %t${cell}\n")
-						env = [...env, Binding({ name: n, slot: cell, rec_type: rt, elem: init_elem(ctx, env, e), is_cell: true, telems: init_telems(ctx, env, e) })]
+						env = [...env, Binding({ name: n, slot: cell, rec_type: rt, elem: init_elem(ctx, env, e), is_cell: true, telems: init_telems(ctx, env, e), fixed: "" })]
 					} else {
-						env = [...env, Binding({ name: n, slot: base, rec_type: rt, elem: init_elem(ctx, env, e), is_cell: false, telems: init_telems(ctx, env, e) })]
+						env = [...env, Binding({ name: n, slot: base, rec_type: rt, elem: init_elem(ctx, env, e), is_cell: false, telems: init_telems(ctx, env, e), fixed: "" })]
 					}
 				}
 			},
@@ -2091,9 +2186,9 @@ const emit_func = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 			ctx.next = ctx.next + 1
 			write_str(ctx.fd, "\t%t${slot} =l copy %p${pi}\n")
 			if str_eq(fn.params[pi].type_name, "$ptr") then {
-				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: "$ptr", elem: "", is_cell: false, telems: [] })]
+				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: "$ptr", elem: "", is_cell: false, telems: [], fixed: "" })]
 			} else {
-				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: fn.params[pi].type_name, elem: "", is_cell: false, telems: [] })]
+				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: fn.params[pi].type_name, elem: "", is_cell: false, telems: [], fixed: "" })]
 			}
 		} else {
 			if is_agg_param(fn.params[pi], ctx.recs, ctx.unions) then {
@@ -2103,14 +2198,16 @@ const emit_func = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 				const Iarch slot = ctx.next
 				ctx.next = ctx.next + 1
 				write_str(ctx.fd, "\t%t${slot} =l copy %p${pi}\n")
-				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: fn.params[pi].type_name, elem: fn.params[pi].elem, is_cell: false, telems: emit_canon_telems(ctx, fn.params[pi].telems) })]
+				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: fn.params[pi].type_name, elem: fn.params[pi].elem, is_cell: false, telems: emit_canon_telems(ctx, fn.params[pi].telems), fixed: "" })]
 			} else {
-				# a word parameter spills into a stack slot so it reads like a local.
+				# a word parameter spills into a stack slot so it reads like a local; a fixed-width
+				# parameter records its type name so ops on it get the right signed/unsigned codegen.
 				const Iarch slot = ctx.next
 				ctx.next = ctx.next + 1
 				write_str(ctx.fd, "\t%t${slot} =l alloc8 8\n")
 				write_str(ctx.fd, "\tstorel %p${pi}, %t${slot}\n")
-				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: "", elem: "", is_cell: true, telems: [] })]
+				const Str pfx = if is_fixed_name(fn.params[pi].type_name) then fn.params[pi].type_name else ""
+				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: "", elem: "", is_cell: true, telems: [], fixed: pfx })]
 			}
 		}
 		pi = pi + 1

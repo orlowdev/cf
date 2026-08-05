@@ -383,10 +383,44 @@ const var_type = ([VarTy] env, Str name, Ctx ctx): Ty -> {
 	return func_ret_ty(ctx.funcs[fidx], ctx.recs, ctx.unions)
 }
 
-# `-x` / `~x` — an integer operand, an integer result.
-const int_unop = (Expr x, [VarTy] env, Ctx ctx): Ty -> {
-	if !is_tint(type_of(x, env, ctx)) then die("cf0: type: the operand of unary `-`/`~` must be an integer\n")
+# An integer-like operand — the register word (`TInt`) or a fixed-width leaf (`TFixed`).
+const is_int_like = (Ty t): Bool -> is_tint(t) || is_tfixed(t)
+
+# The result type of a binary integer op over `l`/`r` (typed `lt`/`rt`). Two words → a word.
+# A fixed-width operand makes the op fixed-width: the OTHER operand must be the SAME fixed
+# type (no implicit widen/narrow — `Int8 + Int16` is rejected) OR a bare integer literal,
+# which ADOPTS the fixed type (range-checked, §3 — `a + 2`). The result is that fixed type.
+const int_result_ty = (Ty lt, Ty rt, Expr l, Expr r): Ty -> {
+	if is_tfixed(lt) && is_tfixed(rt) then {
+		if !ty_eq(lt, rt) then die("cf0: type: an operator needs both operands of the same fixed-width type\n")
+		return lt
+	}
+	if is_tfixed(lt) then {
+		if !is_adoptable_lit(r) then die("cf0: type: a fixed-width operand needs a matching fixed value or an integer literal, not a bare word\n")
+		fixed_lit_fits(r, tfixed_bits(lt), tfixed_signed(lt))
+		return lt
+	}
+	if is_tfixed(rt) then {
+		if !is_adoptable_lit(l) then die("cf0: type: a fixed-width operand needs a matching fixed value or an integer literal, not a bare word\n")
+		fixed_lit_fits(l, tfixed_bits(rt), tfixed_signed(rt))
+		return rt
+	}
 	return Ty.TInt
+}
+
+# `~x` — bitwise complement of any integer (word or fixed); the result keeps the operand's type.
+const bitnot_unop = (Expr x, [VarTy] env, Ctx ctx): Ty -> {
+	const Ty t = type_of(x, env, ctx)
+	if !is_int_like(t) then die("cf0: type: the operand of unary `~` must be an integer\n")
+	return t
+}
+# `-x` — arithmetic negation; defined on a word or a SIGNED fixed type, never an unsigned one
+# (type_system §8.5 — negating an unsigned value is undefined). Result keeps the operand's type.
+const neg_unop = (Expr x, [VarTy] env, Ctx ctx): Ty -> {
+	const Ty t = type_of(x, env, ctx)
+	if !is_int_like(t) then die("cf0: type: the operand of unary `-` must be an integer\n")
+	if is_tfixed(t) && !tfixed_signed(t) then die("cf0: type: unary `-` is undefined on an unsigned type\n")
+	return t
 }
 
 # `!x` — a Bool operand (no truthiness), a Bool result.
@@ -395,11 +429,14 @@ const not_op = (Expr x, [VarTy] env, Ctx ctx): Ty -> {
 	return Ty.TBool
 }
 
-# `+ - * / % & | ^ << >>` — integer operands, an integer result.
+# `+ - * / % & | ^ << >>` — integer operands, an integer result (a word, or a fixed-width
+# type when either operand is fixed; see `int_result_ty` for the matching/adoption rules).
 const int_binop = (Expr l, Expr r, [VarTy] env, Ctx ctx): Ty -> {
-	if !is_tint(type_of(l, env, ctx)) then die("cf0: type: an arithmetic operand must be an integer\n")
-	if !is_tint(type_of(r, env, ctx)) then die("cf0: type: an arithmetic operand must be an integer\n")
-	return Ty.TInt
+	const Ty lt = type_of(l, env, ctx)
+	const Ty rt = type_of(r, env, ctx)
+	if !is_int_like(lt) then die("cf0: type: an arithmetic operand must be an integer\n")
+	if !is_int_like(rt) then die("cf0: type: an arithmetic operand must be an integer\n")
+	return int_result_ty(lt, rt, l, r)
 }
 
 # `== != < > <= >=` — integer operands, a Bool result. `==`/`!=` (`is_eq`) also
@@ -416,8 +453,12 @@ const cmp_op = (Expr l, Expr r, [VarTy] env, Ctx ctx, Bool is_eq): Ty -> {
 		if union_has_payload(ctx.unions, lu) then die("cf0: type: a union with a payload is recovered with `match`, not compared\n")
 		return Ty.TBool
 	}
-	if !is_tint(lt) then die("cf0: type: a comparison operand must be an integer\n")
-	if !is_tint(rt) then die("cf0: type: a comparison operand must be an integer\n")
+	if !is_int_like(lt) then die("cf0: type: a comparison operand must be an integer\n")
+	if !is_int_like(rt) then die("cf0: type: a comparison operand must be an integer\n")
+	# a fixed-width comparison follows the same match/adopt rules as arithmetic (both operands
+	# the same fixed type, or one an adopting literal); the emitter reads their signedness to
+	# pick a signed vs unsigned compare. The result is always a Bool.
+	int_result_ty(lt, rt, l, r)
 	return Ty.TBool
 }
 
@@ -992,8 +1033,8 @@ const type_of = (Expr e, [VarTy] env, Ctx ctx): Ty -> match e {
 	Expr.Spread(x) -> spread_bad_type(),
 	Expr.Buffer(n) -> Ty.TPtr,
 	Expr.Addr(name) -> var_type(env, name, ctx),
-	Expr.Neg(x) -> int_unop(x, env, ctx),
-	Expr.BitNot(x) -> int_unop(x, env, ctx),
+	Expr.Neg(x) -> neg_unop(x, env, ctx),
+	Expr.BitNot(x) -> bitnot_unop(x, env, ctx),
 	Expr.Not(x) -> not_op(x, env, ctx),
 	Expr.Add(l, r) -> int_binop(l, r, env, ctx),
 	Expr.Sub(l, r) -> int_binop(l, r, env, ctx),
