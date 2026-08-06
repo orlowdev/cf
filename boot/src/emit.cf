@@ -77,9 +77,17 @@ const binding_ptr = (*Emit ctx, [Binding] env, Iarch idx): Str -> {
 	if !env[idx].is_cell then return "%t${env[idx].slot}"
 	const Iarch t = ctx.next
 	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${t} =l loadl %t${env[idx].slot}\n")
+	# a float cell loads with its QBE type (`loadd`/`loads`); every other word/pointer is `loadl`
+	if is_float_name(env[idx].fixed) then {
+		const Str qt = float_qt(env[idx].fixed)
+		write_str(ctx.fd, "\t%t${t} =${qt} load${qt} %t${env[idx].slot}\n")
+	} else {
+		write_str(ctx.fd, "\t%t${t} =l loadl %t${env[idx].slot}\n")
+	}
 	return "%t${t}"
 }
+# The QBE store op for a scalar-typed value: `stored`/`stores` for a float, else `storel`.
+const store_op = (Str scalar): Str -> if is_float_name(scalar) then "store${float_qt(scalar)}" else "storel"
 
 # The index of the record declared as `name`, or -1.
 const find_rec = ([RecDecl] recs, Str name): Iarch -> {
@@ -226,7 +234,7 @@ const ret_is_l = (Str ret_name, [RecDecl] recs, [UnionDecl] unions): Bool -> {
 
 # A call argument's operand: the temp holding it, and whether it is a record pointer
 # (emitted `l`) rather than a word (`w`).
-data ArgOp = { Iarch temp, Bool is_rec }
+data ArgOp = { Iarch temp, Bool is_rec, Str qt }
 
 # --- expression emit ------------------------------------------------------------------
 
@@ -235,95 +243,123 @@ data ArgOp = { Iarch temp, Bool is_rec }
 # its binding's recorded fixed type; a binary/unary op takes its fixed operand's type; a call
 # takes its callee's return type; a literal has none (it adopts). Drives the signed-vs-unsigned
 # op choice and the width to which a fixed result is wrapped.
-const call_fixed = (*Emit ctx, Str callee): Str -> {
-	if is_fixed_name(callee) then return callee
+# The SCALAR-LEAF type NAME an expression evaluates to — a fixed-width integer (`Int8`…`Uint64`)
+# OR a float (`Float32`/`Float64`), else `""` (a plain word or non-scalar). cf0 has no typed AST,
+# so emit re-derives it: a `TN(x)` cast is `TN`, a var is its binding's recorded scalar type, a
+# binop/unop takes its scalar operand's type, a call its callee's return type, a float literal is
+# `Float64`. It drives fixed signed/unsigned+wrap codegen AND float `d`/`s` codegen (`qtype_of`).
+const call_scalar = (*Emit ctx, Str callee): Str -> {
+	if is_fixed_name(callee) || is_float_name(callee) then return callee
 	const Iarch fidx = find_func(ctx.funcs, callee)
 	if fidx < 0 then return ""
-	if is_fixed_name(ctx.funcs[fidx].ret_name) then return ctx.funcs[fidx].ret_name
+	if is_fixed_name(ctx.funcs[fidx].ret_name) || is_float_name(ctx.funcs[fidx].ret_name) then return ctx.funcs[fidx].ret_name
 	return ""
 }
-const var_fixed = ([Binding] env, Str n): Str -> {
+const var_scalar = ([Binding] env, Str n): Str -> {
 	const Iarch idx = lookup_index(env, n)
 	if idx < 0 then return ""
 	return env[idx].fixed
 }
-# A record field / tuple position / array element type NAME, kept only when it is fixed-width.
-const fixed_only = (Str name): Str -> if is_fixed_name(name) then name else ""
-const field_fixed = (*Emit ctx, Str rt, Str field): Str -> fixed_only(field_ftype(ctx, rt, field))
-const idx_fixed = ([Binding] env, Str arr, Expr idx): Str -> {
+# A record field / tuple position / array element type NAME, kept only when it is a scalar leaf.
+const scalar_only = (Str name): Str -> if is_fixed_name(name) || is_float_name(name) then name else ""
+const field_scalar = (*Emit ctx, Str rt, Str field): Str -> scalar_only(field_ftype(ctx, rt, field))
+const idx_scalar = ([Binding] env, Str arr, Expr idx): Str -> {
 	const Iarch ai = lookup_index(env, arr)
 	if ai < 0 then return ""
-	return fixed_only(telem_name(env[ai].telems, tuple_lit_index(idx)))
+	return scalar_only(telem_name(env[ai].telems, tuple_lit_index(idx)))
 }
-const idxexpr_fixed = (*Emit ctx, [Binding] env, Expr base, Expr idx): Str -> fixed_only(telem_name(init_telems(ctx, env, base), tuple_lit_index(idx)))
-const match_fixed = (*Emit ctx, [Binding] env, [MatchArm] arms): Str -> {
+const idxexpr_scalar = (*Emit ctx, [Binding] env, Expr base, Expr idx): Str -> scalar_only(telem_name(init_telems(ctx, env, base), tuple_lit_index(idx)))
+const match_scalar = (*Emit ctx, [Binding] env, [MatchArm] arms): Str -> {
 	if Iarch(arms.len) == 0 then return ""
-	return emit_fixed_of(ctx, env, arms[0].body)
+	return scalar_of(ctx, env, arms[0].body)
 }
-# The fixed-width type a value-yielding `loop` produces — the first `<- v`'s type (all yields
-# agree, per typecheck). Walks the body like the type checker's yield walk, recursing into
-# if/match/block but NOT a nested loop, so a fixed-yielding loop used in an op still gets the
-# right signed/unsigned codegen and wrap even when no other operand supplies the type.
-const loop_yield_fixed_list = (*Emit ctx, [Binding] env, [Stmt] ss): Str -> {
+# The scalar type a value-yielding `loop` produces — the first `<- v`'s type (all yields agree,
+# per typecheck). Walks the body like the type checker's yield walk, recursing into if/match/block
+# but NOT a nested loop, so a fixed/float-yielding loop used in an op still gets the right codegen.
+const loop_yield_scalar_list = (*Emit ctx, [Binding] env, [Stmt] ss): Str -> {
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(ss.len) then break
-		const Str f = loop_yield_fixed_stmt(ctx, env, ss[i])
+		const Str f = loop_yield_scalar_stmt(ctx, env, ss[i])
 		if !str_eq(f, "") then return f
 		i = i + 1
 	}
 	return ""
 }
-const loop_yield_fixed_arms = (*Emit ctx, [Binding] env, [StmtArm] arms): Str -> {
+const loop_yield_scalar_arms = (*Emit ctx, [Binding] env, [StmtArm] arms): Str -> {
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(arms.len) then break
-		const Str f = loop_yield_fixed_list(ctx, env, arms[i].body)
+		const Str f = loop_yield_scalar_list(ctx, env, arms[i].body)
 		if !str_eq(f, "") then return f
 		i = i + 1
 	}
 	return ""
 }
-const loop_yield_fixed_stmt = (*Emit ctx, [Binding] env, Stmt s): Str -> match s {
-	Stmt.Yield(e) -> emit_fixed_of(ctx, env, e),
-	Stmt.IfThen(c, b) -> loop_yield_fixed_stmt(ctx, env, b),
-	Stmt.IfElse(c, tb, eb) -> loop_yield_fixed_either(ctx, env, tb, eb),
-	Stmt.Block(ss) -> loop_yield_fixed_list(ctx, env, ss),
-	Stmt.Match(scrut, arms) -> loop_yield_fixed_arms(ctx, env, arms),
+const loop_yield_scalar_stmt = (*Emit ctx, [Binding] env, Stmt s): Str -> match s {
+	Stmt.Yield(e) -> scalar_of(ctx, env, e),
+	Stmt.IfThen(c, b) -> loop_yield_scalar_stmt(ctx, env, b),
+	Stmt.IfElse(c, tb, eb) -> loop_yield_scalar_either(ctx, env, tb, eb),
+	Stmt.Block(ss) -> loop_yield_scalar_list(ctx, env, ss),
+	Stmt.Match(scrut, arms) -> loop_yield_scalar_arms(ctx, env, arms),
 	_ -> ""
 }
-const loop_yield_fixed_either = (*Emit ctx, [Binding] env, Stmt a, Stmt b): Str -> {
-	const Str f = loop_yield_fixed_stmt(ctx, env, a)
+const loop_yield_scalar_either = (*Emit ctx, [Binding] env, Stmt a, Stmt b): Str -> {
+	const Str f = loop_yield_scalar_stmt(ctx, env, a)
 	if !str_eq(f, "") then return f
-	return loop_yield_fixed_stmt(ctx, env, b)
+	return loop_yield_scalar_stmt(ctx, env, b)
 }
-const emit_fixed_of = (*Emit ctx, [Binding] env, Expr e): Str -> match e {
-	Expr.Call(callee, args) -> call_fixed(ctx, callee),
-	Expr.Var(n) -> var_fixed(env, n),
-	Expr.Loop(body) -> loop_yield_fixed_list(ctx, env, body),
-	Expr.Add(l, r) -> bin_fixed(ctx, env, l, r),
-	Expr.Sub(l, r) -> bin_fixed(ctx, env, l, r),
-	Expr.Mul(l, r) -> bin_fixed(ctx, env, l, r),
-	Expr.Div(l, r) -> bin_fixed(ctx, env, l, r),
-	Expr.Mod(l, r) -> bin_fixed(ctx, env, l, r),
-	Expr.BitAnd(l, r) -> bin_fixed(ctx, env, l, r),
-	Expr.BitOr(l, r) -> bin_fixed(ctx, env, l, r),
-	Expr.BitXor(l, r) -> bin_fixed(ctx, env, l, r),
-	Expr.Shl(l, r) -> bin_fixed(ctx, env, l, r),
-	Expr.Shr(l, r) -> bin_fixed(ctx, env, l, r),
-	Expr.Neg(x) -> emit_fixed_of(ctx, env, x),
-	Expr.BitNot(x) -> emit_fixed_of(ctx, env, x),
-	# a fixed value projected out of an aggregate or a value-form: re-derive its type so the
-	# op still gets the right signed/unsigned codegen and wrap (else a Uint64 field-compare or
-	# a narrow field-arith would silently miscompile)
-	Expr.Field(base, f) -> field_fixed(ctx, var_agg_type(env, base), f),
-	Expr.FieldExpr(be, f) -> field_fixed(ctx, init_agg_type(ctx, env, be), f),
-	Expr.Index(arr, idx) -> idx_fixed(env, arr, idx),
-	Expr.IndexExpr(be, idx) -> idxexpr_fixed(ctx, env, be, idx),
-	Expr.IndexField(arr, idx, f) -> field_fixed(ctx, index_agg_type(ctx, env, arr, idx), f),
-	Expr.If(c, t, el) -> emit_fixed_of(ctx, env, t),
-	Expr.Match(scrut, arms) -> match_fixed(ctx, env, arms),
+const scalar_of = (*Emit ctx, [Binding] env, Expr e): Str -> match e {
+	Expr.Call(callee, args) -> call_scalar(ctx, callee),
+	Expr.Var(n) -> var_scalar(env, n),
+	Expr.FloatLit(t) -> "Float64",
+	Expr.Loop(body) -> loop_yield_scalar_list(ctx, env, body),
+	Expr.Add(l, r) -> bin_scalar(ctx, env, l, r),
+	Expr.Sub(l, r) -> bin_scalar(ctx, env, l, r),
+	Expr.Mul(l, r) -> bin_scalar(ctx, env, l, r),
+	Expr.Div(l, r) -> bin_scalar(ctx, env, l, r),
+	Expr.Mod(l, r) -> bin_scalar(ctx, env, l, r),
+	Expr.BitAnd(l, r) -> bin_scalar(ctx, env, l, r),
+	Expr.BitOr(l, r) -> bin_scalar(ctx, env, l, r),
+	Expr.BitXor(l, r) -> bin_scalar(ctx, env, l, r),
+	Expr.Shl(l, r) -> bin_scalar(ctx, env, l, r),
+	Expr.Shr(l, r) -> bin_scalar(ctx, env, l, r),
+	Expr.Neg(x) -> scalar_of(ctx, env, x),
+	Expr.BitNot(x) -> scalar_of(ctx, env, x),
+	# a scalar value projected out of an aggregate or a value-form: re-derive its type so the op
+	# still gets the right codegen (else a Uint64 field-compare / narrow field-arith / float field
+	# would silently miscompile)
+	Expr.Field(base, f) -> field_scalar(ctx, var_agg_type(env, base), f),
+	Expr.FieldExpr(be, f) -> field_scalar(ctx, init_agg_type(ctx, env, be), f),
+	Expr.Index(arr, idx) -> idx_scalar(env, arr, idx),
+	Expr.IndexExpr(be, idx) -> idxexpr_scalar(ctx, env, be, idx),
+	Expr.IndexField(arr, idx, f) -> field_scalar(ctx, index_agg_type(ctx, env, arr, idx), f),
+	Expr.If(c, t, el) -> scalar_of(ctx, env, t),
+	Expr.Match(scrut, arms) -> match_scalar(ctx, env, arms),
 	_ -> ""
+}
+const bin_scalar = (*Emit ctx, [Binding] env, Expr l, Expr r): Str -> {
+	const Str a = scalar_of(ctx, env, l)
+	if !str_eq(a, "") then return a
+	return scalar_of(ctx, env, r)
+}
+# Filters over `scalar_of`: the fixed-width name (for signed/unsigned + wrap), the float name,
+# and the QBE type class of a value — `d` (Float64), `s` (Float32), else `l` (int/word/pointer).
+const emit_fixed_of = (*Emit ctx, [Binding] env, Expr e): Str -> {
+	const Str s = scalar_of(ctx, env, e)
+	if is_fixed_name(s) then return s
+	return ""
+}
+const float_name_of = (*Emit ctx, [Binding] env, Expr e): Str -> {
+	const Str s = scalar_of(ctx, env, e)
+	if is_float_name(s) then return s
+	return ""
+}
+const qtype_of = (*Emit ctx, [Binding] env, Expr e): Str -> {
+	const Str f = float_name_of(ctx, env, e)
+	if str_eq(f, "Float64") then return "d"
+	if str_eq(f, "Float32") then return "s"
+	return "l"
 }
 const bin_fixed = (*Emit ctx, [Binding] env, Expr l, Expr r): Str -> {
 	const Str a = emit_fixed_of(ctx, env, l)
@@ -346,13 +382,44 @@ const unsigned_op = (Str op): Str -> {
 	return op
 }
 
-# Emit a binary operator node: evaluate both operands, then combine into a fresh
-# temp. Operands are bound (not passed as call arguments) so evaluation order —
-# left before right — is explicit. A fixed-width operation picks the unsigned op variant
-# when its type is unsigned, and wraps an arithmetic (non-comparison) result to the width.
+# The QBE type of a float type name (`d` for Float64, `s` for Float32) and the float form of a
+# comparison op (`csltl` → `cltd`/`clts`, …) — a float compare still yields an integer Bool.
+const float_qt = (Str name): Str -> if str_eq(name, "Float32") then "s" else "d"
+# The QBE type of a declared type NAME for a signature/slot: `d`/`s` for a float, else `l`
+# (words, pointers, records — all `l`). Used for a function's return, its params, and calls.
+const qtype_of_name = (Str name): Str -> {
+	if str_eq(name, "Float64") then return "d"
+	if str_eq(name, "Float32") then return "s"
+	return "l"
+}
+const float_cmp_op = (Str op, Str qt): Str -> {
+	if str_eq(op, "csltl") then return "clt${qt}"
+	if str_eq(op, "csgtl") then return "cgt${qt}"
+	if str_eq(op, "cslel") then return "cle${qt}"
+	if str_eq(op, "csgel") then return "cge${qt}"
+	if str_eq(op, "ceql") then return "ceq${qt}"
+	if str_eq(op, "cnel") then return "cne${qt}"
+	return op
+}
+
+# Emit a binary operator node: evaluate both operands, then combine into a fresh temp. A FLOAT
+# op emits in the operand's QBE type (`=d`/`=s`) for `+ - * /` and a float compare for ordering
+# (result an `l` Bool). A fixed-width integer op picks the unsigned variant and wraps the
+# arithmetic result; a plain word op is `=l` as-is.
 const emit_binop = (*Emit ctx, Str op, Expr l, Expr r, [Binding] env): Str -> {
 	const Str a = emit_expr(l, ctx, env)
 	const Str b = emit_expr(r, ctx, env)
+	const Str fl = float_name_of(ctx, env, l)
+	const Str fr = float_name_of(ctx, env, r)
+	if !str_eq(fl, "") || !str_eq(fr, "") then {
+		let Str qt = float_qt(fl)
+		if str_eq(fl, "") then qt = float_qt(fr)
+		const Iarch tf = ctx.next
+		ctx.next = ctx.next + 1
+		if op_is_cmp(op) then write_str(ctx.fd, "\t%t${tf} =l ${float_cmp_op(op, qt)} ${a}, ${b}\n")
+		else write_str(ctx.fd, "\t%t${tf} =${qt} ${op} ${a}, ${b}\n")
+		return "%t${tf}"
+	}
 	const Str fx = bin_fixed(ctx, env, l, r)
 	let Str realop = op
 	if !str_eq(fx, "") && !fixed_signed(fx) then realop = unsigned_op(op)
@@ -372,6 +439,15 @@ const emit_binop = (*Emit ctx, Str op, Expr l, Expr r, [Binding] env): Str -> {
 # operand (`-`/`~` on a fixed value) wraps the result to the type's width.
 const emit_unop = (*Emit ctx, Str pre, Expr x, Str post, [Binding] env): Str -> {
 	const Str a = emit_expr(x, ctx, env)
+	# a float operand: only `-` reaches here (`~` is integer-only) — emit `=<qt> neg <a>`
+	const Str ff = float_name_of(ctx, env, x)
+	if !str_eq(ff, "") then {
+		const Str qt = float_qt(ff)
+		const Iarch tf = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${tf} =${qt} neg ${a}\n")
+		return "%t${tf}"
+	}
 	const Iarch t = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${t} =l ${pre}${a}${post}\n")
@@ -1133,6 +1209,8 @@ const emit_agg_binding = (*Emit ctx, Expr e, [Binding] env): Iarch -> match e {
 # `alloc` in a non-entry block.
 const emit_if = (*Emit ctx, Expr cond, Expr then_e, Expr else_e, [Binding] env): Str -> {
 	const Str c = emit_expr(cond, ctx, env)
+	# the merge slot stores/loads in the branches' QBE type (a float `if` value uses `d`/`s`)
+	const Str qt = qtype_of(ctx, env, then_e)
 	const Iarch slot = ctx.next
 	ctx.next = ctx.next + 1
 	const Iarch lid = ctx.label
@@ -1141,16 +1219,16 @@ const emit_if = (*Emit ctx, Expr cond, Expr then_e, Expr else_e, [Binding] env):
 	write_str(ctx.fd, "\tjnz ${c}, @then${lid}, @else${lid}\n")
 	write_str(ctx.fd, "@then${lid}\n")
 	const Str a = emit_expr(then_e, ctx, env)
-	write_str(ctx.fd, "\tstorel ${a}, %t${slot}\n")
+	write_str(ctx.fd, "\tstore${qt} ${a}, %t${slot}\n")
 	write_str(ctx.fd, "\tjmp @end${lid}\n")
 	write_str(ctx.fd, "@else${lid}\n")
 	const Str b = emit_expr(else_e, ctx, env)
-	write_str(ctx.fd, "\tstorel ${b}, %t${slot}\n")
+	write_str(ctx.fd, "\tstore${qt} ${b}, %t${slot}\n")
 	write_str(ctx.fd, "\tjmp @end${lid}\n")
 	write_str(ctx.fd, "@end${lid}\n")
 	const Iarch rt = ctx.next
 	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${rt} =l loadl %t${slot}\n")
+	write_str(ctx.fd, "\t%t${rt} =${qt} load${qt} %t${slot}\n")
 	return "%t${rt}"
 }
 
@@ -1218,6 +1296,8 @@ const is_cast_type = (Str name): Bool -> {
 	if str_eq(name, "Uint16") then return true
 	if str_eq(name, "Uint32") then return true
 	if str_eq(name, "Uint64") then return true
+	if str_eq(name, "Float32") then return true
+	if str_eq(name, "Float64") then return true
 	return false
 }
 
@@ -1244,6 +1324,41 @@ const emit_call = (*Emit ctx, Str callee, [Expr] args, [Binding] env): Str -> {
 	# `Int8(x)`… narrows to the fixed width (canonicalizing); `Iarch`/`Int`/`Uarch` are identity
 	if is_cast_type(callee) then {
 		const Str v = emit_expr(args[0], ctx, env)
+		const Str src = float_name_of(ctx, env, args[0])
+		const Bool src_float = !str_eq(src, "")
+		if is_float_name(callee) then {
+			# → a float. From a float of a different width: `truncd` (→ single) / `exts` (→ double);
+			# from an integer: `sltof`. Same-width float-to-float is identity.
+			const Str dqt = float_qt(callee)
+			if src_float then {
+				if str_eq(src, callee) then return v
+				const Iarch tc = ctx.next
+				ctx.next = ctx.next + 1
+				if str_eq(callee, "Float32") then write_str(ctx.fd, "\t%t${tc} =s truncd ${v}\n")
+				else write_str(ctx.fd, "\t%t${tc} =d exts ${v}\n")
+				return "%t${tc}"
+			}
+			# an UNSIGNED fixed-width source converts with `ultof`, else signed `sltof` (a
+			# register-width `Uarch` rides cf0's signed-word narrowing — small values are exact)
+			const Str ifx = emit_fixed_of(ctx, env, args[0])
+			let Str icvt = "sltof"
+			if is_fixed_name(ifx) && !fixed_signed(ifx) then icvt = "ultof"
+			const Iarch ti = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${ti} =${dqt} ${icvt} ${v}\n")
+			return "%t${ti}"
+		}
+		# → an integer. A float source converts (`dtosi`/`stosi`, truncating toward zero), then a
+		# fixed-width target canonicalizes to its width; an integer source keeps the existing path.
+		if src_float then {
+			let Str fcvt = "dtosi"
+			if str_eq(src, "Float32") then fcvt = "stosi"
+			const Iarch tf = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${tf} =l ${fcvt} ${v}\n")
+			if is_fixed_name(callee) then return emit_fixed_canon(ctx, fixed_bits(callee), fixed_signed(callee), "%t${tf}")
+			return "%t${tf}"
+		}
 		if !is_fixed_name(callee) then return v
 		return emit_fixed_canon(ctx, fixed_bits(callee), fixed_signed(callee), v)
 	}
@@ -1259,22 +1374,23 @@ const emit_call = (*Emit ctx, Str callee, [Expr] args, [Binding] env): Str -> {
 		if is_agg_param(ctx.funcs[fidx].params[i], ctx.recs, ctx.unions) then {
 			const Str av = emit_expr(args[i], ctx, env)
 			const Iarch tt = copy_agg(ctx, av)
-			aops = [...aops, ArgOp({ temp: tt, is_rec: true })]
+			aops = [...aops, ArgOp({ temp: tt, is_rec: true, qt: "l" })]
 		} else {
+			# a float argument is copied/passed in its QBE type (`d`/`s`); every other in `l`
+			const Str aqt = qtype_of_name(ctx.funcs[fidx].params[i].type_name)
 			const Str op = emit_expr(args[i], ctx, env)
 			const Iarch tt = ctx.next
 			ctx.next = ctx.next + 1
-			write_str(ctx.fd, "\t%t${tt} =l copy ${op}\n")
-			aops = [...aops, ArgOp({ temp: tt, is_rec: false })]
+			write_str(ctx.fd, "\t%t${tt} =${aqt} copy ${op}\n")
+			aops = [...aops, ArgOp({ temp: tt, is_rec: false, qt: aqt })]
 		}
 		i = i + 1
 	}
 	const Iarch rt = ctx.next
 	ctx.next = ctx.next + 1
 	const Bool is_main = str_eq(ctx.funcs[fidx].name, "main")
-	# a record-returning callee yields an `l` arena pointer; every other returns a word
-	if ret_is_l(ctx.funcs[fidx].ret_name, ctx.recs, ctx.unions) then write_str(ctx.fd, "\t%t${rt} =l call $")
-	if !ret_is_l(ctx.funcs[fidx].ret_name, ctx.recs, ctx.unions) then write_str(ctx.fd, "\t%t${rt} =l call $")
+	# a float-returning callee yields `d`/`s`; a record yields an `l` pointer; else a word `l`
+	write_str(ctx.fd, "\t%t${rt} =${qtype_of_name(ctx.funcs[fidx].ret_name)} call $")
 	if is_main then write_str(ctx.fd, "main")
 	if !is_main then write_str(ctx.fd, "f${fidx}")
 	write_str(ctx.fd, "(")
@@ -1283,8 +1399,7 @@ const emit_call = (*Emit ctx, Str callee, [Expr] args, [Binding] env): Str -> {
 		if j >= Iarch(aops.len) then break
 		if j > 0 then write_str(ctx.fd, ", ")
 		const Iarch tj = aops[j].temp
-		if aops[j].is_rec then write_str(ctx.fd, "l %t${tj}")
-		if !aops[j].is_rec then write_str(ctx.fd, "l %t${tj}")
+		write_str(ctx.fd, "${aops[j].qt} %t${tj}")
 		j = j + 1
 	}
 	write_str(ctx.fd, ")\n")
@@ -1372,6 +1487,8 @@ const emit_match = (*Emit ctx, Expr scrut, [MatchArm] arms, [Binding] env): Str 
 	const Iarch lid = ctx.label
 	ctx.label = ctx.label + 1
 	write_str(ctx.fd, "\t%t${slot} =l alloc8 8\n")
+	# the merge slot stores/loads in the arms' QBE type (a float-valued match yields `d`/`s`)
+	const Str qt = qtype_of_name(match_scalar(ctx, env, arms))
 	const Iarch na = Iarch(arms.len)
 	let Iarch i = 0
 	loop {
@@ -1379,7 +1496,7 @@ const emit_match = (*Emit ctx, Expr scrut, [MatchArm] arms, [Binding] env): Str 
 		if i == na - 1 then {
 			const [Binding] benv_e = arm_body_env(ctx, env, arms[i].type_name, arms[i].members, arms[i].binds, s)
 			const Str v = emit_expr(arms[i].body, ctx, benv_e)
-			write_str(ctx.fd, "\tstorel ${v}, %t${slot}\n")
+			write_str(ctx.fd, "\tstore${qt} ${v}, %t${slot}\n")
 			write_str(ctx.fd, "\tjmp @mend${lid}\n")
 		} else {
 			# test each or-pattern alternative: a hit jumps to the arm body, a miss to
@@ -1402,7 +1519,7 @@ const emit_match = (*Emit ctx, Expr scrut, [MatchArm] arms, [Binding] env): Str 
 			write_str(ctx.fd, "@marm${lid}_${i}\n")
 			const [Binding] benv_m = arm_body_env(ctx, env, arms[i].type_name, arms[i].members, arms[i].binds, s)
 			const Str v = emit_expr(arms[i].body, ctx, benv_m)
-			write_str(ctx.fd, "\tstorel ${v}, %t${slot}\n")
+			write_str(ctx.fd, "\tstore${qt} ${v}, %t${slot}\n")
 			write_str(ctx.fd, "\tjmp @mend${lid}\n")
 			write_str(ctx.fd, "@mnext${lid}_${i}\n")
 		}
@@ -1411,7 +1528,7 @@ const emit_match = (*Emit ctx, Expr scrut, [MatchArm] arms, [Binding] env): Str 
 	write_str(ctx.fd, "@mend${lid}\n")
 	const Iarch rt = ctx.next
 	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${rt} =l loadl %t${slot}\n")
+	write_str(ctx.fd, "\t%t${rt} =${qt} load${qt} %t${slot}\n")
 	return "%t${rt}"
 }
 
@@ -1845,6 +1962,7 @@ const is_named_var = (Expr e, Str name): Bool -> match e { Expr.Var(n) -> str_eq
 const emit_expr = (Expr e, *Emit ctx, [Binding] env): Str -> match e {
 	Expr.Lit(v) -> "${v}",
 	Expr.BoolLit(b) -> if b then "1" else "0",
+	Expr.FloatLit(t) -> "d_${t}",
 	Expr.Var(name) -> emit_var(ctx, env, name),
 	Expr.StrLit(bytes) -> emit_str_lit(ctx, bytes),
 	Expr.Interp(segs) -> emit_interp(ctx, segs, env),
@@ -2003,9 +2121,11 @@ const emit_loop_value = (*Emit ctx, [Binding] env, [Stmt] body): Str -> {
 	write_str(ctx.fd, "@lend${lid}\n")
 	ctx.cur_loop = saved
 	ctx.cur_slot = saved_slot
+	# the slot loads in the yielded value's QBE type (a float loop yields `d`/`s`)
+	const Str qt = qtype_of_name(loop_yield_scalar_list(ctx, env, body))
 	const Iarch rt = ctx.next
 	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${rt} =l loadl %t${slot}\n")
+	write_str(ctx.fd, "\t%t${rt} =${qt} load${qt} %t${slot}\n")
 	return "%t${rt}"
 }
 
@@ -2067,9 +2187,10 @@ const emit_simple_stmt = (*Emit ctx, [Binding] env, Stmt s): Iarch -> {
 			term = 1
 		},
 		Stmt.Yield(e) -> {
-			# `<- v` — store the value into the nearest value-loop's merge slot and break to `@lend`
+			# `<- v` — store the value (in its QBE type, `d`/`s` for a float) into the nearest
+			# value-loop's merge slot and break to `@lend`
 			const Str v = emit_expr(e, ctx, env)
-			write_str(ctx.fd, "\tstorel ${v}, %t${ctx.cur_slot}\n")
+			write_str(ctx.fd, "\tstore${qtype_of(ctx, env, e)} ${v}, %t${ctx.cur_slot}\n")
 			write_str(ctx.fd, "\tjmp @lend${ctx.cur_loop}\n")
 			term = 1
 		},
@@ -2089,7 +2210,7 @@ const emit_simple_stmt = (*Emit ctx, [Binding] env, Stmt s): Iarch -> {
 				emit_append_expr(ctx, env, hdr, e, env[idx].elem)
 			} else {
 				const Str v = emit_expr(e, ctx, env)
-				write_str(ctx.fd, "\tstorel ${v}, %t${env[idx].slot}\n")
+				write_str(ctx.fd, "\t${store_op(env[idx].fixed)} ${v}, %t${env[idx].slot}\n")
 			}
 		},
 		Stmt.FieldAssign(b, f, e) -> {
@@ -2190,13 +2311,14 @@ const emit_block = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 				const Str rt = init_agg_type(ctx, env, e)
 				if str_eq(rt, "") then {
 					const Str v = emit_expr(e, ctx, env)
+					# a scalar local records its leaf type (fixed OR float, from the annotation else
+					# inferred) so later ops pick the right codegen and the cell stores/loads with its
+					# QBE type (a float uses `stored`/`loadd`, an integer `storel`/`loadl`)
+					const Str fx = if is_fixed_name(ann) || is_float_name(ann) then ann else scalar_of(ctx, env, e)
 					const Iarch slot = ctx.next
 					ctx.next = ctx.next + 1
 					write_str(ctx.fd, "\t%t${slot} =l alloc8 8\n")
-					write_str(ctx.fd, "\tstorel ${v}, %t${slot}\n")
-					# a fixed-width local records its type (from the annotation, else inferred) so
-					# later ops on it pick the right signed/unsigned codegen and wrap width
-					const Str fx = if is_fixed_name(ann) then ann else emit_fixed_of(ctx, env, e)
+					write_str(ctx.fd, "\t${store_op(fx)} ${v}, %t${slot}\n")
 					env = [...env, Binding({ name: n, slot: slot, rec_type: "", elem: "", is_cell: true, telems: [], fixed: fx })]
 				} else {
 					const Iarch base = emit_agg_binding(ctx, e, env)
@@ -2234,16 +2356,14 @@ const emit_func = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 	# main always returns a word (its Int exit code); a helper returning a record
 	# returns an `l` arena pointer, else a word.
 	if is_main then write_str(ctx.fd, "export function l $main(")
-	if !is_main then {
-		if ret_is_l(fn.ret_name, ctx.recs, ctx.unions) then write_str(ctx.fd, "function l $f${idx}(")
-		if !ret_is_l(fn.ret_name, ctx.recs, ctx.unions) then write_str(ctx.fd, "function l $f${idx}(")
-	}
+	# a float-returning helper is typed `d`/`s`; every other return (word/pointer/record) is `l`
+	if !is_main then write_str(ctx.fd, "function ${qtype_of_name(fn.ret_name)} $f${idx}(")
 	let Iarch si = 0
 	loop {
 		if si >= Iarch(fn.params.len) then break
 		if si > 0 then write_str(ctx.fd, ", ")
-		if param_l(fn.params[si], ctx.recs, ctx.unions) then write_str(ctx.fd, "l %p${si}")
-		if !param_l(fn.params[si], ctx.recs, ctx.unions) then write_str(ctx.fd, "l %p${si}")
+		# a float scalar parameter is `d`/`s`; every other parameter (word/pointer/record) is `l`
+		write_str(ctx.fd, "${qtype_of_name(fn.params[si].type_name)} %p${si}")
 		si = si + 1
 	}
 	write_str(ctx.fd, ") {\n")
@@ -2274,13 +2394,14 @@ const emit_func = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 				write_str(ctx.fd, "\t%t${slot} =l copy %p${pi}\n")
 				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: fn.params[pi].type_name, elem: fn.params[pi].elem, is_cell: false, telems: emit_canon_telems(ctx, fn.params[pi].telems), fixed: "" })]
 			} else {
-				# a word parameter spills into a stack slot so it reads like a local; a fixed-width
-				# parameter records its type name so ops on it get the right signed/unsigned codegen.
+				# a word/float parameter spills into a stack slot so it reads like a local; a
+				# fixed-width or float parameter records its type name so ops on it and the slot's
+				# store/load use the right codegen (a float spills with `stored`/`stores`).
+				const Str pfx = if is_fixed_name(fn.params[pi].type_name) || is_float_name(fn.params[pi].type_name) then fn.params[pi].type_name else ""
 				const Iarch slot = ctx.next
 				ctx.next = ctx.next + 1
 				write_str(ctx.fd, "\t%t${slot} =l alloc8 8\n")
-				write_str(ctx.fd, "\tstorel %p${pi}, %t${slot}\n")
-				const Str pfx = if is_fixed_name(fn.params[pi].type_name) then fn.params[pi].type_name else ""
+				write_str(ctx.fd, "\t${store_op(pfx)} %p${pi}, %t${slot}\n")
 				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: "", elem: "", is_cell: true, telems: [], fixed: pfx })]
 			}
 		}

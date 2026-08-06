@@ -17,7 +17,7 @@
 
 import "io" as { die }
 import "ast" as { Expr, Stmt, Param, Func, Ty, FieldInit, RecDecl, UnionMember, UnionDecl, MatchArm, StmtArm, Seg, TupElem, Program }
-import "astutil" as { is_spread, spread_inner, is_skip, skip_count, is_nested, nested_inner, tel_leaf, tel_nest, tel_is_nest, is_fixed_name, fixed_bits, fixed_signed }
+import "astutil" as { is_spread, spread_inner, is_skip, skip_count, is_nested, nested_inner, tel_leaf, tel_nest, tel_is_nest, is_fixed_name, fixed_bits, fixed_signed, is_float_name, float_bits }
 
 # A name in scope during checking: its type and whether it is reassignable (`let`).
 data VarTy = { Str name, Ty ty, Bool mutable }
@@ -36,6 +36,8 @@ const is_tbool = (Ty t): Bool -> match t { Ty.TBool -> true, _ -> false }
 const is_tstr = (Ty t): Bool -> match t { Ty.TStr -> true, _ -> false }
 const is_tunit = (Ty t): Bool -> match t { Ty.TUnit -> true, _ -> false }
 const is_tfixed = (Ty t): Bool -> match t { Ty.TFixed(b, s) -> true, _ -> false }
+const is_tfloat = (Ty t): Bool -> match t { Ty.TFloat(b) -> true, _ -> false }
+const tfloat_bits = (Ty t): Iarch -> match t { Ty.TFloat(b) -> b, _ -> 0 }
 # The `Ty` a fixed-width name denotes (`Int8` → signed 8-bit, …).
 const fixed_ty = (Str name): Ty -> Ty.TFixed(fixed_bits(name), fixed_signed(name))
 const is_tptr = (Ty t): Bool -> match t { Ty.TPtr -> true, _ -> false }
@@ -138,6 +140,7 @@ const ty_eq = (Ty a, Ty b): Bool -> match a {
 	Ty.TStr -> is_tstr(b),
 	Ty.TUnit -> is_tunit(b),
 	Ty.TFixed(ab, asg) -> match b { Ty.TFixed(bb, bsg) -> ab == bb && (if asg then bsg else !bsg), _ -> false },
+	Ty.TFloat(ab) -> match b { Ty.TFloat(bb) -> ab == bb, _ -> false },
 	Ty.TTuple(ae) -> match b { Ty.TTuple(be) -> tuple_elems_eq(ae, be), _ -> false }
 }
 
@@ -224,6 +227,7 @@ const named_ty = (Str type_name, Str elem, [RecDecl] recs, [UnionDecl] unions): 
 	if str_eq(type_name, "Unit") then return Ty.TUnit
 	# a fixed-width leaf (`Int8`…`Uint64`) is its own width/signedness type, NOT the word `TInt`
 	if is_fixed_name(type_name) then return Ty.TFixed(fixed_bits(type_name), fixed_signed(type_name))
+	if is_float_name(type_name) then return Ty.TFloat(float_bits(type_name))
 	# any integer-family name (`Iarch`/`Int`/`Uarch`/`Uint8`/… — the same set a cast names)
 	# is one word: cf0 tracks every integer width as `TInt` (a genesis narrowing).
 	if is_cast_type(type_name) then return Ty.TInt
@@ -308,6 +312,7 @@ const func_ret_ty = (Func fn, [RecDecl] recs, [UnionDecl] unions): Ty -> {
 	if str_eq(fn.ret_name, "Str") then return Ty.TStr
 	if str_eq(fn.ret_name, "Unit") then return Ty.TUnit
 	if is_fixed_name(fn.ret_name) then return Ty.TFixed(fixed_bits(fn.ret_name), fixed_signed(fn.ret_name))
+	if is_float_name(fn.ret_name) then return Ty.TFloat(float_bits(fn.ret_name))
 	return Ty.TInt
 }
 
@@ -432,9 +437,27 @@ const bitnot_unop = (Expr x, [VarTy] env, Ctx ctx): Ty -> {
 # (type_system §8.5 — negating an unsigned value is undefined). Result keeps the operand's type.
 const neg_unop = (Expr x, [VarTy] env, Ctx ctx): Ty -> {
 	const Ty t = type_of(x, env, ctx)
+	# a float negates fine (`-2.5`); an integer negates unless unsigned (§8.5)
+	if is_tfloat(t) then return t
 	if !is_int_like(t) then die("cf0: type: the operand of unary `-` must be an integer\n")
 	if is_tfixed(t) && !tfixed_signed(t) then die("cf0: type: unary `-` is undefined on an unsigned type\n")
 	return t
+}
+
+# `+ - * /` where either operand may be a FLOAT: two floats of the SAME width (no int/float
+# mix, no adoption — floats are strict, type_system §4) yield that float; otherwise it is an
+# integer op (`num_int_result`, the word/fixed rules). `%` and the bitwise ops stay integer-only.
+const num_binop = (Expr l, Expr r, [VarTy] env, Ctx ctx): Ty -> {
+	const Ty lt = type_of(l, env, ctx)
+	const Ty rt = type_of(r, env, ctx)
+	if is_tfloat(lt) || is_tfloat(rt) then {
+		if !is_tfloat(lt) || !is_tfloat(rt) then die("cf0: type: a float operator needs two floats — no int/float mixing\n")
+		if !ty_eq(lt, rt) then die("cf0: type: a float operator needs both operands of the same float width\n")
+		return lt
+	}
+	if !is_int_like(lt) then die("cf0: type: an arithmetic operand must be a number\n")
+	if !is_int_like(rt) then die("cf0: type: an arithmetic operand must be a number\n")
+	return int_result_ty(lt, rt, l, r)
 }
 
 # `!x` — a Bool operand (no truthiness), a Bool result.
@@ -467,8 +490,14 @@ const cmp_op = (Expr l, Expr r, [VarTy] env, Ctx ctx, Bool is_eq): Ty -> {
 		if union_has_payload(ctx.unions, lu) then die("cf0: type: a union with a payload is recovered with `match`, not compared\n")
 		return Ty.TBool
 	}
-	if !is_int_like(lt) then die("cf0: type: a comparison operand must be an integer\n")
-	if !is_int_like(rt) then die("cf0: type: a comparison operand must be an integer\n")
+	# a float comparison: two floats of the same width, yielding a Bool
+	if is_tfloat(lt) || is_tfloat(rt) then {
+		if !is_tfloat(lt) || !is_tfloat(rt) then die("cf0: type: a float comparison needs two floats — no int/float mixing\n")
+		if !ty_eq(lt, rt) then die("cf0: type: a float comparison needs both operands of the same float width\n")
+		return Ty.TBool
+	}
+	if !is_int_like(lt) then die("cf0: type: a comparison operand must be a number\n")
+	if !is_int_like(rt) then die("cf0: type: a comparison operand must be a number\n")
 	# a fixed-width comparison follows the same match/adopt rules as arithmetic (both operands
 	# the same fixed type, or one an adopting literal); the emitter reads their signedness to
 	# pick a signed vs unsigned compare. The result is always a Bool.
@@ -509,6 +538,8 @@ const is_cast_type = (Str name): Bool -> {
 	if str_eq(name, "Uint16") then return true
 	if str_eq(name, "Uint32") then return true
 	if str_eq(name, "Uint64") then return true
+	if str_eq(name, "Float32") then return true
+	if str_eq(name, "Float64") then return true
 	return false
 }
 
@@ -517,11 +548,13 @@ const is_cast_type = (Str name): Bool -> {
 const cast_type = (Str callee, [Expr] args, [VarTy] env, Ctx ctx): Ty -> {
 	if Iarch(args.len) != 1 then die("cf0: type: a numeric cast takes exactly one argument\n")
 	const Ty ot = type_of(args[0], env, ctx)
-	# the operand is any integer (word or fixed-width); a pointer/Bool/aggregate is rejected
-	if !is_tint(ot) && !is_tfixed(ot) then die("cf0: type: a numeric cast takes a scalar integer (no pointer<->integer conversion)\n")
-	# `Int8(x)`… yields that fixed-width type (a truncating conversion); `Iarch`/`Int`/`Uarch`
-	# yield the register word.
+	# the operand is any number — a word, a fixed-width int, or a float; a pointer/Bool/aggregate
+	# is rejected. Casts cross the integer/float boundary (`Float64(7)`, `Int32(f)`).
+	if !is_tint(ot) && !is_tfixed(ot) && !is_tfloat(ot) then die("cf0: type: a numeric cast takes a scalar number (no pointer<->number conversion)\n")
+	# `Int8(x)`… yields that fixed-width type; `Float32`/`Float64` a float; `Iarch`/`Int`/`Uarch`
+	# the register word. Each is a real conversion of the operand's value.
 	if is_fixed_name(callee) then return fixed_ty(callee)
+	if is_float_name(callee) then return Ty.TFloat(float_bits(callee))
 	return Ty.TInt
 }
 
@@ -1123,6 +1156,7 @@ const type_of = (Expr e, [VarTy] env, Ctx ctx): Ty -> match e {
 	Expr.Lit(v) -> lit_type(v),
 	Expr.BoolLit(b) -> Ty.TBool,
 	Expr.StrLit(bytes) -> strlit_type(bytes),
+	Expr.FloatLit(t) -> Ty.TFloat(64),
 	Expr.Interp(segs) -> interp_type(segs, env, ctx),
 	Expr.Var(name) -> var_type(env, name, ctx),
 	Expr.FieldExpr(base, f) -> fieldexpr_type(base, f, env, ctx),
@@ -1143,10 +1177,10 @@ const type_of = (Expr e, [VarTy] env, Ctx ctx): Ty -> match e {
 	Expr.Neg(x) -> neg_unop(x, env, ctx),
 	Expr.BitNot(x) -> bitnot_unop(x, env, ctx),
 	Expr.Not(x) -> not_op(x, env, ctx),
-	Expr.Add(l, r) -> int_binop(l, r, env, ctx),
-	Expr.Sub(l, r) -> int_binop(l, r, env, ctx),
-	Expr.Mul(l, r) -> int_binop(l, r, env, ctx),
-	Expr.Div(l, r) -> int_binop(l, r, env, ctx),
+	Expr.Add(l, r) -> num_binop(l, r, env, ctx),
+	Expr.Sub(l, r) -> num_binop(l, r, env, ctx),
+	Expr.Mul(l, r) -> num_binop(l, r, env, ctx),
+	Expr.Div(l, r) -> num_binop(l, r, env, ctx),
 	Expr.Mod(l, r) -> int_binop(l, r, env, ctx),
 	Expr.BitAnd(l, r) -> int_binop(l, r, env, ctx),
 	Expr.BitOr(l, r) -> int_binop(l, r, env, ctx),
@@ -1214,7 +1248,7 @@ const check_simple_stmt = (Stmt s, [VarTy] env, Ctx ctx, Iarch loop_kind): Iarch
 			# a WORD slot, so it must be a scalar (a record/Str/tuple yield is rejected).
 			if loop_kind != lk_value then die("cf0: type: `<- v` is only valid inside a value-yielding `loop`\n")
 			const Ty yt = type_of(e, env, ctx)
-			if !is_int_like(yt) && !is_tbool(yt) then die("cf0: type: a value-yielding loop merges through a word slot — it yields a scalar, not a record/Str/tuple\n")
+			if !is_int_like(yt) && !is_tbool(yt) && !is_tfloat(yt) then die("cf0: type: a value-yielding loop merges through one slot — it yields a scalar, not a record/Str/tuple\n")
 			code = 1
 		},
 		Stmt.Return(e) -> {
@@ -1473,6 +1507,9 @@ const check_whole = (Program prog): Iarch -> {
 				if str_eq(prog.recs[r].fields[b], prog.recs[r].fields[a]) then die("cf0: type: a record declares a field twice\n")
 				b = b + 1
 			}
+			# a float record field would store/load through the aggregate's uniform-word slot —
+			# floats in aggregates (fields/tuple positions) are a later brick, rejected for now
+			if is_float_name(prog.recs[r].ftypes[a]) then die("cf0: type: a float record field is not yet supported (floats in aggregates are a later brick)\n")
 			a = a + 1
 		}
 		r = r + 1
