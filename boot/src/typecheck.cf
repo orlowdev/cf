@@ -25,7 +25,9 @@ data VarTy = { Str name, Ty ty, Bool mutable }
 # The whole-program context threaded through typing: the functions (a call resolves
 # its callee here), the record declarations (a data literal / field read), and the
 # union declarations (a `Type.member` construction / a `match`).
-data Ctx = { [Func] funcs, [RecDecl] recs, [UnionDecl] unions }
+# `frt` is the CURRENT function's declared return type, threaded on `Ctx` so `type_of` can
+# check a value-yielding loop's body (which may itself `return`) without a separate parameter.
+data Ctx = { [Func] funcs, [RecDecl] recs, [UnionDecl] unions, Ty frt }
 
 # --- small helpers --------------------------------------------------------------------
 
@@ -1028,6 +1030,95 @@ const fieldexpr_type = (Expr base, Str field, [VarTy] env, Ctx ctx): Ty -> {
 	return field_decl_ty(ri, fi, ctx)
 }
 
+# The type a `let`/`const` binding takes: a fixed-width annotation ADOPTS a bare literal
+# (range-checked) or demands the exact type; otherwise it is inferred from the value. Shared
+# by the statement checker and the value-loop yield walk (which threads bindings the same way).
+const binding_ty = (Str ann, Expr e, [VarTy] env, Ctx ctx): Ty -> {
+	if is_fixed_name(ann) then {
+		if is_adoptable_lit(e) then return adopt_fixed(e, ann)
+		const Ty t = type_of(e, env, ctx)
+		if !ty_eq(t, fixed_ty(ann)) then die("cf0: type: a fixed-width binding needs a value of that exact type or an adopting integer literal\n")
+		return t
+	}
+	return type_of(e, env, ctx)
+}
+
+# The enclosing-loop kind threaded through statement checking, so `break`/`continue`/`<-`
+# validate against the NEAREST loop: none, a value-yielding `loop` (exits with `<- v`, so a
+# bare `break` is rejected), a statement `loop`, or a `for` (both statement-only — no `<-`).
+const lk_none = 0
+const lk_value = 1
+const lk_stmt = 2
+const lk_for = 3
+
+# The types every `<- v` in a value-loop body yields — walked so the `loop` expression gets
+# one type. Recurses through `if`/`match`/block bodies but NOT a nested `loop`/`for` (each
+# opens its own value context). (Typed-list helpers avoid a bare `[]` mis-inferring in a
+# match arm; a yield's value is typed in the loop's ENTRY env — sufficient for cf0's uses.)
+const no_tys = (): [Ty] -> { let [Ty] r = [] return r }
+const one_ty = (Ty t): [Ty] -> { let [Ty] r = [t] return r }
+const cat_tys = ([Ty] a, [Ty] b): [Ty] -> {
+	let [Ty] r = a
+	let Iarch i = 0
+	loop { if i >= Iarch(b.len) then break r = [...r, b[i]] i = i + 1 }
+	return r
+}
+const yields_of_list = ([Stmt] ss, [VarTy] env0, Ctx ctx): [Ty] -> {
+	# thread the env through bindings so a `<- v` sees `let`s declared earlier in the body
+	# (e.g. a nested loop bound to a name and then yielded) — mirroring the statement checker
+	let [VarTy] env = []
+	let Iarch e0 = 0
+	loop { if e0 >= Iarch(env0.len) then break env = [...env, env0[e0]] e0 = e0 + 1 }
+	let [Ty] r = no_tys()
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		const Stmt s = ss[i]
+		match s {
+			Stmt.Let(n, m, ann, e) -> { env = [...env, VarTy({ name: n, ty: binding_ty(ann, e, env, ctx), mutable: m })] },
+			Stmt.Destructure(pat, m, e) -> { env = check_destructure(pat, m, e, env, ctx) },
+			_ -> { r = cat_tys(r, yields_of_stmt(s, env, ctx)) }
+		}
+		i = i + 1
+	}
+	return r
+}
+const yields_of_arms = ([StmtArm] arms, [VarTy] env, Ctx ctx): [Ty] -> {
+	let [Ty] r = no_tys()
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		# type the arm's `<- v` in the arm's payload-bound env (a `<- boundvar` must resolve)
+		const [VarTy] benv = arm_bind_env(arms[i].type_name, arms[i].members, arms[i].binds, env, ctx)
+		r = cat_tys(r, yields_of_list(arms[i].body, benv, ctx))
+		i = i + 1
+	}
+	return r
+}
+const yields_of_stmt = (Stmt s, [VarTy] env, Ctx ctx): [Ty] -> match s {
+	Stmt.Yield(e) -> one_ty(type_of(e, env, ctx)),
+	Stmt.IfThen(c, b) -> yields_of_stmt(b, env, ctx),
+	Stmt.IfElse(c, tb, eb) -> cat_tys(yields_of_stmt(tb, env, ctx), yields_of_stmt(eb, env, ctx)),
+	Stmt.Block(ss) -> yields_of_list(ss, env, ctx),
+	Stmt.Match(scrut, arms) -> yields_of_arms(arms, env, ctx),
+	_ -> no_tys()
+}
+# The type of a value-yielding `loop { … }`: validate its body in a value-loop context (so
+# `<- v` is allowed, a bare `break` rejected, reachability and returns checked), then require
+# it to reach at least one `<- v` and that all yields share one type.
+const loop_expr_type = ([Stmt] body, [VarTy] env, Ctx ctx): Ty -> {
+	check_stmts(body, env, ctx, lk_value)
+	const [Ty] ys = yields_of_list(body, env, ctx)
+	if Iarch(ys.len) == 0 then die("cf0: type: a `loop` used as a value must reach a `<- v`\n")
+	let Iarch i = 1
+	loop {
+		if i >= Iarch(ys.len) then break
+		if !ty_eq(ys[0], ys[i]) then die("cf0: type: a value-yielding loop's `<- v` yields must all have the same type\n")
+		i = i + 1
+	}
+	return ys[0]
+}
+
 const type_of = (Expr e, [VarTy] env, Ctx ctx): Ty -> match e {
 	Expr.Lit(v) -> lit_type(v),
 	Expr.BoolLit(b) -> Ty.TBool,
@@ -1045,6 +1136,7 @@ const type_of = (Expr e, [VarTy] env, Ctx ctx): Ty -> match e {
 	Expr.IndexExpr(base, idx) -> indexexpr_type(base, idx, env, ctx),
 	Expr.Tuple(elems) -> tuple_type(elems, env, ctx),
 	Expr.Unit -> Ty.TUnit,
+	Expr.Loop(body) -> loop_expr_type(body, env, ctx),
 	Expr.Spread(x) -> spread_bad_type(),
 	Expr.Buffer(n) -> Ty.TPtr,
 	Expr.Addr(name) -> var_type(env, name, ctx),
@@ -1080,13 +1172,13 @@ const type_of = (Expr e, [VarTy] env, Ctx ctx): Ty -> match e {
 # Check a `for lv in arr { body }`: `arr` must be a dynamic array, and the body is
 # checked with `lv` bound as an `Int`. Called directly from `check_stmts`'s `ForIn`
 # match arm, which binds the loop variable, array name, and body.
-const check_for_body = (Func fn, Str lv, Str arr, [Stmt] body, [VarTy] env, Ctx ctx, Ty frt): Iarch -> {
+const check_for_body = (Str lv, Str arr, [Stmt] body, [VarTy] env, Ctx ctx): Iarch -> {
 	const Iarch ai = env_index(env, arr)
 	if ai < 0 then die("cf0: type: `for` over an undeclared name\n")
 	if str_eq(dyn_of(env[ai].ty), "") then die("cf0: type: `for` needs a dynamic array\n")
 	if env_index(env, lv) >= 0 then die("cf0: type: a `for` loop variable cannot shadow an existing binding\n")
 	const [VarTy] benv = [...env, VarTy({ name: lv, ty: Ty.TInt, mutable: false })]
-	return check_stmts(fn, body, benv, ctx, frt, true)
+	return check_stmts(body, benv, ctx, lk_for)
 }
 
 # Check one function: seed the environment with its parameters (immutable; a word
@@ -1103,25 +1195,36 @@ const check_for_body = (Func fn, Str lv, Str arr, [Stmt] body, [VarTy] env, Ctx 
 # 0 = falls through (an assignment, or a guard — the guarded statement is conditional,
 # so a guard never terminates the enclosing flow). A binding or block statement in a
 # guard body is rejected.
-const check_simple_stmt = (Func fn, Stmt s, [VarTy] env, Ctx ctx, Ty frt, Bool in_loop): Iarch -> {
+const check_simple_stmt = (Stmt s, [VarTy] env, Ctx ctx, Iarch loop_kind): Iarch -> {
 	let Iarch code = 0
 	match s {
 		Stmt.Break -> {
-			if !in_loop then die("cf0: type: `break` is only valid inside a loop\n")
+			if loop_kind == lk_none then die("cf0: type: `break` is only valid inside a loop\n")
+			# a value-yielding loop exits with `<- v`, never a bare `break`
+			if loop_kind == lk_value then die("cf0: type: a value-yielding loop exits with `<- v`, not a bare `break`\n")
 			code = 1
 		},
 		Stmt.Continue -> {
-			if !in_loop then die("cf0: type: `continue` is only valid inside a loop\n")
+			if loop_kind == lk_none then die("cf0: type: `continue` is only valid inside a loop\n")
+			code = 1
+		},
+		Stmt.Yield(e) -> {
+			# `<- v` yields a value from the nearest loop; only a `loop` used as an expression
+			# has a value slot (a statement `loop`/`for` does not), and the value merges through
+			# a WORD slot, so it must be a scalar (a record/Str/tuple yield is rejected).
+			if loop_kind != lk_value then die("cf0: type: `<- v` is only valid inside a value-yielding `loop`\n")
+			const Ty yt = type_of(e, env, ctx)
+			if !is_int_like(yt) && !is_tbool(yt) then die("cf0: type: a value-yielding loop merges through a word slot — it yields a scalar, not a record/Str/tuple\n")
 			code = 1
 		},
 		Stmt.Return(e) -> {
 			# a bare `[]` return adopts the function's declared element type (context-directed —
 			# `type_of` would default it to `[Iarch]` and spuriously mismatch a `[Str]`/`[T]` return)
 			if is_empty_arraylit(e) then {
-				if str_eq(dyn_of(frt), "") then die("cf0: type: `[]` may only be returned as a dynamic array\n")
+				if str_eq(dyn_of(ctx.frt), "") then die("cf0: type: `[]` may only be returned as a dynamic array\n")
 			} else {
 				const Ty rty = type_of(e, env, ctx)
-				if !ty_eq(rty, frt) then die("cf0: type: a returned value's type must match the function's return type\n")
+				if !ty_eq(rty, ctx.frt) then die("cf0: type: a returned value's type must match the function's return type\n")
 			}
 			code = 2
 		},
@@ -1164,12 +1267,12 @@ const check_simple_stmt = (Func fn, Stmt s, [VarTy] env, Ctx ctx, Ty frt, Bool i
 		},
 		Stmt.IfThen(c, body) -> {
 			if !is_tbool(type_of(c, env, ctx)) then die("cf0: type: an `if` condition must be a Bool (no truthiness)\n")
-			check_simple_stmt(fn, body, env, ctx, frt, in_loop)
+			check_simple_stmt(body, env, ctx, loop_kind)
 		},
 		Stmt.IfElse(c, tb, eb) -> {
 			if !is_tbool(type_of(c, env, ctx)) then die("cf0: type: an `if` condition must be a Bool (no truthiness)\n")
-			const Iarch tc = check_simple_stmt(fn, tb, env, ctx, frt, in_loop)
-			const Iarch ec = check_simple_stmt(fn, eb, env, ctx, frt, in_loop)
+			const Iarch tc = check_simple_stmt(tb, env, ctx, loop_kind)
+			const Iarch ec = check_simple_stmt(eb, env, ctx, loop_kind)
 			# terminal only if BOTH branches terminate; the function returns on this path
 			# only if both branches `return` (a `break`/`continue` leaves the loop, not the fn).
 			if tc >= 1 then { if ec >= 1 then code = 1 }
@@ -1181,11 +1284,11 @@ const check_simple_stmt = (Func fn, Stmt s, [VarTy] env, Ctx ctx, Ty frt, Bool i
 		},
 		Stmt.Block(stmts) -> {
 			# a `{ … }` guard body — its own scope; its terminal code is the block's.
-			code = check_stmts(fn, stmts, env, ctx, frt, in_loop)
+			code = check_stmts(stmts, env, ctx, loop_kind)
 		},
 		Stmt.Match(scrut, arms) -> {
 			# a statement-position `match` — dispatched for effect; terminal iff every arm is.
-			code = check_stmt_match(fn, scrut, arms, env, ctx, frt, in_loop)
+			code = check_stmt_match(scrut, arms, env, ctx, loop_kind)
 		},
 		_ -> {
 			die("cf0: type: a statement `if` may guard only a block, a `return`, an assignment, a call, or `break`/`continue`\n")
@@ -1202,7 +1305,7 @@ const check_simple_stmt = (Func fn, Stmt s, [VarTy] env, Ctx ctx, Ty frt, Bool i
 # its loop variable an `Int` bound in the (recursively checked) body; every other statement
 # is a "simple" one delegated to `check_simple_stmt`, whose reachability code drives the
 # unreachable-after-terminator and must-return checks.
-const check_stmts = (Func fn, [Stmt] stmts, [VarTy] env0, Ctx ctx, Ty frt, Bool in_loop): Iarch -> {
+const check_stmts = ([Stmt] stmts, [VarTy] env0, Ctx ctx, Iarch loop_kind): Iarch -> {
 	let [VarTy] env = []
 	let Iarch e0 = 0
 	loop {
@@ -1218,30 +1321,18 @@ const check_stmts = (Func fn, [Stmt] stmts, [VarTy] env0, Ctx ctx, Ty frt, Bool 
 		if terminated then die("cf0: type: unreachable statement after `break`/`continue`/`return`\n")
 		const Stmt s = stmts[i]
 		match s {
-			Stmt.Loop(bd) -> { check_stmts(fn, bd, env, ctx, frt, true) },
-			Stmt.ForIn(fv, fa, fbd) -> { check_for_body(fn, fv, fa, fbd, env, ctx, frt) },
+			Stmt.Loop(bd) -> { check_stmts(bd, env, ctx, lk_stmt) },
+			Stmt.ForIn(fv, fa, fbd) -> { check_for_body(fv, fa, fbd, env, ctx) },
 			Stmt.Let(n, m, ann, e) -> {
 				if env_index(env, n) >= 0 then die("cf0: type: a binding cannot shadow an existing name\n")
-				# a fixed-width annotation (`const Int8 x = …`) either ADOPTS a bare integer
-				# literal (range-checked, §3) or demands a value already of that exact type (no
-				# implicit widen/narrow); every other annotation is inferred from the value.
-				let Ty ty = Ty.TInt
-				if is_fixed_name(ann) then {
-					if is_adoptable_lit(e) then ty = adopt_fixed(e, ann)
-					else {
-						ty = type_of(e, env, ctx)
-						if !ty_eq(ty, fixed_ty(ann)) then die("cf0: type: a fixed-width binding needs a value of that exact type or an adopting integer literal\n")
-					}
-				} else {
-					ty = type_of(e, env, ctx)
-				}
+				const Ty ty = binding_ty(ann, e, env, ctx)
 				if m && is_ttuple(ty) then die("cf0: type: a tuple binds `const` only (a mutable tuple is a later brick)\n")
 				if is_ttuple(ty) && !is_tuple_bindable(e) then die("cf0: type: this expression cannot bind a tuple\n")
 				env = [...env, VarTy({ name: n, ty: ty, mutable: m })]
 			},
 			Stmt.Destructure(pat, m, e) -> { env = check_destructure(pat, m, e, env, ctx) },
 			_ -> {
-				const Iarch t = check_simple_stmt(fn, s, env, ctx, frt, in_loop)
+				const Iarch t = check_simple_stmt(s, env, ctx, loop_kind)
 				if t >= 1 then {
 					terminated = true
 					term_code = t
@@ -1261,7 +1352,7 @@ const check_stmts = (Func fn, [Stmt] stmts, [VarTy] env0, Ctx ctx, Ty frt, Bool 
 # locals do not leak). A statement `match` is always treated as NON-terminal (returns 0, so
 # a function still needs an explicit trailing `return` after it) — matching the genesis
 # compiler, and correct for cf0's own use where every arm falls through.
-const check_stmt_match = (Func fn, Expr scrut, [StmtArm] arms, [VarTy] env, Ctx ctx, Ty frt, Bool in_loop): Iarch -> {
+const check_stmt_match = (Expr scrut, [StmtArm] arms, [VarTy] env, Ctx ctx, Iarch loop_kind): Iarch -> {
 	const Str un = union_of(type_of(scrut, env, ctx))
 	if str_eq(un, "") then die("cf0: type: a match scrutinee must be a union\n")
 	const Iarch ui = find_union(ctx.unions, un)
@@ -1312,7 +1403,7 @@ const check_stmt_match = (Func fn, Expr scrut, [StmtArm] arms, [VarTy] env, Ctx 
 			}
 		}
 		const [VarTy] benv = arm_bind_env(arms[i].type_name, arms[i].members, arms[i].binds, env, ctx)
-		check_stmts(fn, arms[i].body, benv, ctx, frt, in_loop)
+		check_stmts(arms[i].body, benv, ctx, loop_kind)
 		i = i + 1
 	}
 	if !wild_seen then {
@@ -1339,6 +1430,8 @@ const check_func = (Func fn, Ctx ctx): Iarch -> {
 	# still register it for callers (call_type resolves them); the asm is emitted verbatim.
 	if fn.is_asm then return 0
 	const Ty frt = func_ret_ty(fn, ctx.recs, ctx.unions)
+	# thread this function's return type on the Ctx so `type_of` (a value-loop body) can reach it
+	const Ctx fctx = Ctx({ funcs: ctx.funcs, recs: ctx.recs, unions: ctx.unions, frt: frt })
 	let [VarTy] env = []
 	let Iarch pi = 0
 	loop {
@@ -1351,7 +1444,7 @@ const check_func = (Func fn, Ctx ctx): Iarch -> {
 		env = [...env, VarTy({ name: fn.params[pi].name, ty: pty, mutable: pmut })]
 		pi = pi + 1
 	}
-	const Iarch dr = check_stmts(fn, fn.body, env, ctx, frt, false)
+	const Iarch dr = check_stmts(fn.body, env, fctx, lk_none)
 	if dr != 2 then die("cf0: type: a function body must end with `return`\n")
 	return 0
 }
@@ -1409,7 +1502,7 @@ const check_whole = (Program prog): Iarch -> {
 # authority for all semantic validation; the emitter does no re-checking.
 pub const check_program = (Program prog): Iarch -> {
 	check_whole(prog)
-	let Ctx ctx = Ctx({ funcs: prog.funcs, recs: prog.recs, unions: prog.unions })
+	let Ctx ctx = Ctx({ funcs: prog.funcs, recs: prog.recs, unions: prog.unions, frt: Ty.TInt })
 	let Iarch f = 0
 	loop {
 		if f >= Iarch(prog.funcs.len) then break

@@ -9,7 +9,7 @@
 # (`acc = Expr.Add(acc, rhs)`) — one function per precedence level.
 
 import "io" as { die }
-import "token" as { Token, TokKind, is_eof, is_ident, is_intlit, is_strlit, is_lparen, is_rparen, is_lbrace, is_rbrace, is_lbracket, is_rbracket, is_comma, is_colon, is_dot, is_ellipsis, is_eq, is_arrow, is_minus, is_plus, is_star, is_slash, is_percent, is_amp, is_pipe, is_caret, is_tilde, is_bang, is_shl, is_shr, is_eqeq, is_ne, is_lt, is_gt, is_le, is_ge, is_logand, is_logor }
+import "token" as { Token, TokKind, is_eof, is_ident, is_intlit, is_strlit, is_lparen, is_rparen, is_lbrace, is_rbrace, is_lbracket, is_rbracket, is_comma, is_colon, is_dot, is_ellipsis, is_eq, is_arrow, is_minus, is_plus, is_star, is_slash, is_percent, is_amp, is_pipe, is_caret, is_tilde, is_bang, is_shl, is_shr, is_eqeq, is_ne, is_lt, is_gt, is_le, is_ge, is_logand, is_logor, is_yield }
 import "lexer" as { lex }
 import "ast" as { Expr, Stmt, Param, Func, Ty, FieldInit, RecDecl, UnionMember, UnionDecl, MatchArm, StmtArm, Seg, RetSig, TupElem, Import, Program }
 import "astutil" as { tel_leaf, tel_nest }
@@ -533,6 +533,14 @@ const postfix_chain = (*Parser p, Expr base): Expr -> {
 const parse_primary = (*Parser p): Expr -> {
 	if kw(p, "if") then return parse_if(p)
 	if kw(p, "match") then return parse_match(p)
+	# `loop { … }` in expression position is a VALUE-yielding loop (`<- v` breaks with a value);
+	# in statement position `parse_stmt` reads it as an effect-only `Stmt.Loop`.
+	if kw(p, "loop") then {
+		p.pos = p.pos + 1
+		if !is_lbrace(peek(p)) then die("cf0: parse: expected `{` after `loop`\n")
+		p.pos = p.pos + 1
+		return Expr.Loop(parse_block(p))
+	}
 	if is_lbracket(peek(p)) then return parse_array_lit(p)
 	# `true`/`false` — Bool literals. Typed `Bool` by the typecheck phase; lowered to
 	# the 1/0 words a Bool is represented by at emit.
@@ -883,6 +891,12 @@ const parse_stmt = (*Parser p): Stmt -> {
 	if kw(p, "loop") then return parse_loop(p)
 	if kw(p, "if") then return parse_guard(p)
 	if kw(p, "match") then return parse_stmt_match(p)
+	# `<- v` — yield `v` from the nearest value-yielding loop (break-with-value). Only valid
+	# inside a `loop` used as an expression; the typecheck phase enforces the context.
+	if is_yield(peek(p)) then {
+		p.pos = p.pos + 1
+		return Stmt.Yield(parse_expr(p))
+	}
 	if kw(p, "break") then {
 		p.pos = p.pos + 1
 		return Stmt.Break

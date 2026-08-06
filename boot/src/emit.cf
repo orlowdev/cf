@@ -26,7 +26,9 @@ import "astutil" as { is_spread, spread_inner, is_skip, skip_count, is_nested, n
 # field read / data literal resolves a field's byte offset), and its union
 # declarations (a `Type.member` / `match` resolves a member's tag). `next`/`label`
 # reset per function; `funcs`/`recs`/`unions` are constant across the program.
-data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs, [RecDecl] recs, [UnionDecl] unions, Iarch cur_loop }
+# `cur_slot` is the merge-slot temp of the nearest value-yielding `loop` (or -1) — a `<- v`
+# stores into it and jumps to `@lend${cur_loop}`, and the `loop` expression loads it afterward.
+data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs, [RecDecl] recs, [UnionDecl] unions, Iarch cur_loop, Iarch cur_slot }
 
 # A local/parameter in scope: its interned name, `slot`, its `rec_type` (a record/union
 # type name, `"$dyn"`, `"$ptr"`, or `"Str"` — `""` for a word), and `elem` (a dynamic
@@ -258,9 +260,47 @@ const match_fixed = (*Emit ctx, [Binding] env, [MatchArm] arms): Str -> {
 	if Iarch(arms.len) == 0 then return ""
 	return emit_fixed_of(ctx, env, arms[0].body)
 }
+# The fixed-width type a value-yielding `loop` produces — the first `<- v`'s type (all yields
+# agree, per typecheck). Walks the body like the type checker's yield walk, recursing into
+# if/match/block but NOT a nested loop, so a fixed-yielding loop used in an op still gets the
+# right signed/unsigned codegen and wrap even when no other operand supplies the type.
+const loop_yield_fixed_list = (*Emit ctx, [Binding] env, [Stmt] ss): Str -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		const Str f = loop_yield_fixed_stmt(ctx, env, ss[i])
+		if !str_eq(f, "") then return f
+		i = i + 1
+	}
+	return ""
+}
+const loop_yield_fixed_arms = (*Emit ctx, [Binding] env, [StmtArm] arms): Str -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		const Str f = loop_yield_fixed_list(ctx, env, arms[i].body)
+		if !str_eq(f, "") then return f
+		i = i + 1
+	}
+	return ""
+}
+const loop_yield_fixed_stmt = (*Emit ctx, [Binding] env, Stmt s): Str -> match s {
+	Stmt.Yield(e) -> emit_fixed_of(ctx, env, e),
+	Stmt.IfThen(c, b) -> loop_yield_fixed_stmt(ctx, env, b),
+	Stmt.IfElse(c, tb, eb) -> loop_yield_fixed_either(ctx, env, tb, eb),
+	Stmt.Block(ss) -> loop_yield_fixed_list(ctx, env, ss),
+	Stmt.Match(scrut, arms) -> loop_yield_fixed_arms(ctx, env, arms),
+	_ -> ""
+}
+const loop_yield_fixed_either = (*Emit ctx, [Binding] env, Stmt a, Stmt b): Str -> {
+	const Str f = loop_yield_fixed_stmt(ctx, env, a)
+	if !str_eq(f, "") then return f
+	return loop_yield_fixed_stmt(ctx, env, b)
+}
 const emit_fixed_of = (*Emit ctx, [Binding] env, Expr e): Str -> match e {
 	Expr.Call(callee, args) -> call_fixed(ctx, callee),
 	Expr.Var(n) -> var_fixed(env, n),
+	Expr.Loop(body) -> loop_yield_fixed_list(ctx, env, body),
 	Expr.Add(l, r) -> bin_fixed(ctx, env, l, r),
 	Expr.Sub(l, r) -> bin_fixed(ctx, env, l, r),
 	Expr.Mul(l, r) -> bin_fixed(ctx, env, l, r),
@@ -1817,6 +1857,7 @@ const emit_expr = (Expr e, *Emit ctx, [Binding] env): Str -> match e {
 	Expr.IndexExpr(base, idx) -> emit_index_expr(ctx, env, base, idx),
 	Expr.Tuple(elems) -> emit_tuple(ctx, elems, env),
 	Expr.Unit -> "0",
+	Expr.Loop(body) -> emit_loop_value(ctx, env, body),
 	Expr.Spread(x) -> spread_emit_bad(),
 	Expr.Buffer(n) -> emit_buffer(ctx, n),
 	Expr.Addr(name) -> emit_var(ctx, env, name),
@@ -1942,6 +1983,32 @@ const emit_loop_body = (*Emit ctx, [Binding] env, [Stmt] body): Iarch -> {
 	return 0
 }
 
+# Emit a value-yielding `loop { … }` (an expression): allocate ONE merge slot before the loop
+# (so a long loop does not leak — it is not re-alloc'd per iteration), then `@ltop` / body /
+# back-edge / `@lend` like a statement loop, but with `cur_slot` set so each `<- v` stores its
+# value into the slot and jumps to `@lend`. After the loop, load the slot as the result.
+const emit_loop_value = (*Emit ctx, [Binding] env, [Stmt] body): Str -> {
+	const Iarch slot = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${slot} =l alloc8 8\n")
+	const Iarch lid = ctx.label
+	ctx.label = ctx.label + 1
+	const Iarch saved = ctx.cur_loop
+	const Iarch saved_slot = ctx.cur_slot
+	ctx.cur_loop = lid
+	ctx.cur_slot = slot
+	write_str(ctx.fd, "@ltop${lid}\n")
+	const Iarch term = emit_block(ctx, body, env)
+	if term == 0 then write_str(ctx.fd, "\tjmp @ltop${lid}\n")
+	write_str(ctx.fd, "@lend${lid}\n")
+	ctx.cur_loop = saved
+	ctx.cur_slot = saved_slot
+	const Iarch rt = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${rt} =l loadl %t${slot}\n")
+	return "%t${rt}"
+}
+
 # Emit a statement-position `if cond then <body>` guard: branch on the condition into a
 # `@then` block that runs the guarded statement, then fall through to `@gnext`. When the
 # guarded statement is itself terminal (`break`/`continue`/`return` writes its own jump)
@@ -1997,6 +2064,13 @@ const emit_simple_stmt = (*Emit ctx, [Binding] env, Stmt s): Iarch -> {
 		},
 		Stmt.Continue -> {
 			write_str(ctx.fd, "\tjmp @ltop${ctx.cur_loop}\n")
+			term = 1
+		},
+		Stmt.Yield(e) -> {
+			# `<- v` — store the value into the nearest value-loop's merge slot and break to `@lend`
+			const Str v = emit_expr(e, ctx, env)
+			write_str(ctx.fd, "\tstorel ${v}, %t${ctx.cur_slot}\n")
+			write_str(ctx.fd, "\tjmp @lend${ctx.cur_loop}\n")
 			term = 1
 		},
 		Stmt.Return(e) -> {
@@ -2565,7 +2639,7 @@ pub const emit_program = (Program prog, Uarch qbe_fd, Uarch asm_fd): Iarch -> {
 		if i >= Iarch(prog.funcs.len) then break
 		# an asm function is emitted into the floor, not through QBE
 		if !prog.funcs[i].is_asm then {
-			let Emit ctx = Emit({ fd: qbe_fd, next: 0, label: 0, funcs: prog.funcs, recs: prog.recs, unions: prog.unions, cur_loop: 0 - 1 })
+			let Emit ctx = Emit({ fd: qbe_fd, next: 0, label: 0, funcs: prog.funcs, recs: prog.recs, unions: prog.unions, cur_loop: 0 - 1, cur_slot: 0 - 1 })
 			emit_func(&ctx, prog.funcs[i], i)
 		}
 		i = i + 1
