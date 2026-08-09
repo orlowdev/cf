@@ -260,6 +260,13 @@ const var_scalar = ([Binding] env, Str n): Str -> {
 	if idx < 0 then return ""
 	return env[idx].fixed
 }
+# The scalar-leaf type of a call result, env-aware: an INDIRECT call through a function-value
+# binding yields its signature's return type (`elem`); a direct call defers to `call_scalar`.
+const call_scalar_e = (*Emit ctx, [Binding] env, Str callee): Str -> {
+	const Iarch bi = lookup_index(env, callee)
+	if bi >= 0 then { if str_eq(env[bi].rec_type, "$fn") then return scalar_only(env[bi].elem) }
+	return call_scalar(ctx, callee)
+}
 # A record field / tuple position / array element type NAME, kept only when it is a scalar leaf.
 const scalar_only = (Str name): Str -> if is_fixed_name(name) || is_float_name(name) then name else ""
 const field_scalar = (*Emit ctx, Str rt, Str field): Str -> scalar_only(field_ftype(ctx, rt, field))
@@ -310,7 +317,7 @@ const loop_yield_scalar_either = (*Emit ctx, [Binding] env, Stmt a, Stmt b): Str
 	return loop_yield_scalar_stmt(ctx, env, b)
 }
 const scalar_of = (*Emit ctx, [Binding] env, Expr e): Str -> match e {
-	Expr.Call(callee, tyargs, args) -> call_scalar(ctx, callee),
+	Expr.Call(callee, tyargs, args) -> call_scalar_e(ctx, env, callee),
 	Expr.Var(n) -> var_scalar(env, n),
 	Expr.FloatLit(t) -> "Float64",
 	Expr.Loop(body) -> loop_yield_scalar_list(ctx, env, body),
@@ -1320,6 +1327,57 @@ const emit_fixed_canon = (*Emit ctx, Iarch bits, Bool signed, Str v): Str -> {
 	return "%t${t2}"
 }
 
+# The name of a bare `Var` argument (a function reference), or "".
+const argvar_name = (Expr e): Str -> match e { Expr.Var(n) -> n, _ -> "" }
+
+# The code-address value of a function reference passed to a function-type parameter: a
+# function-value binding in scope loads its held address; a top-level function by name takes its
+# symbol `$f${idx}`. (Only a bare name reaches here — the typecheck phase rejects anything else.)
+const emit_fnval = (*Emit ctx, [Binding] env, Expr arg): Str -> {
+	const Str nm = argvar_name(arg)
+	const Iarch bi = lookup_index(env, nm)
+	if bi >= 0 then return binding_ptr(ctx, env, bi)
+	const Iarch fi = find_func(ctx.funcs, nm)
+	if fi < 0 then die("cf0: emit: internal: a function-type argument names no function\n")
+	const Iarch t = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${t} =l copy $f${fi}\n")
+	return "%t${t}"
+}
+
+# Emit an INDIRECT call `f(args)` through a function-value binding: load its code address, then
+# `call` it with each argument in the signature's QBE class (`telems` the argument type names,
+# `elem` the return type name).
+const emit_indirect_call = (*Emit ctx, [Binding] env, Iarch fpidx, [Expr] args): Str -> {
+	const Str addr = binding_ptr(ctx, env, fpidx)
+	const [TupElem] sig = env[fpidx].telems
+	let [ArgOp] aops = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(args.len) then break
+		const Str aqt = qtype_of_name(sig[i].name)
+		const Str op = emit_expr(args[i], ctx, env)
+		const Iarch tt = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${tt} =${aqt} copy ${op}\n")
+		aops = [...aops, ArgOp({ temp: tt, is_rec: false, qt: aqt })]
+		i = i + 1
+	}
+	const Iarch rt = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${rt} =${qtype_of_name(env[fpidx].elem)} call ${addr}(")
+	let Iarch j = 0
+	loop {
+		if j >= Iarch(aops.len) then break
+		if j > 0 then write_str(ctx.fd, ", ")
+		const Iarch tj = aops[j].temp
+		write_str(ctx.fd, "${aops[j].qt} %t${tj}")
+		j = j + 1
+	}
+	write_str(ctx.fd, ")\n")
+	return "%t${rt}"
+}
+
 const emit_call = (*Emit ctx, Str callee, [Expr] args, [Binding] env): Str -> {
 	# `Int8(x)`… narrows to the fixed width (canonicalizing); `Iarch`/`Int`/`Uarch` are identity
 	if is_cast_type(callee) then {
@@ -1364,6 +1422,9 @@ const emit_call = (*Emit ctx, Str callee, [Expr] args, [Binding] env): Str -> {
 	}
 	# `Str(v)` — seal a `[Uint8]` byte vector into a Str header borrowing its backing
 	if str_eq(callee, "Str") then return emit_str_seal(ctx, emit_expr(args[0], ctx, env))
+	# an INDIRECT call: the callee names a function-value binding (a HOF's function parameter)
+	const Iarch fpi = lookup_index(env, callee)
+	if fpi >= 0 then { if str_eq(env[fpi].rec_type, "$fn") then return emit_indirect_call(ctx, env, fpi, args) }
 	const Iarch fidx = find_func(ctx.funcs, callee)
 	if fidx < 0 then die("cf0: emit: internal: unresolved call (should be caught by typecheck)\n")
 	const Iarch nargs = Iarch(args.len)
@@ -1371,7 +1432,14 @@ const emit_call = (*Emit ctx, Str callee, [Expr] args, [Binding] env): Str -> {
 	let Iarch i = 0
 	loop {
 		if i >= nargs then break
-		if is_agg_param(ctx.funcs[fidx].params[i], ctx.recs, ctx.unions) then {
+		if str_eq(ctx.funcs[fidx].params[i].type_name, "$fn") then {
+			# a function-type argument: pass the callee's code address as an `l` value
+			const Str fv = emit_fnval(ctx, env, args[i])
+			const Iarch tt = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${tt} =l copy ${fv}\n")
+			aops = [...aops, ArgOp({ temp: tt, is_rec: false, qt: "l" })]
+		} else if is_agg_param(ctx.funcs[fidx].params[i], ctx.recs, ctx.unions) then {
 			const Str av = emit_expr(args[i], ctx, env)
 			const Iarch tt = copy_agg(ctx, av)
 			aops = [...aops, ArgOp({ temp: tt, is_rec: true, qt: "l" })]
@@ -2390,6 +2458,15 @@ const emit_func = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 			} else {
 				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: fn.params[pi].type_name, elem: "", is_cell: false, telems: [], fixed: "" })]
 			}
+		} else if str_eq(fn.params[pi].type_name, "$fn") then {
+			# a function-value parameter arrives as a code address in an `l` register; spill it to a
+			# cell (loaded on use) and record its signature — `telems` the argument type names, `elem`
+			# the return type name — so an indirect call `f(x)` picks the right QBE arg/return classes.
+			const Iarch slot = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${slot} =l alloc8 8\n")
+			write_str(ctx.fd, "\tstorel %p${pi}, %t${slot}\n")
+			params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: "$fn", elem: fn.params[pi].elem, is_cell: true, telems: fn.params[pi].telems, fixed: "" })]
 		} else {
 			if is_agg_param(fn.params[pi], ctx.recs, ctx.unions) then {
 				# a record/tuple parameter arrives as a pointer to the caller's aggregate; copy

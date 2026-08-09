@@ -78,6 +78,49 @@ const rec_of = (Ty t): Str -> match t { Ty.TRec(n) -> n, _ -> "" }
 const union_of = (Ty t): Str -> match t { Ty.TUnion(n) -> n, _ -> "" }
 pub const dyn_of = (Ty t): Str -> match t { Ty.TDyn(n) -> n, _ -> "" }
 const is_ttuple = (Ty t): Bool -> match t { Ty.TTuple(e) -> true, _ -> false }
+const is_tfn = (Ty t): Bool -> match t { Ty.TFn(s) -> true, _ -> false }
+# The signature positions of a function type (args then return), or an empty list otherwise.
+const tfn_sig = (Ty t): [TupElem] -> {
+	let [TupElem] r = []
+	match t { Ty.TFn(s) -> { r = s }, _ -> {} }
+	return r
+}
+
+# The nominal name a function SIGNATURE position carries: the implicit-`Int` return (`""`) and
+# the `Int` alias both normalize to `Iarch`, so `(Iarch) -> Iarch` matches an unannotated `inc =
+# (Iarch n) -> …`; every other name (`Uarch`, `Float64`, a record, …) stays distinct, so a
+# signature distinguishes them (type_system §8: function values match nominally).
+const fn_sig_name = (Str name): Str -> {
+	if str_eq(name, "") then return "Iarch"
+	if str_eq(name, "Int") then return "Iarch"
+	return name
+}
+# The `TFn` of a `(A, …) -> R` PARAMETER: its `telems` are the argument type names, its `elem`
+# the return type name — spliced into one nominal signature list (args then return).
+const fn_ty_of_param = (Param p): Ty -> {
+	let [TupElem] sig = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(p.telems.len) then break
+		sig = [...sig, tel_leaf(fn_sig_name(p.telems[i].name))]
+		i = i + 1
+	}
+	sig = [...sig, tel_leaf(fn_sig_name(p.elem))]
+	return Ty.TFn(sig)
+}
+# The `TFn` of a top-level FUNCTION referenced by name (to match against a function-type
+# parameter): each parameter's declared type name, then the return type name.
+const fn_ty_of_func = (Func fn): Ty -> {
+	let [TupElem] sig = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(fn.params.len) then break
+		sig = [...sig, tel_leaf(fn_sig_name(fn.params[i].type_name))]
+		i = i + 1
+	}
+	sig = [...sig, tel_leaf(fn_sig_name(fn.ret_name))]
+	return Ty.TFn(sig)
+}
 pub const tuple_elems = (Ty t): [TupElem] -> {
 	let [TupElem] r = []
 	match t {
@@ -172,7 +215,8 @@ const ty_eq = (Ty a, Ty b): Bool -> match a {
 	Ty.TUnit -> is_tunit(b),
 	Ty.TFixed(ab, asg) -> match b { Ty.TFixed(bb, bsg) -> ab == bb && (if asg then bsg else !bsg), _ -> false },
 	Ty.TFloat(ab) -> match b { Ty.TFloat(bb) -> ab == bb, _ -> false },
-	Ty.TTuple(ae) -> match b { Ty.TTuple(be) -> tuple_elems_eq(ae, be), _ -> false }
+	Ty.TTuple(ae) -> match b { Ty.TTuple(be) -> tuple_elems_eq(ae, be), _ -> false },
+	Ty.TFn(asig) -> match b { Ty.TFn(bsig) -> tuple_elems_eq(asig, bsig), _ -> false }
 }
 
 # Byte-wise `Str` equality (name lookup).
@@ -295,7 +339,8 @@ pub const ty_name = (Ty t): Str -> match t {
 	# and instantiated at an array type. A tuple/pointer type variable is a later brick.
 	Ty.TDyn(n) -> "[${n}]",
 	Ty.TPtr -> "",
-	Ty.TTuple(e) -> ""
+	Ty.TTuple(e) -> "",
+	Ty.TFn(s) -> ""
 }
 
 pub const param_ty = (Param p, [RecDecl] recs, [UnionDecl] unions): Ty -> {
@@ -306,6 +351,8 @@ pub const param_ty = (Param p, [RecDecl] recs, [UnionDecl] unions): Ty -> {
 	}
 	# a `(A, B) name` tuple parameter — its position types (canonicalized like a tuple return)
 	if str_eq(p.type_name, "$tuple") then return Ty.TTuple(canon_telems(p.telems, recs, unions))
+	# a `(A, …) -> R name` function-value parameter — its nominal signature
+	if str_eq(p.type_name, "$fn") then return fn_ty_of_param(p)
 	return named_ty(p.type_name, p.elem, recs, unions)
 }
 
@@ -633,9 +680,55 @@ const str_seal_type = ([Expr] args, [VarTy] env, Ctx ctx): Ty -> {
 # The `tyargs` are ignored here: the monomorphization pass has already resolved every generic
 # call to a concrete instance (a stripped, concretely-named `Call`), so by typecheck a `Call`
 # carries no live type arguments.
+# The name of a bare `Var` expression, or "" (used to recognize a function reference passed as
+# an argument — the only expression a function-type parameter accepts).
+const as_var_name = (Expr e): Str -> match e { Expr.Var(n) -> n, _ -> "" }
+
+# Check the argument passed to a function-type parameter: it must be a bare function reference —
+# a function-value parameter in scope, or a top-level function by name — whose signature matches
+# the parameter's (nominally). Anything else (a non-function value, an arbitrary expression) is
+# rejected: cf0 has no first-class function values beyond passing a name (closures are a later
+# brick).
+const check_fn_arg = (Ty expected, Expr arg, [VarTy] env, Ctx ctx): Iarch -> {
+	const Str nm = as_var_name(arg)
+	if str_eq(nm, "") then die("cf0: type: a function-type argument must be a function name\n")
+	const Iarch ei = env_index(env, nm)
+	if ei >= 0 then {
+		if !is_tfn(env[ei].ty) then die("cf0: type: a function-type argument must be a function\n")
+		if !ty_eq(env[ei].ty, expected) then die("cf0: type: a function argument's signature does not match the parameter\n")
+		return 0
+	}
+	const Iarch fi = find_func(ctx.funcs, nm)
+	if fi < 0 then die("cf0: type: a function-type argument names no function\n")
+	if !ty_eq(fn_ty_of_func(ctx.funcs[fi]), expected) then die("cf0: type: a function argument's signature does not match the parameter\n")
+	return 0
+}
+
+# Type an INDIRECT call `f(args)` where `f` is a function-value binding (a `TFn`): check the
+# argument count and each argument's type against the signature, and yield its return type.
+const indirect_call_type = (Ty fty, [Expr] args, [VarTy] env, Ctx ctx): Ty -> {
+	const [TupElem] sig = tfn_sig(fty)
+	const Iarch arity = Iarch(sig.len) - 1
+	if Iarch(args.len) != arity then die("cf0: type: wrong number of arguments in an indirect call\n")
+	let Iarch i = 0
+	loop {
+		if i >= arity then break
+		const Ty at = type_of(args[i], env, ctx)
+		const Ty pt = named_ty(sig[i].name, "", ctx.recs, ctx.unions)
+		if !ty_eq(at, pt) then {
+			if is_tptr(at) then { if !is_tint(pt) then die("cf0: type: an indirect-call argument's type does not match\n") } else die("cf0: type: an indirect-call argument's type does not match\n")
+		}
+		i = i + 1
+	}
+	return named_ty(sig[arity].name, "", ctx.recs, ctx.unions)
+}
+
 const call_type = (Str callee, [Str] tyargs, [Expr] args, [VarTy] env, Ctx ctx): Ty -> {
 	if is_cast_type(callee) then return cast_type(callee, args, env, ctx)
 	if str_eq(callee, "Str") then return str_seal_type(args, env, ctx)
+	# an INDIRECT call: the callee names a function-value binding (a HOF's function parameter)
+	const Iarch cei = env_index(env, callee)
+	if cei >= 0 then { if is_tfn(env[cei].ty) then return indirect_call_type(env[cei].ty, args, env, ctx) }
 	const Iarch fidx = find_func(ctx.funcs, callee)
 	if fidx < 0 then die("cf0: type: call to an undefined function\n")
 	const Iarch np = Iarch(ctx.funcs[fidx].params.len)
@@ -644,11 +737,15 @@ const call_type = (Str callee, [Str] tyargs, [Expr] args, [VarTy] env, Ctx ctx):
 	let Iarch i = 0
 	loop {
 		if i >= na then break
-		const Ty at = type_of(args[i], env, ctx)
 		const Ty pt = param_ty(ctx.funcs[fidx].params[i], ctx.recs, ctx.unions)
-		# a byte pointer is an address, acceptable where a `Uarch`/`Int` is expected (syscalls)
-		if !ty_eq(at, pt) then {
-			if is_tptr(at) then { if !is_tint(pt) then die("cf0: type: a call argument's type does not match the parameter\n") } else die("cf0: type: a call argument's type does not match the parameter\n")
+		# a function-type parameter takes a function reference (checked nominally), not a value
+		if is_tfn(pt) then { check_fn_arg(pt, args[i], env, ctx) }
+		else {
+			const Ty at = type_of(args[i], env, ctx)
+			# a byte pointer is an address, acceptable where a `Uarch`/`Int` is expected (syscalls)
+			if !ty_eq(at, pt) then {
+				if is_tptr(at) then { if !is_tint(pt) then die("cf0: type: a call argument's type does not match the parameter\n") } else die("cf0: type: a call argument's type does not match the parameter\n")
+			}
 		}
 		i = i + 1
 	}

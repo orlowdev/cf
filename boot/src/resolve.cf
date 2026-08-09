@@ -15,7 +15,7 @@
 
 import "io" as { open, read, close, die, o_rdonly }
 import "token" as { Token }
-import "ast" as { Expr, Stmt, MatchArm, StmtArm, Seg, FieldInit, RecDecl, UnionDecl, UnionMember, TupElem, Func, Import, Program }
+import "ast" as { Expr, Stmt, MatchArm, StmtArm, Seg, FieldInit, RecDecl, UnionDecl, UnionMember, TupElem, Param, Func, Import, Program }
 import "lexer" as { lex }
 import "typealias" as { strip_type_aliases }
 import "parser" as { Parser, parse_program }
@@ -187,7 +187,10 @@ const mangle_name = (Str n, [Str] priv, Iarch tag): Str -> {
 const mangle_expr = (Expr e, [Str] priv, Iarch tag): Expr -> match e {
 	Expr.Lit(v) -> Expr.Lit(v),
 	Expr.BoolLit(b) -> Expr.BoolLit(b),
-	Expr.Var(n) -> Expr.Var(n),
+	# a bare name may REFERENCE a private function (passed by name to a higher-order function);
+	# rewrite it like a `Call` callee so the reference tracks the mangled definition. A local /
+	# value-const name is not in `priv`, so it is left unchanged.
+	Expr.Var(n) -> Expr.Var(mangle_name(n, priv, tag)),
 	Expr.StrLit(bs) -> Expr.StrLit(bs),
 	Expr.FloatLit(t) -> Expr.FloatLit(t),
 	Expr.Record(n, fs) -> Expr.Record(n, mangle_fields(fs, priv, tag)),
@@ -334,8 +337,143 @@ const priv_names = ([Func] fs): [Str] -> {
 	return out
 }
 
+# --- local-name collection --------------------------------------------------------------
+#
+# A bare `Var` reference is mangled (rewritten to a private function's mangled name) ONLY when
+# it is NOT shadowed by a local binding of the same name in the enclosing function. So each
+# function's LOCAL names — its parameters plus every binder in its body (a `let`/`const`, a
+# destructuring pattern, a `for x in`, a match-arm payload binding) — are collected and removed
+# from the private set used to rewrite THAT body. A private function reference (not shadowed)
+# still tracks its mangled definition; a local that happens to share a name with a private
+# function is left alone (module_system §8: a syntactic mangle must not capture a local).
+const no_names = (): [Str] -> { let [Str] e = []  return e }
+const cat_names = ([Str] a, [Str] b): [Str] -> {
+	let [Str] out = a
+	let Iarch i = 0
+	loop { if i >= Iarch(b.len) then break  out = [...out, b[i]]  i = i + 1 }
+	return out
+}
+const lnames_exprs = ([Expr] es): [Str] -> {
+	let [Str] out = []
+	let Iarch i = 0
+	loop { if i >= Iarch(es.len) then break  out = cat_names(out, lnames_expr(es[i]))  i = i + 1 }
+	return out
+}
+const lnames_fieldinits = ([FieldInit] fs): [Str] -> {
+	let [Str] out = []
+	let Iarch i = 0
+	loop { if i >= Iarch(fs.len) then break  out = cat_names(out, lnames_expr(fs[i].value))  i = i + 1 }
+	return out
+}
+const lnames_segs = ([Seg] segs): [Str] -> {
+	let [Str] out = []
+	let Iarch i = 0
+	loop { if i >= Iarch(segs.len) then break  out = cat_names(out, lnames_expr(segs[i].expr))  i = i + 1 }
+	return out
+}
+const lnames_match_arms = ([MatchArm] arms): [Str] -> {
+	let [Str] out = []
+	let Iarch i = 0
+	loop { if i >= Iarch(arms.len) then break  out = cat_names(cat_names(out, arms[i].binds), lnames_expr(arms[i].body))  i = i + 1 }
+	return out
+}
+const lnames_stmt_arms = ([StmtArm] arms): [Str] -> {
+	let [Str] out = []
+	let Iarch i = 0
+	loop { if i >= Iarch(arms.len) then break  out = cat_names(cat_names(out, arms[i].binds), lnames_stmts(arms[i].body))  i = i + 1 }
+	return out
+}
+const lnames_stmts = ([Stmt] ss): [Str] -> {
+	let [Str] out = []
+	let Iarch i = 0
+	loop { if i >= Iarch(ss.len) then break  out = cat_names(out, lnames_stmt(ss[i]))  i = i + 1 }
+	return out
+}
+const lnames_expr = (Expr e): [Str] -> match e {
+	Expr.Lit(v) -> no_names(),
+	Expr.BoolLit(b) -> no_names(),
+	Expr.Var(n) -> no_names(),
+	Expr.StrLit(bs) -> no_names(),
+	Expr.FloatLit(t) -> no_names(),
+	Expr.Record(n, fs) -> lnames_fieldinits(fs),
+	Expr.Field(b, f) -> no_names(),
+	Expr.FieldExpr(b, f) -> lnames_expr(b),
+	Expr.UnionMk(t, m, args) -> lnames_exprs(args),
+	Expr.Match(scrut, arms) -> cat_names(lnames_expr(scrut), lnames_match_arms(arms)),
+	Expr.ArrayLit(hs, sn, elems, et) -> cat_names(lnames_expr(sn), lnames_exprs(elems)),
+	Expr.Index(a, i) -> lnames_expr(i),
+	Expr.IndexField(a, i, f) -> lnames_expr(i),
+	Expr.IndexExpr(b, i) -> cat_names(lnames_expr(b), lnames_expr(i)),
+	Expr.Interp(segs) -> lnames_segs(segs),
+	Expr.Tuple(elems) -> lnames_exprs(elems),
+	Expr.Spread(x) -> lnames_expr(x),
+	Expr.Unit -> no_names(),
+	Expr.Loop(body) -> lnames_stmts(body),
+	Expr.Buffer(sz) -> lnames_expr(sz),
+	Expr.Addr(name) -> no_names(),
+	Expr.Neg(x) -> lnames_expr(x),
+	Expr.Not(x) -> lnames_expr(x),
+	Expr.BitNot(x) -> lnames_expr(x),
+	Expr.Add(l, r) -> cat_names(lnames_expr(l), lnames_expr(r)),
+	Expr.Sub(l, r) -> cat_names(lnames_expr(l), lnames_expr(r)),
+	Expr.Mul(l, r) -> cat_names(lnames_expr(l), lnames_expr(r)),
+	Expr.Div(l, r) -> cat_names(lnames_expr(l), lnames_expr(r)),
+	Expr.Mod(l, r) -> cat_names(lnames_expr(l), lnames_expr(r)),
+	Expr.BitAnd(l, r) -> cat_names(lnames_expr(l), lnames_expr(r)),
+	Expr.BitOr(l, r) -> cat_names(lnames_expr(l), lnames_expr(r)),
+	Expr.BitXor(l, r) -> cat_names(lnames_expr(l), lnames_expr(r)),
+	Expr.Shl(l, r) -> cat_names(lnames_expr(l), lnames_expr(r)),
+	Expr.Shr(l, r) -> cat_names(lnames_expr(l), lnames_expr(r)),
+	Expr.CmpEq(l, r) -> cat_names(lnames_expr(l), lnames_expr(r)),
+	Expr.CmpNe(l, r) -> cat_names(lnames_expr(l), lnames_expr(r)),
+	Expr.CmpLt(l, r) -> cat_names(lnames_expr(l), lnames_expr(r)),
+	Expr.CmpGt(l, r) -> cat_names(lnames_expr(l), lnames_expr(r)),
+	Expr.CmpLe(l, r) -> cat_names(lnames_expr(l), lnames_expr(r)),
+	Expr.CmpGe(l, r) -> cat_names(lnames_expr(l), lnames_expr(r)),
+	Expr.And(l, r) -> cat_names(lnames_expr(l), lnames_expr(r)),
+	Expr.Or(l, r) -> cat_names(lnames_expr(l), lnames_expr(r)),
+	Expr.If(c, t, e2) -> cat_names(cat_names(lnames_expr(c), lnames_expr(t)), lnames_expr(e2)),
+	Expr.Call(n, ta, args) -> lnames_exprs(args)
+}
+const lnames_stmt = (Stmt s): [Str] -> match s {
+	Stmt.Let(n, m, ann, e) -> cat_names([n], lnames_expr(e)),
+	Stmt.Destructure(pat, m, e) -> cat_names(pat, lnames_expr(e)),
+	Stmt.Assign(n, e) -> lnames_expr(e),
+	Stmt.FieldAssign(b, f, e) -> lnames_expr(e),
+	Stmt.IndexAssign(a, i, v) -> cat_names(lnames_expr(i), lnames_expr(v)),
+	Stmt.Return(e) -> lnames_expr(e),
+	Stmt.ForIn(v, a, body) -> cat_names([v], lnames_stmts(body)),
+	Stmt.Loop(body) -> lnames_stmts(body),
+	Stmt.Break -> no_names(),
+	Stmt.Continue -> no_names(),
+	Stmt.IfThen(c, st) -> cat_names(lnames_expr(c), lnames_stmt(st)),
+	Stmt.IfElse(c, t, e) -> cat_names(cat_names(lnames_expr(c), lnames_stmt(t)), lnames_stmt(e)),
+	Stmt.Do(e) -> lnames_expr(e),
+	Stmt.Block(ss) -> lnames_stmts(ss),
+	Stmt.Match(scrut, arms) -> cat_names(lnames_expr(scrut), lnames_stmt_arms(arms)),
+	Stmt.Yield(e) -> lnames_expr(e)
+}
+# A function's parameter names.
+const param_name_list = ([Param] ps): [Str] -> {
+	let [Str] out = []
+	let Iarch i = 0
+	loop { if i >= Iarch(ps.len) then break  out = [...out, ps[i].name]  i = i + 1 }
+	return out
+}
+# `priv` minus any name shadowed by a local (`names`) — the set to rewrite in one body.
+const priv_minus = ([Str] priv, [Str] names): [Str] -> {
+	let [Str] out = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(priv.len) then break
+		if !in_priv(names, priv[i]) then out = [...out, priv[i]]
+		i = i + 1
+	}
+	return out
+}
+
 # Mangle one module's functions with tag `tag`: rename each private definition and rewrite
-# every private-function reference in every body.
+# every private-function reference in every body — but not a reference shadowed by a local.
 const mangle_funcs = ([Func] fs, Iarch tag): [Func] -> {
 	const [Str] priv = priv_names(fs)
 	let [Func] out = []
@@ -344,7 +482,11 @@ const mangle_funcs = ([Func] fs, Iarch tag): [Func] -> {
 		if i >= Iarch(fs.len) then break
 		const Func f = fs[i]
 		const Str nm = mangle_name(f.name, priv, tag)
-		const [Stmt] body = mangle_stmts(f.body, priv, tag)
+		# a name bound locally in THIS function (a parameter or any body binder) shadows a private
+		# function of the same name, so it is excluded from the set this body's references rewrite
+		const [Str] locals = cat_names(param_name_list(f.params), lnames_stmts(f.body))
+		const [Str] bodypriv = priv_minus(priv, locals)
+		const [Stmt] body = mangle_stmts(f.body, bodypriv, tag)
 		# an asm body references only parameters, never functions — passed through unchanged
 		out = [...out, Func({ name: nm, is_pub: f.is_pub, ret_name: f.ret_name, ret_elem: f.ret_elem, params: f.params, body: body, is_asm: f.is_asm, asm_body: f.asm_body, is_value: f.is_value, ret_telems: f.ret_telems, typarams: f.typarams, tbounds: f.tbounds })]
 		i = i + 1
