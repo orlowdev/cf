@@ -353,7 +353,9 @@ const parse_tyargs = (*Parser p): [Str] -> {
 	p.pos = p.pos + 1 # `[`
 	let [Str] tys = []
 	loop {
-		if !is_ident(peek(p)) then die("cf0: parse: expected a type argument in `[...]`\n")
+		# a TYPE argument (an ident) or a comptime VALUE argument (an int literal, `f[8]()`) —
+		# either is kept as its source text; the monomorph pass tells them apart by the parameter
+		if !is_ident(peek(p)) && !is_intlit(peek(p)) then die("cf0: parse: expected a type or value argument in `[...]`\n")
 		tys = [...tys, cur_name(p)]
 		p.pos = p.pos + 1
 		if !is_comma(peek(p)) then break
@@ -407,10 +409,30 @@ const tyargs_shaped = (*Parser p, Iarch br): Bool -> {
 	if j == br + 1 then return false
 	return true
 }
+# Like `tyargs_shaped`, but a bracket token may ALSO be a comptime VALUE argument — an int literal
+# (`f[8]()`, `f[3, Iarch](x)`). Used to disambiguate a generic CALL only (a construction keeps the
+# strict type-shaped check, so `xs[1].field` stays an index-then-field, not a `[1]`-construction).
+const callargs_shaped = (*Parser p, Iarch br): Bool -> {
+	let Iarch j = br + 1
+	loop {
+		if j >= Iarch(p.toks.len) then return false
+		const TokKind k = p.toks[j].kind
+		if is_rbracket(k) then break
+		if is_comma(k) || is_intlit(k) then j = j + 1
+		else {
+			if !is_ident(k) then return false
+			const Iarch c = Iarch(p.src[p.toks[j].start])
+			if !((c >= 65 && c <= 90) || c == 39) then return false  # uppercase-initial or `'T`
+			j = j + 1
+		}
+	}
+	if j == br + 1 then return false
+	return true
+}
 # At a `[` right after a NAME: is it `[tyargs](` (a generic call) or `[idx]` (an array index)?
 const generic_call_ahead = (*Parser p): Bool -> {
 	if !is_lbracket(peek(p)) then return false
-	if !tyargs_shaped(p, p.pos) then return false
+	if !callargs_shaped(p, p.pos) then return false
 	const Iarch after = after_brackets(p, p.pos)
 	if after < 0 then return false
 	if after >= Iarch(p.toks.len) then return false
@@ -431,7 +453,7 @@ const generic_ctor_ahead = (*Parser p): Bool -> {
 const generic_call_stmt_ahead = (*Parser p): Bool -> {
 	if p.pos + 1 >= Iarch(p.toks.len) then return false
 	if !is_lbracket(p.toks[p.pos + 1].kind) then return false
-	if !tyargs_shaped(p, p.pos + 1) then return false
+	if !callargs_shaped(p, p.pos + 1) then return false
 	const Iarch after = after_brackets(p, p.pos + 1)
 	if after < 0 then return false
 	if after >= Iarch(p.toks.len) then return false
@@ -908,7 +930,22 @@ const parse_let = (*Parser p, Bool mutable): Stmt -> {
 				if !is_fixed_arraylit(init, n) then die("cf0: parse: a fixed-array initializer must be a plain array literal of exactly N elements (no spread)\n")
 				return Stmt.Let(bname, mutable, "", init)
 			}
-			return Stmt.Let(bname, mutable, "", Expr.Buffer(n))
+			return Stmt.Let(bname, mutable, "", Expr.Buffer(Expr.Lit(n)))
+		}
+		# `[n Elem] buf` — a buffer whose size is a comptime VALUE PARAMETER (two idents in the
+		# brackets, no initializer); the size folds to its literal at monomorphization
+		if is_ident(p.toks[p.pos + 1].kind) && p.pos + 2 < Iarch(p.toks.len) && is_ident(p.toks[p.pos + 2].kind) then {
+			p.pos = p.pos + 1 # `[`
+			const Str szname = cur_name(p)
+			p.pos = p.pos + 1 # size name
+			const Str felem2 = cur_name(p)
+			p.pos = p.pos + 1 # element type
+			if !is_rbracket(peek(p)) then die("cf0: parse: expected `]` in a value-parameter-sized buffer\n")
+			p.pos = p.pos + 1 # `]`
+			if !is_ident(peek(p)) then die("cf0: parse: expected a binding name\n")
+			const Str bufname = cur_name(p)
+			p.pos = p.pos + 1
+			return Stmt.Let(bufname, mutable, "", Expr.Buffer(Expr.Var(szname)))
 		}
 		const Str elem = dyn_elem_of(parse_type(p))
 		if !is_ident(peek(p)) then die("cf0: parse: expected a binding name\n")
@@ -1366,13 +1403,14 @@ const parse_typarams = (*Parser p): TyParams -> {
 	let [Str] tbs = []
 	loop {
 		if !is_ident(peek(p)) then die("cf0: parse: expected a type variable in a `['T]` list\n")
-		# an optional BOUND precedes the variable — a non-`'T` ident, e.g. `[Color 'T]`
+		# a non-`'T` ident preceding the name is either a BOUND on a type variable (`[Color 'T]`)
+		# or the TYPE of a comptime VALUE parameter (`[Iarch n]` — the name is a plain ident, not
+		# a `'T`); whether it is a bound or a value type is told apart later by the name's `'T`.
 		let Str bound = ""
 		if !is_typar_name(cur_name(p)) then {
 			bound = cur_name(p)
 			p.pos = p.pos + 1
-			if !is_ident(peek(p)) then die("cf0: parse: a generic bound must be followed by a type variable\n")
-			if !is_typar_name(cur_name(p)) then die("cf0: parse: a generic bound must be followed by a type variable\n")
+			if !is_ident(peek(p)) then die("cf0: parse: a bound or value-parameter type must be followed by a name\n")
 		}
 		tps = [...tps, cur_name(p)]
 		tbs = [...tbs, bound]

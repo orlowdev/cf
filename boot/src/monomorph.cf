@@ -36,7 +36,7 @@ data MonoCtx = { [Func] templates, [Str] keys, [Func] instances, [Str] unions, [
 # cloning a template) plus the local value environment (`[VarTy]`, seeded from parameters and
 # extended by `let`/match/`for`/destructure binders) and the enclosing function's return type —
 # together everything the shared `type_of` needs to derive an argument's type for inference.
-data MonoEnv = { [Str] tvars, [Str] tvals, [VarTy] venv, Ty ret }
+data MonoEnv = { [Str] tvars, [Str] tvals, [VarTy] venv, Ty ret, [Str] vpnames, [Iarch] vpvals }
 
 const str_eq = (Str a, Str b): Bool -> {
 	if a.len != b.len then return false
@@ -78,12 +78,14 @@ const is_union_name = (*MonoCtx m, Str n): Bool -> {
 }
 # Every non-empty bound in a declaration must name a union — validated at DECL time (like the
 # type-variable checks) so a malformed bound is rejected even if the template is never used.
-const check_bound_list = (*MonoCtx m, [Str] tbounds): Iarch -> {
+const check_bound_list = (*MonoCtx m, [Str] typarams, [Str] tbounds): Iarch -> {
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(tbounds.len) then break
 		if !str_eq(tbounds[i], "") then {
-			if !is_union_name(m, tbounds[i]) then die("cf0: type: a generic bound must name a union\n")
+			# a TYPE parameter's bound must name a union; a VALUE parameter's type must be Iarch/Uarch
+			if is_tvar(typarams[i]) then { if !is_union_name(m, tbounds[i]) then die("cf0: type: a generic bound must name a union\n") }
+			else { if !str_eq(tbounds[i], "Iarch") && !str_eq(tbounds[i], "Uarch") then die("cf0: type: a comptime value parameter must be typed Iarch or Uarch\n") }
 		}
 		i = i + 1
 	}
@@ -91,25 +93,36 @@ const check_bound_list = (*MonoCtx m, [Str] tbounds): Iarch -> {
 }
 const check_template_bounds = (*MonoCtx m): Iarch -> {
 	let Iarch i = 0
-	loop { if i >= Iarch(m.templates.len) then break  check_bound_list(m, m.templates[i].tbounds)  i = i + 1 }
+	loop { if i >= Iarch(m.templates.len) then break  check_bound_list(m, m.templates[i].typarams, m.templates[i].tbounds)  i = i + 1 }
 	let Iarch j = 0
-	loop { if j >= Iarch(m.rec_templates.len) then break  check_bound_list(m, m.rec_templates[j].tbounds)  j = j + 1 }
+	loop { if j >= Iarch(m.rec_templates.len) then break  check_bound_list(m, m.rec_templates[j].typarams, m.rec_templates[j].tbounds)  j = j + 1 }
 	let Iarch k = 0
-	loop { if k >= Iarch(m.union_templates.len) then break  check_bound_list(m, m.union_templates[k].tbounds)  k = k + 1 }
+	loop { if k >= Iarch(m.union_templates.len) then break  check_bound_list(m, m.union_templates[k].typarams, m.union_templates[k].tbounds)  k = k + 1 }
 	return 0
 }
 # Check each type argument satisfies its parameter's BOUND (`[Color 'T]`): the argument must be
 # the bound union (reflexive — §8.5 compose-over union subtyping is a later brick). An unbounded
 # parameter (`""`) accepts any argument. (The bound-is-a-union check is done at decl time above.)
-const check_bounds = (*MonoCtx m, [Str] tbounds, [Str] margs): Iarch -> {
+const check_params = (*MonoCtx m, [Str] typarams, [Str] tbounds, [Str] margs): Iarch -> {
 	let Iarch i = 0
 	loop {
-		if i >= Iarch(tbounds.len) then break
-		const Str b = tbounds[i]
-		if !str_eq(b, "") then {
-			if !is_union_name(m, b) then die("cf0: type: a generic bound must name a union\n")
-			if i >= Iarch(margs.len) then die("cf0: type: a bounded type parameter has no argument\n")
-			if !str_eq(margs[i], b) then die("cf0: type: a type argument does not satisfy its bound\n")
+		if i >= Iarch(typarams.len) then break
+		if i >= Iarch(margs.len) then die("cf0: type: a generic parameter has no argument\n")
+		const Str arg = margs[i]
+		if is_tvar(typarams[i]) then {
+			# a TYPE parameter — its argument must be a type (not a value), and satisfy any bound
+			if is_num_arg(arg) then die("cf0: type: a comptime value was given where a type is expected\n")
+			const Str b = tbounds[i]
+			if !str_eq(b, "") then {
+				if !is_union_name(m, b) then die("cf0: type: a generic bound must name a union\n")
+				if !str_eq(arg, b) then die("cf0: type: a type argument does not satisfy its bound\n")
+			}
+		}
+		if !is_tvar(typarams[i]) then {
+			# a comptime VALUE parameter — its type must be Iarch/Uarch and its argument a value
+			const Str vt = tbounds[i]
+			if !str_eq(vt, "Iarch") && !str_eq(vt, "Uarch") then die("cf0: type: a comptime value parameter must be typed Iarch or Uarch\n")
+			if !is_num_arg(arg) then die("cf0: type: a type was given where a comptime value is expected\n")
 		}
 		i = i + 1
 	}
@@ -122,6 +135,51 @@ const is_int_lit = (Expr e): Bool -> match e {
 	Expr.Lit(v) -> true,
 	Expr.Neg(x) -> match x { Expr.Lit(v) -> true, _ -> false },
 	_ -> false
+}
+# A TYPE-parameter name (`'T`, apostrophe-led) vs a comptime VALUE-parameter name (a plain ident).
+const is_tvar = (Str s): Bool -> {
+	if Iarch(s.len) == 0 then return false
+	return Iarch(s[0]) == 39
+}
+# A comptime VALUE argument — an int-literal source string (`8`) — vs a TYPE argument (a name).
+const is_num_arg = (Str s): Bool -> {
+	if Iarch(s.len) == 0 then return false
+	const Iarch c = Iarch(s[0])
+	return c >= 48 && c <= 57
+}
+# Decimal string → integer (a value argument's literal, folded into the instance body).
+const str_to_int = (Str s): Iarch -> {
+	let Iarch v = 0
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(s.len) then break
+		const Iarch c = Iarch(s[i])
+		if c >= 48 && c <= 57 then v = v * 10 + (c - 48)
+		i = i + 1
+	}
+	return v
+}
+const name_in_venv = (Str n, [VarTy] venv): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(venv.len) then break
+		if str_eq(venv[i].name, n) then return true
+		i = i + 1
+	}
+	return false
+}
+# Fold a variable reference: a comptime value parameter (`n`) becomes its literal — UNLESS a real
+# local/parameter of the same name shadows it (inner binding wins), in which case it is left as
+# the variable reference. Anything else is unchanged.
+const vp_fold = (Str n, MonoEnv env): Expr -> {
+	if name_in_venv(n, env.venv) then return Expr.Var(n)
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(env.vpnames.len) then break
+		if str_eq(env.vpnames[i], n) then return Expr.Lit(env.vpvals[i])
+		i = i + 1
+	}
+	return Expr.Var(n)
 }
 
 # --- substitution --------------------------------------------------------------------------
@@ -366,7 +424,7 @@ const ensure_union_instance = (*MonoCtx m, Str base, [Str] margs): Str -> {
 	const Iarch ui = find_union_template(m.union_templates, base)
 	const UnionDecl tmpl = m.union_templates[ui]
 	if Iarch(tmpl.typarams.len) != Iarch(margs.len) then die("cf0: type: wrong number of type arguments for a generic type\n")
-	check_bounds(m, tmpl.tbounds, margs)
+	check_params(m, tmpl.typarams, tmpl.tbounds, margs)
 	let [UnionMember] members = []
 	let Iarch mi = 0
 	loop {
@@ -401,7 +459,7 @@ const ensure_rec_instance = (*MonoCtx m, Str base, [Str] margs): Str -> {
 	if ri < 0 then die("cf0: type: a generic type application names a non-generic or undeclared type\n")
 	const RecDecl tmpl = m.rec_templates[ri]
 	if Iarch(tmpl.typarams.len) != Iarch(margs.len) then die("cf0: type: wrong number of type arguments for a generic type\n")
-	check_bounds(m, tmpl.tbounds, margs)
+	check_params(m, tmpl.typarams, tmpl.tbounds, margs)
 	const SlotList fs = subst_slots(m, tmpl.ftypes, tmpl.felems, tmpl.ftelems, tmpl.typarams, margs)
 	const [Str] no_tp = []
 	m.rec_instances = [...m.rec_instances, RecDecl({ name: mn, fields: tmpl.fields, ftypes: fs.names, felems: fs.elems, ftelems: fs.telemss, typarams: no_tp, tbounds: no_tp })]
@@ -482,7 +540,7 @@ const mangle_concrete_sigs = (*MonoCtx m): Iarch -> {
 	return 0
 }
 
-const env_bind = (MonoEnv e, Str name, Ty ty): MonoEnv -> MonoEnv({ tvars: e.tvars, tvals: e.tvals, venv: [...e.venv, VarTy({ name: name, ty: ty, mutable: false })], ret: e.ret })
+const env_bind = (MonoEnv e, Str name, Ty ty): MonoEnv -> MonoEnv({ tvars: e.tvars, tvals: e.tvals, venv: [...e.venv, VarTy({ name: name, ty: ty, mutable: false })], ret: e.ret, vpnames: e.vpnames, vpvals: e.vpvals })
 
 # The concrete type NAME an argument denotes, for inference — derived by the SAME `type_of` the
 # typechecker uses, over the threaded `[VarTy]` environment (parameters + `let`/match/`for`/
@@ -542,7 +600,7 @@ const ensure_instance = (*MonoCtx m, Str gname, [Str] tyargs): Str -> {
 	const Iarch ti = find_template(m.templates, gname)
 	const Func tmpl = m.templates[ti]
 	if Iarch(tmpl.typarams.len) != Iarch(tyargs.len) then die("cf0: type: a generic call has the wrong number of type arguments\n")
-	check_bounds(m, tmpl.tbounds, tyargs)
+	check_params(m, tmpl.typarams, tmpl.tbounds, tyargs)
 	const Func clone = mono_func(m, tmpl, mn, tmpl.typarams, tyargs)
 	m.instances = [...m.instances, clone]
 	return mn
@@ -552,6 +610,20 @@ const ensure_instance = (*MonoCtx m, Str gname, [Str] tyargs): Str -> {
 # return, local annotations, nested generic call arguments) and its generic calls rewritten to
 # instances. `newname` is the (concrete) result name.
 const mono_func = (*MonoCtx m, Func f, Str newname, [Str] tvars, [Str] tvals): Func -> {
+	# split the parameters: a TYPE parameter (`'T`) drives type substitution; a comptime VALUE
+	# parameter (`n`, its arg an int literal) is FOLDED to its literal in the body — so the two
+	# have distinct machineries (`subst_slot` vs a `Var → Lit` fold threaded on the env).
+	let [Str] tvars_t = []
+	let [Str] tvals_t = []
+	let [Str] vpnames = []
+	let [Iarch] vpvals = []
+	let Iarch ti = 0
+	loop {
+		if ti >= Iarch(tvars.len) then break
+		if is_tvar(tvars[ti]) then { tvars_t = [...tvars_t, tvars[ti]]  tvals_t = [...tvals_t, tvals[ti]] }
+		else { vpnames = [...vpnames, tvars[ti]]  vpvals = [...vpvals, str_to_int(tvals[ti])] }
+		ti = ti + 1
+	}
 	let [Param] ps = []
 	let Iarch i = 0
 	loop {
@@ -560,11 +632,11 @@ const mono_func = (*MonoCtx m, Func f, Str newname, [Str] tvars, [Str] tvals): F
 		# substitute `'T` across EVERY type position of the parameter as one slot — the scalar/
 		# record name (or a generic application → its instance), a `[T]` array element, a tuple,
 		# AND the case where `'T` itself resolves to an array type (→ a `$dyn` slot)
-		const TySlot pst = subst_slot(m, p.type_name, p.elem, p.telems, tvars, tvals)
+		const TySlot pst = subst_slot(m, p.type_name, p.elem, p.telems, tvars_t, tvals_t)
 		ps = [...ps, Param({ name: p.name, is_ptr: p.is_ptr, type_name: pst.name, elem: pst.elem, telems: pst.telems })]
 		i = i + 1
 	}
-	const TySlot rst = subst_slot(m, f.ret_name, f.ret_elem, f.ret_telems, tvars, tvals)
+	const TySlot rst = subst_slot(m, f.ret_name, f.ret_elem, f.ret_telems, tvars_t, tvals_t)
 	const Str rn = rst.name
 	const Str re = rst.elem
 	const [TupElem] rtel = rst.telems
@@ -582,7 +654,7 @@ const mono_func = (*MonoCtx m, Func f, Str newname, [Str] tvars, [Str] tvals): F
 			pi = pi + 1
 		}
 	}
-	const MonoEnv env = MonoEnv({ tvars: tvars, tvals: tvals, venv: venv, ret: ret })
+	const MonoEnv env = MonoEnv({ tvars: tvars_t, tvals: tvals_t, venv: venv, ret: ret, vpnames: vpnames, vpvals: vpvals })
 	const [Stmt] body = mono_stmts(m, f.body, env)
 	const [Str] no_tp = []
 	return Func({ name: newname, is_pub: f.is_pub, ret_name: rn, ret_elem: re, params: ps, body: body, is_asm: f.is_asm, asm_body: f.asm_body, is_value: f.is_value, ret_telems: rtel, typarams: no_tp, tbounds: no_tp })
@@ -611,7 +683,7 @@ const mono_call = (*MonoCtx m, Str n, [Str] ta, [Expr] args, MonoEnv env): Expr 
 const mono_expr = (*MonoCtx m, Expr e, MonoEnv env): Expr -> match e {
 	Expr.Lit(v) -> Expr.Lit(v),
 	Expr.BoolLit(b) -> Expr.BoolLit(b),
-	Expr.Var(n) -> Expr.Var(n),
+	Expr.Var(n) -> vp_fold(n, env),
 	Expr.StrLit(bs) -> Expr.StrLit(bs),
 	Expr.FloatLit(t) -> Expr.FloatLit(t),
 	Expr.Record(n, fs) -> Expr.Record(mangle_type(m, n, env.tvars, env.tvals), mono_fields(m, fs, env)),
@@ -628,7 +700,7 @@ const mono_expr = (*MonoCtx m, Expr e, MonoEnv env): Expr -> match e {
 	Expr.Unit -> Expr.Unit,
 	Expr.Loop(body) -> Expr.Loop(mono_stmts(m, body, env)),
 	Expr.Interp(segs) -> Expr.Interp(mono_segs(m, segs, env)),
-	Expr.Buffer(n) -> Expr.Buffer(n),
+	Expr.Buffer(sz) -> Expr.Buffer(mono_expr(m, sz, env)),
 	Expr.Addr(name) -> Expr.Addr(name),
 	Expr.Neg(x) -> Expr.Neg(mono_expr(m, x, env)),
 	Expr.Not(x) -> Expr.Not(mono_expr(m, x, env)),
@@ -704,7 +776,7 @@ const arm_env = (*MonoCtx m, Str tn, [Str] members, [Str] binds, MonoEnv env): M
 	if !m.has_gen then return env
 	if str_eq(tn, "") then return env
 	if Iarch(binds.len) == 0 then return env
-	return MonoEnv({ tvars: env.tvars, tvals: env.tvals, venv: arm_bind_env(tn, members, binds, env.venv, build_ctx(m, env.ret)), ret: env.ret })
+	return MonoEnv({ tvars: env.tvars, tvals: env.tvals, venv: arm_bind_env(tn, members, binds, env.venv, build_ctx(m, env.ret)), ret: env.ret, vpnames: env.vpnames, vpvals: env.vpvals })
 }
 const mono_arms = (*MonoCtx m, [MatchArm] arms, MonoEnv env, Str scrut_ty): [MatchArm] -> {
 	let [MatchArm] out = []
@@ -772,7 +844,7 @@ const mono_stmt_match = (*MonoCtx m, Expr scrut, [StmtArm] arms, MonoEnv env): S
 }
 # Extend the environment for the statements after a destructure — the tuple binders' types via
 # the typechecker's `check_destructure` over the (monomorphized) initializer.
-const destr_env = (*MonoCtx m, [Str] pat, Bool mut, Expr e, MonoEnv env): MonoEnv -> MonoEnv({ tvars: env.tvars, tvals: env.tvals, venv: check_destructure(pat, mut, e, env.venv, build_ctx(m, env.ret)), ret: env.ret })
+const destr_env = (*MonoCtx m, [Str] pat, Bool mut, Expr e, MonoEnv env): MonoEnv -> MonoEnv({ tvars: env.tvars, tvals: env.tvals, venv: check_destructure(pat, mut, e, env.venv, build_ctx(m, env.ret)), ret: env.ret, vpnames: env.vpnames, vpvals: env.vpvals })
 # After a `let` / destructure, record the binding's type (via the typechecker's `binding_ty` /
 # `check_destructure` over the monomorphized statement) so a later generic call can infer from it.
 # Only under generics; a non-generic program never consults the environment, so this is skipped.
