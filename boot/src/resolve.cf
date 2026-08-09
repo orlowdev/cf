@@ -15,7 +15,7 @@
 
 import "io" as { open, read, close, die, o_rdonly }
 import "token" as { Token }
-import "ast" as { Expr, Stmt, MatchArm, StmtArm, Seg, FieldInit, RecDecl, UnionDecl, Func, Import, Program }
+import "ast" as { Expr, Stmt, MatchArm, StmtArm, Seg, FieldInit, RecDecl, UnionDecl, UnionMember, TupElem, Func, Import, Program }
 import "lexer" as { lex }
 import "typealias" as { strip_type_aliases }
 import "parser" as { Parser, parse_program }
@@ -352,6 +352,158 @@ const mangle_funcs = ([Func] fs, Iarch tag): [Func] -> {
 	return out
 }
 
+# --- declaration spread (data/union), type_system §8 -------------------------------------
+#
+# A `data Ext = { ...Src, … }` splices record `Src`'s fields in place; a `union Big = {
+# ...Src, … }` splices union `Src`'s members. The parser leaves a sentinel — a record field
+# with ftype "$spread" (its source name in the field slot), or a union member with payloads
+# == ["$spread"] (its source name in the member `name`). This pass, run after the flatten so
+# every source declaration is visible, replaces each sentinel with the source's (recursively
+# expanded) fields/members. The source must be a CONCRETE record (resp. union): a generic
+# template is rejected, as is a cross-kind or duplicate-name splice.
+
+# Index of a record / union by name, or -1 when absent.
+const find_rec = ([RecDecl] recs, Str name): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(recs.len) then break
+		if str_eq(recs[i].name, name) then return i
+		i = i + 1
+	}
+	return 0 - 1
+}
+const find_union = ([UnionDecl] unions, Str name): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(unions.len) then break
+		if str_eq(unions[i].name, name) then return i
+		i = i + 1
+	}
+	return 0 - 1
+}
+
+# Whether a name already appears among the accumulated field / member names (collision).
+const has_name = ([Str] names, Str name): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(names.len) then break
+		if str_eq(names[i], name) then return true
+		i = i + 1
+	}
+	return false
+}
+
+# Whether a union member is a spread sentinel (`payloads` is exactly `["$spread"]`).
+const is_spread_member = (UnionMember m): Bool -> {
+	if Iarch(m.payloads.len) != 1 then return false
+	return str_eq(m.payloads[0], "$spread")
+}
+
+# Expand a record's declaration spreads into a flat field set. Each `$spread` sentinel names
+# a source record; the source is looked up (must be a concrete record), recursively expanded,
+# and its fields spliced in place — preserving order and rejecting name collisions. The depth
+# guard turns an accidental spread cycle into a clean error instead of a hang.
+const expand_rec = (RecDecl d, [RecDecl] recs, [UnionDecl] unions, Iarch depth): RecDecl -> {
+	if depth > 64 then die("cf0: spread: a record spread cycle\n")
+	let [Str] fields = []
+	let [Str] ftypes = []
+	let [Str] felems = []
+	let [[TupElem]] ftelems = []
+	let Iarch k = 0
+	loop {
+		if k >= Iarch(d.fields.len) then break
+		if str_eq(d.ftypes[k], "$spread") then {
+			const Str src = d.fields[k]
+			const Iarch si = find_rec(recs, src)
+			if si < 0 then {
+				if find_union(unions, src) >= 0 then die("cf0: spread: a record can only spread a record, not a union\n")
+				die("cf0: spread: `...` names an undeclared record\n")
+			}
+			const RecDecl srd = recs[si]
+			if Iarch(srd.typarams.len) > 0 then die("cf0: spread: cannot spread a generic record template\n")
+			const RecDecl ex = expand_rec(srd, recs, unions, depth + 1)
+			let Iarch j = 0
+			loop {
+				if j >= Iarch(ex.fields.len) then break
+				if has_name(fields, ex.fields[j]) then die("cf0: spread: a spliced field collides with an existing field\n")
+				fields = [...fields, ex.fields[j]]
+				ftypes = [...ftypes, ex.ftypes[j]]
+				felems = [...felems, ex.felems[j]]
+				ftelems = [...ftelems, ex.ftelems[j]]
+				j = j + 1
+			}
+		} else {
+			if has_name(fields, d.fields[k]) then die("cf0: spread: a field collides with a spliced field\n")
+			fields = [...fields, d.fields[k]]
+			ftypes = [...ftypes, d.ftypes[k]]
+			felems = [...felems, d.felems[k]]
+			ftelems = [...ftelems, d.ftelems[k]]
+		}
+		k = k + 1
+	}
+	return RecDecl({ name: d.name, fields: fields, ftypes: ftypes, felems: felems, ftelems: ftelems, typarams: d.typarams, tbounds: d.tbounds })
+}
+
+# Expand a union's member spreads into a flat member set, mirroring `expand_rec`.
+const expand_union = (UnionDecl d, [RecDecl] recs, [UnionDecl] unions, Iarch depth): UnionDecl -> {
+	if depth > 64 then die("cf0: spread: a union spread cycle\n")
+	let [UnionMember] members = []
+	let [Str] names = []
+	let Iarch k = 0
+	loop {
+		if k >= Iarch(d.members.len) then break
+		const UnionMember mem = d.members[k]
+		if is_spread_member(mem) then {
+			const Str src = mem.name
+			const Iarch si = find_union(unions, src)
+			if si < 0 then {
+				if find_rec(recs, src) >= 0 then die("cf0: spread: a union can only spread a union, not a record\n")
+				die("cf0: spread: `...` names an undeclared union\n")
+			}
+			const UnionDecl sud = unions[si]
+			if Iarch(sud.typarams.len) > 0 then die("cf0: spread: cannot spread a generic union template\n")
+			const UnionDecl ex = expand_union(sud, recs, unions, depth + 1)
+			let Iarch j = 0
+			loop {
+				if j >= Iarch(ex.members.len) then break
+				if has_name(names, ex.members[j].name) then die("cf0: spread: a spliced member collides with an existing member\n")
+				members = [...members, ex.members[j]]
+				names = [...names, ex.members[j].name]
+				j = j + 1
+			}
+		} else {
+			if has_name(names, mem.name) then die("cf0: spread: a member collides with a spliced member\n")
+			members = [...members, mem]
+			names = [...names, mem.name]
+		}
+		k = k + 1
+	}
+	return UnionDecl({ name: d.name, members: members, typarams: d.typarams, tbounds: d.tbounds })
+}
+
+# Expand every record / union declaration's spreads. Lookups use the raw (pre-expansion)
+# lists; `expand_rec`/`expand_union` re-expand a source on demand, so ordering is irrelevant.
+const expand_recs = ([RecDecl] recs, [UnionDecl] unions): [RecDecl] -> {
+	let [RecDecl] out = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(recs.len) then break
+		out = [...out, expand_rec(recs[i], recs, unions, 0)]
+		i = i + 1
+	}
+	return out
+}
+const expand_unions = ([UnionDecl] unions, [RecDecl] recs): [UnionDecl] -> {
+	let [UnionDecl] out = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(unions.len) then break
+		out = [...out, expand_union(unions[i], recs, unions, 0)]
+		i = i + 1
+	}
+	return out
+}
+
 # Load the entry module and flatten its transitive import graph into one Program. The
 # work list grows as newly loaded modules contribute imports; `loaded` dedups by resolved
 # path so a diamond or a cycle loads each module once. Each module's private functions are
@@ -386,5 +538,8 @@ pub const resolve_program = (Str entry): Program -> {
 		wi = wi + 1
 	}
 	let [Import] none = []
-	return Program({ imports: none, recs: recs, unions: unions, funcs: funcs })
+	# expand declaration spreads now that every source record/union is visible
+	const [RecDecl] erecs = expand_recs(recs, unions)
+	const [UnionDecl] eunions = expand_unions(unions, recs)
+	return Program({ imports: none, recs: erecs, unions: eunions, funcs: funcs })
 }

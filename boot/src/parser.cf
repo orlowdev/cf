@@ -1564,7 +1564,22 @@ const parse_data = (*Parser p): RecDecl -> {
 		# the field type: a `[Elem]` dynamic array (`ftype` = "$dyn", `felem` = Elem), a
 		# `(A, B)` tuple (`ftype` = "$tuple", `ftelem` = the element names), or a
 		# scalar/aggregate type name (`Iarch`/`Bool`/`Str`/a record/a union).
-		if is_star(peek(p)) then {
+		if is_ellipsis(peek(p)) then {
+			# `...Src` — a declaration spread: splice another record's fields in place. The
+			# source name rides in the field slot with the sentinel ftype "$spread"; the
+			# resolve pass expands it once every declaration is visible. A generic APPLICATION
+			# `...Box[Iarch]` cannot be spread (rejected here); a generic TEMPLATE `...Box` is
+			# rejected at resolve time (its arity is only known there).
+			p.pos = p.pos + 1 # `...`
+			if !is_ident(peek(p)) then die("cf0: parse: expected a record name after `...`\n")
+			const Str src = cur_name(p)
+			p.pos = p.pos + 1
+			if is_lbracket(peek(p)) then die("cf0: parse: cannot spread a generic type application in a declaration\n")
+			fields = [...fields, src]
+			ftypes = [...ftypes, "$spread"]
+			felems = [...felems, ""]
+			ftelems = [...ftelems, no_tel]
+		} else if is_star(peek(p)) then {
 			# a `*[Uint8]` byte-pointer field
 			parse_type(p)
 			if !is_ident(peek(p)) then die("cf0: parse: expected a field name\n")
@@ -1629,6 +1644,24 @@ const parse_union = (*Parser p): UnionDecl -> {
 	let [UnionMember] members = []
 	loop {
 		if is_rbrace(peek(p)) then break
+		if is_ellipsis(peek(p)) then {
+			# `...Src` — a member spread: splice another union's members in place. The source
+			# name rides in the member `name` slot with the sentinel payload `["$spread"]`; the
+			# resolve pass expands it. A generic application `...Box[Iarch]` is rejected here; a
+			# generic template `...Box` at resolve time.
+			p.pos = p.pos + 1 # `...`
+			if !is_ident(peek(p)) then die("cf0: parse: expected a union name after `...`\n")
+			const Str usrc = cur_name(p)
+			p.pos = p.pos + 1
+			if is_lbracket(peek(p)) then die("cf0: parse: cannot spread a generic type application in a declaration\n")
+			const [Str] sp_mark = ["$spread"]
+			const [Str] sp_pe = []
+			const [[TupElem]] sp_pt = []
+			members = [...members, UnionMember({ name: usrc, payloads: sp_mark, pelems: sp_pe, ptelems: sp_pt })]
+			if !is_comma(peek(p)) then break
+			p.pos = p.pos + 1
+			continue
+		}
 		if !is_ident(peek(p)) then die("cf0: parse: expected a member name\n")
 		const Str mname = cur_name(p)
 		p.pos = p.pos + 1
