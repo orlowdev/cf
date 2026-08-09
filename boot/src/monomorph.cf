@@ -127,6 +127,66 @@ const subst_telemss = ([[TupElem]] tlss, [Str] tvars, [Str] tvals): [[TupElem]] 
 	return out
 }
 
+# --- array-typed type variables --------------------------------------------------------------
+# A type variable may be instantiated to an ARRAY type, encoded as an EMPTY-base bracket string
+# `[Elem]` (`[Iarch]`, `[Point]`) — the form `ty_name` produces for a `TDyn`. It is distinct
+# from a generic application `Base[Args]` (non-empty base) and a scalar name (no bracket).
+const is_arr_enc = (Str s): Bool -> {
+	if Iarch(s.len) == 0 then return false
+	return Iarch(s[0]) == 91  # '['
+}
+# The element of an array encoding — `[Iarch]` → `Iarch`, `[[Iarch]]` → `[Iarch]`.
+const arr_elem = (Str s): Str -> {
+	let [Uint8] out = []
+	let Iarch i = 1
+	loop {
+		if i + 1 >= Iarch(s.len) then break
+		out = [...out, s[i]]
+		i = i + 1
+	}
+	return Str(out)
+}
+# A fully-substituted type SLOT — the `type_name`/`elem`/`telems` trio a parameter, return,
+# field, or payload occupies (cf0 splits a type across these three positions).
+data TySlot = { Str name, Str elem, [TupElem] telems }
+# Substitute type variables across a whole type slot. A bare type variable may resolve to a
+# COMPOUND type — an array `[X]` becomes a `$dyn` slot with element X — so the ENTIRE trio is
+# rewritten, not just the scalar name. A type variable bound to a TUPLE, or nested as a `[…]`
+# element (`['T]` at `'T = [Iarch]` → a dynamic array of arrays), is a later brick — the latter
+# is cleanly rejected here.
+const subst_slot = (*MonoCtx m, Str name, Str elem, [TupElem] telems, [Str] tvars, [Str] tvals): TySlot -> {
+	const [TupElem] no_tel = []
+	# an array slot `[E]` — the element is substituted as a name (a type variable there may itself
+	# expand to an array, `['T]` at `'T = [Iarch]` → the element `[Iarch]`, i.e. a nested dynamic
+	# array — `mangle_type`'s empty-base branch produces the nested encoding, which emit supports)
+	if str_eq(name, "$dyn") then return TySlot({ name: "$dyn", elem: mangle_type(m, elem, tvars, tvals), telems: no_tel })
+	# a tuple slot `(…)` — substitute each position (leaves stay scalar; see the later-brick note)
+	if str_eq(name, "$tuple") then return TySlot({ name: "$tuple", elem: elem, telems: subst_telems(telems, tvars, tvals) })
+	# a bare name — a type variable here may expand to an ARRAY type
+	const Str bound = subst_ty(name, tvars, tvals)
+	if is_arr_enc(bound) then return TySlot({ name: "$dyn", elem: mangle_type(m, arr_elem(bound), tvars, tvals), telems: no_tel })
+	# scalar / record / union / generic application
+	return TySlot({ name: mangle_type(m, name, tvars, tvals), elem: subst_ty(elem, tvars, tvals), telems: subst_telems(telems, tvars, tvals) })
+}
+# The three parallel per-position slot lists (a record's `ftypes`/`felems`/`ftelems`, a union
+# member's `payloads`/`pelems`/`ptelems`), each position substituted as a whole slot.
+data SlotList = { [Str] names, [Str] elems, [[TupElem]] telemss }
+const subst_slots = (*MonoCtx m, [Str] names, [Str] elems, [[TupElem]] telemss, [Str] tvars, [Str] tvals): SlotList -> {
+	let [Str] ns = []
+	let [Str] es = []
+	let [[TupElem]] ts = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(names.len) then break
+		const TySlot s = subst_slot(m, names[i], elems[i], telemss[i], tvars, tvals)
+		ns = [...ns, s.name]
+		es = [...es, s.elem]
+		ts = [...ts, s.telems]
+		i = i + 1
+	}
+	return SlotList({ names: ns, elems: es, telemss: ts })
+}
+
 # The concrete instance name for `gname` applied to `tyargs` — `id[Iarch]` → `id$Iarch`,
 # `pair[Iarch, Color]` → `pair$Iarch$Color`. The `$` separator never occurs in a source name or
 # in resolve's `__<tag>` private-mangling, so (template, args) → name is injective (no collision
@@ -218,6 +278,9 @@ const type_key_seen = (*MonoCtx m, Str mn): Bool -> {
 const mangle_type = (*MonoCtx m, Str name, [Str] tvars, [Str] tvals): Str -> {
 	if !is_type_app(name) then return subst_ty(name, tvars, tvals)
 	const Str base = type_base(name)
+	# an EMPTY base is the array encoding `[Elem]` (not a generic application) — mangle the
+	# element and keep the encoding; `subst_slot` later expands it into a `$dyn` type slot
+	if str_eq(base, "") then return "[${mangle_type(m, arr_elem(name), tvars, tvals)}]"
 	const [Str] args = type_args(name)
 	let [Str] margs = []
 	let Iarch i = 0
@@ -259,7 +322,8 @@ const ensure_union_instance = (*MonoCtx m, Str base, [Str] margs): Str -> {
 	loop {
 		if mi >= Iarch(tmpl.members.len) then break
 		const UnionMember um = tmpl.members[mi]
-		members = [...members, UnionMember({ name: um.name, payloads: mangle_types(m, um.payloads, tmpl.typarams, margs), pelems: subst_tys(um.pelems, tmpl.typarams, margs), ptelems: subst_telemss(um.ptelems, tmpl.typarams, margs) })]
+		const SlotList ps = subst_slots(m, um.payloads, um.pelems, um.ptelems, tmpl.typarams, margs)
+		members = [...members, UnionMember({ name: um.name, payloads: ps.names, pelems: ps.elems, ptelems: ps.telemss })]
 		mi = mi + 1
 	}
 	const [Str] no_tp = []
@@ -287,11 +351,9 @@ const ensure_rec_instance = (*MonoCtx m, Str base, [Str] margs): Str -> {
 	if ri < 0 then die("cf0: type: a generic type application names a non-generic or undeclared type\n")
 	const RecDecl tmpl = m.rec_templates[ri]
 	if Iarch(tmpl.typarams.len) != Iarch(margs.len) then die("cf0: type: wrong number of type arguments for a generic type\n")
-	let [Str] ftypes = mangle_types(m, tmpl.ftypes, tmpl.typarams, margs)
-	let [Str] felems = subst_tys(tmpl.felems, tmpl.typarams, margs)
-	let [[TupElem]] ftelems = subst_telemss(tmpl.ftelems, tmpl.typarams, margs)
+	const SlotList fs = subst_slots(m, tmpl.ftypes, tmpl.felems, tmpl.ftelems, tmpl.typarams, margs)
 	const [Str] no_tp = []
-	m.rec_instances = [...m.rec_instances, RecDecl({ name: mn, fields: tmpl.fields, ftypes: ftypes, felems: felems, ftelems: ftelems, typarams: no_tp })]
+	m.rec_instances = [...m.rec_instances, RecDecl({ name: mn, fields: tmpl.fields, ftypes: fs.names, felems: fs.elems, ftelems: fs.telemss, typarams: no_tp })]
 	return mn
 }
 
@@ -443,14 +505,17 @@ const mono_func = (*MonoCtx m, Func f, Str newname, [Str] tvars, [Str] tvals): F
 	loop {
 		if i >= Iarch(f.params.len) then break
 		const Param p = f.params[i]
-		# substitute `'T` in EVERY type position of the parameter: the scalar/record name (or a
-		# generic type application, mangled to its instance), a `[T]` array element, and a tuple
-		ps = [...ps, Param({ name: p.name, is_ptr: p.is_ptr, type_name: mangle_type(m, p.type_name, tvars, tvals), elem: subst_ty(p.elem, tvars, tvals), telems: subst_telems(p.telems, tvars, tvals) })]
+		# substitute `'T` across EVERY type position of the parameter as one slot — the scalar/
+		# record name (or a generic application → its instance), a `[T]` array element, a tuple,
+		# AND the case where `'T` itself resolves to an array type (→ a `$dyn` slot)
+		const TySlot pst = subst_slot(m, p.type_name, p.elem, p.telems, tvars, tvals)
+		ps = [...ps, Param({ name: p.name, is_ptr: p.is_ptr, type_name: pst.name, elem: pst.elem, telems: pst.telems })]
 		i = i + 1
 	}
-	const Str rn = mangle_type(m, f.ret_name, tvars, tvals)
-	const Str re = subst_ty(f.ret_elem, tvars, tvals)
-	const [TupElem] rtel = subst_telems(f.ret_telems, tvars, tvals)
+	const TySlot rst = subst_slot(m, f.ret_name, f.ret_elem, f.ret_telems, tvars, tvals)
+	const Str rn = rst.name
+	const Str re = rst.elem
+	const [TupElem] rtel = rst.telems
 	# seed the local value env with the (substituted) parameter types, so a generic call in the
 	# body can infer from a parameter reference. Only under generics: a non-generic function has
 	# nothing to instantiate, so the env stays empty and `type_of` is never invoked on it.
