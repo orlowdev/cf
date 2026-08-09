@@ -8,11 +8,12 @@
 # emit see only ordinary functions. Instances are deduped, and a clone's own body is scanned
 # for further generic calls (transitive instantiation) to a fixpoint.
 #
-# Type arguments are given EXPLICITLY (`id[Iarch](x)`) or INFERRED from the argument types
-# (`id(x)`). Inference is shallow — it reads each argument's type from a local environment the
-# pass threads (parameters + `let` bindings): a parameter whose declared type IS a type
-# variable fixes that variable to the argument's type. Structural inference (through a tuple or
-# array parameter), generic DATA/UNION types, and bounds are later bricks.
+# Type arguments are given EXPLICITLY (`id[Iarch](x)`) or INFERRED (`id(x)`). Inference derives
+# each argument's type with the typechecker's own `type_of` over a threaded value environment
+# (parameters + `let`/match/`for`/destructure binders), so a parameter whose declared type IS a
+# type variable fixes it to the argument's type. Generic DATA/UNION types, array-typed type
+# variables, and union BOUNDS (`[Color 'T]`) are supported; STRUCTURAL inference (fixing `'T`
+# from INSIDE a `['T]`/tuple parameter) and a tuple-typed type variable are later bricks.
 
 import "io" as { die }
 import "ast" as { Expr, Stmt, Param, Func, MatchArm, StmtArm, Seg, FieldInit, RecDecl, UnionDecl, UnionMember, TupElem, Import, Program, Ty }
@@ -65,6 +66,54 @@ const key_seen = (*MonoCtx m, Str mn): Bool -> {
 		i = i + 1
 	}
 	return false
+}
+const is_union_name = (*MonoCtx m, Str n): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(m.unions.len) then break
+		if str_eq(m.unions[i], n) then return true
+		i = i + 1
+	}
+	return false
+}
+# Every non-empty bound in a declaration must name a union — validated at DECL time (like the
+# type-variable checks) so a malformed bound is rejected even if the template is never used.
+const check_bound_list = (*MonoCtx m, [Str] tbounds): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(tbounds.len) then break
+		if !str_eq(tbounds[i], "") then {
+			if !is_union_name(m, tbounds[i]) then die("cf0: type: a generic bound must name a union\n")
+		}
+		i = i + 1
+	}
+	return 0
+}
+const check_template_bounds = (*MonoCtx m): Iarch -> {
+	let Iarch i = 0
+	loop { if i >= Iarch(m.templates.len) then break  check_bound_list(m, m.templates[i].tbounds)  i = i + 1 }
+	let Iarch j = 0
+	loop { if j >= Iarch(m.rec_templates.len) then break  check_bound_list(m, m.rec_templates[j].tbounds)  j = j + 1 }
+	let Iarch k = 0
+	loop { if k >= Iarch(m.union_templates.len) then break  check_bound_list(m, m.union_templates[k].tbounds)  k = k + 1 }
+	return 0
+}
+# Check each type argument satisfies its parameter's BOUND (`[Color 'T]`): the argument must be
+# the bound union (reflexive — §8.5 compose-over union subtyping is a later brick). An unbounded
+# parameter (`""`) accepts any argument. (The bound-is-a-union check is done at decl time above.)
+const check_bounds = (*MonoCtx m, [Str] tbounds, [Str] margs): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(tbounds.len) then break
+		const Str b = tbounds[i]
+		if !str_eq(b, "") then {
+			if !is_union_name(m, b) then die("cf0: type: a generic bound must name a union\n")
+			if i >= Iarch(margs.len) then die("cf0: type: a bounded type parameter has no argument\n")
+			if !str_eq(margs[i], b) then die("cf0: type: a type argument does not satisfy its bound\n")
+		}
+		i = i + 1
+	}
+	return 0
 }
 # A bare or negated integer literal — a WEAK inference source: it fixes a type variable only
 # when no non-literal argument does, since an integer literal ADOPTS its context's width
@@ -317,6 +366,7 @@ const ensure_union_instance = (*MonoCtx m, Str base, [Str] margs): Str -> {
 	const Iarch ui = find_union_template(m.union_templates, base)
 	const UnionDecl tmpl = m.union_templates[ui]
 	if Iarch(tmpl.typarams.len) != Iarch(margs.len) then die("cf0: type: wrong number of type arguments for a generic type\n")
+	check_bounds(m, tmpl.tbounds, margs)
 	let [UnionMember] members = []
 	let Iarch mi = 0
 	loop {
@@ -327,7 +377,7 @@ const ensure_union_instance = (*MonoCtx m, Str base, [Str] margs): Str -> {
 		mi = mi + 1
 	}
 	const [Str] no_tp = []
-	m.union_instances = [...m.union_instances, UnionDecl({ name: mn, members: members, typarams: no_tp })]
+	m.union_instances = [...m.union_instances, UnionDecl({ name: mn, members: members, typarams: no_tp, tbounds: no_tp })]
 	return mn
 }
 const mangle_types = (*MonoCtx m, [Str] names, [Str] tvars, [Str] tvals): [Str] -> {
@@ -351,9 +401,10 @@ const ensure_rec_instance = (*MonoCtx m, Str base, [Str] margs): Str -> {
 	if ri < 0 then die("cf0: type: a generic type application names a non-generic or undeclared type\n")
 	const RecDecl tmpl = m.rec_templates[ri]
 	if Iarch(tmpl.typarams.len) != Iarch(margs.len) then die("cf0: type: wrong number of type arguments for a generic type\n")
+	check_bounds(m, tmpl.tbounds, margs)
 	const SlotList fs = subst_slots(m, tmpl.ftypes, tmpl.felems, tmpl.ftelems, tmpl.typarams, margs)
 	const [Str] no_tp = []
-	m.rec_instances = [...m.rec_instances, RecDecl({ name: mn, fields: tmpl.fields, ftypes: fs.names, felems: fs.elems, ftelems: fs.telemss, typarams: no_tp })]
+	m.rec_instances = [...m.rec_instances, RecDecl({ name: mn, fields: tmpl.fields, ftypes: fs.names, felems: fs.elems, ftelems: fs.telemss, typarams: no_tp, tbounds: no_tp })]
 	return mn
 }
 
@@ -396,11 +447,11 @@ const mangle_func_sig = (*MonoCtx m, Func f): Func -> {
 		i = i + 1
 	}
 	const [Stmt] nobody = []
-	return Func({ name: f.name, is_pub: f.is_pub, ret_name: mangle_type(m, f.ret_name, nt, nt), ret_elem: mangle_type(m, f.ret_elem, nt, nt), params: ps, body: nobody, is_asm: f.is_asm, asm_body: f.asm_body, is_value: f.is_value, ret_telems: f.ret_telems, typarams: f.typarams })
+	return Func({ name: f.name, is_pub: f.is_pub, ret_name: mangle_type(m, f.ret_name, nt, nt), ret_elem: mangle_type(m, f.ret_elem, nt, nt), params: ps, body: nobody, is_asm: f.is_asm, asm_body: f.asm_body, is_value: f.is_value, ret_telems: f.ret_telems, typarams: f.typarams, tbounds: f.tbounds })
 }
 const mangle_rec_sig = (*MonoCtx m, RecDecl r): RecDecl -> {
 	const [Str] nt = []
-	return RecDecl({ name: r.name, fields: r.fields, ftypes: mangle_types(m, r.ftypes, nt, nt), felems: mangle_types(m, r.felems, nt, nt), ftelems: r.ftelems, typarams: r.typarams })
+	return RecDecl({ name: r.name, fields: r.fields, ftypes: mangle_types(m, r.ftypes, nt, nt), felems: mangle_types(m, r.felems, nt, nt), ftelems: r.ftelems, typarams: r.typarams, tbounds: r.tbounds })
 }
 const mangle_union_sig = (*MonoCtx m, UnionDecl u): UnionDecl -> {
 	const [Str] nt = []
@@ -412,7 +463,7 @@ const mangle_union_sig = (*MonoCtx m, UnionDecl u): UnionDecl -> {
 		mem = [...mem, UnionMember({ name: um.name, payloads: mangle_types(m, um.payloads, nt, nt), pelems: mangle_types(m, um.pelems, nt, nt), ptelems: um.ptelems })]
 		i = i + 1
 	}
-	return UnionDecl({ name: u.name, members: mem, typarams: u.typarams })
+	return UnionDecl({ name: u.name, members: mem, typarams: u.typarams, tbounds: u.tbounds })
 }
 # Replace the concrete declarations in `m` with their signature-mangled forms (§ above).
 const mangle_concrete_sigs = (*MonoCtx m): Iarch -> {
@@ -491,6 +542,7 @@ const ensure_instance = (*MonoCtx m, Str gname, [Str] tyargs): Str -> {
 	const Iarch ti = find_template(m.templates, gname)
 	const Func tmpl = m.templates[ti]
 	if Iarch(tmpl.typarams.len) != Iarch(tyargs.len) then die("cf0: type: a generic call has the wrong number of type arguments\n")
+	check_bounds(m, tmpl.tbounds, tyargs)
 	const Func clone = mono_func(m, tmpl, mn, tmpl.typarams, tyargs)
 	m.instances = [...m.instances, clone]
 	return mn
@@ -533,7 +585,7 @@ const mono_func = (*MonoCtx m, Func f, Str newname, [Str] tvars, [Str] tvals): F
 	const MonoEnv env = MonoEnv({ tvars: tvars, tvals: tvals, venv: venv, ret: ret })
 	const [Stmt] body = mono_stmts(m, f.body, env)
 	const [Str] no_tp = []
-	return Func({ name: newname, is_pub: f.is_pub, ret_name: rn, ret_elem: re, params: ps, body: body, is_asm: f.is_asm, asm_body: f.asm_body, is_value: f.is_value, ret_telems: rtel, typarams: no_tp })
+	return Func({ name: newname, is_pub: f.is_pub, ret_name: rn, ret_elem: re, params: ps, body: body, is_asm: f.is_asm, asm_body: f.asm_body, is_value: f.is_value, ret_telems: rtel, typarams: no_tp, tbounds: no_tp })
 }
 
 # Rewrite a call. A generic callee is instantiated (type args explicit, or inferred from the
@@ -861,6 +913,7 @@ pub const mono_program = (Program prog): Program -> {
 	# reject a generic record/union template whose field/payload names an undeclared type variable
 	check_rec_templates(&m)
 	check_union_templates(&m)
+	check_template_bounds(&m)
 	# resolve any generic type NAMED in a concrete signature to its instance, so the shared
 	# `type_of` sees only concrete decls (skipped when there are no generics — the identity path)
 	if has_gen then mangle_concrete_sigs(&m)

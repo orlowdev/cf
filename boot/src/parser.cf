@@ -1357,30 +1357,46 @@ const scan_asm_segs = (*[Uint8] src, Iarch start, Iarch len): [Seg] -> {
 # and its uses take.
 const is_typar_name = (Str s): Bool -> if Iarch(s.len) == 0 then false else Iarch(s[0]) == 39
 # `['T, 'U]` — a generic type-parameter list (each a type variable). Consumes the brackets.
-const parse_typarams = (*Parser p): [Str] -> {
+# The parsed type parameters of a declaration — the bare variable NAMES (`["'A", "'B"]`) and the
+# per-parameter BOUNDS (`["Color", ""]`; the empty string for an unbounded parameter).
+data TyParams = { [Str] names, [Str] bounds }
+const parse_typarams = (*Parser p): TyParams -> {
 	p.pos = p.pos + 1 # `[`
 	let [Str] tps = []
+	let [Str] tbs = []
 	loop {
 		if !is_ident(peek(p)) then die("cf0: parse: expected a type variable in a `['T]` list\n")
-		const Str tp = cur_name(p)
-		if !is_typar_name(tp) then die("cf0: parse: a generic type parameter must be a type variable like `'T`\n")
-		tps = [...tps, tp]
+		# an optional BOUND precedes the variable — a non-`'T` ident, e.g. `[Color 'T]`
+		let Str bound = ""
+		if !is_typar_name(cur_name(p)) then {
+			bound = cur_name(p)
+			p.pos = p.pos + 1
+			if !is_ident(peek(p)) then die("cf0: parse: a generic bound must be followed by a type variable\n")
+			if !is_typar_name(cur_name(p)) then die("cf0: parse: a generic bound must be followed by a type variable\n")
+		}
+		tps = [...tps, cur_name(p)]
+		tbs = [...tbs, bound]
 		p.pos = p.pos + 1
 		if !is_comma(peek(p)) then break
 		p.pos = p.pos + 1
 	}
 	if !is_rbracket(peek(p)) then die("cf0: parse: expected `]` after type parameters\n")
 	p.pos = p.pos + 1
-	return tps
+	return TyParams({ names: tps, bounds: tbs })
 }
-# Whether a `[...]` at the current position opens a generic type-parameter list (the token
-# after `[` is a type variable) rather than an array-literal value const (`const N = [1,2]`).
+# Whether a `[...]` at the current position opens a (possibly bounded) type-parameter list —
+# `['T…]` (a `'T` right after `[`) or `[Bound 'T…]` (a non-`'T` ident then a `'T`) — rather than
+# an array-literal value const (`const N = [1,2]`).
 const typarams_ahead = (*Parser p): Bool -> {
 	if !is_lbracket(peek(p)) then return false
 	if p.pos + 1 >= Iarch(p.toks.len) then return false
 	const Token t2 = p.toks[p.pos + 1]
 	if !is_ident(t2.kind) then return false
-	return Iarch(p.src[t2.start]) == 39
+	if Iarch(p.src[t2.start]) == 39 then return true
+	if p.pos + 2 >= Iarch(p.toks.len) then return false
+	const Token t3 = p.toks[p.pos + 2]
+	if !is_ident(t3.kind) then return false
+	return Iarch(p.src[t3.start]) == 39
 }
 
 # Read a type REFERENCE in a type position: a bare name (`Iarch`, `Point`, `'T`) or a generic
@@ -1426,9 +1442,10 @@ const parse_func = (*Parser p): Func -> {
 	p.pos = p.pos + 1
 	if !is_eq(peek(p)) then die("cf0: parse: expected `=`\n")
 	p.pos = p.pos + 1
-	# `= ['T](…)` — a generic function's type-parameter list (before the value params)
+	# `= ['T](…)` / `= [Color 'T](…)` — a generic function's (optionally bounded) type parameters
 	let [Str] typarams = []
-	if typarams_ahead(p) then typarams = parse_typarams(p)
+	let [Str] tbounds = []
+	if typarams_ahead(p) then { const TyParams tpb = parse_typarams(p)  typarams = tpb.names  tbounds = tpb.bounds }
 	const [Str] no_tp = []
 	# `[pub] const NAME = <expr>` with no `(` — a top-level VALUE const (module_system /
 	# ebnf § Modules), modeled as a nullary function returning the value; a bare reference
@@ -1440,7 +1457,7 @@ const parse_func = (*Parser p): Func -> {
 		const [Stmt] vempty = []
 		const [Stmt] vbody = [...vempty, Stmt.Return(parse_expr(p))]
 		const [Seg] vnoasm = []
-		return Func({ name: name, is_pub: is_pub, ret_name: "", ret_elem: "", params: noparams, body: vbody, is_asm: false, asm_body: vnoasm, is_value: true, ret_telems: [], typarams: no_tp })
+		return Func({ name: name, is_pub: is_pub, ret_name: "", ret_elem: "", params: noparams, body: vbody, is_asm: false, asm_body: vnoasm, is_value: true, ret_telems: [], typarams: no_tp, tbounds: no_tp })
 	}
 	p.pos = p.pos + 1
 	const [Param] params = parse_params(p)
@@ -1458,15 +1475,15 @@ const parse_func = (*Parser p): Func -> {
 		if !is_strlit(peek(p)) then die("cf0: parse: expected a string after `asm`\n")
 		const [Seg] segs = scan_asm_segs(p.src, p.toks[p.pos].start, p.toks[p.pos].len)
 		p.pos = p.pos + 1
-		return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: nobody, is_asm: true, asm_body: segs, is_value: false, ret_telems: rs.telems, typarams: typarams })
+		return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: nobody, is_asm: true, asm_body: segs, is_value: false, ret_telems: rs.telems, typarams: typarams, tbounds: tbounds })
 	}
 	if is_lbrace(peek(p)) then {
 		p.pos = p.pos + 1
 		const [Stmt] body = parse_block(p)
-		return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: body, is_asm: false, asm_body: noasm, is_value: false, ret_telems: rs.telems, typarams: typarams })
+		return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: body, is_asm: false, asm_body: noasm, is_value: false, ret_telems: rs.telems, typarams: typarams, tbounds: tbounds })
 	}
 	const [Stmt] one = [...nobody, Stmt.Return(parse_expr(p))]
-	return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: one, is_asm: false, asm_body: noasm, is_value: false, ret_telems: rs.telems, typarams: typarams })
+	return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: one, is_asm: false, asm_body: noasm, is_value: false, ret_telems: rs.telems, typarams: typarams, tbounds: tbounds })
 }
 
 # `data Name = { Iarch a, Iarch b }` — a record declaration (Iarch fields only, at
@@ -1478,9 +1495,10 @@ const parse_data = (*Parser p): RecDecl -> {
 	if !is_ident(peek(p)) then die("cf0: parse: expected a record type name\n")
 	const Str name = cur_name(p)
 	p.pos = p.pos + 1
-	# `data Pair['A, 'B] = …` — a generic record's type parameters
+	# `data Pair['A, 'B] = …` / `data Tagged[Color 'T] = …` — a record's (bounded) type parameters
 	let [Str] typarams = []
-	if typarams_ahead(p) then typarams = parse_typarams(p)
+	let [Str] tbounds = []
+	if typarams_ahead(p) then { const TyParams tpb = parse_typarams(p)  typarams = tpb.names  tbounds = tpb.bounds }
 	if !is_eq(peek(p)) then die("cf0: parse: expected `=` in a data declaration\n")
 	p.pos = p.pos + 1
 	if !is_lbrace(peek(p)) then die("cf0: parse: expected `{` in a data declaration\n")
@@ -1538,7 +1556,7 @@ const parse_data = (*Parser p): RecDecl -> {
 	}
 	if !is_rbrace(peek(p)) then die("cf0: parse: expected `}` in a data declaration\n")
 	p.pos = p.pos + 1
-	return RecDecl({ name: name, fields: fields, ftypes: ftypes, felems: felems, ftelems: ftelems, typarams: typarams })
+	return RecDecl({ name: name, fields: fields, ftypes: ftypes, felems: felems, ftelems: ftelems, typarams: typarams, tbounds: tbounds })
 }
 
 # `union Name = { A, B, C }` — a tag-only union declaration (at least one member; a
@@ -1549,9 +1567,10 @@ const parse_union = (*Parser p): UnionDecl -> {
 	if !is_ident(peek(p)) then die("cf0: parse: expected a union type name\n")
 	const Str name = cur_name(p)
 	p.pos = p.pos + 1
-	# `union Maybe['V] = …` — a generic union's type parameters
+	# `union Maybe['V] = …` / `union Wrapper[Color 'T] = …` — a union's (bounded) type parameters
 	let [Str] typarams = []
-	if typarams_ahead(p) then typarams = parse_typarams(p)
+	let [Str] tbounds = []
+	if typarams_ahead(p) then { const TyParams tpb = parse_typarams(p)  typarams = tpb.names  tbounds = tpb.bounds }
 	if !is_eq(peek(p)) then die("cf0: parse: expected `=` in a union declaration\n")
 	p.pos = p.pos + 1
 	if !is_lbrace(peek(p)) then die("cf0: parse: expected `{` in a union declaration\n")
@@ -1603,7 +1622,7 @@ const parse_union = (*Parser p): UnionDecl -> {
 	}
 	if !is_rbrace(peek(p)) then die("cf0: parse: expected `}` in a union declaration\n")
 	p.pos = p.pos + 1
-	return UnionDecl({ name: name, members: members, typarams: typarams })
+	return UnionDecl({ name: name, members: members, typarams: typarams, tbounds: tbounds })
 }
 
 # A top-level import `import "path" as { a, b, … }` (module_system §4). The path is a
