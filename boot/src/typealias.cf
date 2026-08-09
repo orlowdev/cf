@@ -1,0 +1,186 @@
+# typealias — comptime `type` alias resolution over the token stream (type_system §7, token erasure).
+#
+# `type Name = Target` declares Name as an alias for the type expression Target. This pass runs
+# between lex and parse: it COLLECTS every alias (order-independent — an alias may appear textually
+# before its `type` decl), REMOVES the `type` declarations, and SPLICES each alias's fully-expanded
+# target tokens in for every remaining occurrence of the alias name. Alias-of-alias resolves to a
+# fixpoint (`B = A`, `A = Iarch` → `B` becomes `Iarch`); a cycle is rejected. A GENERIC alias
+# (`type Name['T] = …`) is not supported. The target runs to the next top-level declaration keyword
+# (or EOF), tracking paren/bracket depth so a `(A) -> R` / `Box[Iarch]` target stays whole.
+
+import "io" as { die }
+import "token" as { Token, TokKind, is_ident, is_eq, is_eof, is_lbracket, is_rbracket, is_lparen, is_rparen, is_lbrace, is_rbrace, is_comma }
+
+const str_eq = (Str a, Str b): Bool -> {
+	if a.len != b.len then return false
+	let Iarch i = 0
+	loop { if i >= Iarch(a.len) then break  if Iarch(a[i]) != Iarch(b[i]) then return false  i = i + 1 }
+	return true
+}
+const tok_text = (*[Uint8] src, Token t): Str -> {
+	let [Uint8] out = []
+	let Iarch i = 0
+	loop { if i >= t.len then break  out = [...out, src[t.start + i]]  i = i + 1 }
+	return Str(out)
+}
+const is_decl_kw = (Str s): Bool -> {
+	if str_eq(s, "const") then return true
+	if str_eq(s, "pub") then return true
+	if str_eq(s, "data") then return true
+	if str_eq(s, "union") then return true
+	if str_eq(s, "type") then return true
+	if str_eq(s, "import") then return true
+	return false
+}
+# List concatenation building from `[]` (a `let o = a` would alias `a`'s store and the in-place
+# spread-append would mutate the caller's array).
+const cat_toks = ([Token] a, [Token] b): [Token] -> {
+	let [Token] o = []
+	let Iarch i = 0
+	loop { if i >= Iarch(a.len) then break  o = [...o, a[i]]  i = i + 1 }
+	let Iarch j = 0
+	loop { if j >= Iarch(b.len) then break  o = [...o, b[j]]  j = j + 1 }
+	return o
+}
+
+data Alias = { Str name, [Token] target }
+const find_alias = ([Alias] aliases, Str n): Iarch -> {
+	let Iarch i = 0
+	loop { if i >= Iarch(aliases.len) then break  if str_eq(aliases[i].name, n) then return i  i = i + 1 }
+	return 0 - 1
+}
+const str_in = ([Str] names, Str n): Bool -> {
+	let Iarch i = 0
+	loop { if i >= Iarch(names.len) then break  if str_eq(names[i], n) then return true  i = i + 1 }
+	return false
+}
+# Collect the DECLARATION names an alias must not collide with — data/union type names and union
+# MEMBER names. Token erasure is textual, so an alias name equal to one of these would clobber it
+# (a member `Green` inside `union Hue = { Red, Green, Blue }` would be rewritten to its target);
+# value identifiers are snake_case and never collide, but these PascalCase names can, so a
+# collision is rejected up front rather than silently miscompiled.
+const collect_decl_names = (*[Uint8] src, [Token] toks): [Str] -> {
+	let [Str] names = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(toks.len) then break
+		if is_ident(toks[i].kind) && i + 1 < Iarch(toks.len) && is_ident(toks[i + 1].kind) then {
+			const Str w = tok_text(src, toks[i])
+			if str_eq(w, "data") || str_eq(w, "union") then {
+				names = [...names, tok_text(src, toks[i + 1])]
+				if str_eq(w, "union") then {
+					let Iarch j = i + 2
+					loop { if j >= Iarch(toks.len) || is_lbrace(toks[j].kind) then break  j = j + 1 }
+					j = j + 1  # past `{`
+					let Iarch bdepth = 1
+					let Iarch pdepth = 0
+					let Bool at_member = true
+					loop {
+						if j >= Iarch(toks.len) then break
+						const TokKind k = toks[j].kind
+						if is_lbrace(k) then bdepth = bdepth + 1
+						if is_rbrace(k) then { bdepth = bdepth - 1  if bdepth == 0 then break }
+						if is_lparen(k) then pdepth = pdepth + 1
+						if is_rparen(k) then pdepth = pdepth - 1
+						if bdepth == 1 && pdepth == 0 then {
+							if at_member && is_ident(k) then { names = [...names, tok_text(src, toks[j])]  at_member = false }
+							if is_comma(k) then at_member = true
+						}
+						j = j + 1
+					}
+				}
+			}
+		}
+		i = i + 1
+	}
+	return names
+}
+# The index just past a `type Name = Target` declaration whose `type` token is at index `i` — the
+# target ends at the next top-level decl keyword (at depth 0) or EOF.
+const alias_decl_end = (*[Uint8] src, [Token] toks, Iarch i): Iarch -> {
+	let Iarch j = i + 2  # past `type Name`
+	if j < Iarch(toks.len) && is_eq(toks[j].kind) then j = j + 1  # past `=`
+	let Iarch depth = 0
+	loop {
+		if j >= Iarch(toks.len) then break
+		if is_eof(toks[j].kind) then break
+		const TokKind k = toks[j].kind
+		if depth == 0 && is_ident(k) && is_decl_kw(tok_text(src, toks[j])) then break
+		if is_lparen(k) || is_lbracket(k) then depth = depth + 1
+		if is_rparen(k) || is_rbracket(k) then depth = depth - 1
+		j = j + 1
+	}
+	return j
+}
+# Expand any alias names inside a target to a fixpoint (alias-of-alias); `fuel` guards a cycle.
+const expand_target = (*[Uint8] src, [Alias] aliases, [Token] tgt, Iarch fuel): [Token] -> {
+	if fuel <= 0 then die("cf0: type: a cyclic `type` alias\n")
+	let [Token] out = []
+	let Bool changed = false
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(tgt.len) then break
+		let Bool spliced = false
+		if is_ident(tgt[i].kind) then {
+			const Iarch ai = find_alias(aliases, tok_text(src, tgt[i]))
+			if ai >= 0 then { out = cat_toks(out, aliases[ai].target)  changed = true  spliced = true }
+		}
+		if !spliced then out = [...out, tgt[i]]
+		i = i + 1
+	}
+	if changed then return expand_target(src, aliases, out, fuel - 1)
+	return out
+}
+const is_type_kw = (*[Uint8] src, [Token] toks, Iarch i): Bool -> {
+	if !is_ident(toks[i].kind) then return false
+	return str_eq(tok_text(src, toks[i]), "type")
+}
+
+pub const strip_type_aliases = (*[Uint8] src, [Token] toks): [Token] -> {
+	# pass 1 — collect every `type Name = Target`
+	let [Alias] aliases = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(toks.len) then break
+		if is_type_kw(src, toks, i) then {
+			if i >= 1 && is_ident(toks[i - 1].kind) && str_eq(tok_text(src, toks[i - 1]), "pub") then die("cf0: parse: a `type` alias cannot be `pub` (it is comptime-erased)\n")
+			if i + 1 >= Iarch(toks.len) || !is_ident(toks[i + 1].kind) then die("cf0: parse: expected a name after `type`\n")
+			const Str aname = tok_text(src, toks[i + 1])
+			if i + 2 < Iarch(toks.len) && is_lbracket(toks[i + 2].kind) then die("cf0: type: a generic `type` alias is not supported\n")
+			if i + 2 >= Iarch(toks.len) || !is_eq(toks[i + 2].kind) then die("cf0: parse: expected `=` in a `type` alias\n")
+			const Iarch end = alias_decl_end(src, toks, i)
+			let [Token] tgt = []
+			let Iarch t = i + 3
+			loop { if t >= end then break  tgt = [...tgt, toks[t]]  t = t + 1 }
+			if Iarch(tgt.len) == 0 then die("cf0: parse: a `type` alias needs a target type\n")
+			aliases = [...aliases, Alias({ name: aname, target: tgt })]
+			i = end
+		} else i = i + 1
+	}
+	if Iarch(aliases.len) == 0 then return toks
+	# reject an alias whose name collides with a declared type / union member (see collect_decl_names)
+	const [Str] declnames = collect_decl_names(src, toks)
+	let Iarch ci = 0
+	loop {
+		if ci >= Iarch(aliases.len) then break
+		if str_in(declnames, aliases[ci].name) then die("cf0: type: a `type` alias name collides with a declared type or union member\n")
+		ci = ci + 1
+	}
+	# pass 2 — drop the `type` decls, splice each alias name's fully-expanded target
+	let [Token] out = []
+	let Iarch k = 0
+	loop {
+		if k >= Iarch(toks.len) then break
+		if is_type_kw(src, toks, k) then k = alias_decl_end(src, toks, k)
+		else {
+			let Bool spliced = false
+			if is_ident(toks[k].kind) then {
+				const Iarch ai = find_alias(aliases, tok_text(src, toks[k]))
+				if ai >= 0 then { out = cat_toks(out, expand_target(src, aliases, aliases[ai].target, 1024))  spliced = true }
+			}
+			if !spliced then out = [...out, toks[k]]
+			k = k + 1
+		}
+	}
+	return out
+}
