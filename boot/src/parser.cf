@@ -386,9 +386,11 @@ const after_brackets = (*Parser p, Iarch br): Iarch -> {
 	return j + 1
 }
 # Do the tokens between the `[` at index `br` and its matching `]` look like a type-argument
-# list — only identifiers and commas (`[Iarch, Color]`) — rather than an index expression
-# (`xs[1]`, `xs[i + 1]`)? This, together with a trailing `(`, distinguishes a generic call from
-# an array index (both are `name[…]`), so an index followed by a `(`-statement is not misread.
+# list — only commas and TYPE-shaped identifiers, each uppercase-initial (`Iarch`, `Color`) or a
+# type variable (`'T`) — rather than an index expression (`xs[1]`, `xs[i + 1]`, `fs[i]`)? A
+# concrete type or type variable is never lowercase, and a value/index name never uppercase, so
+# this is what separates a generic form `Maybe[Iarch].Just` / `f[Iarch](x)` from an index-then
+# accessor `fs[i].field` / `xs[i](…)` (both are `name[…]` followed by `.`/`(`).
 const tyargs_shaped = (*Parser p, Iarch br): Bool -> {
 	let Iarch j = br + 1
 	loop {
@@ -396,6 +398,10 @@ const tyargs_shaped = (*Parser p, Iarch br): Bool -> {
 		const TokKind k = p.toks[j].kind
 		if is_rbracket(k) then break
 		if !is_ident(k) && !is_comma(k) then return false
+		if is_ident(k) then {
+			const Iarch c = Iarch(p.src[p.toks[j].start])
+			if !((c >= 65 && c <= 90) || c == 39) then return false  # uppercase-initial or `'T`
+		}
 		j = j + 1
 	}
 	if j == br + 1 then return false
@@ -409,6 +415,16 @@ const generic_call_ahead = (*Parser p): Bool -> {
 	if after < 0 then return false
 	if after >= Iarch(p.toks.len) then return false
 	return is_lparen(p.toks[after].kind)
+}
+# At a `[` right after a NAME: is it `[tyargs].Member` — a generic union member construction
+# (`Maybe[Iarch].Just(…)`) — rather than a generic call or an index?
+const generic_ctor_ahead = (*Parser p): Bool -> {
+	if !is_lbracket(peek(p)) then return false
+	if !tyargs_shaped(p, p.pos) then return false
+	const Iarch after = after_brackets(p, p.pos)
+	if after < 0 then return false
+	if after >= Iarch(p.toks.len) then return false
+	return is_dot(p.toks[after].kind)
 }
 # At a statement head (the current token is a name): is the statement `name[T](…)` — a generic
 # call evaluated for effect — rather than an index-assignment `name[i] = …`?
@@ -671,6 +687,19 @@ const parse_primary = (*Parser p): Expr -> {
 			# args) is a field read or a tag-only-member construction.
 			if is_lparen(peek(p)) then return parse_union_mk(p, name, field)
 			return postfix_chain(p, Expr.Field(name, field))
+		}
+		# `Name[T].Member(args)` — a construction of a generic union INSTANCE (checked before the
+		# call/index forms; all three start with `[`)
+		if generic_ctor_ahead(p) then {
+			const Str tyapp = parse_type_app_tail(p, name)
+			if !is_dot(peek(p)) then die("cf0: parse: expected `.member` after a generic type\n")
+			p.pos = p.pos + 1
+			if !is_ident(peek(p)) then die("cf0: parse: expected a union member name\n")
+			const Str member = cur_name(p)
+			p.pos = p.pos + 1
+			if is_lparen(peek(p)) then return postfix_chain(p, parse_union_mk(p, tyapp, member))
+			const [Expr] noargs = []
+			return postfix_chain(p, Expr.UnionMk(tyapp, member, noargs))
 		}
 		# `name[T](args)` — a call to a generic function with explicit type arguments (must be
 		# checked before the index form, since both start with `[`)
@@ -1359,26 +1388,29 @@ const typarams_ahead = (*Parser p): Bool -> {
 # `Box[Pair[Iarch, Iarch]]`). A type application is returned as a canonical bracketed string
 # (no spaces) that the monomorphization pass substitutes and mangles to a concrete instance
 # name (`Maybe[Iarch]` → `Maybe$Iarch`); a bare name is returned as-is.
+# Read a generic application's `[arg, …]` (the `[` is current) after its already-consumed base
+# name, returning the canonical bracketed string `Base[arg,…]`.
+const parse_type_app_tail = (*Parser p, Str base): Str -> {
+	p.pos = p.pos + 1 # `[`
+	let Str s = "${base}["
+	let Bool first = true
+	loop {
+		if !first then s = "${s},"
+		first = false
+		s = "${s}${parse_type_ref(p)}"
+		if !is_comma(peek(p)) then break
+		p.pos = p.pos + 1
+	}
+	if !is_rbracket(peek(p)) then die("cf0: parse: expected `]` in a type application\n")
+	p.pos = p.pos + 1
+	return "${s}]"
+}
 const parse_type_ref = (*Parser p): Str -> {
 	if !is_ident(peek(p)) then die("cf0: parse: expected a type name\n")
-	let Str s = cur_name(p)
+	const Str base = cur_name(p)
 	p.pos = p.pos + 1
-	if is_lbracket(peek(p)) then {
-		p.pos = p.pos + 1 # `[`
-		s = "${s}["
-		let Bool first = true
-		loop {
-			if !first then s = "${s},"
-			first = false
-			s = "${s}${parse_type_ref(p)}"
-			if !is_comma(peek(p)) then break
-			p.pos = p.pos + 1
-		}
-		if !is_rbracket(peek(p)) then die("cf0: parse: expected `]` in a type application\n")
-		p.pos = p.pos + 1
-		s = "${s}]"
-	}
-	return s
+	if is_lbracket(peek(p)) then return parse_type_app_tail(p, base)
+	return base
 }
 
 const parse_func = (*Parser p): Func -> {
