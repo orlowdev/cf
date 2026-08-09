@@ -1330,6 +1330,10 @@ const emit_fixed_canon = (*Emit ctx, Iarch bits, Bool signed, Str v): Str -> {
 # The name of a bare `Var` argument (a function reference), or "".
 const argvar_name = (Expr e): Str -> match e { Expr.Var(n) -> n, _ -> "" }
 
+# A lifted-closure CAPTURE parameter — a scalar by slot address (`$capref`) or an aggregate by
+# pointer (`$capagg`); both ride an `l` and are passed by reference (no copy) at the call site.
+const is_cap_param = (Str type_name): Bool -> str_eq(type_name, "$capref") || str_eq(type_name, "$capagg")
+
 # The code-address value of a function reference passed to a function-type parameter: a
 # function-value binding in scope loads its held address; a top-level function by name takes its
 # symbol `$f${idx}`. (Only a bare name reaches here — the typecheck phase rejects anything else.)
@@ -1438,6 +1442,18 @@ const emit_call = (*Emit ctx, Str callee, [Expr] args, [Binding] env): Str -> {
 			const Iarch tt = ctx.next
 			ctx.next = ctx.next + 1
 			write_str(ctx.fd, "\t%t${tt} =l copy ${fv}\n")
+			aops = [...aops, ArgOp({ temp: tt, is_rec: false, qt: "l" })]
+		} else if is_cap_param(ctx.funcs[fidx].params[i].type_name) then {
+			# a CAPTURE argument to a lifted closure (`args[i]` is the captured var by name): a scalar
+			# passes its SLOT ADDRESS (`$capref`), an aggregate its POINTER value (`$capagg`), so the
+			# closure reads/writes it by reference. Passed as a raw `l`, no copy.
+			const Iarch bi = lookup_index(env, argvar_name(args[i]))
+			let Str cv = ""
+			if str_eq(ctx.funcs[fidx].params[i].type_name, "$capref") then cv = "%t${env[bi].slot}"
+			else cv = binding_ptr(ctx, env, bi)
+			const Iarch tt = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${tt} =l copy ${cv}\n")
 			aops = [...aops, ArgOp({ temp: tt, is_rec: false, qt: "l" })]
 		} else if is_agg_param(ctx.funcs[fidx].params[i], ctx.recs, ctx.unions) then {
 			const Str av = emit_expr(args[i], ctx, env)
@@ -2467,6 +2483,23 @@ const emit_func = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 			write_str(ctx.fd, "\t%t${slot} =l alloc8 8\n")
 			write_str(ctx.fd, "\tstorel %p${pi}, %t${slot}\n")
 			params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: "$fn", elem: fn.params[pi].elem, is_cell: true, telems: fn.params[pi].telems, fixed: "" })]
+		} else if str_eq(fn.params[pi].type_name, "$capref") then {
+			# a captured SCALAR arrives as its enclosing slot ADDRESS; bind a cell OVER that address
+			# so reads/writes go THROUGH it (by-reference capture). `fixed` carries the scalar type
+			# so a fixed-width/float capture loads/stores in its own QBE class.
+			const Str cfx = if is_fixed_name(fn.params[pi].elem) || is_float_name(fn.params[pi].elem) then fn.params[pi].elem else ""
+			const Iarch slot = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${slot} =l copy %p${pi}\n")
+			params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: "", elem: "", is_cell: true, telems: [], fixed: cfx })]
+		} else if str_eq(fn.params[pi].type_name, "$capagg") then {
+			# a captured AGGREGATE arrives as its pointer; bind it like an aggregate parameter (its
+			# record/`Str` type in `rec_type`), so field/`.len` reads and field writes hit the shared
+			# arena value the enclosing scope also holds.
+			const Iarch slot = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${slot} =l copy %p${pi}\n")
+			params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: fn.params[pi].elem, elem: "", is_cell: false, telems: [], fixed: "" })]
 		} else {
 			if is_agg_param(fn.params[pi], ctx.recs, ctx.unions) then {
 				# a record/tuple parameter arrives as a pointer to the caller's aggregate; copy

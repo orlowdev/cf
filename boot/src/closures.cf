@@ -1,0 +1,473 @@
+# closures — lift local closures to top-level functions (memory_model §7), after typecheck.
+#
+# A `const f = (params) -> body` captures enclosing locals/parameters. C! closures are FAKE:
+# there is no runtime closure object. This pass lowers each closure into an ordinary top-level
+# function whose captures become trailing HIDDEN parameters, and rewrites the call sites to pass
+# them. Capture is BY REFERENCE:
+#   - a captured SCALAR (a word/Bool/fixed/float) is passed by its SLOT ADDRESS (`$capref`) — the
+#     lifted body reads/writes THROUGH it, so a mutation is observed by the enclosing scope.
+#   - a captured AGGREGATE (a record or `Str`) is passed by its POINTER (`$capagg`) — field writes
+#     land in the shared arena record, observed by the enclosing scope.
+# At each call site the capture argument is `&x` (`Expr.Addr`) — emit yields the binding's slot
+# temp (the address for a scalar cell, the pointer for an aggregate), passed without a copy.
+#
+# v1 scope (typecheck enforces): a closure is `const`-bound, called directly, not nested in
+# another closure, and not a first-class value. A captured local must be annotated (its type is
+# read from the annotation / parameter). Runs AFTER typecheck (validated) and BEFORE emit.
+
+import "ast" as { Expr, Stmt, MatchArm, StmtArm, Seg, FieldInit, TupElem, Param, RecDecl, UnionDecl, Func, Import, Program }
+
+const no_names = (): [Str] -> { let [Str] e = []  return e }
+# Byte-wise Str equality.
+const str_eq = (Str a, Str b): Bool -> {
+	if a.len != b.len then return false
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(a.len) then break
+		if Iarch(a[i]) != Iarch(b[i]) then return false
+		i = i + 1
+	}
+	return true
+}
+const in_list = ([Str] xs, Str n): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(xs.len) then break
+		if str_eq(xs[i], n) then return true
+		i = i + 1
+	}
+	return false
+}
+const cat = ([Str] a, [Str] b): [Str] -> {
+	let [Str] out = a
+	let Iarch i = 0
+	loop { if i >= Iarch(b.len) then break  out = [...out, b[i]]  i = i + 1 }
+	return out
+}
+const find_rec = ([RecDecl] recs, Str name): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(recs.len) then break
+		if str_eq(recs[i].name, name) then return i
+		i = i + 1
+	}
+	return 0 - 1
+}
+
+# --- referenced-name collection (a closure's free variables) -----------------------------
+# Every bare name a body READS or WRITES — Var, a field/index/assign base, an `&` operand, a
+# call callee, a `for … in` array. A captured variable is one of these that names an enclosing
+# binding (and is not the closure's own parameter/local). Over-collecting a top-level function
+# name (a call callee) is harmless: it is not in the enclosing local scope, so it is filtered.
+const uses_exprs = ([Expr] es): [Str] -> {
+	let [Str] out = []
+	let Iarch i = 0
+	loop { if i >= Iarch(es.len) then break  out = cat(out, uses_expr(es[i]))  i = i + 1 }
+	return out
+}
+const uses_fieldinits = ([FieldInit] fs): [Str] -> {
+	let [Str] out = []
+	let Iarch i = 0
+	loop { if i >= Iarch(fs.len) then break  out = cat(out, uses_expr(fs[i].value))  i = i + 1 }
+	return out
+}
+const uses_segs = ([Seg] segs): [Str] -> {
+	let [Str] out = []
+	let Iarch i = 0
+	loop { if i >= Iarch(segs.len) then break  out = cat(out, uses_expr(segs[i].expr))  i = i + 1 }
+	return out
+}
+const uses_match_arms = ([MatchArm] arms): [Str] -> {
+	let [Str] out = []
+	let Iarch i = 0
+	loop { if i >= Iarch(arms.len) then break  out = cat(out, uses_expr(arms[i].body))  i = i + 1 }
+	return out
+}
+const uses_stmt_arms = ([StmtArm] arms): [Str] -> {
+	let [Str] out = []
+	let Iarch i = 0
+	loop { if i >= Iarch(arms.len) then break  out = cat(out, uses_stmts(arms[i].body))  i = i + 1 }
+	return out
+}
+const uses_stmts = ([Stmt] ss): [Str] -> {
+	let [Str] out = []
+	let Iarch i = 0
+	loop { if i >= Iarch(ss.len) then break  out = cat(out, uses_stmt(ss[i]))  i = i + 1 }
+	return out
+}
+const uses_expr = (Expr e): [Str] -> match e {
+	Expr.Lit(v) -> no_names(),
+	Expr.BoolLit(b) -> no_names(),
+	Expr.Var(n) -> [n],
+	Expr.StrLit(bs) -> no_names(),
+	Expr.FloatLit(t) -> no_names(),
+	Expr.Record(n, fs) -> uses_fieldinits(fs),
+	Expr.Field(b, f) -> [b],
+	Expr.FieldExpr(b, f) -> uses_expr(b),
+	Expr.UnionMk(t, m, args) -> uses_exprs(args),
+	Expr.Match(scrut, arms) -> cat(uses_expr(scrut), uses_match_arms(arms)),
+	Expr.ArrayLit(hs, sn, elems, et) -> cat(uses_expr(sn), uses_exprs(elems)),
+	Expr.Index(a, i) -> cat([a], uses_expr(i)),
+	Expr.IndexField(a, i, f) -> cat([a], uses_expr(i)),
+	Expr.IndexExpr(b, i) -> cat(uses_expr(b), uses_expr(i)),
+	Expr.Interp(segs) -> uses_segs(segs),
+	Expr.Tuple(elems) -> uses_exprs(elems),
+	Expr.Spread(x) -> uses_expr(x),
+	Expr.Unit -> no_names(),
+	Expr.Loop(body) -> uses_stmts(body),
+	Expr.Buffer(sz) -> uses_expr(sz),
+	Expr.Addr(name) -> [name],
+	Expr.Neg(x) -> uses_expr(x),
+	Expr.Not(x) -> uses_expr(x),
+	Expr.BitNot(x) -> uses_expr(x),
+	Expr.Add(l, r) -> cat(uses_expr(l), uses_expr(r)),
+	Expr.Sub(l, r) -> cat(uses_expr(l), uses_expr(r)),
+	Expr.Mul(l, r) -> cat(uses_expr(l), uses_expr(r)),
+	Expr.Div(l, r) -> cat(uses_expr(l), uses_expr(r)),
+	Expr.Mod(l, r) -> cat(uses_expr(l), uses_expr(r)),
+	Expr.BitAnd(l, r) -> cat(uses_expr(l), uses_expr(r)),
+	Expr.BitOr(l, r) -> cat(uses_expr(l), uses_expr(r)),
+	Expr.BitXor(l, r) -> cat(uses_expr(l), uses_expr(r)),
+	Expr.Shl(l, r) -> cat(uses_expr(l), uses_expr(r)),
+	Expr.Shr(l, r) -> cat(uses_expr(l), uses_expr(r)),
+	Expr.CmpEq(l, r) -> cat(uses_expr(l), uses_expr(r)),
+	Expr.CmpNe(l, r) -> cat(uses_expr(l), uses_expr(r)),
+	Expr.CmpLt(l, r) -> cat(uses_expr(l), uses_expr(r)),
+	Expr.CmpGt(l, r) -> cat(uses_expr(l), uses_expr(r)),
+	Expr.CmpLe(l, r) -> cat(uses_expr(l), uses_expr(r)),
+	Expr.CmpGe(l, r) -> cat(uses_expr(l), uses_expr(r)),
+	Expr.And(l, r) -> cat(uses_expr(l), uses_expr(r)),
+	Expr.Or(l, r) -> cat(uses_expr(l), uses_expr(r)),
+	Expr.If(c, t, e2) -> cat(cat(uses_expr(c), uses_expr(t)), uses_expr(e2)),
+	Expr.Call(n, ta, args) -> cat([n], uses_exprs(args))
+}
+const uses_stmt = (Stmt s): [Str] -> match s {
+	Stmt.Let(n, m, ann, e) -> uses_expr(e),
+	Stmt.Destructure(pat, m, e) -> uses_expr(e),
+	Stmt.Assign(n, e) -> cat([n], uses_expr(e)),
+	Stmt.FieldAssign(b, f, e) -> cat([b], uses_expr(e)),
+	Stmt.IndexAssign(a, i, v) -> cat([a], cat(uses_expr(i), uses_expr(v))),
+	Stmt.Return(e) -> uses_expr(e),
+	Stmt.ForIn(v, a, body) -> cat([a], uses_stmts(body)),
+	Stmt.Loop(body) -> uses_stmts(body),
+	Stmt.Break -> no_names(),
+	Stmt.Continue -> no_names(),
+	Stmt.IfThen(c, st) -> cat(uses_expr(c), uses_stmt(st)),
+	Stmt.IfElse(c, t, e) -> cat(uses_expr(c), cat(uses_stmt(t), uses_stmt(e))),
+	Stmt.Do(e) -> uses_expr(e),
+	Stmt.Block(ss) -> uses_stmts(ss),
+	Stmt.Match(scrut, arms) -> cat(uses_expr(scrut), uses_stmt_arms(arms)),
+	Stmt.Yield(e) -> uses_expr(e),
+	Stmt.Closure(nm, params, ret, body) -> uses_stmts(body)
+}
+
+# --- closure-local binders (names bound INSIDE the closure — not captures) ----------------
+const param_names = ([Param] ps): [Str] -> {
+	let [Str] out = []
+	let Iarch i = 0
+	loop { if i >= Iarch(ps.len) then break  out = [...out, ps[i].name]  i = i + 1 }
+	return out
+}
+const binds_stmts = ([Stmt] ss): [Str] -> {
+	let [Str] out = []
+	let Iarch i = 0
+	loop { if i >= Iarch(ss.len) then break  out = cat(out, binds_stmt(ss[i]))  i = i + 1 }
+	return out
+}
+const binds_stmt = (Stmt s): [Str] -> match s {
+	Stmt.Let(n, m, ann, e) -> [n],
+	Stmt.Destructure(pat, m, e) -> pat,
+	Stmt.Assign(n, e) -> no_names(),
+	Stmt.FieldAssign(b, f, e) -> no_names(),
+	Stmt.IndexAssign(a, i, v) -> no_names(),
+	Stmt.Return(e) -> no_names(),
+	Stmt.ForIn(v, a, body) -> cat([v], binds_stmts(body)),
+	Stmt.Loop(body) -> binds_stmts(body),
+	Stmt.Break -> no_names(),
+	Stmt.Continue -> no_names(),
+	Stmt.IfThen(c, st) -> binds_stmt(st),
+	Stmt.IfElse(c, t, e) -> cat(binds_stmt(t), binds_stmt(e)),
+	Stmt.Do(e) -> no_names(),
+	Stmt.Block(ss) -> binds_stmts(ss),
+	Stmt.Match(scrut, arms) -> stmt_arms_binds(arms),
+	Stmt.Yield(e) -> no_names(),
+	Stmt.Closure(nm, params, ret, body) -> [nm]
+}
+const stmt_arms_binds = ([StmtArm] arms): [Str] -> {
+	let [Str] out = []
+	let Iarch i = 0
+	loop { if i >= Iarch(arms.len) then break  out = cat(cat(out, arms[i].binds), binds_stmts(arms[i].body))  i = i + 1 }
+	return out
+}
+
+# --- the enclosing scope (name -> declared type name) -------------------------------------
+# Tracks each in-scope local/parameter's declared TYPE NAME so a capture's kind (scalar via
+# `$capref`, aggregate via `$capagg`) and element type are known when the closure is lifted.
+pub data ScopeVar = { Str name, Str tyname, Str elem }
+const scope_find = ([ScopeVar] sc, Str name): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(sc.len) then break
+		if str_eq(sc[i].name, name) then return i
+		i = i + 1
+	}
+	return 0 - 1
+}
+# Record a `let`/`const` binding's type for later capture (a bare/array `let`, and a destructured
+# binding — which cannot carry a type annotation — are recorded with an empty type that
+# `capture_param` rejects cleanly if the closure actually captures them; a v1 limitation).
+const add_scope_names = ([ScopeVar] sc, [Str] names): [ScopeVar] -> {
+	let [ScopeVar] out = sc
+	let Iarch i = 0
+	loop { if i >= Iarch(names.len) then break  out = [...out, ScopeVar({ name: names[i], tyname: "", elem: "" })]  i = i + 1 }
+	return out
+}
+const extend_scope = ([ScopeVar] sc, Stmt s): [ScopeVar] -> match s {
+	Stmt.Let(n, m, ann, e) -> [...sc, ScopeVar({ name: n, tyname: ann, elem: "" })],
+	Stmt.ForIn(v, a, body) -> [...sc, ScopeVar({ name: v, tyname: "Iarch", elem: "" })],
+	Stmt.Destructure(pat, m, e) -> add_scope_names(sc, pat),
+	_ -> sc
+}
+
+# --- call-site rewrite (append capture arguments) -----------------------------------------
+# A record mapping a closure NAME to its lifted function name and the ordered capture ARGUMENTS
+# to append at each call site: a scalar as `&x` (its slot address, `$capref`), an aggregate as
+# `x` (its pointer value, `$capagg`) — matching how the lifted parameter is bound.
+pub data CloRef = { Str name, Str lifted, [Expr] capargs }
+const clo_find = ([CloRef] m, Str name): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(m.len) then break
+		if str_eq(m[i].name, name) then return i
+		i = i + 1
+	}
+	return 0 - 1
+}
+# The capture argument for a call site: the captured variable by NAME. Emit resolves it to a
+# slot address (a scalar `$capref`) or a pointer (an aggregate `$capagg`) by the lifted
+# parameter's kind, so the same `Var` serves both.
+const cap_arg_expr = (ScopeVar sv): Expr -> Expr.Var(sv.name)
+const rw_exprs = ([Expr] es, [CloRef] m): [Expr] -> {
+	let [Expr] out = []
+	let Iarch i = 0
+	loop { if i >= Iarch(es.len) then break  out = [...out, rw_expr(es[i], m)]  i = i + 1 }
+	return out
+}
+const rw_fieldinits = ([FieldInit] fs, [CloRef] m): [FieldInit] -> {
+	let [FieldInit] out = []
+	let Iarch i = 0
+	loop { if i >= Iarch(fs.len) then break  out = [...out, FieldInit({ field: fs[i].field, value: rw_expr(fs[i].value, m) })]  i = i + 1 }
+	return out
+}
+const rw_segs = ([Seg] segs, [CloRef] m): [Seg] -> {
+	let [Seg] out = []
+	let Iarch i = 0
+	loop { if i >= Iarch(segs.len) then break  const Seg g = segs[i]  out = [...out, Seg({ is_hole: g.is_hole, lit: g.lit, name: g.name, expr: rw_expr(g.expr, m) })]  i = i + 1 }
+	return out
+}
+const rw_match_arms = ([MatchArm] arms, [CloRef] m): [MatchArm] -> {
+	let [MatchArm] out = []
+	let Iarch i = 0
+	loop { if i >= Iarch(arms.len) then break  const MatchArm a = arms[i]  out = [...out, MatchArm({ is_wild: a.is_wild, type_name: a.type_name, members: a.members, binds: a.binds, body: rw_expr(a.body, m) })]  i = i + 1 }
+	return out
+}
+const rw_stmt_arms = ([StmtArm] arms, [CloRef] m): [StmtArm] -> {
+	let [StmtArm] out = []
+	let Iarch i = 0
+	loop { if i >= Iarch(arms.len) then break  const StmtArm a = arms[i]  out = [...out, StmtArm({ is_wild: a.is_wild, type_name: a.type_name, members: a.members, binds: a.binds, body: rw_stmts(a.body, m) })]  i = i + 1 }
+	return out
+}
+const rw_stmts = ([Stmt] ss, [CloRef] m): [Stmt] -> {
+	let [Stmt] out = []
+	let Iarch i = 0
+	loop { if i >= Iarch(ss.len) then break  out = [...out, rw_stmt(ss[i], m)]  i = i + 1 }
+	return out
+}
+const rw_expr = (Expr e, [CloRef] m): Expr -> match e {
+	Expr.Lit(v) -> Expr.Lit(v),
+	Expr.BoolLit(b) -> Expr.BoolLit(b),
+	Expr.Var(n) -> Expr.Var(n),
+	Expr.StrLit(bs) -> Expr.StrLit(bs),
+	Expr.FloatLit(t) -> Expr.FloatLit(t),
+	Expr.Record(n, fs) -> Expr.Record(n, rw_fieldinits(fs, m)),
+	Expr.Field(b, f) -> Expr.Field(b, f),
+	Expr.FieldExpr(b, f) -> Expr.FieldExpr(rw_expr(b, m), f),
+	Expr.UnionMk(t, mm, args) -> Expr.UnionMk(t, mm, rw_exprs(args, m)),
+	Expr.Match(scrut, arms) -> Expr.Match(rw_expr(scrut, m), rw_match_arms(arms, m)),
+	Expr.ArrayLit(hs, sn, elems, et) -> Expr.ArrayLit(hs, rw_expr(sn, m), rw_exprs(elems, m), et),
+	Expr.Index(a, i) -> Expr.Index(a, rw_expr(i, m)),
+	Expr.IndexField(a, i, f) -> Expr.IndexField(a, rw_expr(i, m), f),
+	Expr.IndexExpr(b, i) -> Expr.IndexExpr(rw_expr(b, m), rw_expr(i, m)),
+	Expr.Interp(segs) -> Expr.Interp(rw_segs(segs, m)),
+	Expr.Tuple(elems) -> Expr.Tuple(rw_exprs(elems, m)),
+	Expr.Spread(x) -> Expr.Spread(rw_expr(x, m)),
+	Expr.Unit -> Expr.Unit,
+	Expr.Loop(body) -> Expr.Loop(rw_stmts(body, m)),
+	Expr.Buffer(sz) -> Expr.Buffer(rw_expr(sz, m)),
+	Expr.Addr(name) -> Expr.Addr(name),
+	Expr.Neg(x) -> Expr.Neg(rw_expr(x, m)),
+	Expr.Not(x) -> Expr.Not(rw_expr(x, m)),
+	Expr.BitNot(x) -> Expr.BitNot(rw_expr(x, m)),
+	Expr.Add(l, r) -> Expr.Add(rw_expr(l, m), rw_expr(r, m)),
+	Expr.Sub(l, r) -> Expr.Sub(rw_expr(l, m), rw_expr(r, m)),
+	Expr.Mul(l, r) -> Expr.Mul(rw_expr(l, m), rw_expr(r, m)),
+	Expr.Div(l, r) -> Expr.Div(rw_expr(l, m), rw_expr(r, m)),
+	Expr.Mod(l, r) -> Expr.Mod(rw_expr(l, m), rw_expr(r, m)),
+	Expr.BitAnd(l, r) -> Expr.BitAnd(rw_expr(l, m), rw_expr(r, m)),
+	Expr.BitOr(l, r) -> Expr.BitOr(rw_expr(l, m), rw_expr(r, m)),
+	Expr.BitXor(l, r) -> Expr.BitXor(rw_expr(l, m), rw_expr(r, m)),
+	Expr.Shl(l, r) -> Expr.Shl(rw_expr(l, m), rw_expr(r, m)),
+	Expr.Shr(l, r) -> Expr.Shr(rw_expr(l, m), rw_expr(r, m)),
+	Expr.CmpEq(l, r) -> Expr.CmpEq(rw_expr(l, m), rw_expr(r, m)),
+	Expr.CmpNe(l, r) -> Expr.CmpNe(rw_expr(l, m), rw_expr(r, m)),
+	Expr.CmpLt(l, r) -> Expr.CmpLt(rw_expr(l, m), rw_expr(r, m)),
+	Expr.CmpGt(l, r) -> Expr.CmpGt(rw_expr(l, m), rw_expr(r, m)),
+	Expr.CmpLe(l, r) -> Expr.CmpLe(rw_expr(l, m), rw_expr(r, m)),
+	Expr.CmpGe(l, r) -> Expr.CmpGe(rw_expr(l, m), rw_expr(r, m)),
+	Expr.And(l, r) -> Expr.And(rw_expr(l, m), rw_expr(r, m)),
+	Expr.Or(l, r) -> Expr.Or(rw_expr(l, m), rw_expr(r, m)),
+	Expr.If(c, t, e2) -> Expr.If(rw_expr(c, m), rw_expr(t, m), rw_expr(e2, m)),
+	Expr.Call(n, ta, args) -> rw_call(n, ta, rw_exprs(args, m), m)
+}
+# A call to a closure name is redirected to its lifted function with the capture arguments
+# appended; every other call is unchanged (its arguments already rewritten).
+const rw_call = (Str n, [Str] ta, [Expr] args, [CloRef] m): Expr -> {
+	const Iarch ci = clo_find(m, n)
+	if ci < 0 then return Expr.Call(n, ta, args)
+	let [Expr] all = args
+	const [Expr] caps = m[ci].capargs
+	let Iarch i = 0
+	loop { if i >= Iarch(caps.len) then break  all = [...all, caps[i]]  i = i + 1 }
+	return Expr.Call(m[ci].lifted, ta, all)
+}
+const rw_stmt = (Stmt s, [CloRef] m): Stmt -> match s {
+	Stmt.Let(n, mut, ann, e) -> Stmt.Let(n, mut, ann, rw_expr(e, m)),
+	Stmt.Destructure(pat, mut, e) -> Stmt.Destructure(pat, mut, rw_expr(e, m)),
+	Stmt.Assign(n, e) -> Stmt.Assign(n, rw_expr(e, m)),
+	Stmt.FieldAssign(b, f, e) -> Stmt.FieldAssign(b, f, rw_expr(e, m)),
+	Stmt.IndexAssign(a, i, v) -> Stmt.IndexAssign(a, rw_expr(i, m), rw_expr(v, m)),
+	Stmt.Return(e) -> Stmt.Return(rw_expr(e, m)),
+	Stmt.ForIn(v, a, body) -> Stmt.ForIn(v, a, rw_stmts(body, m)),
+	Stmt.Loop(body) -> Stmt.Loop(rw_stmts(body, m)),
+	Stmt.Break -> Stmt.Break,
+	Stmt.Continue -> Stmt.Continue,
+	Stmt.IfThen(c, st) -> Stmt.IfThen(rw_expr(c, m), rw_stmt(st, m)),
+	Stmt.IfElse(c, t, e) -> Stmt.IfElse(rw_expr(c, m), rw_stmt(t, m), rw_stmt(e, m)),
+	Stmt.Do(e) -> Stmt.Do(rw_expr(e, m)),
+	Stmt.Block(ss) -> Stmt.Block(rw_stmts(ss, m)),
+	Stmt.Match(scrut, arms) -> Stmt.Match(rw_expr(scrut, m), rw_stmt_arms(arms, m)),
+	Stmt.Yield(e) -> Stmt.Yield(rw_expr(e, m)),
+	Stmt.Closure(nm, params, ret, body) -> Stmt.Closure(nm, params, ret, rw_stmts(body, m))
+}
+
+# --- capture parameter construction -------------------------------------------------------
+# The hidden parameter for a captured variable, by its declared type: a record or `Str` rides
+# by pointer (`$capagg`, `elem` = the type name); every other scalar (word/Bool/fixed/float)
+# rides by slot address (`$capref`, `elem` = the type name). An unannotated or array/tuple
+# capture is unsupported in v1.
+const capture_param = ([RecDecl] recs, ScopeVar sv): Param -> {
+	if str_eq(sv.tyname, "") then die("cf0: closure: a captured local must be annotated with its type\n")
+	if find_rec(recs, sv.tyname) >= 0 then return Param({ name: sv.name, is_ptr: false, type_name: "$capagg", elem: sv.tyname, telems: [] })
+	if str_eq(sv.tyname, "Str") then return Param({ name: sv.name, is_ptr: false, type_name: "$capagg", elem: sv.tyname, telems: [] })
+	if str_eq(sv.tyname, "$dyn") then die("cf0: closure: capturing an array is not supported yet\n")
+	if str_eq(sv.tyname, "$tuple") then die("cf0: closure: capturing a tuple is not supported yet\n")
+	if str_eq(sv.tyname, "$ptr") then die("cf0: closure: capturing a pointer is not supported yet\n")
+	return Param({ name: sv.name, is_ptr: false, type_name: "$capref", elem: sv.tyname, telems: [] })
+}
+
+# --- per-function lifting -----------------------------------------------------------------
+# The captured variables of a closure body, in enclosing-scope order: an in-scope local/parameter
+# that the body references and the closure does not itself bind.
+const compute_captures = ([RecDecl] recs, [Stmt] body, [Param] params, [ScopeVar] scope): [ScopeVar] -> {
+	const [Str] used = uses_stmts(body)
+	const [Str] local = cat(param_names(params), binds_stmts(body))
+	let [ScopeVar] caps = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(scope.len) then break
+		const ScopeVar sv = scope[i]
+		if in_list(used, sv.name) then { if !in_list(local, sv.name) then caps = [...caps, sv] }
+		i = i + 1
+	}
+	return caps
+}
+# One lifted function name per closure — unique across the program via the enclosing function
+# index and the closure's ordinal within it.
+const lifted_name = (Iarch fi, Iarch ci): Str -> "__clo_${fi}_${ci}"
+
+# Result of lifting one function's body: the rewritten body (closures removed, calls redirected)
+# and the list of lifted top-level functions it produced.
+pub data Lifted = { [Stmt] body, [Func] funcs }
+const lift_func = (Func fn, Iarch fi, [RecDecl] recs): Lifted -> {
+	let [ScopeVar] scope = []
+	let Iarch p = 0
+	loop {
+		if p >= Iarch(fn.params.len) then break
+		scope = [...scope, ScopeVar({ name: fn.params[p].name, tyname: fn.params[p].type_name, elem: fn.params[p].elem })]
+		p = p + 1
+	}
+	let [CloRef] cmap = []
+	let [Func] lifted = []
+	let [Stmt] out = []
+	let Iarch ci = 0
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(fn.body.len) then break
+		const Stmt s = fn.body[i]
+		match s {
+			Stmt.Closure(nm, params, ret, body) -> {
+				const [ScopeVar] caps = compute_captures(recs, body, params, scope)
+				let [Param] lparams = params
+				let [Expr] capargs = []
+				let Iarch c = 0
+				loop {
+					if c >= Iarch(caps.len) then break
+					lparams = [...lparams, capture_param(recs, caps[c])]
+					capargs = [...capargs, cap_arg_expr(caps[c])]
+					c = c + 1
+				}
+				const Str ln = lifted_name(fi, ci)
+				# the closure's calls (later in this body) are redirected before its own body is
+				# rewritten, so a captured closure that itself calls another already-lifted closure
+				# still resolves
+				const [Stmt] lbody = rw_stmts(body, cmap)
+				const [Seg] noasm = []
+				const [Str] no_tp = []
+				const [TupElem] no_tel = []
+				lifted = [...lifted, Func({ name: ln, is_pub: false, ret_name: ret, ret_elem: "", params: lparams, body: lbody, is_asm: false, asm_body: noasm, is_value: false, ret_telems: no_tel, typarams: no_tp, tbounds: no_tp })]
+				cmap = [...cmap, CloRef({ name: nm, lifted: ln, capargs: capargs })]
+				ci = ci + 1
+			},
+			_ -> {
+				out = [...out, rw_stmt(s, cmap)]
+				scope = extend_scope(scope, s)
+			}
+		}
+		i = i + 1
+	}
+	return Lifted({ body: out, funcs: lifted })
+}
+
+# Lift every function's closures and append the lifted functions to the program. An asm-bodied
+# function has no closures. The lifted functions carry `$capref`/`$capagg` parameters that emit
+# lowers (a scalar-address cell / an aggregate pointer); they are already type-validated as the
+# original closures, so they are not re-checked.
+pub const lift_program = (Program prog): Program -> {
+	let [Func] funcs = []
+	let [Func] extra = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(prog.funcs.len) then break
+		const Func fn = prog.funcs[i]
+		if fn.is_asm then { funcs = [...funcs, fn] } else {
+			const Lifted lf = lift_func(fn, i, prog.recs)
+			funcs = [...funcs, Func({ name: fn.name, is_pub: fn.is_pub, ret_name: fn.ret_name, ret_elem: fn.ret_elem, params: fn.params, body: lf.body, is_asm: false, asm_body: fn.asm_body, is_value: fn.is_value, ret_telems: fn.ret_telems, typarams: fn.typarams, tbounds: fn.tbounds })]
+			let Iarch k = 0
+			loop { if k >= Iarch(lf.funcs.len) then break  extra = [...extra, lf.funcs[k]]  k = k + 1 }
+		}
+		i = i + 1
+	}
+	let Iarch e = 0
+	loop { if e >= Iarch(extra.len) then break  funcs = [...funcs, extra[e]]  e = e + 1 }
+	return Program({ imports: prog.imports, recs: prog.recs, unions: prog.unions, funcs: funcs })
+}

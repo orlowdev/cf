@@ -982,6 +982,12 @@ const parse_let = (*Parser p, Bool mutable): Stmt -> {
 	}
 	if !is_eq(peek(p)) then die("cf0: parse: expected `=` in a binding\n")
 	p.pos = p.pos + 1
+	# `const name = (params) -> …` — a local closure (memory_model §7). A `let`-bound closure is
+	# rejected (no reassignable closures); a closure takes no type annotation.
+	if is_lparen(peek(p)) && lambda_ahead(p) then {
+		if mutable then die("cf0: parse: a closure must be bound with `const`\n")
+		return parse_closure(p, name)
+	}
 	return Stmt.Let(name, mutable, type_name, parse_init(p, type_name))
 }
 
@@ -1328,6 +1334,51 @@ const parse_param = (*Parser p): Param -> {
 	const Str name = cur_name(p)
 	p.pos = p.pos + 1
 	return Param({ name: name, is_ptr: false, type_name: type_name, elem: "", telems: [] })
+}
+
+# Does a `(` at the current position open a LAMBDA parameter list (a closure `(params) ->
+# body`) rather than a parenthesised expression or a tuple? Scan to the matching `)` and check
+# whether a `->` (or a `: ret ->` return annotation) follows — the same one-token-past-`)`
+# lookahead the grammar (ebnf) uses to fork a function type from a tuple.
+const lambda_ahead = (*Parser p): Bool -> {
+	let Iarch i = p.pos
+	let Iarch depth = 0
+	loop {
+		if i >= Iarch(p.toks.len) then return false
+		const TokKind k = p.toks[i].kind
+		if is_lparen(k) then depth = depth + 1
+		if is_rparen(k) then {
+			depth = depth - 1
+			if depth == 0 then {
+				const Iarch j = i + 1
+				if j >= Iarch(p.toks.len) then return false
+				return is_arrow(p.toks[j].kind) || is_colon(p.toks[j].kind)
+			}
+		}
+		i = i + 1
+	}
+	return false
+}
+
+# Parse a closure body `const name = (params) [: ret] -> ( expr | { block } )` into a
+# `Stmt.Closure`; `(` is the current token. The body forks like a function's — a `{` opens a
+# statement block, else a single expression becomes the returned value.
+const parse_closure = (*Parser p, Str name): Stmt -> {
+	p.pos = p.pos + 1 # `(`
+	const [Param] params = parse_params(p)
+	if !is_rparen(peek(p)) then die("cf0: parse: expected `)` in a closure\n")
+	p.pos = p.pos + 1
+	const RetSig rs = parse_ret_name(p)
+	if !is_arrow(peek(p)) then die("cf0: parse: expected `->` in a closure\n")
+	p.pos = p.pos + 1
+	const [Stmt] nobody = []
+	if is_lbrace(peek(p)) then {
+		p.pos = p.pos + 1
+		const [Stmt] body = parse_block(p)
+		return Stmt.Closure(name, params, rs.name, body)
+	}
+	const [Stmt] one = [...nobody, Stmt.Return(parse_expr(p))]
+	return Stmt.Closure(name, params, rs.name, one)
 }
 
 # The parenthesised parameter list; a repeated name is rejected. Any arity is

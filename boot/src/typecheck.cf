@@ -1502,6 +1502,102 @@ const check_simple_stmt = (Stmt s, [VarTy] env, Ctx ctx, Iarch loop_kind): Iarch
 # its loop variable an `Int` bound in the (recursively checked) body; every other statement
 # is a "simple" one delegated to `check_simple_stmt`, whose reachability code drives the
 # unreachable-after-terminator and must-return checks.
+# --- closures (memory_model §7) — validated here; the lift pass lowers them after -----------
+# A closure's declared return type (an unannotated closure yields the implicit `Int`, like a
+# value function), and its nominal function-value signature (its parameter types then its
+# return) — bound in the environment so a call `f(x)` typechecks (via `indirect_call_type`) and
+# using it as a plain value is rejected (`use(f)` where an `Iarch` is expected).
+const closure_ret_ty = (Str ret, Ctx ctx): Ty -> {
+	if str_eq(ret, "") then return Ty.TInt
+	return named_ty(ret, "", ctx.recs, ctx.unions)
+}
+const closure_tfn = (Str ret, [Param] params): Ty -> {
+	let [TupElem] sig = []
+	let Iarch i = 0
+	loop { if i >= Iarch(params.len) then break  sig = [...sig, tel_leaf(fn_sig_name(params[i].type_name))]  i = i + 1 }
+	sig = [...sig, tel_leaf(fn_sig_name(ret))]
+	return Ty.TFn(sig)
+}
+# Does a closure body directly contain another closure? v1 forbids nesting.
+const body_has_closure = ([Stmt] ss): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		const Bool isc = match ss[i] { Stmt.Closure(a, b, c, d) -> true, _ -> false }
+		if isc then return true
+		i = i + 1
+	}
+	return false
+}
+# Does a statement contain a closure ANYWHERE at any depth (in nested blocks, loops, `if`
+# branches, `for` bodies, or match arms)? v1 admits a closure ONLY as a direct statement of its
+# enclosing function's body — the lift pass lowers those; one buried in control flow would slip
+# through to emit. `check_func` uses this to reject the buried case with a clean diagnostic.
+const stmt_arms_have_closure = ([StmtArm] arms): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		if stmts_have_closure(arms[i].body) then return true
+		i = i + 1
+	}
+	return false
+}
+const stmts_have_closure = ([Stmt] ss): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		if stmt_has_closure(ss[i]) then return true
+		i = i + 1
+	}
+	return false
+}
+const stmt_has_closure = (Stmt s): Bool -> match s {
+	Stmt.Closure(a, b, c, d) -> true,
+	Stmt.Block(ss) -> stmts_have_closure(ss),
+	Stmt.Loop(ss) -> stmts_have_closure(ss),
+	Stmt.ForIn(v, a, body) -> stmts_have_closure(body),
+	Stmt.IfThen(c, st) -> stmt_has_closure(st),
+	Stmt.IfElse(c, t, e) -> stmt_has_closure(t) || stmt_has_closure(e),
+	Stmt.Match(scrut, arms) -> stmt_arms_have_closure(arms),
+	_ -> false
+}
+# A closure may appear ONLY as a direct statement of the function body (v1). A top-level closure
+# is allowed (its own body must contain no closure); any closure buried in a nested statement is
+# rejected here rather than surviving unlowered to emit.
+const enforce_toplevel_closures = ([Stmt] body): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(body.len) then break
+		match body[i] {
+			Stmt.Closure(nm, params, ret, cbody) -> { if stmts_have_closure(cbody) then die("cf0: type: a closure cannot be nested in another closure\n") },
+			_ -> { if stmt_has_closure(body[i]) then die("cf0: type: a closure must be a top-level statement of its function (v1)\n") }
+		}
+		i = i + 1
+	}
+	return 0
+}
+# Validate a closure: check its body in the enclosing environment extended with its (immutable)
+# parameters, requiring a return; a captured `const`/parameter is thus non-mutable, so mutating
+# it through the closure is rejected there. Returns the environment extended with the closure
+# name bound as a function value.
+const check_closure = (Str nm, [Param] params, Str ret, [Stmt] body, [VarTy] env, Ctx ctx): [VarTy] -> {
+	if env_index(env, nm) >= 0 then die("cf0: type: a binding cannot shadow an existing name\n")
+	if body_has_closure(body) then die("cf0: type: a closure cannot be nested in another closure\n")
+	const Ty crt = closure_ret_ty(ret, ctx)
+	const Ctx cctx = Ctx({ funcs: ctx.funcs, recs: ctx.recs, unions: ctx.unions, frt: crt })
+	let [VarTy] cenv = env
+	let Iarch pi = 0
+	loop {
+		if pi >= Iarch(params.len) then break
+		check_ptr_pointee(params[pi], ctx.recs, ctx.unions)
+		cenv = [...cenv, VarTy({ name: params[pi].name, ty: param_ty(params[pi], ctx.recs, ctx.unions), mutable: false })]
+		pi = pi + 1
+	}
+	const Iarch dr = check_stmts(body, cenv, cctx, lk_none)
+	if dr != 2 then die("cf0: type: a closure body must end with `return`\n")
+	return [...env, VarTy({ name: nm, ty: closure_tfn(ret, params), mutable: false })]
+}
+
 const check_stmts = ([Stmt] stmts, [VarTy] env0, Ctx ctx, Iarch loop_kind): Iarch -> {
 	let [VarTy] env = []
 	let Iarch e0 = 0
@@ -1528,6 +1624,7 @@ const check_stmts = ([Stmt] stmts, [VarTy] env0, Ctx ctx, Iarch loop_kind): Iarc
 				env = [...env, VarTy({ name: n, ty: ty, mutable: m })]
 			},
 			Stmt.Destructure(pat, m, e) -> { env = check_destructure(pat, m, e, env, ctx) },
+			Stmt.Closure(nm, params, ret, body) -> { env = check_closure(nm, params, ret, body, env, ctx) },
 			_ -> {
 				const Iarch t = check_simple_stmt(s, env, ctx, loop_kind)
 				if t >= 1 then {
@@ -1644,6 +1741,9 @@ const check_func = (Func fn, Ctx ctx): Iarch -> {
 		env = [...env, VarTy({ name: fn.params[pi].name, ty: pty, mutable: pmut })]
 		pi = pi + 1
 	}
+	# a closure is admitted only as a direct function-body statement (v1); reject one buried in
+	# control flow before it survives unlowered to emit
+	enforce_toplevel_closures(fn.body)
 	const Iarch dr = check_stmts(fn.body, env, fctx, lk_none)
 	if dr != 2 then die("cf0: type: a function body must end with `return`\n")
 	return 0
