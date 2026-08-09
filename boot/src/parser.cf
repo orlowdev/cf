@@ -890,15 +890,25 @@ const parse_let = (*Parser p, Bool mutable): Stmt -> {
 		return Stmt.Let(dname, mutable, "", set_arr_elem(parse_init(p, ""), elem))
 	}
 	if !is_ident(peek(p)) then die("cf0: parse: expected a binding name\n")
-	# `TYPE name` (an annotation) vs a bare `name` — the first ident is the name unless a
-	# second ident follows, in which case the first was the type and the second is the name.
+	# `TYPE name` (an annotation) vs a bare `name`. A generic type-application annotation
+	# `Box[Iarch] b` is recognized by the `[` after the first name (in a binding, `Name[…]` is
+	# always a type, never an index); otherwise the first ident is the name unless a second
+	# ident follows, in which case the first was the type.
 	let Str type_name = ""
-	let Str name = cur_name(p)
-	p.pos = p.pos + 1
-	if is_ident(peek(p)) then {
-		type_name = name
+	let Str name = ""
+	if is_lbracket(p.toks[p.pos + 1].kind) then {
+		type_name = parse_type_ref(p)
+		if !is_ident(peek(p)) then die("cf0: parse: expected a binding name after a type\n")
 		name = cur_name(p)
 		p.pos = p.pos + 1
+	} else {
+		name = cur_name(p)
+		p.pos = p.pos + 1
+		if is_ident(peek(p)) then {
+			type_name = name
+			name = cur_name(p)
+			p.pos = p.pos + 1
+		}
 	}
 	if !is_eq(peek(p)) then die("cf0: parse: expected `=` in a binding\n")
 	p.pos = p.pos + 1
@@ -1220,8 +1230,8 @@ const parse_param = (*Parser p): Param -> {
 		return Param({ name: tname, is_ptr: false, type_name: "$tuple", elem: "", telems: tel })
 	}
 	if !is_ident(peek(p)) then die("cf0: parse: expected a parameter type\n")
-	const Str type_name = cur_name(p)
-	p.pos = p.pos + 1
+	# a scalar/aggregate parameter type — a name, a type variable, or a generic type application
+	const Str type_name = parse_type_ref(p)
 	if !is_ident(peek(p)) then die("cf0: parse: expected a parameter name\n")
 	const Str name = cur_name(p)
 	p.pos = p.pos + 1
@@ -1271,8 +1281,8 @@ const parse_ret_name = (*Parser p): RetSig -> {
 		return RetSig({ name: "$tuple", elem: "", telems: tel })
 	}
 	if !is_ident(peek(p)) then die("cf0: parse: expected a return type name after `:`\n")
-	const Str n = cur_name(p)
-	p.pos = p.pos + 1
+	# a named return type — possibly a generic type application `Box['T]`
+	const Str n = parse_type_ref(p)
 	return RetSig({ name: n, elem: "", telems: [] })
 }
 
@@ -1344,6 +1354,33 @@ const typarams_ahead = (*Parser p): Bool -> {
 	return Iarch(p.src[t2.start]) == 39
 }
 
+# Read a type REFERENCE in a type position: a bare name (`Iarch`, `Point`, `'T`) or a generic
+# type APPLICATION `Base[arg, …]` whose arguments are themselves type references (nested, e.g.
+# `Box[Pair[Iarch, Iarch]]`). A type application is returned as a canonical bracketed string
+# (no spaces) that the monomorphization pass substitutes and mangles to a concrete instance
+# name (`Maybe[Iarch]` → `Maybe$Iarch`); a bare name is returned as-is.
+const parse_type_ref = (*Parser p): Str -> {
+	if !is_ident(peek(p)) then die("cf0: parse: expected a type name\n")
+	let Str s = cur_name(p)
+	p.pos = p.pos + 1
+	if is_lbracket(peek(p)) then {
+		p.pos = p.pos + 1 # `[`
+		s = "${s}["
+		let Bool first = true
+		loop {
+			if !first then s = "${s},"
+			first = false
+			s = "${s}${parse_type_ref(p)}"
+			if !is_comma(peek(p)) then break
+			p.pos = p.pos + 1
+		}
+		if !is_rbracket(peek(p)) then die("cf0: parse: expected `]` in a type application\n")
+		p.pos = p.pos + 1
+		s = "${s}]"
+	}
+	return s
+}
+
 const parse_func = (*Parser p): Func -> {
 	let Bool is_pub = false
 	if kw(p, "pub") then {
@@ -1409,6 +1446,9 @@ const parse_data = (*Parser p): RecDecl -> {
 	if !is_ident(peek(p)) then die("cf0: parse: expected a record type name\n")
 	const Str name = cur_name(p)
 	p.pos = p.pos + 1
+	# `data Pair['A, 'B] = …` — a generic record's type parameters
+	let [Str] typarams = []
+	if typarams_ahead(p) then typarams = parse_typarams(p)
 	if !is_eq(peek(p)) then die("cf0: parse: expected `=` in a data declaration\n")
 	p.pos = p.pos + 1
 	if !is_lbrace(peek(p)) then die("cf0: parse: expected `{` in a data declaration\n")
@@ -1451,9 +1491,9 @@ const parse_data = (*Parser p): RecDecl -> {
 			ftelems = [...ftelems, tel]
 			p.pos = p.pos + 1
 		} else {
-			if !is_ident(peek(p)) then die("cf0: parse: expected a field type\n")
-			const Str ftype = cur_name(p)
-			p.pos = p.pos + 1
+			# a scalar/aggregate field type — a name, a type variable `'T`, or a generic type
+			# application `Box[Iarch]` (kept as a bracketed string for the monomorph pass)
+			const Str ftype = parse_type_ref(p)
 			if !is_ident(peek(p)) then die("cf0: parse: expected a field name\n")
 			fields = [...fields, cur_name(p)]
 			ftypes = [...ftypes, ftype]
@@ -1466,7 +1506,7 @@ const parse_data = (*Parser p): RecDecl -> {
 	}
 	if !is_rbrace(peek(p)) then die("cf0: parse: expected `}` in a data declaration\n")
 	p.pos = p.pos + 1
-	return RecDecl({ name: name, fields: fields, ftypes: ftypes, felems: felems, ftelems: ftelems })
+	return RecDecl({ name: name, fields: fields, ftypes: ftypes, felems: felems, ftelems: ftelems, typarams: typarams })
 }
 
 # `union Name = { A, B, C }` — a tag-only union declaration (at least one member; a
@@ -1477,6 +1517,9 @@ const parse_union = (*Parser p): UnionDecl -> {
 	if !is_ident(peek(p)) then die("cf0: parse: expected a union type name\n")
 	const Str name = cur_name(p)
 	p.pos = p.pos + 1
+	# `union Maybe['V] = …` — a generic union's type parameters
+	let [Str] typarams = []
+	if typarams_ahead(p) then typarams = parse_typarams(p)
 	if !is_eq(peek(p)) then die("cf0: parse: expected `=` in a union declaration\n")
 	p.pos = p.pos + 1
 	if !is_lbrace(peek(p)) then die("cf0: parse: expected `{` in a union declaration\n")
@@ -1510,11 +1553,11 @@ const parse_union = (*Parser p): UnionDecl -> {
 					pelems = [...pelems, ""]
 					ptelems = [...ptelems, tel]
 				} else {
-					if !is_ident(peek(p)) then die("cf0: parse: expected a payload type\n")
-					payloads = [...payloads, cur_name(p)]
+					# a scalar/aggregate payload type — a name, a type variable `'T`, or a generic
+					# type application `List['T]` (kept as a bracketed string for the monomorph pass)
+					payloads = [...payloads, parse_type_ref(p)]
 					pelems = [...pelems, ""]
 					ptelems = [...ptelems, no_ptel]
-					p.pos = p.pos + 1
 				}
 				if !is_comma(peek(p)) then break
 				p.pos = p.pos + 1
@@ -1528,7 +1571,7 @@ const parse_union = (*Parser p): UnionDecl -> {
 	}
 	if !is_rbrace(peek(p)) then die("cf0: parse: expected `}` in a union declaration\n")
 	p.pos = p.pos + 1
-	return UnionDecl({ name: name, members: members })
+	return UnionDecl({ name: name, members: members, typarams: typarams })
 }
 
 # A top-level import `import "path" as { a, b, … }` (module_system §4). The path is a

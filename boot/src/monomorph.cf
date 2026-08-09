@@ -18,10 +18,12 @@ import "io" as { die }
 import "ast" as { Expr, Stmt, Param, Func, MatchArm, StmtArm, Seg, FieldInit, RecDecl, UnionDecl, TupElem, Import, Program }
 import "astutil" as { is_fixed_name, is_float_name }
 
-# The accumulating state, threaded by pointer: the generic templates, the mangled names of the
-# instances already generated (dedup / recursion guard), the generated instance clones, and the
-# program's union names (to tell a tag-only union member `Color.Green` from a field read).
-data MonoCtx = { [Func] templates, [Str] keys, [Func] instances, [Str] unions }
+# The accumulating state, threaded by pointer: the generic FUNCTION templates + their instance
+# clones (with a dedup key set), the program's union names (to tell a tag-only union member
+# `Color.Green` from a field read), and the generic RECORD templates + their instance clones
+# (with their own key set) — a generic type application `Box[Iarch]` clones the record template
+# `Box` into a concrete `Box$Iarch`.
+data MonoCtx = { [Func] templates, [Str] keys, [Func] instances, [Str] unions, [RecDecl] rec_templates, [Str] type_keys, [RecDecl] rec_instances }
 
 # The context threaded through a function body: the active substitution (type variable → its
 # concrete argument, when cloning a template) and a local TYPE environment (a name → its type
@@ -128,6 +130,125 @@ const mangle_instance = (Str gname, [Str] tyargs): Str -> {
 		i = i + 1
 	}
 	return s
+}
+
+# --- generic TYPE applications ('Base[a, b]', a bracketed string from the parser) ------------
+
+# Whether a type reference is a generic application (`Box[Iarch]`) rather than a bare name.
+const is_type_app = (Str s): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(s.len) then break
+		if Iarch(s[i]) == 91 then return true  # '['
+		i = i + 1
+	}
+	return false
+}
+# The base name of a type application — `Box[Iarch]` → `Box`.
+const type_base = (Str s): Str -> {
+	let [Uint8] out = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(s.len) then break
+		if Iarch(s[i]) == 91 then break
+		out = [...out, s[i]]
+		i = i + 1
+	}
+	return Str(out)
+}
+# The top-level argument type references of a type application — `Box[Pair[Iarch,Iarch]]` →
+# `["Pair[Iarch,Iarch]"]`, splitting only at depth-1 commas so nested applications stay whole.
+const type_args = (Str s): [Str] -> {
+	let Iarch start = 0
+	loop {
+		if start >= Iarch(s.len) then break
+		if Iarch(s[start]) == 91 then break
+		start = start + 1
+	}
+	let [Str] out = []
+	let [Uint8] cur = []
+	let Iarch depth = 0
+	let Iarch i = start
+	loop {
+		if i >= Iarch(s.len) then break
+		const Iarch c = Iarch(s[i])
+		if c == 91 then { depth = depth + 1 if depth > 1 then cur = [...cur, s[i]] }
+		if c == 93 then { depth = depth - 1 if depth >= 1 then cur = [...cur, s[i]] }
+		if c == 44 && depth == 1 then { out = [...out, Str(cur)] cur = [] }
+		if c != 91 && c != 93 && !(c == 44 && depth == 1) then cur = [...cur, s[i]]
+		i = i + 1
+	}
+	if Iarch(cur.len) > 0 then out = [...out, Str(cur)]
+	return out
+}
+
+const find_rec_template = ([RecDecl] recs, Str n): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(recs.len) then break
+		if str_eq(recs[i].name, n) then return i
+		i = i + 1
+	}
+	return 0 - 1
+}
+const type_key_seen = (*MonoCtx m, Str mn): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(m.type_keys.len) then break
+		if str_eq(m.type_keys[i], mn) then return true
+		i = i + 1
+	}
+	return false
+}
+
+# Resolve a type reference to its concrete name, substituting type variables and mangling any
+# generic application to its instance (`'T` → `Iarch`; `Box['T]` → `Box$Iarch`, generating the
+# `Box$Iarch` record). Recurses through nested applications and registers each instance.
+const mangle_type = (*MonoCtx m, Str name, [Str] tvars, [Str] tvals): Str -> {
+	if !is_type_app(name) then return subst_ty(name, tvars, tvals)
+	const Str base = type_base(name)
+	const [Str] args = type_args(name)
+	let [Str] margs = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(args.len) then break
+		margs = [...margs, mangle_type(m, args[i], tvars, tvals)]
+		i = i + 1
+	}
+	return ensure_rec_instance(m, base, margs)
+}
+const mangle_types = (*MonoCtx m, [Str] names, [Str] tvars, [Str] tvals): [Str] -> {
+	let [Str] out = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(names.len) then break
+		out = [...out, mangle_type(m, names[i], tvars, tvals)]
+		i = i + 1
+	}
+	return out
+}
+# Ensure the concrete record instance `base[margs]` exists (cloning the template, substituting
+# its type parameters in every field type — which may register further instances) and return
+# its mangled name.
+const ensure_rec_instance = (*MonoCtx m, Str base, [Str] margs): Str -> {
+	const Str mn = mangle_instance(base, margs)
+	if type_key_seen(m, mn) then return mn
+	m.type_keys = [...m.type_keys, mn]  # mark before recursing (a self-referential type terminates)
+	const Iarch ri = find_rec_template(m.rec_templates, base)
+	if ri < 0 then die("cf0: type: a generic type application names a non-generic or undeclared type\n")
+	const RecDecl tmpl = m.rec_templates[ri]
+	if Iarch(tmpl.typarams.len) != Iarch(margs.len) then die("cf0: type: wrong number of type arguments for a generic type\n")
+	let [Str] ftypes = mangle_types(m, tmpl.ftypes, tmpl.typarams, margs)
+	let [Str] felems = []
+	let Iarch j = 0
+	loop {
+		if j >= Iarch(tmpl.felems.len) then break
+		felems = [...felems, subst_ty(tmpl.felems[j], tmpl.typarams, margs)]
+		j = j + 1
+	}
+	const [Str] no_tp = []
+	m.rec_instances = [...m.rec_instances, RecDecl({ name: mn, fields: tmpl.fields, ftypes: ftypes, felems: felems, ftelems: tmpl.ftelems, typarams: no_tp })]
+	return mn
 }
 
 # --- local type environment (for inference) ------------------------------------------------
@@ -241,12 +362,12 @@ const mono_func = (*MonoCtx m, Func f, Str newname, [Str] tvars, [Str] tvals): F
 	loop {
 		if i >= Iarch(f.params.len) then break
 		const Param p = f.params[i]
-		# substitute `'T` in EVERY type position of the parameter: the scalar/record name, a
-		# `[T]` array element, and a `(A, B)` tuple's positions
-		ps = [...ps, Param({ name: p.name, is_ptr: p.is_ptr, type_name: subst_ty(p.type_name, tvars, tvals), elem: subst_ty(p.elem, tvars, tvals), telems: subst_telems(p.telems, tvars, tvals) })]
+		# substitute `'T` in EVERY type position of the parameter: the scalar/record name (or a
+		# generic type application, mangled to its instance), a `[T]` array element, and a tuple
+		ps = [...ps, Param({ name: p.name, is_ptr: p.is_ptr, type_name: mangle_type(m, p.type_name, tvars, tvals), elem: subst_ty(p.elem, tvars, tvals), telems: subst_telems(p.telems, tvars, tvals) })]
 		i = i + 1
 	}
-	const Str rn = subst_ty(f.ret_name, tvars, tvals)
+	const Str rn = mangle_type(m, f.ret_name, tvars, tvals)
 	const Str re = subst_ty(f.ret_elem, tvars, tvals)
 	const [TupElem] rtel = subst_telems(f.ret_telems, tvars, tvals)
 	# seed the local type env with the (substituted) parameter types, so a generic call in the
@@ -289,7 +410,7 @@ const mono_expr = (*MonoCtx m, Expr e, MonoEnv env): Expr -> match e {
 	Expr.Var(n) -> Expr.Var(n),
 	Expr.StrLit(bs) -> Expr.StrLit(bs),
 	Expr.FloatLit(t) -> Expr.FloatLit(t),
-	Expr.Record(n, fs) -> Expr.Record(n, mono_fields(m, fs, env)),
+	Expr.Record(n, fs) -> Expr.Record(mangle_type(m, n, env.tvars, env.tvals), mono_fields(m, fs, env)),
 	Expr.Field(b, f) -> Expr.Field(b, f),
 	Expr.FieldExpr(b, f) -> Expr.FieldExpr(mono_expr(m, b, env), f),
 	Expr.UnionMk(t, mem, args) -> Expr.UnionMk(t, mem, mono_exprs(m, args, env)),
@@ -374,7 +495,7 @@ const mono_arms = (*MonoCtx m, [MatchArm] arms, MonoEnv env): [MatchArm] -> {
 }
 
 const mono_stmt = (*MonoCtx m, Stmt s, MonoEnv env): Stmt -> match s {
-	Stmt.Let(n, mut, ann, e) -> Stmt.Let(n, mut, subst_ty(ann, env.tvars, env.tvals), mono_expr(m, e, env)),
+	Stmt.Let(n, mut, ann, e) -> Stmt.Let(n, mut, mangle_type(m, ann, env.tvars, env.tvals), mono_expr(m, e, env)),
 	Stmt.Destructure(pat, mut, e) -> Stmt.Destructure(pat, mut, mono_expr(m, e, env)),
 	Stmt.Yield(e) -> Stmt.Yield(mono_expr(m, e, env)),
 	Stmt.Assign(n, e) -> Stmt.Assign(n, mono_expr(m, e, env)),
@@ -405,7 +526,7 @@ const mono_stmt_arms = (*MonoCtx m, [StmtArm] arms, MonoEnv env): [StmtArm] -> {
 # The binding type recorded for a `let`: its (substituted) annotation, or — with no annotation
 # — the shallow type inferred from the initializer.
 const let_binding_ty = (*MonoCtx m, Str ann, Expr e, MonoEnv env): Str -> {
-	const Str bt = subst_ty(ann, env.tvars, env.tvals)
+	const Str bt = mangle_type(m, ann, env.tvars, env.tvals)
 	if !str_eq(bt, "") then return bt
 	return arg_ty(m, e, env)
 }
@@ -425,6 +546,46 @@ const mono_stmts = (*MonoCtx m, [Stmt] ss, MonoEnv env0): [Stmt] -> {
 		i = i + 1
 	}
 	return out
+}
+
+# Whether every type variable mentioned in a type reference (a bare `'X` or the arguments of a
+# generic application) is among `typarams` — used to reject a generic declaration's field/payload
+# type that names an undeclared type variable.
+const typevar_declared = (Str name, [Str] typarams): Bool -> {
+	if is_type_app(name) then {
+		const [Str] args = type_args(name)
+		let Iarch i = 0
+		loop {
+			if i >= Iarch(args.len) then break
+			if !typevar_declared(args[i], typarams) then return false
+			i = i + 1
+		}
+		return true
+	}
+	if Iarch(name.len) == 0 then return true
+	if Iarch(name[0]) != 39 then return true
+	let Iarch j = 0
+	loop {
+		if j >= Iarch(typarams.len) then break
+		if str_eq(typarams[j], name) then return true
+		j = j + 1
+	}
+	return false
+}
+const check_rec_templates = (*MonoCtx m): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(m.rec_templates.len) then break
+		const RecDecl r = m.rec_templates[i]
+		let Iarch f = 0
+		loop {
+			if f >= Iarch(r.ftypes.len) then break
+			if !typevar_declared(r.ftypes[f], r.typarams) then die("cf0: type: an undeclared type variable in a generic record field\n")
+			f = f + 1
+		}
+		i = i + 1
+	}
+	return 0
 }
 
 # Monomorphize the program: drop the generic templates, rewrite every concrete function's body
@@ -447,9 +608,23 @@ pub const mono_program = (Program prog): Program -> {
 		unames = [...unames, prog.unions[u].name]
 		u = u + 1
 	}
+	# split generic RECORD templates from the concrete records the output keeps
+	let [RecDecl] rec_templates = []
+	let [RecDecl] concrete_recs = []
+	let Iarch ri = 0
+	loop {
+		if ri >= Iarch(prog.recs.len) then break
+		if Iarch(prog.recs[ri].typarams.len) > 0 then rec_templates = [...rec_templates, prog.recs[ri]]
+		else concrete_recs = [...concrete_recs, prog.recs[ri]]
+		ri = ri + 1
+	}
 	let [Func] no_inst = []
 	let [Str] no_keys = []
-	let MonoCtx m = MonoCtx({ templates: templates, keys: no_keys, instances: no_inst, unions: unames })
+	let [RecDecl] no_recinst = []
+	let [Str] no_tk = []
+	let MonoCtx m = MonoCtx({ templates: templates, keys: no_keys, instances: no_inst, unions: unames, rec_templates: rec_templates, type_keys: no_tk, rec_instances: no_recinst })
+	# reject a generic record template whose field mentions an undeclared type variable
+	check_rec_templates(&m)
 	const [Str] no_tv = []
 	let [Func] out = []
 	let Iarch j = 0
@@ -464,5 +639,13 @@ pub const mono_program = (Program prog): Program -> {
 		out = [...out, m.instances[k]]
 		k = k + 1
 	}
-	return Program({ imports: prog.imports, recs: prog.recs, unions: prog.unions, funcs: out })
+	# the output records: the concrete ones plus every generated generic-record instance
+	let [RecDecl] out_recs = concrete_recs
+	let Iarch g = 0
+	loop {
+		if g >= Iarch(m.rec_instances.len) then break
+		out_recs = [...out_recs, m.rec_instances[g]]
+		g = g + 1
+	}
+	return Program({ imports: prog.imports, recs: out_recs, unions: prog.unions, funcs: out })
 }
