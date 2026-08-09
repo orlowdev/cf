@@ -15,20 +15,27 @@
 # array parameter), generic DATA/UNION types, and bounds are later bricks.
 
 import "io" as { die }
-import "ast" as { Expr, Stmt, Param, Func, MatchArm, StmtArm, Seg, FieldInit, RecDecl, UnionDecl, UnionMember, TupElem, Import, Program }
+import "ast" as { Expr, Stmt, Param, Func, MatchArm, StmtArm, Seg, FieldInit, RecDecl, UnionDecl, UnionMember, TupElem, Import, Program, Ty }
 import "astutil" as { is_fixed_name, is_float_name }
+# The monomorph pass infers a generic call's type arguments by deriving argument types with the
+# SAME `type_of` the typechecker uses (types flow, not a parallel guesser). `Ctx`/`VarTy` are the
+# shared typing vocabulary; the helpers build the pieces `type_of` needs from a binding.
+import "typecheck" as { type_of, ty_name, Ctx, VarTy, named_ty, param_ty, binding_ty, arm_bind_env, check_destructure }
 
 # The accumulating state, threaded by pointer: the generic FUNCTION templates + their instance
-# clones (with a dedup key set), the program's union names (to tell a tag-only union member
-# `Color.Green` from a field read), and the generic RECORD templates + their instance clones
-# (with their own key set) — a generic type application `Box[Iarch]` clones the record template
-# `Box` into a concrete `Box$Iarch`.
-data MonoCtx = { [Func] templates, [Str] keys, [Func] instances, [Str] unions, [RecDecl] rec_templates, [Str] type_keys, [RecDecl] rec_instances, [UnionDecl] union_templates, [UnionDecl] union_instances }
+# clones (with a dedup key set); the generic RECORD/UNION templates + their instance clones (with
+# a shared key set) — a generic application `Box[Iarch]` clones template `Box` into `Box$Iarch`;
+# and the program's CONCRETE (non-generic) functions/records/unions, which — together with the
+# instances — form the `Ctx` the shared `type_of` resolves inference against. `has_gen` is false
+# for a program with no templates (cf0's own source): the inference machinery is then never
+# engaged and the pass is a byte-identical identity.
+data MonoCtx = { [Func] templates, [Str] keys, [Func] instances, [Str] unions, [RecDecl] rec_templates, [Str] type_keys, [RecDecl] rec_instances, [UnionDecl] union_templates, [UnionDecl] union_instances, [Func] cfuncs, [RecDecl] crecs, [UnionDecl] cunions, Bool has_gen }
 
-# The context threaded through a function body: the active substitution (type variable → its
-# concrete argument, when cloning a template) and a local TYPE environment (a name → its type
-# name, for parameters and `let` bindings) used to infer a generic call's type arguments.
-data MonoEnv = { [Str] tvars, [Str] tvals, [Str] enames, [Str] etypes }
+# The context threaded through a function body: the active type-variable substitution (when
+# cloning a template) plus the local value environment (`[VarTy]`, seeded from parameters and
+# extended by `let`/match/`for`/destructure binders) and the enclosing function's return type —
+# together everything the shared `type_of` needs to derive an argument's type for inference.
+data MonoEnv = { [Str] tvars, [Str] tvals, [VarTy] venv, Ty ret }
 
 const str_eq = (Str a, Str b): Bool -> {
 	if a.len != b.len then return false
@@ -55,15 +62,6 @@ const key_seen = (*MonoCtx m, Str mn): Bool -> {
 	loop {
 		if i >= Iarch(m.keys.len) then break
 		if str_eq(m.keys[i], mn) then return true
-		i = i + 1
-	}
-	return false
-}
-const is_union_name = (*MonoCtx m, Str n): Bool -> {
-	let Iarch i = 0
-	loop {
-		if i >= Iarch(m.unions.len) then break
-		if str_eq(m.unions[i], n) then return true
 		i = i + 1
 	}
 	return false
@@ -299,54 +297,91 @@ const ensure_rec_instance = (*MonoCtx m, Str base, [Str] margs): Str -> {
 
 # --- local type environment (for inference) ------------------------------------------------
 
-const env_add = (MonoEnv e, Str name, Str ty): MonoEnv -> MonoEnv({ tvars: e.tvars, tvals: e.tvals, enames: [...e.enames, name], etypes: [...e.etypes, ty] })
-const env_lookup = (MonoEnv e, Str name): Str -> {
+# List concatenation (cf0 has no `[...a, ...b]` double-spread); used to assemble the whole-
+# program `Ctx` from the concrete declarations plus the instances generated so far.
+# NB: build a fresh array from `[]` and copy BOTH inputs — `let o = a` would alias `a`'s backing
+# store, and the in-place spread-append would then grow (mutate) the caller's array.
+const cat_funcs = ([Func] a, [Func] b): [Func] -> { let [Func] o = []  let Iarch i = 0  loop { if i >= Iarch(a.len) then break  o = [...o, a[i]]  i = i + 1 }  let Iarch j = 0  loop { if j >= Iarch(b.len) then break  o = [...o, b[j]]  j = j + 1 }  return o }
+const cat_recs = ([RecDecl] a, [RecDecl] b): [RecDecl] -> { let [RecDecl] o = []  let Iarch i = 0  loop { if i >= Iarch(a.len) then break  o = [...o, a[i]]  i = i + 1 }  let Iarch j = 0  loop { if j >= Iarch(b.len) then break  o = [...o, b[j]]  j = j + 1 }  return o }
+const cat_unions = ([UnionDecl] a, [UnionDecl] b): [UnionDecl] -> { let [UnionDecl] o = []  let Iarch i = 0  loop { if i >= Iarch(a.len) then break  o = [...o, a[i]]  i = i + 1 }  let Iarch j = 0  loop { if j >= Iarch(b.len) then break  o = [...o, b[j]]  j = j + 1 }  return o }
+const all_recs = (*MonoCtx m): [RecDecl] -> cat_recs(m.crecs, m.rec_instances)
+const all_unions = (*MonoCtx m): [UnionDecl] -> cat_unions(m.cunions, m.union_instances)
+# The whole-program typing context the shared `type_of` needs: every concrete function/record/
+# union PLUS every instance generated so far (so a call to an already-instantiated generic, or a
+# field of a generated record instance, resolves). `frt` is the enclosing function's return type.
+const build_ctx = (*MonoCtx m, Ty ret): Ctx -> Ctx({ funcs: cat_funcs(m.cfuncs, m.instances), recs: all_recs(m), unions: all_unions(m), frt: ret })
+# The enclosing function's return type as a `Ty` (for `Ctx.frt`, which `type_of` consults for a
+# value-yielding loop that `return`s): a tuple return is its position list, an empty name is the
+# implicit `Int`, otherwise the named scalar/record/union/array type.
+const ret_ty = (*MonoCtx m, Str rn, Str re, [TupElem] rtel): Ty -> {
+	if Iarch(rtel.len) > 0 then return Ty.TTuple(rtel)
+	if Iarch(rn.len) == 0 then return Ty.TInt
+	return named_ty(rn, re, all_recs(m), all_unions(m))
+}
+# A concrete declaration's own signature may still NAME a generic type (a function returning
+# `Maybe[Iarch]`, a record field of type `Box[Iarch]`). The shared `type_of` needs those names
+# already resolved to their instances, so pre-mangle every concrete signature (which also
+# registers the referenced instances). Bodies are irrelevant to `type_of`, so a function keeps
+# only its signature here (the OUTPUT still comes from `mono_func`, with the body intact).
+const mangle_func_sig = (*MonoCtx m, Func f): Func -> {
+	const [Str] nt = []
+	let [Param] ps = []
 	let Iarch i = 0
 	loop {
-		if i >= Iarch(e.enames.len) then break
-		if str_eq(e.enames[i], name) then return e.etypes[i]
+		if i >= Iarch(f.params.len) then break
+		const Param p = f.params[i]
+		ps = [...ps, Param({ name: p.name, is_ptr: p.is_ptr, type_name: mangle_type(m, p.type_name, nt, nt), elem: mangle_type(m, p.elem, nt, nt), telems: p.telems })]
 		i = i + 1
 	}
-	return ""
+	const [Stmt] nobody = []
+	return Func({ name: f.name, is_pub: f.is_pub, ret_name: mangle_type(m, f.ret_name, nt, nt), ret_elem: mangle_type(m, f.ret_elem, nt, nt), params: ps, body: nobody, is_asm: f.is_asm, asm_body: f.asm_body, is_value: f.is_value, ret_telems: f.ret_telems, typarams: f.typarams })
+}
+const mangle_rec_sig = (*MonoCtx m, RecDecl r): RecDecl -> {
+	const [Str] nt = []
+	return RecDecl({ name: r.name, fields: r.fields, ftypes: mangle_types(m, r.ftypes, nt, nt), felems: mangle_types(m, r.felems, nt, nt), ftelems: r.ftelems, typarams: r.typarams })
+}
+const mangle_union_sig = (*MonoCtx m, UnionDecl u): UnionDecl -> {
+	const [Str] nt = []
+	let [UnionMember] mem = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(u.members.len) then break
+		const UnionMember um = u.members[i]
+		mem = [...mem, UnionMember({ name: um.name, payloads: mangle_types(m, um.payloads, nt, nt), pelems: mangle_types(m, um.pelems, nt, nt), ptelems: um.ptelems })]
+		i = i + 1
+	}
+	return UnionDecl({ name: u.name, members: mem, typarams: u.typarams })
+}
+# Replace the concrete declarations in `m` with their signature-mangled forms (§ above).
+const mangle_concrete_sigs = (*MonoCtx m): Iarch -> {
+	let [Func] fs = []
+	let Iarch i = 0
+	loop { if i >= Iarch(m.cfuncs.len) then break  fs = [...fs, mangle_func_sig(m, m.cfuncs[i])]  i = i + 1 }
+	m.cfuncs = fs
+	let [RecDecl] rs = []
+	let Iarch j = 0
+	loop { if j >= Iarch(m.crecs.len) then break  rs = [...rs, mangle_rec_sig(m, m.crecs[j])]  j = j + 1 }
+	m.crecs = rs
+	let [UnionDecl] us = []
+	let Iarch k = 0
+	loop { if k >= Iarch(m.cunions.len) then break  us = [...us, mangle_union_sig(m, m.cunions[k])]  k = k + 1 }
+	m.cunions = us
+	return 0
 }
 
-# A `base.f` argument: a tag-only union member construction (`Color.Green`, `base` a declared
-# union) has the union's type; a field read (`base` a local/param, or anything non-union) has a
-# type this shallow pass cannot know, so inference from it is not possible (use explicit args).
-const field_arg_ty = (*MonoCtx m, Str base, MonoEnv env): Str -> {
-	if !str_eq(env_lookup(env, base), "") then return ""
-	if is_union_name(m, base) then return base
-	return ""
-}
-# A numeric cast `T(x)` argument has the obvious type `T`; the width-changing casts are the
-# common way to fix a fixed-width/float type argument (`addc(Uint8(a), Uint8(b))` infers Uint8).
-const cast_arg_ty = (Str callee): Str -> {
-	if is_fixed_name(callee) then return callee
-	if is_float_name(callee) then return callee
-	if str_eq(callee, "Iarch") then return "Iarch"
-	if str_eq(callee, "Int") then return "Iarch"
-	if str_eq(callee, "Uarch") then return "Uarch"
-	return ""
-}
-# The type NAME an argument expression denotes, for inference — a literal's builtin type, a
-# variable's recorded type, or a record/union construction's type. Anything else yields "" (an
-# inference from that argument is not possible, so a fully-unfixed call is an error).
-const arg_ty = (*MonoCtx m, Expr e, MonoEnv env): Str -> match e {
-	Expr.Lit(v) -> "Iarch",
-	Expr.FloatLit(t) -> "Float64",
-	Expr.BoolLit(b) -> "Bool",
-	Expr.StrLit(bs) -> "Str",
-	Expr.Var(n) -> env_lookup(env, n),
-	Expr.Record(tn, fs) -> tn,
-	Expr.UnionMk(tn, mem, args) -> tn,
-	Expr.Field(base, f) -> field_arg_ty(m, base, env),
-	Expr.Call(callee, ta, cargs) -> cast_arg_ty(callee),
-	Expr.Neg(x) -> arg_ty(m, x, env),
-	Expr.Add(l, r) -> arg_ty(m, l, env),
-	Expr.Sub(l, r) -> arg_ty(m, l, env),
-	Expr.Mul(l, r) -> arg_ty(m, l, env),
-	Expr.Div(l, r) -> arg_ty(m, l, env),
-	_ -> ""
+const env_bind = (MonoEnv e, Str name, Ty ty): MonoEnv -> MonoEnv({ tvars: e.tvars, tvals: e.tvals, venv: [...e.venv, VarTy({ name: name, ty: ty, mutable: false })], ret: e.ret })
+
+# The concrete type NAME an argument denotes, for inference — derived by the SAME `type_of` the
+# typechecker uses, over the threaded `[VarTy]` environment (parameters + `let`/match/`for`/
+# destructure binders) and the whole-program context. So a field read `p.x`, a call result
+# `f(x)`, a match/loop binder, etc. all resolve, not just the literal/var/construction cases a
+# shallow guesser could see. This is only ever reached under generic instantiation — a program
+# with no templates (cf0's own source) has nothing to infer, so `type_of` is never invoked there
+# and the pass stays a byte-identical identity on it. A `""` result denotes an array/tuple/
+# pointer type (no type variable is inferred to one — that structural inference is a later brick).
+const arg_ty = (*MonoCtx m, Expr e, MonoEnv env): Str -> {
+	if !m.has_gen then return ""
+	return ty_name(type_of(e, env.venv, build_ctx(m, env.ret)))
 }
 
 # Infer a generic call's type arguments: for each type variable, a parameter whose declared
@@ -416,18 +451,21 @@ const mono_func = (*MonoCtx m, Func f, Str newname, [Str] tvars, [Str] tvals): F
 	const Str rn = mangle_type(m, f.ret_name, tvars, tvals)
 	const Str re = subst_ty(f.ret_elem, tvars, tvals)
 	const [TupElem] rtel = subst_telems(f.ret_telems, tvars, tvals)
-	# seed the local type env with the (substituted) parameter types, so a generic call in the
-	# body can infer from a parameter reference
-	let [Str] enames = []
-	let [Str] etypes = []
-	let Iarch pi = 0
-	loop {
-		if pi >= Iarch(ps.len) then break
-		enames = [...enames, ps[pi].name]
-		etypes = [...etypes, ps[pi].type_name]
-		pi = pi + 1
+	# seed the local value env with the (substituted) parameter types, so a generic call in the
+	# body can infer from a parameter reference. Only under generics: a non-generic function has
+	# nothing to instantiate, so the env stays empty and `type_of` is never invoked on it.
+	let Ty ret = Ty.TInt
+	let [VarTy] venv = []
+	if m.has_gen then {
+		ret = ret_ty(m, rn, re, rtel)
+		let Iarch pi = 0
+		loop {
+			if pi >= Iarch(ps.len) then break
+			venv = [...venv, VarTy({ name: ps[pi].name, ty: param_ty(ps[pi], all_recs(m), all_unions(m)), mutable: false })]
+			pi = pi + 1
+		}
 	}
-	const MonoEnv env = MonoEnv({ tvars: tvars, tvals: tvals, enames: enames, etypes: etypes })
+	const MonoEnv env = MonoEnv({ tvars: tvars, tvals: tvals, venv: venv, ret: ret })
 	const [Stmt] body = mono_stmts(m, f.body, env)
 	const [Str] no_tp = []
 	return Func({ name: newname, is_pub: f.is_pub, ret_name: rn, ret_elem: re, params: ps, body: body, is_asm: f.is_asm, asm_body: f.asm_body, is_value: f.is_value, ret_telems: rtel, typarams: no_tp })
@@ -443,7 +481,10 @@ const mono_call = (*MonoCtx m, Str n, [Str] ta, [Expr] args, MonoEnv env): Expr 
 	const Iarch ti = find_template(m.templates, n)
 	if ti >= 0 then {
 		let [Str] fty = rty
-		if Iarch(rty.len) == 0 then fty = infer_tyargs(m, m.templates[ti], args, env)
+		# infer from the ALREADY-monomorphized arguments (`margs`): an inner generic call has by
+		# now been rewritten to its concrete instance, so its result type is knowable — this is
+		# what lets a nested generic argument `id(f(x))` be inferred.
+		if Iarch(rty.len) == 0 then fty = infer_tyargs(m, m.templates[ti], margs, env)
 		return Expr.Call(ensure_instance(m, n, fty), no_ty, margs)
 	}
 	if Iarch(rty.len) > 0 then die("cf0: type: type arguments on a non-generic function\n")
@@ -535,16 +576,18 @@ const mono_segs = (*MonoCtx m, [Seg] segs, MonoEnv env): [Seg] -> {
 # other (a non-generic union, or a `_`) is unchanged.
 const arm_type = (*MonoCtx m, Str tn, Str scrut_ty, MonoEnv env): Str -> {
 	if str_eq(tn, "") then return tn
-	if is_type_app(tn) then return mangle_type(m, tn, env.tvars, env.tvals)
-	if find_union_template(m.union_templates, tn) >= 0 then {
-		const Str st = mangle_type(m, scrut_ty, env.tvars, env.tvals)
-		# the scrutinee's concrete instance is read shallowly (a parameter, or a `let` / literal
-		# construction); a scrutinee whose type is not yet inferable — e.g. a direct call result —
-		# has no concrete instance to name the arm with, so bind it to an annotated `let` first
-		if str_eq(st, "") then die("cf0: type: cannot infer a generic-union match scrutinee's type; bind it to a typed `let` first\n")
-		return st
-	}
+	if is_type_app(tn) then return mangle_type(m, tn, env.tvars, env.tvals)   # explicitly-qualified `Maybe[Iarch]`
+	if find_union_template(m.union_templates, tn) >= 0 then return scrut_ty    # unqualified generic union → the scrutinee's concrete instance
 	return tn
+}
+# Extend the environment with a match arm's payload bindings, so a generic call inside the arm
+# body can infer from a bound name (`match m { Just(v) -> id(v) }`). Reuses the typechecker's
+# `arm_bind_env` over the arm's CONCRETE union (`tn`); only engaged under generics.
+const arm_env = (*MonoCtx m, Str tn, [Str] members, [Str] binds, MonoEnv env): MonoEnv -> {
+	if !m.has_gen then return env
+	if str_eq(tn, "") then return env
+	if Iarch(binds.len) == 0 then return env
+	return MonoEnv({ tvars: env.tvars, tvals: env.tvals, venv: arm_bind_env(tn, members, binds, env.venv, build_ctx(m, env.ret)), ret: env.ret })
 }
 const mono_arms = (*MonoCtx m, [MatchArm] arms, MonoEnv env, Str scrut_ty): [MatchArm] -> {
 	let [MatchArm] out = []
@@ -552,16 +595,29 @@ const mono_arms = (*MonoCtx m, [MatchArm] arms, MonoEnv env, Str scrut_ty): [Mat
 	loop {
 		if i >= Iarch(arms.len) then break
 		const MatchArm a = arms[i]
-		out = [...out, MatchArm({ is_wild: a.is_wild, type_name: arm_type(m, a.type_name, scrut_ty, env), members: a.members, binds: a.binds, body: mono_expr(m, a.body, env) })]
+		const Str at = arm_type(m, a.type_name, scrut_ty, env)
+		out = [...out, MatchArm({ is_wild: a.is_wild, type_name: at, members: a.members, binds: a.binds, body: mono_expr(m, a.body, arm_env(m, at, a.members, a.binds, env)) })]
 		i = i + 1
 	}
 	return out
 }
+# A match's arms name their union UNQUALIFIED; the concrete instance is the (monomorphized)
+# scrutinee's type, derived by `type_of` over `ms` — so a match on a call result / constructed
+# value / `let` binding all resolve, not only a bare parameter.
 const mono_match = (*MonoCtx m, Expr scrut, [MatchArm] arms, MonoEnv env): Expr -> {
-	const Str st = arg_ty(m, scrut, env)
-	return Expr.Match(mono_expr(m, scrut, env), mono_arms(m, arms, env, st))
+	const Expr ms = mono_expr(m, scrut, env)
+	const Str st = arg_ty(m, ms, env)
+	return Expr.Match(ms, mono_arms(m, arms, env, st))
 }
 
+# Bind a `for x in xs` loop variable for the body's environment. cf0 binds EVERY `for` variable
+# to a word (`check_for_body` — a genesis narrowing, regardless of the array's element type), so
+# the inference env must bind it the same way; else a generic call on the binder would infer an
+# instance the typechecker (which sees a word) rejects.
+const for_env = (*MonoCtx m, Str v, MonoEnv env): MonoEnv -> {
+	if !m.has_gen then return env
+	return env_bind(env, v, Ty.TInt)
+}
 const mono_stmt = (*MonoCtx m, Stmt s, MonoEnv env): Stmt -> match s {
 	Stmt.Let(n, mut, ann, e) -> Stmt.Let(n, mut, mangle_type(m, ann, env.tvars, env.tvals), mono_expr(m, e, env)),
 	Stmt.Destructure(pat, mut, e) -> Stmt.Destructure(pat, mut, mono_expr(m, e, env)),
@@ -570,7 +626,7 @@ const mono_stmt = (*MonoCtx m, Stmt s, MonoEnv env): Stmt -> match s {
 	Stmt.FieldAssign(b, f, e) -> Stmt.FieldAssign(b, f, mono_expr(m, e, env)),
 	Stmt.IndexAssign(a, i, v) -> Stmt.IndexAssign(a, mono_expr(m, i, env), mono_expr(m, v, env)),
 	Stmt.Return(e) -> Stmt.Return(mono_expr(m, e, env)),
-	Stmt.ForIn(v, a, body) -> Stmt.ForIn(v, a, mono_stmts(m, body, env)),
+	Stmt.ForIn(v, a, body) -> Stmt.ForIn(v, a, mono_stmts(m, body, for_env(m, v, env))),
 	Stmt.Loop(body) -> Stmt.Loop(mono_stmts(m, body, env)),
 	Stmt.Break -> Stmt.Break,
 	Stmt.Continue -> Stmt.Continue,
@@ -586,25 +642,30 @@ const mono_stmt_arms = (*MonoCtx m, [StmtArm] arms, MonoEnv env, Str scrut_ty): 
 	loop {
 		if i >= Iarch(arms.len) then break
 		const StmtArm a = arms[i]
-		out = [...out, StmtArm({ is_wild: a.is_wild, type_name: arm_type(m, a.type_name, scrut_ty, env), members: a.members, binds: a.binds, body: mono_stmts(m, a.body, env) })]
+		const Str at = arm_type(m, a.type_name, scrut_ty, env)
+		out = [...out, StmtArm({ is_wild: a.is_wild, type_name: at, members: a.members, binds: a.binds, body: mono_stmts(m, a.body, arm_env(m, at, a.members, a.binds, env)) })]
 		i = i + 1
 	}
 	return out
 }
 const mono_stmt_match = (*MonoCtx m, Expr scrut, [StmtArm] arms, MonoEnv env): Stmt -> {
-	const Str st = arg_ty(m, scrut, env)
-	return Stmt.Match(mono_expr(m, scrut, env), mono_stmt_arms(m, arms, env, st))
+	const Expr ms = mono_expr(m, scrut, env)
+	const Str st = arg_ty(m, ms, env)
+	return Stmt.Match(ms, mono_stmt_arms(m, arms, env, st))
 }
-# The binding type recorded for a `let`: its (substituted) annotation, or — with no annotation
-# — the shallow type inferred from the initializer.
-const let_binding_ty = (*MonoCtx m, Str ann, Expr e, MonoEnv env): Str -> {
-	const Str bt = mangle_type(m, ann, env.tvars, env.tvals)
-	if !str_eq(bt, "") then return bt
-	return arg_ty(m, e, env)
-}
-const mono_extend = (*MonoCtx m, Stmt s, MonoEnv env): MonoEnv -> match s {
-	Stmt.Let(n, mut, ann, e) -> env_add(env, n, let_binding_ty(m, ann, e, env)),
-	_ -> env
+# Extend the environment for the statements after a destructure — the tuple binders' types via
+# the typechecker's `check_destructure` over the (monomorphized) initializer.
+const destr_env = (*MonoCtx m, [Str] pat, Bool mut, Expr e, MonoEnv env): MonoEnv -> MonoEnv({ tvars: env.tvars, tvals: env.tvals, venv: check_destructure(pat, mut, e, env.venv, build_ctx(m, env.ret)), ret: env.ret })
+# After a `let` / destructure, record the binding's type (via the typechecker's `binding_ty` /
+# `check_destructure` over the monomorphized statement) so a later generic call can infer from it.
+# Only under generics; a non-generic program never consults the environment, so this is skipped.
+const mono_extend = (*MonoCtx m, Stmt s, MonoEnv env): MonoEnv -> {
+	if !m.has_gen then return env
+	return match s {
+		Stmt.Let(n, mut, ann, e) -> env_bind(env, n, binding_ty(ann, e, env.venv, build_ctx(m, env.ret))),
+		Stmt.Destructure(pat, mut, e) -> destr_env(m, pat, mut, e, env),
+		_ -> env
+	}
 }
 const mono_stmts = (*MonoCtx m, [Stmt] ss, MonoEnv env0): [Stmt] -> {
 	let MonoEnv env = env0
@@ -612,9 +673,9 @@ const mono_stmts = (*MonoCtx m, [Stmt] ss, MonoEnv env0): [Stmt] -> {
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(ss.len) then break
-		const Stmt s = ss[i]
-		out = [...out, mono_stmt(m, s, env)]
-		env = mono_extend(m, s, env)  # a `let` extends the env for the statements after it
+		const Stmt ms = mono_stmt(m, ss[i], env)
+		out = [...out, ms]
+		env = mono_extend(m, ms, env)  # extend using the MONO'd statement (concrete types) for the rest
 		i = i + 1
 	}
 	return out
@@ -725,10 +786,19 @@ pub const mono_program = (Program prog): Program -> {
 	let [RecDecl] no_recinst = []
 	let [Str] no_tk = []
 	let [UnionDecl] no_uni = []
-	let MonoCtx m = MonoCtx({ templates: templates, keys: no_keys, instances: no_inst, unions: unames, rec_templates: rec_templates, type_keys: no_tk, rec_instances: no_recinst, union_templates: union_templates, union_instances: no_uni })
+	# whether the program has ANY generic template — if not (cf0's own source), the inference
+	# machinery (which drives the shared `type_of`) is never engaged and the pass is an identity
+	let Bool has_gen = false
+	if Iarch(templates.len) > 0 then has_gen = true
+	if Iarch(rec_templates.len) > 0 then has_gen = true
+	if Iarch(union_templates.len) > 0 then has_gen = true
+	let MonoCtx m = MonoCtx({ templates: templates, keys: no_keys, instances: no_inst, unions: unames, rec_templates: rec_templates, type_keys: no_tk, rec_instances: no_recinst, union_templates: union_templates, union_instances: no_uni, cfuncs: concrete, crecs: concrete_recs, cunions: concrete_unions, has_gen: has_gen })
 	# reject a generic record/union template whose field/payload names an undeclared type variable
 	check_rec_templates(&m)
 	check_union_templates(&m)
+	# resolve any generic type NAMED in a concrete signature to its instance, so the shared
+	# `type_of` sees only concrete decls (skipped when there are no generics — the identity path)
+	if has_gen then mangle_concrete_sigs(&m)
 	const [Str] no_tv = []
 	let [Func] out = []
 	let Iarch j = 0
