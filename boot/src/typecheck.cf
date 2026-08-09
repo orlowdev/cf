@@ -37,6 +37,37 @@ const is_tstr = (Ty t): Bool -> match t { Ty.TStr -> true, _ -> false }
 const is_tunit = (Ty t): Bool -> match t { Ty.TUnit -> true, _ -> false }
 const is_tfixed = (Ty t): Bool -> match t { Ty.TFixed(b, s) -> true, _ -> false }
 const is_tfloat = (Ty t): Bool -> match t { Ty.TFloat(b) -> true, _ -> false }
+# A type-variable name (`'T`) — an apostrophe-led name (byte 39). After monomorphization no
+# concrete program has these, so one surviving into a declaration is an undeclared type var.
+const name_is_typevar = (Str s): Bool -> if Iarch(s.len) == 0 then false else Iarch(s[0]) == 39
+const telems_have_typevar = ([TupElem] tels): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(tels.len) then break
+		if tel_is_nest(tels[i]) then { if telems_have_typevar(tels[i].sub) then return true }
+		if !tel_is_nest(tels[i]) && name_is_typevar(tels[i].name) then return true
+		i = i + 1
+	}
+	return false
+}
+# Whether a function's signature still mentions a type variable in ANY type position (a scalar
+# name, a `[T]` element, or a tuple position — of a parameter or the return). After
+# monomorphization every function is concrete, so a survivor is an undeclared type variable
+# (a `'T` used in a non-generic function, or a substitution the mono pass failed to reach).
+const sig_has_typevar = (Func fn): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(fn.params.len) then break
+		if name_is_typevar(fn.params[i].type_name) then return true
+		if name_is_typevar(fn.params[i].elem) then return true
+		if telems_have_typevar(fn.params[i].telems) then return true
+		i = i + 1
+	}
+	if name_is_typevar(fn.ret_name) then return true
+	if name_is_typevar(fn.ret_elem) then return true
+	if telems_have_typevar(fn.ret_telems) then return true
+	return false
+}
 const tfloat_bits = (Ty t): Iarch -> match t { Ty.TFloat(b) -> b, _ -> 0 }
 # The `Ty` a fixed-width name denotes (`Int8` → signed 8-bit, …).
 const fixed_ty = (Str name): Ty -> Ty.TFixed(fixed_bits(name), fixed_signed(name))
@@ -82,7 +113,7 @@ const tel_to_ty = (TupElem te, Ctx ctx): Ty -> {
 # keeps the element to a shape the emitter classifies the same way the type gate does (an
 # `if`/`match`-valued record element is a later brick).
 const is_fresh_record = (Expr e): Bool -> match e {
-	Expr.Call(c, a) -> true,
+	Expr.Call(c, ta, a) -> true,
 	Expr.Record(n, fs) -> true,
 	Expr.UnionMk(t, m, args) -> true,
 	_ -> false
@@ -92,12 +123,12 @@ const is_fresh_record = (Expr e): Bool -> match e {
 # binding may take (a literal `(a,b)` or a tuple-returning call `f(…)`). Aliasing a tuple
 # name or a tuple from a field/index is a later brick.
 const is_tuple_lit = (Expr e): Bool -> match e { Expr.Tuple(es) -> true, _ -> false }
-const is_call_expr = (Expr e): Bool -> match e { Expr.Call(c, a) -> true, _ -> false }
+const is_call_expr = (Expr e): Bool -> match e { Expr.Call(c, ta, a) -> true, _ -> false }
 # The value forms a whole-tuple binding may take — every form emit resolves telems for: a
 # literal, a call result, a bound tuple name, a tuple element/field (indexed or via `.field`).
 const is_tuple_bindable = (Expr e): Bool -> match e {
 	Expr.Tuple(es) -> true,
-	Expr.Call(c, a) -> true,
+	Expr.Call(c, ta, a) -> true,
 	Expr.Var(n) -> true,
 	Expr.Index(a, i) -> true,
 	Expr.IndexExpr(b, i) -> true,
@@ -567,7 +598,10 @@ const str_seal_type = ([Expr] args, [VarTy] env, Ctx ctx): Ty -> {
 	return Ty.TStr
 }
 
-const call_type = (Str callee, [Expr] args, [VarTy] env, Ctx ctx): Ty -> {
+# The `tyargs` are ignored here: the monomorphization pass has already resolved every generic
+# call to a concrete instance (a stripped, concretely-named `Call`), so by typecheck a `Call`
+# carries no live type arguments.
+const call_type = (Str callee, [Str] tyargs, [Expr] args, [VarTy] env, Ctx ctx): Ty -> {
 	if is_cast_type(callee) then return cast_type(callee, args, env, ctx)
 	if str_eq(callee, "Str") then return str_seal_type(args, env, ctx)
 	const Iarch fidx = find_func(ctx.funcs, callee)
@@ -848,7 +882,7 @@ const arraylit_type = (Bool has_spread, Expr spread_src, [Expr] elems, Str elem_
 # than letting emit silently copy zero slots.)
 const is_spreadable_src = (Expr e): Bool -> match e {
 	Expr.Var(n) -> true,
-	Expr.Call(c, a) -> true,
+	Expr.Call(c, ta, a) -> true,
 	Expr.Tuple(es) -> true,
 	_ -> false
 }
@@ -1196,7 +1230,7 @@ const type_of = (Expr e, [VarTy] env, Ctx ctx): Ty -> match e {
 	Expr.And(l, r) -> bool_binop(l, r, env, ctx),
 	Expr.Or(l, r) -> bool_binop(l, r, env, ctx),
 	Expr.If(c, t, e2) -> if_type(c, t, e2, env, ctx),
-	Expr.Call(callee, args) -> call_type(callee, args, env, ctx)
+	Expr.Call(callee, tyargs, args) -> call_type(callee, tyargs, args, env, ctx)
 }
 
 # --- statement / function checking ----------------------------------------------------
@@ -1463,6 +1497,9 @@ const check_func = (Func fn, Ctx ctx): Iarch -> {
 	# an asm-bodied function has no statement body to check — its parameters and return type
 	# still register it for callers (call_type resolves them); the asm is emitted verbatim.
 	if fn.is_asm then return 0
+	# a concrete function's signature may not mention a type variable (an undeclared `'T` in a
+	# non-generic function, or one the monomorph pass left unsubstituted)
+	if sig_has_typevar(fn) then die("cf0: type: an undeclared type variable in a function signature\n")
 	const Ty frt = func_ret_ty(fn, ctx.recs, ctx.unions)
 	# thread this function's return type on the Ctx so `type_of` (a value-loop body) can reach it
 	const Ctx fctx = Ctx({ funcs: ctx.funcs, recs: ctx.recs, unions: ctx.unions, frt: frt })
@@ -1510,6 +1547,11 @@ const check_whole = (Program prog): Iarch -> {
 			# a float record field would store/load through the aggregate's uniform-word slot —
 			# floats in aggregates (fields/tuple positions) are a later brick, rejected for now
 			if is_float_name(prog.recs[r].ftypes[a]) then die("cf0: type: a float record field is not yet supported (floats in aggregates are a later brick)\n")
+			# a type variable `'T` in a field needs a generic data declaration to bind it; a
+			# plain `data` record is not generic, so the `'T` is undeclared (validated here at the
+			# declaration, since a never-USED field would otherwise slip past resolution)
+			if name_is_typevar(prog.recs[r].ftypes[a]) then die("cf0: type: an undeclared type variable in a record field\n")
+			if str_eq(prog.recs[r].ftypes[a], "$tuple") && telems_have_typevar(prog.recs[r].ftelems[a]) then die("cf0: type: an undeclared type variable in a tuple field\n")
 			a = a + 1
 		}
 		r = r + 1

@@ -1,0 +1,319 @@
+# monomorph — clone-based monomorphization of generic functions (type_system §8.1, seed_subset).
+#
+# A generic function `id = ['T]('T x): 'T -> x` is a TEMPLATE. This pass runs between resolve
+# and typecheck: it removes the templates and, for every distinct set of type ARGUMENTS a
+# template is called with, emits a concrete CLONE with each `'T` substituted by the argument
+# (e.g. `id[Iarch]` → a function `id__Iarch` with `Iarch` params/return). Every generic call
+# site is rewritten to name its concrete instance (type arguments stripped), so typecheck and
+# emit see only ordinary functions. Instances are deduped, and a clone's own body is scanned
+# for further generic calls (transitive instantiation) to a fixpoint.
+#
+# Brick scope: EXPLICIT type arguments only (`id[Iarch](x)`); inference (`id(x)`) is a later
+# brick. Generic DATA/UNION types and bounds are later bricks too.
+
+import "io" as { die }
+import "ast" as { Expr, Stmt, Param, Func, MatchArm, StmtArm, Seg, FieldInit, RecDecl, UnionDecl, TupElem, Import, Program }
+
+# The accumulating state, threaded by pointer: the generic templates, the mangled names of the
+# instances already generated (dedup / recursion guard), and the generated instance clones.
+data MonoCtx = { [Func] templates, [Str] keys, [Func] instances }
+
+const str_eq = (Str a, Str b): Bool -> {
+	if a.len != b.len then return false
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(a.len) then break
+		if Iarch(a[i]) != Iarch(b[i]) then return false
+		i = i + 1
+	}
+	return true
+}
+
+# The index of the generic template named `n`, or -1 if `n` is not a generic function.
+const find_template = ([Func] templates, Str n): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(templates.len) then break
+		if str_eq(templates[i].name, n) then return i
+		i = i + 1
+	}
+	return 0 - 1
+}
+const key_seen = (*MonoCtx m, Str mn): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(m.keys.len) then break
+		if str_eq(m.keys[i], mn) then return true
+		i = i + 1
+	}
+	return false
+}
+
+# Substitute a type-variable name with its concrete argument (`'T` → `Iarch`); a non-variable
+# name (a real type, or a `'T` not among these parameters) passes through unchanged.
+const subst_ty = (Str name, [Str] tvars, [Str] tvals): Str -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(tvars.len) then break
+		if str_eq(tvars[i], name) then return tvals[i]
+		i = i + 1
+	}
+	return name
+}
+const subst_tys = ([Str] names, [Str] tvars, [Str] tvals): [Str] -> {
+	let [Str] out = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(names.len) then break
+		out = [...out, subst_ty(names[i], tvars, tvals)]
+		i = i + 1
+	}
+	return out
+}
+# Substitute type variables inside a tuple's position list — a nested position recurses, a leaf
+# substitutes its name — so a `('T, Iarch)` param/return in a generic instance is concretized.
+const subst_telems = ([TupElem] tels, [Str] tvars, [Str] tvals): [TupElem] -> {
+	let [TupElem] out = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(tels.len) then break
+		const TupElem t = tels[i]
+		if str_eq(t.name, "$tuple") then out = [...out, TupElem({ name: "$tuple", sub: subst_telems(t.sub, tvars, tvals) })]
+		if !str_eq(t.name, "$tuple") then {
+			let [TupElem] none = []
+			out = [...out, TupElem({ name: subst_ty(t.name, tvars, tvals), sub: none })]
+		}
+		i = i + 1
+	}
+	return out
+}
+# The concrete instance name for `gname` applied to `tyargs` — `id[Iarch]` → `id$Iarch`,
+# `pair[Iarch, Color]` → `pair$Iarch$Color`. The `$` separator never occurs in a source name or
+# in resolve's `__<tag>` private-mangling, so (template, args) → name is injective (no collision
+# between `pair[Iarch, Str]` and a `pair__Iarch[Str]`). The name is only a resolution key —
+# emit names every function positionally (`$f<idx>`), so the `$` never reaches a QBE symbol.
+const mangle_instance = (Str gname, [Str] tyargs): Str -> {
+	let Str s = gname
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(tyargs.len) then break
+		s = "${s}$${tyargs[i]}"
+		i = i + 1
+	}
+	return s
+}
+
+# Ensure the instance of `gname` with concrete `tyargs` exists (generating it, and transitively
+# any instance its body needs), and return its mangled name.
+const ensure_instance = (*MonoCtx m, Str gname, [Str] tyargs): Str -> {
+	const Str mn = mangle_instance(gname, tyargs)
+	if key_seen(m, mn) then return mn
+	m.keys = [...m.keys, mn]  # mark before recursing so a recursive generic terminates
+	const Iarch ti = find_template(m.templates, gname)
+	const Func tmpl = m.templates[ti]
+	if Iarch(tmpl.typarams.len) != Iarch(tyargs.len) then die("cf0: type: a generic call has the wrong number of type arguments\n")
+	const Func clone = mono_func(m, tmpl, mn, tmpl.typarams, tyargs)
+	m.instances = [...m.instances, clone]
+	return mn
+}
+
+# Clone a function with `tvars` → `tvals` substituted in every type position (parameters,
+# return, and — via the body walk — local annotations and nested generic call arguments), and
+# rewrite the body's generic calls to their instances. `newname` is the (concrete) result name.
+const mono_func = (*MonoCtx m, Func f, Str newname, [Str] tvars, [Str] tvals): Func -> {
+	let [Param] ps = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(f.params.len) then break
+		const Param p = f.params[i]
+		# substitute `'T` in EVERY type position of the parameter: the scalar/record name, a
+		# `[T]` array element, and a `(A, B)` tuple's positions
+		ps = [...ps, Param({ name: p.name, is_ptr: p.is_ptr, type_name: subst_ty(p.type_name, tvars, tvals), elem: subst_ty(p.elem, tvars, tvals), telems: subst_telems(p.telems, tvars, tvals) })]
+		i = i + 1
+	}
+	const Str rn = subst_ty(f.ret_name, tvars, tvals)
+	const Str re = subst_ty(f.ret_elem, tvars, tvals)
+	const [TupElem] rtel = subst_telems(f.ret_telems, tvars, tvals)
+	const [Stmt] body = mono_stmts(m, f.body, tvars, tvals)
+	const [Str] no_tp = []
+	return Func({ name: newname, is_pub: f.is_pub, ret_name: rn, ret_elem: re, params: ps, body: body, is_asm: f.is_asm, asm_body: f.asm_body, is_value: f.is_value, ret_telems: rtel, typarams: no_tp })
+}
+
+# Rewrite a call: substitute its type arguments, and — if the callee is generic — instantiate
+# it and rename the call to the concrete instance (stripping the type args). Type arguments on
+# a non-generic function are an error; a generic call with none needs explicit args for now.
+const mono_call = (*MonoCtx m, Str n, [Str] ta, [Expr] args, [Str] tvars, [Str] tvals): Expr -> {
+	const [Expr] margs = mono_exprs(m, args, tvars, tvals)
+	const [Str] rty = subst_tys(ta, tvars, tvals)
+	const [Str] no_ty = []
+	const Iarch ti = find_template(m.templates, n)
+	if ti >= 0 then {
+		if Iarch(rty.len) == 0 then die("cf0: type: a generic call needs explicit type arguments (inference is a later brick)\n")
+		return Expr.Call(ensure_instance(m, n, rty), no_ty, margs)
+	}
+	if Iarch(rty.len) > 0 then die("cf0: type: type arguments on a non-generic function\n")
+	return Expr.Call(n, no_ty, margs)
+}
+
+const mono_expr = (*MonoCtx m, Expr e, [Str] tvars, [Str] tvals): Expr -> match e {
+	Expr.Lit(v) -> Expr.Lit(v),
+	Expr.BoolLit(b) -> Expr.BoolLit(b),
+	Expr.Var(n) -> Expr.Var(n),
+	Expr.StrLit(bs) -> Expr.StrLit(bs),
+	Expr.FloatLit(t) -> Expr.FloatLit(t),
+	Expr.Record(n, fs) -> Expr.Record(n, mono_fields(m, fs, tvars, tvals)),
+	Expr.Field(b, f) -> Expr.Field(b, f),
+	Expr.FieldExpr(b, f) -> Expr.FieldExpr(mono_expr(m, b, tvars, tvals), f),
+	Expr.UnionMk(t, mem, args) -> Expr.UnionMk(t, mem, mono_exprs(m, args, tvars, tvals)),
+	Expr.Match(scrut, arms) -> Expr.Match(mono_expr(m, scrut, tvars, tvals), mono_arms(m, arms, tvars, tvals)),
+	Expr.ArrayLit(hs, sn, elems, et) -> Expr.ArrayLit(hs, mono_expr(m, sn, tvars, tvals), mono_exprs(m, elems, tvars, tvals), et),
+	Expr.Index(a, i) -> Expr.Index(a, mono_expr(m, i, tvars, tvals)),
+	Expr.IndexField(a, i, f) -> Expr.IndexField(a, mono_expr(m, i, tvars, tvals), f),
+	Expr.IndexExpr(b, i) -> Expr.IndexExpr(mono_expr(m, b, tvars, tvals), mono_expr(m, i, tvars, tvals)),
+	Expr.Tuple(elems) -> Expr.Tuple(mono_exprs(m, elems, tvars, tvals)),
+	Expr.Spread(x) -> Expr.Spread(mono_expr(m, x, tvars, tvals)),
+	Expr.Unit -> Expr.Unit,
+	Expr.Loop(body) -> Expr.Loop(mono_stmts(m, body, tvars, tvals)),
+	Expr.Interp(segs) -> Expr.Interp(mono_segs(m, segs, tvars, tvals)),
+	Expr.Buffer(n) -> Expr.Buffer(n),
+	Expr.Addr(name) -> Expr.Addr(name),
+	Expr.Neg(x) -> Expr.Neg(mono_expr(m, x, tvars, tvals)),
+	Expr.Not(x) -> Expr.Not(mono_expr(m, x, tvars, tvals)),
+	Expr.BitNot(x) -> Expr.BitNot(mono_expr(m, x, tvars, tvals)),
+	Expr.Add(l, r) -> Expr.Add(mono_expr(m, l, tvars, tvals), mono_expr(m, r, tvars, tvals)),
+	Expr.Sub(l, r) -> Expr.Sub(mono_expr(m, l, tvars, tvals), mono_expr(m, r, tvars, tvals)),
+	Expr.Mul(l, r) -> Expr.Mul(mono_expr(m, l, tvars, tvals), mono_expr(m, r, tvars, tvals)),
+	Expr.Div(l, r) -> Expr.Div(mono_expr(m, l, tvars, tvals), mono_expr(m, r, tvars, tvals)),
+	Expr.Mod(l, r) -> Expr.Mod(mono_expr(m, l, tvars, tvals), mono_expr(m, r, tvars, tvals)),
+	Expr.BitAnd(l, r) -> Expr.BitAnd(mono_expr(m, l, tvars, tvals), mono_expr(m, r, tvars, tvals)),
+	Expr.BitOr(l, r) -> Expr.BitOr(mono_expr(m, l, tvars, tvals), mono_expr(m, r, tvars, tvals)),
+	Expr.BitXor(l, r) -> Expr.BitXor(mono_expr(m, l, tvars, tvals), mono_expr(m, r, tvars, tvals)),
+	Expr.Shl(l, r) -> Expr.Shl(mono_expr(m, l, tvars, tvals), mono_expr(m, r, tvars, tvals)),
+	Expr.Shr(l, r) -> Expr.Shr(mono_expr(m, l, tvars, tvals), mono_expr(m, r, tvars, tvals)),
+	Expr.CmpEq(l, r) -> Expr.CmpEq(mono_expr(m, l, tvars, tvals), mono_expr(m, r, tvars, tvals)),
+	Expr.CmpNe(l, r) -> Expr.CmpNe(mono_expr(m, l, tvars, tvals), mono_expr(m, r, tvars, tvals)),
+	Expr.CmpLt(l, r) -> Expr.CmpLt(mono_expr(m, l, tvars, tvals), mono_expr(m, r, tvars, tvals)),
+	Expr.CmpGt(l, r) -> Expr.CmpGt(mono_expr(m, l, tvars, tvals), mono_expr(m, r, tvars, tvals)),
+	Expr.CmpLe(l, r) -> Expr.CmpLe(mono_expr(m, l, tvars, tvals), mono_expr(m, r, tvars, tvals)),
+	Expr.CmpGe(l, r) -> Expr.CmpGe(mono_expr(m, l, tvars, tvals), mono_expr(m, r, tvars, tvals)),
+	Expr.And(l, r) -> Expr.And(mono_expr(m, l, tvars, tvals), mono_expr(m, r, tvars, tvals)),
+	Expr.Or(l, r) -> Expr.Or(mono_expr(m, l, tvars, tvals), mono_expr(m, r, tvars, tvals)),
+	Expr.If(c, t, e2) -> Expr.If(mono_expr(m, c, tvars, tvals), mono_expr(m, t, tvars, tvals), mono_expr(m, e2, tvars, tvals)),
+	Expr.Call(n, ta, args) -> mono_call(m, n, ta, args, tvars, tvals)
+}
+
+const mono_exprs = (*MonoCtx m, [Expr] es, [Str] tvars, [Str] tvals): [Expr] -> {
+	let [Expr] out = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(es.len) then break
+		out = [...out, mono_expr(m, es[i], tvars, tvals)]
+		i = i + 1
+	}
+	return out
+}
+const mono_fields = (*MonoCtx m, [FieldInit] fs, [Str] tvars, [Str] tvals): [FieldInit] -> {
+	let [FieldInit] out = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(fs.len) then break
+		out = [...out, FieldInit({ field: fs[i].field, value: mono_expr(m, fs[i].value, tvars, tvals) })]
+		i = i + 1
+	}
+	return out
+}
+const mono_segs = (*MonoCtx m, [Seg] segs, [Str] tvars, [Str] tvals): [Seg] -> {
+	let [Seg] out = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(segs.len) then break
+		const Seg sg = segs[i]
+		out = [...out, Seg({ is_hole: sg.is_hole, lit: sg.lit, name: sg.name, expr: mono_expr(m, sg.expr, tvars, tvals) })]
+		i = i + 1
+	}
+	return out
+}
+const mono_arms = (*MonoCtx m, [MatchArm] arms, [Str] tvars, [Str] tvals): [MatchArm] -> {
+	let [MatchArm] out = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		const MatchArm a = arms[i]
+		out = [...out, MatchArm({ is_wild: a.is_wild, type_name: a.type_name, members: a.members, binds: a.binds, body: mono_expr(m, a.body, tvars, tvals) })]
+		i = i + 1
+	}
+	return out
+}
+
+const mono_stmt = (*MonoCtx m, Stmt s, [Str] tvars, [Str] tvals): Stmt -> match s {
+	Stmt.Let(n, mut, ann, e) -> Stmt.Let(n, mut, subst_ty(ann, tvars, tvals), mono_expr(m, e, tvars, tvals)),
+	Stmt.Destructure(pat, mut, e) -> Stmt.Destructure(pat, mut, mono_expr(m, e, tvars, tvals)),
+	Stmt.Yield(e) -> Stmt.Yield(mono_expr(m, e, tvars, tvals)),
+	Stmt.Assign(n, e) -> Stmt.Assign(n, mono_expr(m, e, tvars, tvals)),
+	Stmt.FieldAssign(b, f, e) -> Stmt.FieldAssign(b, f, mono_expr(m, e, tvars, tvals)),
+	Stmt.IndexAssign(a, i, v) -> Stmt.IndexAssign(a, mono_expr(m, i, tvars, tvals), mono_expr(m, v, tvars, tvals)),
+	Stmt.Return(e) -> Stmt.Return(mono_expr(m, e, tvars, tvals)),
+	Stmt.ForIn(v, a, body) -> Stmt.ForIn(v, a, mono_stmts(m, body, tvars, tvals)),
+	Stmt.Loop(body) -> Stmt.Loop(mono_stmts(m, body, tvars, tvals)),
+	Stmt.Break -> Stmt.Break,
+	Stmt.Continue -> Stmt.Continue,
+	Stmt.IfThen(c, st) -> Stmt.IfThen(mono_expr(m, c, tvars, tvals), mono_stmt(m, st, tvars, tvals)),
+	Stmt.IfElse(c, t, e) -> Stmt.IfElse(mono_expr(m, c, tvars, tvals), mono_stmt(m, t, tvars, tvals), mono_stmt(m, e, tvars, tvals)),
+	Stmt.Do(e) -> Stmt.Do(mono_expr(m, e, tvars, tvals)),
+	Stmt.Block(stmts) -> Stmt.Block(mono_stmts(m, stmts, tvars, tvals)),
+	Stmt.Match(scrut, arms) -> Stmt.Match(mono_expr(m, scrut, tvars, tvals), mono_stmt_arms(m, arms, tvars, tvals))
+}
+const mono_stmt_arms = (*MonoCtx m, [StmtArm] arms, [Str] tvars, [Str] tvals): [StmtArm] -> {
+	let [StmtArm] out = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		const StmtArm a = arms[i]
+		out = [...out, StmtArm({ is_wild: a.is_wild, type_name: a.type_name, members: a.members, binds: a.binds, body: mono_stmts(m, a.body, tvars, tvals) })]
+		i = i + 1
+	}
+	return out
+}
+const mono_stmts = (*MonoCtx m, [Stmt] ss, [Str] tvars, [Str] tvals): [Stmt] -> {
+	let [Stmt] out = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		out = [...out, mono_stmt(m, ss[i], tvars, tvals)]
+		i = i + 1
+	}
+	return out
+}
+
+# Monomorphize the program: drop the generic templates, rewrite every concrete function's
+# body (registering the instances its generic calls need, transitively), then append all the
+# generated concrete instances. The result has no generic functions.
+pub const mono_program = (Program prog): Program -> {
+	let [Func] templates = []
+	let [Func] concrete = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(prog.funcs.len) then break
+		if Iarch(prog.funcs[i].typarams.len) > 0 then templates = [...templates, prog.funcs[i]]
+		else concrete = [...concrete, prog.funcs[i]]
+		i = i + 1
+	}
+	let [Func] no_inst = []
+	let [Str] no_keys = []
+	let MonoCtx m = MonoCtx({ templates: templates, keys: no_keys, instances: no_inst })
+	const [Str] no_tv = []
+	let [Func] out = []
+	let Iarch j = 0
+	loop {
+		if j >= Iarch(concrete.len) then break
+		out = [...out, mono_func(&m, concrete[j], concrete[j].name, no_tv, no_tv)]
+		j = j + 1
+	}
+	let Iarch k = 0
+	loop {
+		if k >= Iarch(m.instances.len) then break
+		out = [...out, m.instances[k]]
+		k = k + 1
+	}
+	return Program({ imports: prog.imports, recs: prog.recs, unions: prog.unions, funcs: out })
+}

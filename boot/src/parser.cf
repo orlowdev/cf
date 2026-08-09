@@ -328,7 +328,7 @@ const parse_if = (*Parser p): Expr -> {
 # `name(args)` — a call. `(` is already the current token. The callee is resolved
 # whole-program at emit time (so forward references and recursion work); here we
 # only collect the comma-separated argument expressions.
-const parse_call = (*Parser p, Str name): Expr -> {
+const parse_args = (*Parser p): [Expr] -> {
 	p.pos = p.pos + 1 # `(`
 	let [Expr] args = []
 	if !is_rparen(peek(p)) then {
@@ -340,7 +340,86 @@ const parse_call = (*Parser p, Str name): Expr -> {
 	}
 	if !is_rparen(peek(p)) then die("cf0: parse: expected `)` in a call\n")
 	p.pos = p.pos + 1
-	return Expr.Call(name, args)
+	return args
+}
+const parse_call = (*Parser p, Str name): Expr -> {
+	const [Str] no_ty = []
+	return Expr.Call(name, no_ty, parse_args(p))
+}
+
+# `f[T1, T2](args)` — a call to a generic function with explicit type arguments. Each type
+# argument is a type NAME (`Iarch`/a record/a `'T` in a generic body/a fixed or float leaf).
+const parse_tyargs = (*Parser p): [Str] -> {
+	p.pos = p.pos + 1 # `[`
+	let [Str] tys = []
+	loop {
+		if !is_ident(peek(p)) then die("cf0: parse: expected a type argument in `[...]`\n")
+		tys = [...tys, cur_name(p)]
+		p.pos = p.pos + 1
+		if !is_comma(peek(p)) then break
+		p.pos = p.pos + 1
+	}
+	if !is_rbracket(peek(p)) then die("cf0: parse: expected `]` after type arguments\n")
+	p.pos = p.pos + 1
+	return tys
+}
+const parse_generic_call = (*Parser p, Str name): Expr -> {
+	const [Str] tys = parse_tyargs(p)
+	if !is_lparen(peek(p)) then die("cf0: parse: expected `(` after type arguments\n")
+	return Expr.Call(name, tys, parse_args(p))
+}
+# Scan a bracket group starting at token index `br` (a `[`) to its matching `]`, returning the
+# index of the token AFTER the `]` (or -1 if unbalanced).
+const after_brackets = (*Parser p, Iarch br): Iarch -> {
+	let Iarch depth = 0
+	let Iarch j = br
+	loop {
+		if j >= Iarch(p.toks.len) then return 0 - 1
+		const TokKind k = p.toks[j].kind
+		if is_lbracket(k) then depth = depth + 1
+		if is_rbracket(k) then {
+			depth = depth - 1
+			if depth == 0 then break
+		}
+		j = j + 1
+	}
+	return j + 1
+}
+# Do the tokens between the `[` at index `br` and its matching `]` look like a type-argument
+# list — only identifiers and commas (`[Iarch, Color]`) — rather than an index expression
+# (`xs[1]`, `xs[i + 1]`)? This, together with a trailing `(`, distinguishes a generic call from
+# an array index (both are `name[…]`), so an index followed by a `(`-statement is not misread.
+const tyargs_shaped = (*Parser p, Iarch br): Bool -> {
+	let Iarch j = br + 1
+	loop {
+		if j >= Iarch(p.toks.len) then return false
+		const TokKind k = p.toks[j].kind
+		if is_rbracket(k) then break
+		if !is_ident(k) && !is_comma(k) then return false
+		j = j + 1
+	}
+	if j == br + 1 then return false
+	return true
+}
+# At a `[` right after a NAME: is it `[tyargs](` (a generic call) or `[idx]` (an array index)?
+const generic_call_ahead = (*Parser p): Bool -> {
+	if !is_lbracket(peek(p)) then return false
+	if !tyargs_shaped(p, p.pos) then return false
+	const Iarch after = after_brackets(p, p.pos)
+	if after < 0 then return false
+	if after >= Iarch(p.toks.len) then return false
+	return is_lparen(p.toks[after].kind)
+}
+# At a statement head (the current token is a name): is the statement `name[T](…)` — a generic
+# call evaluated for effect — rather than an index-assignment `name[i] = …`?
+const generic_call_stmt_ahead = (*Parser p): Bool -> {
+	if p.pos + 1 >= Iarch(p.toks.len) then return false
+	if !is_lbracket(p.toks[p.pos + 1].kind) then return false
+	if !tyargs_shaped(p, p.pos + 1) then return false
+	const Iarch after = after_brackets(p, p.pos + 1)
+	if after < 0 then return false
+	if after >= Iarch(p.toks.len) then return false
+	return is_lparen(p.toks[after].kind)
 }
 
 # A `[…]` dynamic-array literal: `[]`, `[a, b]`, or a spread `[...src, e, …]`. `[` is
@@ -593,6 +672,9 @@ const parse_primary = (*Parser p): Expr -> {
 			if is_lparen(peek(p)) then return parse_union_mk(p, name, field)
 			return postfix_chain(p, Expr.Field(name, field))
 		}
+		# `name[T](args)` — a call to a generic function with explicit type arguments (must be
+		# checked before the index form, since both start with `[`)
+		if generic_call_ahead(p) then return postfix_chain(p, parse_generic_call(p, name))
 		# `name[i]` — a dynamic-array index, optionally followed by `.field` to read a
 		# field off a record element (`name[i].field`).
 		if is_lbracket(peek(p)) then {
@@ -939,10 +1021,11 @@ const parse_stmt = (*Parser p): Stmt -> {
 	# (`name.field = expr`), an element write (`name[i] = expr`), or a whole-name
 	# reassignment (`name = expr`, a `let` local).
 	if is_ident(peek(p)) then {
-		# `name(...)` — a call evaluated for its effect, its result discarded
+		# `name(...)` / `name[T](...)` — a call (possibly generic) evaluated for its effect
 		if is_lparen(p.toks[p.pos + 1].kind) then {
 			return Stmt.Do(parse_expr(p))
 		}
+		if generic_call_stmt_ahead(p) then return Stmt.Do(parse_expr(p))
 		const Str name = cur_name(p)
 		p.pos = p.pos + 1
 		if is_dot(peek(p)) then {
@@ -1231,6 +1314,36 @@ const scan_asm_segs = (*[Uint8] src, Iarch start, Iarch len): [Seg] -> {
 # is a block `{ … }`, a bare expression (sugar for `{ return <expr> }`), or an `asm "…"`
 # naked assembly body. The return type is parsed and ignored (no typecheck yet; every
 # function returns a word).
+# A type-variable name — an apostrophe-led identifier (`'T`), the form a generic type parameter
+# and its uses take.
+const is_typar_name = (Str s): Bool -> if Iarch(s.len) == 0 then false else Iarch(s[0]) == 39
+# `['T, 'U]` — a generic type-parameter list (each a type variable). Consumes the brackets.
+const parse_typarams = (*Parser p): [Str] -> {
+	p.pos = p.pos + 1 # `[`
+	let [Str] tps = []
+	loop {
+		if !is_ident(peek(p)) then die("cf0: parse: expected a type variable in a `['T]` list\n")
+		const Str tp = cur_name(p)
+		if !is_typar_name(tp) then die("cf0: parse: a generic type parameter must be a type variable like `'T`\n")
+		tps = [...tps, tp]
+		p.pos = p.pos + 1
+		if !is_comma(peek(p)) then break
+		p.pos = p.pos + 1
+	}
+	if !is_rbracket(peek(p)) then die("cf0: parse: expected `]` after type parameters\n")
+	p.pos = p.pos + 1
+	return tps
+}
+# Whether a `[...]` at the current position opens a generic type-parameter list (the token
+# after `[` is a type variable) rather than an array-literal value const (`const N = [1,2]`).
+const typarams_ahead = (*Parser p): Bool -> {
+	if !is_lbracket(peek(p)) then return false
+	if p.pos + 1 >= Iarch(p.toks.len) then return false
+	const Token t2 = p.toks[p.pos + 1]
+	if !is_ident(t2.kind) then return false
+	return Iarch(p.src[t2.start]) == 39
+}
+
 const parse_func = (*Parser p): Func -> {
 	let Bool is_pub = false
 	if kw(p, "pub") then {
@@ -1244,16 +1357,21 @@ const parse_func = (*Parser p): Func -> {
 	p.pos = p.pos + 1
 	if !is_eq(peek(p)) then die("cf0: parse: expected `=`\n")
 	p.pos = p.pos + 1
+	# `= ['T](…)` — a generic function's type-parameter list (before the value params)
+	let [Str] typarams = []
+	if typarams_ahead(p) then typarams = parse_typarams(p)
+	const [Str] no_tp = []
 	# `[pub] const NAME = <expr>` with no `(` — a top-level VALUE const (module_system /
 	# ebnf § Modules), modeled as a nullary function returning the value; a bare reference
 	# to NAME auto-calls it (typecheck/emit). Its value type is inferred as `Int` (the
 	# implicit return type) — cf0's value consts are integers (flags, sizes).
 	if !is_lparen(peek(p)) then {
+		if Iarch(typarams.len) > 0 then die("cf0: parse: a top-level value const cannot be generic\n")
 		const [Param] noparams = []
 		const [Stmt] vempty = []
 		const [Stmt] vbody = [...vempty, Stmt.Return(parse_expr(p))]
 		const [Seg] vnoasm = []
-		return Func({ name: name, is_pub: is_pub, ret_name: "", ret_elem: "", params: noparams, body: vbody, is_asm: false, asm_body: vnoasm, is_value: true, ret_telems: [] })
+		return Func({ name: name, is_pub: is_pub, ret_name: "", ret_elem: "", params: noparams, body: vbody, is_asm: false, asm_body: vnoasm, is_value: true, ret_telems: [], typarams: no_tp })
 	}
 	p.pos = p.pos + 1
 	const [Param] params = parse_params(p)
@@ -1271,15 +1389,15 @@ const parse_func = (*Parser p): Func -> {
 		if !is_strlit(peek(p)) then die("cf0: parse: expected a string after `asm`\n")
 		const [Seg] segs = scan_asm_segs(p.src, p.toks[p.pos].start, p.toks[p.pos].len)
 		p.pos = p.pos + 1
-		return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: nobody, is_asm: true, asm_body: segs, is_value: false, ret_telems: rs.telems })
+		return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: nobody, is_asm: true, asm_body: segs, is_value: false, ret_telems: rs.telems, typarams: typarams })
 	}
 	if is_lbrace(peek(p)) then {
 		p.pos = p.pos + 1
 		const [Stmt] body = parse_block(p)
-		return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: body, is_asm: false, asm_body: noasm, is_value: false, ret_telems: rs.telems })
+		return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: body, is_asm: false, asm_body: noasm, is_value: false, ret_telems: rs.telems, typarams: typarams })
 	}
 	const [Stmt] one = [...nobody, Stmt.Return(parse_expr(p))]
-	return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: one, is_asm: false, asm_body: noasm, is_value: false, ret_telems: rs.telems })
+	return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: one, is_asm: false, asm_body: noasm, is_value: false, ret_telems: rs.telems, typarams: typarams })
 }
 
 # `data Name = { Iarch a, Iarch b }` — a record declaration (Iarch fields only, at
