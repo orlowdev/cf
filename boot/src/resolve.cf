@@ -699,6 +699,107 @@ const expand_unions = ([UnionDecl] unions, [RecDecl] recs): [UnionDecl] -> {
 	return out
 }
 
+# --- member-type annotations (§8.1): validate + collapse `Union.Member` to `Union` -------------
+# A member is a first-class type usable anywhere a type is (`Color.Red`, `Maybe[Iarch].Just`), but
+# it DENOTES its union — cf0 collapses it to that union (a member value already widens to its union).
+# The parser preserved the `Base.Member` spelling; this pass (run after expand, before monomorph)
+# validates the member against the now-visible union tables and rewrites the annotation to `Base`.
+
+# Index of the first byte `b` in `t`, or -1. A type name has no `.` except a member-type's one.
+const index_of_byte = (Str t, Iarch b): Iarch -> {
+	let Iarch i = 0
+	loop { if i >= Iarch(t.len) then break  if Iarch(t[i]) == b then return i  i = i + 1 }
+	return 0 - 1
+}
+const str_prefix = (Str t, Iarch k): Str -> {
+	let [Uint8] v = []
+	let Iarch i = 0
+	loop { if i >= k then break  v = [...v, t[i]]  i = i + 1 }
+	return Str(v)
+}
+const str_suffix = (Str t, Iarch k): Str -> {
+	let [Uint8] v = []
+	let Iarch i = k
+	loop { if i >= Iarch(t.len) then break  v = [...v, t[i]]  i = i + 1 }
+	return Str(v)
+}
+const union_has_mem = (UnionDecl u, Str member): Bool -> {
+	let Iarch i = 0
+	loop { if i >= Iarch(u.members.len) then break  if str_eq(u.members[i].name, member) then return true  i = i + 1 }
+	return false
+}
+# Collapse a member-type annotation to its union, validating base + member (§8.1). `Color.Red` →
+# `Color`; `Maybe[Iarch].Just` → `Maybe[Iarch]`. A plain type (no `.`) is returned unchanged, so
+# this is a no-op on every ordinary annotation. Rejects a record base (685) or an unknown member (684).
+const collapse_member_type = (Str t, [RecDecl] recs, [UnionDecl] unions): Str -> {
+	const Iarch d = index_of_byte(t, 46)
+	if d < 0 then return t
+	const Str base = str_prefix(t, d)
+	const Str member = str_suffix(t, d + 1)
+	const Iarch lb = index_of_byte(base, 91)   # `[` — strip a generic application to the union name
+	let Str uname = base
+	if lb >= 0 then uname = str_prefix(base, lb)
+	const Iarch ui = find_union(unions, uname)
+	if ui < 0 then {
+		if find_rec(recs, uname) >= 0 then die("cf0: type: a member type requires a union base (a record has no members)\n")
+		die("cf0: type: a member type names an unknown union\n")
+	}
+	if !union_has_mem(unions[ui], member) then die("cf0: type: a member type names a non-member of its union\n")
+	return base
+}
+# Rewrite every member-type annotation in a statement (a binding's `ann`), recursing into nested
+# statement containers. NOT covered (each a later brick, and each fails LOUD at typecheck/monomorph
+# — a dotted type is an unknown type — never a miscompile): an annotation buried in a value-yielding
+# EXPRESSION (`loop`/`if`/block that yields), and a CLOSURE parameter/return type (monomorph likewise
+# skips those, so a closure already rejects even a plain generic-app annotation there).
+const norm_mt_stmt = (Stmt s, [RecDecl] recs, [UnionDecl] unions): Stmt -> match s {
+	Stmt.Let(n, m, ann, e) -> Stmt.Let(n, m, collapse_member_type(ann, recs, unions), e),
+	Stmt.ForIn(v, a, body) -> Stmt.ForIn(v, a, norm_mt_stmts(body, recs, unions)),
+	Stmt.Loop(body) -> Stmt.Loop(norm_mt_stmts(body, recs, unions)),
+	Stmt.IfThen(c, st) -> Stmt.IfThen(c, norm_mt_stmt(st, recs, unions)),
+	Stmt.IfElse(c, t, e) -> Stmt.IfElse(c, norm_mt_stmt(t, recs, unions), norm_mt_stmt(e, recs, unions)),
+	Stmt.Block(stmts) -> Stmt.Block(norm_mt_stmts(stmts, recs, unions)),
+	Stmt.Match(scrut, arms) -> Stmt.Match(scrut, norm_mt_stmt_arms(arms, recs, unions)),
+	Stmt.Closure(nm, params, ret, body) -> Stmt.Closure(nm, params, ret, norm_mt_stmts(body, recs, unions)),
+	Stmt.Defer(body) -> Stmt.Defer(norm_mt_stmts(body, recs, unions)),
+	_ -> s
+}
+const norm_mt_stmts = ([Stmt] ss, [RecDecl] recs, [UnionDecl] unions): [Stmt] -> {
+	let [Stmt] out = []
+	let Iarch i = 0
+	loop { if i >= Iarch(ss.len) then break  out = [...out, norm_mt_stmt(ss[i], recs, unions)]  i = i + 1 }
+	return out
+}
+const norm_mt_stmt_arms = ([StmtArm] arms, [RecDecl] recs, [UnionDecl] unions): [StmtArm] -> {
+	let [StmtArm] out = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		const StmtArm a = arms[i]
+		out = [...out, StmtArm({ is_wild: a.is_wild, type_name: a.type_name, members: a.members, binds: a.binds, body: norm_mt_stmts(a.body, recs, unions) })]
+		i = i + 1
+	}
+	return out
+}
+# Collapse the member-type annotations in a function's parameters, return type, and body bindings.
+const norm_mt_func = (Func f, [RecDecl] recs, [UnionDecl] unions): Func -> {
+	let [Param] ps = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(f.params.len) then break
+		const Param p = f.params[i]
+		ps = [...ps, Param({ name: p.name, is_ptr: p.is_ptr, type_name: collapse_member_type(p.type_name, recs, unions), elem: p.elem, telems: p.telems })]
+		i = i + 1
+	}
+	return Func({ name: f.name, is_pub: f.is_pub, ret_name: collapse_member_type(f.ret_name, recs, unions), ret_elem: f.ret_elem, params: ps, body: norm_mt_stmts(f.body, recs, unions), is_asm: f.is_asm, asm_body: f.asm_body, is_value: f.is_value, ret_telems: f.ret_telems, typarams: f.typarams, tbounds: f.tbounds })
+}
+const norm_mt_funcs = ([Func] fs, [RecDecl] recs, [UnionDecl] unions): [Func] -> {
+	let [Func] out = []
+	let Iarch i = 0
+	loop { if i >= Iarch(fs.len) then break  out = [...out, norm_mt_func(fs[i], recs, unions)]  i = i + 1 }
+	return out
+}
+
 # Load the entry module and flatten its transitive import graph into one Program. The
 # work list grows as newly loaded modules contribute imports; `loaded` dedups by resolved
 # path so a diamond or a cycle loads each module once. Each module's private functions are
@@ -736,5 +837,8 @@ pub const resolve_program = (Str entry): Program -> {
 	# expand declaration spreads now that every source record/union is visible
 	const [RecDecl] erecs = expand_recs(recs, unions)
 	const [UnionDecl] eunions = expand_unions(unions, recs)
-	return Program({ imports: none, recs: erecs, unions: eunions, funcs: funcs })
+	# collapse member-type annotations (`Color.Red` → `Color`, §8.1) against the expanded tables,
+	# before monomorph sees the signatures — validating the base union and member
+	const [Func] nfuncs = norm_mt_funcs(funcs, erecs, eunions)
+	return Program({ imports: none, recs: erecs, unions: eunions, funcs: nfuncs })
 }

@@ -1028,8 +1028,10 @@ const parse_let = (*Parser p, Bool mutable): Stmt -> {
 	# ident follows, in which case the first was the type.
 	let Str type_name = ""
 	let Str name = ""
-	if is_lbracket(p.toks[p.pos + 1].kind) then {
-		type_name = parse_type_ref(p)
+	if is_lbracket(p.toks[p.pos + 1].kind) || is_dot(p.toks[p.pos + 1].kind) then {
+		# a `Box[Iarch]` generic-application annotation, or a member-type annotation `Color.Red` /
+		# `Maybe[Iarch].Just` (the `.` after the first name — §8.1, collapsed to its union by resolve)
+		type_name = parse_member_type(p)
 		if !is_ident(peek(p)) then die("cf0: parse: expected a binding name after a type\n")
 		name = cur_name(p)
 		p.pos = p.pos + 1
@@ -1448,8 +1450,9 @@ const parse_param = (*Parser p): Param -> {
 		return Param({ name: tname, is_ptr: false, type_name: "$tuple", elem: "", telems: tel })
 	}
 	if !is_ident(peek(p)) then die("cf0: parse: expected a parameter type\n")
-	# a scalar/aggregate parameter type — a name, a type variable, or a generic type application
-	const Str type_name = parse_type_ref(p)
+	# a scalar/aggregate parameter type — a name, a type variable, a generic type application, or a
+	# member-type annotation `Maybe[Iarch].Just` (§8.1, collapsed to its union by resolve)
+	const Str type_name = parse_member_type(p)
 	if !is_ident(peek(p)) then die("cf0: parse: expected a parameter name\n")
 	const Str name = cur_name(p)
 	p.pos = p.pos + 1
@@ -1547,8 +1550,9 @@ const parse_ret_name = (*Parser p): RetSig -> {
 	# the bare pointee name (the star elided; §6.4 `*Scalar` rejected in `parse_star_agg_name`)
 	if is_star(peek(p)) then return RetSig({ name: parse_star_agg_name(p), elem: "", telems: [] })
 	if !is_ident(peek(p)) then die("cf0: parse: expected a return type name after `:`\n")
-	# a named return type — possibly a generic type application `Box['T]`
-	const Str n = parse_type_ref(p)
+	# a named return type — possibly a generic type application `Box['T]` or a member-type
+	# annotation `Maybe[Iarch].Just` (§8.1, collapsed to its union by resolve)
+	const Str n = parse_member_type(p)
 	return RetSig({ name: n, elem: "", telems: [] })
 }
 
@@ -1673,6 +1677,24 @@ const parse_type_ref = (*Parser p): Str -> {
 	const Str base = cur_name(p)
 	p.pos = p.pos + 1
 	if is_lbracket(peek(p)) then return parse_type_app_tail(p, base)
+	return base
+}
+
+# A type reference optionally suffixed by a `.Member` — a MEMBER-TYPE annotation (`Color.Red`,
+# `Maybe[Iarch].Just`, type_system §8.1: a union member is a first-class type, denoting its union).
+# The dotted form is preserved as `Base.Member` for the resolve pass to VALIDATE the member and
+# COLLAPSE it to the union `Base` (before monomorph). Used only where a member type is accepted: a
+# parameter, a return type, and a binding annotation (not fields/payloads/generic args — a `.` there
+# stays a parse error, a later brick). Match-arm `Type.Member` patterns are parsed elsewhere.
+const parse_member_type = (*Parser p): Str -> {
+	const Str base = parse_type_ref(p)
+	if is_dot(peek(p)) then {
+		p.pos = p.pos + 1 # `.`
+		if !is_ident(peek(p)) then die("cf0: parse: expected a member name after `.` in a type\n")
+		const Str member = cur_name(p)
+		p.pos = p.pos + 1
+		return "${base}.${member}"
+	}
 	return base
 }
 
