@@ -547,6 +547,52 @@ const is_spread_member = (UnionMember m): Bool -> {
 	return str_eq(m.payloads[0], "$spread")
 }
 
+# A builtin non-aggregate type name — composing a bare union member over one of these is a
+# deferred later brick (a compose-over LEAF like `Int8` needs the member usable as a standalone
+# type argument; see the bound machinery). A bare member naming one is rejected (test 209).
+const is_builtin_scalar_name = (Str n): Bool -> {
+	if str_eq(n, "Iarch") then return true
+	if str_eq(n, "Uarch") then return true
+	if str_eq(n, "Int") then return true
+	if str_eq(n, "Int8") then return true
+	if str_eq(n, "Int16") then return true
+	if str_eq(n, "Int32") then return true
+	if str_eq(n, "Int64") then return true
+	if str_eq(n, "Uint8") then return true
+	if str_eq(n, "Uint16") then return true
+	if str_eq(n, "Uint32") then return true
+	if str_eq(n, "Uint64") then return true
+	if str_eq(n, "Float32") then return true
+	if str_eq(n, "Float64") then return true
+	if str_eq(n, "Bool") then return true
+	if str_eq(n, "Str") then return true
+	return false
+}
+
+# §8.1 resolve-or-create: a BARE union member (no explicit payload) whose NAME denotes a declared
+# record or union COMPOSES OVER it — the member carries that type as its single payload, so the
+# value IS a value of that type (payload-is-the-value, §8.3), reachable as `U.Name(v)` /
+# `match … { U.Name(v) -> … }` on the existing payload-member path. A name denoting nothing stays a
+# fresh nullary tag (`Nil`, `Nothing`, `Red`). Composing over a builtin scalar is deferred (209).
+# This is deliberately SCOPE-SENSITIVE (§8.1): a member whose name matches a type in scope IS that
+# type. Runs inside `expand_union`, so both direct and spliced members are resolved.
+const compose_member = (UnionMember mem, [RecDecl] recs, [UnionDecl] unions): UnionMember -> {
+	if Iarch(mem.payloads.len) > 0 then return mem
+	const Str nm = mem.name
+	let Bool is_type = false
+	if find_rec(recs, nm) >= 0 then is_type = true
+	if find_union(unions, nm) >= 0 then is_type = true
+	if is_type then {
+		const [Str] ps = [nm]
+		const [Str] pe = [""]
+		const [TupElem] empty_tel = []
+		const [[TupElem]] pt = [empty_tel]
+		return UnionMember({ name: nm, payloads: ps, pelems: pe, ptelems: pt })
+	}
+	if is_builtin_scalar_name(nm) then die("cf0: type: a union member composing over a builtin type is not yet supported\n")
+	return mem
+}
+
 # Expand a record's declaration spreads into a flat field set. Each `$spread` sentinel names
 # a source record; the source is looked up (must be a concrete record), recursively expanded,
 # and its fields spliced in place — preserving order and rejecting name collisions. The depth
@@ -620,9 +666,10 @@ const expand_union = (UnionDecl d, [RecDecl] recs, [UnionDecl] unions, Iarch dep
 				j = j + 1
 			}
 		} else {
-			if has_name(names, mem.name) then die("cf0: spread: a member collides with a spliced member\n")
-			members = [...members, mem]
-			names = [...names, mem.name]
+			const UnionMember cm = compose_member(mem, recs, unions)
+			if has_name(names, cm.name) then die("cf0: spread: a member collides with a spliced member\n")
+			members = [...members, cm]
+			names = [...names, cm.name]
 		}
 		k = k + 1
 	}
