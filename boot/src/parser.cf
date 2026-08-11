@@ -180,6 +180,20 @@ const parse_pipe = (*Parser p): Expr -> {
 # whose remaining slot the piped value fills. The name must be lowercase (a value binding),
 # not a PascalCase type — there is no first-class construction pipe.
 const parse_pipe_target = (*Parser p, Expr piped): Expr -> {
+	# `x |> defer f` / `x |> defer f(a)` — schedule `f(…, x)` at scope exit and TAP x through (the
+	# pipe forwards its input). A `defer { … }` block taps no value, so it is not a pipe target.
+	if kw(p, "defer") then {
+		p.pos = p.pos + 1
+		if is_lbrace(peek(p)) then die("cf0: parse: `|> defer { … }` — a defer block taps no value; pipe into `defer f`\n")
+		if !is_ident(peek(p)) then die("cf0: parse: `|> defer` needs a function name\n")
+		const Iarch dc = Iarch(p.src[p.toks[p.pos].start])
+		if dc >= 65 && dc <= 90 then die("cf0: parse: a `|> defer` target must be a function, not a type\n")
+		const Str dn = cur_name(p)
+		p.pos = p.pos + 1
+		let [Expr] dargs = []
+		if is_lparen(peek(p)) then dargs = parse_args(p)
+		return Expr.DeferTap(dn, [...dargs, piped])
+	}
 	if !is_ident(peek(p)) then die("cf0: parse: a `|>` target must be a function name\n")
 	const Iarch c0 = Iarch(p.src[p.toks[p.pos].start])
 	if c0 >= 65 && c0 <= 90 then die("cf0: parse: a `|>` target must be a function, not a type\n")
@@ -697,6 +711,21 @@ const postfix_chain = (*Parser p, Expr base): Expr -> {
 const parse_primary = (*Parser p): Expr -> {
 	if kw(p, "if") then return parse_if(p)
 	if kw(p, "match") then return parse_match(p)
+	# `defer f(x)` in VALUE position (a binding RHS / a return value): schedule `f(x)` at scope
+	# exit and evaluate to the tapped last argument x. A statement-position `defer` is intercepted
+	# by `parse_stmt` first, so this is only the value form; it needs a call with at least one arg
+	# (a no-arg call has nothing to tap; a block taps no value).
+	if kw(p, "defer") then {
+		p.pos = p.pos + 1
+		if is_lbrace(peek(p)) then die("cf0: parse: `defer { … }` is a statement, not a value\n")
+		if !is_ident(peek(p)) then die("cf0: parse: `defer` as a value needs a call `defer f(x)`\n")
+		const Str dn = cur_name(p)
+		p.pos = p.pos + 1
+		if !is_lparen(peek(p)) then die("cf0: parse: `defer` as a value needs a call `defer f(x)`\n")
+		const [Expr] dargs = parse_args(p)
+		if Iarch(dargs.len) == 0 then die("cf0: parse: `defer f()` as a value has no tapped argument\n")
+		return Expr.DeferTap(dn, dargs)
+	}
 	# `loop { … }` in expression position is a VALUE-yielding loop (`<- v` breaks with a value);
 	# in statement position `parse_stmt` reads it as an effect-only `Stmt.Loop`.
 	if kw(p, "loop") then {

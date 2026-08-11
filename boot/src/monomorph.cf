@@ -660,24 +660,33 @@ const mono_func = (*MonoCtx m, Func f, Str newname, [Str] tvars, [Str] tvals): F
 	return Func({ name: newname, is_pub: f.is_pub, ret_name: rn, ret_elem: re, params: ps, body: body, is_asm: f.is_asm, asm_body: f.asm_body, is_value: f.is_value, ret_telems: rtel, typarams: no_tp, tbounds: no_tp })
 }
 
-# Rewrite a call. A generic callee is instantiated (type args explicit, or inferred from the
-# argument types) and renamed to its concrete instance; type args on a non-generic function are
-# an error. A non-generic call passes through with its (recursively rewritten) arguments.
-const mono_call = (*MonoCtx m, Str n, [Str] ta, [Expr] args, MonoEnv env): Expr -> {
-	const [Expr] margs = mono_exprs(m, args, env)
+# Resolve a callee name to its concrete instance: a generic callee is instantiated (type args
+# explicit, or inferred from the ALREADY-monomorphized arguments `margs` — so a nested generic
+# argument's result type is knowable), a non-generic one passes through; type args on a
+# non-generic function are an error. Shared by an ordinary call and a `defer`-tap call.
+const mono_callee = (*MonoCtx m, Str n, [Str] ta, [Expr] margs, MonoEnv env): Str -> {
 	const [Str] rty = subst_tys(ta, env.tvars, env.tvals)
-	const [Str] no_ty = []
 	const Iarch ti = find_template(m.templates, n)
 	if ti >= 0 then {
 		let [Str] fty = rty
-		# infer from the ALREADY-monomorphized arguments (`margs`): an inner generic call has by
-		# now been rewritten to its concrete instance, so its result type is knowable — this is
-		# what lets a nested generic argument `id(f(x))` be inferred.
 		if Iarch(rty.len) == 0 then fty = infer_tyargs(m, m.templates[ti], margs, env)
-		return Expr.Call(ensure_instance(m, n, fty), no_ty, margs)
+		return ensure_instance(m, n, fty)
 	}
 	if Iarch(rty.len) > 0 then die("cf0: type: type arguments on a non-generic function\n")
-	return Expr.Call(n, no_ty, margs)
+	return n
+}
+# Rewrite a call: monomorphize the arguments, then rename the callee to its concrete instance.
+const mono_call = (*MonoCtx m, Str n, [Str] ta, [Expr] args, MonoEnv env): Expr -> {
+	const [Expr] margs = mono_exprs(m, args, env)
+	const [Str] no_ty = []
+	return Expr.Call(mono_callee(m, n, ta, margs, env), no_ty, margs)
+}
+# Rewrite a `defer`-tap: like a call (a generic callee is instantiated), but there are no explicit
+# type args (the pipe/prefix syntax carries none), so the callee is always inferred from `margs`.
+const mono_defertap = (*MonoCtx m, Str fn, [Expr] args, MonoEnv env): Expr -> {
+	const [Expr] margs = mono_exprs(m, args, env)
+	const [Str] no_ta = []
+	return Expr.DeferTap(mono_callee(m, fn, no_ta, margs, env), margs)
 }
 
 const mono_expr = (*MonoCtx m, Expr e, MonoEnv env): Expr -> match e {
@@ -724,7 +733,8 @@ const mono_expr = (*MonoCtx m, Expr e, MonoEnv env): Expr -> match e {
 	Expr.And(l, r) -> Expr.And(mono_expr(m, l, env), mono_expr(m, r, env)),
 	Expr.Or(l, r) -> Expr.Or(mono_expr(m, l, env), mono_expr(m, r, env)),
 	Expr.If(c, t, e2) -> Expr.If(mono_expr(m, c, env), mono_expr(m, t, env), mono_expr(m, e2, env)),
-	Expr.Call(n, ta, args) -> mono_call(m, n, ta, args, env)
+	Expr.Call(n, ta, args) -> mono_call(m, n, ta, args, env),
+	Expr.DeferTap(fn, args) -> mono_defertap(m, fn, args, env)
 }
 
 const mono_exprs = (*MonoCtx m, [Expr] es, MonoEnv env): [Expr] -> {

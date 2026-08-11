@@ -1359,7 +1359,17 @@ pub const type_of = (Expr e, [VarTy] env, Ctx ctx): Ty -> match e {
 	Expr.And(l, r) -> bool_binop(l, r, env, ctx),
 	Expr.Or(l, r) -> bool_binop(l, r, env, ctx),
 	Expr.If(c, t, e2) -> if_type(c, t, e2, env, ctx),
-	Expr.Call(callee, tyargs, args) -> call_type(callee, tyargs, args, env, ctx)
+	Expr.Call(callee, tyargs, args) -> call_type(callee, tyargs, args, env, ctx),
+	Expr.DeferTap(fn, args) -> defertap_type(fn, args, env, ctx)
+}
+# `defer fn(args)` in value position: the scheduled call must typecheck (arity + argument types,
+# via `call_type`, whose result — fn's return — is discarded), and the expression's type is the
+# TAPPED value: its LAST argument. A no-arg call has nothing to tap (also caught at parse).
+const defertap_type = (Str fn, [Expr] args, [VarTy] env, Ctx ctx): Ty -> {
+	if Iarch(args.len) == 0 then die("cf0: type: `defer` as a value has no tapped argument\n")
+	const [Str] no_ty = []
+	call_type(fn, no_ty, args, env, ctx)
+	return type_of(args[Iarch(args.len) - 1], env, ctx)
 }
 
 # --- statement / function checking ----------------------------------------------------
@@ -1657,6 +1667,127 @@ const enforce_toplevel_defer = ([Stmt] body): Iarch -> {
 	}
 	return 0
 }
+# Does an expression contain a `defer`-tap (`defer f(x)` / `|> defer f`) anywhere? A defer-tap is
+# a value form admitted ONLY in a direct function-body binding/return (v1) — the hoist pass lifts
+# those; one buried elsewhere would slip through. Recurses into the sub-expression-bearing forms
+# (emit's `DeferTap` die-arm is the final backstop for any exotic nesting this misses).
+const exprs_have_defertap = ([Expr] es): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(es.len) then break
+		if expr_has_defertap(es[i]) then return true
+		i = i + 1
+	}
+	return false
+}
+const expr_has_defertap = (Expr e): Bool -> match e {
+	Expr.DeferTap(fn, args) -> true,
+	Expr.Call(n, ta, args) -> exprs_have_defertap(args),
+	Expr.UnionMk(t, m, args) -> exprs_have_defertap(args),
+	Expr.Tuple(elems) -> exprs_have_defertap(elems),
+	Expr.ArrayLit(hs, sn, elems, et) -> expr_has_defertap(sn) || exprs_have_defertap(elems),
+	Expr.FieldExpr(b, f) -> expr_has_defertap(b),
+	Expr.IndexExpr(b, i) -> expr_has_defertap(b) || expr_has_defertap(i),
+	Expr.Spread(x) -> expr_has_defertap(x),
+	Expr.Buffer(sz) -> expr_has_defertap(sz),
+	Expr.Neg(x) -> expr_has_defertap(x),
+	Expr.Not(x) -> expr_has_defertap(x),
+	Expr.BitNot(x) -> expr_has_defertap(x),
+	Expr.Add(l, r) -> expr_has_defertap(l) || expr_has_defertap(r),
+	Expr.Sub(l, r) -> expr_has_defertap(l) || expr_has_defertap(r),
+	Expr.Mul(l, r) -> expr_has_defertap(l) || expr_has_defertap(r),
+	Expr.Div(l, r) -> expr_has_defertap(l) || expr_has_defertap(r),
+	Expr.Mod(l, r) -> expr_has_defertap(l) || expr_has_defertap(r),
+	Expr.BitAnd(l, r) -> expr_has_defertap(l) || expr_has_defertap(r),
+	Expr.BitOr(l, r) -> expr_has_defertap(l) || expr_has_defertap(r),
+	Expr.BitXor(l, r) -> expr_has_defertap(l) || expr_has_defertap(r),
+	Expr.Shl(l, r) -> expr_has_defertap(l) || expr_has_defertap(r),
+	Expr.Shr(l, r) -> expr_has_defertap(l) || expr_has_defertap(r),
+	Expr.CmpEq(l, r) -> expr_has_defertap(l) || expr_has_defertap(r),
+	Expr.CmpNe(l, r) -> expr_has_defertap(l) || expr_has_defertap(r),
+	Expr.CmpLt(l, r) -> expr_has_defertap(l) || expr_has_defertap(r),
+	Expr.CmpGt(l, r) -> expr_has_defertap(l) || expr_has_defertap(r),
+	Expr.CmpLe(l, r) -> expr_has_defertap(l) || expr_has_defertap(r),
+	Expr.CmpGe(l, r) -> expr_has_defertap(l) || expr_has_defertap(r),
+	Expr.And(l, r) -> expr_has_defertap(l) || expr_has_defertap(r),
+	Expr.Or(l, r) -> expr_has_defertap(l) || expr_has_defertap(r),
+	Expr.If(c, t, e2) -> expr_has_defertap(c) || expr_has_defertap(t) || expr_has_defertap(e2),
+	_ -> false
+}
+# Does a statement (or any statement it nests) contain a `defer`-tap in one of its expressions?
+const arms_have_defertap = ([StmtArm] arms): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		if stmts_have_defertap(arms[i].body) then return true
+		i = i + 1
+	}
+	return false
+}
+const stmts_have_defertap = ([Stmt] ss): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		if stmt_has_defertap(ss[i]) then return true
+		i = i + 1
+	}
+	return false
+}
+const stmt_has_defertap = (Stmt s): Bool -> match s {
+	Stmt.Let(n, m, ann, e) -> expr_has_defertap(e),
+	Stmt.Assign(n, e) -> expr_has_defertap(e),
+	Stmt.FieldAssign(b, f, e) -> expr_has_defertap(e),
+	Stmt.IndexAssign(a, i, v) -> expr_has_defertap(i) || expr_has_defertap(v),
+	Stmt.Return(e) -> expr_has_defertap(e),
+	Stmt.Do(e) -> expr_has_defertap(e),
+	Stmt.Yield(e) -> expr_has_defertap(e),
+	Stmt.Destructure(pat, m, e) -> expr_has_defertap(e),
+	Stmt.ForIn(v, a, body) -> stmts_have_defertap(body),
+	Stmt.Loop(body) -> stmts_have_defertap(body),
+	Stmt.IfThen(c, st) -> expr_has_defertap(c) || stmt_has_defertap(st),
+	Stmt.IfElse(c, t, e) -> expr_has_defertap(c) || stmt_has_defertap(t) || stmt_has_defertap(e),
+	Stmt.Block(ss) -> stmts_have_defertap(ss),
+	Stmt.Match(scrut, arms) -> expr_has_defertap(scrut) || arms_have_defertap(arms),
+	Stmt.Closure(nm, params, ret, body) -> stmts_have_defertap(body),
+	Stmt.Defer(body) -> stmts_have_defertap(body),
+	_ -> false
+}
+# Is every `defer`-tap in `e` in a position the hoist pass can lift — the whole value, or nested
+# only through call arguments (`dbl(x |> defer log)`)? A defer-tap as an operand of any other form
+# (`defer f(x) + 1`, a tuple/record/array element, …) is not lifted (v1), so it is rejected with a
+# clean message rather than reaching emit's internal die-arm.
+const exprs_defertap_hoistable = ([Expr] es): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(es.len) then break
+		if !defertap_hoistable(es[i]) then return false
+		i = i + 1
+	}
+	return true
+}
+const defertap_hoistable = (Expr e): Bool -> match e {
+	Expr.DeferTap(fn, args) -> exprs_defertap_hoistable(args),
+	Expr.Call(n, ta, args) -> exprs_defertap_hoistable(args),
+	_ -> !expr_has_defertap(e)
+}
+# A `defer`-tap value is admitted ONLY as (part of) a direct function-body binding / return / call
+# statement, and only in a hoistable position within it (v1). One in a nested statement (a loop
+# body, an `if` branch, a defer body), in any other top-level statement, or embedded in a larger
+# expression is rejected here with a clean message.
+const enforce_toplevel_defertap = ([Stmt] body): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(body.len) then break
+		match body[i] {
+			Stmt.Let(n, m, ann, e) -> { if !defertap_hoistable(e) then die("cf0: type: a `defer`-tap value must be the whole bound value or a pipe target, not part of a larger expression (v1)\n") },
+			Stmt.Return(e) -> { if !defertap_hoistable(e) then die("cf0: type: a `defer`-tap value must be the whole returned value or a pipe target, not part of a larger expression (v1)\n") },
+			Stmt.Do(e) -> { if !defertap_hoistable(e) then die("cf0: type: a `defer`-tap value must be a pipe target, not part of a larger expression (v1)\n") },
+			_ -> { if stmt_has_defertap(body[i]) then die("cf0: type: `defer` as a value is only valid in a function's top-level binding or return (v1)\n") }
+		}
+		i = i + 1
+	}
+	return 0
+}
 # Validate a closure: check its body in the enclosing environment extended with its (immutable)
 # parameters, requiring a return; a captured `const`/parameter is thus non-mutable, so mutating
 # it through the closure is rejected there. Returns the environment extended with the closure
@@ -1834,6 +1965,8 @@ const check_func = (Func fn, Ctx ctx): Iarch -> {
 	# a defer is admitted only as a direct function-body statement (v1), and its body may not
 	# `return`; reject the buried / returning cases before the lowering pass runs
 	enforce_toplevel_defer(fn.body)
+	# a defer-tap VALUE (`defer f(x)` / `|> defer f`) is admitted only in a top-level binding/return
+	enforce_toplevel_defertap(fn.body)
 	const Iarch dr = check_stmts(fn.body, env, fctx, lk_none)
 	if dr != 2 then die("cf0: type: a function body must end with `return`\n")
 	return 0

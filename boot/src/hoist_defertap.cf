@@ -1,0 +1,137 @@
+# hoist_defertap — lift `defer`-tap VALUES out of expression position (memory_model §6), after
+# typecheck, before the defer lowering.
+#
+# `defer f(x)` in value position (a binding RHS, a return value, or a `|> defer f` pipe target)
+# both SCHEDULES f(x) at scope exit AND evaluates to its tapped argument x. This pass rewrites each
+# such `Expr.DeferTap(f, args)` into three top-level pieces:
+#     const $tapK = <last arg>          # snapshot the tapped value once, at the defer point
+#     defer f(<other args>, $tapK)      # a Stmt.Defer the later lower_defers pass schedules (LIFO)
+#     …$tapK…                           # the DeferTap expression is replaced by the snapshot temp
+# The snapshot makes the tap a stable value (a later mutation of the source does not change it) and
+# feeds the deferred call the same value. Runs BEFORE lower_defers (so the emitted `Stmt.Defer`s
+# flow through it) and before the closure lift.
+#
+# typecheck's enforce_toplevel_defertap guarantees a DeferTap appears only in a direct function-body
+# binding / return / call statement, so this pass rewrites exactly those top-level statements; a
+# DeferTap nested in any expression form this misses is caught by emit's DeferTap die-arm.
+
+import "ast" as { Expr, Stmt, MatchArm, StmtArm, Seg, FieldInit, TupElem, Param, RecDecl, UnionDecl, Func, Import, Program }
+
+const no_stmts = (): [Stmt] -> { let [Stmt] e = []  return e }
+
+# A mutable, per-function counter for unique `$tapK` names (a word field is reassignable; a `[Stmt]`
+# field would not be — so the accumulated statements are returned, not stored on the state).
+data HoistState = { Iarch ctr }
+# A rewritten expression plus the statements that must run before it (the snapshot + scheduled defer
+# for each DeferTap lifted out of it).
+data HoistedExpr = { Expr expr, [Stmt] pre }
+data HoistedList = { [Expr] exprs, [Stmt] pre }
+
+const hoist_exprs = (*HoistState st, [Expr] es): HoistedList -> {
+	let [Expr] oute = []
+	let [Stmt] outp = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(es.len) then break
+		const HoistedExpr h = hoist_expr(st, es[i])
+		oute = [...oute, h.expr]
+		let Iarch j = 0
+		loop { if j >= Iarch(h.pre.len) then break  outp = [...outp, h.pre[j]]  j = j + 1 }
+		i = i + 1
+	}
+	return HoistedList({ exprs: oute, pre: outp })
+}
+
+# `defer fn(args)` → snapshot the last arg into a fresh `$tapK`, schedule `fn(…, $tapK)`, yield the
+# snapshot. Nested DeferTaps in the args are lifted first (their pre-statements run before ours).
+const hoist_defertap = (*HoistState st, Str fn, [Expr] args): HoistedExpr -> {
+	const HoistedList h = hoist_exprs(st, args)
+	const Iarch k = st.ctr
+	st.ctr = st.ctr + 1
+	const Str tap = "$tap${k}"
+	const Iarch n = Iarch(h.exprs.len)
+	# the scheduled call keeps the earlier args as-is and replaces the tapped (last) arg with $tapK
+	let [Expr] dargs = []
+	let Iarch i = 0
+	loop { if i >= n - 1 then break  dargs = [...dargs, h.exprs[i]]  i = i + 1 }
+	dargs = [...dargs, Expr.Var(tap)]
+	const [Str] no_ty = []
+	let [Stmt] pre = []
+	let Iarch p = 0
+	loop { if p >= Iarch(h.pre.len) then break  pre = [...pre, h.pre[p]]  p = p + 1 }
+	pre = [...pre, Stmt.Let(tap, false, "", h.exprs[n - 1])]
+	# annotate the defer body so its element type is `Stmt` (a bare `[…]` literal cannot infer a
+	# union element type — elem_name_of names only Str/record/array elements)
+	const [Stmt] dbody = [Stmt.Do(Expr.Call(fn, no_ty, dargs))]
+	pre = [...pre, Stmt.Defer(dbody)]
+	return HoistedExpr({ expr: Expr.Var(tap), pre: pre })
+}
+
+# Rewrite an expression, lifting out every DeferTap. Only Call (recurse into args, e.g. a mid-pipe
+# `dbl(x |> defer log)`) and DeferTap need handling; every other form is returned as-is — a DeferTap
+# it might nest is a v1 non-case (emit's die-arm backstops it).
+const hoist_expr = (*HoistState st, Expr e): HoistedExpr -> match e {
+	Expr.Call(fn, ta, args) -> hoist_call(st, fn, ta, args),
+	Expr.DeferTap(fn, args) -> hoist_defertap(st, fn, args),
+	_ -> HoistedExpr({ expr: e, pre: no_stmts() })
+}
+const hoist_call = (*HoistState st, Str fn, [Str] ta, [Expr] args): HoistedExpr -> {
+	const HoistedList h = hoist_exprs(st, args)
+	return HoistedExpr({ expr: Expr.Call(fn, ta, h.exprs), pre: h.pre })
+}
+
+# Splice a hoisted expression's pre-statements ahead of the rebuilt statement.
+const emit_hoisted = ([Stmt] out, HoistedExpr h, Stmt rebuilt): [Stmt] -> {
+	let [Stmt] o = []
+	let Iarch a = 0
+	loop { if a >= Iarch(out.len) then break  o = [...o, out[a]]  a = a + 1 }
+	let Iarch p = 0
+	loop { if p >= Iarch(h.pre.len) then break  o = [...o, h.pre[p]]  p = p + 1 }
+	return [...o, rebuilt]
+}
+
+# Rewrite a function body's top-level statements. A DeferTap lives only in a top-level binding /
+# return / call expression (typecheck enforced), so only those three carry hoisting; the rest pass
+# through unchanged.
+const hoist_body = (*HoistState st, [Stmt] body): [Stmt] -> {
+	let [Stmt] out = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(body.len) then break
+		const Stmt s = body[i]
+		match s {
+			Stmt.Let(n, m, ann, e) -> {
+				const HoistedExpr h = hoist_expr(st, e)
+				out = emit_hoisted(out, h, Stmt.Let(n, m, ann, h.expr))
+			},
+			Stmt.Return(e) -> {
+				const HoistedExpr h = hoist_expr(st, e)
+				out = emit_hoisted(out, h, Stmt.Return(h.expr))
+			},
+			Stmt.Do(e) -> {
+				const HoistedExpr h = hoist_expr(st, e)
+				out = emit_hoisted(out, h, Stmt.Do(h.expr))
+			},
+			_ -> { out = [...out, s] }
+		}
+		i = i + 1
+	}
+	return out
+}
+
+pub const hoist_defertaps = (Program prog): Program -> {
+	let [Func] funcs = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(prog.funcs.len) then break
+		const Func fn = prog.funcs[i]
+		if fn.is_asm then { funcs = [...funcs, fn] }
+		else {
+			let HoistState st = HoistState({ ctr: 0 })
+			const [Stmt] nb = hoist_body(&st, fn.body)
+			funcs = [...funcs, Func({ name: fn.name, is_pub: fn.is_pub, ret_name: fn.ret_name, ret_elem: fn.ret_elem, params: fn.params, body: nb, is_asm: false, asm_body: fn.asm_body, is_value: fn.is_value, ret_telems: fn.ret_telems, typarams: fn.typarams, tbounds: fn.tbounds })]
+		}
+		i = i + 1
+	}
+	return Program({ imports: prog.imports, recs: prog.recs, unions: prog.unions, funcs: funcs })
+}
