@@ -246,47 +246,62 @@ const clo_find = ([CloRef] m, Str name): Iarch -> {
 	}
 	return 0 - 1
 }
+# The rewrite context threaded through the lift: the in-scope closure map, the whole-program
+# function table (so a capturing closure passed to a higher-order function can be handled by
+# INLINING the HOF at the call site — see `rw_call`), and the current INLINE depth (a recursive HOF
+# passed a capturing closure would inline forever — the depth bounds it to a clean diagnostic).
+data RwCtx = { [CloRef] clos, [Func] fns, Iarch depth }
+const rwctx0 = ([CloRef] clos, [Func] fns): RwCtx -> RwCtx({ clos: clos, fns: fns, depth: 0 })
+const find_func = ([Func] fns, Str name): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(fns.len) then break
+		if str_eq(fns[i].name, name) then return i
+		i = i + 1
+	}
+	return 0 - 1
+}
 # The capture argument for a call site: the captured variable by NAME. Emit resolves it to a
 # slot address (a scalar `$capref`) or a pointer (an aggregate `$capagg`) by the lifted
 # parameter's kind, so the same `Var` serves both.
 const cap_arg_expr = (ScopeVar sv): Expr -> Expr.Var(sv.name)
-const rw_exprs = ([Expr] es, [CloRef] m): [Expr] -> {
+const rw_exprs = ([Expr] es, RwCtx m): [Expr] -> {
 	let [Expr] out = []
 	let Iarch i = 0
 	loop { if i >= Iarch(es.len) then break  out = [...out, rw_expr(es[i], m)]  i = i + 1 }
 	return out
 }
-const rw_fieldinits = ([FieldInit] fs, [CloRef] m): [FieldInit] -> {
+const rw_fieldinits = ([FieldInit] fs, RwCtx m): [FieldInit] -> {
 	let [FieldInit] out = []
 	let Iarch i = 0
 	loop { if i >= Iarch(fs.len) then break  out = [...out, FieldInit({ field: fs[i].field, value: rw_expr(fs[i].value, m) })]  i = i + 1 }
 	return out
 }
-const rw_segs = ([Seg] segs, [CloRef] m): [Seg] -> {
+const rw_segs = ([Seg] segs, RwCtx m): [Seg] -> {
 	let [Seg] out = []
 	let Iarch i = 0
 	loop { if i >= Iarch(segs.len) then break  const Seg g = segs[i]  out = [...out, Seg({ is_hole: g.is_hole, lit: g.lit, name: g.name, expr: rw_expr(g.expr, m) })]  i = i + 1 }
 	return out
 }
-const rw_match_arms = ([MatchArm] arms, [CloRef] m): [MatchArm] -> {
+const rw_match_arms = ([MatchArm] arms, RwCtx m): [MatchArm] -> {
 	let [MatchArm] out = []
 	let Iarch i = 0
 	loop { if i >= Iarch(arms.len) then break  const MatchArm a = arms[i]  out = [...out, MatchArm({ is_wild: a.is_wild, type_name: a.type_name, members: a.members, binds: a.binds, body: rw_expr(a.body, m) })]  i = i + 1 }
 	return out
 }
-const rw_stmt_arms = ([StmtArm] arms, [CloRef] m): [StmtArm] -> {
+const rw_stmt_arms = ([StmtArm] arms, RwCtx m): [StmtArm] -> {
 	let [StmtArm] out = []
 	let Iarch i = 0
 	loop { if i >= Iarch(arms.len) then break  const StmtArm a = arms[i]  out = [...out, StmtArm({ is_wild: a.is_wild, type_name: a.type_name, members: a.members, binds: a.binds, body: rw_stmts(a.body, m) })]  i = i + 1 }
 	return out
 }
-const rw_stmts = ([Stmt] ss, [CloRef] m): [Stmt] -> {
+const rw_stmts = ([Stmt] ss, RwCtx m): [Stmt] -> {
 	let [Stmt] out = []
 	let Iarch i = 0
 	loop { if i >= Iarch(ss.len) then break  out = [...out, rw_stmt(ss[i], m)]  i = i + 1 }
 	return out
 }
-const rw_expr = (Expr e, [CloRef] m): Expr -> match e {
+const rw_expr = (Expr e, RwCtx m): Expr -> match e {
 	Expr.Lit(v) -> Expr.Lit(v),
 	Expr.BoolLit(b) -> Expr.BoolLit(b),
 	# a bare reference to a CAPTURE-FREE closure (used as a function VALUE, e.g. passed to a HOF) is
@@ -337,26 +352,222 @@ const rw_expr = (Expr e, [CloRef] m): Expr -> match e {
 	Expr.Call(n, ta, args) -> rw_call(n, ta, rw_exprs(args, m), m),
 	Expr.DeferTap(fn, args) -> Expr.DeferTap(fn, rw_exprs(args, m))
 }
-# A call to a closure name is redirected to its lifted function with the capture arguments
-# appended; every other call is unchanged (its arguments already rewritten).
 # A bare closure reference used as a value: a capture-free closure becomes its lifted function name
 # (a code pointer); any other name is unchanged.
-const rw_var = (Str n, [CloRef] m): Expr -> {
-	const Iarch ci = clo_find(m, n)
+const rw_var = (Str n, RwCtx m): Expr -> {
+	const Iarch ci = clo_find(m.clos, n)
 	if ci < 0 then return Expr.Var(n)
-	if Iarch(m[ci].capargs.len) == 0 then return Expr.Var(m[ci].lifted)
+	if Iarch(m.clos[ci].capargs.len) == 0 then return Expr.Var(m.clos[ci].lifted)
 	return Expr.Var(n)
 }
-const rw_call = (Str n, [Str] ta, [Expr] args, [CloRef] m): Expr -> {
-	const Iarch ci = clo_find(m, n)
-	if ci < 0 then return Expr.Call(n, ta, args)
-	let [Expr] all = args
-	const [Expr] caps = m[ci].capargs
+
+# --- inlining a HOF called with a capturing closure (the fake-closure model) ---------------------
+# A capturing closure has no bare code address, so it cannot ride an ordinary function-value
+# parameter. Instead, at each call `hof(clo, …)` the HOF is INLINED: its single-expression body is
+# substituted (the function parameter → the closure, the value parameters → the call arguments) and
+# re-rewritten, so `f(x)` becomes a direct call to the closure's lifted body with its captures
+# threaded. Inlining recurses, so a closure passed through a chain of HOFs (`relay -> apply`) still
+# reduces to a direct call.
+data Subst = { Str param, Expr repl }
+const subst_find = ([Subst] su, Str n): Iarch -> {
 	let Iarch i = 0
-	loop { if i >= Iarch(caps.len) then break  all = [...all, caps[i]]  i = i + 1 }
-	return Expr.Call(m[ci].lifted, ta, all)
+	loop {
+		if i >= Iarch(su.len) then break
+		if str_eq(su[i].param, n) then return i
+		i = i + 1
+	}
+	return 0 - 1
 }
-const rw_stmt = (Stmt s, [CloRef] m): Stmt -> match s {
+const repl_name = (Expr e): Str -> match e { Expr.Var(n) -> n, _ -> "" }
+const subst_var = (Str n, [Subst] su): Expr -> {
+	const Iarch si = subst_find(su, n)
+	if si < 0 then return Expr.Var(n)
+	return su[si].repl
+}
+const arg_var_name = (Expr e): Str -> match e { Expr.Var(n) -> n, _ -> "" }
+const subst_exprs = ([Expr] es, [Subst] su): [Expr] -> {
+	let [Expr] out = []
+	let Iarch i = 0
+	loop { if i >= Iarch(es.len) then break  out = [...out, subst_expr(es[i], su)]  i = i + 1 }
+	return out
+}
+# Replace a call's CALLEE too, when it names a substituted function parameter (`f(x)` with `f` bound
+# to a closure → `clo(x)`, later redirected to the lifted body). The arguments are already substituted.
+const subst_call = (Str c, [Str] ta, [Expr] sargs, [Subst] su): Expr -> {
+	const Iarch si = subst_find(su, c)
+	if si < 0 then return Expr.Call(c, ta, sargs)
+	const Str rn = repl_name(su[si].repl)
+	if str_eq(rn, "") then return Expr.Call(c, ta, sargs)
+	return Expr.Call(rn, ta, sargs)
+}
+# Substitute a bare-name BASE (a `p.f` field, a `p[i]` index, an `&p` address on a parameter name):
+# a parameter substituted by a `Var(name)` keeps the name-based form; one substituted by a compound
+# expression is rebuilt with the expression-based form (`FieldExpr`/`IndexExpr`).
+const subst_field = (Str b, Str f, [Subst] su): Expr -> {
+	const Iarch si = subst_find(su, b)
+	if si < 0 then return Expr.Field(b, f)
+	const Str rn = repl_name(su[si].repl)
+	if !str_eq(rn, "") then return Expr.Field(rn, f)
+	return Expr.FieldExpr(su[si].repl, f)
+}
+const subst_index = (Str a, Expr i, [Subst] su): Expr -> {
+	const Iarch si = subst_find(su, a)
+	if si < 0 then return Expr.Index(a, subst_expr(i, su))
+	const Str rn = repl_name(su[si].repl)
+	if !str_eq(rn, "") then return Expr.Index(rn, subst_expr(i, su))
+	return Expr.IndexExpr(su[si].repl, subst_expr(i, su))
+}
+const subst_indexfield = (Str a, Expr i, Str f, [Subst] su): Expr -> {
+	const Iarch si = subst_find(su, a)
+	if si < 0 then return Expr.IndexField(a, subst_expr(i, su), f)
+	const Str rn = repl_name(su[si].repl)
+	if !str_eq(rn, "") then return Expr.IndexField(rn, subst_expr(i, su), f)
+	return Expr.FieldExpr(Expr.IndexExpr(su[si].repl, subst_expr(i, su)), f)
+}
+const subst_addr = (Str name, [Subst] su): Expr -> {
+	const Iarch si = subst_find(su, name)
+	if si < 0 then return Expr.Addr(name)
+	const Str rn = repl_name(su[si].repl)
+	if str_eq(rn, "") then die("cf0: closure: cannot take the address of a non-name argument in an inlined HOF (v1)\n")
+	return Expr.Addr(rn)
+}
+const subst_fieldinits = ([FieldInit] fs, [Subst] su): [FieldInit] -> {
+	let [FieldInit] out = []
+	let Iarch i = 0
+	loop { if i >= Iarch(fs.len) then break  out = [...out, FieldInit({ field: fs[i].field, value: subst_expr(fs[i].value, su) })]  i = i + 1 }
+	return out
+}
+const subst_match_arms = ([MatchArm] arms, [Subst] su): [MatchArm] -> {
+	let [MatchArm] out = []
+	let Iarch i = 0
+	loop { if i >= Iarch(arms.len) then break  const MatchArm a = arms[i]  out = [...out, MatchArm({ is_wild: a.is_wild, type_name: a.type_name, members: a.members, binds: a.binds, body: subst_expr(a.body, su) })]  i = i + 1 }
+	return out
+}
+const subst_segs = ([Seg] segs, [Subst] su): [Seg] -> {
+	let [Seg] out = []
+	let Iarch i = 0
+	loop { if i >= Iarch(segs.len) then break  const Seg g = segs[i]  out = [...out, Seg({ is_hole: g.is_hole, lit: g.lit, name: g.name, expr: subst_expr(g.expr, su) })]  i = i + 1 }
+	return out
+}
+const subst_expr = (Expr e, [Subst] su): Expr -> match e {
+	Expr.Var(n) -> subst_var(n, su),
+	Expr.Call(c, ta, args) -> subst_call(c, ta, subst_exprs(args, su), su),
+	Expr.DeferTap(fn, args) -> Expr.DeferTap(fn, subst_exprs(args, su)),
+	Expr.Field(b, f) -> subst_field(b, f, su),
+	Expr.Index(a, i) -> subst_index(a, i, su),
+	Expr.IndexField(a, i, f) -> subst_indexfield(a, i, f, su),
+	Expr.Addr(name) -> subst_addr(name, su),
+	Expr.Record(n, fs) -> Expr.Record(n, subst_fieldinits(fs, su)),
+	Expr.Match(scrut, arms) -> Expr.Match(subst_expr(scrut, su), subst_match_arms(arms, su)),
+	Expr.Interp(segs) -> Expr.Interp(subst_segs(segs, su)),
+	Expr.FieldExpr(b, f) -> Expr.FieldExpr(subst_expr(b, su), f),
+	Expr.UnionMk(t, mm, args) -> Expr.UnionMk(t, mm, subst_exprs(args, su)),
+	Expr.ArrayLit(hs, sn, elems, et) -> Expr.ArrayLit(hs, subst_expr(sn, su), subst_exprs(elems, su), et),
+	Expr.IndexExpr(b, i) -> Expr.IndexExpr(subst_expr(b, su), subst_expr(i, su)),
+	Expr.Tuple(elems) -> Expr.Tuple(subst_exprs(elems, su)),
+	Expr.Spread(x) -> Expr.Spread(subst_expr(x, su)),
+	Expr.Buffer(sz) -> Expr.Buffer(subst_expr(sz, su)),
+	Expr.Neg(x) -> Expr.Neg(subst_expr(x, su)),
+	Expr.Not(x) -> Expr.Not(subst_expr(x, su)),
+	Expr.BitNot(x) -> Expr.BitNot(subst_expr(x, su)),
+	Expr.Add(l, r) -> Expr.Add(subst_expr(l, su), subst_expr(r, su)),
+	Expr.Sub(l, r) -> Expr.Sub(subst_expr(l, su), subst_expr(r, su)),
+	Expr.Mul(l, r) -> Expr.Mul(subst_expr(l, su), subst_expr(r, su)),
+	Expr.Div(l, r) -> Expr.Div(subst_expr(l, su), subst_expr(r, su)),
+	Expr.Mod(l, r) -> Expr.Mod(subst_expr(l, su), subst_expr(r, su)),
+	Expr.BitAnd(l, r) -> Expr.BitAnd(subst_expr(l, su), subst_expr(r, su)),
+	Expr.BitOr(l, r) -> Expr.BitOr(subst_expr(l, su), subst_expr(r, su)),
+	Expr.BitXor(l, r) -> Expr.BitXor(subst_expr(l, su), subst_expr(r, su)),
+	Expr.Shl(l, r) -> Expr.Shl(subst_expr(l, su), subst_expr(r, su)),
+	Expr.Shr(l, r) -> Expr.Shr(subst_expr(l, su), subst_expr(r, su)),
+	Expr.CmpEq(l, r) -> Expr.CmpEq(subst_expr(l, su), subst_expr(r, su)),
+	Expr.CmpNe(l, r) -> Expr.CmpNe(subst_expr(l, su), subst_expr(r, su)),
+	Expr.CmpLt(l, r) -> Expr.CmpLt(subst_expr(l, su), subst_expr(r, su)),
+	Expr.CmpGt(l, r) -> Expr.CmpGt(subst_expr(l, su), subst_expr(r, su)),
+	Expr.CmpLe(l, r) -> Expr.CmpLe(subst_expr(l, su), subst_expr(r, su)),
+	Expr.CmpGe(l, r) -> Expr.CmpGe(subst_expr(l, su), subst_expr(r, su)),
+	Expr.And(l, r) -> Expr.And(subst_expr(l, su), subst_expr(r, su)),
+	Expr.Or(l, r) -> Expr.Or(subst_expr(l, su), subst_expr(r, su)),
+	Expr.If(c, t, e2) -> Expr.If(subst_expr(c, su), subst_expr(t, su), subst_expr(e2, su)),
+	_ -> e
+}
+# The position of the HOF's function parameter that is receiving a CAPTURING closure at this call
+# (or -1). A capture-free closure has been lowered to a code pointer already, so it is not matched.
+const capturing_clo_arg = (Func hof, [Expr] args, [CloRef] clos): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(hof.params.len) then break
+		if i < Iarch(args.len) then {
+			if str_eq(hof.params[i].type_name, "$fn") then {
+				const Iarch ci = clo_find(clos, arg_var_name(args[i]))
+				if ci >= 0 then { if Iarch(clos[ci].capargs.len) > 0 then return i }
+			}
+		}
+		i = i + 1
+	}
+	return 0 - 1
+}
+const return_expr = (Stmt s): Expr -> match s { Stmt.Return(e) -> e, _ -> Expr.Unit }
+# A substitution-safe argument — one that inlining may duplicate (a repeated parameter) without
+# changing meaning: a literal or a bare name (no side effect, same value each read).
+const is_simple_arg = (Expr e): Bool -> match e {
+	Expr.Lit(v) -> true,
+	Expr.BoolLit(b) -> true,
+	Expr.FloatLit(t) -> true,
+	Expr.StrLit(bs) -> true,
+	Expr.Var(n) -> true,
+	_ -> false
+}
+const count_name = ([Str] names, Str n): Iarch -> {
+	let Iarch c = 0
+	let Iarch i = 0
+	loop { if i >= Iarch(names.len) then break  if str_eq(names[i], n) then c = c + 1  i = i + 1 }
+	return c
+}
+# Inline `hof(args)` at a call site where `args[cp]` is a capturing closure: substitute the HOF's
+# parameters with the arguments in its (single-expression) body, then re-rewrite — so the closure's
+# call becomes a direct call to its lifted body, and a further HOF hop inlines in turn (the `depth`
+# bounds a recursive HOF, which would inline forever). A value parameter used more than once would
+# duplicate its argument, so a repeated parameter admits only a simple (side-effect-free) argument.
+const inline_hof = (Func hof, [Expr] args, Iarch cp, RwCtx m): Expr -> {
+	if Iarch(hof.body.len) != 1 then die("cf0: closure: a higher-order function taking a capturing closure needs a single-expression body (v1)\n")
+	if m.depth > 64 then die("cf0: closure: a recursive higher-order function cannot be passed a capturing closure (v1)\n")
+	const Expr bodyexpr = return_expr(hof.body[0])
+	const [Str] used = uses_expr(bodyexpr)
+	let [Subst] su = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(hof.params.len) then break
+		if !str_eq(hof.params[i].type_name, "$fn") then {
+			if count_name(used, hof.params[i].name) > 1 then {
+				if !is_simple_arg(args[i]) then die("cf0: closure: a HOF parameter used more than once needs a simple argument when a capturing closure is passed (v1)\n")
+			}
+		}
+		su = [...su, Subst({ param: hof.params[i].name, repl: args[i] })]
+		i = i + 1
+	}
+	const Expr inlined = subst_expr(bodyexpr, su)
+	return rw_expr(inlined, RwCtx({ clos: m.clos, fns: m.fns, depth: m.depth + 1 }))
+}
+# A call to a closure name is redirected to its lifted function (captures appended); a HOF called
+# with a capturing closure is inlined; every other call is unchanged (its arguments already rewritten).
+const rw_call = (Str n, [Str] ta, [Expr] args, RwCtx m): Expr -> {
+	const Iarch ci = clo_find(m.clos, n)
+	if ci >= 0 then {
+		let [Expr] all = args
+		const [Expr] caps = m.clos[ci].capargs
+		let Iarch i = 0
+		loop { if i >= Iarch(caps.len) then break  all = [...all, caps[i]]  i = i + 1 }
+		return Expr.Call(m.clos[ci].lifted, ta, all)
+	}
+	const Iarch fi = find_func(m.fns, n)
+	if fi >= 0 then {
+		const Iarch cp = capturing_clo_arg(m.fns[fi], args, m.clos)
+		if cp >= 0 then return inline_hof(m.fns[fi], args, cp, m)
+	}
+	return Expr.Call(n, ta, args)
+}
+const rw_stmt = (Stmt s, RwCtx m): Stmt -> match s {
 	Stmt.Let(n, mut, ann, e) -> Stmt.Let(n, mut, ann, rw_expr(e, m)),
 	Stmt.Destructure(pat, mut, e) -> Stmt.Destructure(pat, mut, rw_expr(e, m)),
 	Stmt.Assign(n, e) -> Stmt.Assign(n, rw_expr(e, m)),
@@ -415,7 +626,7 @@ const lifted_name = (Iarch fi, Iarch ci): Str -> "__clo_${fi}_${ci}"
 # Result of lifting one function's body: the rewritten body (closures removed, calls redirected)
 # and the list of lifted top-level functions it produced.
 pub data Lifted = { [Stmt] body, [Func] funcs }
-const lift_func = (Func fn, Iarch fi, [RecDecl] recs): Lifted -> {
+const lift_func = (Func fn, Iarch fi, [RecDecl] recs, [Func] fns): Lifted -> {
 	let [ScopeVar] scope = []
 	let Iarch p = 0
 	loop {
@@ -447,7 +658,7 @@ const lift_func = (Func fn, Iarch fi, [RecDecl] recs): Lifted -> {
 				# the closure's calls (later in this body) are redirected before its own body is
 				# rewritten, so a captured closure that itself calls another already-lifted closure
 				# still resolves
-				const [Stmt] lbody = rw_stmts(body, cmap)
+				const [Stmt] lbody = rw_stmts(body, rwctx0(cmap, fns))
 				const [Seg] noasm = []
 				const [Str] no_tp = []
 				const [TupElem] no_tel = []
@@ -456,7 +667,7 @@ const lift_func = (Func fn, Iarch fi, [RecDecl] recs): Lifted -> {
 				ci = ci + 1
 			},
 			_ -> {
-				out = [...out, rw_stmt(s, cmap)]
+				out = [...out, rw_stmt(s, rwctx0(cmap, fns))]
 				scope = extend_scope(scope, s)
 			}
 		}
@@ -477,7 +688,7 @@ pub const lift_program = (Program prog): Program -> {
 		if i >= Iarch(prog.funcs.len) then break
 		const Func fn = prog.funcs[i]
 		if fn.is_asm then { funcs = [...funcs, fn] } else {
-			const Lifted lf = lift_func(fn, i, prog.recs)
+			const Lifted lf = lift_func(fn, i, prog.recs, prog.funcs)
 			funcs = [...funcs, Func({ name: fn.name, is_pub: fn.is_pub, ret_name: fn.ret_name, ret_elem: fn.ret_elem, params: fn.params, body: lf.body, is_asm: false, asm_body: fn.asm_body, is_value: fn.is_value, ret_telems: fn.ret_telems, typarams: fn.typarams, tbounds: fn.tbounds })]
 			let Iarch k = 0
 			loop { if k >= Iarch(lf.funcs.len) then break  extra = [...extra, lf.funcs[k]]  k = k + 1 }
