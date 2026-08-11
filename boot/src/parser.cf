@@ -9,7 +9,7 @@
 # (`acc = Expr.Add(acc, rhs)`) — one function per precedence level.
 
 import "io" as { die }
-import "token" as { Token, TokKind, is_eof, is_ident, is_intlit, is_strlit, is_lparen, is_rparen, is_lbrace, is_rbrace, is_lbracket, is_rbracket, is_comma, is_colon, is_dot, is_ellipsis, is_eq, is_arrow, is_minus, is_plus, is_star, is_slash, is_percent, is_amp, is_pipe, is_caret, is_tilde, is_bang, is_shl, is_shr, is_eqeq, is_ne, is_lt, is_gt, is_le, is_ge, is_logand, is_logor, is_yield, is_floatlit }
+import "token" as { Token, TokKind, is_eof, is_ident, is_intlit, is_strlit, is_lparen, is_rparen, is_lbrace, is_rbrace, is_lbracket, is_rbracket, is_comma, is_colon, is_dot, is_ellipsis, is_eq, is_arrow, is_minus, is_plus, is_star, is_slash, is_percent, is_amp, is_pipe, is_caret, is_tilde, is_bang, is_shl, is_shr, is_eqeq, is_ne, is_lt, is_gt, is_le, is_ge, is_logand, is_logor, is_yield, is_floatlit, is_pipearrow }
 import "lexer" as { lex }
 import "ast" as { Expr, Stmt, Param, Func, Ty, FieldInit, RecDecl, UnionMember, UnionDecl, MatchArm, StmtArm, Seg, RetSig, TupElem, Import, Program }
 import "astutil" as { tel_leaf, tel_nest }
@@ -159,7 +159,37 @@ const parse_string = (*[Uint8] src, Iarch start, Iarch len): Expr -> {
 # an `Expr` accumulator (`acc = Expr.Add(acc, rhs)`). Comparison is NON-associative — a single
 # compare, no chaining.
 
-const parse_expr = (*Parser p): Expr -> parse_or(p)
+const parse_expr = (*Parser p): Expr -> parse_pipe(p)
+
+# `x |> f` / `x |> f(a, …)` — the pipe threads the left value in as the callee's LAST
+# positional argument: `f(x)` / `f(a, …, x)`. It is the LOOSEST operator (looser than
+# arithmetic and the logical/comparison ladder, so `1 + 2 |> inc` is `inc(1 + 2)`) and
+# left-associative, so a chain `3 |> inc |> sum(10)` reads left to right as
+# `sum(10, inc(3))`. A newline before a leading `|>` is whitespace, so a chain may wrap.
+const parse_pipe = (*Parser p): Expr -> {
+	let Expr acc = parse_or(p)
+	loop {
+		if !is_pipearrow(peek(p)) then break
+		p.pos = p.pos + 1
+		acc = parse_pipe_target(p, acc)
+	}
+	return acc
+}
+
+# The target after a `|>`: a bare function name, or a partially-applied call `f(a, …)`
+# whose remaining slot the piped value fills. The name must be lowercase (a value binding),
+# not a PascalCase type — there is no first-class construction pipe.
+const parse_pipe_target = (*Parser p, Expr piped): Expr -> {
+	if !is_ident(peek(p)) then die("cf0: parse: a `|>` target must be a function name\n")
+	const Iarch c0 = Iarch(p.src[p.toks[p.pos].start])
+	if c0 >= 65 && c0 <= 90 then die("cf0: parse: a `|>` target must be a function, not a type\n")
+	const Str name = cur_name(p)
+	p.pos = p.pos + 1
+	let [Expr] args = []
+	if is_lparen(peek(p)) then args = parse_args(p)
+	const [Str] no_ty = []
+	return Expr.Call(name, no_ty, [...args, piped])
+}
 
 const parse_or = (*Parser p): Expr -> {
 	let Expr acc = parse_and(p)
