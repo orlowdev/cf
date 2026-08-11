@@ -10,7 +10,7 @@ _start:
 .p2align 2
 _cf_arena_init:
 	mov x0, #0
-	mov x1, #0x4000000
+	mov x1, #0x10000000
 	mov x2, #3
 	mov x3, #0x1002
 	mov x4, #-1
@@ -21,7 +21,7 @@ _cf_arena_init:
 	adrp x9, _cf_top@PAGE
 	add x9, x9, _cf_top@PAGEOFF
 	str x0, [x9]
-	mov x1, #0x4000000
+	mov x1, #0x10000000
 	add x11, x0, x1
 	adrp x10, _cf_limit@PAGE
 	add x10, x10, _cf_limit@PAGEOFF
