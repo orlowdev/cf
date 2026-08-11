@@ -21,7 +21,7 @@ import "astutil" as { is_fixed_name, is_float_name }
 # The monomorph pass infers a generic call's type arguments by deriving argument types with the
 # SAME `type_of` the typechecker uses (types flow, not a parallel guesser). `Ctx`/`VarTy` are the
 # shared typing vocabulary; the helpers build the pieces `type_of` needs from a binding.
-import "typecheck" as { type_of, ty_name, Ctx, VarTy, named_ty, param_ty, binding_ty, arm_bind_env, check_destructure }
+import "typecheck" as { type_of, ty_name, Ctx, VarTy, named_ty, param_ty, binding_ty, arm_bind_env, check_destructure, dyn_of, tuple_elems }
 
 # The accumulating state, threaded by pointer: the generic FUNCTION templates + their instance
 # clones (with a dedup key set); the generic RECORD/UNION templates + their instance clones (with
@@ -558,6 +558,63 @@ const arg_ty = (*MonoCtx m, Expr e, MonoEnv env): Str -> {
 # Infer a generic call's type arguments: for each type variable, a parameter whose declared
 # type IS that variable fixes it to the corresponding argument's type. A variable no parameter
 # mentions (or whose argument type is unknown) cannot be inferred — an error.
+# --- structural type-argument inference -----------------------------------------------------
+# Peel one `[…]` bracket level off a type-name STRING (`"[Iarch]"` → `"Iarch"`, `"[[X]]"` → `"[X]"`);
+# "" if the string does not name a bracketed array.
+const bracket_inner = (Str s): Str -> {
+	const Iarch n = Iarch(s.len)
+	if n < 2 then return ""
+	if Iarch(s[0]) != 91 then return ""
+	if Iarch(s[n - 1]) != 93 then return ""
+	let [Uint8] out = []
+	let Iarch i = 1
+	loop { if i >= n - 1 then break  out = [...out, s[i]]  i = i + 1 }
+	return Str(out)
+}
+# Match a `[…]` parameter element STRING `pe` (which mentions the type variable `tv`, possibly under
+# more brackets) against an argument array's element STRING `ae`, returning what `tv` binds to — or
+# "" if `pe` does not mention `tv` or the array nesting does not line up.
+const infer_from_elem = (Str tv, Str pe, Str ae): Str -> {
+	if str_eq(pe, tv) then return ae
+	const Str pin = bracket_inner(pe)
+	if str_eq(pin, "") then return ""
+	const Str ain = bracket_inner(ae)
+	if str_eq(ain, "") then return ""
+	return infer_from_elem(tv, pin, ain)
+}
+# Match a tuple parameter's element list `ptel` against an argument tuple's `atel`, returning what
+# `tv` binds to at the first position that mentions it (or "").
+const infer_from_telems = (Str tv, [TupElem] ptel, [TupElem] atel): Str -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ptel.len) then break
+		if i < Iarch(atel.len) then {
+			if str_eq(ptel[i].name, tv) then return atel[i].name
+			if str_eq(ptel[i].name, "$tuple") then {
+				const Str b = infer_from_telems(tv, ptel[i].sub, atel[i].sub)
+				if !str_eq(b, "") then return b
+			} else {
+				const Str eb = infer_from_elem(tv, ptel[i].name, atel[i].name)
+				if !str_eq(eb, "") then return eb
+			}
+		}
+		i = i + 1
+	}
+	return ""
+}
+# What the type variable `tv` binds to given a template parameter and its argument's inferred type —
+# by STRUCTURE: the whole parameter (`'T`), an array element (`['T]`, `[['T]]`), or a tuple position
+# (`('T, Iarch)`). "" if the parameter does not mention `tv`.
+const infer_from_param = (Str tv, Param p, Ty at): Str -> {
+	if str_eq(p.type_name, tv) then return ty_name(at)
+	if str_eq(p.type_name, "$dyn") then {
+		const Str ae = dyn_of(at)
+		if str_eq(ae, "") then return ""
+		return infer_from_elem(tv, p.elem, ae)
+	}
+	if str_eq(p.type_name, "$tuple") then return infer_from_telems(tv, p.telems, tuple_elems(at))
+	return ""
+}
 const infer_tyargs = (*MonoCtx m, Func tmpl, [Expr] args, MonoEnv env): [Str] -> {
 	let [Str] tvals = []
 	let Iarch t = 0
@@ -565,17 +622,26 @@ const infer_tyargs = (*MonoCtx m, Func tmpl, [Expr] args, MonoEnv env): [Str] ->
 		if t >= Iarch(tmpl.typarams.len) then break
 		const Str tv = tmpl.typarams[t]
 		# a NON-literal argument fixes the variable authoritatively; an integer literal only
-		# fixes it if nothing else does (it would otherwise adopt, not pin, the width)
+		# fixes it if nothing else does (it would otherwise adopt, not pin, the width). A type
+		# variable may sit anywhere in a parameter's type — the whole type, a `['T]` array element,
+		# or a `('T, …)` tuple position — so the binding is read out STRUCTURALLY.
 		let Str strong = ""
 		let Str weak = ""
 		let Iarch p = 0
 		loop {
 			if p >= Iarch(tmpl.params.len) then break
-			if str_eq(tmpl.params[p].type_name, tv) && p < Iarch(args.len) then {
-				const Str at = arg_ty(m, args[p], env)
-				if !str_eq(at, "") then {
-					if is_int_lit(args[p]) then weak = at
-					if !is_int_lit(args[p]) then strong = at
+			# a binding can only come from a parameter whose type is the variable itself, or an array
+			# / tuple that could nest it — skip every other parameter WITHOUT typing its argument (a
+			# function-value argument is a bare name that `type_of` rejects, and it can carry no `'T`)
+			const Str pn = tmpl.params[p].type_name
+			const Bool shaped = str_eq(pn, tv) || str_eq(pn, "$dyn") || str_eq(pn, "$tuple")
+			if shaped && p < Iarch(args.len) then {
+				const Ty at = type_of(args[p], env.venv, build_ctx(m, env.ret))
+				const Str b = infer_from_param(tv, tmpl.params[p], at)
+				if !str_eq(b, "") then {
+					# only a bare integer literal filling the WHOLE `'T` parameter is weak
+					if str_eq(pn, tv) && is_int_lit(args[p]) then weak = b
+					else strong = b
 				}
 			}
 			p = p + 1
