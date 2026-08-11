@@ -1576,6 +1576,87 @@ const enforce_toplevel_closures = ([Stmt] body): Iarch -> {
 	}
 	return 0
 }
+# --- defer (memory_model §6) — validated here; the defer.cf pass lowers it after ------------
+# Does a statement contain a `defer` anywhere at any depth (in a nested block, loop, `if`
+# branch, `for` body, match arm, or another defer)? A defer is admitted ONLY as a direct
+# statement of the function body (v1) — the lowering pass rewrites the returns of a
+# defer-bearing body; one buried in control flow would slip through unlowered.
+const stmt_arms_have_defer = ([StmtArm] arms): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		if stmts_have_defer(arms[i].body) then return true
+		i = i + 1
+	}
+	return false
+}
+const stmts_have_defer = ([Stmt] ss): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		if stmt_has_defer(ss[i]) then return true
+		i = i + 1
+	}
+	return false
+}
+const stmt_has_defer = (Stmt s): Bool -> match s {
+	Stmt.Defer(ss) -> true,
+	Stmt.Block(ss) -> stmts_have_defer(ss),
+	Stmt.Loop(ss) -> stmts_have_defer(ss),
+	Stmt.ForIn(v, a, body) -> stmts_have_defer(body),
+	Stmt.IfThen(c, st) -> stmt_has_defer(st),
+	Stmt.IfElse(c, t, e) -> stmt_has_defer(t) || stmt_has_defer(e),
+	Stmt.Match(scrut, arms) -> stmt_arms_have_defer(arms),
+	_ -> false
+}
+# Does a statement contain a `return` anywhere at any depth? A defer body runs at scope exit,
+# after the return value is fixed, so it cannot itself `return`.
+const stmt_arms_have_return = ([StmtArm] arms): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		if stmts_have_return(arms[i].body) then return true
+		i = i + 1
+	}
+	return false
+}
+const stmts_have_return = ([Stmt] ss): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		if stmt_has_return(ss[i]) then return true
+		i = i + 1
+	}
+	return false
+}
+const stmt_has_return = (Stmt s): Bool -> match s {
+	Stmt.Return(e) -> true,
+	Stmt.Block(ss) -> stmts_have_return(ss),
+	Stmt.Loop(ss) -> stmts_have_return(ss),
+	Stmt.ForIn(v, a, body) -> stmts_have_return(body),
+	Stmt.IfThen(c, st) -> stmt_has_return(st),
+	Stmt.IfElse(c, t, e) -> stmt_has_return(t) || stmt_has_return(e),
+	Stmt.Match(scrut, arms) -> stmt_arms_have_return(arms),
+	_ -> false
+}
+# A `defer` may appear ONLY as a direct statement of the function body (v1). A defer nested in
+# a loop / `if` / block / match / another defer is rejected here rather than surviving
+# unlowered to emit; a defer body may not `return`.
+const enforce_toplevel_defer = ([Stmt] body): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(body.len) then break
+		match body[i] {
+			Stmt.Defer(dbody) -> {
+				if stmts_have_defer(dbody) then die("cf0: type: a `defer` cannot be nested in another `defer`\n")
+				if stmts_have_return(dbody) then die("cf0: type: a `defer` body runs at scope exit and cannot `return`\n")
+			},
+			_ -> { if stmt_has_defer(body[i]) then die("cf0: type: a `defer` must be a top-level statement of its function (v1)\n") }
+		}
+		i = i + 1
+	}
+	return 0
+}
 # Validate a closure: check its body in the enclosing environment extended with its (immutable)
 # parameters, requiring a return; a captured `const`/parameter is thus non-mutable, so mutating
 # it through the closure is rejected there. Returns the environment extended with the closure
@@ -1625,6 +1706,12 @@ const check_stmts = ([Stmt] stmts, [VarTy] env0, Ctx ctx, Iarch loop_kind): Iarc
 			},
 			Stmt.Destructure(pat, m, e) -> { env = check_destructure(pat, m, e, env, ctx) },
 			Stmt.Closure(nm, params, ret, body) -> { env = check_closure(nm, params, ret, body, env, ctx) },
+			# a `defer` body is checked in the current environment (its call/mutations must resolve
+			# and typecheck); a captured `const`/parameter stays non-mutable, so mutating it is
+			# rejected here. A defer is NON-terminal (like a `Do`) — control falls through to the
+			# real `return` that follows. The top-level-only / no-`return`-inside rules are enforced
+			# separately by `enforce_toplevel_defer`.
+			Stmt.Defer(dbody) -> { check_stmts(dbody, env, ctx, lk_none) },
 			_ -> {
 				const Iarch t = check_simple_stmt(s, env, ctx, loop_kind)
 				if t >= 1 then {
@@ -1744,6 +1831,9 @@ const check_func = (Func fn, Ctx ctx): Iarch -> {
 	# a closure is admitted only as a direct function-body statement (v1); reject one buried in
 	# control flow before it survives unlowered to emit
 	enforce_toplevel_closures(fn.body)
+	# a defer is admitted only as a direct function-body statement (v1), and its body may not
+	# `return`; reject the buried / returning cases before the lowering pass runs
+	enforce_toplevel_defer(fn.body)
 	const Iarch dr = check_stmts(fn.body, env, fctx, lk_none)
 	if dr != 2 then die("cf0: type: a function body must end with `return`\n")
 	return 0
