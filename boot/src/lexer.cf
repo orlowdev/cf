@@ -16,6 +16,19 @@ const is_digit = (Iarch c): Bool -> c >= 48 && c <= 57
 const is_alpha = (Iarch c): Bool -> (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95
 const is_alnum = (Iarch c): Bool -> is_alpha(c) || is_digit(c)
 
+# The byte a char-literal escape `\<e>` decodes to. Mirrors the parser's string `escape_byte`,
+# plus `\'` (a quote inside a char literal) and minus the string-only `\"`/`\$`.
+const char_escape_byte = (Iarch e): Iarch -> {
+	if e == 110 then return 10  # \n
+	if e == 116 then return 9   # \t
+	if e == 114 then return 13  # \r
+	if e == 48 then return 0    # \0
+	if e == 92 then return 92   # backslash
+	if e == 39 then return 39   # \'
+	die("cf0: lex: unknown char escape (allowed: \\n \\t \\r \\0 \\\\ \\')\n")
+	return 0
+}
+
 # Lex the first `n` bytes of `src` into a token stream terminated by `Eof`.
 pub const lex = (*[Uint8] src, Iarch n): [Token] -> {
 	let [Token] toks = []
@@ -55,6 +68,22 @@ pub const lex = (*[Uint8] src, Iarch n): [Token] -> {
 			toks = [...toks, Token({ kind: TokKind.StrLit, ival: 0, start: start, len: j - start })]
 			i = j + 1
 			continue
+		}
+		# a CHARACTER literal `'A'` / `'\n'` — a single byte. It is distinguished from a type
+		# variable `'T` (lexed by the identifier branch below) by the CLOSING apostrophe, which a
+		# type var never has. Emitted straight as an `IntLit` of the byte value, so the parser reads
+		# it as an ordinary integer (`p.toks[..].ival`) — no dedicated char token or parser arm.
+		if c == 39 then {
+			if i + 3 < n && Iarch(src[i + 1]) == 92 && Iarch(src[i + 3]) == 39 then {
+				toks = [...toks, Token({ kind: TokKind.IntLit, ival: char_escape_byte(Iarch(src[i + 2])), start: i, len: 4 })]
+				i = i + 4
+				continue
+			}
+			if i + 2 < n && Iarch(src[i + 1]) != 92 && Iarch(src[i + 2]) == 39 then {
+				toks = [...toks, Token({ kind: TokKind.IntLit, ival: Iarch(src[i + 1]), start: i, len: 3 })]
+				i = i + 3
+				continue
+			}
 		}
 		# identifier / keyword: [A-Za-z_][A-Za-z0-9_]* — and a TYPE VARIABLE `'T` (a leading
 		# apostrophe, byte 39, then an identifier), lexed as one ident token whose text keeps the
