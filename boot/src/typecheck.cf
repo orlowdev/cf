@@ -860,6 +860,9 @@ pub const arm_bind_env = (Str type_name, [Str] members, [Str] binds, [VarTy] env
 	if Iarch(binds.len) == 0 then return benv
 	# a binding arm is single-member; each bound name takes the member's declared payload type
 	const Iarch ui = find_union(ctx.unions, type_name)
+	# a `Bool` (or otherwise non-table) scrutinee has no table payloads: bind nothing and let the
+	# caller's arity check report the mistake (a Bool member is nullary, so `Bool.True(x)` is invalid)
+	if ui < 0 then return benv
 	const Iarch mi = union_member_index(ctx.unions[ui].members, members[0])
 	let Iarch bi = 0
 	loop {
@@ -878,15 +881,33 @@ const type_arm_body = (MatchArm arm, [VarTy] env, Ctx ctx): Ty -> {
 	return type_of(arm.body, arm_bind_env(arm.type_name, arm.members, arm.binds, env, ctx), ctx)
 }
 
+# The members of the builtin `Bool` union `{ False, True }` (§8.6, tag 0/1) — Bool is the primitive
+# `TBool` and is not in the union tables, so `match` on a Bool sources its members here. Both are
+# nullary (no payload), so the arm machinery treats them as tag-only members.
+const bool_members = (): [UnionMember] -> {
+	let [Str] nop = []
+	let [[TupElem]] nopt = []
+	const UnionMember mf = UnionMember({ name: "False", payloads: nop, pelems: nop, ptelems: nopt })
+	const UnionMember mt = UnionMember({ name: "True", payloads: nop, pelems: nop, ptelems: nopt })
+	let [UnionMember] r = [mf, mt]
+	return r
+}
+
 # `match scrut { arms }` — the scrutinee must be a union; every arm must name that
 # union and one of its members (no member twice), no arm may follow a `_` wildcard,
 # every member must be covered (unless a `_` is present), a payload pattern's arity
 # must match its member with no repeated binding name, and all arm bodies must share
 # a type — which is the match's type.
 const match_type = (Expr scrut, [MatchArm] arms, [VarTy] env, Ctx ctx): Ty -> {
-	const Str un = union_of(type_of(scrut, env, ctx))
+	const Ty sty = type_of(scrut, env, ctx)
+	# a `Bool` scrutinee matches as the tag-only union `{ False, True }` (§8.6) — `Bool` is not in
+	# the union tables (it is the primitive `TBool`), so its members come from `bool_members()`
+	let Str un = union_of(sty)
+	if str_eq(un, "") && is_tbool(sty) then un = "Bool"
 	if str_eq(un, "") then die("cf0: type: a match scrutinee must be a union\n")
 	const Iarch ui = find_union(ctx.unions, un)
+	let [UnionMember] mems = bool_members()
+	if ui >= 0 then mems = ctx.unions[ui].members
 	const Iarch na = Iarch(arms.len)
 	if na == 0 then die("cf0: type: a match needs at least one arm\n")
 	const Ty rty = type_arm_body(arms[0], env, ctx)
@@ -903,7 +924,7 @@ const match_type = (Expr scrut, [MatchArm] arms, [VarTy] env, Ctx ctx): Ty -> {
 			let Iarch mj = 0
 			loop {
 				if mj >= Iarch(arms[i].members.len) then break
-				const Iarch mi = union_member_index(ctx.unions[ui].members, arms[i].members[mj])
+				const Iarch mi = union_member_index(mems, arms[i].members[mj])
 				if mi < 0 then die("cf0: type: a match arm names a nonexistent union member\n")
 				let Iarch d = 0
 				loop {
@@ -916,8 +937,8 @@ const match_type = (Expr scrut, [MatchArm] arms, [VarTy] env, Ctx ctx): Ty -> {
 			}
 			# a payload-binding arm (single member): arity must match, no repeated name
 			if Iarch(arms[i].binds.len) > 0 then {
-				const Iarch mi0 = union_member_index(ctx.unions[ui].members, arms[i].members[0])
-				if Iarch(arms[i].binds.len) != Iarch(ctx.unions[ui].members[mi0].payloads.len) then die("cf0: type: a payload pattern's arity must match the member\n")
+				const Iarch mi0 = union_member_index(mems, arms[i].members[0])
+				if Iarch(arms[i].binds.len) != Iarch(mems[mi0].payloads.len) then die("cf0: type: a payload pattern's arity must match the member\n")
 				let Iarch di = 0
 				loop {
 					if di >= Iarch(arms[i].binds.len) then break
@@ -937,7 +958,7 @@ const match_type = (Expr scrut, [MatchArm] arms, [VarTy] env, Ctx ctx): Ty -> {
 		i = i + 1
 	}
 	if !wild_seen then {
-		if Iarch(covered.len) != Iarch(ctx.unions[ui].members.len) then die("cf0: type: a match must cover every union member or carry a `_`\n")
+		if Iarch(covered.len) != Iarch(mems.len) then die("cf0: type: a match must cover every union member or carry a `_`\n")
 	}
 	return rty
 }
@@ -1869,9 +1890,15 @@ const check_stmts = ([Stmt] stmts, [VarTy] env0, Ctx ctx, Iarch loop_kind): Iarc
 # a function still needs an explicit trailing `return` after it) — matching the genesis
 # compiler, and correct for cf0's own use where every arm falls through.
 const check_stmt_match = (Expr scrut, [StmtArm] arms, [VarTy] env, Ctx ctx, Iarch loop_kind): Iarch -> {
-	const Str un = union_of(type_of(scrut, env, ctx))
+	const Ty sty = type_of(scrut, env, ctx)
+	# a `Bool` scrutinee matches as the tag-only union `{ False, True }` (§8.6); `Bool` is the
+	# primitive `TBool`, not a table union, so its members come from `bool_members()`
+	let Str un = union_of(sty)
+	if str_eq(un, "") && is_tbool(sty) then un = "Bool"
 	if str_eq(un, "") then die("cf0: type: a match scrutinee must be a union\n")
 	const Iarch ui = find_union(ctx.unions, un)
+	let [UnionMember] mems = bool_members()
+	if ui >= 0 then mems = ctx.unions[ui].members
 	const Iarch na = Iarch(arms.len)
 	if na == 0 then die("cf0: type: a match needs at least one arm\n")
 	let [Iarch] covered = []
@@ -1888,7 +1915,7 @@ const check_stmt_match = (Expr scrut, [StmtArm] arms, [VarTy] env, Ctx ctx, Iarc
 			let Iarch mj = 0
 			loop {
 				if mj >= Iarch(arms[i].members.len) then break
-				const Iarch mi = union_member_index(ctx.unions[ui].members, arms[i].members[mj])
+				const Iarch mi = union_member_index(mems, arms[i].members[mj])
 				if mi < 0 then die("cf0: type: a match arm names a nonexistent union member\n")
 				let Iarch d = 0
 				loop {
@@ -1901,8 +1928,8 @@ const check_stmt_match = (Expr scrut, [StmtArm] arms, [VarTy] env, Ctx ctx, Iarc
 			}
 			# a payload-binding arm (single member): arity must match, no repeated name
 			if Iarch(arms[i].binds.len) > 0 then {
-				const Iarch mi0 = union_member_index(ctx.unions[ui].members, arms[i].members[0])
-				if Iarch(arms[i].binds.len) != Iarch(ctx.unions[ui].members[mi0].payloads.len) then die("cf0: type: a payload pattern's arity must match the member\n")
+				const Iarch mi0 = union_member_index(mems, arms[i].members[0])
+				if Iarch(arms[i].binds.len) != Iarch(mems[mi0].payloads.len) then die("cf0: type: a payload pattern's arity must match the member\n")
 				let Iarch di = 0
 				loop {
 					if di >= Iarch(arms[i].binds.len) then break
@@ -1923,7 +1950,7 @@ const check_stmt_match = (Expr scrut, [StmtArm] arms, [VarTy] env, Ctx ctx, Iarc
 		i = i + 1
 	}
 	if !wild_seen then {
-		if Iarch(covered.len) != Iarch(ctx.unions[ui].members.len) then die("cf0: type: a match must cover every union member or carry a `_`\n")
+		if Iarch(covered.len) != Iarch(mems.len) then die("cf0: type: a match must cover every union member or carry a `_`\n")
 	}
 	return 0
 }
