@@ -133,6 +133,10 @@ const ptr_stride = (Str elem): Iarch -> {
 # (uniform 8-byte slots; a word field rides in the low 4 bytes). Typecheck guarantees both resolve.
 const field_offset = ([RecDecl] recs, Str rt, Str field): Iarch -> {
 	const Iarch ri = find_rec(recs, rt)
+	# `rt` is "" when a value's aggregate type could not be recovered (`init_agg_type` returned "")
+	# — e.g. a record bound from a `match` PAYLOAD (`M.Some(x) -> x`), which this env cannot resolve.
+	# Fail with a clean diagnostic rather than dereferencing `recs[-1]` (a segfault).
+	if ri < 0 then die("cf0: emit: a field access on a value whose record type is unknown here (an aggregate bound from a match payload is not yet supported)\n")
 	let Iarch fi = 0
 	loop {
 		if fi >= Iarch(recs[ri].fields.len) then break
@@ -1154,6 +1158,17 @@ const var_agg_type = ([Binding] env, Str name): Str -> {
 	return env[idx].rec_type
 }
 
+# The aggregate type a `match` YIELDS, recovered from its first arm's body — but ONLY when that arm
+# binds no payload. If the arm binds a payload (`M.Some(x) -> x`), its body may reference a bind that
+# is absent from this outer env; resolving it here would either miss (→ "") OR, if the bind name
+# SHADOWS an outer variable, wrongly resolve to that outer variable's type — a miscompile. So a
+# payload-binding first arm is treated conservatively as "" (a clean `field_offset` die downstream),
+# never a guessed type. A no-bind first arm's body (an outer variable or a construction) resolves
+# correctly against this env. Every arm shares the match's type (typecheck), so the first suffices.
+const match_agg_type = (*Emit ctx, [Binding] env, [MatchArm] arms): Str -> {
+	if Iarch(arms[0].binds.len) > 0 then return ""
+	return init_agg_type(ctx, env, arms[0].body)
+}
 # The aggregate type name of a binding initializer that yields an aggregate (a record,
 # a boxed union, a dynamic array, a string, or an aggregate variable copied) — so its
 # binding holds a base pointer — else "".
@@ -1173,6 +1188,13 @@ const init_agg_type = (*Emit ctx, [Binding] env, Expr e): Str -> match e {
 	Expr.IndexField(arr, idx, f) -> indexfield_agg_type(ctx, env, arr, idx, f),
 	Expr.FieldExpr(base, f) -> fieldexpr_agg_type(ctx, env, base, f),
 	Expr.Tuple(elems) -> "$tuple",
+	# an `if`/`match` that YIELDS an aggregate reports its branch/arm aggregate type (both branches
+	# share a type by typecheck) — so `let R r = if c then a else b` binds `r` as its record and a
+	# later `r.field` (or a direct `(if …).field`) dispatches, instead of losing the type to "" and
+	# dereferencing `recs[-1]`. An `if` branch shares this env, so recursing into the `then` branch is
+	# safe; a `match` arm may bind a payload, so it is handled conservatively by `match_agg_type`.
+	Expr.If(c, t, el) -> init_agg_type(ctx, env, t),
+	Expr.Match(sc, arms) -> match_agg_type(ctx, env, arms),
 	_ -> ""
 }
 
