@@ -18,7 +18,7 @@
 
 import "io" as { write_str, die }
 import "ast" as { Expr, Stmt, Param, Func, FieldInit, RecDecl, UnionMember, UnionDecl, MatchArm, StmtArm, Seg, TupElem, Program }
-import "astutil" as { is_spread, spread_inner, is_skip, skip_count, is_nested, nested_inner, tel_leaf, tel_nest, tel_is_nest, is_fixed_name, fixed_bits, fixed_signed }
+import "astutil" as { is_spread, spread_inner, is_skip, skip_count, is_nested, nested_inner, tel_leaf, tel_nest, tel_is_nest, is_fixed_name, fixed_bits, fixed_signed, is_pat_guard, is_member_guard, is_int_guard, guard_body, guard_qual, guard_member }
 
 # The emit context: the QBE-IL output fd, the next free temp number, the next free
 # basic-block label id, the program's functions (a call resolves its callee — by
@@ -1620,7 +1620,8 @@ const arm_body_env = (*Emit ctx, [Binding] env, Str type_name, [Str] members, [S
 	let Iarch bi = 0
 	loop {
 		if bi >= Iarch(binds.len) then break
-		if !str_eq(binds[bi], "_") then {
+		# a `_` binds nothing, and a sub-pattern GUARD (`=Member`/`#int`) constrains but binds no name
+		if !str_eq(binds[bi], "_") && !is_pat_guard(binds[bi]) then {
 			const Iarch off = 8 + bi * 8
 			const Iarch addr = ctx.next
 			ctx.next = ctx.next + 1
@@ -1696,6 +1697,41 @@ const emit_arm_test = (*Emit ctx, Str type_name, Str member, Str scrut, Str tago
 	}
 	return 0
 }
+# Whether an arm carries payload sub-pattern GUARDS (so its tag match alone is not enough).
+const arm_is_guarded = ([Str] binds): Bool -> {
+	let Iarch i = 0
+	loop { if i >= Iarch(binds.len) then break  if is_pat_guard(binds[i]) then return true  i = i + 1 }
+	return false
+}
+# The 0/1 test temp for a payload sub-pattern guard at position `bi` (payload slot `s + 8 + bi*8`):
+# an integer guard compares the field word to the literal; a member guard loads the field union's
+# tag (from the box for a boxed field union) and compares it to the guarded member's tag.
+const emit_guard_cmp = (*Emit ctx, Str type_name, Str member, Str guard, Str s, Iarch bi): Str -> {
+	const Iarch off = 8 + bi * 8
+	const Iarch addr = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${addr} =l add ${s}, ${off}\n")
+	const Iarch val = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${val} =l loadl %t${addr}\n")
+	const Iarch cg = ctx.next
+	ctx.next = ctx.next + 1
+	if is_int_guard(guard) then {
+		write_str(ctx.fd, "\t%t${cg} =l ceql %t${val}, ${guard_body(guard)}\n")
+	} else {
+		const Str fu = payload_type(ctx, type_name, member, bi)
+		let Str ftag = "%t${val}"
+		if union_is_boxed(ctx.unions, fu) then {
+			const Iarch tg = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${tg} =l loadl %t${val}\n")
+			ftag = "%t${tg}"
+		}
+		const Iarch gtag = member_tag(ctx.unions, fu, guard_member(guard_body(guard)))
+		write_str(ctx.fd, "\t%t${cg} =l ceql ${ftag}, ${gtag}\n")
+	}
+	return "%t${cg}"
+}
 const emit_match = (*Emit ctx, Expr scrut, [MatchArm] arms, [Binding] env): Str -> {
 	const Str s = emit_expr(scrut, ctx, env)
 	const Str tagop = scrut_tag(ctx, match_union(arms), s)
@@ -1715,6 +1751,31 @@ const emit_match = (*Emit ctx, Expr scrut, [MatchArm] arms, [Binding] env): Str 
 			const Str v = emit_expr(arms[i].body, ctx, benv_e)
 			write_str(ctx.fd, "\tstore${qt} ${v}, %t${slot}\n")
 			write_str(ctx.fd, "\tjmp @mend${lid}\n")
+		} else if arm_is_guarded(arms[i].binds) then {
+			# a GUARDED arm (single member + payload sub-patterns): test the tag, then each guard in
+			# turn; any failure falls through to the next arm, all passing enters the body.
+			const Iarch c0 = ctx.next
+			ctx.next = ctx.next + 1
+			emit_arm_test(ctx, arms[i].type_name, arms[i].members[0], s, tagop, c0)
+			write_str(ctx.fd, "\tjnz %t${c0}, @mg${lid}_${i}_0, @mnext${lid}_${i}\n")
+			let Iarch g = 0
+			let Iarch bg = 0
+			loop {
+				if bg >= Iarch(arms[i].binds.len) then break
+				if is_pat_guard(arms[i].binds[bg]) then {
+					write_str(ctx.fd, "@mg${lid}_${i}_${g}\n")
+					const Str cg = emit_guard_cmp(ctx, arms[i].type_name, arms[i].members[0], arms[i].binds[bg], s, bg)
+					write_str(ctx.fd, "\tjnz ${cg}, @mg${lid}_${i}_${g + 1}, @mnext${lid}_${i}\n")
+					g = g + 1
+				}
+				bg = bg + 1
+			}
+			write_str(ctx.fd, "@mg${lid}_${i}_${g}\n")
+			const [Binding] benv_g = arm_body_env(ctx, env, arms[i].type_name, arms[i].members, arms[i].binds, s)
+			const Str vg = emit_expr(arms[i].body, ctx, benv_g)
+			write_str(ctx.fd, "\tstore${qt} ${vg}, %t${slot}\n")
+			write_str(ctx.fd, "\tjmp @mend${lid}\n")
+			write_str(ctx.fd, "@mnext${lid}_${i}\n")
 		} else {
 			# test each or-pattern alternative: a hit jumps to the arm body, a miss to
 			# the next alternative, and after the last to the next arm.
