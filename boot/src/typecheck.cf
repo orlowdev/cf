@@ -20,7 +20,14 @@ import "ast" as { Expr, Stmt, Param, Func, Ty, FieldInit, RecDecl, UnionMember, 
 import "astutil" as { is_spread, spread_inner, is_skip, skip_count, is_nested, nested_inner, tel_leaf, tel_nest, tel_is_nest, is_fixed_name, fixed_bits, fixed_signed, is_float_name, float_bits, is_pat_guard, is_member_guard, is_int_guard, guard_body, guard_qual, guard_member }
 
 # A name in scope during checking: its type and whether it is reassignable (`let`).
-pub data VarTy = { Str name, Ty ty, Bool mutable }
+# `esc` — this binding is, or (by construction) transitively contains, an explicit pointer into a
+# function-LOCAL residence (`&x`, a `*T` pointer local, or a record/union/tuple built holding one).
+# Storing such a value into a longer-lived home (a `return`, or a caller-provided `*T` param's field)
+# dangles once the local dies — the region-outlives check (memory_model §6). `outer` — this binding
+# is a caller-provided pointer parameter (a home that OUTLIVES the function), the destination whose
+# rehome is checked. (cf0 collapses `*Point`≡`Point`, so an EXPLICIT `&`/pointer-local is the only
+# alias to a specific local residence it can track; an owned aggregate field moves with its parent.)
+pub data VarTy = { Str name, Ty ty, Bool mutable, Bool esc, Bool outer }
 
 # The whole-program context threaded through typing: the functions (a call resolves
 # its callee here), the record declarations (a data literal / field read), and the
@@ -1049,7 +1056,7 @@ pub const arm_bind_env = (Str type_name, [Str] members, [Str] binds, [VarTy] env
 		# a `_` skips and a sub-pattern GUARD (`=Member`/`#int`) constrains but binds no name
 		if !str_eq(binds[bi], "_") && !is_pat_guard(binds[bi]) then {
 			const Ty bt = payload_decl_ty(ui, mi, bi, ctx)
-			benv = [...benv, VarTy({ name: binds[bi], ty: bt, mutable: false })]
+			benv = [...benv, VarTy({ name: binds[bi], ty: bt, mutable: false, esc: false, outer: false })]
 		}
 		bi = bi + 1
 	}
@@ -1486,7 +1493,7 @@ pub const check_destructure = ([Str] pat, Bool mutable, Expr rhs, [VarTy] env, C
 		if mutable then {
 			if !is_tint(pty) && !is_tbool(pty) then die("cf0: type: a `let` destructure position must be a scalar (a record/Str position binds `const`)\n")
 		}
-		e2 = [...e2, VarTy({ name: tok, ty: pty, mutable: mutable })]
+		e2 = [...e2, VarTy({ name: tok, ty: pty, mutable: mutable, esc: false, outer: false })]
 		pos = pos + 1
 		pi = pi + 1
 	}
@@ -1667,7 +1674,7 @@ const yields_of_list = ([Stmt] ss, [VarTy] env0, Ctx ctx): [Ty] -> {
 		if i >= Iarch(ss.len) then break
 		const Stmt s = ss[i]
 		match s {
-			Stmt.Let(n, m, ann, e) -> { env = [...env, VarTy({ name: n, ty: binding_ty(ann, e, env, ctx), mutable: m })] },
+			Stmt.Let(n, m, ann, e) -> { env = [...env, VarTy({ name: n, ty: binding_ty(ann, e, env, ctx), mutable: m, esc: false, outer: false })] },
 			Stmt.Destructure(pat, m, e) -> { env = check_destructure(pat, m, e, env, ctx) },
 			_ -> { r = cat_tys(r, yields_of_stmt(s, env, ctx)) }
 		}
@@ -1780,7 +1787,7 @@ const check_for_body = (Str lv, Str arr, [Stmt] body, [VarTy] env, Ctx ctx): Iar
 	if ai < 0 then die("cf0: type: `for` over an undeclared name\n")
 	if str_eq(dyn_of(env[ai].ty), "") then die("cf0: type: `for` needs a dynamic array\n")
 	if env_index(env, lv) >= 0 then die("cf0: type: a `for` loop variable cannot shadow an existing binding\n")
-	const [VarTy] benv = [...env, VarTy({ name: lv, ty: Ty.TInt, mutable: false })]
+	const [VarTy] benv = [...env, VarTy({ name: lv, ty: Ty.TInt, mutable: false, esc: false, outer: false })]
 	return check_stmts(body, benv, ctx, lk_for)
 }
 
@@ -1790,6 +1797,72 @@ const check_for_body = (Str lv, Str arr, [Stmt] body, [VarTy] env, Ctx ctx): Iar
 # its own name (so a self-reference is an undeclared-name error); a name may not
 # shadow an existing one; an `Assign` targets an existing mutable name and keeps its
 # type; every `Return` must match the function's declared return type; the body must
+# Whether a value carries an explicit pointer into a function-LOCAL residence — the region-outlives
+# taint (memory_model §6). `&x` always does (in cf0 you can only `&` an aggregate the function owns
+# by value, so `&x` addresses a local). A binding carries it iff its own `esc` flag is set (a `*T`
+# pointer local `= &x`, or a laundering `let q = p`). A record/union/tuple/array literal, or an
+# `if`/`match`/value-block, carries it iff any constituent value does — so `Holder({ p: &x })` and
+# arbitrarily nested constructions are caught. A field/index read propagates its base's taint (a
+# caller's aggregate — a non-`esc` param — reads as outer). A call returns a well-formed (checked)
+# value, never local; scalars/literals carry nothing. (An owned aggregate stored by value into a
+# field moves with its parent and is NOT tainted — cf0 cannot and need not distinguish it from a
+# reference, so only an explicit `&`/pointer-local escaping is flagged.)
+const name_esc = ([VarTy] env, Str n): Bool -> {
+	const Iarch i = env_index(env, n)
+	if i < 0 then return false
+	return env[i].esc
+}
+const carries_local = (Expr e, [VarTy] env): Bool -> match e {
+	Expr.Addr(n) -> true,
+	Expr.Var(n) -> name_esc(env, n),
+	# a field / index READ is NOT propagated: its result is usually a SCALAR (`p.x`, `a[i]`), which
+	# carries no pointer, and distinguishing a pointer-field read would need the field's type here.
+	# So returning a raw pointer FIELD read from a local aggregate (`return localAgg.ptrField`) is an
+	# unflagged gap — the direct `&`, pointer-local, and by-construction escapes below are what matter.
+	Expr.Record(tn, inits) -> inits_carry_local(inits, env),
+	Expr.UnionMk(tn, mem, args) -> exprs_carry_local(args, env),
+	Expr.Tuple(elems) -> exprs_carry_local(elems, env),
+	Expr.ArrayLit(hs, sn, elems, et) -> exprs_carry_local(elems, env),
+	Expr.If(c, t, el) -> carries_local(t, env) || carries_local(el, env),
+	Expr.Match(sc, arms) -> arms_carry_local(arms, env),
+	Expr.Loop(body) -> body_yields_local(body, env),
+	_ -> false
+}
+const exprs_carry_local = ([Expr] es, [VarTy] env): Bool -> {
+	let Iarch i = 0
+	loop { if i >= Iarch(es.len) then break if carries_local(es[i], env) then return true i = i + 1 }
+	return false
+}
+const inits_carry_local = ([FieldInit] inits, [VarTy] env): Bool -> {
+	let Iarch i = 0
+	loop { if i >= Iarch(inits.len) then break if carries_local(inits[i].value, env) then return true i = i + 1 }
+	return false
+}
+const arms_carry_local = ([MatchArm] arms, [VarTy] env): Bool -> {
+	let Iarch i = 0
+	loop { if i >= Iarch(arms.len) then break if carries_local(arms[i].body, env) then return true i = i + 1 }
+	return false
+}
+# A value block / value-yielding loop carries a local pointer iff any `<- v` yields one (recursing
+# into nested if/block/match statements, but NOT a nested loop — it opens its own value context).
+const stmt_yields_local = (Stmt s, [VarTy] env): Bool -> match s {
+	Stmt.Yield(v) -> carries_local(v, env),
+	Stmt.IfThen(c, b) -> stmt_yields_local(b, env),
+	Stmt.IfElse(c, tb, eb) -> stmt_yields_local(tb, env) || stmt_yields_local(eb, env),
+	Stmt.Block(ss) -> body_yields_local(ss, env),
+	Stmt.Match(sc, arms) -> stmt_arms_yield_local(arms, env),
+	_ -> false
+}
+const body_yields_local = ([Stmt] ss, [VarTy] env): Bool -> {
+	let Iarch i = 0
+	loop { if i >= Iarch(ss.len) then break if stmt_yields_local(ss[i], env) then return true i = i + 1 }
+	return false
+}
+const stmt_arms_yield_local = ([StmtArm] arms, [VarTy] env): Bool -> {
+	let Iarch i = 0
+	loop { if i >= Iarch(arms.len) then break if body_yields_local(arms[i].body, env) then return true i = i + 1 }
+	return false
+}
 # return.
 # Check a single "simple" statement — one that neither binds a name nor opens a block:
 # a loop exit, an early `return`, an assignment, or a statement-position `if` guard.
@@ -1823,6 +1896,11 @@ const check_simple_stmt = (Stmt s, [VarTy] env, Ctx ctx, Iarch loop_kind): Iarch
 			code = 1
 		},
 		Stmt.Return(e) -> {
+			# region-outlives: a returned value handed up to the caller may not carry a pointer into a
+			# function-LOCAL residence — it would dangle once this call's locals die (memory_model §6).
+			# (Returning a local aggregate BY VALUE is fine — it re-homes upward; only an explicit `&`
+			# pointer, or an aggregate built holding one, escapes.)
+			if carries_local(e, env) then die("cf0: type: a returned value cannot carry a pointer into a local — it would dangle once the call returns\n")
 			# a bare `[]` return adopts the function's declared element type (context-directed —
 			# `type_of` would default it to `[Iarch]` and spuriously mismatch a `[Str]`/`[T]` return)
 			if is_empty_arraylit(e) then {
@@ -1866,6 +1944,10 @@ const check_simple_stmt = (Stmt s, [VarTy] env, Ctx ctx, Iarch loop_kind): Iarch
 			const Iarch fi = field_index(ctx.recs[ri].fields, f)
 			if fi < 0 then die("cf0: type: mutating a field the record does not declare\n")
 			const Ty ft = field_decl_ty(ri, fi, ctx)
+			# region-outlives: rehoming a pointer into a caller-provided aggregate (an `outer` param, which
+			# OUTLIVES this call) may not store a pointer into a function-LOCAL — it would dangle once the
+			# local dies (memory_model §6). A store into a local record is same-rank and permitted.
+			if env[idx].outer && carries_local(e, env) then die("cf0: type: cannot rehome a pointer into a local through a caller's aggregate — it would dangle once the call returns\n")
 			if !ty_eq(type_of(e, env, ctx), ft) then die("cf0: type: a field value's type must match the field\n")
 		},
 		Stmt.IndexAssign(a, ix, val) -> {
@@ -2209,12 +2291,12 @@ const check_closure = (Str nm, [Param] params, Str ret, [Stmt] body, [VarTy] env
 	loop {
 		if pi >= Iarch(params.len) then break
 		check_ptr_pointee(params[pi], ctx.recs, ctx.unions)
-		cenv = [...cenv, VarTy({ name: params[pi].name, ty: param_ty(params[pi], ctx.recs, ctx.unions), mutable: false })]
+		cenv = [...cenv, VarTy({ name: params[pi].name, ty: param_ty(params[pi], ctx.recs, ctx.unions), mutable: false, esc: false, outer: false })]
 		pi = pi + 1
 	}
 	const Iarch dr = check_stmts(body, cenv, cctx, lk_none)
 	if dr != 2 then die("cf0: type: a closure body must end with `return`\n")
-	return [...env, VarTy({ name: nm, ty: closure_tfn(ret, params), mutable: false })]
+	return [...env, VarTy({ name: nm, ty: closure_tfn(ret, params), mutable: false, esc: false, outer: false })]
 }
 
 const check_stmts = ([Stmt] stmts, [VarTy] env0, Ctx ctx, Iarch loop_kind): Iarch -> {
@@ -2240,7 +2322,9 @@ const check_stmts = ([Stmt] stmts, [VarTy] env0, Ctx ctx, Iarch loop_kind): Iarc
 				const Ty ty = binding_ty(ann, e, env, ctx)
 				if m && is_ttuple(ty) then die("cf0: type: a tuple binds `const` only (a mutable tuple is a later brick)\n")
 				if is_ttuple(ty) && !is_tuple_bindable(e) then die("cf0: type: this expression cannot bind a tuple\n")
-				env = [...env, VarTy({ name: n, ty: ty, mutable: m })]
+				# a binding inherits the region-outlives taint of its initializer: `const *P p = &x`, or a
+				# `let q = p` that launders one, carries a local pointer that a later escape must catch.
+				env = [...env, VarTy({ name: n, ty: ty, mutable: m, esc: carries_local(e, env), outer: false })]
 			},
 			Stmt.Destructure(pat, m, e) -> { env = check_destructure(pat, m, e, env, ctx) },
 			Stmt.Closure(nm, params, ret, body) -> { env = check_closure(nm, params, ret, body, env, ctx) },
@@ -2442,7 +2526,9 @@ const check_func = (Func fn, Ctx ctx): Iarch -> {
 		const Ty pty = param_ty(fn.params[pi], ctx.recs, ctx.unions)
 		# a `*Record` pointer parameter is mutable — its fields are written through it
 		const Bool pmut = param_is_recptr(fn.params[pi], ctx.recs) || param_is_indexptr(fn.params[pi])
-		env = [...env, VarTy({ name: fn.params[pi].name, ty: pty, mutable: pmut })]
+		# a `*T` pointer parameter is a caller-provided home that OUTLIVES this call (`outer`): the
+		# region-outlives check rejects rehoming a pointer-into-local through it (memory_model §6).
+		env = [...env, VarTy({ name: fn.params[pi].name, ty: pty, mutable: pmut, esc: false, outer: fn.params[pi].is_ptr })]
 		pi = pi + 1
 	}
 	# a closure is admitted only as a direct function-body statement (v1); reject one buried in
