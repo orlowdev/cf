@@ -1065,10 +1065,78 @@ const str_match_type = (Ty sty, [MatchArm] arms, [VarTy] env, Ctx ctx): Ty -> {
 	}
 	return rty
 }
+# An INTEGER match — the first non-wildcard arm carries the sentinel type_name "$int" (the parser's
+# integer-literal arm). Its arms are constant integer patterns compared for equality, so a `_` is
+# always required (the domain is open), and a repeated literal is rejected.
+const arms_are_int = ([MatchArm] arms): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		if !arms[i].is_wild then return str_eq(arms[i].type_name, "$int")
+		i = i + 1
+	}
+	return false
+}
+# Validate an integer match's ARM METADATA: the scrutinee must be an integer (a word or a
+# fixed-width), no arm may follow `_`, every non-wildcard arm must be an "$int" arm (no union
+# mixing), no literal repeated across the match, and a `_` is mandatory. Returns 0 on success.
+const check_int_arms = (Ty sty, [Iarch] wilds, [Str] tns, [[Str]] memss): Iarch -> {
+	if !is_tint(sty) && !is_tfixed(sty) then die("cf0: type: an integer match arm requires an integer scrutinee\n")
+	const Iarch na = Iarch(wilds.len)
+	if na == 0 then die("cf0: type: a match needs at least one arm\n")
+	let [Str] seen = []
+	let Bool wild_seen = false
+	let Iarch i = 0
+	loop {
+		if i >= na then break
+		if wild_seen then die("cf0: type: no match arm may follow a `_` wildcard\n")
+		if wilds[i] == 1 then { wild_seen = true }
+		else {
+			if !str_eq(tns[i], "$int") then die("cf0: type: an integer match cannot mix integer and union arms\n")
+			let Iarch mj = 0
+			loop {
+				if mj >= Iarch(memss[i].len) then break
+				let Iarch d = 0
+				loop {
+					if d >= Iarch(seen.len) then break
+					if str_eq(seen[d], memss[i][mj]) then die("cf0: type: a duplicate integer match pattern\n")
+					d = d + 1
+				}
+				seen = [...seen, memss[i][mj]]
+				mj = mj + 1
+			}
+		}
+		i = i + 1
+	}
+	if !wild_seen then die("cf0: type: an integer match must carry a `_` (it is never exhaustive)\n")
+	return 0
+}
+const int_match_type = (Ty sty, [MatchArm] arms, [VarTy] env, Ctx ctx): Ty -> {
+	let [Iarch] wilds = []
+	let [Str] tns = []
+	let Iarch j = 0
+	loop {
+		if j >= Iarch(arms.len) then break
+		if arms[j].is_wild then wilds = [...wilds, 1] else wilds = [...wilds, 0]
+		tns = [...tns, arms[j].type_name]
+		j = j + 1
+	}
+	check_int_arms(sty, wilds, tns, match_arm_meta(arms))
+	const Ty rty = type_arm_body(arms[0], env, ctx)
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		if !ty_eq(type_arm_body(arms[i], env, ctx), rty) then die("cf0: type: all match arms must have the same type\n")
+		i = i + 1
+	}
+	return rty
+}
 const match_type = (Expr scrut, [MatchArm] arms, [VarTy] env, Ctx ctx): Ty -> {
 	const Ty sty = type_of(scrut, env, ctx)
 	# a STRING match (`match s { "add" -> …, _ -> … }`) — arms are constant Str patterns, not union members
 	if arms_are_str(arms) then return str_match_type(sty, arms, env, ctx)
+	# an INTEGER match (`match n { 0 -> …, 1 | 2 -> …, _ -> … }`) — arms are constant integer patterns
+	if arms_are_int(arms) then return int_match_type(sty, arms, env, ctx)
 	# a `Bool` scrutinee matches as the tag-only union `{ False, True }` (§8.6) — `Bool` is not in
 	# the union tables (it is the primitive `TBool`), so its members come from `bool_members()`
 	let Str un = union_of(sty)

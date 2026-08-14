@@ -560,6 +560,30 @@ const parse_union_mk = (*Parser p, Str type_name, Str member): Expr -> {
 	return Expr.UnionMk(type_name, member, args)
 }
 
+# The signed decimal spelling of an integer value — used to normalize an integer match arm's
+# literal (so different bases collapse to one canonical key `members` compares and emit uses).
+const int_to_dec = (Iarch v): Str -> {
+	if v == 0 then return "0"
+	let Bool neg = v < 0
+	let Iarch x = v
+	if neg then x = 0 - v
+	let [Uint8] rev = []
+	loop {
+		if x == 0 then break
+		rev = [...rev, Uint8(48 + (x % 10))]
+		x = x / 10
+	}
+	let [Uint8] out = []
+	if neg then out = [...out, Uint8(45)] # '-'
+	let Iarch i = Iarch(rev.len) - 1
+	loop {
+		if i < 0 then break
+		out = [...out, rev[i]]
+		i = i - 1
+	}
+	return Str(out)
+}
+
 # Parse a `match` arm's PATTERN and the `->` that follows, returning a `MatchArm` whose
 # body is a placeholder (`Expr.Lit(0)`) the caller replaces. Shared by the expression-arm
 # (`parse_arm`, body = an expression) and the statement-arm (`parse_stmt_arm`, body = a
@@ -588,6 +612,28 @@ const parse_arm_head = (*Parser p): MatchArm -> {
 		if !is_arrow(peek(p)) then die("cf0: parse: expected `->` in a match arm\n")
 		p.pos = p.pos + 1
 		return MatchArm({ is_wild: false, type_name: "$str", members: pats, binds: nob, body: Expr.Lit(0) })
+	}
+	# an INTEGER-literal match arm — word/fixed-width equality dispatch (`0 -> …`), with `|`
+	# or-alternatives (`1 | 2 | 3`) and negative literals (`-5 -> …`). The literal VALUES normalized
+	# to decimal (so different bases collapse) ride in `members` under the sentinel type_name "$int";
+	# a `_` is always required (the integer domain is open).
+	if is_intlit(peek(p)) || is_minus(peek(p)) then {
+		let [Str] pats = []
+		const [Str] nob = []
+		loop {
+			let Bool neg = false
+			if is_minus(peek(p)) then { neg = true  p.pos = p.pos + 1 }
+			if !is_intlit(peek(p)) then die("cf0: parse: expected an integer pattern\n")
+			let Iarch v = p.toks[p.pos].ival
+			if neg then v = 0 - v
+			pats = [...pats, int_to_dec(v)]
+			p.pos = p.pos + 1
+			if !is_pipe(peek(p)) then break
+			p.pos = p.pos + 1
+		}
+		if !is_arrow(peek(p)) then die("cf0: parse: expected `->` in a match arm\n")
+		p.pos = p.pos + 1
+		return MatchArm({ is_wild: false, type_name: "$int", members: pats, binds: nob, body: Expr.Lit(0) })
 	}
 	if !is_ident(peek(p)) then die("cf0: parse: expected a match-arm pattern\n")
 	let Str first = cur_name(p)
