@@ -661,12 +661,52 @@ const emit_str_seal = (*Emit ctx, Str vec): Str -> {
 # so it outlives the current stack frame and may be returned), store each
 # initializer at its field's offset, and return the base-pointer temp. Field
 # initializers may be given in any order; each maps to its declared offset.
+# The init index whose (non-spread) field is `fname`, or -1 — the override for a spread-copied field.
+const find_override = ([FieldInit] inits, Str fname): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(inits.len) then break
+		if !str_eq(inits[i].field, "$spread") && str_eq(inits[i].field, fname) then return i
+		i = i + 1
+	}
+	return 0 - 1
+}
 const emit_record_lit = (*Emit ctx, Str type_name, [FieldInit] inits, [Binding] env): Iarch -> {
 	const Iarch ri = find_rec(ctx.recs, type_name)
-	const Iarch size = Iarch(ctx.recs[ri].fields.len) * 8
+	const Iarch nfld = Iarch(ctx.recs[ri].fields.len)
+	const Iarch size = nfld * 8
 	const Iarch base = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${base} =l call $cf_alloc(w ${size})\n")
+	# a VALUE spread `{ ...src, … }`: fill each field in declaration order — from its override if
+	# present, else COPY the source's word at that offset (typecheck guarantees copied fields are
+	# words, never aliasing pointers). The source's base pointer is the spread value.
+	if Iarch(inits.len) > 0 && str_eq(inits[0].field, "$spread") then {
+		const Str srcbp = emit_expr(inits[0].value, ctx, env)
+		let Iarch f = 0
+		loop {
+			if f >= nfld then break
+			const Iarch off = f * 8
+			const Iarch addr = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${addr} =l add %t${base}, ${off}\n")
+			const Iarch ov = find_override(inits, ctx.recs[ri].fields[f])
+			if ov >= 0 then {
+				const Str v = emit_expr(inits[ov].value, ctx, env)
+				write_str(ctx.fd, "\tstorel ${v}, %t${addr}\n")
+			} else {
+				const Iarch sa = ctx.next
+				ctx.next = ctx.next + 1
+				write_str(ctx.fd, "\t%t${sa} =l add ${srcbp}, ${off}\n")
+				const Iarch sv = ctx.next
+				ctx.next = ctx.next + 1
+				write_str(ctx.fd, "\t%t${sv} =l loadl %t${sa}\n")
+				write_str(ctx.fd, "\tstorel %t${sv}, %t${addr}\n")
+			}
+			f = f + 1
+		}
+		return base
+	}
 	let Iarch a = 0
 	loop {
 		if a >= Iarch(inits.len) then break
@@ -675,13 +715,8 @@ const emit_record_lit = (*Emit ctx, Str type_name, [FieldInit] inits, [Binding] 
 		const Iarch addr = ctx.next
 		ctx.next = ctx.next + 1
 		write_str(ctx.fd, "\t%t${addr} =l add %t${base}, ${off}\n")
-		# a pointer field (Str/[T]/record/boxed union) stores the 8-byte pointer; a word
-		# field (Iarch/Bool/tag-only union) stores its value in the low 4 bytes.
-		if field_is_ptr(ctx, type_name, inits[a].field) then {
-			write_str(ctx.fd, "\tstorel ${v}, %t${addr}\n")
-		} else {
-			write_str(ctx.fd, "\tstorel ${v}, %t${addr}\n")
-		}
+		# a word or pointer field alike stores 8 bytes (`storel`) at the field's slot
+		write_str(ctx.fd, "\tstorel ${v}, %t${addr}\n")
 		a = a + 1
 	}
 	return base

@@ -758,35 +758,83 @@ const call_type = (Str callee, [Str] tyargs, [Expr] args, [VarTy] env, Ctx ctx):
 
 # `{ f: v, … }` — the record type must exist and the literal must set every declared
 # field exactly once (order-independent), each with an integer value.
+# Whether field `fname` has an explicit (non-spread) override among a data literal's inits.
+const is_overridden = ([FieldInit] inits, Str fname): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(inits.len) then break
+		if !str_eq(inits[i].field, "$spread") && str_eq(inits[i].field, fname) then return true
+		i = i + 1
+	}
+	return false
+}
+# Whether a field's type is stored as an 8-byte POINTER (a record/array/Str/tuple/byte-ptr or a
+# boxed union) rather than a word — such a field cannot be spread-COPIED (a shallow copy aliases).
+const is_ptr_field_ty = (Ty ft, Ctx ctx): Bool -> match ft {
+	Ty.TRec(n) -> true,
+	Ty.TDyn(n) -> true,
+	Ty.TStr -> true,
+	Ty.TTuple(e) -> true,
+	Ty.TPtr -> true,
+	Ty.TUnion(n) -> union_has_payload(ctx.unions, n),
+	_ -> false
+}
 const record_type = (Str type_name, [FieldInit] inits, [VarTy] env, Ctx ctx): Ty -> {
 	const Iarch ri = find_rec(ctx.recs, type_name)
 	if ri < 0 then die("cf0: type: unknown record type in a data literal\n")
 	const Iarch nf = Iarch(ctx.recs[ri].fields.len)
 	const Iarch ni = Iarch(inits.len)
-	if ni != nf then die("cf0: type: a data literal must set every field exactly once\n")
+	# a VALUE spread `{ ...src, … }` — must be the FIRST entry, single, and copy a record of the SAME
+	# type; the overrides that follow are a subset (the spread supplies the remaining fields)
+	let Bool has_spread = false
+	let Iarch s = 0
+	loop {
+		if s >= ni then break
+		if str_eq(inits[s].field, "$spread") then {
+			if s != 0 then die("cf0: type: a value spread `...` must be the first entry in a data literal\n")
+			has_spread = true
+			const Ty srct = type_of(inits[s].value, env, ctx)
+			if !str_eq(rec_of(srct), type_name) then die("cf0: type: a value spread source must be a record of the same type\n")
+		}
+		s = s + 1
+	}
+	if !has_spread then { if ni != nf then die("cf0: type: a data literal must set every field exactly once\n") }
 	let Iarch a = 0
 	loop {
 		if a >= ni then break
-		const Iarch fi = field_index(ctx.recs[ri].fields, inits[a].field)
-		if fi < 0 then die("cf0: type: unknown field in a data literal\n")
-		let Iarch b = 0
-		loop {
-			if b >= a then break
-			if str_eq(inits[b].field, inits[a].field) then die("cf0: type: a field is set twice in a data literal\n")
-			b = b + 1
-		}
-		const Ty ft = field_decl_ty(ri, fi, ctx)
-		# a bare `[]` field value adopts the field's declared element type (context-directed —
-		# `type_of` would default it to `[Iarch]` and spuriously mismatch a `[Str]`/`[T]` field)
-		if is_empty_arraylit(inits[a].value) then {
-			if str_eq(dyn_of(ft), "") then die("cf0: type: `[]` may only initialize a dynamic-array field\n")
-		} else if is_tfixed(ft) && is_adoptable_lit(inits[a].value) then {
-			# a bare integer literal adopts the fixed-width field's type (range-checked), as at a `let`
-			fixed_lit_fits(inits[a].value, tfixed_bits(ft), tfixed_signed(ft))
-		} else {
-			if !ty_eq(type_of(inits[a].value, env, ctx), ft) then die("cf0: type: a data-literal field value's type must match the field\n")
+		if !str_eq(inits[a].field, "$spread") then {
+			const Iarch fi = field_index(ctx.recs[ri].fields, inits[a].field)
+			if fi < 0 then die("cf0: type: unknown field in a data literal\n")
+			let Iarch b = 0
+			loop {
+				if b >= a then break
+				if !str_eq(inits[b].field, "$spread") && str_eq(inits[b].field, inits[a].field) then die("cf0: type: a field is set twice in a data literal\n")
+				b = b + 1
+			}
+			const Ty ft = field_decl_ty(ri, fi, ctx)
+			# a bare `[]` field value adopts the field's declared element type (context-directed —
+			# `type_of` would default it to `[Iarch]` and spuriously mismatch a `[Str]`/`[T]` field)
+			if is_empty_arraylit(inits[a].value) then {
+				if str_eq(dyn_of(ft), "") then die("cf0: type: `[]` may only initialize a dynamic-array field\n")
+			} else if is_tfixed(ft) && is_adoptable_lit(inits[a].value) then {
+				# a bare integer literal adopts the fixed-width field's type (range-checked), as at a `let`
+				fixed_lit_fits(inits[a].value, tfixed_bits(ft), tfixed_signed(ft))
+			} else {
+				if !ty_eq(type_of(inits[a].value, env, ctx), ft) then die("cf0: type: a data-literal field value's type must match the field\n")
+			}
 		}
 		a = a + 1
+	}
+	# a spread that COPIES (does not override) a POINTER field would shallow-copy an aliasing pointer
+	if has_spread then {
+		let Iarch f = 0
+		loop {
+			if f >= nf then break
+			if !is_overridden(inits, ctx.recs[ri].fields[f]) then {
+				if is_ptr_field_ty(field_decl_ty(ri, f, ctx), ctx) then die("cf0: type: a value spread cannot copy an aggregate field (a shallow copy would alias) — override it explicitly\n")
+			}
+			f = f + 1
+		}
 	}
 	return Ty.TRec(type_name)
 }
