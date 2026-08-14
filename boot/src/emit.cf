@@ -1565,6 +1565,8 @@ const scrut_tag = (*Emit ctx, Str un, Str s): Str -> {
 	if str_eq(un, "") then return s
 	# a `Bool` scrutinee IS its tag word (0/1, §8.6); it is not a table union so skip the boxed check
 	if str_eq(un, "Bool") then return s
+	# a string match ("$str") compares the scrutinee Str directly (`cf_str_eq`), not a tag
+	if str_eq(un, "$str") then return s
 	if !union_is_boxed(ctx.unions, un) then return s
 	const Iarch t = ctx.next
 	ctx.next = ctx.next + 1
@@ -1577,6 +1579,26 @@ const scrut_tag = (*Emit ctx, Str un, Str s): Str -> {
 # a hit, evaluates its body into the result slot and jumps to the end; the LAST arm (a
 # `_` wildcard, or — for an exhaustive match — the final member) is the unconditional
 # else. The result merges through a stack slot, like `if`.
+# Materialize a string `match` PATTERN (its bytes ride in the arm's `members` as a `Str`) into a
+# runtime Str header the compare can pass to `cf_str_eq`. Reuses the string-literal emitter.
+const emit_str_pattern = (*Emit ctx, Str pat): Str -> {
+	let [Uint8] b = []
+	let Iarch i = 0
+	loop { if i >= Iarch(pat.len) then break  b = [...b, pat[i]]  i = i + 1 }
+	return emit_str_lit(ctx, b)
+}
+# The per-alternative test in a `match` compare-chain: string equality (`cf_str_eq`) for a "$str"
+# arm, else a union tag compare (`ceql`). Writes `%t<c> =l …` and returns nothing.
+const emit_arm_test = (*Emit ctx, Str type_name, Str member, Str scrut, Str tagop, Iarch c): Iarch -> {
+	if str_eq(type_name, "$str") then {
+		const Str patstr = emit_str_pattern(ctx, member)
+		write_str(ctx.fd, "\t%t${c} =l call $cf_str_eq(l ${scrut}, l ${patstr})\n")
+	} else {
+		const Iarch tag = member_tag(ctx.unions, type_name, member)
+		write_str(ctx.fd, "\t%t${c} =l ceql ${tagop}, ${tag}\n")
+	}
+	return 0
+}
 const emit_match = (*Emit ctx, Expr scrut, [MatchArm] arms, [Binding] env): Str -> {
 	const Str s = emit_expr(scrut, ctx, env)
 	const Str tagop = scrut_tag(ctx, match_union(arms), s)
@@ -1603,10 +1625,9 @@ const emit_match = (*Emit ctx, Expr scrut, [MatchArm] arms, [Binding] env): Str 
 			let Iarch j = 0
 			loop {
 				if j >= k then break
-				const Iarch tag = member_tag(ctx.unions, arms[i].type_name, arms[i].members[j])
 				const Iarch c = ctx.next
 				ctx.next = ctx.next + 1
-				write_str(ctx.fd, "\t%t${c} =l ceql ${tagop}, ${tag}\n")
+				emit_arm_test(ctx, arms[i].type_name, arms[i].members[j], s, tagop, c)
 				if j == k - 1 then write_str(ctx.fd, "\tjnz %t${c}, @marm${lid}_${i}, @mnext${lid}_${i}\n")
 				if j != k - 1 then {
 					write_str(ctx.fd, "\tjnz %t${c}, @marm${lid}_${i}, @malt${lid}_${i}_${j}\n")
@@ -1668,10 +1689,9 @@ const emit_stmt_match = (*Emit ctx, [Binding] env, Expr scrut, [StmtArm] arms): 
 			let Iarch j = 0
 			loop {
 				if j >= k then break
-				const Iarch tag = member_tag(ctx.unions, arms[i].type_name, arms[i].members[j])
 				const Iarch c = ctx.next
 				ctx.next = ctx.next + 1
-				write_str(ctx.fd, "\t%t${c} =l ceql ${tagop}, ${tag}\n")
+				emit_arm_test(ctx, arms[i].type_name, arms[i].members[j], s, tagop, c)
 				if j == k - 1 then write_str(ctx.fd, "\tjnz %t${c}, @sarm${lid}_${i}, @snext${lid}_${i}\n")
 				if j != k - 1 then {
 					write_str(ctx.fd, "\tjnz %t${c}, @sarm${lid}_${i}, @salt${lid}_${i}_${j}\n")
@@ -2717,6 +2737,43 @@ const emit_arena_qbe = (Uarch fd): Iarch -> {
 	write_str(fd, "\tjmp @sloop\n")
 	write_str(fd, "@sdone\n")
 	write_str(fd, "\tret\n")
+	write_str(fd, "}\n")
+	# cf_str_eq(a, b) — Str value equality (used by string `match`): compare the low word of the
+	# `len@8` slot (LE, matching `cf_str_append`), then the `bytes@0` run byte-for-byte; returns
+	# 1 if equal, 0 otherwise. Length-driven, so an interior NUL and an empty string compare right.
+	write_str(fd, "function l $cf_str_eq(l %a, l %b) {\n")
+	write_str(fd, "@start\n")
+	write_str(fd, "\t%la =l add %a, 8\n")
+	write_str(fd, "\t%law =w loadw %la\n")
+	write_str(fd, "\t%lb =l add %b, 8\n")
+	write_str(fd, "\t%lbw =w loadw %lb\n")
+	write_str(fd, "\t%lne =w cnew %law, %lbw\n")
+	write_str(fd, "\tjnz %lne, @neq, @lenok\n")
+	write_str(fd, "@lenok\n")
+	write_str(fd, "\t%len =l extuw %law\n")
+	write_str(fd, "\t%ba =l loadl %a\n")
+	write_str(fd, "\t%bb =l loadl %b\n")
+	write_str(fd, "\t%ip =l alloc8 8\n")
+	write_str(fd, "\tstorel 0, %ip\n")
+	write_str(fd, "@eloop\n")
+	write_str(fd, "\t%i =l loadl %ip\n")
+	write_str(fd, "\t%done =w cugel %i, %len\n")
+	write_str(fd, "\tjnz %done, @eq, @estep\n")
+	write_str(fd, "@estep\n")
+	write_str(fd, "\t%pa =l add %ba, %i\n")
+	write_str(fd, "\t%ca =w loadub %pa\n")
+	write_str(fd, "\t%pb =l add %bb, %i\n")
+	write_str(fd, "\t%cb =w loadub %pb\n")
+	write_str(fd, "\t%bne =w cnew %ca, %cb\n")
+	write_str(fd, "\tjnz %bne, @neq, @econt\n")
+	write_str(fd, "@econt\n")
+	write_str(fd, "\t%i1 =l add %i, 1\n")
+	write_str(fd, "\tstorel %i1, %ip\n")
+	write_str(fd, "\tjmp @eloop\n")
+	write_str(fd, "@eq\n")
+	write_str(fd, "\tret 1\n")
+	write_str(fd, "@neq\n")
+	write_str(fd, "\tret 0\n")
 	write_str(fd, "}\n")
 	return 0
 }
