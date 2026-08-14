@@ -569,7 +569,7 @@ const emit_field = (*Emit ctx, [Binding] env, Str base, Str field): Str -> {
 	}
 	# a dynamic array's `.len` — loadl the header's len@8
 	if str_eq(rt, "$dyn") then return load_at(ctx, bp, 8)
-	return load_at(ctx, bp, field_offset(ctx.recs, rt, field))
+	return load_field_at(ctx, bp, field_offset(ctx.recs, rt, field), field_scalar(ctx, rt, field))
 }
 
 # Emit a string literal: materialize its bytes in the arena (a byte buffer written one
@@ -617,6 +617,25 @@ const load_at = (*Emit ctx, Str base, Iarch off): Str -> {
 	write_str(ctx.fd, "\t%t${v} =l loadl %t${a}\n")
 	return "%t${v}"
 }
+# Load the value at an already-computed address `addr` in its scalar QBE type: a FLOAT reads with
+# `loadd`/`loads` into a `d`/`s` temp, everything else (`scalar` = "" / a fixed-width) with `loadl`.
+const load_typed = (*Emit ctx, Str addr, Str scalar): Str -> {
+	const Str qt = if is_float_name(scalar) then float_qt(scalar) else "l"
+	const Iarch v = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${v} =${qt} load${qt} ${addr}\n")
+	return "%t${v}"
+}
+# Load a field slot at `base + off` in its scalar QBE type: a FLOAT field reads with `loadd`/`loads`
+# into a `d`/`s` temp (so a `p.x + p.y` picks up float operands), everything else (word / pointer /
+# fixed-width, `scalar` = "") reads 8 bytes with `loadl` — identical to `load_at`.
+const load_field_at = (*Emit ctx, Str base, Iarch off, Str scalar): Str -> {
+	if !is_float_name(scalar) then return load_at(ctx, base, off)
+	const Iarch a = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${a} =l add ${base}, ${off}\n")
+	return load_typed(ctx, "%t${a}", scalar)
+}
 
 # Emit `base.field` on a general expression base. Emit the base to a pointer, then read
 # the field: a `$dyn` array's `.len` @8; a `Str`'s `.bytes` @0 or `.len` @8; a RECORD base
@@ -632,8 +651,8 @@ const emit_field_expr = (*Emit ctx, [Binding] env, Expr base, Str field): Str ->
 		if str_eq(field, "bytes") then return load_at(ctx, b, 0)
 		return load_at(ctx, b, 8)
 	}
-	# a record base — read the field at its declared offset
-	return load_at(ctx, b, field_offset(ctx.recs, bt, field))
+	# a record base — read the field at its declared offset (a float field reads as `d`/`s`)
+	return load_field_at(ctx, b, field_offset(ctx.recs, bt, field), field_scalar(ctx, bt, field))
 }
 
 # Emit an interpolated string `"…${name}…"`: build a fresh `[Uint8]` byte vector
@@ -792,8 +811,8 @@ const emit_record_lit = (*Emit ctx, Str type_name, [FieldInit] inits, [Binding] 
 		const Iarch addr = ctx.next
 		ctx.next = ctx.next + 1
 		write_str(ctx.fd, "\t%t${addr} =l add %t${base}, ${off}\n")
-		# a word or pointer field alike stores 8 bytes (`storel`) at the field's slot
-		write_str(ctx.fd, "\tstorel ${v}, %t${addr}\n")
+		# a word or pointer field stores 8 bytes (`storel`); a float field stores `stored`/`stores`
+		write_str(ctx.fd, "\t${store_op(field_scalar(ctx, type_name, inits[a].field))} ${v}, %t${addr}\n")
 		a = a + 1
 	}
 	return base
@@ -2220,10 +2239,7 @@ const emit_index_field = (*Emit ctx, [Binding] env, Str arr, Expr idx, Str field
 		const Iarch tfaddr = ctx.next
 		ctx.next = ctx.next + 1
 		write_str(ctx.fd, "\t%t${tfaddr} =l add %t${trecp}, ${tfoff}\n")
-		const Iarch tval = ctx.next
-		ctx.next = ctx.next + 1
-		write_str(ctx.fd, "\t%t${tval} =l loadl %t${tfaddr}\n")
-		return "%t${tval}"
+		return load_typed(ctx, "%t${tfaddr}", field_scalar(ctx, tn, field))
 	}
 	const Str iv = emit_expr(idx, ctx, env)
 	const Iarch data = ctx.next
@@ -2248,10 +2264,7 @@ const emit_index_field = (*Emit ctx, [Binding] env, Str arr, Expr idx, Str field
 	const Iarch faddr = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${faddr} =l add %t${recp}, ${foff}\n")
-	const Iarch val = ctx.next
-	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${val} =l loadl %t${faddr}\n")
-	return "%t${val}"
+	return load_typed(ctx, "%t${faddr}", field_scalar(ctx, env[ai].elem, field))
 }
 
 # Emit `base[i]` on a general expression base (`p.toks[p.pos]`, `prog.recs[r]`). The base
@@ -2638,7 +2651,8 @@ const emit_simple_stmt = (*Emit ctx, [Binding] env, Stmt s): Iarch -> {
 			const Iarch addr = ctx.next
 			ctx.next = ctx.next + 1
 			write_str(ctx.fd, "\t%t${addr} =l add ${bp}, ${off}\n")
-			write_str(ctx.fd, "\tstorel ${v}, %t${addr}\n")
+			# a float field stores `stored`/`stores`; a word/pointer field `storel`
+			write_str(ctx.fd, "\t${store_op(field_scalar(ctx, rt, f))} ${v}, %t${addr}\n")
 		},
 		Stmt.IndexAssign(a, ix, val) -> {
 			# `arr[idx] = val` — store the value at data + idx*8
