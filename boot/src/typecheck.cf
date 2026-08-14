@@ -779,6 +779,17 @@ const is_ptr_field_ty = (Ty ft, Ctx ctx): Bool -> match ft {
 	Ty.TUnion(n) -> union_has_payload(ctx.unions, n),
 	_ -> false
 }
+# A bare `{ … }` record literal (an inline NESTED literal) — a `Record` whose type_name is empty,
+# to be resolved from its FIELD's declared record type. `record_inits` reads its field inits.
+const is_bare_record = (Expr e): Bool -> match e {
+	Expr.Record(tn, fs) -> str_eq(tn, ""),
+	_ -> false
+}
+const record_inits = (Expr e): [FieldInit] -> {
+	let [FieldInit] r = []
+	match e { Expr.Record(tn, fs) -> { r = fs }, _ -> {} }
+	return r
+}
 const record_type = (Str type_name, [FieldInit] inits, [VarTy] env, Ctx ctx): Ty -> {
 	const Iarch ri = find_rec(ctx.recs, type_name)
 	if ri < 0 then die("cf0: type: unknown record type in a data literal\n")
@@ -816,6 +827,12 @@ const record_type = (Str type_name, [FieldInit] inits, [VarTy] env, Ctx ctx): Ty
 			# `type_of` would default it to `[Iarch]` and spuriously mismatch a `[Str]`/`[T]` field)
 			if is_empty_arraylit(inits[a].value) then {
 				if str_eq(dyn_of(ft), "") then die("cf0: type: `[]` may only initialize a dynamic-array field\n")
+			} else if is_bare_record(inits[a].value) then {
+				# an inline nested `{ … }` — resolved against the field's OWN record type (recursively,
+				# so literals nest to any depth); a bare `{}` on a non-record field is rejected (981)
+				const Str frt = rec_of(ft)
+				if str_eq(frt, "") then die("cf0: type: a bare `{…}` record literal does not fit a non-record field\n")
+				record_type(frt, record_inits(inits[a].value), env, ctx)
 			} else if is_tfixed(ft) && is_adoptable_lit(inits[a].value) then {
 				# a bare integer literal adopts the fixed-width field's type (range-checked), as at a `let`
 				fixed_lit_fits(inits[a].value, tfixed_bits(ft), tfixed_signed(ft))

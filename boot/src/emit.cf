@@ -661,6 +661,25 @@ const emit_str_seal = (*Emit ctx, Str vec): Str -> {
 # so it outlives the current stack frame and may be returned), store each
 # initializer at its field's offset, and return the base-pointer temp. Field
 # initializers may be given in any order; each maps to its declared offset.
+# A bare `{ … }` nested record literal — a `Record` with an empty type_name, typed by its field.
+const is_bare_record_e = (Expr e): Bool -> match e {
+	Expr.Record(tn, fs) -> str_eq(tn, ""),
+	_ -> false
+}
+const record_inits_e = (Expr e): [FieldInit] -> {
+	let [FieldInit] r = []
+	match e { Expr.Record(tn, fs) -> { r = fs }, _ -> {} }
+	return r
+}
+# Emit a data-literal field VALUE: a bare `{ … }` nested literal is built as the field's OWN record
+# type (its base pointer stored like any record field); everything else emits as an ordinary expr.
+const emit_field_value = (*Emit ctx, Str rt, Str fname, Expr val, [Binding] env): Str -> {
+	if is_bare_record_e(val) then {
+		const Iarch b = emit_record_lit(ctx, field_ftype(ctx, rt, fname), record_inits_e(val), env)
+		return "%t${b}"
+	}
+	return emit_expr(val, ctx, env)
+}
 # The init index whose (non-spread) field is `fname`, or -1 — the override for a spread-copied field.
 const find_override = ([FieldInit] inits, Str fname): Iarch -> {
 	let Iarch i = 0
@@ -692,7 +711,7 @@ const emit_record_lit = (*Emit ctx, Str type_name, [FieldInit] inits, [Binding] 
 			write_str(ctx.fd, "\t%t${addr} =l add %t${base}, ${off}\n")
 			const Iarch ov = find_override(inits, ctx.recs[ri].fields[f])
 			if ov >= 0 then {
-				const Str v = emit_expr(inits[ov].value, ctx, env)
+				const Str v = emit_field_value(ctx, type_name, inits[ov].field, inits[ov].value, env)
 				write_str(ctx.fd, "\tstorel ${v}, %t${addr}\n")
 			} else {
 				const Iarch sa = ctx.next
@@ -710,7 +729,7 @@ const emit_record_lit = (*Emit ctx, Str type_name, [FieldInit] inits, [Binding] 
 	let Iarch a = 0
 	loop {
 		if a >= Iarch(inits.len) then break
-		const Str v = emit_expr(inits[a].value, ctx, env)
+		const Str v = emit_field_value(ctx, type_name, inits[a].field, inits[a].value, env)
 		const Iarch off = field_offset(ctx.recs, type_name, inits[a].field)
 		const Iarch addr = ctx.next
 		ctx.next = ctx.next + 1
