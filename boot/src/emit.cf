@@ -873,7 +873,8 @@ const emit_tuple = (*Emit ctx, [Expr] elems, [Binding] env): Str -> {
 			const Iarch addr = ctx.next
 			ctx.next = ctx.next + 1
 			write_str(ctx.fd, "\t%t${addr} =l add %t${base}, ${off}\n")
-			write_str(ctx.fd, "\tstorel ${v}, %t${addr}\n")
+			# a word/pointer element stores 8 bytes (`storel`); a FLOAT element `stored`/`stores`
+			write_str(ctx.fd, "\t${store_op(scalar_of(ctx, env, elems[k]))} ${v}, %t${addr}\n")
 			pos = pos + 1
 		}
 		k = k + 1
@@ -895,7 +896,11 @@ const tuple_lit_index = (Expr idx): Iarch -> match idx { Expr.Lit(v) -> v, _ -> 
 const pos_telem = (*Emit ctx, [Binding] env, Expr e): TupElem -> {
 	const Str at = init_agg_type(ctx, env, e)
 	if str_eq(at, "$tuple") then return tel_nest(init_telems(ctx, env, e))
-	return tel_leaf(at)
+	if !str_eq(at, "") then return tel_leaf(at)
+	# a scalar element: a FLOAT records its type so `t[k]` reloads with `loadd`/`loads`; a word stays ""
+	const Str sc = scalar_of(ctx, env, e)
+	if is_float_name(sc) then return tel_leaf(sc)
+	return tel_leaf("")
 }
 
 const tuple_pos_types = (*Emit ctx, [Binding] env, [Expr] elems): [TupElem] -> {
@@ -1081,6 +1086,9 @@ const emit_destructure = (*Emit ctx, [Binding] env, [Str] pat, Bool mutable, Exp
 			write_str(ctx.fd, "\t%t${ptr} =l loadl %t${saddr}\n")
 			e2 = [...e2, Binding({ name: tok, slot: ptr, rec_type: tel_agg_type(ctx, ptype), elem: "", is_cell: false, telems: tel_sub(ptype), fixed: "" })]
 		} else {
+			# a word or FLOAT position: copy the 8-byte slot into a fresh cell. A float records its
+			# scalar in `fixed` so `binding_ptr` reloads it with `loadd`/`loads` (the copy is bit-preserving).
+			const Str pf = if is_float_name(ptype.name) then ptype.name else ""
 			const Iarch val = ctx.next
 			ctx.next = ctx.next + 1
 			write_str(ctx.fd, "\t%t${val} =l loadl %t${saddr}\n")
@@ -1088,7 +1096,7 @@ const emit_destructure = (*Emit ctx, [Binding] env, [Str] pat, Bool mutable, Exp
 			ctx.next = ctx.next + 1
 			write_str(ctx.fd, "\t%t${cell} =l alloc8 8\n")
 			write_str(ctx.fd, "\tstorel %t${val}, %t${cell}\n")
-			e2 = [...e2, Binding({ name: tok, slot: cell, rec_type: "", elem: "", is_cell: true, telems: [], fixed: "" })]
+			e2 = [...e2, Binding({ name: tok, slot: cell, rec_type: "", elem: "", is_cell: true, telems: [], fixed: pf })]
 		}
 		pos = pos + 1
 		pi = pi + 1
@@ -2152,14 +2160,13 @@ const emit_index = (*Emit ctx, [Binding] env, Str arr, Expr idx): Str -> {
 	# a tuple index `t[k]` (k a comptime literal) loads the k-th 8-byte slot directly — the
 	# binding IS the aggregate (no header/data indirection like a dynamic array).
 	if str_eq(env[ai].rec_type, "$tuple") then {
-		const Iarch toff = tuple_lit_index(idx) * 8
+		const Iarch tk = tuple_lit_index(idx)
+		const Iarch toff = tk * 8
 		const Iarch taddr = ctx.next
 		ctx.next = ctx.next + 1
 		write_str(ctx.fd, "\t%t${taddr} =l add ${hdr}, ${toff}\n")
-		const Iarch tval = ctx.next
-		ctx.next = ctx.next + 1
-		write_str(ctx.fd, "\t%t${tval} =l loadl %t${taddr}\n")
-		return "%t${tval}"
+		# a float position reloads with `loadd`/`loads` (its telem records the type); else `loadl`
+		return load_typed(ctx, "%t${taddr}", scalar_only(telem_name(env[ai].telems, tk)))
 	}
 	# a raw pointer index `p[i]` reads the i-th element at pointer + i*stride (no header): a
 	# `*[Uint8]` byte pointer strides 1 (`loadub`), a `*[Iarch]` word pointer strides 8 (`loadl`).
