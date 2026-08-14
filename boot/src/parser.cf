@@ -380,7 +380,10 @@ const parse_args = (*Parser p): [Expr] -> {
 	let [Expr] args = []
 	if !is_rparen(peek(p)) then {
 		loop {
-			args = [...args, parse_expr(p)]
+			# a `{ … }` argument is a grouped-parameter literal (a bare `Record` with empty type_name,
+			# expanded to positional field values by the resolve group splat)
+			if is_lbrace(peek(p)) then args = [...args, parse_record_lit(p, "")]
+			else args = [...args, parse_expr(p)]
 			if !is_comma(peek(p)) then break
 			p.pos = p.pos + 1
 		}
@@ -777,9 +780,10 @@ const parse_primary = (*Parser p): Expr -> {
 		const Str name = cur_name(p)
 		p.pos = p.pos + 1
 		if is_lparen(peek(p)) then {
-			# `Type({ … })` — an explicit record construction (the same `Expr.Record` the
-			# annotated brace form builds); a `(` followed by anything else is a call.
-			if is_lbrace(p.toks[p.pos + 1].kind) then {
+			# `Type({ … })` — an explicit record construction (a PascalCase type name). A lowercase
+			# name with a `{ … }` argument is instead a grouped-parameter CALL (`sum({ a: 1 })`),
+			# handled by `parse_call`/`parse_args`; any other `(` is an ordinary call.
+			if is_lbrace(p.toks[p.pos + 1].kind) && is_pascal_name(name) then {
 				p.pos = p.pos + 1
 				const Expr rec = parse_record_lit(p, name)
 				if !is_rparen(peek(p)) then die("cf0: parse: expected `)` after a record construction\n")
@@ -1311,6 +1315,13 @@ const parse_block = (*Parser p): [Stmt] -> {
 # --- parameters -----------------------------------------------------------------------
 
 # Byte-wise `Str` equality (duplicate-parameter detection).
+# A PascalCase name (leading A-Z) — a TYPE, so `Name({…})` is a record construction; a lowercase
+# name with a `{…}` argument is instead a grouped-parameter call.
+const is_pascal_name = (Str n): Bool -> {
+	if Iarch(n.len) == 0 then return false
+	const Iarch c = Iarch(n[0])
+	return c >= 65 && c <= 90
+}
 const str_eq = (Str a, Str b): Bool -> {
 	if a.len != b.len then return false
 	let Iarch i = 0
@@ -1844,6 +1855,13 @@ const parse_data = (*Parser p): RecDecl -> {
 	p.pos = p.pos + 1
 	if !is_lbrace(peek(p)) then die("cf0: parse: expected `{` in a data declaration\n")
 	p.pos = p.pos + 1
+	return parse_record_body(p, name, typarams, tbounds)
+}
+
+# Parse a record/group FIELD BODY — the fields between `{` and `}` (the opening `{` already
+# consumed) — into a `RecDecl`. Shared by `data` records and grouped-parameter `type` declarations
+# (§7); each field is a scalar/aggregate/pointer/array/tuple type + a name, with `...Src` spreads.
+const parse_record_body = (*Parser p, Str name, [Str] typarams, [Str] tbounds): RecDecl -> {
 	let [Str] fields = []
 	let [Str] ftypes = []
 	let [Str] felems = []
@@ -1917,6 +1935,40 @@ const parse_data = (*Parser p): RecDecl -> {
 	if !is_rbrace(peek(p)) then die("cf0: parse: expected `}` in a data declaration\n")
 	p.pos = p.pos + 1
 	return RecDecl({ name: name, fields: fields, ftypes: ftypes, felems: felems, ftelems: ftelems, typarams: typarams, tbounds: tbounds })
+}
+
+# A grouped-parameter `type X = { … }` declaration (§7) — a record-shaped parameter bundle. Parsed
+# like a `data` record (into a `RecDecl`), but resolve SPLATS it: a `(X g)` parameter becomes the
+# group's fields, and a `{ … }` call argument expands to positional values. An empty group is
+# rejected here (623); a duplicate field is caught by the shared body parser (like a record).
+# NOTE: `type X = <type-expr>` ALIASES are erased before parse (typealias.cf); only `type X = { … }`
+# groups reach the parser.
+const parse_group = (*Parser p): RecDecl -> {
+	# a group is never `pub` — a `pub type …` is already rejected earlier (typealias.cf)
+	p.pos = p.pos + 1 # `type`
+	if !is_ident(peek(p)) then die("cf0: parse: expected a group type name after `type`\n")
+	const Str name = cur_name(p)
+	p.pos = p.pos + 1
+	let [Str] typarams = []
+	let [Str] tbounds = []
+	if typarams_ahead(p) then { const TyParams tpb = parse_typarams(p)  typarams = tpb.names  tbounds = tpb.bounds }
+	if !is_eq(peek(p)) then die("cf0: parse: expected `=` in a group `type` declaration\n")
+	p.pos = p.pos + 1
+	if !is_lbrace(peek(p)) then die("cf0: parse: expected `{` in a group `type` declaration\n")
+	p.pos = p.pos + 1
+	const RecDecl g = parse_record_body(p, name, typarams, tbounds)
+	if Iarch(g.fields.len) == 0 then die("cf0: parse: a grouped-parameter `type` must declare at least one field\n")
+	# reject a duplicate field name AND a `...` declaration spread (a group is never used as a record,
+	# so neither typecheck-of-use nor the record-spread expansion — which handle these for `data` — runs)
+	let Iarch di = 0
+	loop {
+		if di >= Iarch(g.fields.len) then break
+		if str_eq(g.ftypes[di], "$spread") then die("cf0: parse: a grouped-parameter `type` cannot use a `...` spread\n")
+		let Iarch dj = 0
+		loop { if dj >= di then break  if str_eq(g.fields[dj], g.fields[di]) then die("cf0: parse: a duplicate field in a grouped-parameter `type`\n")  dj = dj + 1 }
+		di = di + 1
+	}
+	return g
 }
 
 # `union Name = { A, B, C }` — a tag-only union declaration (at least one member; a
@@ -2063,6 +2115,7 @@ pub const parse_program = (*Parser p): Program -> {
 	let [RecDecl] recs = []
 	let [UnionDecl] unions = []
 	let [Func] funcs = []
+	let [RecDecl] groups = []
 	loop {
 		if is_eof(peek(p)) then break
 		if kw(p, "import") then {
@@ -2071,9 +2124,13 @@ pub const parse_program = (*Parser p): Program -> {
 			recs = [...recs, parse_data(p)]
 		} else if heads(p, "union") then {
 			unions = [...unions, parse_union(p)]
+		} else if heads(p, "type") then {
+			# only grouped-parameter `type X = { … }` decls reach here — `type` ALIASES are erased
+			# before parse (typealias.cf token pass)
+			groups = [...groups, parse_group(p)]
 		} else {
 			funcs = [...funcs, parse_func(p)]
 		}
 	}
-	return Program({ imports: imports, recs: recs, unions: unions, funcs: funcs })
+	return Program({ imports: imports, recs: recs, unions: unions, funcs: funcs, groups: groups })
 }

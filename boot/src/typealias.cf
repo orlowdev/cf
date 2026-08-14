@@ -135,6 +135,15 @@ const is_type_kw = (*[Uint8] src, [Token] toks, Iarch i): Bool -> {
 	if !is_ident(toks[i].kind) then return false
 	return str_eq(tok_text(src, toks[i]), "type")
 }
+# Whether the `type` token at `i` begins a GROUPED-PARAMETER decl `type X = { … }` (its target is a
+# `{ … }` field body) rather than a `type X = <type>` alias. A group is NEVER generic (628), so its
+# `=` is at i+2 and `{` at i+3. Groups are NOT erased here — they are left whole for the parser.
+const is_group_type = (*[Uint8] src, [Token] toks, Iarch i): Bool -> {
+	if !is_type_kw(src, toks, i) then return false
+	if i + 3 >= Iarch(toks.len) then return false
+	if !is_eq(toks[i + 2].kind) then return false
+	return is_lbrace(toks[i + 3].kind)
+}
 
 pub const strip_type_aliases = (*[Uint8] src, [Token] toks): [Token] -> {
 	# pass 1 — collect every `type Name = Target`
@@ -148,13 +157,18 @@ pub const strip_type_aliases = (*[Uint8] src, [Token] toks): [Token] -> {
 			const Str aname = tok_text(src, toks[i + 1])
 			if i + 2 < Iarch(toks.len) && is_lbracket(toks[i + 2].kind) then die("cf0: type: a generic `type` alias is not supported\n")
 			if i + 2 >= Iarch(toks.len) || !is_eq(toks[i + 2].kind) then die("cf0: parse: expected `=` in a `type` alias\n")
-			const Iarch end = alias_decl_end(src, toks, i)
-			let [Token] tgt = []
-			let Iarch t = i + 3
-			loop { if t >= end then break  tgt = [...tgt, toks[t]]  t = t + 1 }
-			if Iarch(tgt.len) == 0 then die("cf0: parse: a `type` alias needs a target type\n")
-			aliases = [...aliases, Alias({ name: aname, target: tgt })]
-			i = end
+			if is_group_type(src, toks, i) then {
+				# a grouped-parameter `type X = { … }` — not an alias; leave its tokens for the parser
+				i = i + 1
+			} else {
+				const Iarch end = alias_decl_end(src, toks, i)
+				let [Token] tgt = []
+				let Iarch t = i + 3
+				loop { if t >= end then break  tgt = [...tgt, toks[t]]  t = t + 1 }
+				if Iarch(tgt.len) == 0 then die("cf0: parse: a `type` alias needs a target type\n")
+				aliases = [...aliases, Alias({ name: aname, target: tgt })]
+				i = end
+			}
 		} else i = i + 1
 	}
 	if Iarch(aliases.len) == 0 then return toks
@@ -171,7 +185,7 @@ pub const strip_type_aliases = (*[Uint8] src, [Token] toks): [Token] -> {
 	let Iarch k = 0
 	loop {
 		if k >= Iarch(toks.len) then break
-		if is_type_kw(src, toks, k) then k = alias_decl_end(src, toks, k)
+		if is_type_kw(src, toks, k) && !is_group_type(src, toks, k) then k = alias_decl_end(src, toks, k)
 		else {
 			let Bool spliced = false
 			if is_ident(toks[k].kind) then {

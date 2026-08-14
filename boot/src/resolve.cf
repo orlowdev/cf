@@ -820,6 +820,279 @@ const reject_builtin_type_names = ([RecDecl] recs, [UnionDecl] unions): Iarch ->
 	return 0
 }
 
+# --- grouped-parameter `type` splat (§7) -------------------------------------------------------
+# Groups are record-shaped parameter bundles: a `(X g)` parameter becomes X's fields as individual
+# parameters (the body uses the field names bare), and a `{ … }` call argument for a group parameter
+# expands to positional field values in the group's DECLARED order. Fully consumed by resolve.
+
+const find_group = ([RecDecl] groups, Str name): Iarch -> {
+	let Iarch i = 0
+	loop { if i >= Iarch(groups.len) then break  if str_eq(groups[i].name, name) then return i  i = i + 1 }
+	return 0 - 1
+}
+const param_is_group = (Param p, [RecDecl] groups): Bool -> {
+	if p.is_ptr then return false
+	return find_group(groups, p.type_name) >= 0
+}
+# The fi-th field of a group as a Param (preserving `$dyn`/`$tuple`/`$ptr` field shapes).
+const group_field_param = (RecDecl g, Iarch fi): Param -> {
+	const Str ft = g.ftypes[fi]
+	const [TupElem] no_tel = []
+	if str_eq(ft, "$dyn") then return Param({ name: g.fields[fi], is_ptr: false, type_name: "$dyn", elem: g.felems[fi], telems: no_tel })
+	if str_eq(ft, "$tuple") then return Param({ name: g.fields[fi], is_ptr: false, type_name: "$tuple", elem: "", telems: g.ftelems[fi] })
+	if str_eq(ft, "$ptr") then return Param({ name: g.fields[fi], is_ptr: true, type_name: "$ptr", elem: "", telems: no_tel })
+	return Param({ name: g.fields[fi], is_ptr: false, type_name: ft, elem: "", telems: no_tel })
+}
+# Expand a function's parameters: a group parameter `(X g)` becomes X's fields (in order); others
+# pass through. A duplicate parameter name after splatting (a field colliding with another param) is
+# a duplicate-parameter error (627).
+const splat_params = ([RecDecl] groups, [Param] params): [Param] -> {
+	let [Param] out = []
+	let [Str] names = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(params.len) then break
+		if param_is_group(params[i], groups) then {
+			const RecDecl g = groups[find_group(groups, params[i].type_name)]
+			let Iarch f = 0
+			loop {
+				if f >= Iarch(g.fields.len) then break
+				const Param fp = group_field_param(g, f)
+				if has_name(names, fp.name) then die("cf0: type: a grouped parameter's field collides with another parameter\n")
+				out = [...out, fp]
+				names = [...names, fp.name]
+				f = f + 1
+			}
+		} else {
+			if has_name(names, params[i].name) then die("cf0: type: a duplicate parameter name\n")
+			out = [...out, params[i]]
+			names = [...names, params[i].name]
+		}
+		i = i + 1
+	}
+	return out
+}
+# A bare `{ … }` group-literal argument (a `Record` with an empty type_name) and its inits.
+const is_bare_record_r = (Expr e): Bool -> match e { Expr.Record(tn, fs) -> str_eq(tn, ""), _ -> false }
+const record_inits_r = (Expr e): [FieldInit] -> {
+	let [FieldInit] r = []
+	match e { Expr.Record(tn, fs) -> { r = fs }, _ -> {} }
+	return r
+}
+# Expand a group-literal argument `{ f1: v1, … }` into positional field values in the GROUP's field
+# order. Every group field must be present exactly once (a missing field 634 or extra field 635 is
+# rejected); each value is itself splatted (a nested group call).
+const expand_group_lit = ([RecDecl] groups, RecDecl g, [FieldInit] inits): [Expr] -> {
+	if Iarch(inits.len) != Iarch(g.fields.len) then die("cf0: type: a group literal must set every field of the group exactly once\n")
+	let [Expr] vals = []
+	let Iarch f = 0
+	loop {
+		if f >= Iarch(g.fields.len) then break
+		let Iarch found = 0 - 1
+		let Iarch k = 0
+		loop {
+			if k >= Iarch(inits.len) then break
+			if str_eq(inits[k].field, g.fields[f]) then { found = k  k = Iarch(inits.len) } else k = k + 1
+		}
+		if found < 0 then die("cf0: type: a group literal is missing a field of the group\n")
+		vals = [...vals, inits[found].value]
+		f = f + 1
+	}
+	return vals
+}
+const splat_call = (Str callee, [Str] ta, [Expr] args, [Func] funcs, [RecDecl] groups): Expr -> {
+	# recurse into every argument first (nested calls / literals)
+	let [Expr] sargs = []
+	let Iarch a0 = 0
+	loop { if a0 >= Iarch(args.len) then break  sargs = [...sargs, splat_expr(args[a0], funcs, groups)]  a0 = a0 + 1 }
+	# does the callee have group parameters? (look up its ORIGINAL, pre-splat signature)
+	const Iarch fi = find_func_r(funcs, callee)
+	if fi < 0 then return Expr.Call(callee, ta, sargs)
+	const [Param] ps = funcs[fi].params
+	let Bool any_group = false
+	let Iarch pg = 0
+	loop { if pg >= Iarch(ps.len) then break  if param_is_group(ps[pg], groups) then any_group = true  pg = pg + 1 }
+	if !any_group then return Expr.Call(callee, ta, sargs)
+	# a grouped-parameter callee must be called with one argument per ORIGINAL parameter
+	if Iarch(sargs.len) != Iarch(ps.len) then die("cf0: type: a grouped-parameter call needs one argument per parameter (a `{…}` for each group)\n")
+	let [Expr] out = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ps.len) then break
+		if param_is_group(ps[i], groups) then {
+			if !is_bare_record_r(sargs[i]) then die("cf0: type: a grouped parameter must be passed a `{…}` literal argument\n")
+			const RecDecl g = groups[find_group(groups, ps[i].type_name)]
+			out = cat_exprs(out, expand_group_lit(groups, g, record_inits_r(sargs[i])))
+		} else {
+			out = [...out, sargs[i]]
+		}
+		i = i + 1
+	}
+	return Expr.Call(callee, ta, out)
+}
+const find_func_r = ([Func] funcs, Str name): Iarch -> {
+	let Iarch i = 0
+	loop { if i >= Iarch(funcs.len) then break  if str_eq(funcs[i].name, name) then return i  i = i + 1 }
+	return 0 - 1
+}
+const cat_exprs = ([Expr] a, [Expr] b): [Expr] -> {
+	let [Expr] o = a
+	let Iarch i = 0
+	loop { if i >= Iarch(b.len) then break  o = [...o, b[i]]  i = i + 1 }
+	return o
+}
+# The call-expanding expression walk — mirrors `mangle_expr`, rewriting only `Call` (via `splat_call`)
+# and recursing everywhere else.
+const splat_exprs = ([Expr] es, [Func] funcs, [RecDecl] groups): [Expr] -> {
+	let [Expr] o = []
+	let Iarch i = 0
+	loop { if i >= Iarch(es.len) then break  o = [...o, splat_expr(es[i], funcs, groups)]  i = i + 1 }
+	return o
+}
+const splat_fields = ([FieldInit] fs, [Func] funcs, [RecDecl] groups): [FieldInit] -> {
+	let [FieldInit] o = []
+	let Iarch i = 0
+	loop { if i >= Iarch(fs.len) then break  o = [...o, FieldInit({ field: fs[i].field, value: splat_expr(fs[i].value, funcs, groups) })]  i = i + 1 }
+	return o
+}
+const splat_arms = ([MatchArm] arms, [Func] funcs, [RecDecl] groups): [MatchArm] -> {
+	let [MatchArm] o = []
+	let Iarch i = 0
+	loop { if i >= Iarch(arms.len) then break  o = [...o, MatchArm({ is_wild: arms[i].is_wild, type_name: arms[i].type_name, members: arms[i].members, binds: arms[i].binds, body: splat_expr(arms[i].body, funcs, groups) })]  i = i + 1 }
+	return o
+}
+const splat_segs = ([Seg] segs, [Func] funcs, [RecDecl] groups): [Seg] -> {
+	let [Seg] o = []
+	let Iarch i = 0
+	loop { if i >= Iarch(segs.len) then break  o = [...o, Seg({ is_hole: segs[i].is_hole, lit: segs[i].lit, name: segs[i].name, expr: splat_expr(segs[i].expr, funcs, groups) })]  i = i + 1 }
+	return o
+}
+const splat_expr = (Expr e, [Func] funcs, [RecDecl] groups): Expr -> match e {
+	Expr.Lit(v) -> Expr.Lit(v),
+	Expr.BoolLit(b) -> Expr.BoolLit(b),
+	Expr.Var(n) -> Expr.Var(n),
+	Expr.StrLit(bs) -> Expr.StrLit(bs),
+	Expr.FloatLit(t) -> Expr.FloatLit(t),
+	Expr.Record(n, fs) -> Expr.Record(n, splat_fields(fs, funcs, groups)),
+	Expr.Field(b, f) -> Expr.Field(b, f),
+	Expr.FieldExpr(b, f) -> Expr.FieldExpr(splat_expr(b, funcs, groups), f),
+	Expr.UnionMk(t, m, args) -> Expr.UnionMk(t, m, splat_exprs(args, funcs, groups)),
+	Expr.Match(scrut, arms) -> Expr.Match(splat_expr(scrut, funcs, groups), splat_arms(arms, funcs, groups)),
+	Expr.ArrayLit(hs, sn, elems, et) -> Expr.ArrayLit(hs, splat_expr(sn, funcs, groups), splat_exprs(elems, funcs, groups), et),
+	Expr.Index(a, i) -> Expr.Index(a, splat_expr(i, funcs, groups)),
+	Expr.IndexField(a, i, f) -> Expr.IndexField(a, splat_expr(i, funcs, groups), f),
+	Expr.IndexExpr(b, i) -> Expr.IndexExpr(splat_expr(b, funcs, groups), splat_expr(i, funcs, groups)),
+	Expr.Tuple(elems) -> Expr.Tuple(splat_exprs(elems, funcs, groups)),
+	Expr.Spread(x) -> Expr.Spread(splat_expr(x, funcs, groups)),
+	Expr.Unit -> Expr.Unit,
+	Expr.Loop(body) -> Expr.Loop(splat_stmts(body, funcs, groups)),
+	Expr.Interp(segs) -> Expr.Interp(splat_segs(segs, funcs, groups)),
+	Expr.Buffer(sz) -> Expr.Buffer(splat_expr(sz, funcs, groups)),
+	Expr.Addr(name) -> Expr.Addr(name),
+	Expr.Neg(x) -> Expr.Neg(splat_expr(x, funcs, groups)),
+	Expr.Not(x) -> Expr.Not(splat_expr(x, funcs, groups)),
+	Expr.BitNot(x) -> Expr.BitNot(splat_expr(x, funcs, groups)),
+	Expr.Add(l, r) -> Expr.Add(splat_expr(l, funcs, groups), splat_expr(r, funcs, groups)),
+	Expr.Sub(l, r) -> Expr.Sub(splat_expr(l, funcs, groups), splat_expr(r, funcs, groups)),
+	Expr.Mul(l, r) -> Expr.Mul(splat_expr(l, funcs, groups), splat_expr(r, funcs, groups)),
+	Expr.Div(l, r) -> Expr.Div(splat_expr(l, funcs, groups), splat_expr(r, funcs, groups)),
+	Expr.Mod(l, r) -> Expr.Mod(splat_expr(l, funcs, groups), splat_expr(r, funcs, groups)),
+	Expr.BitAnd(l, r) -> Expr.BitAnd(splat_expr(l, funcs, groups), splat_expr(r, funcs, groups)),
+	Expr.BitOr(l, r) -> Expr.BitOr(splat_expr(l, funcs, groups), splat_expr(r, funcs, groups)),
+	Expr.BitXor(l, r) -> Expr.BitXor(splat_expr(l, funcs, groups), splat_expr(r, funcs, groups)),
+	Expr.Shl(l, r) -> Expr.Shl(splat_expr(l, funcs, groups), splat_expr(r, funcs, groups)),
+	Expr.Shr(l, r) -> Expr.Shr(splat_expr(l, funcs, groups), splat_expr(r, funcs, groups)),
+	Expr.CmpEq(l, r) -> Expr.CmpEq(splat_expr(l, funcs, groups), splat_expr(r, funcs, groups)),
+	Expr.CmpNe(l, r) -> Expr.CmpNe(splat_expr(l, funcs, groups), splat_expr(r, funcs, groups)),
+	Expr.CmpLt(l, r) -> Expr.CmpLt(splat_expr(l, funcs, groups), splat_expr(r, funcs, groups)),
+	Expr.CmpGt(l, r) -> Expr.CmpGt(splat_expr(l, funcs, groups), splat_expr(r, funcs, groups)),
+	Expr.CmpLe(l, r) -> Expr.CmpLe(splat_expr(l, funcs, groups), splat_expr(r, funcs, groups)),
+	Expr.CmpGe(l, r) -> Expr.CmpGe(splat_expr(l, funcs, groups), splat_expr(r, funcs, groups)),
+	Expr.And(l, r) -> Expr.And(splat_expr(l, funcs, groups), splat_expr(r, funcs, groups)),
+	Expr.Or(l, r) -> Expr.Or(splat_expr(l, funcs, groups), splat_expr(r, funcs, groups)),
+	Expr.If(c, t, e2) -> Expr.If(splat_expr(c, funcs, groups), splat_expr(t, funcs, groups), splat_expr(e2, funcs, groups)),
+	Expr.Call(n, ta, args) -> splat_call(n, ta, args, funcs, groups),
+	Expr.DeferTap(fn, args) -> Expr.DeferTap(fn, splat_exprs(args, funcs, groups))
+}
+const splat_stmts = ([Stmt] ss, [Func] funcs, [RecDecl] groups): [Stmt] -> {
+	let [Stmt] o = []
+	let Iarch i = 0
+	loop { if i >= Iarch(ss.len) then break  o = [...o, splat_stmt(ss[i], funcs, groups)]  i = i + 1 }
+	return o
+}
+const splat_stmt_arms = ([StmtArm] arms, [Func] funcs, [RecDecl] groups): [StmtArm] -> {
+	let [StmtArm] o = []
+	let Iarch i = 0
+	loop { if i >= Iarch(arms.len) then break  o = [...o, StmtArm({ is_wild: arms[i].is_wild, type_name: arms[i].type_name, members: arms[i].members, binds: arms[i].binds, body: splat_stmts(arms[i].body, funcs, groups) })]  i = i + 1 }
+	return o
+}
+const splat_stmt = (Stmt s, [Func] funcs, [RecDecl] groups): Stmt -> match s {
+	Stmt.Let(n, m, ann, e) -> Stmt.Let(n, m, ann, splat_expr(e, funcs, groups)),
+	Stmt.Destructure(pat, m, e) -> Stmt.Destructure(pat, m, splat_expr(e, funcs, groups)),
+	Stmt.Yield(e) -> Stmt.Yield(splat_expr(e, funcs, groups)),
+	Stmt.Assign(n, e) -> Stmt.Assign(n, splat_expr(e, funcs, groups)),
+	Stmt.FieldAssign(b, f, e) -> Stmt.FieldAssign(b, f, splat_expr(e, funcs, groups)),
+	Stmt.IndexAssign(a, i, v) -> Stmt.IndexAssign(a, splat_expr(i, funcs, groups), splat_expr(v, funcs, groups)),
+	Stmt.Return(e) -> Stmt.Return(splat_expr(e, funcs, groups)),
+	Stmt.ForIn(v, a, body) -> Stmt.ForIn(v, a, splat_stmts(body, funcs, groups)),
+	Stmt.Loop(body) -> Stmt.Loop(splat_stmts(body, funcs, groups)),
+	Stmt.Break -> Stmt.Break,
+	Stmt.Continue -> Stmt.Continue,
+	Stmt.IfThen(c, st) -> Stmt.IfThen(splat_expr(c, funcs, groups), splat_stmt(st, funcs, groups)),
+	Stmt.IfElse(c, t, e) -> Stmt.IfElse(splat_expr(c, funcs, groups), splat_stmt(t, funcs, groups), splat_stmt(e, funcs, groups)),
+	Stmt.Do(e) -> Stmt.Do(splat_expr(e, funcs, groups)),
+	Stmt.Block(stmts) -> Stmt.Block(splat_stmts(stmts, funcs, groups)),
+	Stmt.Match(scrut, arms) -> Stmt.Match(splat_expr(scrut, funcs, groups), splat_stmt_arms(arms, funcs, groups)),
+	Stmt.Closure(nm, params, ret, body) -> Stmt.Closure(nm, params, ret, splat_stmts(body, funcs, groups)),
+	Stmt.Defer(body) -> Stmt.Defer(splat_stmts(body, funcs, groups))
+}
+# A group `type` names only PARAMETERS — never a return type (629) or a record field type (630) —
+# and its name may not collide with a declared `data`/`union` (626) or a builtin type name.
+const reject_group_misuse = ([Func] funcs, [RecDecl] recs, [UnionDecl] unions, [RecDecl] groups): Iarch -> {
+	let Iarch gi = 0
+	loop {
+		if gi >= Iarch(groups.len) then break
+		const Str gn = groups[gi].name
+		if find_rec(recs, gn) >= 0 || find_union(unions, gn) >= 0 then die("cf0: type: a grouped-parameter `type` name collides with a declared type\n")
+		if is_builtin_scalar_name(gn) || str_eq(gn, "Unit") then die("cf0: type: a grouped-parameter `type` may not redeclare a builtin type name\n")
+		gi = gi + 1
+	}
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(funcs.len) then break
+		if find_group(groups, funcs[i].ret_name) >= 0 then die("cf0: type: a grouped-parameter `type` may not be a return type\n")
+		i = i + 1
+	}
+	let Iarch r = 0
+	loop {
+		if r >= Iarch(recs.len) then break
+		let Iarch f = 0
+		loop {
+			if f >= Iarch(recs[r].fields.len) then break
+			if find_group(groups, recs[r].ftypes[f]) >= 0 then die("cf0: type: a grouped-parameter `type` may not be a record field type\n")
+			f = f + 1
+		}
+		r = r + 1
+	}
+	return 0
+}
+# Desugar every grouped-parameter `type`: splat group parameters and expand group-literal calls.
+const splat_groups = ([Func] funcs, [RecDecl] recs, [UnionDecl] unions, [RecDecl] groups): [Func] -> {
+	if Iarch(groups.len) == 0 then return funcs
+	reject_group_misuse(funcs, recs, unions, groups)
+	let [Func] out = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(funcs.len) then break
+		const Func f = funcs[i]
+		const [Param] nps = splat_params(groups, f.params)
+		const [Stmt] nbody = splat_stmts(f.body, funcs, groups)
+		out = [...out, Func({ name: f.name, is_pub: f.is_pub, ret_name: f.ret_name, ret_elem: f.ret_elem, params: nps, body: nbody, is_asm: f.is_asm, asm_body: f.asm_body, is_value: f.is_value, ret_telems: f.ret_telems, typarams: f.typarams, tbounds: f.tbounds })]
+		i = i + 1
+	}
+	return out
+}
+
 # Load the entry module and flatten its transitive import graph into one Program. The
 # work list grows as newly loaded modules contribute imports; `loaded` dedups by resolved
 # path so a diamond or a cycle loads each module once. Each module's private functions are
@@ -830,8 +1103,10 @@ pub const resolve_program = (Str entry): Program -> {
 	let [RecDecl] recs = []
 	let [UnionDecl] unions = []
 	let [Func] funcs = []
+	let [RecDecl] groups = []
 	recs = cat_recs(recs, root.recs)
 	unions = cat_unions(unions, root.unions)
+	groups = cat_recs(groups, root.groups) # grouped-parameter `type` decls (splatted below)
 	funcs = cat_funcs(funcs, mangle_funcs(root.funcs, 0)) # the entry is module tag 0
 	let [Str] loaded = []
 	let [Import] work = []
@@ -848,6 +1123,7 @@ pub const resolve_program = (Str entry): Program -> {
 			const Program m = load_module(mpath)
 			recs = cat_recs(recs, m.recs)
 			unions = cat_unions(unions, m.unions)
+			groups = cat_recs(groups, m.groups)
 			funcs = cat_funcs(funcs, mangle_funcs(m.funcs, tag))
 			work = cat_imports(work, m.imports)
 		}
@@ -863,5 +1139,9 @@ pub const resolve_program = (Str entry): Program -> {
 	# collapse member-type annotations (`Color.Red` → `Color`, §8.1) against the expanded tables,
 	# before monomorph sees the signatures — validating the base union and member
 	const [Func] nfuncs = norm_mt_funcs(funcs, erecs, eunions)
-	return Program({ imports: none, recs: erecs, unions: eunions, funcs: nfuncs })
+	# grouped-parameter `type` desugar (§7): splat group params into individual params and expand
+	# `{ … }` group-literal call args into positional values — CONSUMES `groups` (empty afterward)
+	const [Func] gfuncs = splat_groups(nfuncs, erecs, eunions, groups)
+	const [RecDecl] nogroups = []
+	return Program({ imports: none, recs: erecs, unions: eunions, funcs: gfuncs, groups: nogroups })
 }
