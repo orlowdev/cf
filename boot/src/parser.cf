@@ -357,6 +357,19 @@ const parse_unary = (*Parser p): Expr -> {
 	return parse_primary(p)
 }
 
+# The value produced by an `if`/`match` branch: a bare expression, or — when the branch
+# opens with `{` — a value BLOCK `{ … <- v }` (a nested scope that yields with `<-`, per
+# ebnf.md §Control Flow). A value block is lowered to a run-once `Expr.Loop`: its first
+# `<- v` stores the value and breaks, so the body runs exactly once and the whole loop
+# machinery (type, aggregate yield, merge slot) applies unchanged. A bare `{` was never a
+# valid expression start before, so this is purely additive (record literals use `({…})`).
+const parse_branch_body = (*Parser p): Expr -> {
+	if is_lbrace(peek(p)) then {
+		p.pos = p.pos + 1 # `{`
+		return Expr.Loop(parse_block(p))
+	}
+	return parse_expr(p)
+}
 # `if <cond> then <a> else <b>` — a value-producing conditional expression. `else`
 # is required (an else-less `if` is an `Option`, a later brick). The condition is a
 # `Bool` (a comparison); no truthiness (§5).
@@ -365,10 +378,10 @@ const parse_if = (*Parser p): Expr -> {
 	const Expr cond = parse_expr(p)
 	if !kw(p, "then") then die("cf0: parse: expected `then`\n")
 	p.pos = p.pos + 1
-	const Expr then_e = parse_expr(p)
+	const Expr then_e = parse_branch_body(p)
 	if !kw(p, "else") then die("cf0: parse: expected `else` (an else-less `if` is a later brick)\n")
 	p.pos = p.pos + 1
-	const Expr else_e = parse_expr(p)
+	const Expr else_e = parse_branch_body(p)
 	return Expr.If(cond, then_e, else_e)
 }
 
@@ -716,10 +729,11 @@ const parse_arm_head = (*Parser p): MatchArm -> {
 	return MatchArm({ is_wild: true, type_name: "", members: no_members, binds: no_binds, body: Expr.Lit(0) })
 }
 
-# One expression-`match` arm: the pattern (via `parse_arm_head`) with an expression body.
+# One expression-`match` arm: the pattern (via `parse_arm_head`) with an expression body —
+# a bare expression or, when it opens with `{`, a value block `{ … <- v }` (via `parse_branch_body`).
 const parse_arm = (*Parser p): MatchArm -> {
 	const MatchArm h = parse_arm_head(p)
-	return MatchArm({ is_wild: h.is_wild, type_name: h.type_name, members: h.members, binds: h.binds, body: parse_expr(p) })
+	return MatchArm({ is_wild: h.is_wild, type_name: h.type_name, members: h.members, binds: h.binds, body: parse_branch_body(p) })
 }
 
 # One statement-`match` arm: the pattern (via `parse_arm_head`) with a statement body — a
