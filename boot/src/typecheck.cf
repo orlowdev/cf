@@ -27,7 +27,10 @@ import "astutil" as { is_spread, spread_inner, is_skip, skip_count, is_nested, n
 # is a caller-provided pointer parameter (a home that OUTLIVES the function), the destination whose
 # rehome is checked. (cf0 collapses `*Point`≡`Point`, so an EXPLICIT `&`/pointer-local is the only
 # alias to a specific local residence it can track; an owned aggregate field moves with its parent.)
-pub data VarTy = { Str name, Ty ty, Bool mutable, Bool esc, Bool outer }
+# `fixed` — this binding is a FIXED array `[N T]` (not a growable `[T]`). cf0 represents both as a
+# dynamic header (they share index/`.len`/`for`), so this bit is the only fixed-vs-dyn distinction:
+# a fixed array may not be a `[...src, e]` spread SOURCE (nor grown in place) — memory_model / §2.
+pub data VarTy = { Str name, Ty ty, Bool mutable, Bool esc, Bool outer, Bool fixed }
 
 # The whole-program context threaded through typing: the functions (a call resolves
 # its callee here), the record declarations (a data literal / field read), and the
@@ -1056,7 +1059,7 @@ pub const arm_bind_env = (Str type_name, [Str] members, [Str] binds, [VarTy] env
 		# a `_` skips and a sub-pattern GUARD (`=Member`/`#int`) constrains but binds no name
 		if !str_eq(binds[bi], "_") && !is_pat_guard(binds[bi]) then {
 			const Ty bt = payload_decl_ty(ui, mi, bi, ctx)
-			benv = [...benv, VarTy({ name: binds[bi], ty: bt, mutable: false, esc: false, outer: false })]
+			benv = [...benv, VarTy({ name: binds[bi], ty: bt, mutable: false, esc: false, outer: false, fixed: false })]
 		}
 		bi = bi + 1
 	}
@@ -1359,8 +1362,20 @@ const elem_name_of = (Ty t): Str -> {
 # element type (and the source must be a dynamic array); otherwise a `let [Elem]`
 # annotation (`elem_type`), else the first element's type, else `Iarch` for an empty
 # `[]`.
+# Whether a spread source `[...src, e]` names a FIXED array `[N T]` binding — such an array is not
+# a growable `[T]`, so it may neither be copy-appended from nor grown in place (`fx = [...fx, e]`).
+const name_is_fixed = ([VarTy] env, Str n): Bool -> {
+	const Iarch i = env_index(env, n)
+	if i < 0 then return false
+	return env[i].fixed
+}
+const spread_src_fixed = (Expr src, [VarTy] env): Bool -> match src {
+	Expr.Var(n) -> name_is_fixed(env, n),
+	_ -> false
+}
 const arraylit_elem = (Bool has_spread, Expr spread_src, [Expr] elems, Str elem_type, [VarTy] env, Ctx ctx): Str -> {
 	if has_spread then {
+		if spread_src_fixed(spread_src, env) then die("cf0: type: a fixed array `[N T]` cannot be a spread source — only a dynamic `[T]` may be copy-appended or grown\n")
 		const Str sen = dyn_of(type_of(spread_src, env, ctx))
 		if str_eq(sen, "") then die("cf0: type: a spread source must be a dynamic array\n")
 		return sen
@@ -1493,7 +1508,7 @@ pub const check_destructure = ([Str] pat, Bool mutable, Expr rhs, [VarTy] env, C
 		if mutable then {
 			if !is_tint(pty) && !is_tbool(pty) then die("cf0: type: a `let` destructure position must be a scalar (a record/Str position binds `const`)\n")
 		}
-		e2 = [...e2, VarTy({ name: tok, ty: pty, mutable: mutable, esc: false, outer: false })]
+		e2 = [...e2, VarTy({ name: tok, ty: pty, mutable: mutable, esc: false, outer: false, fixed: false })]
 		pos = pos + 1
 		pi = pi + 1
 	}
@@ -1674,7 +1689,7 @@ const yields_of_list = ([Stmt] ss, [VarTy] env0, Ctx ctx): [Ty] -> {
 		if i >= Iarch(ss.len) then break
 		const Stmt s = ss[i]
 		match s {
-			Stmt.Let(n, m, ann, e) -> { env = [...env, VarTy({ name: n, ty: binding_ty(ann, e, env, ctx), mutable: m, esc: false, outer: false })] },
+			Stmt.Let(n, m, ann, e) -> { env = [...env, VarTy({ name: n, ty: binding_ty(ann, e, env, ctx), mutable: m, esc: false, outer: false, fixed: false })] },
 			Stmt.Destructure(pat, m, e) -> { env = check_destructure(pat, m, e, env, ctx) },
 			_ -> { r = cat_tys(r, yields_of_stmt(s, env, ctx)) }
 		}
@@ -1787,7 +1802,7 @@ const check_for_body = (Str lv, Str arr, [Stmt] body, [VarTy] env, Ctx ctx): Iar
 	if ai < 0 then die("cf0: type: `for` over an undeclared name\n")
 	if str_eq(dyn_of(env[ai].ty), "") then die("cf0: type: `for` needs a dynamic array\n")
 	if env_index(env, lv) >= 0 then die("cf0: type: a `for` loop variable cannot shadow an existing binding\n")
-	const [VarTy] benv = [...env, VarTy({ name: lv, ty: Ty.TInt, mutable: false, esc: false, outer: false })]
+	const [VarTy] benv = [...env, VarTy({ name: lv, ty: Ty.TInt, mutable: false, esc: false, outer: false, fixed: false })]
 	return check_stmts(body, benv, ctx, lk_for)
 }
 
@@ -2291,12 +2306,12 @@ const check_closure = (Str nm, [Param] params, Str ret, [Stmt] body, [VarTy] env
 	loop {
 		if pi >= Iarch(params.len) then break
 		check_ptr_pointee(params[pi], ctx.recs, ctx.unions)
-		cenv = [...cenv, VarTy({ name: params[pi].name, ty: param_ty(params[pi], ctx.recs, ctx.unions), mutable: false, esc: false, outer: false })]
+		cenv = [...cenv, VarTy({ name: params[pi].name, ty: param_ty(params[pi], ctx.recs, ctx.unions), mutable: false, esc: false, outer: false, fixed: false })]
 		pi = pi + 1
 	}
 	const Iarch dr = check_stmts(body, cenv, cctx, lk_none)
 	if dr != 2 then die("cf0: type: a closure body must end with `return`\n")
-	return [...env, VarTy({ name: nm, ty: closure_tfn(ret, params), mutable: false, esc: false, outer: false })]
+	return [...env, VarTy({ name: nm, ty: closure_tfn(ret, params), mutable: false, esc: false, outer: false, fixed: false })]
 }
 
 const check_stmts = ([Stmt] stmts, [VarTy] env0, Ctx ctx, Iarch loop_kind): Iarch -> {
@@ -2324,7 +2339,7 @@ const check_stmts = ([Stmt] stmts, [VarTy] env0, Ctx ctx, Iarch loop_kind): Iarc
 				if is_ttuple(ty) && !is_tuple_bindable(e) then die("cf0: type: this expression cannot bind a tuple\n")
 				# a binding inherits the region-outlives taint of its initializer: `const *P p = &x`, or a
 				# `let q = p` that launders one, carries a local pointer that a later escape must catch.
-				env = [...env, VarTy({ name: n, ty: ty, mutable: m, esc: carries_local(e, env), outer: false })]
+				env = [...env, VarTy({ name: n, ty: ty, mutable: m, esc: carries_local(e, env), outer: false, fixed: str_eq(ann, "$fix") })]
 			},
 			Stmt.Destructure(pat, m, e) -> { env = check_destructure(pat, m, e, env, ctx) },
 			Stmt.Closure(nm, params, ret, body) -> { env = check_closure(nm, params, ret, body, env, ctx) },
@@ -2528,7 +2543,7 @@ const check_func = (Func fn, Ctx ctx): Iarch -> {
 		const Bool pmut = param_is_recptr(fn.params[pi], ctx.recs) || param_is_indexptr(fn.params[pi])
 		# a `*T` pointer parameter is a caller-provided home that OUTLIVES this call (`outer`): the
 		# region-outlives check rejects rehoming a pointer-into-local through it (memory_model §6).
-		env = [...env, VarTy({ name: fn.params[pi].name, ty: pty, mutable: pmut, esc: false, outer: fn.params[pi].is_ptr })]
+		env = [...env, VarTy({ name: fn.params[pi].name, ty: pty, mutable: pmut, esc: false, outer: fn.params[pi].is_ptr, fixed: false })]
 		pi = pi + 1
 	}
 	# a closure is admitted only as a direct function-body statement (v1); reject one buried in
