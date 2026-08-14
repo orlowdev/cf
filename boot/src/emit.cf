@@ -119,6 +119,16 @@ const elem_bytes = (Str elem): Iarch -> {
 	return 8
 }
 
+# A raw pointer's element STRIDE: a `*[Uint8]`/opaque byte pointer or buffer (`elem` "" or an
+# 8-bit fixed type) is byte-packed (stride 1, `loadub`/`storeb`); a `*[Iarch]` word pointer
+# strides 8 (`loadl`/`storel`). Distinct from `elem_bytes` because an EMPTY elem means "byte
+# buffer" here (a `$ptr` from `cf_alloc`/a `[N Uint8]` buffer), not the word default.
+const ptr_stride = (Str elem): Iarch -> {
+	if str_eq(elem, "") then return 1
+	if is_fixed_name(elem) && fixed_bits(elem) == 8 then return 1
+	return 8
+}
+
 # The byte offset of field `field` in record type `rt` — its declaration index × 8
 # (uniform 8-byte slots; a word field rides in the low 4 bytes). Typecheck guarantees both resolve.
 const field_offset = ([RecDecl] recs, Str rt, Str field): Iarch -> {
@@ -1396,6 +1406,23 @@ const emit_fixed_canon = (*Emit ctx, Iarch bits, Bool signed, Str v): Str -> {
 # The name of a bare `Var` argument (a function reference), or "".
 const argvar_name = (Expr e): Str -> match e { Expr.Var(n) -> n, _ -> "" }
 
+# The value passed to a `*[T]` raw-pointer parameter. A dynamic-/fixed-array argument is a
+# `{data@0, len@8, cap@16}` HEADER, so pass its DATA pointer (`loadl @0`) — the raw element
+# base the callee indexes. An argument that is already a raw pointer (a `$ptr` buffer, or a
+# forwarded `*[T]` param) is passed through unchanged.
+const emit_ptr_arg = (*Emit ctx, [Binding] env, Expr arg): Str -> {
+	const Str v = emit_expr(arg, ctx, env)
+	const Str nm = argvar_name(arg)
+	if str_eq(nm, "") then return v
+	const Iarch bi = lookup_index(env, nm)
+	if bi < 0 then return v
+	if !str_eq(env[bi].rec_type, "$dyn") then return v
+	const Iarch data = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${data} =l loadl ${v}\n")
+	return "%t${data}"
+}
+
 # A lifted-closure CAPTURE parameter — a scalar by slot address (`$capref`) or an aggregate by
 # pointer (`$capagg`); both ride an `l` and are passed by reference (no copy) at the call site.
 const is_cap_param = (Str type_name): Bool -> str_eq(type_name, "$capref") || str_eq(type_name, "$capagg")
@@ -1520,6 +1547,14 @@ const emit_call = (*Emit ctx, Str callee, [Expr] args, [Binding] env): Str -> {
 			const Iarch tt = ctx.next
 			ctx.next = ctx.next + 1
 			write_str(ctx.fd, "\t%t${tt} =l copy ${cv}\n")
+			aops = [...aops, ArgOp({ temp: tt, is_rec: false, qt: "l" })]
+		} else if str_eq(ctx.funcs[fidx].params[i].type_name, "$ptr") then {
+			# a `*[T]` raw-pointer parameter: pass the element base (an array header's data@0, or
+			# a raw pointer as-is). Rides an `l`, no aggregate copy.
+			const Str pv = emit_ptr_arg(ctx, env, args[i])
+			const Iarch tt = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${tt} =l copy ${pv}\n")
 			aops = [...aops, ArgOp({ temp: tt, is_rec: false, qt: "l" })]
 		} else if is_agg_param(ctx.funcs[fidx].params[i], ctx.recs, ctx.unions) then {
 			const Str av = emit_expr(args[i], ctx, env)
@@ -1921,18 +1956,21 @@ const emit_index = (*Emit ctx, [Binding] env, Str arr, Expr idx): Str -> {
 		write_str(ctx.fd, "\t%t${tval} =l loadl %t${taddr}\n")
 		return "%t${tval}"
 	}
-	# a byte pointer / buffer index `p[i]` reads the i-th byte at pointer + i (no header).
+	# a raw pointer index `p[i]` reads the i-th element at pointer + i*stride (no header): a
+	# `*[Uint8]` byte pointer strides 1 (`loadub`), a `*[Iarch]` word pointer strides 8 (`loadl`).
 	if str_eq(env[ai].rec_type, "$ptr") then {
+		const Iarch pesz = ptr_stride(env[ai].elem)
 		const Str pv = emit_expr(idx, ctx, env)
 		const Iarch pil = ctx.next
 		ctx.next = ctx.next + 1
-		write_str(ctx.fd, "\t%t${pil} =l copy ${pv}\n")
+		write_str(ctx.fd, "\t%t${pil} =l mul ${pv}, ${pesz}\n")
 		const Iarch paddr = ctx.next
 		ctx.next = ctx.next + 1
 		write_str(ctx.fd, "\t%t${paddr} =l add ${hdr}, %t${pil}\n")
 		const Iarch pval = ctx.next
 		ctx.next = ctx.next + 1
-		write_str(ctx.fd, "\t%t${pval} =l loadub %t${paddr}\n")
+		if pesz == 1 then write_str(ctx.fd, "\t%t${pval} =l loadub %t${paddr}\n")
+		if pesz != 1 then write_str(ctx.fd, "\t%t${pval} =l loadl %t${paddr}\n")
 		return "%t${pval}"
 	}
 	# a string index `s[i]` reads the i-th byte: the header's bytes pointer @0, then +i.
@@ -2415,13 +2453,15 @@ const emit_simple_stmt = (*Emit ctx, [Binding] env, Stmt s): Iarch -> {
 			const Str iv = emit_expr(ix, ctx, env)
 			const Str vv = emit_expr(val, ctx, env)
 			if str_eq(env[ai].rec_type, "$ptr") then {
+				const Iarch besz = ptr_stride(env[ai].elem)
 				const Iarch bil = ctx.next
 				ctx.next = ctx.next + 1
-				write_str(ctx.fd, "\t%t${bil} =l copy ${iv}\n")
+				write_str(ctx.fd, "\t%t${bil} =l mul ${iv}, ${besz}\n")
 				const Iarch baddr = ctx.next
 				ctx.next = ctx.next + 1
 				write_str(ctx.fd, "\t%t${baddr} =l add ${hdr}, %t${bil}\n")
-				write_str(ctx.fd, "\tstoreb ${vv}, %t${baddr}\n")
+				if besz == 1 then write_str(ctx.fd, "\tstoreb ${vv}, %t${baddr}\n")
+				if besz != 1 then write_str(ctx.fd, "\tstorel ${vv}, %t${baddr}\n")
 				return 0
 			}
 			const Iarch esz = elem_bytes(env[ai].elem)
@@ -2562,7 +2602,7 @@ const emit_func = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 			ctx.next = ctx.next + 1
 			write_str(ctx.fd, "\t%t${slot} =l copy %p${pi}\n")
 			if str_eq(fn.params[pi].type_name, "$ptr") then {
-				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: "$ptr", elem: "", is_cell: false, telems: [], fixed: "" })]
+				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: "$ptr", elem: fn.params[pi].elem, is_cell: false, telems: [], fixed: "" })]
 			} else {
 				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: fn.params[pi].type_name, elem: "", is_cell: false, telems: [], fixed: "" })]
 			}

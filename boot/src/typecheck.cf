@@ -362,6 +362,16 @@ const param_is_recptr = (Param p, [RecDecl] recs): Bool -> {
 	if str_eq(p.type_name, "$ptr") then return false
 	return find_rec(recs, p.type_name) >= 0
 }
+# A `*[Iarch]` WORD-array pointer parameter — its elements are written through it (`xs[i] = v`),
+# so it binds mutable. A `*[Uint8]` byte pointer (elem "" or an 8-bit fixed type) stays a
+# read-only view, matching the buffer/token-stream usage.
+const param_is_wordptr = (Param p): Bool -> {
+	if !p.is_ptr then return false
+	if !str_eq(p.type_name, "$ptr") then return false
+	if str_eq(p.elem, "") then return false
+	if is_fixed_name(p.elem) && fixed_bits(p.elem) == 8 then return false
+	return true
+}
 
 # A `*T` pointer may only point to an aggregate — a declared record or a PAYLOAD-BEARING union
 # (type_system §6.4: no pointer to a scalar). A `*[Uint8]` byte pointer (`$ptr`) is exempt (it is
@@ -748,7 +758,15 @@ const call_type = (Str callee, [Str] tyargs, [Expr] args, [VarTy] env, Ctx ctx):
 			const Ty at = type_of(args[i], env, ctx)
 			# a byte pointer is an address, acceptable where a `Uarch`/`Int` is expected (syscalls)
 			if !ty_eq(at, pt) then {
-				if is_tptr(at) then { if !is_tint(pt) then die("cf0: type: a call argument's type does not match the parameter\n") } else die("cf0: type: a call argument's type does not match the parameter\n")
+				if is_tptr(at) && is_tint(pt) then { }
+				# a `*[T]` raw-pointer parameter accepts another raw pointer (forwarding a `*[T]`
+				# onward), or a BARE-VARIABLE dynamic-/fixed-array whose element base (data@0) is
+				# passed. A non-variable array expression (a field/index/call result) is a follow-up:
+				# emit only lowers a named array to its data pointer, so accepting one here would
+				# pass the header instead — rejected cleanly rather than miscompiled.
+				else if is_tptr(pt) && is_tptr(at) then { }
+				else if is_tptr(pt) && !str_eq(dyn_of(at), "") && !str_eq(as_var_name(args[i]), "") then { }
+				else die("cf0: type: a call argument's type does not match the parameter\n")
 			}
 		}
 		i = i + 1
@@ -2170,7 +2188,7 @@ const check_func = (Func fn, Ctx ctx): Iarch -> {
 		check_ptr_pointee(fn.params[pi], ctx.recs, ctx.unions)
 		const Ty pty = param_ty(fn.params[pi], ctx.recs, ctx.unions)
 		# a `*Record` pointer parameter is mutable — its fields are written through it
-		const Bool pmut = param_is_recptr(fn.params[pi], ctx.recs)
+		const Bool pmut = param_is_recptr(fn.params[pi], ctx.recs) || param_is_wordptr(fn.params[pi])
 		env = [...env, VarTy({ name: fn.params[pi].name, ty: pty, mutable: pmut })]
 		pi = pi + 1
 	}
