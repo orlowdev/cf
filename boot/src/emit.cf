@@ -28,7 +28,7 @@ import "astutil" as { is_spread, spread_inner, is_skip, skip_count, is_nested, n
 # reset per function; `funcs`/`recs`/`unions` are constant across the program.
 # `cur_slot` is the merge-slot temp of the nearest value-yielding `loop` (or -1) — a `<- v`
 # stores into it and jumps to `@lend${cur_loop}`, and the `loop` expression loads it afterward.
-data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs, [RecDecl] recs, [UnionDecl] unions, Iarch cur_loop, Iarch cur_slot }
+data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs, [RecDecl] recs, [UnionDecl] unions, Iarch cur_loop, Iarch cur_slot, Str cur_ret }
 
 # A local/parameter in scope: its interned name, `slot`, its `rec_type` (a record/union
 # type name, `"$dyn"`, `"$ptr"`, or `"Str"` — `""` for a word), and `elem` (a dynamic
@@ -2415,7 +2415,13 @@ const emit_simple_stmt = (*Emit ctx, [Binding] env, Stmt s): Iarch -> {
 			term = 1
 		},
 		Stmt.Return(e) -> {
-			const Str v = emit_expr(e, ctx, env)
+			# a bare `({…})` record literal is built as the function's return record type (its own
+			# type_name is empty); every other value emits normally
+			let Str v = ""
+			if is_bare_record_e(e) && find_rec(ctx.recs, ctx.cur_ret) >= 0 then {
+				const Iarch b = emit_record_lit(ctx, ctx.cur_ret, record_inits_e(e), env)
+				v = "%t${b}"
+			} else v = emit_expr(e, ctx, env)
 			write_str(ctx.fd, "\tret ${v}\n")
 			term = 1
 		},
@@ -2530,7 +2536,9 @@ const emit_block = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 				# An aggregate initializer yields a base pointer: a `const` binds the pointer temp
 				# directly (a write-once borrow); a `let` (mutable) spills the pointer into a stack
 				# cell so a later `name = …` can repoint it (`xs = []`, `acc = Expr.Add(acc, r)`).
-				const Str rt = init_agg_type(ctx, env, e)
+				# a bare `({…})` bound to a record-annotated local builds the annotation's record type
+				const Bool bare_rec = is_bare_record_e(e) && find_rec(ctx.recs, ann) >= 0
+				const Str rt = if bare_rec then ann else init_agg_type(ctx, env, e)
 				if str_eq(rt, "") then {
 					const Str v = emit_expr(e, ctx, env)
 					# a scalar local records its leaf type (fixed OR float, from the annotation else
@@ -2543,15 +2551,18 @@ const emit_block = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 					write_str(ctx.fd, "\t${store_op(fx)} ${v}, %t${slot}\n")
 					env = [...env, Binding({ name: n, slot: slot, rec_type: "", elem: "", is_cell: true, telems: [], fixed: fx })]
 				} else {
-					const Iarch base = emit_agg_binding(ctx, e, env)
+					const Iarch base = if bare_rec then emit_record_lit(ctx, ann, record_inits_e(e), env) else emit_agg_binding(ctx, e, env)
+					let Str belem = ""
+					let [TupElem] btel = []
+					if !bare_rec then { belem = init_elem(ctx, env, e)  btel = init_telems(ctx, env, e) }
 					if m then {
 						const Iarch cell = ctx.next
 						ctx.next = ctx.next + 1
 						write_str(ctx.fd, "\t%t${cell} =l alloc8 8\n")
 						write_str(ctx.fd, "\tstorel %t${base}, %t${cell}\n")
-						env = [...env, Binding({ name: n, slot: cell, rec_type: rt, elem: init_elem(ctx, env, e), is_cell: true, telems: init_telems(ctx, env, e), fixed: "" })]
+						env = [...env, Binding({ name: n, slot: cell, rec_type: rt, elem: belem, is_cell: true, telems: btel, fixed: "" })]
 					} else {
-						env = [...env, Binding({ name: n, slot: base, rec_type: rt, elem: init_elem(ctx, env, e), is_cell: false, telems: init_telems(ctx, env, e), fixed: "" })]
+						env = [...env, Binding({ name: n, slot: base, rec_type: rt, elem: belem, is_cell: false, telems: btel, fixed: "" })]
 					}
 				}
 			},
@@ -2575,6 +2586,9 @@ const emit_block = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 # bound (the typecheck phase guarantees it is never referenced). All returns are words.
 const emit_func = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 	const Bool is_main = str_eq(fn.name, "main")
+	# the current function's return type — supplied to a bare `({…})` record literal returned from
+	# this function (its type_name is empty; the return annotation names its record type)
+	ctx.cur_ret = fn.ret_name
 	# main always returns a word (its Int exit code); a helper returning a record
 	# returns an `l` arena pointer, else a word.
 	if is_main then write_str(ctx.fd, "export function l $main(")
@@ -3045,7 +3059,7 @@ pub const emit_program = (Program prog, Uarch qbe_fd, Uarch asm_fd): Iarch -> {
 		if i >= Iarch(prog.funcs.len) then break
 		# an asm function is emitted into the floor, not through QBE
 		if !prog.funcs[i].is_asm then {
-			let Emit ctx = Emit({ fd: qbe_fd, next: 0, label: 0, funcs: prog.funcs, recs: prog.recs, unions: prog.unions, cur_loop: 0 - 1, cur_slot: 0 - 1 })
+			let Emit ctx = Emit({ fd: qbe_fd, next: 0, label: 0, funcs: prog.funcs, recs: prog.recs, unions: prog.unions, cur_loop: 0 - 1, cur_slot: 0 - 1, cur_ret: "" })
 			emit_func(&ctx, prog.funcs[i], i)
 		}
 		i = i + 1
