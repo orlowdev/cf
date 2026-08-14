@@ -761,6 +761,64 @@ const indirect_call_type = (Ty fty, [Expr] args, [VarTy] env, Ctx ctx): Ty -> {
 	return named_ty(sig[arity].name, "", ctx.recs, ctx.unions)
 }
 
+# The write-capability of an argument, traced to the binding it is ROOTED in: a `let` (or a
+# writable `*T` parameter) is mutable, a `const` binding or a by-value (read-only) parameter is
+# not. A name not in scope (a top-level scalar `const`, never an aggregate) and a freshly-built
+# value (a literal, a call result, a `buffer` — owned by the caller, so writable) default to
+# mutable. Used to enforce the memory model's write-through-`const` rule: a `*T`/`*[T]` pointer
+# into a `const` is read-only, so it may not be handed to a parameter that writes through it.
+const name_mutable = ([VarTy] env, Str n): Bool -> {
+	const Iarch i = env_index(env, n)
+	if i < 0 then return true
+	return env[i].mutable
+}
+const arg_root_mutable = (Expr e, [VarTy] env): Bool -> match e {
+	Expr.Var(n) -> name_mutable(env, n),
+	Expr.Addr(n) -> name_mutable(env, n),
+	Expr.Field(base, f) -> name_mutable(env, base),
+	Expr.Index(base, ix) -> name_mutable(env, base),
+	Expr.IndexField(base, ix, f) -> name_mutable(env, base),
+	Expr.FieldExpr(base, f) -> arg_root_mutable(base, env),
+	Expr.IndexExpr(base, ix) -> arg_root_mutable(base, env),
+	_ -> true
+}
+# Whether a function body WRITES through the pointer named `pn` — a `pn.field = v` (FieldAssign) or
+# `pn[i] = v` (IndexAssign) whose base names the parameter, anywhere in the body (recursing into
+# loops / ifs / matches / blocks). Write-capability is inferred from the body (memory_model §6): a
+# read-only pointer param may receive a `const` aggregate, only a writer demands a `let`. Names never
+# shadow a parameter (shadowing is rejected), so `pn` always denotes the parameter here. A pointer
+# FORWARDED to another writer is not traced — transitive write-capability remains a gap (it would
+# only ever ACCEPT more; under-checking preserves the prior lenient behavior, never miscompiles).
+const stmt_writes_name = (Stmt s, Str pn): Bool -> match s {
+	Stmt.FieldAssign(base, f, v) -> str_eq(base, pn),
+	Stmt.IndexAssign(base, ix, v) -> str_eq(base, pn),
+	Stmt.Loop(bd) -> stmts_write_name(bd, pn),
+	Stmt.ForIn(fv, fa, bd) -> stmts_write_name(bd, pn),
+	Stmt.Block(bd) -> stmts_write_name(bd, pn),
+	Stmt.IfThen(c, b) -> stmt_writes_name(b, pn),
+	Stmt.IfElse(c, tb, eb) -> stmt_writes_name(tb, pn) || stmt_writes_name(eb, pn),
+	Stmt.Match(sc, arms) -> arm_stmts_write_name(arms, pn),
+	_ -> false
+}
+const stmts_write_name = ([Stmt] ss, Str pn): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		if stmt_writes_name(ss[i], pn) then return true
+		i = i + 1
+	}
+	return false
+}
+const arm_stmts_write_name = ([StmtArm] arms, Str pn): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		if stmts_write_name(arms[i].body, pn) then return true
+		i = i + 1
+	}
+	return false
+}
+const func_writes_ptr_param = (Func fn, Iarch pidx): Bool -> stmts_write_name(fn.body, fn.params[pidx].name)
 const call_type = (Str callee, [Str] tyargs, [Expr] args, [VarTy] env, Ctx ctx): Ty -> {
 	if is_cast_type(callee) then return cast_type(callee, args, env, ctx)
 	if str_eq(callee, "Str") then return str_seal_type(args, env, ctx)
@@ -779,6 +837,15 @@ const call_type = (Str callee, [Str] tyargs, [Expr] args, [VarTy] env, Ctx ctx):
 		# a function-type parameter takes a function reference (checked nominally), not a value
 		if is_tfn(pt) then { check_fn_arg(pt, args[i], env, ctx) }
 		else {
+			# a pointer parameter the body WRITES through (a `*Record` field store, or a `*[T]` element
+			# store) may only receive a pointer into a `let`: the argument's ROOT binding must be mutable.
+			# A `const` aggregate's pointer — or a by-value parameter's, a read-only view — is rejected
+			# (memory_model §6 write-through-`const`). A read-only pointer param accepts a `const`.
+			if param_is_recptr(ctx.funcs[fidx].params[i], ctx.recs) || param_is_indexptr(ctx.funcs[fidx].params[i]) then {
+				if func_writes_ptr_param(ctx.funcs[fidx], i) then {
+					if !arg_root_mutable(args[i], env) then die("cf0: type: a `*T` parameter that writes needs a `let` aggregate — a pointer into a `const` (or a by-value view) is read-only\n")
+				}
+			}
 			const Ty at = type_of(args[i], env, ctx)
 			# a byte pointer is an address, acceptable where a `Uarch`/`Int` is expected (syscalls)
 			if !ty_eq(at, pt) then {
