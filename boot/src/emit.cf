@@ -1158,16 +1158,41 @@ const var_agg_type = ([Binding] env, Str name): Str -> {
 	return env[idx].rec_type
 }
 
-# The aggregate type a `match` YIELDS, recovered from its first arm's body — but ONLY when that arm
-# binds no payload. If the arm binds a payload (`M.Some(x) -> x`), its body may reference a bind that
-# is absent from this outer env; resolving it here would either miss (→ "") OR, if the bind name
-# SHADOWS an outer variable, wrongly resolve to that outer variable's type — a miscompile. So a
-# payload-binding first arm is treated conservatively as "" (a clean `field_offset` die downstream),
-# never a guessed type. A no-bind first arm's body (an outer variable or a construction) resolves
-# correctly against this env. Every arm shares the match's type (typecheck), so the first suffices.
+# The outer env AUGMENTED with an arm's payload binds as TYPE-ONLY bindings — the same rec_type/elem
+# assignment `arm_body_env` gives each bind (`payload_type`/`payload_elem`), but with a dummy slot and
+# no emitted extraction, since it is used only to recover the aggregate TYPE of an arm body that
+# references a payload (`M.Some(x) -> x`). A `_` and a sub-pattern guard bind no name (skipped). The
+# bind is appended AFTER `env`, so with first-match `lookup_index` a name that collides with an outer
+# binding still resolves to the outer one — exactly as `arm_body_env` does, keeping the recovered type
+# in agreement with the value `emit_match` actually stores.
+const arm_bind_types = (*Emit ctx, [Binding] env, Str type_name, [Str] members, [Str] binds): [Binding] -> {
+	let [Binding] benv = []
+	let Iarch k = 0
+	loop { if k >= Iarch(env.len) then break  benv = [...benv, env[k]]  k = k + 1 }
+	let Iarch bi = 0
+	loop {
+		if bi >= Iarch(binds.len) then break
+		if !str_eq(binds[bi], "_") && !is_pat_guard(binds[bi]) then {
+			if payload_is_ptr(ctx, type_name, members[0], bi) then {
+				const Str pt = payload_type(ctx, type_name, members[0], bi)
+				const Str pe = payload_elem(ctx, type_name, members[0], bi)
+				benv = [...benv, Binding({ name: binds[bi], slot: 0, rec_type: pt, elem: pe, is_cell: false, telems: payload_ptelems(ctx, type_name, members[0], bi), fixed: "" })]
+			} else {
+				benv = [...benv, Binding({ name: binds[bi], slot: 0, rec_type: "", elem: "", is_cell: true, telems: [], fixed: "" })]
+			}
+		}
+		bi = bi + 1
+	}
+	return benv
+}
+# The aggregate type a `match` YIELDS, recovered from its first arm's body evaluated in that arm's
+# payload-binding env (via `arm_bind_types`) — so a payload-bound aggregate (`M.Some(x) -> x`) is
+# recovered as its member's payload type, not lost. The type-only env mirrors `arm_body_env`, so the
+# recovered type agrees with the value `emit_match` stores (no miscompile under a shadowed name). Every
+# arm shares the match's type (typecheck), so the first arm suffices.
 const match_agg_type = (*Emit ctx, [Binding] env, [MatchArm] arms): Str -> {
-	if Iarch(arms[0].binds.len) > 0 then return ""
-	return init_agg_type(ctx, env, arms[0].body)
+	const [Binding] aenv = arm_bind_types(ctx, env, arms[0].type_name, arms[0].members, arms[0].binds)
+	return init_agg_type(ctx, aenv, arms[0].body)
 }
 # The aggregate type name of a binding initializer that yields an aggregate (a record,
 # a boxed union, a dynamic array, a string, or an aggregate variable copied) — so its
