@@ -372,6 +372,13 @@ const param_is_wordptr = (Param p): Bool -> {
 	if is_fixed_name(p.elem) && fixed_bits(p.elem) == 8 then return false
 	return true
 }
+# A valid element for a `*[T]` raw-pointer FIELD — an indexable word scalar (an `Iarch`/`Int`/`Uarch`
+# word, or a fixed-width integer, including the byte `Uint8`). A `Str`/record/aggregate element has
+# no meaningful element stride and is not a pointer-field type (874).
+const is_ptr_field_elem = (Str elem): Bool -> {
+	if str_eq(elem, "Iarch") || str_eq(elem, "Int") || str_eq(elem, "Uarch") then return true
+	return is_fixed_name(elem)
+}
 
 # A `*T` pointer may only point to an aggregate — a declared record or a PAYLOAD-BEARING union
 # (type_system §6.4: no pointer to a scalar). A `*[Uint8]` byte pointer (`$ptr`) is exempt (it is
@@ -855,7 +862,12 @@ const record_type = (Str type_name, [FieldInit] inits, [VarTy] env, Ctx ctx): Ty
 				# a bare integer literal adopts the fixed-width field's type (range-checked), as at a `let`
 				fixed_lit_fits(inits[a].value, tfixed_bits(ft), tfixed_signed(ft))
 			} else {
-				if !ty_eq(type_of(inits[a].value, env, ctx), ft) then die("cf0: type: a data-literal field value's type must match the field\n")
+				const Ty vt = type_of(inits[a].value, env, ctx)
+					# a `*[T]` raw-pointer field stores another raw pointer, or a BARE-variable dynamic-/fixed
+					# array whose element base (data@0) is stored — mirroring a `*[T]` parameter argument
+					if is_tptr(ft) then {
+						if !is_tptr(vt) && (str_eq(dyn_of(vt), "") || str_eq(as_var_name(inits[a].value), "")) then die("cf0: type: a `*[T]` field needs a raw pointer or a named array\n")
+					} else if !ty_eq(vt, ft) then die("cf0: type: a data-literal field value's type must match the field\n")
 			}
 		}
 		a = a + 1
@@ -2246,6 +2258,10 @@ const check_whole = (Program prog): Iarch -> {
 			# declaration, since a never-USED field would otherwise slip past resolution)
 			if name_is_typevar(prog.recs[r].ftypes[a]) then die("cf0: type: an undeclared type variable in a record field\n")
 			if str_eq(prog.recs[r].ftypes[a], "$tuple") && telems_have_typevar(prog.recs[r].ftelems[a]) then die("cf0: type: an undeclared type variable in a tuple field\n")
+			# a `*[T]` raw-pointer field is indexed `f[i]` by element width, so its element must be a
+			# word scalar — `*[Uint8]` (byte) or `*[Iarch]`/a fixed-width (word). A `*[Str]`/record
+			# element has no meaningful stride and is rejected (874); a `*Record` field has `felem` ""
+			if str_eq(prog.recs[r].ftypes[a], "$ptr") && !str_eq(prog.recs[r].felems[a], "") && !is_ptr_field_elem(prog.recs[r].felems[a]) then die("cf0: type: a `*[T]` pointer field element must be `Uint8`, `Iarch`, or a fixed-width integer\n")
 			a = a + 1
 		}
 		r = r + 1

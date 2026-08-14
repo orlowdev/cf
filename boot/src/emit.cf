@@ -688,6 +688,9 @@ const emit_field_value = (*Emit ctx, Str rt, Str fname, Expr val, [Binding] env)
 		const Iarch b = emit_record_lit(ctx, field_ftype(ctx, rt, fname), record_inits_e(val), env)
 		return "%t${b}"
 	}
+	# a `*[T]` raw-pointer field storing an array: pass its element base (data@0), like a `*[T]`
+	# parameter argument; a raw-pointer value (a `$ptr` buffer/field) passes through unchanged
+	if str_eq(field_ftype(ctx, rt, fname), "$ptr") then return emit_ptr_arg(ctx, env, val)
 	return emit_expr(val, ctx, env)
 }
 # The init index whose (non-spread) field is `fname`, or -1 — the override for a spread-copied field.
@@ -2089,18 +2092,21 @@ const emit_index_expr = (*Emit ctx, [Binding] env, Expr base, Expr idx): Str -> 
 		write_str(ctx.fd, "\t%t${tval} =l loadl %t${taddr}\n")
 		return "%t${tval}"
 	}
-	# a byte pointer / buffer index `p[i]` reads the i-th byte at pointer + i (no header).
+	# a raw pointer index `p[i]` reads the i-th element at pointer + i*stride (no header): a
+	# `*[Uint8]` byte pointer/buffer strides 1 (`loadub`), a `*[Iarch]` word pointer strides 8 (`loadl`).
 	if str_eq(bt, "$ptr") then {
+		const Iarch pesz = ptr_stride(init_elem(ctx, env, base))
 		const Str pv = emit_expr(idx, ctx, env)
 		const Iarch pil = ctx.next
 		ctx.next = ctx.next + 1
-		write_str(ctx.fd, "\t%t${pil} =l copy ${pv}\n")
+		write_str(ctx.fd, "\t%t${pil} =l mul ${pv}, ${pesz}\n")
 		const Iarch paddr = ctx.next
 		ctx.next = ctx.next + 1
 		write_str(ctx.fd, "\t%t${paddr} =l add ${hv}, %t${pil}\n")
 		const Iarch pval = ctx.next
 		ctx.next = ctx.next + 1
-		write_str(ctx.fd, "\t%t${pval} =l loadub %t${paddr}\n")
+		if pesz == 1 then write_str(ctx.fd, "\t%t${pval} =l loadub %t${paddr}\n")
+		if pesz != 1 then write_str(ctx.fd, "\t%t${pval} =l loadl %t${paddr}\n")
 		return "%t${pval}"
 	}
 	# a string index `s[i]` reads the i-th byte: the header's bytes pointer @0, then +i.
