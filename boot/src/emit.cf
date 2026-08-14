@@ -332,6 +332,47 @@ const loop_yield_scalar_either = (*Emit ctx, [Binding] env, Stmt a, Stmt b): Str
 	if !str_eq(f, "") then return f
 	return loop_yield_scalar_stmt(ctx, env, b)
 }
+# The AGGREGATE type a value-yielding `loop` produces (a record/union/Str name / `$dyn` / `$tuple`,
+# else "") — the first `<- v` whose value is an aggregate. Mirrors `loop_yield_scalar_*` but reports
+# the aggregate marker (`init_agg_type`), so `let R r = loop { … <- R({…}) }` binds `r` as its record.
+# A scalar yield is "" (not an aggregate) and the walk continues; since all yields share a type
+# (typecheck), the first aggregate found is the loop's type. A `match` arm's body is walked in that
+# arm's payload-binding env (`arm_bind_types`), so a `<- x` yielding a bound payload aggregate is
+# recovered correctly (and consistently with the value `emit_match` stores).
+const loop_yield_agg_list = (*Emit ctx, [Binding] env, [Stmt] ss): Str -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		const Str f = loop_yield_agg_stmt(ctx, env, ss[i])
+		if !str_eq(f, "") then return f
+		i = i + 1
+	}
+	return ""
+}
+const loop_yield_agg_arms = (*Emit ctx, [Binding] env, [StmtArm] arms): Str -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		const [Binding] aenv = arm_bind_types(ctx, env, arms[i].type_name, arms[i].members, arms[i].binds)
+		const Str f = loop_yield_agg_list(ctx, aenv, arms[i].body)
+		if !str_eq(f, "") then return f
+		i = i + 1
+	}
+	return ""
+}
+const loop_yield_agg_either = (*Emit ctx, [Binding] env, Stmt a, Stmt b): Str -> {
+	const Str f = loop_yield_agg_stmt(ctx, env, a)
+	if !str_eq(f, "") then return f
+	return loop_yield_agg_stmt(ctx, env, b)
+}
+const loop_yield_agg_stmt = (*Emit ctx, [Binding] env, Stmt s): Str -> match s {
+	Stmt.Yield(e) -> init_agg_type(ctx, env, e),
+	Stmt.IfThen(c, b) -> loop_yield_agg_stmt(ctx, env, b),
+	Stmt.IfElse(c, tb, eb) -> loop_yield_agg_either(ctx, env, tb, eb),
+	Stmt.Block(ss) -> loop_yield_agg_list(ctx, env, ss),
+	Stmt.Match(scrut, arms) -> loop_yield_agg_arms(ctx, env, arms),
+	_ -> ""
+}
 const scalar_of = (*Emit ctx, [Binding] env, Expr e): Str -> match e {
 	Expr.Call(callee, tyargs, args) -> call_scalar_e(ctx, env, callee),
 	Expr.Var(n) -> var_scalar(env, n),
@@ -1220,6 +1261,9 @@ const init_agg_type = (*Emit ctx, [Binding] env, Expr e): Str -> match e {
 	# safe; a `match` arm may bind a payload, so it is handled conservatively by `match_agg_type`.
 	Expr.If(c, t, el) -> init_agg_type(ctx, env, t),
 	Expr.Match(sc, arms) -> match_agg_type(ctx, env, arms),
+	# a value-yielding `loop` that produces an aggregate reports its `<- v` aggregate type, so
+	# `let R r = loop { … <- R({…}) }` binds `r` as its record and `r.field` dispatches.
+	Expr.Loop(body) -> loop_yield_agg_list(ctx, env, body),
 	_ -> ""
 }
 
