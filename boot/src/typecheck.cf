@@ -703,6 +703,25 @@ const str_seal_type = ([Expr] args, [VarTy] env, Ctx ctx): Ty -> {
 # an argument — the only expression a function-type parameter accepts).
 const as_var_name = (Expr e): Str -> match e { Expr.Var(n) -> n, _ -> "" }
 
+# Whether an array-typed expression is a shape `emit_ptr_arg` can lower to its data pointer (data@0)
+# when passed to a `*[T]` raw pointer — exactly the forms emit's `init_agg_type` classifies as a
+# `$dyn` header: a literal, a variable, a field/index read (name- or expression-based), or a call
+# result. A value-COMPOUND that yields an array opaquely (`if`/`match`/value-`loop`) types as an array
+# but emit cannot classify its header, so it is rejected cleanly here rather than miscompiled. (A
+# field/index whose BASE is such a compound — `(if…).items` — cannot compile at all: cf0 already
+# crashes on an `if`/`match` that yields an aggregate, independent of this gate.)
+const is_ptr_arr_arg = (Expr e): Bool -> match e {
+	Expr.ArrayLit(_, _, _, _) -> true,
+	Expr.Var(_) -> true,
+	Expr.Field(_, _) -> true,
+	Expr.FieldExpr(_, _) -> true,
+	Expr.Index(_, _) -> true,
+	Expr.IndexExpr(_, _) -> true,
+	Expr.IndexField(_, _, _) -> true,
+	Expr.Call(_, _, _) -> true,
+	_ -> false
+}
+
 # Check the argument passed to a function-type parameter: it must be a bare function reference —
 # a function-value parameter in scope, or a top-level function by name — whose signature matches
 # the parameter's (nominally). Anything else (a non-function value, an arbitrary expression) is
@@ -765,12 +784,11 @@ const call_type = (Str callee, [Str] tyargs, [Expr] args, [VarTy] env, Ctx ctx):
 			if !ty_eq(at, pt) then {
 				if is_tptr(at) && is_tint(pt) then { }
 				# a `*[T]` raw-pointer parameter accepts another raw pointer (forwarding a `*[T]`
-				# onward), or a BARE-VARIABLE dynamic-/fixed-array whose element base (data@0) is
-				# passed. A non-variable array expression (a field/index/call result) is a follow-up:
-				# emit only lowers a named array to its data pointer, so accepting one here would
-				# pass the header instead — rejected cleanly rather than miscompiled.
+				# onward), or a dynamic-/fixed-array expression `emit_ptr_arg` can lower to its element
+				# base (data@0) — a bare variable, or a field/index/call result (`is_ptr_arr_arg`). An
+				# array yielded opaquely by an `if`/`match` is rejected (emit cannot classify its header).
 				else if is_tptr(pt) && is_tptr(at) then { }
-				else if is_tptr(pt) && !str_eq(dyn_of(at), "") && !str_eq(as_var_name(args[i]), "") then { }
+				else if is_tptr(pt) && !str_eq(dyn_of(at), "") && is_ptr_arr_arg(args[i]) then { }
 				else die("cf0: type: a call argument's type does not match the parameter\n")
 			}
 		}
@@ -861,10 +879,10 @@ const record_type = (Str type_name, [FieldInit] inits, [VarTy] env, Ctx ctx): Ty
 				fixed_lit_fits(inits[a].value, tfixed_bits(ft), tfixed_signed(ft))
 			} else {
 				const Ty vt = type_of(inits[a].value, env, ctx)
-					# a `*[T]` raw-pointer field stores another raw pointer, or a BARE-variable dynamic-/fixed
+					# a `*[T]` raw-pointer field stores another raw pointer, or ANY dynamic-/fixed-array
 					# array whose element base (data@0) is stored — mirroring a `*[T]` parameter argument
 					if is_tptr(ft) then {
-						if !is_tptr(vt) && (str_eq(dyn_of(vt), "") || str_eq(as_var_name(inits[a].value), "")) then die("cf0: type: a `*[T]` field needs a raw pointer or a named array\n")
+						if !is_tptr(vt) && (str_eq(dyn_of(vt), "") || !is_ptr_arr_arg(inits[a].value)) then die("cf0: type: a `*[T]` field needs a raw pointer or an array\n")
 					} else if !ty_eq(vt, ft) then die("cf0: type: a data-literal field value's type must match the field\n")
 			}
 		}
