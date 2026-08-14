@@ -2276,28 +2276,16 @@ const check_stmt_match = (Expr scrut, [StmtArm] arms, [VarTy] env, Ctx ctx, Iarc
 		} else {
 			if wild_seen then die("cf0: type: no match arm may follow `_`\n")
 			if !str_eq(arms[i].type_name, un) then die("cf0: type: a match arm must name the scrutinee's union\n")
-			let Iarch mj = 0
-			loop {
-				if mj >= Iarch(arms[i].members.len) then break
-				const Iarch mi = union_member_index(mems, arms[i].members[mj])
-				if mi < 0 then die("cf0: type: a match arm names a nonexistent union member\n")
-				let Iarch d = 0
-				loop {
-					if d >= Iarch(covered.len) then break
-					if covered[d] == mi then die("cf0: type: a union member is matched twice\n")
-					d = d + 1
-				}
-				covered = [...covered, mi]
-				mj = mj + 1
-			}
-			# a payload-binding arm (single member): arity must match, no repeated name
+			# a payload-binding arm is single-member: validate arity + no repeated bind name (skipping
+			# guards), and resolve its sub-pattern guards — a GUARDED arm only partially covers its member.
+			let Bool guarded = false
 			if Iarch(arms[i].binds.len) > 0 then {
 				const Iarch mi0 = union_member_index(mems, arms[i].members[0])
 				if Iarch(arms[i].binds.len) != Iarch(mems[mi0].payloads.len) then die("cf0: type: a payload pattern's arity must match the member\n")
 				let Iarch di = 0
 				loop {
 					if di >= Iarch(arms[i].binds.len) then break
-					if !str_eq(arms[i].binds[di], "_") then {
+					if !str_eq(arms[i].binds[di], "_") && !is_pat_guard(arms[i].binds[di]) then {
 						let Iarch dj = 0
 						loop {
 							if dj >= di then break
@@ -2307,6 +2295,22 @@ const check_stmt_match = (Expr scrut, [StmtArm] arms, [VarTy] env, Ctx ctx, Iarc
 					}
 					di = di + 1
 				}
+				guarded = check_arm_guards(ui, mems, mi0, arms[i].binds, ctx)
+			}
+			let Iarch mj = 0
+			loop {
+				if mj >= Iarch(arms[i].members.len) then break
+				const Iarch mi = union_member_index(mems, arms[i].members[mj])
+				if mi < 0 then die("cf0: type: a match arm names a nonexistent union member\n")
+				if guarded then {
+					# a guarded arm only partially covers its member: it never proves the member
+					# exhausted, and it is unreachable if an earlier unguarded arm already did
+					if int_in(covered, mi) then die("cf0: type: a guarded match arm is unreachable (its member is already fully covered)\n")
+				} else {
+					if int_in(covered, mi) then die("cf0: type: a union member is matched twice\n")
+					covered = [...covered, mi]
+				}
+				mj = mj + 1
 			}
 		}
 		const [VarTy] benv = arm_bind_env(arms[i].type_name, arms[i].members, arms[i].binds, env, ctx)

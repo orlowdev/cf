@@ -1840,6 +1840,30 @@ const emit_stmt_match = (*Emit ctx, [Binding] env, Expr scrut, [StmtArm] arms): 
 			const [Binding] benv_e = arm_body_env(ctx, env, arms[i].type_name, arms[i].members, arms[i].binds, s)
 			const Iarch t = emit_block(ctx, arms[i].body, benv_e)
 			if t == 0 then write_str(ctx.fd, "\tjmp @smend${lid}\n")
+		} else if arm_is_guarded(arms[i].binds) then {
+			# a GUARDED arm (single member + payload sub-patterns): test the tag, then each guard in
+			# turn; any failure falls through to the next arm, all passing runs the statement body.
+			const Iarch c0 = ctx.next
+			ctx.next = ctx.next + 1
+			emit_arm_test(ctx, arms[i].type_name, arms[i].members[0], s, tagop, c0)
+			write_str(ctx.fd, "\tjnz %t${c0}, @sg${lid}_${i}_0, @snext${lid}_${i}\n")
+			let Iarch g = 0
+			let Iarch bg = 0
+			loop {
+				if bg >= Iarch(arms[i].binds.len) then break
+				if is_pat_guard(arms[i].binds[bg]) then {
+					write_str(ctx.fd, "@sg${lid}_${i}_${g}\n")
+					const Str cg = emit_guard_cmp(ctx, arms[i].type_name, arms[i].members[0], arms[i].binds[bg], s, bg)
+					write_str(ctx.fd, "\tjnz ${cg}, @sg${lid}_${i}_${g + 1}, @snext${lid}_${i}\n")
+					g = g + 1
+				}
+				bg = bg + 1
+			}
+			write_str(ctx.fd, "@sg${lid}_${i}_${g}\n")
+			const [Binding] benv_g = arm_body_env(ctx, env, arms[i].type_name, arms[i].members, arms[i].binds, s)
+			const Iarch t = emit_block(ctx, arms[i].body, benv_g)
+			if t == 0 then write_str(ctx.fd, "\tjmp @smend${lid}\n")
+			write_str(ctx.fd, "@snext${lid}_${i}\n")
 		} else {
 			# test each or-pattern alternative: a hit jumps to the arm body, a miss to the
 			# next alternative, and after the last to the next arm.
