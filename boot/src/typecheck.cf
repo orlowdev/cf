@@ -47,6 +47,10 @@ const is_tstr = (Ty t): Bool -> match t { Ty.TStr -> true, _ -> false }
 const is_tunit = (Ty t): Bool -> match t { Ty.TUnit -> true, _ -> false }
 const is_tfixed = (Ty t): Bool -> match t { Ty.TFixed(b, s) -> true, _ -> false }
 const is_tfloat = (Ty t): Bool -> match t { Ty.TFloat(b) -> true, _ -> false }
+# A register-WIDTH integer: the word `Iarch`/`Int` (`TInt`) or a 64-bit fixed leaf (`Uarch`/`Uint64`/
+# `Int64`). These all ride an 8-byte register and interconvert freely in WORD contexts (a call
+# argument, a return, an assignment) — only an OPERATOR keeps them distinct (`Uarch + Iarch`, §4).
+const is_wordish = (Ty t): Bool -> is_tint(t) || (is_tfixed(t) && tfixed_bits(t) == 64)
 # A type-variable name (`'T`) — an apostrophe-led name (byte 39). After monomorphization no
 # concrete program has these, so one surviving into a declaration is an undeclared type var.
 const name_is_typevar = (Str s): Bool -> if Iarch(s.len) == 0 then false else Iarch(s[0]) == 39
@@ -887,9 +891,13 @@ const call_type = (Str callee, [Str] tyargs, [Expr] args, [VarTy] env, Ctx ctx):
 				}
 			}
 			const Ty at = type_of(args[i], env, ctx)
-			# a byte pointer is an address, acceptable where a `Uarch`/`Int` is expected (syscalls)
+			# a byte pointer is a pointer-width address, acceptable where a register word is expected
+			# (the syscall-argument idiom)
 			if !ty_eq(at, pt) then {
-				if is_tptr(at) && is_tint(pt) then { }
+				if is_tptr(at) && is_wordish(pt) then { }
+				# register-width words interconvert in argument position (`Iarch`↔`Uarch`, and a bare
+				# literal → `Uarch`) — the word idiom; a NARROW fixed param (`Int8`/…) stays strict (731)
+				else if is_wordish(at) && is_wordish(pt) then { }
 				# a `*[T]` raw-pointer parameter accepts another raw pointer (forwarding a `*[T]`
 				# onward), or a dynamic-/fixed-array expression `emit_ptr_arg` can lower to its element
 				# base (data@0) — a bare variable, or a field/index/call result (`is_ptr_arr_arg`). An
@@ -1638,7 +1646,9 @@ const interp_type = ([Seg] segs, [VarTy] env, Ctx ctx): Ty -> {
 		if i >= Iarch(segs.len) then break
 		if segs[i].is_hole then {
 			const Ty ht = type_of(segs[i].expr, env, ctx)
-			if !is_tint(ht) && !is_tstr(ht) then die("cf0: type: an interpolation hole must be an integer or a string\n")
+			# an integer word, a pointer-width fixed (`Uarch`, itoa'd like a word), or a `Str` — a Bool,
+			# aggregate, narrow fixed, or float hole is not stringifiable
+			if !is_tint(ht) && !(is_tfixed(ht) && tfixed_bits(ht) == 64) && !is_tstr(ht) then die("cf0: type: an interpolation hole must be an integer or a string\n")
 		}
 		i = i + 1
 	}
@@ -1968,8 +1978,10 @@ const check_simple_stmt = (Stmt s, [VarTy] env, Ctx ctx, Iarch loop_kind): Iarch
 				if str_eq(rrt, "") then die("cf0: type: a bare `({…})` record literal does not fit a non-record return type\n")
 				record_type(rrt, record_inits(e), env, ctx)
 			} else {
+				# register-width words interconvert on return (`Iarch`/`Uarch`/a bare literal → `Uarch`),
+				# e.g. a folded `[Uarch n]` value-param body returning `42`; a narrow fixed return (733) is strict
 				const Ty rty = type_of(e, env, ctx)
-				if !ty_eq(rty, ctx.frt) then die("cf0: type: a returned value's type must match the function's return type\n")
+				if !ty_eq(rty, ctx.frt) && !(is_wordish(rty) && is_wordish(ctx.frt)) then die("cf0: type: a returned value's type must match the function's return type\n")
 			}
 			code = 2
 		},
