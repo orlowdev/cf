@@ -194,7 +194,16 @@ const is_tuple_bindable = (Expr e): Bool -> match e {
 # The written type NAME for a tuple element — `Iarch` for any integer width, `Bool`, `Str`,
 # or a record type. A record element must be a FRESH value (see `is_fresh_record`). Arrays,
 # unions, and nested tuples are a later tuple brick.
-const element_type_name = (Ty t, Expr e): TupElem -> {
+# A freshly-constructed UNION value (not an alias): `Type.member(...)` (a payload construction) or a
+# bare `Type.Member` (a tag-only member — a `Field` whose base names a union type), or a call. Rules
+# out a bound union name / a union-typed record field read, which would put a borrowed value in the tuple.
+const is_fresh_union = (Expr e, Ctx ctx): Bool -> match e {
+	Expr.UnionMk(t, m, args) -> true,
+	Expr.Call(c, ta, a) -> true,
+	Expr.Field(base, member) -> find_union(ctx.unions, base) >= 0,
+	_ -> false
+}
+const element_type_name = (Ty t, Expr e, Ctx ctx): TupElem -> {
 	if is_tint(t) then return tel_leaf("Iarch")
 	if is_tbool(t) then return tel_leaf("Bool")
 	if is_tstr(t) then return tel_leaf("Str")
@@ -209,7 +218,14 @@ const element_type_name = (Ty t, Expr e): TupElem -> {
 		if !is_fresh_record(e) then die("cf0: type: a record tuple element must be a freshly constructed value (a call or a `T({…})` construction), not an alias\n")
 		return tel_leaf(rn)
 	}
-	die("cf0: type: a tuple element must be an Iarch, Bool, Str, a fresh record, or a nested tuple (arrays and unions are a later brick)\n")
+	# a UNION position rides as its 8-byte value (a boxed pointer, or a bare tag for a tag-only union),
+	# recovered via `named_ty` → `TUnion`; like a record it must be a fresh construction, not an alias
+	const Str un = union_of(t)
+	if !str_eq(un, "") then {
+		if !is_fresh_union(e, ctx) then die("cf0: type: a union tuple element must be a freshly constructed value (`Type.Member` / `Type.member(...)`), not an alias\n")
+		return tel_leaf(un)
+	}
+	die("cf0: type: a tuple element must be an Iarch, Bool, Str, a fresh record, a fresh union, or a nested tuple (arrays are a later brick)\n")
 	return tel_leaf("Iarch")
 }
 
@@ -1453,7 +1469,7 @@ const tuple_type = ([Expr] elems, [VarTy] env, Ctx ctx): Ty -> {
 				j = j + 1
 			}
 		} else {
-			names = [...names, element_type_name(type_of(elems[i], env, ctx), elems[i])]
+			names = [...names, element_type_name(type_of(elems[i], env, ctx), elems[i], ctx)]
 		}
 		i = i + 1
 	}
