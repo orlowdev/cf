@@ -157,6 +157,8 @@ const tuple_elems_eq = ([TupElem] a, [TupElem] b): Bool -> {
 # The `Ty` a tuple position denotes: a nested position is a `TTuple`, else its named type.
 pub const tel_to_ty = (TupElem te, Ctx ctx): Ty -> {
 	if tel_is_nest(te) then return Ty.TTuple(te.sub)
+	# a `[Elem]`-spelled position is a dynamic array (the nested-array convention)
+	if is_nested(te.name) then return Ty.TDyn(nested_inner(te.name))
 	return named_ty(te.name, "", ctx.recs, ctx.unions)
 }
 
@@ -225,7 +227,16 @@ const element_type_name = (Ty t, Expr e, Ctx ctx): TupElem -> {
 		if !is_fresh_union(e, ctx) then die("cf0: type: a union tuple element must be a freshly constructed value (`Type.Member` / `Type.member(...)`), not an alias\n")
 		return tel_leaf(un)
 	}
-	die("cf0: type: a tuple element must be an Iarch, Bool, Str, a fresh record, a fresh union, or a nested tuple (arrays are a later brick)\n")
+	# a dynamic-ARRAY position rides as its 8-byte header pointer, spelled `[Elem]` (the nested-array
+	# convention, so `tel_to_ty`/`elem_ty` recover `TDyn`). Like a record it must be a fresh value (an
+	# array literal or a call result), never an aliased array binding.
+	const Str aen = dyn_of(t)
+	if !str_eq(aen, "") then {
+		const Bool afresh = match e { Expr.ArrayLit(h, s, el, et) -> true, Expr.Call(c, ta, a) -> true, _ -> false }
+		if !afresh then die("cf0: type: an array tuple element must be a fresh array literal or a call result, not an alias\n")
+		return tel_leaf("[${aen}]")
+	}
+	die("cf0: type: a tuple element must be an Iarch, Bool, Str, a fresh record/union/array, or a nested tuple\n")
 	return tel_leaf("Iarch")
 }
 
@@ -1497,8 +1508,13 @@ const tuple_indexfield_type = ([TupElem] names, Expr idx, Str field, Ctx ctx): T
 		if !str_eq(field, "len") then die("cf0: type: a string element has only `.len`\n")
 		return Ty.TInt
 	}
+	# a dynamic-array element (`[Elem]`-spelled) answers only `.len` (its header len @8)
+	if is_nested(tn) then {
+		if !str_eq(field, "len") then die("cf0: type: an array element has only `.len` (index it for values, `t[k][i]`)\n")
+		return Ty.TInt
+	}
 	const Iarch ri = find_rec(ctx.recs, tn)
-	if ri < 0 then die("cf0: type: a field read needs a record or string element\n")
+	if ri < 0 then die("cf0: type: a field read needs a record, string, or array element\n")
 	const Iarch fi = field_index(ctx.recs[ri].fields, field)
 	if fi < 0 then die("cf0: type: the element record has no such field\n")
 	return field_decl_ty(ri, fi, ctx)
