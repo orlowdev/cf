@@ -289,6 +289,9 @@ const field_scalar = (*Emit ctx, Str rt, Str field): Str -> scalar_only(field_ft
 const idx_scalar = ([Binding] env, Str arr, Expr idx): Str -> {
 	const Iarch ai = lookup_index(env, arr)
 	if ai < 0 then return ""
+	# a FLOAT dynamic-array element (`xs[i]`) reports its float type so an op picks up float codegen;
+	# other arrays keep the tuple-position path (empty for a word/aggregate element)
+	if str_eq(env[ai].rec_type, "$dyn") && is_float_name(env[ai].elem) then return env[ai].elem
 	return scalar_only(telem_name(env[ai].telems, tuple_lit_index(idx)))
 }
 const idxexpr_scalar = (*Emit ctx, [Binding] env, Expr base, Expr idx): Str -> scalar_only(telem_name(init_telems(ctx, env, base), tuple_lit_index(idx)))
@@ -2047,8 +2050,9 @@ const emit_array_lit = (*Emit ctx, [Expr] elems, Str elem_type, [Binding] env): 
 			const Iarch addr = ctx.next
 			ctx.next = ctx.next + 1
 			write_str(ctx.fd, "\t%t${addr} =l add %t${data}, ${off}\n")
+			# a `[Uint8]` byte element uses `storeb`; a float element `stored`/`stores`; else `storel`
 			if esz == 1 then write_str(ctx.fd, "\tstoreb ${v}, %t${addr}\n")
-			if esz != 1 then write_str(ctx.fd, "\tstorel ${v}, %t${addr}\n")
+			if esz != 1 then write_str(ctx.fd, "\t${store_op(scalar_only(elem_type))} ${v}, %t${addr}\n")
 			i = i + 1
 		}
 		write_str(ctx.fd, "\tstorel %t${data}, %t${hdr}\n")
@@ -2218,9 +2222,10 @@ const emit_index = (*Emit ctx, [Binding] env, Str arr, Expr idx): Str -> {
 	write_str(ctx.fd, "\t%t${slot} =l add %t${data}, %t${off}\n")
 	const Iarch val = ctx.next
 	ctx.next = ctx.next + 1
-	# a `[Uint8]` element is one byte (`loadub`); every other is an 8-byte slot (`loadl`)
+	# a `[Uint8]` element is one byte (`loadub`); a float element `loadd`/`loads`; else an 8-byte `loadl`
+	const Str eqt = if is_float_name(env[ai].elem) then float_qt(env[ai].elem) else "l"
 	if esz == 1 then write_str(ctx.fd, "\t%t${val} =l loadub %t${slot}\n")
-	if esz != 1 then write_str(ctx.fd, "\t%t${val} =l loadl %t${slot}\n")
+	if esz != 1 then write_str(ctx.fd, "\t%t${val} =${eqt} load${eqt} %t${slot}\n")
 	return "%t${val}"
 }
 
@@ -2496,6 +2501,9 @@ const emit_for_body = (*Emit ctx, [Binding] env, Str lv, Str arr, [Stmt] body): 
 	const Iarch eslot = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${eslot} =l add %t${data}, %t${off}\n")
+	# a float array binds each element as a float (the cell records its scalar so `binding_ptr`
+	# reloads with `loadd`/`loads`); the raw `loadl`/`storel` spill is bit-preserving
+	const Str fx = if is_float_name(env[ai].elem) then env[ai].elem else ""
 	const Iarch xval = ctx.next
 	ctx.next = ctx.next + 1
 	if esz == 1 then write_str(ctx.fd, "\t%t${xval} =l loadub %t${eslot}\n")
@@ -2504,7 +2512,7 @@ const emit_for_body = (*Emit ctx, [Binding] env, Str lv, Str arr, [Stmt] body): 
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${xcell} =l alloc8 8\n")
 	write_str(ctx.fd, "\tstorel %t${xval}, %t${xcell}\n")
-	const [Binding] benv = [...env, Binding({ name: lv, slot: xcell, rec_type: "", elem: "", is_cell: true, telems: [], fixed: "" })]
+	const [Binding] benv = [...env, Binding({ name: lv, slot: xcell, rec_type: "", elem: "", is_cell: true, telems: [], fixed: fx })]
 	const Iarch term = emit_block(ctx, body, benv)
 	if term == 0 then write_str(ctx.fd, "\tjmp @ltop${lid}\n")
 	write_str(ctx.fd, "@lend${lid}\n")
@@ -2693,8 +2701,9 @@ const emit_simple_stmt = (*Emit ctx, [Binding] env, Stmt s): Iarch -> {
 			const Iarch slot = ctx.next
 			ctx.next = ctx.next + 1
 			write_str(ctx.fd, "\t%t${slot} =l add %t${data}, %t${off}\n")
+			# a `[Uint8]` byte element uses `storeb`; a float element `stored`/`stores`; else `storel`
 			if esz == 1 then write_str(ctx.fd, "\tstoreb ${vv}, %t${slot}\n")
-			if esz != 1 then write_str(ctx.fd, "\tstorel ${vv}, %t${slot}\n")
+			if esz != 1 then write_str(ctx.fd, "\t${store_op(scalar_only(env[ai].elem))} ${vv}, %t${slot}\n")
 		},
 		Stmt.IfThen(c, body) -> {
 			emit_guard(ctx, env, c, body)
