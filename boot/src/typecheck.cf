@@ -987,6 +987,26 @@ const is_ptr_field_ty = (Ty ft, Ctx ctx): Bool -> match ft {
 	Ty.TUnion(n) -> union_has_payload(ctx.unions, n),
 	_ -> false
 }
+# Whether `e` reads an aggregate-POINTER field `o.p` where `p` was declared `*Record`/`*Union` (a
+# reference to a referent, tracked in the record's `fptrs`). Such a read yields a reference, not an
+# owned value, so binding it with `let` would permit repointing — an inferred pointer local binds
+# `const` (993), mirroring the explicit `const *P p = &x` rule. A bare value-field read (`fptr` false)
+# and any non-`Field` expression are NOT flagged.
+const is_ptr_field_read = (Expr e, [VarTy] env, Ctx ctx): Bool -> {
+	let Str base = ""
+	let Str fld = ""
+	match e { Expr.Field(b, f) -> { base = b  fld = f }, _ -> {} }
+	if str_eq(base, "") then return false
+	const Iarch vi = env_index(env, base)
+	if vi < 0 then return false
+	const Str tn = rec_of(env[vi].ty)
+	if str_eq(tn, "") then return false
+	const Iarch ri = find_rec(ctx.recs, tn)
+	if ri < 0 then return false
+	const Iarch fi = field_index(ctx.recs[ri].fields, fld)
+	if fi < 0 then return false
+	return ctx.recs[ri].fptrs[fi]
+}
 # A bare `{ … }` record literal (an inline NESTED literal) — a `Record` whose type_name is empty,
 # to be resolved from its FIELD's declared record type. `record_inits` reads its field inits.
 const is_bare_record = (Expr e): Bool -> match e {
@@ -2466,6 +2486,9 @@ const check_stmts = ([Stmt] stmts, [VarTy] env0, Ctx ctx, Iarch loop_kind): Iarc
 			Stmt.ForIn(fv, fa, fbd) -> { check_for_body(fv, fa, fbd, env, ctx) },
 			Stmt.Let(n, m, ann, e) -> {
 				if env_index(env, n) >= 0 then die("cf0: type: a binding cannot shadow an existing name\n")
+				# an inferred pointer local — a read of a `*Record`/`*Union` reference field — binds `const`,
+				# not `let`: a reference cannot be repointed (993, the inferred analog of `const *P p = &x`).
+				if m && is_ptr_field_read(e, env, ctx) then die("cf0: type: an inferred pointer local (a `*` reference field read) binds `const`, not `let` — a reference cannot be repointed\n")
 				const Ty ty = binding_ty(ann, e, env, ctx)
 				if m && is_ttuple(ty) then die("cf0: type: a tuple binds `const` only (a mutable tuple is a later brick)\n")
 				if is_ttuple(ty) && !is_tuple_bindable(e) then die("cf0: type: this expression cannot bind a tuple\n")
