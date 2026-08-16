@@ -992,11 +992,10 @@ const is_ptr_field_ty = (Ty ft, Ctx ctx): Bool -> match ft {
 # owned value, so binding it with `let` would permit repointing — an inferred pointer local binds
 # `const` (993), mirroring the explicit `const *P p = &x` rule. A bare value-field read (`fptr` false)
 # and any non-`Field` expression are NOT flagged.
-const is_ptr_field_read = (Expr e, [VarTy] env, Ctx ctx): Bool -> {
-	let Str base = ""
-	let Str fld = ""
-	match e { Expr.Field(b, f) -> { base = b  fld = f }, _ -> {} }
-	if str_eq(base, "") then return false
+# Whether field `fld` of the record-typed local/param `base` was declared an aggregate POINTER
+# (`fptrs[fi]`) — the core `*Record`/`*Union`-field test shared by the `let`-reference gate and the
+# region-outlives field-read propagation.
+const field_is_ptr = (Str base, Str fld, [VarTy] env, Ctx ctx): Bool -> {
 	const Iarch vi = env_index(env, base)
 	if vi < 0 then return false
 	const Str tn = rec_of(env[vi].ty)
@@ -1006,6 +1005,13 @@ const is_ptr_field_read = (Expr e, [VarTy] env, Ctx ctx): Bool -> {
 	const Iarch fi = field_index(ctx.recs[ri].fields, fld)
 	if fi < 0 then return false
 	return ctx.recs[ri].fptrs[fi]
+}
+const is_ptr_field_read = (Expr e, [VarTy] env, Ctx ctx): Bool -> {
+	let Str base = ""
+	let Str fld = ""
+	match e { Expr.Field(b, f) -> { base = b  fld = f }, _ -> {} }
+	if str_eq(base, "") then return false
+	return field_is_ptr(base, fld, env, ctx)
 }
 # A bare `{ … }` record literal (an inline NESTED literal) — a `Record` whose type_name is empty,
 # to be resolved from its FIELD's declared record type. `record_inits` reads its field inits.
@@ -1968,55 +1974,57 @@ const name_esc = ([VarTy] env, Str n): Bool -> {
 	if i < 0 then return false
 	return env[i].esc
 }
-const carries_local = (Expr e, [VarTy] env): Bool -> match e {
+const carries_local = (Expr e, [VarTy] env, Ctx ctx): Bool -> match e {
 	Expr.Addr(n) -> true,
 	Expr.Var(n) -> name_esc(env, n),
-	# a field / index READ is NOT propagated: its result is usually a SCALAR (`p.x`, `a[i]`), which
-	# carries no pointer, and distinguishing a pointer-field read would need the field's type here.
-	# So returning a raw pointer FIELD read from a local aggregate (`return localAgg.ptrField`) is an
-	# unflagged gap — the direct `&`, pointer-local, and by-construction escapes below are what matter.
-	Expr.Record(tn, inits) -> inits_carry_local(inits, env),
-	Expr.UnionMk(tn, mem, args) -> exprs_carry_local(args, env),
-	Expr.Tuple(elems) -> exprs_carry_local(elems, env),
-	Expr.ArrayLit(hs, sn, elems, et) -> exprs_carry_local(elems, env),
-	Expr.If(c, t, el) -> carries_local(t, env) || carries_local(el, env),
-	Expr.Match(sc, arms) -> arms_carry_local(arms, env),
-	Expr.Loop(body) -> body_yields_local(body, env),
+	# a field READ propagates the local-escape taint iff it reads an aggregate POINTER field (`fptrs`)
+	# of a TAINTED local aggregate — `return localAgg.ptrField` hands up the `&local` stored in it, a
+	# pointer into a dying residence (memory_model §6). A scalar-field read (`p.x`) carries no pointer,
+	# and a pointer field of a PARAM (`param.p`, non-`esc`) points into the caller's region and is safe.
+	# (An index read `a[i]` and a nested `FieldExpr` base stay unpropagated — a further edge.)
+	Expr.Field(base, f) -> name_esc(env, base) && field_is_ptr(base, f, env, ctx),
+	Expr.Record(tn, inits) -> inits_carry_local(inits, env, ctx),
+	Expr.UnionMk(tn, mem, args) -> exprs_carry_local(args, env, ctx),
+	Expr.Tuple(elems) -> exprs_carry_local(elems, env, ctx),
+	Expr.ArrayLit(hs, sn, elems, et) -> exprs_carry_local(elems, env, ctx),
+	Expr.If(c, t, el) -> carries_local(t, env, ctx) || carries_local(el, env, ctx),
+	Expr.Match(sc, arms) -> arms_carry_local(arms, env, ctx),
+	Expr.Loop(body) -> body_yields_local(body, env, ctx),
 	_ -> false
 }
-const exprs_carry_local = ([Expr] es, [VarTy] env): Bool -> {
+const exprs_carry_local = ([Expr] es, [VarTy] env, Ctx ctx): Bool -> {
 	let Iarch i = 0
-	loop { if i >= Iarch(es.len) then break if carries_local(es[i], env) then return true i = i + 1 }
+	loop { if i >= Iarch(es.len) then break if carries_local(es[i], env, ctx) then return true i = i + 1 }
 	return false
 }
-const inits_carry_local = ([FieldInit] inits, [VarTy] env): Bool -> {
+const inits_carry_local = ([FieldInit] inits, [VarTy] env, Ctx ctx): Bool -> {
 	let Iarch i = 0
-	loop { if i >= Iarch(inits.len) then break if carries_local(inits[i].value, env) then return true i = i + 1 }
+	loop { if i >= Iarch(inits.len) then break if carries_local(inits[i].value, env, ctx) then return true i = i + 1 }
 	return false
 }
-const arms_carry_local = ([MatchArm] arms, [VarTy] env): Bool -> {
+const arms_carry_local = ([MatchArm] arms, [VarTy] env, Ctx ctx): Bool -> {
 	let Iarch i = 0
-	loop { if i >= Iarch(arms.len) then break if carries_local(arms[i].body, env) then return true i = i + 1 }
+	loop { if i >= Iarch(arms.len) then break if carries_local(arms[i].body, env, ctx) then return true i = i + 1 }
 	return false
 }
 # A value block / value-yielding loop carries a local pointer iff any `<- v` yields one (recursing
 # into nested if/block/match statements, but NOT a nested loop — it opens its own value context).
-const stmt_yields_local = (Stmt s, [VarTy] env): Bool -> match s {
-	Stmt.Yield(v) -> carries_local(v, env),
-	Stmt.IfThen(c, b) -> stmt_yields_local(b, env),
-	Stmt.IfElse(c, tb, eb) -> stmt_yields_local(tb, env) || stmt_yields_local(eb, env),
-	Stmt.Block(ss) -> body_yields_local(ss, env),
-	Stmt.Match(sc, arms) -> stmt_arms_yield_local(arms, env),
+const stmt_yields_local = (Stmt s, [VarTy] env, Ctx ctx): Bool -> match s {
+	Stmt.Yield(v) -> carries_local(v, env, ctx),
+	Stmt.IfThen(c, b) -> stmt_yields_local(b, env, ctx),
+	Stmt.IfElse(c, tb, eb) -> stmt_yields_local(tb, env, ctx) || stmt_yields_local(eb, env, ctx),
+	Stmt.Block(ss) -> body_yields_local(ss, env, ctx),
+	Stmt.Match(sc, arms) -> stmt_arms_yield_local(arms, env, ctx),
 	_ -> false
 }
-const body_yields_local = ([Stmt] ss, [VarTy] env): Bool -> {
+const body_yields_local = ([Stmt] ss, [VarTy] env, Ctx ctx): Bool -> {
 	let Iarch i = 0
-	loop { if i >= Iarch(ss.len) then break if stmt_yields_local(ss[i], env) then return true i = i + 1 }
+	loop { if i >= Iarch(ss.len) then break if stmt_yields_local(ss[i], env, ctx) then return true i = i + 1 }
 	return false
 }
-const stmt_arms_yield_local = ([StmtArm] arms, [VarTy] env): Bool -> {
+const stmt_arms_yield_local = ([StmtArm] arms, [VarTy] env, Ctx ctx): Bool -> {
 	let Iarch i = 0
-	loop { if i >= Iarch(arms.len) then break if body_yields_local(arms[i].body, env) then return true i = i + 1 }
+	loop { if i >= Iarch(arms.len) then break if body_yields_local(arms[i].body, env, ctx) then return true i = i + 1 }
 	return false
 }
 # return.
@@ -2056,7 +2064,7 @@ const check_simple_stmt = (Stmt s, [VarTy] env, Ctx ctx, Iarch loop_kind): Iarch
 			# function-LOCAL residence — it would dangle once this call's locals die (memory_model §6).
 			# (Returning a local aggregate BY VALUE is fine — it re-homes upward; only an explicit `&`
 			# pointer, or an aggregate built holding one, escapes.)
-			if carries_local(e, env) then die("cf0: type: a returned value cannot carry a pointer into a local — it would dangle once the call returns\n")
+			if carries_local(e, env, ctx) then die("cf0: type: a returned value cannot carry a pointer into a local — it would dangle once the call returns\n")
 			# a bare `[]` return adopts the function's declared element type (context-directed —
 			# `type_of` would default it to `[Iarch]` and spuriously mismatch a `[Str]`/`[T]` return)
 			if is_empty_arraylit(e) then {
@@ -2109,7 +2117,7 @@ const check_simple_stmt = (Stmt s, [VarTy] env, Ctx ctx, Iarch loop_kind): Iarch
 			# region-outlives: rehoming a pointer into a caller-provided aggregate (an `outer` param, which
 			# OUTLIVES this call) may not store a pointer into a function-LOCAL — it would dangle once the
 			# local dies (memory_model §6). A store into a local record is same-rank and permitted.
-			if env[idx].outer && carries_local(e, env) then die("cf0: type: cannot rehome a pointer into a local through a caller's aggregate — it would dangle once the call returns\n")
+			if env[idx].outer && carries_local(e, env, ctx) then die("cf0: type: cannot rehome a pointer into a local through a caller's aggregate — it would dangle once the call returns\n")
 			if !ty_eq(type_of(e, env, ctx), ft) then die("cf0: type: a field value's type must match the field\n")
 		},
 		Stmt.IndexAssign(a, ix, val) -> {
@@ -2494,7 +2502,7 @@ const check_stmts = ([Stmt] stmts, [VarTy] env0, Ctx ctx, Iarch loop_kind): Iarc
 				if is_ttuple(ty) && !is_tuple_bindable(e) then die("cf0: type: this expression cannot bind a tuple\n")
 				# a binding inherits the region-outlives taint of its initializer: `const *P p = &x`, or a
 				# `let q = p` that launders one, carries a local pointer that a later escape must catch.
-				env = [...env, VarTy({ name: n, ty: ty, mutable: m, esc: carries_local(e, env), outer: false, fixed: str_eq(ann, "$fix"), is_ref: is_addr_expr(e) })]
+				env = [...env, VarTy({ name: n, ty: ty, mutable: m, esc: carries_local(e, env, ctx), outer: false, fixed: str_eq(ann, "$fix"), is_ref: is_addr_expr(e) })]
 			},
 			Stmt.Destructure(pat, m, e) -> { env = check_destructure(pat, m, e, env, ctx) },
 			Stmt.Closure(nm, params, ret, body) -> { env = check_closure(nm, params, ret, body, env, ctx) },
