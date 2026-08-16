@@ -122,6 +122,28 @@ const fn_ty_of_param = (Param p): Ty -> {
 	sig = [...sig, tel_leaf(fn_sig_name(p.elem))]
 	return Ty.TFn(sig)
 }
+# A function-type component (argument or return) must be a SCALAR — a word/fixed/float/Bool. A
+# record/union/Str/array/tuple component is a later brick (679).
+const fn_component_ok = (Str name): Bool -> {
+	if is_cast_type(name) then return true
+	if is_float_name(name) then return true
+	if str_eq(name, "Bool") then return true
+	return false
+}
+# Validate a `(A, …) -> R` function-type PARAMETER: at most 32 arguments (the indirect-call emit
+# arrays are fixed, 680), and every argument + the return a scalar component (679).
+const check_fn_param_sig = (Param p): Iarch -> {
+	if !str_eq(p.type_name, "$fn") then return 0
+	if Iarch(p.telems.len) > 32 then die("cf0: type: a function type takes at most 32 parameters\n")
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(p.telems.len) then break
+		if tel_is_nest(p.telems[i]) || !fn_component_ok(p.telems[i].name) then die("cf0: type: a function-type component must be a scalar (a record/aggregate component is a later brick)\n")
+		i = i + 1
+	}
+	if !fn_component_ok(p.elem) then die("cf0: type: a function-type return must be a scalar (a record/aggregate is a later brick)\n")
+	return 0
+}
 # The `TFn` of a top-level FUNCTION referenced by name (to match against a function-type
 # parameter): each parameter's declared type name, then the return type name.
 const fn_ty_of_func = (Func fn): Ty -> {
@@ -1433,6 +1455,12 @@ const is_empty_arraylit = (Expr e): Bool -> match e {
 	Expr.ArrayLit(hs, sn, elems, et) -> if hs then false else Iarch(elems.len) == 0,
 	_ -> false
 }
+# A PLAIN array literal — non-spread and non-empty (`[1, 2, 3]`, not `[...src, e]` or `[]`). A
+# dynamic-array binding may not be reassigned from one (growth uses the spread form).
+const is_plain_arraylit_e = (Expr e): Bool -> match e {
+	Expr.ArrayLit(hs, sn, elems, et) -> !hs && Iarch(elems.len) > 0,
+	_ -> false
+}
 
 # `[a, b]` / `[]` — a dynamic-array literal. Every listed element must match the array's
 # element type (records or words alike).
@@ -1687,6 +1715,9 @@ const fieldexpr_type = (Expr base, Str field, [VarTy] env, Ctx ctx): Ty -> {
 # (range-checked) or demands the exact type; otherwise it is inferred from the value. Shared
 # by the statement checker and the value-loop yield walk (which threads bindings the same way).
 pub const binding_ty = (Str ann, Expr e, [VarTy] env, Ctx ctx): Ty -> {
+	# `Int` is a numeric union BOUND (§8.6), not a concrete value type — a bare integer is `Iarch`, a
+	# specific width is its own type. Naming it as a scalar binding's type is rejected (768).
+	if str_eq(ann, "Int") then die("cf0: type: `Int` is a numeric bound, not a value type — a bare integer is `Iarch`\n")
 	if is_fixed_name(ann) then {
 		if is_adoptable_lit(e) then return adopt_fixed(e, ann)
 		const Ty t = type_of(e, env, ctx)
@@ -1696,6 +1727,13 @@ pub const binding_ty = (Str ann, Expr e, [VarTy] env, Ctx ctx): Ty -> {
 	# a bare `({…})` record literal is typed by the binding's record annotation (its own type_name is
 	# empty); an unannotated `const x = ({…})` has no record context and is rejected by `record_type`
 	if is_bare_record(e) && find_rec(ctx.recs, ann) >= 0 then return record_type(ann, record_inits(e), env, ctx)
+	# a RECORD-annotated binding's value must be that exact record — `const Vec v = Point({…})` (a
+	# different constructed record) is rejected, as is a non-record value under a record annotation
+	if find_rec(ctx.recs, ann) >= 0 then {
+		const Ty rt = type_of(e, env, ctx)
+		if !str_eq(rec_of(rt), ann) then die("cf0: type: a binding's value does not match its record annotation\n")
+		return rt
+	}
 	# an array-literal binding must be annotated — the element type is NOT inferred from the elements
 	# (`const xs = [1, 2, 3]` is rejected; write `const [3 Iarch] xs = …`). An annotated binding carries
 	# the element type in the literal's `elem_type` (the parser sets it for `let [Elem]`/`[N Elem]`).
@@ -1995,6 +2033,10 @@ const check_simple_stmt = (Stmt s, [VarTy] env, Ctx ctx, Iarch loop_kind): Iarch
 			# adopted from the target — `arraylit_type` would otherwise default it to `Iarch`)
 			if is_empty_arraylit(e) then {
 				if str_eq(dyn_of(env[idx].ty), "") then die("cf0: type: `[]` may only be assigned to a dynamic array\n")
+			} else if !str_eq(dyn_of(env[idx].ty), "") && is_plain_arraylit_e(e) then {
+				# a `[T]` is grown/reset, not overwritten: reassign via `xs = [...xs, e]` or `xs = []`,
+				# never a plain literal `xs = [9, 9]` (which would silently drop the old vector)
+				die("cf0: type: a `[T]` is reassigned only by growth `[...xs, e]` or reset `[]`, not a plain literal\n")
 			} else if is_tfixed(env[idx].ty) && is_adoptable_lit(e) then {
 				# a bare integer literal adopts the fixed-width binding's type (range-checked),
 				# just as at its declaration — `let Uint8 x = 5; x = 99`
@@ -2585,7 +2627,13 @@ const check_func = (Func fn, Ctx ctx): Iarch -> {
 	if str_eq(fn.name, "main") && str_eq(fn.ret_name, "Unit") then die("cf0: type: main must return an Iarch exit code, not Unit\n")
 	# an asm-bodied function has no statement body to check — its parameters and return type
 	# still register it for callers (call_type resolves them); the asm is emitted verbatim.
-	if fn.is_asm then return 0
+	if fn.is_asm then {
+		# at most 8 parameters (the arm64 argument registers x0..x7, 174) and a MANDATORY return
+		# type (the spec requires it — an untyped `-> asm …` is rejected, 175)
+		if Iarch(fn.params.len) > 8 then die("cf0: type: an asm function takes at most 8 parameters (the arm64 argument registers)\n")
+		if str_eq(fn.ret_name, "") then die("cf0: type: an asm function must declare its return type\n")
+		return 0
+	}
 	# a concrete function's signature may not mention a type variable (an undeclared `'T` in a
 	# non-generic function, or one the monomorph pass left unsubstituted)
 	if sig_has_typevar(fn) then die("cf0: type: an undeclared type variable in a function signature\n")
@@ -2598,6 +2646,8 @@ const check_func = (Func fn, Ctx ctx): Iarch -> {
 		if pi >= Iarch(fn.params.len) then break
 		# a `*T` pointer parameter must point to a record or union, never a scalar (§6.4)
 		check_ptr_pointee(fn.params[pi], ctx.recs, ctx.unions)
+		# a `(A, …) -> R` function-type parameter: arity cap + scalar components (679/680)
+		check_fn_param_sig(fn.params[pi])
 		const Ty pty = param_ty(fn.params[pi], ctx.recs, ctx.unions)
 		# a `*Record` pointer parameter is mutable — its fields are written through it
 		const Bool pmut = param_is_recptr(fn.params[pi], ctx.recs) || param_is_indexptr(fn.params[pi])
@@ -2619,6 +2669,28 @@ const check_func = (Func fn, Ctx ctx): Iarch -> {
 	return 0
 }
 
+# Whether a field/return type NAME is one cf0 recognizes — a builtin scalar, `Str`/`Bool`/`Unit`, an
+# array/pointer/tuple marker, or a declared record/union. An unknown name (`Nope`, or a generic
+# application `Point[Iarch]` on a non-generic type left un-mangled by resolve) is rejected, rather
+# than silently falling through `named_ty` to the word `TInt`.
+const name_has_byte = (Str n, Iarch ch): Bool -> {
+	let Iarch i = 0
+	loop { if i >= Iarch(n.len) then break  if Iarch(n[i]) == ch then return true  i = i + 1 }
+	return false
+}
+const is_known_typename = (Str name, [RecDecl] recs, [UnionDecl] unions): Bool -> {
+	# a generic APPLICATION (`U[Iarch]`, byte 91 `[`) or MEMBER type (`Maybe[Iarch].Just`, byte 46 `.`)
+	# is validated by resolve/monomorph, not here — pass it through (applying to a non-generic type is
+	# a separate later gate, so `Point[Iarch]` on a plain record is NOT caught by this field-type check)
+	if name_has_byte(name, 91) || name_has_byte(name, 46) then return true
+	if str_eq(name, "$dyn") || str_eq(name, "$ptr") || str_eq(name, "$tuple") then return true
+	if str_eq(name, "Str") || str_eq(name, "Bool") || str_eq(name, "Unit") then return true
+	if is_cast_type(name) then return true
+	if is_float_name(name) then return true
+	if find_rec(recs, name) >= 0 then return true
+	if find_union(unions, name) >= 0 then return true
+	return false
+}
 # Whole-program structure: no two records or functions share a name, and there is
 # exactly one `pub const main` (the entry) with at most three parameters.
 const check_whole = (Program prog): Iarch -> {
@@ -2631,6 +2703,8 @@ const check_whole = (Program prog): Iarch -> {
 			if str_eq(prog.recs[q].name, prog.recs[r].name) then die("cf0: type: two records share a name\n")
 			q = q + 1
 		}
+		# a record may not reuse a union's name (a data/union name clash, either declaration order)
+		if find_union(prog.unions, prog.recs[r].name) >= 0 then die("cf0: type: a data type and a union cannot share a name\n")
 		# a record needs at least one field, and its field names must be distinct
 		const Iarch nf = Iarch(prog.recs[r].fields.len)
 		if nf == 0 then die("cf0: type: a record needs at least one field\n")
@@ -2647,6 +2721,9 @@ const check_whole = (Program prog): Iarch -> {
 			# plain `data` record is not generic, so the `'T` is undeclared (validated here at the
 			# declaration, since a never-USED field would otherwise slip past resolution)
 			if name_is_typevar(prog.recs[r].ftypes[a]) then die("cf0: type: an undeclared type variable in a record field\n")
+			# a field type must name a known type — a builtin, `Str`/`Bool`, or a declared record/union
+			# (an unknown name like `Nope`, or a generic application on a non-generic type, is rejected)
+			if !is_known_typename(prog.recs[r].ftypes[a], prog.recs, prog.unions) then die("cf0: type: a record field names an unknown type\n")
 			if str_eq(prog.recs[r].ftypes[a], "$tuple") && telems_have_typevar(prog.recs[r].ftelems[a]) then die("cf0: type: an undeclared type variable in a tuple field\n")
 			# a `*[T]` raw-pointer field is indexed `f[i]` by element width, so its element must be a
 			# word scalar — `*[Uint8]` (byte) or `*[Iarch]`/a fixed-width (word). A `*[Str]`/record
@@ -2666,9 +2743,15 @@ const check_whole = (Program prog): Iarch -> {
 			if str_eq(prog.funcs[j].name, prog.funcs[i].name) then die("cf0: type: two functions share a name\n")
 			j = j + 1
 		}
+		# `asm` is a reserved keyword (it heads an assembly body), so it cannot name a function
+		if str_eq(prog.funcs[i].name, "asm") then die("cf0: type: `asm` is a reserved keyword and cannot name a function\n")
 		if str_eq(prog.funcs[i].name, "main") then {
 			if !prog.funcs[i].is_pub then die("cf0: type: `main` must be `pub`\n")
 			if Iarch(prog.funcs[i].params.len) > 3 then die("cf0: type: `main` takes at most three parameters\n")
+			# `main`'s value is the process exit code, so it returns a word `Iarch` (or is unannotated);
+			# a record/union/Str/array/tuple return is rejected
+			const Str mrt = prog.funcs[i].ret_name
+			if !str_eq(mrt, "") && !str_eq(mrt, "Iarch") && !str_eq(mrt, "Int") && !str_eq(mrt, "Uarch") then die("cf0: type: `main` must return `Iarch` (its value is the exit code)\n")
 			mains = mains + 1
 		}
 		i = i + 1
