@@ -831,6 +831,43 @@ const mono_defertap = (*MonoCtx m, Str fn, [Expr] args, MonoEnv env): Expr -> {
 	return Expr.DeferTap(mono_callee(m, fn, no_ta, margs, env), margs)
 }
 
+# A bare generic-union construction `Maybe.Just(5)` (no explicit `Maybe[Iarch]`): infer the union's
+# type arguments from the member's payload arg types. For each type parameter, the FIRST payload
+# position that IS exactly that variable (`Just('T)` → position 0; a `Cons('T, *List['T])`'s nested
+# `*List['T]` position is NOT a bare `'T` and is skipped, 929) fixes it to that argument's concrete
+# type. Then resolve/register the concrete instance, exactly as an explicit application would.
+const infer_union_instance = (*MonoCtx m, Str base, Str mem, [Expr] margs, MonoEnv env): Str -> {
+	const Iarch ui = find_union_template(m.union_templates, base)
+	const UnionDecl tmpl = m.union_templates[ui]
+	let Iarch mmi = 0 - 1
+	let Iarch k = 0
+	loop { if k >= Iarch(tmpl.members.len) then break  if str_eq(tmpl.members[k].name, mem) then mmi = k  k = k + 1 }
+	if mmi < 0 then die("cf0: type: a generic union construction names an unknown member\n")
+	const UnionMember um = tmpl.members[mmi]
+	let [Str] targs = []
+	let Iarch ti = 0
+	loop {
+		if ti >= Iarch(tmpl.typarams.len) then break
+		const Str tv = tmpl.typarams[ti]
+		let Str bound = ""
+		let Iarch pi = 0
+		loop {
+			if pi >= Iarch(um.payloads.len) then break
+			if str_eq(bound, "") && str_eq(um.payloads[pi], tv) && pi < Iarch(margs.len) then bound = arg_ty(m, margs[pi], env)
+			pi = pi + 1
+		}
+		if str_eq(bound, "") then die("cf0: type: cannot infer a generic union's type argument from its construction\n")
+		targs = [...targs, bound]
+		ti = ti + 1
+	}
+	return ensure_union_instance(m, base, targs)
+}
+const mono_unionmk = (*MonoCtx m, Str t, Str mem, [Expr] args, MonoEnv env): Expr -> {
+	const [Expr] margs = mono_exprs(m, args, env)
+	# a bare generic-union template name (no `[…]` args) — infer its instance from the payloads
+	if !is_type_app(t) && find_union_template(m.union_templates, t) >= 0 then return Expr.UnionMk(infer_union_instance(m, t, mem, margs, env), mem, margs)
+	return Expr.UnionMk(mangle_type(m, t, env.tvars, env.tvals), mem, margs)
+}
 const mono_expr = (*MonoCtx m, Expr e, MonoEnv env): Expr -> match e {
 	Expr.Lit(v) -> Expr.Lit(v),
 	Expr.BoolLit(b) -> Expr.BoolLit(b),
@@ -840,7 +877,7 @@ const mono_expr = (*MonoCtx m, Expr e, MonoEnv env): Expr -> match e {
 	Expr.Record(n, fs) -> Expr.Record(mangle_type(m, n, env.tvars, env.tvals), mono_fields(m, fs, env)),
 	Expr.Field(b, f) -> Expr.Field(b, f),
 	Expr.FieldExpr(b, f) -> Expr.FieldExpr(mono_expr(m, b, env), f),
-	Expr.UnionMk(t, mem, args) -> Expr.UnionMk(mangle_type(m, t, env.tvars, env.tvals), mem, mono_exprs(m, args, env)),
+	Expr.UnionMk(t, mem, args) -> mono_unionmk(m, t, mem, args, env),
 	Expr.Match(scrut, arms) -> mono_match(m, scrut, arms, env),
 	Expr.ArrayLit(hs, sn, elems, et) -> Expr.ArrayLit(hs, mono_expr(m, sn, env), mono_exprs(m, elems, env), et),
 	Expr.Index(a, i) -> Expr.Index(a, mono_expr(m, i, env)),
