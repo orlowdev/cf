@@ -30,11 +30,12 @@ import "astutil" as { is_spread, spread_inner, is_skip, skip_count, is_nested, n
 # `fixed` — this binding is a FIXED array `[N T]` (not a growable `[T]`). cf0 represents both as a
 # dynamic header (they share index/`.len`/`for`), so this bit is the only fixed-vs-dyn distinction:
 # a fixed array may not be a `[...src, e]` spread SOURCE (nor grown in place) — memory_model / §2.
-# `is_borrow` — this binding is a REFERENCE, not an owned value: a `*Record` pointer parameter, or a
-# pointer local `const *P p = &x` (its initializer is an `&`). cf0 collapses `*Point`≡`Point` at the
-# type level, so this bit is how a `*Record` argument (which must be a borrow — `&x` or a forwarded
-# pointer, memory_model §6) is told apart from a bare record value at the call site.
-pub data VarTy = { Str name, Ty ty, Bool mutable, Bool esc, Bool outer, Bool fixed, Bool is_borrow }
+# `is_ref` — this binding is a REFERENCE (a `*T` pointer to a referent owned elsewhere), not an owned
+# value: a `*Record` pointer parameter, or a pointer local `const *P p = &x` (its initializer is an
+# `&`). cf0 collapses `*Point`≡`Point` at the type level, so this bit is how a `*Record` argument
+# (which must be a reference — `&x` or a forwarded pointer, memory_model §6, NOT a "borrow": C! has
+# none — a `*T` is a first-class reference to a `let`-owned referent) is told apart from a bare value.
+pub data VarTy = { Str name, Ty ty, Bool mutable, Bool esc, Bool outer, Bool fixed, Bool is_ref }
 
 # The whole-program context threaded through typing: the functions (a call resolves
 # its callee here), the record declarations (a data literal / field read), and the
@@ -852,23 +853,23 @@ const arg_root_mutable = (Expr e, [VarTy] env): Bool -> match e {
 	Expr.IndexExpr(base, ix) -> arg_root_mutable(base, env),
 	_ -> true
 }
-# Whether an argument to a `*Record` parameter is an explicit BORROW (not a bare record value):
-# `&x` (an address of a `let` aggregate), or the FORWARD of a pointer parameter (a bare `Var` naming
-# an `outer` pointer param). A record VALUE — a `let`/`const` record, a `T({…})` construction, a call
-# result — must be lent with `&` (memory_model §6: `*T` receives the address of a `let` aggregate,
-# never a by-value record). cf0 collapses `*Point`≡`Point` at the type level, so this is caught here.
+# Whether an argument to a `*Record` parameter is an explicit REFERENCE (not a bare record value):
+# `&x` (the address of a `let` aggregate), or the FORWARD of a pointer parameter/local (a `Var`
+# naming an `is_ref` binding). A record VALUE — a `let`/`const` record, a `T({…})` construction —
+# needs `&` (memory_model §6: `*T` receives the address of a `let` aggregate, never a by-value
+# record). cf0 collapses `*Point`≡`Point` at the type level, so this is caught here.
 const is_addr_expr = (Expr e): Bool -> match e { Expr.Addr(n) -> true, _ -> false }
-const name_is_borrow = ([VarTy] env, Str n): Bool -> {
+const name_is_ref = ([VarTy] env, Str n): Bool -> {
 	const Iarch i = env_index(env, n)
 	if i < 0 then return false
-	return env[i].is_borrow
+	return env[i].is_ref
 }
 # A `*Record` argument must not be a bare record VALUE. The clearly-value forms are a `Var` naming a
-# non-borrow binding (a `let`/`const` record, a by-value record param) and a `T({…})`/`({…})`
-# construction; those are rejected. Everything else — `&x`, a forwarded borrow, or a call/field/`if`
+# non-reference binding (a `let`/`const` record, a by-value record param) and a `T({…})`/`({…})`
+# construction; those are rejected. Everything else — `&x`, a forwarded reference, or a call/field/`if`
 # yielding a pointer (whose `*Record`-vs-`Record` return cf0 collapses) — is allowed.
-const is_borrow_arg = (Expr e, [VarTy] env): Bool -> match e {
-	Expr.Var(n) -> name_is_borrow(env, n),
+const is_ref_arg = (Expr e, [VarTy] env): Bool -> match e {
+	Expr.Var(n) -> name_is_ref(env, n),
 	Expr.Record(tn, inits) -> false,
 	_ -> true
 }
@@ -936,10 +937,10 @@ const call_type = (Str callee, [Str] tyargs, [Expr] args, [VarTy] env, Ctx ctx):
 					if !arg_root_mutable(args[i], env) then die("cf0: type: a `*T` parameter that writes needs a `let` aggregate — a pointer into a `const` (or a by-value view) is read-only\n")
 				}
 			}
-			# a `*Record` parameter takes an explicit borrow — `&x` or a forwarded pointer — never a
+			# a `*Record` parameter takes an explicit reference — `&x` or a forwarded pointer — never a
 			# bare record value (700): `*Point`≡`Point` in the type, so it is distinguished here
 			if param_is_recptr(ctx.funcs[fidx].params[i], ctx.recs) then {
-				if !is_borrow_arg(args[i], env) then die("cf0: type: a `*Record` parameter needs an explicit borrow `&x` (or a forwarded pointer), not a bare record value\n")
+				if !is_ref_arg(args[i], env) then die("cf0: type: a `*Record` parameter needs an explicit reference `&x` (or a forwarded pointer), not a bare record value\n")
 			}
 			const Ty at = type_of(args[i], env, ctx)
 			# a byte pointer is a pointer-width address, acceptable where a register word is expected
@@ -1148,7 +1149,7 @@ pub const arm_bind_env = (Str type_name, [Str] members, [Str] binds, [VarTy] env
 		# a `_` skips and a sub-pattern GUARD (`=Member`/`#int`) constrains but binds no name
 		if !str_eq(binds[bi], "_") && !is_pat_guard(binds[bi]) then {
 			const Ty bt = payload_decl_ty(ui, mi, bi, ctx)
-			benv = [...benv, VarTy({ name: binds[bi], ty: bt, mutable: false, esc: false, outer: false, fixed: false, is_borrow: false })]
+			benv = [...benv, VarTy({ name: binds[bi], ty: bt, mutable: false, esc: false, outer: false, fixed: false, is_ref: false })]
 		}
 		bi = bi + 1
 	}
@@ -1612,7 +1613,7 @@ pub const check_destructure = ([Str] pat, Bool mutable, Expr rhs, [VarTy] env, C
 		if mutable then {
 			if !is_tint(pty) && !is_tbool(pty) then die("cf0: type: a `let` destructure position must be a scalar (a record/Str position binds `const`)\n")
 		}
-		e2 = [...e2, VarTy({ name: tok, ty: pty, mutable: mutable, esc: false, outer: false, fixed: false, is_borrow: false })]
+		e2 = [...e2, VarTy({ name: tok, ty: pty, mutable: mutable, esc: false, outer: false, fixed: false, is_ref: false })]
 		pos = pos + 1
 		pi = pi + 1
 	}
@@ -1805,7 +1806,7 @@ const yields_of_list = ([Stmt] ss, [VarTy] env0, Ctx ctx): [Ty] -> {
 		if i >= Iarch(ss.len) then break
 		const Stmt s = ss[i]
 		match s {
-			Stmt.Let(n, m, ann, e) -> { env = [...env, VarTy({ name: n, ty: binding_ty(ann, e, env, ctx), mutable: m, esc: false, outer: false, fixed: false, is_borrow: false })] },
+			Stmt.Let(n, m, ann, e) -> { env = [...env, VarTy({ name: n, ty: binding_ty(ann, e, env, ctx), mutable: m, esc: false, outer: false, fixed: false, is_ref: false })] },
 			Stmt.Destructure(pat, m, e) -> { env = check_destructure(pat, m, e, env, ctx) },
 			_ -> { r = cat_tys(r, yields_of_stmt(s, env, ctx)) }
 		}
@@ -1922,7 +1923,7 @@ const check_for_body = (Str lv, Str arr, [Stmt] body, [VarTy] env, Ctx ctx): Iar
 	# `acc = acc + x` typecheck); every other element binds as a word `Int` (the existing behavior)
 	const Str fen = dyn_of(env[ai].ty)
 	const Ty lvt = if is_float_name(fen) || str_eq(fen, "Bool") then elem_ty(fen, ctx) else Ty.TInt
-	const [VarTy] benv = [...env, VarTy({ name: lv, ty: lvt, mutable: false, esc: false, outer: false, fixed: false, is_borrow: false })]
+	const [VarTy] benv = [...env, VarTy({ name: lv, ty: lvt, mutable: false, esc: false, outer: false, fixed: false, is_ref: false })]
 	return check_stmts(body, benv, ctx, lk_for)
 }
 
@@ -2437,12 +2438,12 @@ const check_closure = (Str nm, [Param] params, Str ret, [Stmt] body, [VarTy] env
 	loop {
 		if pi >= Iarch(params.len) then break
 		check_ptr_pointee(params[pi], ctx.recs, ctx.unions)
-		cenv = [...cenv, VarTy({ name: params[pi].name, ty: param_ty(params[pi], ctx.recs, ctx.unions), mutable: false, esc: false, outer: false, fixed: false, is_borrow: false })]
+		cenv = [...cenv, VarTy({ name: params[pi].name, ty: param_ty(params[pi], ctx.recs, ctx.unions), mutable: false, esc: false, outer: false, fixed: false, is_ref: false })]
 		pi = pi + 1
 	}
 	const Iarch dr = check_stmts(body, cenv, cctx, lk_none)
 	if dr != 2 then die("cf0: type: a closure body must end with `return`\n")
-	return [...env, VarTy({ name: nm, ty: closure_tfn(ret, params), mutable: false, esc: false, outer: false, fixed: false, is_borrow: false })]
+	return [...env, VarTy({ name: nm, ty: closure_tfn(ret, params), mutable: false, esc: false, outer: false, fixed: false, is_ref: false })]
 }
 
 const check_stmts = ([Stmt] stmts, [VarTy] env0, Ctx ctx, Iarch loop_kind): Iarch -> {
@@ -2470,7 +2471,7 @@ const check_stmts = ([Stmt] stmts, [VarTy] env0, Ctx ctx, Iarch loop_kind): Iarc
 				if is_ttuple(ty) && !is_tuple_bindable(e) then die("cf0: type: this expression cannot bind a tuple\n")
 				# a binding inherits the region-outlives taint of its initializer: `const *P p = &x`, or a
 				# `let q = p` that launders one, carries a local pointer that a later escape must catch.
-				env = [...env, VarTy({ name: n, ty: ty, mutable: m, esc: carries_local(e, env), outer: false, fixed: str_eq(ann, "$fix"), is_borrow: is_addr_expr(e) })]
+				env = [...env, VarTy({ name: n, ty: ty, mutable: m, esc: carries_local(e, env), outer: false, fixed: str_eq(ann, "$fix"), is_ref: is_addr_expr(e) })]
 			},
 			Stmt.Destructure(pat, m, e) -> { env = check_destructure(pat, m, e, env, ctx) },
 			Stmt.Closure(nm, params, ret, body) -> { env = check_closure(nm, params, ret, body, env, ctx) },
@@ -2682,7 +2683,7 @@ const check_func = (Func fn, Ctx ctx): Iarch -> {
 		const Bool pmut = param_is_recptr(fn.params[pi], ctx.recs) || param_is_indexptr(fn.params[pi])
 		# a `*T` pointer parameter is a caller-provided home that OUTLIVES this call (`outer`): the
 		# region-outlives check rejects rehoming a pointer-into-local through it (memory_model §6).
-		env = [...env, VarTy({ name: fn.params[pi].name, ty: pty, mutable: pmut, esc: false, outer: fn.params[pi].is_ptr, fixed: false, is_borrow: fn.params[pi].is_ptr })]
+		env = [...env, VarTy({ name: fn.params[pi].name, ty: pty, mutable: pmut, esc: false, outer: fn.params[pi].is_ptr, fixed: false, is_ref: fn.params[pi].is_ptr })]
 		pi = pi + 1
 	}
 	# a closure is admitted only as a direct function-body statement (v1); reject one buried in
