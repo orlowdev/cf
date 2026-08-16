@@ -1368,13 +1368,26 @@ const parse_stmt = (*Parser p): Stmt -> {
 		const Str name = cur_name(p)
 		p.pos = p.pos + 1
 		if is_dot(peek(p)) then {
-			p.pos = p.pos + 1
-			if !is_ident(peek(p)) then die("cf0: parse: expected a field name after `.`\n")
-			const Str field = cur_name(p)
-			p.pos = p.pos + 1
+			# collect the dotted field chain `name.f0.f1…`; a single field is a plain `FieldAssign`,
+			# a chain (`a.b.c = v`) a `DeepFieldAssign` over the base pointer expr `a.b` + last field `c`.
+			let [Str] fchain = []
+			loop {
+				if !is_dot(peek(p)) then break
+				p.pos = p.pos + 1
+				if !is_ident(peek(p)) then die("cf0: parse: expected a field name after `.`\n")
+				fchain = [...fchain, cur_name(p)]
+				p.pos = p.pos + 1
+			}
 			if !is_eq(peek(p)) then die("cf0: parse: expected `=` in a field assignment\n")
 			p.pos = p.pos + 1
-			return Stmt.FieldAssign(name, field, parse_expr(p))
+			const Expr rhs = parse_expr(p)
+			const Iarch nf = Iarch(fchain.len)
+			if nf == 1 then return Stmt.FieldAssign(name, fchain[0], rhs)
+			# build the base pointer expr `name.f0…f(n-2)`, leaving `f(n-1)` as the assign target
+			let Expr base = Expr.Field(name, fchain[0])
+			let Iarch k = 1
+			loop { if k >= nf - 1 then break  base = Expr.FieldExpr(base, fchain[k])  k = k + 1 }
+			return Stmt.DeepFieldAssign(base, fchain[nf - 1], rhs)
 		}
 		# `name[i] = value` — a dynamic-array element write
 		if is_lbracket(peek(p)) then {

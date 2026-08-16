@@ -853,12 +853,45 @@ const arg_root_mutable = (Expr e, [VarTy] env): Bool -> match e {
 	Expr.IndexExpr(base, ix) -> arg_root_mutable(base, env),
 	_ -> true
 }
+# The ROOT variable name of an lvalue chain (`t.top.a` → "t", `n.val` → "n"); "" if not name-rooted.
+const lvalue_root_name = (Expr e): Str -> match e {
+	Expr.Var(n) -> n,
+	Expr.Field(base, f) -> base,
+	Expr.Index(base, ix) -> base,
+	Expr.IndexField(base, ix, f) -> base,
+	Expr.FieldExpr(base, f) -> lvalue_root_name(base),
+	Expr.IndexExpr(base, ix) -> lvalue_root_name(base),
+	Expr.Addr(n) -> n,
+	_ -> ""
+}
+# Whether an lvalue chain's ROOT is WRITABLE — a mutable binding (a `let` local or a writable `*T`
+# param) OR a reference (`is_ref`: a `const` binding aliasing an existing aggregate, written THROUGH).
+# Drives a deep field assignment `a.b.c = v`, mirroring the single-level `mutable || is_ref` rule.
+const lvalue_root_writable = (Expr e, [VarTy] env): Bool -> {
+	const Str r = lvalue_root_name(e)
+	if str_eq(r, "") then return true
+	const Iarch i = env_index(env, r)
+	if i < 0 then return true
+	return env[i].mutable || env[i].is_ref
+}
 # Whether an argument to a `*Record` parameter is an explicit REFERENCE (not a bare record value):
 # `&x` (the address of a `let` aggregate), or the FORWARD of a pointer parameter/local (a `Var`
 # naming an `is_ref` binding). A record VALUE — a `let`/`const` record, a `T({…})` construction —
 # needs `&` (memory_model §6: `*T` receives the address of a `let` aggregate, never a by-value
 # record). cf0 collapses `*Point`≡`Point` at the type level, so this is caught here.
 const is_addr_expr = (Expr e): Bool -> match e { Expr.Addr(n) -> true, _ -> false }
+# Whether a binding's initializer makes it a REFERENCE into an existing aggregate — an explicit `&x`,
+# or a field READ whose result is a record/union (in cf0's arena model every aggregate field is an
+# 8-byte pointer, so `const q = o.p` / `const s = a.b.c` binds the EXISTING node, not a copy). Such a
+# binding may be WRITTEN THROUGH even while `const` (the reference is fixed; its referent is not) —
+# distinct from a `const` VALUE (a construction, literal, or call result), which stays immutable.
+const inits_ref = (Expr e, [VarTy] env, Ctx ctx): Bool -> {
+	if is_addr_expr(e) then return true
+	const Bool fr = match e { Expr.Field(b, f) -> true, Expr.FieldExpr(b, f) -> true, _ -> false }
+	if !fr then return false
+	const Ty t = type_of(e, env, ctx)
+	return !str_eq(rec_of(t), "") || !str_eq(union_of(t), "")
+}
 const name_is_ref = ([VarTy] env, Str n): Bool -> {
 	const Iarch i = env_index(env, n)
 	if i < 0 then return false
@@ -882,6 +915,7 @@ const is_ref_arg = (Expr e, [VarTy] env): Bool -> match e {
 # only ever ACCEPT more; under-checking preserves the prior lenient behavior, never miscompiles).
 const stmt_writes_name = (Stmt s, Str pn): Bool -> match s {
 	Stmt.FieldAssign(base, f, v) -> str_eq(base, pn),
+	Stmt.DeepFieldAssign(be, f, v) -> str_eq(lvalue_root_name(be), pn),
 	Stmt.IndexAssign(base, ix, v) -> str_eq(base, pn),
 	Stmt.Loop(bd) -> stmts_write_name(bd, pn),
 	Stmt.ForIn(fv, fa, bd) -> stmts_write_name(bd, pn),
@@ -2107,7 +2141,7 @@ const check_simple_stmt = (Stmt s, [VarTy] env, Ctx ctx, Iarch loop_kind): Iarch
 		Stmt.FieldAssign(b, f, e) -> {
 			const Iarch idx = env_index(env, b)
 			if idx < 0 then die("cf0: type: field assignment to an undeclared name\n")
-			if !env[idx].mutable then die("cf0: type: cannot mutate a `const` record's fields\n")
+			if !env[idx].mutable && !env[idx].is_ref then die("cf0: type: cannot mutate a `const` record's fields\n")
 			const Str tn = rec_of(env[idx].ty)
 			if str_eq(tn, "") then die("cf0: type: field assignment needs a record on the left\n")
 			const Iarch ri = find_rec(ctx.recs, tn)
@@ -2118,6 +2152,24 @@ const check_simple_stmt = (Stmt s, [VarTy] env, Ctx ctx, Iarch loop_kind): Iarch
 			# OUTLIVES this call) may not store a pointer into a function-LOCAL — it would dangle once the
 			# local dies (memory_model §6). A store into a local record is same-rank and permitted.
 			if env[idx].outer && carries_local(e, env, ctx) then die("cf0: type: cannot rehome a pointer into a local through a caller's aggregate — it would dangle once the call returns\n")
+			if !ty_eq(type_of(e, env, ctx), ft) then die("cf0: type: a field value's type must match the field\n")
+		},
+		Stmt.DeepFieldAssign(be, f, e) -> {
+			# a chained lvalue `a.b.c = v`: `be` addresses the penultimate record (a Field/FieldExpr chain,
+			# each hop an 8-byte arena-pointer load), `f` its final field. The chain's ROOT must be writable
+			# (a mutable binding or an `is_ref` reference — like the single-level `mutable || is_ref` rule).
+			const Ty bt = type_of(be, env, ctx)
+			const Str tn = rec_of(bt)
+			if str_eq(tn, "") then die("cf0: type: field assignment needs a record on the left\n")
+			if !lvalue_root_writable(be, env) then die("cf0: type: cannot mutate a `const` record's fields\n")
+			const Iarch ri = find_rec(ctx.recs, tn)
+			const Iarch fi = field_index(ctx.recs[ri].fields, f)
+			if fi < 0 then die("cf0: type: mutating a field the record does not declare\n")
+			const Ty ft = field_decl_ty(ri, fi, ctx)
+			# region-outlives: rehoming through a caller-provided (`outer`) aggregate may not store a local pointer
+			const Str rn = lvalue_root_name(be)
+			const Iarch rIdx = env_index(env, rn)
+			if rIdx >= 0 && env[rIdx].outer && carries_local(e, env, ctx) then die("cf0: type: cannot rehome a pointer into a local through a caller's aggregate — it would dangle once the call returns\n")
 			if !ty_eq(type_of(e, env, ctx), ft) then die("cf0: type: a field value's type must match the field\n")
 		},
 		Stmt.IndexAssign(a, ix, val) -> {
@@ -2401,6 +2453,7 @@ const stmt_has_defertap = (Stmt s): Bool -> match s {
 	Stmt.Let(n, m, ann, e) -> expr_has_defertap(e),
 	Stmt.Assign(n, e) -> expr_has_defertap(e),
 	Stmt.FieldAssign(b, f, e) -> expr_has_defertap(e),
+	Stmt.DeepFieldAssign(be, f, e) -> expr_has_defertap(be) || expr_has_defertap(e),
 	Stmt.IndexAssign(a, i, v) -> expr_has_defertap(i) || expr_has_defertap(v),
 	Stmt.Return(e) -> expr_has_defertap(e),
 	Stmt.Do(e) -> expr_has_defertap(e),
@@ -2502,7 +2555,7 @@ const check_stmts = ([Stmt] stmts, [VarTy] env0, Ctx ctx, Iarch loop_kind): Iarc
 				if is_ttuple(ty) && !is_tuple_bindable(e) then die("cf0: type: this expression cannot bind a tuple\n")
 				# a binding inherits the region-outlives taint of its initializer: `const *P p = &x`, or a
 				# `let q = p` that launders one, carries a local pointer that a later escape must catch.
-				env = [...env, VarTy({ name: n, ty: ty, mutable: m, esc: carries_local(e, env, ctx), outer: false, fixed: str_eq(ann, "$fix"), is_ref: is_addr_expr(e) })]
+				env = [...env, VarTy({ name: n, ty: ty, mutable: m, esc: carries_local(e, env, ctx), outer: false, fixed: str_eq(ann, "$fix"), is_ref: inits_ref(e, env, ctx) })]
 			},
 			Stmt.Destructure(pat, m, e) -> { env = check_destructure(pat, m, e, env, ctx) },
 			Stmt.Closure(nm, params, ret, body) -> { env = check_closure(nm, params, ret, body, env, ctx) },
