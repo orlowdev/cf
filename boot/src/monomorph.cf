@@ -22,6 +22,7 @@ import "astutil" as { is_fixed_name, is_float_name }
 # SAME `type_of` the typechecker uses (types flow, not a parallel guesser). `Ctx`/`VarTy` are the
 # shared typing vocabulary; the helpers build the pieces `type_of` needs from a binding.
 import "typecheck" as { type_of, ty_name, Ctx, VarTy, named_ty, param_ty, binding_ty, arm_bind_env, check_destructure, dyn_of, tuple_elems }
+import "closures" as { Subst, subst_expr }
 
 # The accumulating state, threaded by pointer: the generic FUNCTION templates + their instance
 # clones (with a dedup key set); the generic RECORD/UNION templates + their instance clones (with
@@ -941,12 +942,58 @@ const mono_arms = (*MonoCtx m, [MatchArm] arms, MonoEnv env, Str scrut_ty): [Mat
 	}
 	return out
 }
+# --- numeric type-switch (§8.3/§8.5) --------------------------------------------------------
+# A comptime match over a numeric-bounded `'T`: `match x { Int.Int8(v) -> …, Int.Int16(v) -> … }`.
+# After the scrutinee monomorphizes to a concrete width, exactly one arm is live (the rest are
+# dead code), so it is RESOLVED here — before typecheck ever sees a match on a non-union scrutinee.
+# A type-switch is detected by an arm naming an intrinsic numeric union (Int/Uint/Number).
+const is_numeric_width = (Str s): Bool -> str_in(s, numeric_union_members("Number"))
+const arms_name_numeric_union = ([MatchArm] arms): Bool -> {
+	let Iarch i = 0
+	loop { if i >= Iarch(arms.len) then break  if is_numeric_union(arms[i].type_name) then return true  i = i + 1 }
+	return false
+}
+# Comptime-select the arm matching width `st` (or the `_` wildcard), bind its value var to the
+# scrutinee `ms` (`v := x`), and monomorphize the resulting body. Validates that each arm names a
+# width IN its bound union (774) and that some arm covers `st` (773 exhaustiveness).
+const resolve_numeric_typeswitch = (*MonoCtx m, Expr ms, [MatchArm] arms, Str st, MonoEnv env): Expr -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		const MatchArm a = arms[i]
+		if !a.is_wild && Iarch(a.members.len) > 0 then {
+			if !str_in(a.members[0], numeric_union_members(a.type_name)) then die("cf0: type: a numeric type-switch arm names a width outside its bound union\n")
+		}
+		i = i + 1
+	}
+	let Iarch wi = 0 - 1
+	let Iarch mi = 0 - 1
+	let Iarch j = 0
+	loop {
+		if j >= Iarch(arms.len) then break
+		const MatchArm a = arms[j]
+		if a.is_wild then wi = j
+		else { if Iarch(a.members.len) > 0 && str_eq(a.members[0], st) then mi = j }
+		j = j + 1
+	}
+	let Iarch sel = mi
+	if sel < 0 then sel = wi
+	if sel < 0 then die("cf0: type: a numeric type-switch has no arm for the instantiated width and no `_`\n")
+	const MatchArm chosen = arms[sel]
+	let Expr body = chosen.body
+	if !chosen.is_wild && Iarch(chosen.binds.len) > 0 then {
+		const [Subst] su = [Subst({ param: chosen.binds[0], repl: ms })]
+		body = subst_expr(body, su)
+	}
+	return mono_expr(m, body, env)
+}
 # A match's arms name their union UNQUALIFIED; the concrete instance is the (monomorphized)
 # scrutinee's type, derived by `type_of` over `ms` — so a match on a call result / constructed
 # value / `let` binding all resolve, not only a bare parameter.
 const mono_match = (*MonoCtx m, Expr scrut, [MatchArm] arms, MonoEnv env): Expr -> {
 	const Expr ms = mono_expr(m, scrut, env)
 	const Str st = arg_ty(m, ms, env)
+	if arms_name_numeric_union(arms) && is_numeric_width(st) then return resolve_numeric_typeswitch(m, ms, arms, st, env)
 	return Expr.Match(ms, mono_arms(m, arms, env, st))
 }
 
