@@ -21,7 +21,7 @@ import "astutil" as { is_fixed_name, is_float_name }
 # The monomorph pass infers a generic call's type arguments by deriving argument types with the
 # SAME `type_of` the typechecker uses (types flow, not a parallel guesser). `Ctx`/`VarTy` are the
 # shared typing vocabulary; the helpers build the pieces `type_of` needs from a binding.
-import "typecheck" as { type_of, ty_name, Ctx, VarTy, named_ty, param_ty, binding_ty, arm_bind_env, check_destructure, dyn_of, tuple_elems }
+import "typecheck" as { type_of, ty_name, Ctx, VarTy, named_ty, param_ty, binding_ty, arm_bind_env, check_destructure, dyn_of, tuple_elems, elem_ty }
 import "closures" as { Subst, subst_expr }
 
 # The accumulating state, threaded by pointer: the generic FUNCTION templates + their instance
@@ -1038,9 +1038,17 @@ const mono_match = (*MonoCtx m, Expr scrut, [MatchArm] arms, MonoEnv env): Expr 
 # to a word (`check_for_body` — a genesis narrowing, regardless of the array's element type), so
 # the inference env must bind it the same way; else a generic call on the binder would infer an
 # instance the typechecker (which sees a word) rejects.
-const for_env = (*MonoCtx m, Str v, MonoEnv env): MonoEnv -> {
+const venv_ty = ([VarTy] venv, Str name): Ty -> {
+	let Iarch i = 0
+	loop { if i >= Iarch(venv.len) then break  if str_eq(venv[i].name, name) then return venv[i].ty  i = i + 1 }
+	return Ty.TInt
+}
+const for_env = (*MonoCtx m, Str v, Str a, MonoEnv env): MonoEnv -> {
 	if !m.has_gen then return env
-	return env_bind(env, v, Ty.TInt)
+	# bind the `for` variable at the array's ELEMENT type (matching typecheck's `check_for_body`), so a
+	# generic call on the binder resolves the right instance (`for w in [Str]` → `id(w)` picks `id[Str]`).
+	const Str en = dyn_of(venv_ty(env.venv, a))
+	return env_bind(env, v, elem_ty(en, build_ctx(m, env.ret)))
 }
 const mono_stmt = (*MonoCtx m, Stmt s, MonoEnv env): Stmt -> match s {
 	Stmt.Let(n, mut, ann, e) -> Stmt.Let(n, mut, mangle_type(m, ann, env.tvars, env.tvals), mono_expr(m, e, env)),
@@ -1051,7 +1059,7 @@ const mono_stmt = (*MonoCtx m, Stmt s, MonoEnv env): Stmt -> match s {
 	Stmt.DeepFieldAssign(be, f, e) -> Stmt.DeepFieldAssign(mono_expr(m, be, env), f, mono_expr(m, e, env)),
 	Stmt.IndexAssign(a, i, v) -> Stmt.IndexAssign(a, mono_expr(m, i, env), mono_expr(m, v, env)),
 	Stmt.Return(e) -> Stmt.Return(mono_expr(m, e, env)),
-	Stmt.ForIn(v, a, body) -> Stmt.ForIn(v, a, mono_stmts(m, body, for_env(m, v, env))),
+	Stmt.ForIn(v, a, body) -> Stmt.ForIn(v, a, mono_stmts(m, body, for_env(m, v, a, env))),
 	Stmt.Loop(body) -> Stmt.Loop(mono_stmts(m, body, env)),
 	Stmt.Break -> Stmt.Break,
 	Stmt.Continue -> Stmt.Continue,
