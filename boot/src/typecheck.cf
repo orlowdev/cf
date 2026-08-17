@@ -1563,19 +1563,32 @@ const is_plain_arraylit_e = (Expr e): Bool -> match e {
 # element type (records or words alike).
 const arraylit_type = (Bool has_spread, Expr spread_src, [Expr] elems, Str elem_type, [VarTy] env, Ctx ctx): Ty -> {
 	const Str en = arraylit_elem(has_spread, spread_src, elems, elem_type, env, ctx)
-	const Ty ety = elem_ty(en, ctx)
+	# a general fixed-WIDTH element array (`[Int32]`, `[Int16]`, …) types its element at that exact
+	# width; `[Uint8]` stays byte-special (word bytes are one byte). Every other element via `elem_ty`.
+	const Bool en_fixed = is_fixed_name(en) && !str_eq(en, "Uint8")
+	const Ty ety = if en_fixed then fixed_ty(en) else elem_ty(en, ctx)
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(elems.len) then break
 		const Ty evt = type_of(elems[i], env, ctx)
-		# a `[Uint8]` byte buffer stores bytes as words; besides plain word bytes it also
-		# accepts an explicit 8-bit fixed VALUE (`Uint8(x)`/`Int8(x)`) — that IS one byte. A
-		# WIDER fixed value (`Int16`/`Int64`/…) is rejected: the byte-packed store would
-		# silently truncate it. (A `[T]` array of general fixed-width elements is a later brick.)
-		if !ty_eq(evt, ety) && !(str_eq(en, "Uint8") && tfixed_bits(evt) == 8) then die("cf0: type: a dynamic-array element's type must match the array's element type\n")
+		# a general fixed-width element accepts an exact fixed VALUE (`Int32(x)`) or an adopting integer
+		# literal (`[3 Int32] = [1,2,3]`); a `[Uint8]` byte buffer stores plain word bytes and an explicit
+		# 8-bit fixed value (`Uint8(x)`/`Int8(x)`) — a WIDER fixed value there is a silently-truncating store.
+		if en_fixed then {
+			if !ty_eq(evt, ety) && !is_adoptable_lit(elems[i]) then die("cf0: type: a dynamic-array element's type must match the array's element type\n")
+		} else if !ty_eq(evt, ety) && !(str_eq(en, "Uint8") && tfixed_bits(evt) == 8) then die("cf0: type: a dynamic-array element's type must match the array's element type\n")
 		i = i + 1
 	}
 	return Ty.TDyn(en)
+}
+# Type an array LITERAL forcing a given element type (context-directed) — used to adopt a fixed-WIDTH
+# return element (`[3 Int32]`) so bare-int elements take the width instead of defaulting to `Iarch`.
+const arraylit_ret_ty = (Expr e, Str elem, [VarTy] env, Ctx ctx): Ty -> {
+	let Bool hs = false
+	let Expr sn = Expr.Lit(0)
+	let [Expr] els = []
+	match e { Expr.ArrayLit(h, s, es, et) -> { hs = h  sn = s  els = es }, _ -> {} }
+	return arraylit_type(hs, sn, els, elem, env, ctx)
 }
 
 # `Spread` is valid ONLY inside a tuple literal (the tuple typing/emit handle it); a bare
@@ -1708,6 +1721,8 @@ const index_type = (Str arr, Expr idx, [VarTy] env, Ctx ctx): Ty -> {
 	const Str en = dyn_of(env[vi].ty)
 	if str_eq(en, "") then die("cf0: type: indexing a non-array value\n")
 	if !is_tint(type_of(idx, env, ctx)) then die("cf0: type: an array index must be an integer\n")
+	# a general fixed-WIDTH element (`[Int32]`) indexes to that exact width; `[Uint8]` stays a byte word
+	if is_fixed_name(en) && !str_eq(en, "Uint8") then return fixed_ty(en)
 	return elem_ty(en, ctx)
 }
 
@@ -2162,6 +2177,11 @@ const check_simple_stmt = (Stmt s, [VarTy] env, Ctx ctx, Iarch loop_kind): Iarch
 				const Str rrt = rec_of(ctx.frt)
 				if str_eq(rrt, "") then die("cf0: type: a bare `({…})` record literal does not fit a non-record return type\n")
 				record_type(rrt, record_inits(e), env, ctx)
+			} else if is_fixed_name(dyn_of(ctx.frt)) && arraylit_len(e) >= 0 then {
+				# a returned array LITERAL adopts a fixed-WIDTH element type: bare integer elements take the
+				# width (`[3 Int32] -> [1,2,3]`) instead of defaulting to `[Iarch]` and spuriously mismatching (913).
+				const Ty rty = arraylit_ret_ty(e, dyn_of(ctx.frt), env, ctx)
+				if !ty_eq(rty, ctx.frt) then die("cf0: type: a returned value's type must match the function's return type\n")
 			} else {
 				# register-width words interconvert on return (`Iarch`/`Uarch`/a bare literal → `Uarch`),
 				# e.g. a folded `[Uarch n]` value-param body returning `42`; a narrow fixed return (733) is strict
