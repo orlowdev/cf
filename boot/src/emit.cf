@@ -380,6 +380,19 @@ const scalar_of = (*Emit ctx, [Binding] env, Expr e): Str -> match e {
 	Expr.Call(callee, tyargs, args) -> call_scalar_e(ctx, env, callee),
 	Expr.Var(n) -> var_scalar(env, n),
 	Expr.FloatLit(t) -> "Float64",
+	# a Bool leaf: the literal, a comparison, or a logical connective all yield the word `Bool`
+	# (0/1). `Bool` is inert to the fixed/float filters (`is_fixed_name`/`is_float_name` reject it),
+	# so it only records the scalar type — the interpolation path reads it to render `true`/`false`.
+	Expr.BoolLit(b) -> "Bool",
+	Expr.Not(x) -> "Bool",
+	Expr.And(l, r) -> "Bool",
+	Expr.Or(l, r) -> "Bool",
+	Expr.CmpEq(l, r) -> "Bool",
+	Expr.CmpNe(l, r) -> "Bool",
+	Expr.CmpLt(l, r) -> "Bool",
+	Expr.CmpGt(l, r) -> "Bool",
+	Expr.CmpLe(l, r) -> "Bool",
+	Expr.CmpGe(l, r) -> "Bool",
 	Expr.Loop(body) -> loop_yield_scalar_list(ctx, env, body),
 	Expr.Add(l, r) -> bin_scalar(ctx, env, l, r),
 	Expr.Sub(l, r) -> bin_scalar(ctx, env, l, r),
@@ -682,10 +695,16 @@ const emit_interp = (*Emit ctx, [Seg] segs, [Binding] env): Str -> {
 		if si >= Iarch(segs.len) then break
 		const Seg sg = segs[si]
 		if sg.is_hole then {
-			# a hole is any expression; stringify a `Str` by its bytes, an integer via itoa
+			# a hole is any expression; stringify a `Str` by its bytes, a `Bool` as `true`/`false`,
+			# an integer via itoa
 			const Str hv = emit_expr(sg.expr, ctx, env)
 			if str_eq(init_agg_type(ctx, env, sg.expr), "Str") then {
 				write_str(ctx.fd, "\tcall $cf_str_append(l %t${vh}, l ${hv})\n")
+			} else if str_eq(scalar_of(ctx, env, sg.expr), "Bool") then {
+				const Iarch bext = ctx.next
+				ctx.next = ctx.next + 1
+				write_str(ctx.fd, "\t%t${bext} =l extsw ${hv}\n")
+				write_str(ctx.fd, "\tcall $cf_bool_append(l %t${vh}, l %t${bext})\n")
 			} else {
 				const Iarch ext = ctx.next
 				ctx.next = ctx.next + 1
@@ -2872,7 +2891,7 @@ const emit_func = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 			# a captured SCALAR arrives as its enclosing slot ADDRESS; bind a cell OVER that address
 			# so reads/writes go THROUGH it (by-reference capture). `fixed` carries the scalar type
 			# so a fixed-width/float capture loads/stores in its own QBE class.
-			const Str cfx = if is_fixed_name(fn.params[pi].elem) || is_float_name(fn.params[pi].elem) then fn.params[pi].elem else ""
+			const Str cfx = if is_fixed_name(fn.params[pi].elem) || is_float_name(fn.params[pi].elem) || str_eq(fn.params[pi].elem, "Bool") then fn.params[pi].elem else ""
 			const Iarch slot = ctx.next
 			ctx.next = ctx.next + 1
 			write_str(ctx.fd, "\t%t${slot} =l copy %p${pi}\n")
@@ -2898,7 +2917,7 @@ const emit_func = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 				# a word/float parameter spills into a stack slot so it reads like a local; a
 				# fixed-width or float parameter records its type name so ops on it and the slot's
 				# store/load use the right codegen (a float spills with `stored`/`stores`).
-				const Str pfx = if is_fixed_name(fn.params[pi].type_name) || is_float_name(fn.params[pi].type_name) then fn.params[pi].type_name else ""
+				const Str pfx = if is_fixed_name(fn.params[pi].type_name) || is_float_name(fn.params[pi].type_name) || str_eq(fn.params[pi].type_name, "Bool") then fn.params[pi].type_name else ""
 				const Iarch slot = ctx.next
 				ctx.next = ctx.next + 1
 				write_str(ctx.fd, "\t%t${slot} =l alloc8 8\n")
@@ -3060,6 +3079,35 @@ const emit_arena_qbe = (Uarch fd): Iarch -> {
 	write_str(fd, "\tret\n")
 	write_str(fd, "@pos\n")
 	write_str(fd, "\tcall $cf_uint_append(l %vhdr, l %val)\n")
+	write_str(fd, "\tret\n")
+	write_str(fd, "}\n")
+	# cf_bool_append(vhdr, val) — append the textual form of a `Bool`: a nonzero word writes
+	# `true` (4 bytes), zero writes `false` (5 bytes), each byte pushed via cf_dyn_push (stride 1).
+	write_str(fd, "function $cf_bool_append(l %vhdr, l %val) {\n")
+	write_str(fd, "@start\n")
+	write_str(fd, "\t%nz =w cnel %val, 0\n")
+	write_str(fd, "\tjnz %nz, @true, @false\n")
+	write_str(fd, "@true\n")
+	write_str(fd, "\t%t0 =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb 116, %t0\n")
+	write_str(fd, "\t%t1 =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb 114, %t1\n")
+	write_str(fd, "\t%t2 =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb 117, %t2\n")
+	write_str(fd, "\t%t3 =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb 101, %t3\n")
+	write_str(fd, "\tret\n")
+	write_str(fd, "@false\n")
+	write_str(fd, "\t%f0 =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb 102, %f0\n")
+	write_str(fd, "\t%f1 =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb 97, %f1\n")
+	write_str(fd, "\t%f2 =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb 108, %f2\n")
+	write_str(fd, "\t%f3 =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb 115, %f3\n")
+	write_str(fd, "\t%f4 =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb 101, %f4\n")
 	write_str(fd, "\tret\n")
 	write_str(fd, "}\n")
 	write_str(fd, "function $cf_str_append(l %vhdr, l %str) {\n")
