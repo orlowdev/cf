@@ -556,7 +556,7 @@ const all_unions = (*MonoCtx m): [UnionDecl] -> cat_unions(m.cunions, m.union_in
 # The whole-program typing context the shared `type_of` needs: every concrete function/record/
 # union PLUS every instance generated so far (so a call to an already-instantiated generic, or a
 # field of a generated record instance, resolves). `frt` is the enclosing function's return type.
-const build_ctx = (*MonoCtx m, Ty ret): Ctx -> Ctx({ funcs: cat_funcs(m.cfuncs, m.instances), recs: all_recs(m), unions: all_unions(m), frt: ret })
+const build_ctx = (*MonoCtx m, Ty ret): Ctx -> Ctx({ funcs: cat_funcs(m.cfuncs, m.instances), recs: all_recs(m), unions: all_unions(m), frt: ret, frsize: 0 })
 # The enclosing function's return type as a `Ty` (for `Ctx.frt`, which `type_of` consults for a
 # value-yielding loop that `return`s): a tuple return is its position list, an empty name is the
 # implicit `Int`, otherwise the named scalar/record/union/array type.
@@ -577,11 +577,11 @@ const mangle_func_sig = (*MonoCtx m, Func f): Func -> {
 	loop {
 		if i >= Iarch(f.params.len) then break
 		const Param p = f.params[i]
-		ps = [...ps, Param({ name: p.name, is_ptr: p.is_ptr, type_name: mangle_type(m, p.type_name, nt, nt), elem: mangle_type(m, p.elem, nt, nt), telems: p.telems })]
+		ps = [...ps, Param({ name: p.name, is_ptr: p.is_ptr, type_name: mangle_type(m, p.type_name, nt, nt), elem: mangle_type(m, p.elem, nt, nt), telems: p.telems, size: p.size })]
 		i = i + 1
 	}
 	const [Stmt] nobody = []
-	return Func({ name: f.name, is_pub: f.is_pub, ret_name: mangle_type(m, f.ret_name, nt, nt), ret_elem: mangle_type(m, f.ret_elem, nt, nt), params: ps, body: nobody, is_asm: f.is_asm, asm_body: f.asm_body, is_value: f.is_value, ret_telems: f.ret_telems, typarams: f.typarams, tbounds: f.tbounds })
+	return Func({ name: f.name, is_pub: f.is_pub, ret_name: mangle_type(m, f.ret_name, nt, nt), ret_elem: mangle_type(m, f.ret_elem, nt, nt), params: ps, body: nobody, is_asm: f.is_asm, asm_body: f.asm_body, is_value: f.is_value, ret_telems: f.ret_telems, typarams: f.typarams, tbounds: f.tbounds, ret_size: f.ret_size })
 }
 const mangle_rec_sig = (*MonoCtx m, RecDecl r): RecDecl -> {
 	const [Str] nt = []
@@ -616,7 +616,7 @@ const mangle_concrete_sigs = (*MonoCtx m): Iarch -> {
 	return 0
 }
 
-const env_bind = (MonoEnv e, Str name, Ty ty): MonoEnv -> MonoEnv({ tvars: e.tvars, tvals: e.tvals, venv: [...e.venv, VarTy({ name: name, ty: ty, mutable: false, esc: false, outer: false, fixed: false, is_ref: false })], ret: e.ret, vpnames: e.vpnames, vpvals: e.vpvals })
+const env_bind = (MonoEnv e, Str name, Ty ty): MonoEnv -> MonoEnv({ tvars: e.tvars, tvals: e.tvals, venv: [...e.venv, VarTy({ name: name, ty: ty, mutable: false, esc: false, outer: false, fixed: false, is_ref: false, fsize: 0 })], ret: e.ret, vpnames: e.vpnames, vpvals: e.vpvals })
 
 # The concrete type NAME an argument denotes, for inference — derived by the SAME `type_of` the
 # typechecker uses, over the threaded `[VarTy]` environment (parameters + `let`/match/`for`/
@@ -775,7 +775,7 @@ const mono_func = (*MonoCtx m, Func f, Str newname, [Str] tvars, [Str] tvals): F
 		# record name (or a generic application → its instance), a `[T]` array element, a tuple,
 		# AND the case where `'T` itself resolves to an array type (→ a `$dyn` slot)
 		const TySlot pst = subst_slot(m, p.type_name, p.elem, p.telems, tvars_t, tvals_t)
-		ps = [...ps, Param({ name: p.name, is_ptr: p.is_ptr, type_name: pst.name, elem: pst.elem, telems: pst.telems })]
+		ps = [...ps, Param({ name: p.name, is_ptr: p.is_ptr, type_name: pst.name, elem: pst.elem, telems: pst.telems, size: p.size })]
 		i = i + 1
 	}
 	const TySlot rst = subst_slot(m, f.ret_name, f.ret_elem, f.ret_telems, tvars_t, tvals_t)
@@ -792,14 +792,14 @@ const mono_func = (*MonoCtx m, Func f, Str newname, [Str] tvars, [Str] tvals): F
 		let Iarch pi = 0
 		loop {
 			if pi >= Iarch(ps.len) then break
-			venv = [...venv, VarTy({ name: ps[pi].name, ty: param_ty(ps[pi], all_recs(m), all_unions(m)), mutable: false, esc: false, outer: false, fixed: false, is_ref: false })]
+			venv = [...venv, VarTy({ name: ps[pi].name, ty: param_ty(ps[pi], all_recs(m), all_unions(m)), mutable: false, esc: false, outer: false, fixed: false, is_ref: false, fsize: 0 })]
 			pi = pi + 1
 		}
 	}
 	const MonoEnv env = MonoEnv({ tvars: tvars_t, tvals: tvals_t, venv: venv, ret: ret, vpnames: vpnames, vpvals: vpvals })
 	const [Stmt] body = mono_stmts(m, f.body, env)
 	const [Str] no_tp = []
-	return Func({ name: newname, is_pub: f.is_pub, ret_name: rn, ret_elem: re, params: ps, body: body, is_asm: f.is_asm, asm_body: f.asm_body, is_value: f.is_value, ret_telems: rtel, typarams: no_tp, tbounds: no_tp })
+	return Func({ name: newname, is_pub: f.is_pub, ret_name: rn, ret_elem: re, params: ps, body: body, is_asm: f.is_asm, asm_body: f.asm_body, is_value: f.is_value, ret_telems: rtel, typarams: no_tp, tbounds: no_tp, ret_size: f.ret_size })
 }
 
 # Resolve a callee name to its concrete instance: a generic callee is instantiated (type args

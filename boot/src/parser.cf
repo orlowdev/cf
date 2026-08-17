@@ -1072,6 +1072,8 @@ const is_fixed_arraylit = (Expr e, Iarch n): Bool -> match e {
 	Expr.ArrayLit(hs, sn, elems, et) -> if hs then false else Iarch(elems.len) == n,
 	_ -> false
 }
+const is_arraylit_e = (Expr e): Bool -> match e { Expr.ArrayLit(hs, sn, elems, et) -> true, _ -> false }
+const is_call_e = (Expr e): Bool -> match e { Expr.Call(c, ta, args) -> true, _ -> false }
 
 # Validate a destructure pattern token: a bare name binds a position; a `_`-led token is a
 # skip — `_` (one) or `_<digits>` (n) — and anything else (`_foo`) is rejected.
@@ -1129,9 +1131,7 @@ const parse_let = (*Parser p, Bool mutable): Stmt -> {
 			p.pos = p.pos + 1 # `[`
 			const Iarch n = p.toks[p.pos].ival
 			p.pos = p.pos + 1 # N
-			if !is_ident(peek(p)) then die("cf0: parse: expected a fixed-array element type\n")
-			const Str felem = cur_name(p)
-			p.pos = p.pos + 1 # element type (e.g. Iarch, Uint8)
+			const Str felem = parse_fixed_elem(p)
 			if !is_rbracket(peek(p)) then die("cf0: parse: expected `]` in a fixed-array type\n")
 			p.pos = p.pos + 1 # `]`
 			if !is_ident(peek(p)) then die("cf0: parse: expected a binding name\n")
@@ -1140,10 +1140,14 @@ const parse_let = (*Parser p, Bool mutable): Stmt -> {
 			if is_eq(peek(p)) then {
 				p.pos = p.pos + 1 # `=`
 				const Expr init = set_arr_elem(parse_init(p, ""), felem)
-				if !is_fixed_arraylit(init, n) then die("cf0: parse: a fixed-array initializer must be a plain array literal of exactly N elements (no spread)\n")
-				# tag the binding `$fix` so typecheck marks it a FIXED array — it may not be a spread
-				# source or grown in place (typing is otherwise the shared dynamic-array machinery).
-				return Stmt.Let(bname, mutable, "$fix", init)
+				# a LITERAL initializer is length-checked here (exactly N, no spread); an array-returning
+				# CALL defers its length check to typecheck (against the callee `ret_size`); anything else —
+				# a scalar `= 0`, a spread — is not a fixed-array initializer (190).
+				if is_arraylit_e(init) then { if !is_fixed_arraylit(init, n) then die("cf0: parse: a fixed-array initializer must be a plain array literal of exactly N elements (no spread)\n") }
+				else if !is_call_e(init) then die("cf0: parse: a fixed-array binding needs an array literal or an array-returning call\n")
+				# tag the binding `$fix<N>` so typecheck marks it FIXED and knows its length: it may not be
+				# a spread source or grown in place (typing is otherwise the shared dynamic-array machinery).
+				return Stmt.Let(bname, mutable, "$fix${n}", init)
 			}
 			# an UNINITIALIZED `[N Elem] buf` is a byte buffer (a read target): it needs a POSITIVE size
 			# and holds `Uint8` only — a `[0 Uint8]` (188) or a non-`Uint8` element (189) is rejected
@@ -1572,6 +1576,15 @@ const parse_star_agg_name = (*Parser p): Str -> {
 	if is_lbracket(peek(p)) then return parse_type_app_tail(p, n)
 	return n
 }
+# The ELEMENT type of a fixed array `[N Elem]`: a plain type name, or a `*Record`/`*Union` pointer
+# element (the star elided — an aggregate element is already an arena pointer in cf0's model, 912).
+const parse_fixed_elem = (*Parser p): Str -> {
+	if is_star(peek(p)) then return parse_star_agg_name(p)
+	if !is_ident(peek(p)) then die("cf0: parse: expected a fixed-array element type\n")
+	const Str e = cur_name(p)
+	p.pos = p.pos + 1
+	return e
+}
 
 # A single parameter: `<type> <name>`. A pointer type (`*[Elem]`/`[Elem]`) becomes a
 # pointer parameter (no type name); a bare type-name identifier (`Iarch`, `Bool`, or
@@ -1593,7 +1606,7 @@ const parse_param = (*Parser p): Param -> {
 			if !is_ident(peek(p)) then die("cf0: parse: expected a parameter name\n")
 			const Str bname = cur_name(p)
 			p.pos = p.pos + 1
-			return Param({ name: bname, is_ptr: true, type_name: "$ptr", elem: pelem, telems: [] })
+			return Param({ name: bname, is_ptr: true, type_name: "$ptr", elem: pelem, telems: [], size: 0 })
 		}
 		if !is_ident(peek(p)) then die("cf0: parse: expected a pointee type name\n")
 		let Str rec = cur_name(p)
@@ -1603,16 +1616,31 @@ const parse_param = (*Parser p): Param -> {
 		if !is_ident(peek(p)) then die("cf0: parse: expected a parameter name\n")
 		const Str name = cur_name(p)
 		p.pos = p.pos + 1
-		return Param({ name: name, is_ptr: true, type_name: rec, elem: "", telems: [] })
+		return Param({ name: name, is_ptr: true, type_name: rec, elem: "", telems: [], size: 0 })
 	}
 	if is_lbracket(peek(p)) then {
+		# a `[N Elem]` FIXED-array parameter (by value, read-only): a `$dyn` array at runtime, its
+		# comptime length `N` kept in `size` so the callee's `.len`/`for` and the call-site length/
+		# element checks (918/919) can use it. A bare `[Elem]` is a plain dynamic-array parameter.
+		if is_intlit(p.toks[p.pos + 1].kind) then {
+			p.pos = p.pos + 1 # `[`
+			const Iarch fn = p.toks[p.pos].ival
+			p.pos = p.pos + 1 # N
+			const Str felem = parse_fixed_elem(p)
+			if !is_rbracket(peek(p)) then die("cf0: parse: expected `]` in a fixed-array parameter type\n")
+			p.pos = p.pos + 1 # `]`
+			if !is_ident(peek(p)) then die("cf0: parse: expected a parameter name\n")
+			const Str fpname = cur_name(p)
+			p.pos = p.pos + 1
+			return Param({ name: fpname, is_ptr: false, type_name: "$dyn", elem: felem, telems: [], size: fn })
+		}
 		# a bare `[Elem]` is a dynamic-array parameter (a `*[Elem]` is an opaque pointer);
 		# its element type is kept in `elem` so the callee can index/read it.
 		const Str elem = dyn_elem_of(parse_type(p))
 		if !is_ident(peek(p)) then die("cf0: parse: expected a parameter name\n")
 		const Str name = cur_name(p)
 		p.pos = p.pos + 1
-		return Param({ name: name, is_ptr: false, type_name: "$dyn", elem: elem, telems: [] })
+		return Param({ name: name, is_ptr: false, type_name: "$dyn", elem: elem, telems: [], size: 0 })
 	}
 	# a parenthesised parameter type — either a `(A, B, …) name` tuple (≥2 positions, passed by
 	# pointer) OR a `(A, …) -> R name` function-value parameter (a HOF callee). The `->` after
@@ -1638,13 +1666,13 @@ const parse_param = (*Parser p): Param -> {
 			if !is_ident(peek(p)) then die("cf0: parse: expected a parameter name\n")
 			const Str fname = cur_name(p)
 			p.pos = p.pos + 1
-			return Param({ name: fname, is_ptr: false, type_name: "$fn", elem: ret, telems: tel })
+			return Param({ name: fname, is_ptr: false, type_name: "$fn", elem: ret, telems: tel, size: 0 })
 		}
 		if Iarch(tel.len) < 2 then die("cf0: parse: a tuple type needs at least two elements\n")
 		if !is_ident(peek(p)) then die("cf0: parse: expected a parameter name\n")
 		const Str tname = cur_name(p)
 		p.pos = p.pos + 1
-		return Param({ name: tname, is_ptr: false, type_name: "$tuple", elem: "", telems: tel })
+		return Param({ name: tname, is_ptr: false, type_name: "$tuple", elem: "", telems: tel, size: 0 })
 	}
 	if !is_ident(peek(p)) then die("cf0: parse: expected a parameter type\n")
 	# a scalar/aggregate parameter type — a name, a type variable, a generic type application, or a
@@ -1653,7 +1681,7 @@ const parse_param = (*Parser p): Param -> {
 	if !is_ident(peek(p)) then die("cf0: parse: expected a parameter name\n")
 	const Str name = cur_name(p)
 	p.pos = p.pos + 1
-	return Param({ name: name, is_ptr: false, type_name: type_name, elem: "", telems: [] })
+	return Param({ name: name, is_ptr: false, type_name: type_name, elem: "", telems: [], size: 0 })
 }
 
 # Does a `(` at the current position open a LAMBDA parameter list (a closure `(params) ->
@@ -1723,13 +1751,24 @@ const parse_params = (*Parser p): [Param] -> {
 # `Ty` at typecheck). Pointer/array return types are a later brick.
 
 const parse_ret_name = (*Parser p): RetSig -> {
-	if !is_colon(peek(p)) then return RetSig({ name: "", elem: "", telems: [] })
+	if !is_colon(peek(p)) then return RetSig({ name: "", elem: "", telems: [], size: 0 })
 	p.pos = p.pos + 1
 	# a `[Elem]` return is a dynamic array (its element kept in `elem`); a bare
 	# identifier is a named type
 	if is_lbracket(peek(p)) then {
+		# `[N Elem]` — a fixed-size array return: represented as a `$dyn` array (an arena pointer with
+		# a length header, so emit is unchanged), the comptime length `N` kept in `size` for the length check.
+		if is_intlit(p.toks[p.pos + 1].kind) then {
+			p.pos = p.pos + 1 # `[`
+			const Iarch n = p.toks[p.pos].ival
+			p.pos = p.pos + 1 # N
+			const Str felem = parse_fixed_elem(p)
+			if !is_rbracket(peek(p)) then die("cf0: parse: expected `]` in a fixed-array return type\n")
+			p.pos = p.pos + 1 # `]`
+			return RetSig({ name: "$dyn", elem: felem, telems: [], size: n })
+		}
 		const Str elem = dyn_elem_of(parse_type(p))
-		return RetSig({ name: "$dyn", elem: elem, telems: [] })
+		return RetSig({ name: "$dyn", elem: elem, telems: [], size: 0 })
 	}
 	# a `(A, B, …)` tuple return type — at least two comma-separated element type names;
 	# `()` is the unit type (type_system §6.1: `()` and `Unit` name the same zero-tuple type).
@@ -1737,20 +1776,20 @@ const parse_ret_name = (*Parser p): RetSig -> {
 		p.pos = p.pos + 1 # `(`
 		if is_rparen(peek(p)) then {
 			p.pos = p.pos + 1
-			return RetSig({ name: "Unit", elem: "", telems: [] })
+			return RetSig({ name: "Unit", elem: "", telems: [], size: 0 })
 		}
 		const [TupElem] tel = parse_tuple_telems(p)
 		if Iarch(tel.len) < 2 then die("cf0: parse: a tuple return type needs at least two elements\n")
-		return RetSig({ name: "$tuple", elem: "", telems: tel })
+		return RetSig({ name: "$tuple", elem: "", telems: tel, size: 0 })
 	}
 	# an explicit `*Point` pointer return — cf0's records/unions are already by-pointer, so it is
 	# the bare pointee name (the star elided; §6.4 `*Scalar` rejected in `parse_star_agg_name`)
-	if is_star(peek(p)) then return RetSig({ name: parse_star_agg_name(p), elem: "", telems: [] })
+	if is_star(peek(p)) then return RetSig({ name: parse_star_agg_name(p), elem: "", telems: [], size: 0 })
 	if !is_ident(peek(p)) then die("cf0: parse: expected a return type name after `:`\n")
 	# a named return type — possibly a generic type application `Box['T]` or a member-type
 	# annotation `Maybe[Iarch].Just` (§8.1, collapsed to its union by resolve)
 	const Str n = parse_member_type(p)
-	return RetSig({ name: n, elem: "", telems: [] })
+	return RetSig({ name: n, elem: "", telems: [], size: 0 })
 }
 
 # Split an `asm "…"` body string into segments — literal runs and `${param}` holes —
@@ -1930,7 +1969,7 @@ const parse_func = (*Parser p): Func -> {
 		}
 		const [Stmt] vbody = [...vempty, Stmt.Return(vexpr)]
 		const [Seg] vnoasm = []
-		return Func({ name: name, is_pub: is_pub, ret_name: vret, ret_elem: "", params: noparams, body: vbody, is_asm: false, asm_body: vnoasm, is_value: true, ret_telems: [], typarams: no_tp, tbounds: no_tp })
+		return Func({ name: name, is_pub: is_pub, ret_name: vret, ret_elem: "", params: noparams, body: vbody, is_asm: false, asm_body: vnoasm, is_value: true, ret_telems: [], typarams: no_tp, tbounds: no_tp, ret_size: 0 })
 	}
 	p.pos = p.pos + 1
 	const [Param] params = parse_params(p)
@@ -1948,15 +1987,15 @@ const parse_func = (*Parser p): Func -> {
 		if !is_strlit(peek(p)) then die("cf0: parse: expected a string after `asm`\n")
 		const [Seg] segs = scan_asm_segs(p.src, p.toks[p.pos].start, p.toks[p.pos].len)
 		p.pos = p.pos + 1
-		return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: nobody, is_asm: true, asm_body: segs, is_value: false, ret_telems: rs.telems, typarams: typarams, tbounds: tbounds })
+		return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: nobody, is_asm: true, asm_body: segs, is_value: false, ret_telems: rs.telems, typarams: typarams, tbounds: tbounds, ret_size: rs.size })
 	}
 	if is_lbrace(peek(p)) then {
 		p.pos = p.pos + 1
 		const [Stmt] body = parse_block(p)
-		return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: body, is_asm: false, asm_body: noasm, is_value: false, ret_telems: rs.telems, typarams: typarams, tbounds: tbounds })
+		return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: body, is_asm: false, asm_body: noasm, is_value: false, ret_telems: rs.telems, typarams: typarams, tbounds: tbounds, ret_size: rs.size })
 	}
 	const [Stmt] one = [...nobody, Stmt.Return(parse_expr(p))]
-	return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: one, is_asm: false, asm_body: noasm, is_value: false, ret_telems: rs.telems, typarams: typarams, tbounds: tbounds })
+	return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: one, is_asm: false, asm_body: noasm, is_value: false, ret_telems: rs.telems, typarams: typarams, tbounds: tbounds, ret_size: rs.size })
 }
 
 # `data Name = { Iarch a, Iarch b }` — a record declaration (Iarch fields only, at

@@ -35,14 +35,14 @@ import "astutil" as { is_spread, spread_inner, is_skip, skip_count, is_nested, n
 # `&`). cf0 collapses `*Point`≡`Point` at the type level, so this bit is how a `*Record` argument
 # (which must be a reference — `&x` or a forwarded pointer, memory_model §6, NOT a "borrow": C! has
 # none — a `*T` is a first-class reference to a `let`-owned referent) is told apart from a bare value.
-pub data VarTy = { Str name, Ty ty, Bool mutable, Bool esc, Bool outer, Bool fixed, Bool is_ref }
+pub data VarTy = { Str name, Ty ty, Bool mutable, Bool esc, Bool outer, Bool fixed, Bool is_ref, Iarch fsize }
 
 # The whole-program context threaded through typing: the functions (a call resolves
 # its callee here), the record declarations (a data literal / field read), and the
 # union declarations (a `Type.member` construction / a `match`).
 # `frt` is the CURRENT function's declared return type, threaded on `Ctx` so `type_of` can
 # check a value-yielding loop's body (which may itself `return`) without a separate parameter.
-pub data Ctx = { [Func] funcs, [RecDecl] recs, [UnionDecl] unions, Ty frt }
+pub data Ctx = { [Func] funcs, [RecDecl] recs, [UnionDecl] unions, Ty frt, Iarch frsize }
 
 # --- small helpers --------------------------------------------------------------------
 
@@ -992,6 +992,13 @@ const call_type = (Str callee, [Str] tyargs, [Expr] args, [VarTy] env, Ctx ctx):
 				else if is_tptr(pt) && !str_eq(dyn_of(at), "") && is_ptr_arr_arg(args[i]) then { }
 				else die("cf0: type: a call argument's type does not match the parameter\n")
 			}
+			# a `[N T]` FIXED-array parameter — the argument's statically-known length must equal N (918);
+			# a wrong-width element is caught by the type check above (919). An unknown-length arg passes.
+			const Iarch psz = ctx.funcs[fidx].params[i].size
+			if psz > 0 then {
+				const Iarch al = fixed_expr_len(args[i], env, ctx)
+				if al >= 0 && al != psz then die("cf0: type: a fixed-array argument's length must match the parameter's `[N …]`\n")
+			}
 		}
 		i = i + 1
 	}
@@ -1209,7 +1216,7 @@ pub const arm_bind_env = (Str type_name, [Str] members, [Str] binds, [VarTy] env
 		# a `_` skips and a sub-pattern GUARD (`=Member`/`#int`) constrains but binds no name
 		if !str_eq(binds[bi], "_") && !is_pat_guard(binds[bi]) then {
 			const Ty bt = payload_decl_ty(ui, mi, bi, ctx)
-			benv = [...benv, VarTy({ name: binds[bi], ty: bt, mutable: false, esc: false, outer: false, fixed: false, is_ref: false })]
+			benv = [...benv, VarTy({ name: binds[bi], ty: bt, mutable: false, esc: false, outer: false, fixed: false, is_ref: false, fsize: 0 })]
 		}
 		bi = bi + 1
 	}
@@ -1673,7 +1680,7 @@ pub const check_destructure = ([Str] pat, Bool mutable, Expr rhs, [VarTy] env, C
 		if mutable then {
 			if !is_tint(pty) && !is_tbool(pty) then die("cf0: type: a `let` destructure position must be a scalar (a record/Str position binds `const`)\n")
 		}
-		e2 = [...e2, VarTy({ name: tok, ty: pty, mutable: mutable, esc: false, outer: false, fixed: false, is_ref: false })]
+		e2 = [...e2, VarTy({ name: tok, ty: pty, mutable: mutable, esc: false, outer: false, fixed: false, is_ref: false, fsize: 0 })]
 		pos = pos + 1
 		pi = pi + 1
 	}
@@ -1804,6 +1811,52 @@ const fieldexpr_type = (Expr base, Str field, [VarTy] env, Ctx ctx): Ty -> {
 # The type a `let`/`const` binding takes: a fixed-width annotation ADOPTS a bare literal
 # (range-checked) or demands the exact type; otherwise it is inferred from the value. Shared
 # by the statement checker and the value-loop yield walk (which threads bindings the same way).
+# A FIXED-array binding annotation is encoded `"$fix<N>"` (`[4 Iarch] xs` → `"$fix4"`); a plain
+# `"$fix"` (no digits, a pre-size literal binding) reads as size 0. The element type is recovered
+# from the initializer, so only the length `N` rides in the annotation (for the length check).
+const is_fix_ann = (Str a): Bool -> {
+	if Iarch(a.len) < 4 then return false
+	return Iarch(a[0]) == 36 && Iarch(a[1]) == 102 && Iarch(a[2]) == 105 && Iarch(a[3]) == 120
+}
+const fix_ann_size = (Str a): Iarch -> {
+	if !is_fix_ann(a) then return 0
+	let Iarch n = 0
+	let Iarch i = 4
+	loop {
+		if i >= Iarch(a.len) then break
+		const Iarch c = Iarch(a[i])
+		if c < 48 || c > 57 then break
+		n = n * 10 + (c - 48)
+		i = i + 1
+	}
+	return n
+}
+# The statically-known length of a fixed-array-valued expression, or -1 if unknown: a plain array
+# LITERAL's element count (a spread `[...src]` is unknown), an array-returning CALL's `ret_size`, or
+# a `Var` naming a FIXED binding's `fsize`. Used to length-check fixed-array returns/bindings/args.
+const arraylit_len = (Expr e): Iarch -> match e {
+	Expr.ArrayLit(hs, sn, elems, et) -> if hs then 0 - 1 else Iarch(elems.len),
+	_ -> 0 - 1
+}
+const call_ret_size = (Expr e, Ctx ctx): Iarch -> {
+	const Str cn = match e { Expr.Call(n, ta, args) -> n, _ -> "" }
+	if str_eq(cn, "") then return 0 - 1
+	const Iarch fi = find_func(ctx.funcs, cn)
+	if fi < 0 then return 0 - 1
+	return ctx.funcs[fi].ret_size
+}
+const fixed_expr_len = (Expr e, [VarTy] env, Ctx ctx): Iarch -> {
+	const Iarch la = arraylit_len(e)
+	if la >= 0 then return la
+	const Iarch lc = call_ret_size(e, ctx)
+	if lc > 0 then return lc
+	const Str vn = match e { Expr.Var(n) -> n, _ -> "" }
+	if str_eq(vn, "") then return 0 - 1
+	const Iarch vi = env_index(env, vn)
+	if vi < 0 then return 0 - 1
+	if env[vi].fsize > 0 then return env[vi].fsize
+	return 0 - 1
+}
 pub const binding_ty = (Str ann, Expr e, [VarTy] env, Ctx ctx): Ty -> {
 	# `Int` is a numeric union BOUND (§8.6), not a concrete value type — a bare integer is `Iarch`, a
 	# specific width is its own type. Naming it as a scalar binding's type is rejected (768).
@@ -1866,7 +1919,7 @@ const yields_of_list = ([Stmt] ss, [VarTy] env0, Ctx ctx): [Ty] -> {
 		if i >= Iarch(ss.len) then break
 		const Stmt s = ss[i]
 		match s {
-			Stmt.Let(n, m, ann, e) -> { env = [...env, VarTy({ name: n, ty: binding_ty(ann, e, env, ctx), mutable: m, esc: false, outer: false, fixed: false, is_ref: false })] },
+			Stmt.Let(n, m, ann, e) -> { env = [...env, VarTy({ name: n, ty: binding_ty(ann, e, env, ctx), mutable: m, esc: false, outer: false, fixed: false, is_ref: false, fsize: 0 })] },
 			Stmt.Destructure(pat, m, e) -> { env = check_destructure(pat, m, e, env, ctx) },
 			_ -> { r = cat_tys(r, yields_of_stmt(s, env, ctx)) }
 		}
@@ -1983,7 +2036,7 @@ const check_for_body = (Str lv, Str arr, [Stmt] body, [VarTy] env, Ctx ctx): Iar
 	# `acc = acc + x` typecheck); every other element binds as a word `Int` (the existing behavior)
 	const Str fen = dyn_of(env[ai].ty)
 	const Ty lvt = if is_float_name(fen) || str_eq(fen, "Bool") then elem_ty(fen, ctx) else Ty.TInt
-	const [VarTy] benv = [...env, VarTy({ name: lv, ty: lvt, mutable: false, esc: false, outer: false, fixed: false, is_ref: false })]
+	const [VarTy] benv = [...env, VarTy({ name: lv, ty: lvt, mutable: false, esc: false, outer: false, fixed: false, is_ref: false, fsize: 0 })]
 	return check_stmts(body, benv, ctx, lk_for)
 }
 
@@ -2115,6 +2168,9 @@ const check_simple_stmt = (Stmt s, [VarTy] env, Ctx ctx, Iarch loop_kind): Iarch
 				const Ty rty = type_of(e, env, ctx)
 				if !ty_eq(rty, ctx.frt) && !(is_wordish(rty) && is_wordish(ctx.frt)) then die("cf0: type: a returned value's type must match the function's return type\n")
 			}
+			# a `[N T]` FIXED-array return: a returned array LITERAL must have exactly N elements (904).
+			# (A non-literal return — a param/call/binding — is not statically length-checked here.)
+			if ctx.frsize > 0 && arraylit_len(e) >= 0 && arraylit_len(e) != ctx.frsize then die("cf0: type: a fixed-array return's length must match the declared `[N …]`\n")
 			code = 2
 		},
 		Stmt.Assign(n, e) -> {
@@ -2513,18 +2569,18 @@ const check_closure = (Str nm, [Param] params, Str ret, [Stmt] body, [VarTy] env
 	if env_index(env, nm) >= 0 then die("cf0: type: a binding cannot shadow an existing name\n")
 	if body_has_closure(body) then die("cf0: type: a closure cannot be nested in another closure\n")
 	const Ty crt = closure_ret_ty(ret, ctx)
-	const Ctx cctx = Ctx({ funcs: ctx.funcs, recs: ctx.recs, unions: ctx.unions, frt: crt })
+	const Ctx cctx = Ctx({ funcs: ctx.funcs, recs: ctx.recs, unions: ctx.unions, frt: crt, frsize: 0 })
 	let [VarTy] cenv = env
 	let Iarch pi = 0
 	loop {
 		if pi >= Iarch(params.len) then break
 		check_ptr_pointee(params[pi], ctx.recs, ctx.unions)
-		cenv = [...cenv, VarTy({ name: params[pi].name, ty: param_ty(params[pi], ctx.recs, ctx.unions), mutable: false, esc: false, outer: false, fixed: false, is_ref: false })]
+		cenv = [...cenv, VarTy({ name: params[pi].name, ty: param_ty(params[pi], ctx.recs, ctx.unions), mutable: false, esc: false, outer: false, fixed: false, is_ref: false, fsize: 0 })]
 		pi = pi + 1
 	}
 	const Iarch dr = check_stmts(body, cenv, cctx, lk_none)
 	if dr != 2 then die("cf0: type: a closure body must end with `return`\n")
-	return [...env, VarTy({ name: nm, ty: closure_tfn(ret, params), mutable: false, esc: false, outer: false, fixed: false, is_ref: false })]
+	return [...env, VarTy({ name: nm, ty: closure_tfn(ret, params), mutable: false, esc: false, outer: false, fixed: false, is_ref: false, fsize: 0 })]
 }
 
 const check_stmts = ([Stmt] stmts, [VarTy] env0, Ctx ctx, Iarch loop_kind): Iarch -> {
@@ -2551,11 +2607,18 @@ const check_stmts = ([Stmt] stmts, [VarTy] env0, Ctx ctx, Iarch loop_kind): Iarc
 				# not `let`: a reference cannot be repointed (993, the inferred analog of `const *P p = &x`).
 				if m && is_ptr_field_read(e, env, ctx) then die("cf0: type: an inferred pointer local (a `*` reference field read) binds `const`, not `let` — a reference cannot be repointed\n")
 				const Ty ty = binding_ty(ann, e, env, ctx)
+				# a `[N T]` FIXED binding whose initializer length is statically known (an array-returning
+				# CALL, or a literal not already caught at parse) must match N (905).
+				const Iarch fs = fix_ann_size(ann)
+				if fs > 0 then {
+					const Iarch il = fixed_expr_len(e, env, ctx)
+					if il >= 0 && il != fs then die("cf0: type: a fixed-array binding's length must match the declared `[N …]`\n")
+				}
 				if m && is_ttuple(ty) then die("cf0: type: a tuple binds `const` only (a mutable tuple is a later brick)\n")
 				if is_ttuple(ty) && !is_tuple_bindable(e) then die("cf0: type: this expression cannot bind a tuple\n")
 				# a binding inherits the region-outlives taint of its initializer: `const *P p = &x`, or a
 				# `let q = p` that launders one, carries a local pointer that a later escape must catch.
-				env = [...env, VarTy({ name: n, ty: ty, mutable: m, esc: carries_local(e, env, ctx), outer: false, fixed: str_eq(ann, "$fix"), is_ref: inits_ref(e, env, ctx) })]
+				env = [...env, VarTy({ name: n, ty: ty, mutable: m, esc: carries_local(e, env, ctx), outer: false, fixed: is_fix_ann(ann), is_ref: inits_ref(e, env, ctx), fsize: fix_ann_size(ann) })]
 			},
 			Stmt.Destructure(pat, m, e) -> { env = check_destructure(pat, m, e, env, ctx) },
 			Stmt.Closure(nm, params, ret, body) -> { env = check_closure(nm, params, ret, body, env, ctx) },
@@ -2753,7 +2816,7 @@ const check_func = (Func fn, Ctx ctx): Iarch -> {
 	if sig_has_typevar(fn) then die("cf0: type: an undeclared type variable in a function signature\n")
 	const Ty frt = func_ret_ty(fn, ctx.recs, ctx.unions)
 	# thread this function's return type on the Ctx so `type_of` (a value-loop body) can reach it
-	const Ctx fctx = Ctx({ funcs: ctx.funcs, recs: ctx.recs, unions: ctx.unions, frt: frt })
+	const Ctx fctx = Ctx({ funcs: ctx.funcs, recs: ctx.recs, unions: ctx.unions, frt: frt, frsize: fn.ret_size })
 	let [VarTy] env = []
 	let Iarch pi = 0
 	loop {
@@ -2767,7 +2830,7 @@ const check_func = (Func fn, Ctx ctx): Iarch -> {
 		const Bool pmut = param_is_recptr(fn.params[pi], ctx.recs) || param_is_indexptr(fn.params[pi])
 		# a `*T` pointer parameter is a caller-provided home that OUTLIVES this call (`outer`): the
 		# region-outlives check rejects rehoming a pointer-into-local through it (memory_model §6).
-		env = [...env, VarTy({ name: fn.params[pi].name, ty: pty, mutable: pmut, esc: false, outer: fn.params[pi].is_ptr, fixed: false, is_ref: fn.params[pi].is_ptr })]
+		env = [...env, VarTy({ name: fn.params[pi].name, ty: pty, mutable: pmut, esc: false, outer: fn.params[pi].is_ptr, fixed: false, is_ref: fn.params[pi].is_ptr, fsize: 0 })]
 		pi = pi + 1
 	}
 	# a closure is admitted only as a direct function-body statement (v1); reject one buried in
@@ -2878,7 +2941,7 @@ const check_whole = (Program prog): Iarch -> {
 # authority for all semantic validation; the emitter does no re-checking.
 pub const check_program = (Program prog): Iarch -> {
 	check_whole(prog)
-	let Ctx ctx = Ctx({ funcs: prog.funcs, recs: prog.recs, unions: prog.unions, frt: Ty.TInt })
+	let Ctx ctx = Ctx({ funcs: prog.funcs, recs: prog.recs, unions: prog.unions, frt: Ty.TInt, frsize: 0 })
 	let Iarch f = 0
 	loop {
 		if f >= Iarch(prog.funcs.len) then break
