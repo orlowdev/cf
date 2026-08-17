@@ -671,12 +671,151 @@ const emit_field_expr = (*Emit ctx, [Binding] env, Expr base, Str field): Str ->
 	return load_field_at(ctx, b, field_offset(ctx.recs, bt, field), field_scalar(ctx, bt, field))
 }
 
+# Push a compile-time byte run (a `Str`'s bytes) onto an interpolation vector `vh` — each byte via
+# `cf_dyn_push` (stride 1). Renders the structural punctuation of a stringified aggregate ("(",
+# ", ", "({ ", "})", ".", …) as well as its type/field/member names.
+const emit_lit_str = (*Emit ctx, Str vh, Str s): Iarch -> {
+	let Iarch j = 0
+	loop {
+		if j >= Iarch(s.len) then break
+		const Iarch b = Iarch(s[j])
+		const Iarch slot = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${slot} =l call $cf_dyn_push(l ${vh}, w 1)\n")
+		write_str(ctx.fd, "\tstoreb ${b}, %t${slot}\n")
+		j = j + 1
+	}
+	return 0
+}
+
+# Append the textual form of a value to the interpolation vector `vh`, recursively over its static
+# type. A scalar renders by value (a `Bool` as `true`/`false`, an integer via itoa); a `Str` inlines
+# its bytes; an aggregate renders structurally — a tuple `(e0, e1, …)`, a record `Type({ f0: v0, … })`,
+# a boxed union `Type.Member(p0, …)`. `name` is the value's declared type name (a record/union name,
+# `"$tuple"`, `"Str"`, `"Bool"`, or an integer leaf — a fixed-width name or `""` for a plain word);
+# `telems` supplies a tuple's positional element types; `op` is the value operand (a word for a
+# scalar, a base pointer for an aggregate / boxed-union box).
+const emit_stringify = (*Emit ctx, [Binding] env, Str vh, Str name, [TupElem] telems, Str op): Iarch -> {
+	if str_eq(name, "Str") then { write_str(ctx.fd, "\tcall $cf_str_append(l ${vh}, l ${op})\n")  return 0 }
+	if str_eq(name, "Bool") then {
+		const Iarch bext = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${bext} =l extsw ${op}\n")
+		write_str(ctx.fd, "\tcall $cf_bool_append(l ${vh}, l %t${bext})\n")
+		return 0
+	}
+	if str_eq(name, "$tuple") then return emit_stringify_tuple(ctx, env, vh, telems, op)
+	if find_rec(ctx.recs, name) >= 0 then return emit_stringify_record(ctx, env, vh, name, op)
+	if find_union(ctx.unions, name) >= 0 then return emit_stringify_union(ctx, env, vh, name, op)
+	# an integer leaf: an unsigned fixed prints its magnitude (no sign extension), everything else
+	# (a signed fixed or a plain word) sign-extends then itoa's
+	if is_fixed_name(name) && !fixed_signed(name) then {
+		write_str(ctx.fd, "\tcall $cf_uint_append(l ${vh}, l ${op})\n")
+		return 0
+	}
+	const Iarch ext = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${ext} =l extsw ${op}\n")
+	write_str(ctx.fd, "\tcall $cf_int_append(l ${vh}, l %t${ext})\n")
+	return 0
+}
+
+# Render a tuple `(e0, e1, …)` — each position read from its 8-byte slot (a float slot as `d`/`s`, a
+# word/pointer slot as 8 bytes) and stringified by its element type; positions joined by `, `.
+const emit_stringify_tuple = (*Emit ctx, [Binding] env, Str vh, [TupElem] telems, Str base): Iarch -> {
+	emit_lit_str(ctx, vh, "(")
+	let Iarch k = 0
+	loop {
+		if k >= Iarch(telems.len) then break
+		if k > 0 then emit_lit_str(ctx, vh, ", ")
+		const TupElem te = telems[k]
+		const Iarch off = k * 8
+		const Str slot = if is_float_name(te.name) then load_field_at(ctx, base, off, te.name) else load_at(ctx, base, off)
+		emit_stringify(ctx, env, vh, te.name, tel_sub(te), slot)
+		k = k + 1
+	}
+	emit_lit_str(ctx, vh, ")")
+	return 0
+}
+
+# Render a record `Type({ f0: v0, f1: v1 })` — the type name, then each field `name: value` in
+# declaration order (read from its 8-byte slot at `f*8`, a float field as `d`/`s`), joined by `, `.
+const emit_stringify_record = (*Emit ctx, [Binding] env, Str vh, Str rt, Str base): Iarch -> {
+	const Iarch ri = find_rec(ctx.recs, rt)
+	emit_lit_str(ctx, vh, rt)
+	emit_lit_str(ctx, vh, "({ ")
+	let Iarch f = 0
+	loop {
+		if f >= Iarch(ctx.recs[ri].fields.len) then break
+		if f > 0 then emit_lit_str(ctx, vh, ", ")
+		emit_lit_str(ctx, vh, ctx.recs[ri].fields[f])
+		emit_lit_str(ctx, vh, ": ")
+		const Str ftype = ctx.recs[ri].ftypes[f]
+		const Iarch off = f * 8
+		const Str slot = if is_float_name(ftype) then load_field_at(ctx, base, off, ftype) else load_at(ctx, base, off)
+		emit_stringify(ctx, env, vh, ftype, ctx.recs[ri].ftelems[f], slot)
+		f = f + 1
+	}
+	emit_lit_str(ctx, vh, " })")
+	return 0
+}
+
+# Render a union member `Type.Member` (a tag-only member) or `Type.Member(p0, p1)` (a payloaded
+# member) via a runtime tag dispatch: read the tag (a boxed value from its box@0, a tag-only value
+# is the word itself), then a compare-chain over the members — the matching arm writes its member
+# name and, for a payloaded member, each payload read from the box (`8 + p*8`) and stringified by its
+# type. Every arm jumps to the shared `@ue` join. A tag-only union nested in an aggregate rides here
+# too: its slot holds the bare tag, which `scrut_tag` returns unchanged.
+const emit_stringify_union = (*Emit ctx, [Binding] env, Str vh, Str un, Str box): Iarch -> {
+	const Iarch ui = find_union(ctx.unions, un)
+	const Str tag = scrut_tag(ctx, un, box)
+	const Iarch lid = ctx.label
+	ctx.label = ctx.label + 1
+	const Iarch nm = Iarch(ctx.unions[ui].members.len)
+	let Iarch m = 0
+	loop {
+		if m >= nm then break
+		const Iarch c = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${c} =w ceql ${tag}, ${m}\n")
+		if m == nm - 1 then {
+			write_str(ctx.fd, "\tjnz %t${c}, @us${lid}_${m}, @ue${lid}\n")
+		} else {
+			write_str(ctx.fd, "\tjnz %t${c}, @us${lid}_${m}, @un${lid}_${m}\n")
+		}
+		write_str(ctx.fd, "@us${lid}_${m}\n")
+		emit_lit_str(ctx, vh, un)
+		emit_lit_str(ctx, vh, ".")
+		emit_lit_str(ctx, vh, ctx.unions[ui].members[m].name)
+		const Iarch np = Iarch(ctx.unions[ui].members[m].payloads.len)
+		if np > 0 then {
+			emit_lit_str(ctx, vh, "(")
+			let Iarch p = 0
+			loop {
+				if p >= np then break
+				if p > 0 then emit_lit_str(ctx, vh, ", ")
+				const Str ptype = ctx.unions[ui].members[m].payloads[p]
+				const Iarch poff = 8 + p * 8
+				const Str pslot = if is_float_name(ptype) then load_field_at(ctx, box, poff, ptype) else load_at(ctx, box, poff)
+				emit_stringify(ctx, env, vh, ptype, ctx.unions[ui].members[m].ptelems[p], pslot)
+				p = p + 1
+			}
+			emit_lit_str(ctx, vh, ")")
+		}
+		write_str(ctx.fd, "\tjmp @ue${lid}\n")
+		if m != nm - 1 then write_str(ctx.fd, "@un${lid}_${m}\n")
+		m = m + 1
+	}
+	write_str(ctx.fd, "@ue${lid}\n")
+	return 0
+}
+
 # Emit an interpolated string `"…${name}…"`: build a fresh `[Uint8]` byte vector
 # (`{data,len,cap}` zeroed), append each segment — a literal run byte-by-byte via
-# `cf_dyn_push`, a hole via `cf_str_append` (a Str, its bytes) or `cf_int_append` (an
-# integer, sign-extended then itoa) — then seal a `{bytes@0, len@8}` Str header
-# borrowing the vector's backing. Returns the header pointer. (Bool holes are a later
-# brick; the typecheck phase rejects them.)
+# `cf_dyn_push`, a hole via `cf_str_append` (a Str, its bytes), `cf_bool_append` (a Bool,
+# `true`/`false`), `emit_stringify` (an aggregate, its structural text) or `cf_int_append`
+# (an integer, sign-extended then itoa) — then seal a `{bytes@0, len@8}` Str header
+# borrowing the vector's backing. Returns the header pointer.
 const emit_interp = (*Emit ctx, [Seg] segs, [Binding] env): Str -> {
 	const Iarch vh = ctx.next
 	ctx.next = ctx.next + 1
@@ -696,15 +835,18 @@ const emit_interp = (*Emit ctx, [Seg] segs, [Binding] env): Str -> {
 		const Seg sg = segs[si]
 		if sg.is_hole then {
 			# a hole is any expression; stringify a `Str` by its bytes, a `Bool` as `true`/`false`,
-			# an integer via itoa
+			# an aggregate (tuple / record / boxed union) by its structural text, an integer via itoa
 			const Str hv = emit_expr(sg.expr, ctx, env)
-			if str_eq(init_agg_type(ctx, env, sg.expr), "Str") then {
+			const Str aggt = init_agg_type(ctx, env, sg.expr)
+			if str_eq(aggt, "Str") then {
 				write_str(ctx.fd, "\tcall $cf_str_append(l %t${vh}, l ${hv})\n")
 			} else if str_eq(scalar_of(ctx, env, sg.expr), "Bool") then {
 				const Iarch bext = ctx.next
 				ctx.next = ctx.next + 1
 				write_str(ctx.fd, "\t%t${bext} =l extsw ${hv}\n")
 				write_str(ctx.fd, "\tcall $cf_bool_append(l %t${vh}, l %t${bext})\n")
+			} else if str_eq(aggt, "$tuple") || find_rec(ctx.recs, aggt) >= 0 || (find_union(ctx.unions, aggt) >= 0 && union_is_boxed(ctx.unions, aggt)) then {
+				emit_stringify(ctx, env, "%t${vh}", aggt, init_telems(ctx, env, sg.expr), hv)
 			} else {
 				const Iarch ext = ctx.next
 				ctx.next = ctx.next + 1
@@ -921,9 +1063,12 @@ const pos_telem = (*Emit ctx, [Binding] env, Expr e): TupElem -> {
 	# a dynamic-array element rides spelled `[Elem]` so its element type survives for `t[k][i]`
 	if str_eq(at, "$dyn") then return tel_leaf("[${init_elem(ctx, env, e)}]")
 	if !str_eq(at, "") then return tel_leaf(at)
-	# a scalar element: a FLOAT records its type so `t[k]` reloads with `loadd`/`loads`; a word stays ""
+	# a scalar element: a FLOAT records its type so `t[k]` reloads with `loadd`/`loads`; a `Bool`
+	# records "Bool" so an interpolated tuple renders it `true`/`false` (inert to arithmetic, so no
+	# codegen ripple); any other word stays ""
 	const Str sc = scalar_of(ctx, env, e)
 	if is_float_name(sc) then return tel_leaf(sc)
+	if str_eq(sc, "Bool") then return tel_leaf("Bool")
 	return tel_leaf("")
 }
 
@@ -956,6 +1101,8 @@ const emit_telem = (*Emit ctx, TupElem te): TupElem -> {
 	if tel_is_nest(te) then return tel_nest(emit_canon_telems(ctx, te.sub))
 	if find_rec(ctx.recs, te.name) >= 0 then return tel_leaf(te.name)
 	if str_eq(te.name, "Str") then return tel_leaf("Str")
+	# a `Bool` position keeps its name so an interpolated tuple renders it `true`/`false`
+	if str_eq(te.name, "Bool") then return tel_leaf("Bool")
 	return tel_leaf("")
 }
 const emit_canon_telems = (*Emit ctx, [TupElem] telems): [TupElem] -> {
