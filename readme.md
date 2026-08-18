@@ -115,6 +115,22 @@ const sum = (Iarch a, Iarch b) -> a + b
 pub const main = () -> 3 |> inc |> inc |> sum(10)   # sum(10) is partial → sum(10, 5) = 15
 ```
 
+## Hello, world
+
+```c!
+import "std/io/console" as { print }
+
+pub const main = () -> {
+	print("Hello, world!\n")
+	return 0
+}
+```
+
+```sh
+sh boot/driver.sh hello.cf hello   # cf0 -> qbe -> cc  ->  ./hello
+./hello                            # Hello, world!
+```
+
 ## Trust
 
 C! takes reproducibility and provenance seriously. The trust chain has exactly
