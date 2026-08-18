@@ -148,8 +148,8 @@ const canon_sig_telem = (TupElem te): TupElem -> {
 	}
 	return tel_leaf(canon_comp_name(te.name))
 }
-# The `TFn` of a `(A, …) -> R` PARAMETER: its `telems` are the argument positions (each a scalar or
-# a nested function type), its `elem` the (scalar) return type name — one nominal signature list.
+# The `TFn` of a `(A, …) -> R` PARAMETER: its `telems` are the WHOLE signature — the argument
+# positions then the return position — each canonicalized into one nominal signature list.
 const fn_ty_of_param = (Param p): Ty -> {
 	let [TupElem] sig = []
 	let Iarch i = 0
@@ -158,7 +158,6 @@ const fn_ty_of_param = (Param p): Ty -> {
 		sig = [...sig, canon_sig_telem(p.telems[i])]
 		i = i + 1
 	}
-	sig = [...sig, tel_leaf(fn_sig_name(p.elem))]
 	return Ty.TFn(sig)
 }
 # A signature POSITION is well-formed iff it is a scalar component (a word/fixed/float/Bool), a
@@ -192,14 +191,14 @@ const sig_telem_ok = (TupElem te, Ctx ctx): Bool -> {
 # by-reference aggregate, or a nested function type).
 const check_fn_param_sig = (Param p, Ctx ctx): Iarch -> {
 	if !str_eq(p.type_name, "$fn") then return 0
-	if Iarch(p.telems.len) > 32 then die("cf0: type: a function type takes at most 32 parameters\n")
+	# `telems` is the whole signature `[args…, ret]`; its length is arity + 1
+	if Iarch(p.telems.len) - 1 > 32 then die("cf0: type: a function type takes at most 32 parameters\n")
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(p.telems.len) then break
 		if !sig_telem_ok(p.telems[i], ctx) then die("cf0: type: a function-type component must be a scalar, a record/union/Str/array, or a nested tuple/function type\n")
 		i = i + 1
 	}
-	if !fn_component_ok(p.elem, ctx) then die("cf0: type: a function-type return must be a scalar, a record/union/Str/array, or a nested function type\n")
 	return 0
 }
 # One position of a top-level FUNCTION's signature: a function-value parameter (`$fn`) contributes a
@@ -208,6 +207,7 @@ const check_fn_param_sig = (Param p, Ctx ctx): Iarch -> {
 # matches a function-type parameter that expects it.
 const param_sig_telem = (Param p): TupElem -> {
 	if str_eq(p.type_name, "$fn") then {
+		# `telems` is already the whole `[args…, ret]` signature — canonicalize it position for position
 		let [TupElem] s = []
 		let Iarch i = 0
 		loop {
@@ -215,7 +215,6 @@ const param_sig_telem = (Param p): TupElem -> {
 			s = [...s, canon_sig_telem(p.telems[i])]
 			i = i + 1
 		}
-		s = [...s, tel_leaf(fn_sig_name(p.elem))]
 		return tel_fn(s)
 	}
 	# a `(A, B) t` tuple parameter contributes a nested telem built from its own position telems;
@@ -233,8 +232,25 @@ const param_sig_telem = (Param p): TupElem -> {
 	if str_eq(p.type_name, "$dyn") then return tel_leaf(canon_comp_name("[${p.elem}]"))
 	return tel_leaf(canon_comp_name(p.type_name))
 }
+# The return signature position of a referenced FUNCTION: a `$tuple` return contributes its position
+# telems as a nested telem, a `$dyn` return the `[Elem]` array component, else the nominal name — so
+# a function returning a tuple/array matches a function-type parameter that expects that return.
+const func_ret_telem = (Func fn): TupElem -> {
+	if str_eq(fn.ret_name, "$tuple") then {
+		let [TupElem] s = []
+		let Iarch i = 0
+		loop {
+			if i >= Iarch(fn.ret_telems.len) then break
+			s = [...s, canon_sig_telem(fn.ret_telems[i])]
+			i = i + 1
+		}
+		return tel_nest(s)
+	}
+	if str_eq(fn.ret_name, "$dyn") then return tel_leaf(canon_comp_name("[${fn.ret_elem}]"))
+	return tel_leaf(canon_comp_name(fn.ret_name))
+}
 # The `TFn` of a top-level FUNCTION referenced by name (to match against a function-type parameter):
-# each parameter's signature position, then the return type name.
+# each parameter's signature position, then the return position.
 const fn_ty_of_func = (Func fn): Ty -> {
 	let [TupElem] sig = []
 	let Iarch i = 0
@@ -243,7 +259,7 @@ const fn_ty_of_func = (Func fn): Ty -> {
 		sig = [...sig, param_sig_telem(fn.params[i])]
 		i = i + 1
 	}
-	sig = [...sig, tel_leaf(fn_sig_name(fn.ret_name))]
+	sig = [...sig, func_ret_telem(fn)]
 	return Ty.TFn(sig)
 }
 pub const tuple_elems = (Ty t): [TupElem] -> {

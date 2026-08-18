@@ -12,7 +12,7 @@ import "io" as { die }
 import "token" as { Token, TokKind, is_eof, is_ident, is_intlit, is_strlit, is_lparen, is_rparen, is_lbrace, is_rbrace, is_lbracket, is_rbracket, is_comma, is_colon, is_dot, is_ellipsis, is_eq, is_arrow, is_minus, is_plus, is_star, is_slash, is_percent, is_amp, is_pipe, is_caret, is_tilde, is_bang, is_shl, is_shr, is_eqeq, is_ne, is_lt, is_gt, is_le, is_ge, is_logand, is_logor, is_yield, is_floatlit, is_pipearrow }
 import "lexer" as { lex }
 import "ast" as { Expr, Stmt, Param, Func, Ty, FieldInit, RecDecl, UnionMember, UnionDecl, MatchArm, StmtArm, Seg, RetSig, TupElem, Import, Program }
-import "astutil" as { tel_leaf, tel_nest, tel_fn }
+import "astutil" as { tel_leaf, tel_nest, tel_fn, tel_is_fn }
 
 # The parse cursor: the token stream, the source (for keyword text), a position.
 pub data Parser = { [Token] toks, *[Uint8] src, Iarch pos, Str file }
@@ -1747,8 +1747,9 @@ const parse_param = (*Parser p): Param -> {
 	}
 	# a parenthesised parameter type — either a `(A, B, …) name` tuple (≥2 positions, passed by
 	# pointer) OR a `(A, …) -> R name` function-value parameter (a HOF callee). The `->` after
-	# the `)` disambiguates: a function type stores its argument types in `telems`, its return
-	# type name in `elem`, and marks `type_name` "$fn"; a tuple keeps its ≥2-position telems.
+	# the `)` disambiguates: a function type stores its WHOLE signature in `telems` (the argument
+	# positions then the return position — the same `[args…, ret]` shape a nested `tel_fn` carries),
+	# and marks `type_name` "$fn"; a tuple keeps its ≥2-position telems.
 	if is_lparen(peek(p)) then {
 		p.pos = p.pos + 1 # `(`
 		let [TupElem] tel = []
@@ -1761,15 +1762,15 @@ const parse_param = (*Parser p): Param -> {
 		p.pos = p.pos + 1
 		if is_arrow(peek(p)) then {
 			p.pos = p.pos + 1 # `->`
-			# the return type — a bare scalar/aggregate type name (an aggregate/tuple return
-			# from a function-type parameter is a later brick)
-			if !is_ident(peek(p)) then die("cf0: parse: expected a return type in a function-type parameter\n")
-			const Str ret = cur_name(p)
-			p.pos = p.pos + 1
+			# the return position — a scalar, a record/union/Str name, an array `[T]`, or a nested
+			# tuple `(A, B)` (parsed by `parse_tel`). A function-returning-function return is still a
+			# later brick: its result is a bare code pointer with no first-class binding/apply form.
+			const TupElem rett = parse_tel(p)
+			if tel_is_fn(rett) then die("cf0: parse: a function type cannot return a function (a later brick)\n")
 			if !is_ident(peek(p)) then die("cf0: parse: expected a parameter name\n")
 			const Str fname = cur_name(p)
 			p.pos = p.pos + 1
-			return Param({ name: fname, is_ptr: false, type_name: "$fn", elem: ret, telems: tel, size: 0 })
+			return Param({ name: fname, is_ptr: false, type_name: "$fn", elem: "", telems: [...tel, rett], size: 0 })
 		}
 		if Iarch(tel.len) < 2 then die("cf0: parse: a tuple type needs at least two elements\n")
 		if !is_ident(peek(p)) then die("cf0: parse: expected a parameter name\n")

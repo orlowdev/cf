@@ -256,6 +256,10 @@ const ret_is_l = (Str ret_name, [RecDecl] recs, [UnionDecl] unions): Bool -> {
 	return false
 }
 
+# The RETURN signature position of a `$fn` binding — the last telem of its whole `[args…, ret]`
+# signature. A function-value binding always carries at least the return, so this is safe.
+const fn_ret_telem = (Binding b): TupElem -> b.telems[Iarch(b.telems.len) - 1]
+
 # A call argument's operand: the temp holding it, and whether it is a record pointer
 # (emitted `l`) rather than a word (`w`).
 data ArgOp = { Iarch temp, Bool is_rec, Str qt }
@@ -288,7 +292,7 @@ const var_scalar = ([Binding] env, Str n): Str -> {
 # binding yields its signature's return type (`elem`); a direct call defers to `call_scalar`.
 const call_scalar_e = (*Emit ctx, [Binding] env, Str callee): Str -> {
 	const Iarch bi = lookup_index(env, callee)
-	if bi >= 0 then { if str_eq(env[bi].rec_type, "$fn") then return scalar_only(env[bi].elem) }
+	if bi >= 0 then { if str_eq(env[bi].rec_type, "$fn") then return scalar_only(fn_ret_telem(env[bi]).name) }
 	return call_scalar(ctx, callee)
 }
 # A record field / tuple position / array element type NAME, kept only when it is a scalar leaf.
@@ -486,6 +490,12 @@ const qtype_of_name = (Str name): Str -> {
 	if str_eq(name, "Float64") then return "d"
 	if str_eq(name, "Float32") then return "s"
 	return "l"
+}
+# The QBE class a signature RETURN position is called in: a nested tuple/function-type return rides
+# an `l` pointer, a leaf defers to its name (`d`/`s` for a float, else `l`).
+const telem_qtype = (TupElem te): Str -> {
+	if tel_is_fn(te) || tel_is_nest(te) then return "l"
+	return qtype_of_name(te.name)
 }
 const float_cmp_op = (Str op, Str qt): Str -> {
 	if str_eq(op, "csltl") then return "clt${qt}"
@@ -1298,18 +1308,35 @@ const index_pos_sub = (*Emit ctx, [Binding] env, Expr base, Expr idx): [TupElem]
 	return tel_sub(tel[k])
 }
 
-# A callee's declared dynamic-array element name (`Func.ret_elem`) — so a binding of a
-# `[T]`/nested-array call result (`const rs = build()`) carries its element for later
-# `rs[i]` / `rs[i].len`; "" for a non-array or unknown callee.
-const call_ret_elem = (*Emit ctx, Str callee): Str -> {
+# A callee's declared dynamic-array element name — so a binding of a `[T]`/nested-array call result
+# (`const rs = build()`) carries its element for later `rs[i]` / `rs[i].len`; "" for a non-array or
+# unknown callee. An INDIRECT call through a `$fn` binding takes it from the return telem's `[Elem]`.
+const call_ret_elem = (*Emit ctx, [Binding] env, Str callee): Str -> {
+	const Iarch bi = lookup_index(env, callee)
+	if bi >= 0 then {
+		if str_eq(env[bi].rec_type, "$fn") then {
+			const Str rn = fn_ret_telem(env[bi]).name
+			if is_nested(rn) then return nested_inner(rn)
+			return ""
+		}
+	}
 	const Iarch fidx = find_func(ctx.funcs, callee)
 	if fidx < 0 then return ""
 	return ctx.funcs[fidx].ret_elem
 }
 
-# A tuple-returning callee's position telems, canonicalized to emit's convention.
-const call_ret_telems = (*Emit ctx, Str callee): [TupElem] -> {
+# A tuple-returning callee's position telems, canonicalized to emit's convention. An INDIRECT call
+# through a `$fn` binding whose return is a nested tuple yields that return telem's sub-positions.
+const call_ret_telems = (*Emit ctx, [Binding] env, Str callee): [TupElem] -> {
 	let [TupElem] none = []
+	const Iarch bi = lookup_index(env, callee)
+	if bi >= 0 then {
+		if str_eq(env[bi].rec_type, "$fn") then {
+			const TupElem rt = fn_ret_telem(env[bi])
+			if tel_is_nest(rt) then return emit_canon_telems(ctx, rt.sub)
+			return none
+		}
+	}
 	const Iarch fidx = find_func(ctx.funcs, callee)
 	if fidx < 0 then return none
 	return emit_canon_telems(ctx, ctx.funcs[fidx].ret_telems)
@@ -1342,7 +1369,7 @@ const init_telems = (*Emit ctx, [Binding] env, Expr e): [TupElem] -> {
 	let [TupElem] r = []
 	match e {
 		Expr.Tuple(elems) -> { r = tuple_pos_types(ctx, env, elems) },
-		Expr.Call(callee, tyargs, args) -> { r = call_ret_telems(ctx, callee) },
+		Expr.Call(callee, tyargs, args) -> { r = call_ret_telems(ctx, env, callee) },
 		Expr.Var(nm) -> { r = var_telems(env, nm) },
 		Expr.Field(base, f) -> { r = field_ftelems(ctx, var_agg_type(env, base), f) },
 		Expr.FieldExpr(base, f) -> { r = field_ftelems(ctx, init_agg_type(ctx, env, base), f) },
@@ -1374,7 +1401,7 @@ const emit_destructure = (*Emit ctx, [Binding] env, [Str] pat, Bool mutable, Exp
 			base = emit_tuple(ctx, elems, env)
 		},
 		Expr.Call(callee, tyargs, args) -> {
-			tels = call_ret_telems(ctx, callee)
+			tels = call_ret_telems(ctx, env, callee)
 			base = emit_call(ctx, callee, args, env)
 		},
 		# Any other tuple-valued expression (a record's tuple field, or a nested tuple reached
@@ -1517,12 +1544,16 @@ const emit_union_mk = (*Emit ctx, Str type_name, Str member, [Expr] args, [Bindi
 # seal yields a Str aggregate, so a `const s = Str(v)` binding adopts the header pointer.
 const call_agg_type = (*Emit ctx, [Binding] env, Str callee): Str -> {
 	if str_eq(callee, "Str") then return "Str"
-	# an INDIRECT call through a `$fn` binding yields its signature's return type (in `elem`) when
-	# that return is an aggregate — so `const P p = g(5)` on a `(…) -> P` function value dispatches
+	# an INDIRECT call through a `$fn` binding yields its return telem's aggregate marker when that
+	# return is by-reference — a nested tuple (`$tuple`), a `[Elem]` array (`$dyn`), or a
+	# record/union/`Str` name — so `const P p = g(5)` / `const (a, b) = g(5)` dispatch off the pointer
 	const Iarch bi = lookup_index(env, callee)
 	if bi >= 0 then {
 		if str_eq(env[bi].rec_type, "$fn") then {
-			if ret_is_l(env[bi].elem, ctx.recs, ctx.unions) then return env[bi].elem
+			const TupElem rt = fn_ret_telem(env[bi])
+			if tel_is_nest(rt) then return "$tuple"
+			if is_nested(rt.name) then return "$dyn"
+			if ret_is_l(rt.name, ctx.recs, ctx.unions) then return rt.name
 			return ""
 		}
 	}
@@ -1751,7 +1782,7 @@ const init_elem = (*Emit ctx, [Binding] env, Expr e): Str -> match e {
 	Expr.IndexField(arr, idx, f) -> field_elem(ctx, index_agg_type(ctx, env, arr, idx), f),
 	Expr.Index(arr, idx) -> index_elem(env, arr),
 	Expr.IndexExpr(base, idx) -> indexexpr_elem(ctx, env, base),
-	Expr.Call(callee, tyargs, args) -> call_ret_elem(ctx, callee),
+	Expr.Call(callee, tyargs, args) -> call_ret_elem(ctx, env, callee),
 	_ -> ""
 }
 
@@ -1956,7 +1987,7 @@ const emit_indirect_call = (*Emit ctx, [Binding] env, Iarch fpidx, [Expr] args):
 	}
 	const Iarch rt = ctx.next
 	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${rt} =${qtype_of_name(env[fpidx].elem)} call ${addr}(")
+	write_str(ctx.fd, "\t%t${rt} =${telem_qtype(fn_ret_telem(env[fpidx]))} call ${addr}(")
 	let Iarch j = 0
 	loop {
 		if j >= Iarch(aops.len) then break
