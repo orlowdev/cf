@@ -707,6 +707,19 @@ const emit_lit_str = (*Emit ctx, Str vh, Str s): Iarch -> {
 # `"$tuple"`, `"Str"`, `"Bool"`, or an integer leaf — a fixed-width name or `""` for a plain word);
 # `telems` supplies a tuple's positional element types; `op` is the value operand (a word for a
 # scalar, a base pointer for an aggregate / boxed-union box).
+# Append a float value's text to the interpolation vector via the `cf_float_append` floor helper.
+# The helper takes a Float64 (`d`); a Float32 (`s`) operand is widened with `exts` first.
+const emit_float_append = (*Emit ctx, Str vh, Str name, Str op): Iarch -> {
+	let Str dv = op
+	if str_eq(name, "Float32") then {
+		const Iarch fd = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${fd} =d exts ${op}\n")
+		dv = "%t${fd}"
+	}
+	write_str(ctx.fd, "\tcall $cf_float_append(l ${vh}, d ${dv})\n")
+	return 0
+}
 const emit_stringify = (*Emit ctx, [Binding] env, Str vh, Str name, [TupElem] telems, Str op): Iarch -> {
 	if str_eq(name, "Str") then { write_str(ctx.fd, "\tcall $cf_str_append(l ${vh}, l ${op})\n")  return 0 }
 	if str_eq(name, "Bool") then {
@@ -719,6 +732,7 @@ const emit_stringify = (*Emit ctx, [Binding] env, Str vh, Str name, [TupElem] te
 	if str_eq(name, "$tuple") then return emit_stringify_tuple(ctx, env, vh, telems, op)
 	if find_rec(ctx.recs, name) >= 0 then return emit_stringify_record(ctx, env, vh, name, op)
 	if find_union(ctx.unions, name) >= 0 then return emit_stringify_union(ctx, env, vh, name, op)
+	if is_float_name(name) then { emit_float_append(ctx, vh, name, op)  return 0 }
 	# an integer leaf: an unsigned fixed prints its magnitude (no sign extension), everything else
 	# (a signed fixed or a plain word) sign-extends then itoa's
 	if is_fixed_name(name) && !fixed_signed(name) then {
@@ -864,6 +878,8 @@ const emit_interp = (*Emit ctx, [Seg] segs, [Binding] env): Str -> {
 				emit_stringify(ctx, env, "%t${vh}", aggt, init_telems(ctx, env, sg.expr), hv)
 			} else if is_tagonly_union(ctx, hsc) then {
 				emit_stringify(ctx, env, "%t${vh}", hsc, notel, hv)
+			} else if is_float_name(hsc) then {
+				emit_float_append(ctx, "%t${vh}", hsc, hv)
 			} else {
 				const Iarch ext = ctx.next
 				ctx.next = ctx.next + 1
@@ -3272,6 +3288,135 @@ const emit_arena_qbe = (Uarch fd): Iarch -> {
 	write_str(fd, "\tstoreb 115, %f3\n")
 	write_str(fd, "\t%f4 =l call $cf_dyn_push(l %vhdr, w 1)\n")
 	write_str(fd, "\tstoreb 101, %f4\n")
+	write_str(fd, "\tret\n")
+	write_str(fd, "}\n")
+	# cf_float_append(vhdr, val) — a NAIVE fixed-precision `%f` (no libc dtoa): NaN/±Inf via a bit
+	# type-pun (store double, load long; exponent all-ones), then sign, the integer part (`dtosi` +
+	# cf_uint_append), `.`, and up to 6 fractional digits pulled by multiply-by-10 — trailing zeros
+	# trimmed but always ≥1 digit (`2.0`). Truncates (no rounding) and assumes |val| < 2^63; a shortest
+	# round-trip (Ryū) is a stdlib concern, not this debug renderer.
+	write_str(fd, "function $cf_float_append(l %vhdr, d %val) {\n")
+	write_str(fd, "@start\n")
+	write_str(fd, "\t%bslot =l alloc8 8\n")
+	write_str(fd, "\tstored %val, %bslot\n")
+	write_str(fd, "\t%bits =l loadl %bslot\n")
+	write_str(fd, "\t%exps =l shr %bits, 52\n")
+	write_str(fd, "\t%exp =l and %exps, 2047\n")
+	write_str(fd, "\t%mant =l and %bits, 4503599627370495\n")
+	write_str(fd, "\t%special =w ceql %exp, 2047\n")
+	write_str(fd, "\tjnz %special, @spec, @finite\n")
+	write_str(fd, "@spec\n")
+	write_str(fd, "\t%isnan =w cnel %mant, 0\n")
+	write_str(fd, "\tjnz %isnan, @nan, @inf\n")
+	write_str(fd, "@nan\n")
+	write_str(fd, "\t%n0 =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb 78, %n0\n")
+	write_str(fd, "\t%n1 =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb 97, %n1\n")
+	write_str(fd, "\t%n2 =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb 78, %n2\n")
+	write_str(fd, "\tret\n")
+	write_str(fd, "@inf\n")
+	write_str(fd, "\t%sgn =l shr %bits, 63\n")
+	write_str(fd, "\tjnz %sgn, @neginf, @posinf\n")
+	write_str(fd, "@neginf\n")
+	write_str(fd, "\t%mm0 =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb 45, %mm0\n")
+	write_str(fd, "\tjmp @posinf\n")
+	write_str(fd, "@posinf\n")
+	write_str(fd, "\t%i0 =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb 73, %i0\n")
+	write_str(fd, "\t%i1 =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb 110, %i1\n")
+	write_str(fd, "\t%i2 =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb 102, %i2\n")
+	write_str(fd, "\tret\n")
+	write_str(fd, "@finite\n")
+	write_str(fd, "\t%vs =l alloc8 8\n")
+	write_str(fd, "\tstored %val, %vs\n")
+	write_str(fd, "\t%isneg =w cltd %val, d_0\n")
+	write_str(fd, "\tjnz %isneg, @doneg, @pos\n")
+	write_str(fd, "@doneg\n")
+	write_str(fd, "\t%s0 =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb 45, %s0\n")
+	write_str(fd, "\t%vld =d loadd %vs\n")
+	write_str(fd, "\t%vng =d neg %vld\n")
+	write_str(fd, "\tstored %vng, %vs\n")
+	write_str(fd, "\tjmp @pos\n")
+	write_str(fd, "@pos\n")
+	write_str(fd, "\t%vv =d loadd %vs\n")
+	write_str(fd, "\t%ip =l dtosi %vv\n")
+	write_str(fd, "\tcall $cf_uint_append(l %vhdr, l %ip)\n")
+	write_str(fd, "\t%dot =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb 46, %dot\n")
+	write_str(fd, "\t%ipf =d sltof %ip\n")
+	write_str(fd, "\t%frac =d sub %vv, %ipf\n")
+	write_str(fd, "\t%fbuf =l alloc4 8\n")
+	write_str(fd, "\t%fs =l alloc8 8\n")
+	write_str(fd, "\tstored %frac, %fs\n")
+	write_str(fd, "\t%ci =l alloc8 8\n")
+	write_str(fd, "\tstorel 0, %ci\n")
+	write_str(fd, "@floop\n")
+	write_str(fd, "\t%i =l loadl %ci\n")
+	write_str(fd, "\t%fdone =w csgel %i, 6\n")
+	write_str(fd, "\tjnz %fdone, @trim, @fstep\n")
+	write_str(fd, "@fstep\n")
+	write_str(fd, "\t%fr =d loadd %fs\n")
+	write_str(fd, "\t%fr10 =d mul %fr, d_10.0\n")
+	write_str(fd, "\t%dg =l dtosi %fr10\n")
+	write_str(fd, "\t%dgc =l add %dg, 48\n")
+	write_str(fd, "\t%faddr =l add %fbuf, %i\n")
+	write_str(fd, "\tstoreb %dgc, %faddr\n")
+	write_str(fd, "\t%dgf =d sltof %dg\n")
+	write_str(fd, "\t%rem =d sub %fr10, %dgf\n")
+	write_str(fd, "\tstored %rem, %fs\n")
+	write_str(fd, "\t%i1f =l add %i, 1\n")
+	write_str(fd, "\tstorel %i1f, %ci\n")
+	write_str(fd, "\tjmp @floop\n")
+	write_str(fd, "@trim\n")
+	write_str(fd, "\t%last =l alloc8 8\n")
+	write_str(fd, "\tstorel -1, %last\n")
+	write_str(fd, "\t%tj =l alloc8 8\n")
+	write_str(fd, "\tstorel 0, %tj\n")
+	write_str(fd, "@tloop\n")
+	write_str(fd, "\t%j =l loadl %tj\n")
+	write_str(fd, "\t%tdone =w csgel %j, 6\n")
+	write_str(fd, "\tjnz %tdone, @emit, @tstep\n")
+	write_str(fd, "@tstep\n")
+	write_str(fd, "\t%ja =l add %fbuf, %j\n")
+	write_str(fd, "\t%jc =w loadub %ja\n")
+	write_str(fd, "\t%isz =w ceqw %jc, 48\n")
+	write_str(fd, "\tjnz %isz, @tskip, @tset\n")
+	write_str(fd, "@tset\n")
+	write_str(fd, "\tstorel %j, %last\n")
+	write_str(fd, "@tskip\n")
+	write_str(fd, "\t%j1 =l add %j, 1\n")
+	write_str(fd, "\tstorel %j1, %tj\n")
+	write_str(fd, "\tjmp @tloop\n")
+	write_str(fd, "@emit\n")
+	write_str(fd, "\t%ln =l loadl %last\n")
+	write_str(fd, "\t%allz =w csltl %ln, 0\n")
+	write_str(fd, "\tjnz %allz, @zero, @digits\n")
+	write_str(fd, "@zero\n")
+	write_str(fd, "\t%z0 =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb 48, %z0\n")
+	write_str(fd, "\tret\n")
+	write_str(fd, "@digits\n")
+	write_str(fd, "\t%ei =l alloc8 8\n")
+	write_str(fd, "\tstorel 0, %ei\n")
+	write_str(fd, "@eloop\n")
+	write_str(fd, "\t%e =l loadl %ei\n")
+	write_str(fd, "\t%eend =w csgtl %e, %ln\n")
+	write_str(fd, "\tjnz %eend, @edone, @estep\n")
+	write_str(fd, "@estep\n")
+	write_str(fd, "\t%ea =l add %fbuf, %e\n")
+	write_str(fd, "\t%ec =w loadub %ea\n")
+	write_str(fd, "\t%esl =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb %ec, %esl\n")
+	write_str(fd, "\t%e1 =l add %e, 1\n")
+	write_str(fd, "\tstorel %e1, %ei\n")
+	write_str(fd, "\tjmp @eloop\n")
+	write_str(fd, "@edone\n")
 	write_str(fd, "\tret\n")
 	write_str(fd, "}\n")
 	write_str(fd, "function $cf_str_append(l %vhdr, l %str) {\n")
