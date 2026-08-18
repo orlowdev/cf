@@ -2417,6 +2417,13 @@ const check_simple_stmt = (Stmt s, [VarTy] env, Ctx ctx, Iarch loop_kind): Iarch
 			if !env[idx].mutable then die("cf0: type: cannot write to a `const`/borrowed array\n")
 			if str_eq(dyn_of(env[idx].ty), "") && !is_tptr(env[idx].ty) then die("cf0: type: element assignment needs a dynamic array or a byte buffer\n")
 			if !is_tint(type_of(ix, env, ctx)) then die("cf0: type: an array index must be an integer\n")
+			# a byte buffer (`[N Uint8]`, a `$ptr`) holds `Uint8`: a literal element must fit 0..255.
+			# (A non-literal stays a byte word — a byte read `src[i]` types `Int`, not `Uint8`, so no
+			# implicit-narrowing gate is possible without also rejecting the legitimate byte-copy path.)
+			if is_tptr(env[idx].ty) && is_adoptable_lit(val) then {
+				const Iarch lv = lit_signed_val(val)
+				if lv < 0 || lv > 255 then die("cf0: type: a byte-buffer element literal must be in 0..255\n")
+			}
 			# a FLOAT-element array (`[Float64]`/`[Float32]`) takes a matching float value; otherwise the
 			# element value is any integer word — a plain `Iarch`/`Int` OR a fixed-width (`Int16`, `Uint8`, …)
 			const Ty vt = type_of(val, env, ctx)
@@ -2752,7 +2759,49 @@ const enforce_toplevel_defertap = ([Stmt] body): Iarch -> {
 # parameters, requiring a return; a captured `const`/parameter is thus non-mutable, so mutating
 # it through the closure is rejected there. Returns the environment extended with the closure
 # name bound as a function value.
+# A by-reference aggregate type (record / union / tuple / dynamic array / `Str`) — captured as a
+# borrowed pointer, not a repointable slot. A scalar (int/fixed/float/Bool) is not.
+const ty_is_agg = (Ty t): Bool -> !str_eq(rec_of(t), "") || !str_eq(union_of(t), "") || is_ttuple(t) || is_tdyn(t) || is_tstr(t)
+# Does `n` name a CAPTURED aggregate — a var from the enclosing env `caps` whose type is by-reference?
+const assign_hits_capture_agg = (Str n, [VarTy] caps): Bool -> {
+	const Iarch i = env_index(caps, n)
+	if i < 0 then return false
+	return ty_is_agg(caps[i].ty)
+}
+# Scan a closure body for a WHOLE-reassign of a captured aggregate (`cap = mk(9)`): a captured
+# record/union/tuple/array/Str is a by-reference borrow with no repointable slot, so the reassign
+# has no storage and silently miscompiles (1054). Field mutation through the capture, and
+# reassigning a captured SCALAR (held by its slot address), stay legal. `caps` is the enclosing env.
+const stmts_reassign_capture_agg = ([Stmt] ss, [VarTy] caps): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		if stmt_reassigns_capture_agg(ss[i], caps) then return true
+		i = i + 1
+	}
+	return false
+}
+const arms_reassign_capture_agg = ([StmtArm] arms, [VarTy] caps): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		if stmts_reassign_capture_agg(arms[i].body, caps) then return true
+		i = i + 1
+	}
+	return false
+}
+const stmt_reassigns_capture_agg = (Stmt s, [VarTy] caps): Bool -> match s {
+	Stmt.Assign(n, e) -> assign_hits_capture_agg(n, caps),
+	Stmt.Block(ss) -> stmts_reassign_capture_agg(ss, caps),
+	Stmt.IfThen(c, b) -> stmt_reassigns_capture_agg(b, caps),
+	Stmt.IfElse(c, t, el) -> stmt_reassigns_capture_agg(t, caps) || stmt_reassigns_capture_agg(el, caps),
+	Stmt.Loop(bd) -> stmts_reassign_capture_agg(bd, caps),
+	Stmt.ForIn(v, a, bd) -> stmts_reassign_capture_agg(bd, caps),
+	Stmt.Match(sc, arms) -> arms_reassign_capture_agg(arms, caps),
+	_ -> false
+}
 const check_closure = (Str nm, [Param] params, Str ret, [Stmt] body, [VarTy] env, Ctx ctx): [VarTy] -> {
+	if stmts_reassign_capture_agg(body, env) then die("cf0: type: cannot whole-reassign a captured aggregate — it is a by-reference borrow with no repointable slot (mutate its fields instead)\n")
 	if env_index(env, nm) >= 0 then die("cf0: type: a binding cannot shadow an existing name\n")
 	if body_has_closure(body) then die("cf0: type: a closure cannot be nested in another closure\n")
 	const Ty crt = closure_ret_ty(ret, ctx)
