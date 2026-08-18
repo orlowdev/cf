@@ -1388,11 +1388,24 @@ const parse_stmt = (*Parser p): Stmt -> {
 				fchain = [...fchain, cur_name(p)]
 				p.pos = p.pos + 1
 			}
-			if !is_eq(peek(p)) then die("cf0: parse: expected `=` in a field assignment\n")
-			p.pos = p.pos + 1
-			const Expr rhs = parse_expr(p)
+			# `= v` (plain) or a compound `op= v` — `p.f += y` desugars to `p.f = p.f op y`, reading the
+			# field target once as the left operand (a `Field` for a single field, a `FieldExpr` through
+			# the base pointer for a chain).
+			const Bool compound = is_compound_op(peek(p)) && is_eq(p.toks[p.pos + 1].kind)
+			const TokKind cop = peek(p)
+			if compound then {
+				p.pos = p.pos + 2
+			} else {
+				if !is_eq(peek(p)) then die("cf0: parse: expected `=` in a field assignment\n")
+				p.pos = p.pos + 1
+			}
+			const Expr rhs0 = parse_expr(p)
 			const Iarch nf = Iarch(fchain.len)
-			if nf == 1 then return Stmt.FieldAssign(name, fchain[0], rhs)
+			if nf == 1 then {
+				let Expr rhs = rhs0
+				if compound then rhs = compound_apply(cop, Expr.Field(name, fchain[0]), rhs0)
+				return Stmt.FieldAssign(name, fchain[0], rhs)
+			}
 			# build the base pointer expr `name.f0…f(n-2)`, leaving `f(n-1)` as the assign target
 			let Expr base = Expr.Field(name, fchain[0])
 			let Iarch k = 1
@@ -1401,7 +1414,9 @@ const parse_stmt = (*Parser p): Stmt -> {
 				base = Expr.FieldExpr(base, fchain[k])
 				k = k + 1
 			}
-			return Stmt.DeepFieldAssign(base, fchain[nf - 1], rhs)
+			let Expr drhs = rhs0
+			if compound then drhs = compound_apply(cop, Expr.FieldExpr(base, fchain[nf - 1]), rhs0)
+			return Stmt.DeepFieldAssign(base, fchain[nf - 1], drhs)
 		}
 		# `name[i] = value` — a dynamic-array element write
 		if is_lbracket(peek(p)) then {
@@ -1428,8 +1443,6 @@ const parse_stmt = (*Parser p): Stmt -> {
 	return Stmt.Return(Expr.Lit(0))
 }
 
-# Parse a `{ … }` block into its statement list (statement boundaries are implicit —
-# cf0 does not yet track newlines, so a statement ends where its expression does).
 # Is there a raw newline in the source gap immediately before token `i` (between the previous
 # token's end and this token's start)? A comment's trailing newline counts; a newline INSIDE a
 # token's own span (a multi-line string literal) does not, since the gap is between tokens. The
