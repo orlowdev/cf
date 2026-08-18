@@ -2409,30 +2409,216 @@ const heads = (*Parser p, Str word): Bool -> {
 	return slice_eq(p.src, p.toks[k].start, p.toks[k].len, word)
 }
 
-# The whole program: a sequence of top-level imports, `data`/`union` declarations, and
-# functions (each optionally `pub`), in any order. One function must be `pub const main`
-# (checked later). Imports are resolved and flattened away before typecheck (module_system §8).
-pub const parse_program = (*Parser p): Program -> {
+# An empty one-item-less `Program` fragment — the identity for `prog_cat`.
+const empty_program = (): Program -> {
 	let [Import] imports = []
 	let [RecDecl] recs = []
 	let [UnionDecl] unions = []
 	let [Func] funcs = []
 	let [RecDecl] groups = []
+	return Program({ imports: imports, recs: recs, unions: unions, funcs: funcs, groups: groups })
+}
+
+# Concatenate two `Program` fragments field-by-field (cf0 has no `[...a, ...b]` double-spread).
+# Both inputs are copied into fresh arrays so neither caller's backing store is aliased/mutated.
+const prog_cat = (Program a, Program b): Program -> {
+	let [Import] imports = []
+	let [RecDecl] recs = []
+	let [UnionDecl] unions = []
+	let [Func] funcs = []
+	let [RecDecl] groups = []
+	let Iarch i = 0
 	loop {
-		if is_eof(peek(p)) then break
-		if kw(p, "import") then {
-			imports = [...imports, parse_import(p)]
-		} else if heads(p, "data") then {
-			recs = [...recs, parse_data(p)]
-		} else if heads(p, "union") then {
-			unions = [...unions, parse_union(p)]
-		} else if heads(p, "type") then {
-			# only grouped-parameter `type X = { … }` decls reach here — `type` ALIASES are erased
-			# before parse (typealias.cf token pass)
-			groups = [...groups, parse_group(p)]
-		} else {
-			funcs = [...funcs, parse_func(p)]
-		}
+		if i >= Iarch(a.imports.len) then break
+		imports = [...imports, a.imports[i]]
+		i = i + 1
+	}
+	i = 0
+	loop {
+		if i >= Iarch(b.imports.len) then break
+		imports = [...imports, b.imports[i]]
+		i = i + 1
+	}
+	i = 0
+	loop {
+		if i >= Iarch(a.recs.len) then break
+		recs = [...recs, a.recs[i]]
+		i = i + 1
+	}
+	i = 0
+	loop {
+		if i >= Iarch(b.recs.len) then break
+		recs = [...recs, b.recs[i]]
+		i = i + 1
+	}
+	i = 0
+	loop {
+		if i >= Iarch(a.unions.len) then break
+		unions = [...unions, a.unions[i]]
+		i = i + 1
+	}
+	i = 0
+	loop {
+		if i >= Iarch(b.unions.len) then break
+		unions = [...unions, b.unions[i]]
+		i = i + 1
+	}
+	i = 0
+	loop {
+		if i >= Iarch(a.funcs.len) then break
+		funcs = [...funcs, a.funcs[i]]
+		i = i + 1
+	}
+	i = 0
+	loop {
+		if i >= Iarch(b.funcs.len) then break
+		funcs = [...funcs, b.funcs[i]]
+		i = i + 1
+	}
+	i = 0
+	loop {
+		if i >= Iarch(a.groups.len) then break
+		groups = [...groups, a.groups[i]]
+		i = i + 1
+	}
+	i = 0
+	loop {
+		if i >= Iarch(b.groups.len) then break
+		groups = [...groups, b.groups[i]]
+		i = i + 1
 	}
 	return Program({ imports: imports, recs: recs, unions: unions, funcs: funcs, groups: groups })
+}
+
+# Consume the current identifier token, returning its interned text; die with `msg` otherwise.
+const expect_ident = (*Parser p, Str msg): Str -> {
+	if !is_ident(peek(p)) then die(msg)
+	const Str s = cur_name(p)
+	p.pos = p.pos + 1
+	return s
+}
+
+# Consume a `.` token in a comptime condition; die if the current token is not a dot.
+const expect_cond_dot = (*Parser p): Bool -> {
+	if !is_dot(peek(p)) then die("cf0: parse: expected `.` in a comptime condition\n")
+	p.pos = p.pos + 1
+	return true
+}
+
+# Evaluate a comptime condition at PARSE TIME against the fixed darwin/arm64 target
+# (module_system): `comptime.<ns>.<member> <op> <Enum>.<Variant>`, where `<ns>` is `os` or
+# `arch`, `<member>` is `target` or `current` (equal on a non-cross build), `<op>` is `==` or
+# `!=`, and `<Enum>` must match the namespace (`os`→`Os`, `arch`→`Arch`). The fixed values are
+# os = Darwin, arch = Arm64. A malformed condition is a parse error.
+const parse_cond = (*Parser p): Bool -> {
+	const Str head = expect_ident(p, "cf0: parse: expected `comptime` in a comptime condition\n")
+	if !str_eq(head, "comptime") then die("cf0: parse: a comptime condition must start with `comptime`\n")
+	expect_cond_dot(p)
+	const Str ns = expect_ident(p, "cf0: parse: expected `os` or `arch` after `comptime.`\n")
+	const Bool is_os = str_eq(ns, "os")
+	const Bool is_arch = str_eq(ns, "arch")
+	if !is_os && !is_arch then die("cf0: parse: a comptime namespace must be `os` or `arch`\n")
+	expect_cond_dot(p)
+	const Str member = expect_ident(p, "cf0: parse: expected `target` or `current` after the comptime namespace\n")
+	if !str_eq(member, "target") && !str_eq(member, "current") then die("cf0: parse: a comptime member must be `target` or `current`\n")
+	let Bool is_eq = false
+	if is_eqeq(peek(p)) then {
+		is_eq = true
+	} else if is_ne(peek(p)) then {
+		is_eq = false
+	} else {
+		die("cf0: parse: expected `==` or `!=` in a comptime condition\n")
+	}
+	p.pos = p.pos + 1
+	const Str ename = expect_ident(p, "cf0: parse: expected an enum name in a comptime condition\n")
+	if is_os && !str_eq(ename, "Os") then die("cf0: parse: the `os` namespace compares against `Os`\n")
+	if is_arch && !str_eq(ename, "Arch") then die("cf0: parse: the `arch` namespace compares against `Arch`\n")
+	expect_cond_dot(p)
+	const Str variant = expect_ident(p, "cf0: parse: expected a variant name after the enum name\n")
+	# The enum variant sets are closed (module_system §7.1): `Os` is `{ Darwin, Linux }` and
+	# `Arch` is `{ Arm64, Amd64, Riscv64, Wasm }`. A variant outside its enum (a typo, or a
+	# cross-enum name like `Os.Arm64`) is a parse error, not a silently-false comparison.
+	if is_os && !str_eq(variant, "Darwin") && !str_eq(variant, "Linux") then die("cf0: parse: `Os` has no such variant (expected `Darwin` or `Linux`)\n")
+	if is_arch && !str_eq(variant, "Arm64") && !str_eq(variant, "Amd64") && !str_eq(variant, "Riscv64") && !str_eq(variant, "Wasm") then die("cf0: parse: `Arch` has no such variant (expected `Arm64`, `Amd64`, `Riscv64`, or `Wasm`)\n")
+	let Str fixed = "Arm64"
+	if is_os then fixed = "Darwin"
+	const Bool same = str_eq(fixed, variant)
+	if is_eq then return same
+	return !same
+}
+
+# Parse a comptime branch: either a single top-level item, or a `{ … }`-enclosed sequence of
+# items. Returns the branch's items as a `Program` fragment.
+const parse_branch = (*Parser p): Program -> {
+	if is_lbrace(peek(p)) then {
+		p.pos = p.pos + 1
+		let Program acc = empty_program()
+		loop {
+			if is_rbrace(peek(p)) then break
+			if is_eof(peek(p)) then die("cf0: parse: unterminated comptime branch block\n")
+			acc = prog_cat(acc, parse_item(p))
+		}
+		p.pos = p.pos + 1 # `}`
+		return acc
+	}
+	return parse_item(p)
+}
+
+# A top-level comptime conditional `if comptime.<cond> then <branch> [else <branch>]`
+# (module_system). Evaluated at parse time; the winning branch's items are returned and the
+# losing branch is parsed (to advance the cursor) but DISCARDED — so its imports are never
+# opened (parsing an `import` never touches a file; only resolve does). Nesting a comptime
+# `if` in a branch expresses `else if` and os-AND-arch conditions.
+const parse_comptime_if = (*Parser p): Program -> {
+	p.pos = p.pos + 1 # `if`
+	const Bool taken = parse_cond(p)
+	if !kw(p, "then") then die("cf0: parse: expected `then` in a comptime `if`\n")
+	p.pos = p.pos + 1
+	const Program then_frag = parse_branch(p)
+	let Program else_frag = empty_program()
+	if kw(p, "else") then {
+		p.pos = p.pos + 1
+		else_frag = parse_branch(p)
+	}
+	if taken then return then_frag
+	return else_frag
+}
+
+# Parse a single top-level item into a one-item `Program` fragment: an import, a
+# `data`/`union`/`type` declaration, a function (each optionally `pub`), or a nested comptime
+# `if` (which yields its winning branch's items).
+const parse_item = (*Parser p): Program -> {
+	if kw(p, "if") then return parse_comptime_if(p)
+	let [Import] imports = []
+	let [RecDecl] recs = []
+	let [UnionDecl] unions = []
+	let [Func] funcs = []
+	let [RecDecl] groups = []
+	if kw(p, "import") then {
+		imports = [...imports, parse_import(p)]
+	} else if heads(p, "data") then {
+		recs = [...recs, parse_data(p)]
+	} else if heads(p, "union") then {
+		unions = [...unions, parse_union(p)]
+	} else if heads(p, "type") then {
+		# only grouped-parameter `type X = { … }` decls reach here — `type` ALIASES are erased
+		# before parse (typealias.cf token pass)
+		groups = [...groups, parse_group(p)]
+	} else {
+		funcs = [...funcs, parse_func(p)]
+	}
+	return Program({ imports: imports, recs: recs, unions: unions, funcs: funcs, groups: groups })
+}
+
+# The whole program: a sequence of top-level imports, `data`/`union` declarations, functions
+# (each optionally `pub`), and comptime `if` conditionals, in any order. One function must be
+# `pub const main` (checked later). Imports are resolved and flattened away before typecheck
+# (module_system §8).
+pub const parse_program = (*Parser p): Program -> {
+	let Program acc = empty_program()
+	loop {
+		if is_eof(peek(p)) then break
+		acc = prog_cat(acc, parse_item(p))
+	}
+	return acc
 }
