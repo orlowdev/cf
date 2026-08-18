@@ -144,41 +144,46 @@ const fn_ty_of_param = (Param p): Ty -> {
 	sig = [...sig, tel_leaf(fn_sig_name(p.elem))]
 	return Ty.TFn(sig)
 }
-# A signature POSITION is well-formed iff it is a scalar component (a word/fixed/float/Bool) or a
-# nested function type whose own positions are (recursively) well-formed. A record/union/Str/array/
-# tuple component is still a later brick (679).
-const fn_component_ok = (Str name): Bool -> {
+# A signature POSITION is well-formed iff it is a scalar component (a word/fixed/float/Bool), a
+# by-reference aggregate that rides an 8-byte pointer (a record, a union, or a `Str`), or a nested
+# function type whose own positions are (recursively) well-formed. A tuple/array component — which
+# would need positional telems / an element name a flat signature name cannot carry — is still a
+# later brick.
+const fn_component_ok = (Str name, Ctx ctx): Bool -> {
 	if is_cast_type(name) then return true
 	if is_float_name(name) then return true
 	if str_eq(name, "Bool") then return true
+	if str_eq(name, "Str") then return true
+	if find_rec(ctx.recs, name) >= 0 then return true
+	if find_union(ctx.unions, name) >= 0 then return true
 	return false
 }
-const sig_telem_ok = (TupElem te): Bool -> {
+const sig_telem_ok = (TupElem te, Ctx ctx): Bool -> {
 	if tel_is_fn(te) then {
 		let Iarch i = 0
 		loop {
 			if i >= Iarch(te.sub.len) then break
-			if !sig_telem_ok(te.sub[i]) then return false
+			if !sig_telem_ok(te.sub[i], ctx) then return false
 			i = i + 1
 		}
 		return true
 	}
 	if tel_is_nest(te) then return false
-	return fn_component_ok(te.name)
+	return fn_component_ok(te.name, ctx)
 }
 # Validate a `(A, …) -> R` function-type PARAMETER: at most 32 arguments (the indirect-call emit
-# arrays are fixed, 680), and every argument + the return a well-formed component (scalar or a
-# nested function type — 679).
-const check_fn_param_sig = (Param p): Iarch -> {
+# arrays are fixed, 680), and every argument + the return a well-formed component (scalar, a
+# by-reference aggregate, or a nested function type).
+const check_fn_param_sig = (Param p, Ctx ctx): Iarch -> {
 	if !str_eq(p.type_name, "$fn") then return 0
 	if Iarch(p.telems.len) > 32 then die("cf0: type: a function type takes at most 32 parameters\n")
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(p.telems.len) then break
-		if !sig_telem_ok(p.telems[i]) then die("cf0: type: a function-type component must be a scalar or a nested function type\n")
+		if !sig_telem_ok(p.telems[i], ctx) then die("cf0: type: a function-type component must be a scalar, a record/union/Str, or a nested function type\n")
 		i = i + 1
 	}
-	if !fn_component_ok(p.elem) then die("cf0: type: a function-type return must be a scalar (a record/aggregate is a later brick)\n")
+	if !fn_component_ok(p.elem, ctx) then die("cf0: type: a function-type return must be a scalar, a record/union/Str, or a nested function type\n")
 	return 0
 }
 # One position of a top-level FUNCTION's signature: a function-value parameter (`$fn`) contributes a
@@ -3122,7 +3127,7 @@ const check_func = (Func fn, Ctx ctx): Iarch -> {
 		# a `*T` pointer parameter must point to a record or union, never a scalar (§6.4)
 		check_ptr_pointee(fn.params[pi], ctx.recs, ctx.unions)
 		# a `(A, …) -> R` function-type parameter: arity cap + scalar components (679/680)
-		check_fn_param_sig(fn.params[pi])
+		check_fn_param_sig(fn.params[pi], ctx)
 		const Ty pty = param_ty(fn.params[pi], ctx.recs, ctx.unions)
 		# a `*Record` pointer parameter is mutable — its fields are written through it
 		const Bool pmut = param_is_recptr(fn.params[pi], ctx.recs) || param_is_indexptr(fn.params[pi])
