@@ -1013,6 +1013,20 @@ const emit_interp = (*Emit ctx, [Seg] segs, [Binding] env): Str -> {
 # `{bytes@0, len@8}` Str header borrowing the vector's backing bytes/len. Returns the
 # Str header operand. Shared by `emit_interp` (the string-builder finish) and the
 # `Str(v)` cast (the explicit seal in cf0's own source).
+# Build a `Str` header `{bytes@0, len@8}` directly over a raw byte pointer and an explicit length —
+# the `Str(buf, n)` two-argument form (a byte buffer / `[Uint8]` data pointer + a runtime length),
+# the file-read → Str path. Unlike `emit_str_seal` there is no vector header to read len from.
+const emit_str_from_buf = (*Emit ctx, Str ptr, Str len): Str -> {
+	const Iarch hdr = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${hdr} =l call $cf_alloc(w 16)\n")
+	write_str(ctx.fd, "\tstorel ${ptr}, %t${hdr}\n")
+	const Iarch hl = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${hl} =l add %t${hdr}, 8\n")
+	write_str(ctx.fd, "\tstorel ${len}, %t${hl}\n")
+	return "%t${hdr}"
+}
 const emit_str_seal = (*Emit ctx, Str vec): Str -> {
 	const Iarch data = ctx.next
 	ctx.next = ctx.next + 1
@@ -1981,7 +1995,10 @@ const emit_call = (*Emit ctx, Str callee, [Expr] args, [Binding] env): Str -> {
 		return emit_fixed_canon(ctx, fixed_bits(callee), fixed_signed(callee), v)
 	}
 	# `Str(v)` — seal a `[Uint8]` byte vector into a Str header borrowing its backing
-	if str_eq(callee, "Str") then return emit_str_seal(ctx, emit_expr(args[0], ctx, env))
+	if str_eq(callee, "Str") then {
+		if Iarch(args.len) == 2 then return emit_str_from_buf(ctx, emit_ptr_arg(ctx, env, args[0]), emit_expr(args[1], ctx, env))
+		return emit_str_seal(ctx, emit_expr(args[0], ctx, env))
+	}
 	# an INDIRECT call: the callee names a function-value binding (a HOF's function parameter)
 	const Iarch fpi = lookup_index(env, callee)
 	if fpi >= 0 then { if str_eq(env[fpi].rec_type, "$fn") then return emit_indirect_call(ctx, env, fpi, args) }
