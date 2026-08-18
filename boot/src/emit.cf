@@ -207,6 +207,11 @@ const member_tag = ([UnionDecl] unions, Str type_name, Str member): Iarch -> {
 	return 0
 }
 
+# Is `name` a declared TAG-ONLY union (no member carries a payload)? Such a value rides as a bare
+# word tag with no aggregate marker, so — exactly like `Bool` — its type name is recorded in a
+# binding's `fixed` slot to survive to interpolation, where it renders `Type.Member` via the tag.
+const is_tagonly_union = (*Emit ctx, Str name): Bool -> find_union(ctx.unions, name) >= 0 && !union_is_boxed(ctx.unions, name)
+
 # Is a union boxed (any member carries a payload)? A boxed union value is a pointer
 # to an arena `{tag, payload…}`; a tag-only union value is a bare word tag.
 const union_is_boxed = ([UnionDecl] unions, Str name): Bool -> {
@@ -376,6 +381,13 @@ const loop_yield_agg_stmt = (*Emit ctx, [Binding] env, Stmt s): Str -> match s {
 	Stmt.Match(scrut, arms) -> loop_yield_agg_arms(ctx, env, arms),
 	_ -> ""
 }
+# The scalar type of `base.f`: a TAG-ONLY union member construction (`Color.Red`) reports its union
+# name (a bare tag word carrying no aggregate marker — recorded like `Bool` so `"${c}"` renders it);
+# any other `base.f` is an ordinary record-field projection.
+const field_scalar_or_tagunion = (*Emit ctx, [Binding] env, Str base, Str f): Str -> {
+	if is_tagonly_union(ctx, base) then return base
+	return field_scalar(ctx, var_agg_type(env, base), f)
+}
 const scalar_of = (*Emit ctx, [Binding] env, Expr e): Str -> match e {
 	Expr.Call(callee, tyargs, args) -> call_scalar_e(ctx, env, callee),
 	Expr.Var(n) -> var_scalar(env, n),
@@ -409,7 +421,7 @@ const scalar_of = (*Emit ctx, [Binding] env, Expr e): Str -> match e {
 	# a scalar value projected out of an aggregate or a value-form: re-derive its type so the op
 	# still gets the right codegen (else a Uint64 field-compare / narrow field-arith / float field
 	# would silently miscompile)
-	Expr.Field(base, f) -> field_scalar(ctx, var_agg_type(env, base), f),
+	Expr.Field(base, f) -> field_scalar_or_tagunion(ctx, env, base, f),
 	Expr.FieldExpr(be, f) -> field_scalar(ctx, init_agg_type(ctx, env, be), f),
 	Expr.Index(arr, idx) -> idx_scalar(env, arr, idx),
 	Expr.IndexExpr(be, idx) -> idxexpr_scalar(ctx, env, be, idx),
@@ -834,19 +846,24 @@ const emit_interp = (*Emit ctx, [Seg] segs, [Binding] env): Str -> {
 		if si >= Iarch(segs.len) then break
 		const Seg sg = segs[si]
 		if sg.is_hole then {
-			# a hole is any expression; stringify a `Str` by its bytes, a `Bool` as `true`/`false`,
-			# an aggregate (tuple / record / boxed union) by its structural text, an integer via itoa
+			# a hole is any expression; stringify a `Str` by its bytes, a `Bool` as `true`/`false`, an
+			# aggregate (tuple / record / boxed union) or a TAG-ONLY union (`Color.Red`, a bare tag word
+			# whose union rides in the scalar slot) by its structural text, an integer via itoa
 			const Str hv = emit_expr(sg.expr, ctx, env)
 			const Str aggt = init_agg_type(ctx, env, sg.expr)
+			const Str hsc = scalar_of(ctx, env, sg.expr)
+			let [TupElem] notel = []
 			if str_eq(aggt, "Str") then {
 				write_str(ctx.fd, "\tcall $cf_str_append(l %t${vh}, l ${hv})\n")
-			} else if str_eq(scalar_of(ctx, env, sg.expr), "Bool") then {
+			} else if str_eq(hsc, "Bool") then {
 				const Iarch bext = ctx.next
 				ctx.next = ctx.next + 1
 				write_str(ctx.fd, "\t%t${bext} =l extsw ${hv}\n")
 				write_str(ctx.fd, "\tcall $cf_bool_append(l %t${vh}, l %t${bext})\n")
 			} else if str_eq(aggt, "$tuple") || find_rec(ctx.recs, aggt) >= 0 || (find_union(ctx.unions, aggt) >= 0 && union_is_boxed(ctx.unions, aggt)) then {
 				emit_stringify(ctx, env, "%t${vh}", aggt, init_telems(ctx, env, sg.expr), hv)
+			} else if is_tagonly_union(ctx, hsc) then {
+				emit_stringify(ctx, env, "%t${vh}", hsc, notel, hv)
 			} else {
 				const Iarch ext = ctx.next
 				ctx.next = ctx.next + 1
@@ -2949,7 +2966,7 @@ const emit_block = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 					# a scalar local records its leaf type (fixed OR float, from the annotation else
 					# inferred) so later ops pick the right codegen and the cell stores/loads with its
 					# QBE type (a float uses `stored`/`loadd`, an integer `storel`/`loadl`)
-					const Str fx = if is_fixed_name(ann) || is_float_name(ann) then ann else scalar_of(ctx, env, e)
+					const Str fx = if is_fixed_name(ann) || is_float_name(ann) || is_tagonly_union(ctx, ann) then ann else scalar_of(ctx, env, e)
 					const Iarch slot = ctx.next
 					ctx.next = ctx.next + 1
 					write_str(ctx.fd, "\t%t${slot} =l alloc8 8\n")
@@ -3064,7 +3081,7 @@ const emit_func = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 				# a word/float parameter spills into a stack slot so it reads like a local; a
 				# fixed-width or float parameter records its type name so ops on it and the slot's
 				# store/load use the right codegen (a float spills with `stored`/`stores`).
-				const Str pfx = if is_fixed_name(fn.params[pi].type_name) || is_float_name(fn.params[pi].type_name) || str_eq(fn.params[pi].type_name, "Bool") then fn.params[pi].type_name else ""
+				const Str pfx = if is_fixed_name(fn.params[pi].type_name) || is_float_name(fn.params[pi].type_name) || str_eq(fn.params[pi].type_name, "Bool") || is_tagonly_union(ctx, fn.params[pi].type_name) then fn.params[pi].type_name else ""
 				const Iarch slot = ctx.next
 				ctx.next = ctx.next + 1
 				write_str(ctx.fd, "\t%t${slot} =l alloc8 8\n")
