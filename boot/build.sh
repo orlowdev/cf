@@ -8,12 +8,12 @@
 # no genesis C compiler is in the loop, only the vendored `qbe` and the system `cc`
 # (darwin needs -lSystem present for the loader even with no libc symbol used).
 #
-# After editing cf0's `.cf` source, regenerate the seed with boot/src/reseed.sh (which
+# After editing cf0's `.cf` source, regenerate the seed with boot/reseed.sh (which
 # rebuilds from the OLD seed, recompiles the new source, and re-verifies the fixpoint),
 # then commit the updated seed alongside the source.
 set -eu
 
-root=$(cd "$(dirname "$0")/../.." && pwd)
+root=$(cd "$(dirname "$0")/.." && pwd)
 qbe="$root/opt/qbe/qbe"
 seed="$root/boot/seed"
 out="$root/var/cf0"

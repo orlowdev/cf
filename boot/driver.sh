@@ -7,13 +7,13 @@
 # `_start`, emitted verbatim since QBE has no `svc`). This driver runs the
 # `qbe`→`cc` tail: qbe lowers the IL to assembly, then `cc -nostdlib -lSystem
 # -Wl,-e,_start` links the freestanding binary (darwin needs -lSystem present for
-# the loader even with no libc symbol used). This is the same tail boot/src/build.sh
+# the loader even with no libc symbol used). This is the same tail boot/build.sh
 # uses to assemble the seed into cf0 itself.
 #
 #   driver.sh <input.cf> <out-binary>
 set -eu
 
-root=$(cd "$(dirname "$0")/../.." && pwd)
+root=$(cd "$(dirname "$0")/.." && pwd)
 cf0="$root/var/cf0"
 qbe="$root/opt/qbe/qbe"
 

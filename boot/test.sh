@@ -5,7 +5,7 @@
 # cc) and run; its exit code must match the test's `# expect:` directive. cfcc (the genesis
 # tool) is gone, so this is no longer a differential check against a second compiler — cf0
 # is validated directly against the corpus's expectations, and its self-reproduction is
-# guaranteed separately by the seed fixpoint (boot/src/reseed.sh).
+# guaranteed separately by the seed fixpoint (boot/reseed.sh).
 #
 # The `manifest` is the cf0-supported SUBSET of the corpus (boot/tests/corpus/, ~1066
 # tests total). As cf0's front end grows, more corpus tests join the manifest.
@@ -17,15 +17,15 @@
 set -u
 
 here=$(cd "$(dirname "$0")" && pwd)
-root=$(cd "$here/../.." && pwd)
-corpus="$here/corpus"
-driver="$root/boot/src/driver.sh"
+root=$(cd "$here/.." && pwd)
+corpus="$here/tests/corpus"
+driver="$root/boot/driver.sh"
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/cf0-tests.XXXXXX") || exit 1
 trap 'rm -rf "$work"' EXIT
 
 # Build cf0 from the seed so the suite always exercises the current compiler.
-if ! "$root/boot/src/build.sh" >/dev/null; then
+if ! "$root/boot/build.sh" >/dev/null; then
 	echo "run: cf0 build failed" >&2
 	exit 1
 fi
@@ -89,7 +89,7 @@ while IFS= read -r name; do
 		echo "FAIL $name (cf0 exit $code, expected $want)"
 		fail=$((fail + 1))
 	fi
-done < "$here/manifest"
+done < "$here/tests/manifest"
 
 echo "---"
 echo "$pass passed, $fail failed"

@@ -13,7 +13,7 @@
 # own accepted subset needs a transitional two-step reseed.
 set -eu
 
-root=$(cd "$(dirname "$0")/../.." && pwd)
+root=$(cd "$(dirname "$0")/.." && pwd)
 qbe="$root/opt/qbe/qbe"
 seed="$root/boot/seed"
 src="$root/boot/src/cf0.cf"
