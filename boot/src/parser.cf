@@ -12,7 +12,7 @@ import "io" as { die }
 import "token" as { Token, TokKind, is_eof, is_ident, is_intlit, is_strlit, is_lparen, is_rparen, is_lbrace, is_rbrace, is_lbracket, is_rbracket, is_comma, is_colon, is_dot, is_ellipsis, is_eq, is_arrow, is_minus, is_plus, is_star, is_slash, is_percent, is_amp, is_pipe, is_caret, is_tilde, is_bang, is_shl, is_shr, is_eqeq, is_ne, is_lt, is_gt, is_le, is_ge, is_logand, is_logor, is_yield, is_floatlit, is_pipearrow }
 import "lexer" as { lex }
 import "ast" as { Expr, Stmt, Param, Func, Ty, FieldInit, RecDecl, UnionMember, UnionDecl, MatchArm, StmtArm, Seg, RetSig, TupElem, Import, Program }
-import "astutil" as { tel_leaf, tel_nest }
+import "astutil" as { tel_leaf, tel_nest, tel_fn }
 
 # The parse cursor: the token stream, the source (for keyword text), a position.
 pub data Parser = { [Token] toks, *[Uint8] src, Iarch pos, Str file }
@@ -1553,8 +1553,26 @@ const parse_elem_name = (*Parser p): Str -> {
 # param, return, field, payload) so tuples nest to any depth.
 const parse_tel = (*Parser p): TupElem -> {
 	if is_lparen(peek(p)) then {
+		# a parenthesised position — a NESTED FUNCTION TYPE `(A, …) -> R` (if a `->` follows the `)`)
+		# or a NESTED TUPLE `(A, B, …)` (≥2 positions, no arrow). Parse the inner positions, then fork.
 		p.pos = p.pos + 1 # `(`
-		return tel_nest(parse_tuple_telems(p))
+		let [TupElem] inner = []
+		if !is_rparen(peek(p)) then {
+			loop {
+				inner = [...inner, parse_tel(p)]
+				if !is_comma(peek(p)) then break
+				p.pos = p.pos + 1
+			}
+		}
+		if !is_rparen(peek(p)) then die("cf0: parse: expected `)` in a parenthesised type\n")
+		p.pos = p.pos + 1
+		if is_arrow(peek(p)) then {
+			p.pos = p.pos + 1 # `->`
+			const TupElem ret = parse_tel(p)
+			return tel_fn([...inner, ret])
+		}
+		if Iarch(inner.len) < 2 then die("cf0: parse: a tuple type needs at least two elements\n")
+		return tel_nest(inner)
 	}
 	if !is_ident(peek(p)) then die("cf0: parse: expected a tuple element type name\n")
 	const Str n = cur_name(p)

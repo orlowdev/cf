@@ -17,7 +17,7 @@
 
 import "io" as { die }
 import "ast" as { Expr, Stmt, Param, Func, Ty, FieldInit, RecDecl, UnionMember, UnionDecl, MatchArm, StmtArm, Seg, TupElem, Program }
-import "astutil" as { is_spread, spread_inner, is_skip, skip_count, is_nested, nested_inner, tel_leaf, tel_nest, tel_is_nest, is_fixed_name, fixed_bits, fixed_signed, is_float_name, float_bits, is_pat_guard, is_member_guard, is_int_guard, guard_body, guard_qual, guard_member }
+import "astutil" as { is_spread, spread_inner, is_skip, skip_count, is_nested, nested_inner, tel_leaf, tel_nest, tel_is_nest, tel_fn, tel_is_fn, is_fixed_name, fixed_bits, fixed_signed, is_float_name, float_bits, is_pat_guard, is_member_guard, is_int_guard, guard_body, guard_qual, guard_member }
 
 # A name in scope during checking: its type and whether it is reassignable (`let`).
 # `esc` — this binding is, or (by construction) transitively contains, an explicit pointer into a
@@ -114,49 +114,99 @@ const fn_sig_name = (Str name): Str -> {
 	if str_eq(name, "Int") then return "Iarch"
 	return name
 }
-# The `TFn` of a `(A, …) -> R` PARAMETER: its `telems` are the argument type names, its `elem`
-# the return type name — spliced into one nominal signature list (args then return).
+# Normalize one signature position into the canonical `TFn` form: a scalar leaf keeps its nominal
+# name (`fn_sig_name`), a NESTED function-type component (`(A) -> B`, a `tel_fn`) recurses over its
+# own sub-signature. So `((Iarch) -> Iarch) -> Iarch` and a function taking that same signature
+# canonicalize to the SAME nested telem and match by `tuple_elems_eq`.
+const canon_sig_telem = (TupElem te): TupElem -> {
+	if tel_is_fn(te) then {
+		let [TupElem] s = []
+		let Iarch i = 0
+		loop {
+			if i >= Iarch(te.sub.len) then break
+			s = [...s, canon_sig_telem(te.sub[i])]
+			i = i + 1
+		}
+		return tel_fn(s)
+	}
+	return tel_leaf(fn_sig_name(te.name))
+}
+# The `TFn` of a `(A, …) -> R` PARAMETER: its `telems` are the argument positions (each a scalar or
+# a nested function type), its `elem` the (scalar) return type name — one nominal signature list.
 const fn_ty_of_param = (Param p): Ty -> {
 	let [TupElem] sig = []
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(p.telems.len) then break
-		sig = [...sig, tel_leaf(fn_sig_name(p.telems[i].name))]
+		sig = [...sig, canon_sig_telem(p.telems[i])]
 		i = i + 1
 	}
 	sig = [...sig, tel_leaf(fn_sig_name(p.elem))]
 	return Ty.TFn(sig)
 }
-# A function-type component (argument or return) must be a SCALAR — a word/fixed/float/Bool. A
-# record/union/Str/array/tuple component is a later brick (679).
+# A signature POSITION is well-formed iff it is a scalar component (a word/fixed/float/Bool) or a
+# nested function type whose own positions are (recursively) well-formed. A record/union/Str/array/
+# tuple component is still a later brick (679).
 const fn_component_ok = (Str name): Bool -> {
 	if is_cast_type(name) then return true
 	if is_float_name(name) then return true
 	if str_eq(name, "Bool") then return true
 	return false
 }
+const sig_telem_ok = (TupElem te): Bool -> {
+	if tel_is_fn(te) then {
+		let Iarch i = 0
+		loop {
+			if i >= Iarch(te.sub.len) then break
+			if !sig_telem_ok(te.sub[i]) then return false
+			i = i + 1
+		}
+		return true
+	}
+	if tel_is_nest(te) then return false
+	return fn_component_ok(te.name)
+}
 # Validate a `(A, …) -> R` function-type PARAMETER: at most 32 arguments (the indirect-call emit
-# arrays are fixed, 680), and every argument + the return a scalar component (679).
+# arrays are fixed, 680), and every argument + the return a well-formed component (scalar or a
+# nested function type — 679).
 const check_fn_param_sig = (Param p): Iarch -> {
 	if !str_eq(p.type_name, "$fn") then return 0
 	if Iarch(p.telems.len) > 32 then die("cf0: type: a function type takes at most 32 parameters\n")
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(p.telems.len) then break
-		if tel_is_nest(p.telems[i]) || !fn_component_ok(p.telems[i].name) then die("cf0: type: a function-type component must be a scalar (a record/aggregate component is a later brick)\n")
+		if !sig_telem_ok(p.telems[i]) then die("cf0: type: a function-type component must be a scalar or a nested function type\n")
 		i = i + 1
 	}
 	if !fn_component_ok(p.elem) then die("cf0: type: a function-type return must be a scalar (a record/aggregate is a later brick)\n")
 	return 0
 }
-# The `TFn` of a top-level FUNCTION referenced by name (to match against a function-type
-# parameter): each parameter's declared type name, then the return type name.
+# One position of a top-level FUNCTION's signature: a function-value parameter (`$fn`) contributes a
+# nested function-type telem built from ITS own argument telems + return; any other parameter its
+# nominal type name. Keeps `fn_ty_of_func` in lockstep with `fn_ty_of_param` so a function reference
+# matches a function-type parameter that expects it.
+const param_sig_telem = (Param p): TupElem -> {
+	if str_eq(p.type_name, "$fn") then {
+		let [TupElem] s = []
+		let Iarch i = 0
+		loop {
+			if i >= Iarch(p.telems.len) then break
+			s = [...s, canon_sig_telem(p.telems[i])]
+			i = i + 1
+		}
+		s = [...s, tel_leaf(fn_sig_name(p.elem))]
+		return tel_fn(s)
+	}
+	return tel_leaf(fn_sig_name(p.type_name))
+}
+# The `TFn` of a top-level FUNCTION referenced by name (to match against a function-type parameter):
+# each parameter's signature position, then the return type name.
 const fn_ty_of_func = (Func fn): Ty -> {
 	let [TupElem] sig = []
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(fn.params.len) then break
-		sig = [...sig, tel_leaf(fn_sig_name(fn.params[i].type_name))]
+		sig = [...sig, param_sig_telem(fn.params[i])]
 		i = i + 1
 	}
 	sig = [...sig, tel_leaf(fn_sig_name(fn.ret_name))]
@@ -829,8 +879,16 @@ const check_fn_arg = (Ty expected, Expr arg, [VarTy] env, Ctx ctx): Iarch -> {
 	return 0
 }
 
+# The `Ty` of a signature position: a nested function-type telem becomes a `TFn` over its own
+# sub-signature; a scalar leaf resolves nominally (`named_ty`).
+const sig_telem_ty = (TupElem te, Ctx ctx): Ty -> {
+	if tel_is_fn(te) then return Ty.TFn(te.sub)
+	return named_ty(te.name, "", ctx.recs, ctx.unions)
+}
 # Type an INDIRECT call `f(args)` where `f` is a function-value binding (a `TFn`): check the
-# argument count and each argument's type against the signature, and yield its return type.
+# argument count and each argument's type against the signature, and yield its return type. A
+# function-type argument position (`f` takes a function) is matched like a direct function-type
+# argument — the argument must be a function reference whose signature matches.
 const indirect_call_type = (Ty fty, [Expr] args, [VarTy] env, Ctx ctx): Ty -> {
 	const [TupElem] sig = tfn_sig(fty)
 	const Iarch arity = Iarch(sig.len) - 1
@@ -838,14 +896,18 @@ const indirect_call_type = (Ty fty, [Expr] args, [VarTy] env, Ctx ctx): Ty -> {
 	let Iarch i = 0
 	loop {
 		if i >= arity then break
-		const Ty at = type_of(args[i], env, ctx)
-		const Ty pt = named_ty(sig[i].name, "", ctx.recs, ctx.unions)
-		if !ty_eq(at, pt) then {
-			if is_tptr(at) then { if !is_tint(pt) then die("cf0: type: an indirect-call argument's type does not match\n") } else die("cf0: type: an indirect-call argument's type does not match\n")
+		if tel_is_fn(sig[i]) then {
+			check_fn_arg(sig_telem_ty(sig[i], ctx), args[i], env, ctx)
+		} else {
+			const Ty at = type_of(args[i], env, ctx)
+			const Ty pt = named_ty(sig[i].name, "", ctx.recs, ctx.unions)
+			if !ty_eq(at, pt) then {
+				if is_tptr(at) then { if !is_tint(pt) then die("cf0: type: an indirect-call argument's type does not match\n") } else die("cf0: type: an indirect-call argument's type does not match\n")
+			}
 		}
 		i = i + 1
 	}
-	return named_ty(sig[arity].name, "", ctx.recs, ctx.unions)
+	return sig_telem_ty(sig[arity], ctx)
 }
 
 # The write-capability of an argument, traced to the binding it is ROOTED in: a `let` (or a
