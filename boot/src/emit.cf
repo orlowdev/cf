@@ -730,6 +730,8 @@ const emit_stringify = (*Emit ctx, [Binding] env, Str vh, Str name, [TupElem] te
 		return 0
 	}
 	if str_eq(name, "$tuple") then return emit_stringify_tuple(ctx, env, vh, telems, op)
+	# a `[Elem]` array (the bracketed spelling `is_nested` recognizes): `op` is the array header ptr
+	if is_nested(name) then return emit_stringify_array(ctx, env, vh, nested_inner(name), op)
 	if find_rec(ctx.recs, name) >= 0 then return emit_stringify_record(ctx, env, vh, name, op)
 	if find_union(ctx.unions, name) >= 0 then return emit_stringify_union(ctx, env, vh, name, op)
 	if is_float_name(name) then { emit_float_append(ctx, vh, name, op)  return 0 }
@@ -777,9 +779,12 @@ const emit_stringify_record = (*Emit ctx, [Binding] env, Str vh, Str rt, Str bas
 		emit_lit_str(ctx, vh, ctx.recs[ri].fields[f])
 		emit_lit_str(ctx, vh, ": ")
 		const Str ftype = ctx.recs[ri].ftypes[f]
+		# an array field arrives as `$dyn` + a separate element name — respell it `[Elem]` so the
+		# stringifier's `is_nested` array arm picks it up
+		const Str fname = if str_eq(ftype, "$dyn") then "[${ctx.recs[ri].felems[f]}]" else ftype
 		const Iarch off = f * 8
 		const Str slot = if is_float_name(ftype) then load_field_at(ctx, base, off, ftype) else load_at(ctx, base, off)
-		emit_stringify(ctx, env, vh, ftype, ctx.recs[ri].ftelems[f], slot)
+		emit_stringify(ctx, env, vh, fname, ctx.recs[ri].ftelems[f], slot)
 		f = f + 1
 	}
 	emit_lit_str(ctx, vh, " })")
@@ -821,9 +826,11 @@ const emit_stringify_union = (*Emit ctx, [Binding] env, Str vh, Str un, Str box)
 				if p >= np then break
 				if p > 0 then emit_lit_str(ctx, vh, ", ")
 				const Str ptype = ctx.unions[ui].members[m].payloads[p]
+				# an array payload is `$dyn` + a separate element name — respell it `[Elem]` (as records do)
+				const Str pname = if str_eq(ptype, "$dyn") then "[${ctx.unions[ui].members[m].pelems[p]}]" else ptype
 				const Iarch poff = 8 + p * 8
 				const Str pslot = if is_float_name(ptype) then load_field_at(ctx, box, poff, ptype) else load_at(ctx, box, poff)
-				emit_stringify(ctx, env, vh, ptype, ctx.unions[ui].members[m].ptelems[p], pslot)
+				emit_stringify(ctx, env, vh, pname, ctx.unions[ui].members[m].ptelems[p], pslot)
 				p = p + 1
 			}
 			emit_lit_str(ctx, vh, ")")
@@ -833,6 +840,74 @@ const emit_stringify_union = (*Emit ctx, [Binding] env, Str vh, Str un, Str box)
 		m = m + 1
 	}
 	write_str(ctx.fd, "@ue${lid}\n")
+	return 0
+}
+
+# Render a `[Elem]` array `[e0, e1, …]` via a RUNTIME loop (the length is dynamic, unlike the
+# fixed-arity aggregates): read `data@0`/`len@8`, then for each index read the element at
+# `data + i*stride` (a `[Uint8]` strides 1 with `loadub`, a float loads `d`/`s`, everything else is
+# an 8-byte word/pointer `loadl`) and stringify it by `elem`, joining positions with `, `. The
+# element type is compile-time known, so ONE stringify body is emitted inside the loop.
+const emit_stringify_array = (*Emit ctx, [Binding] env, Str vh, Str elem, Str base): Iarch -> {
+	const Iarch stride = elem_bytes(elem)
+	const Str data = load_at(ctx, base, 0)
+	const Str alen = load_at(ctx, base, 8)
+	emit_lit_str(ctx, vh, "[")
+	const Iarch lid = ctx.label
+	ctx.label = ctx.label + 1
+	const Iarch ic = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${ic} =l alloc8 8\n")
+	write_str(ctx.fd, "\tstorel 0, %t${ic}\n")
+	write_str(ctx.fd, "@arloop${lid}\n")
+	const Iarch iv = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${iv} =l loadl %t${ic}\n")
+	const Iarch cmp = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${cmp} =w csgel %t${iv}, ${alen}\n")
+	write_str(ctx.fd, "\tjnz %t${cmp}, @ardone${lid}, @arbody${lid}\n")
+	write_str(ctx.fd, "@arbody${lid}\n")
+	const Iarch sc = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${sc} =w csgtl %t${iv}, 0\n")
+	write_str(ctx.fd, "\tjnz %t${sc}, @arsep${lid}, @arelem${lid}\n")
+	write_str(ctx.fd, "@arsep${lid}\n")
+	emit_lit_str(ctx, vh, ", ")
+	write_str(ctx.fd, "\tjmp @arelem${lid}\n")
+	write_str(ctx.fd, "@arelem${lid}\n")
+	const Iarch off = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${off} =l mul %t${iv}, ${stride}\n")
+	const Iarch addr = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${addr} =l add ${data}, %t${off}\n")
+	let Str eop = ""
+	if str_eq(elem, "Uint8") then {
+		const Iarch v = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${v} =l loadub %t${addr}\n")
+		eop = "%t${v}"
+	} else if is_float_name(elem) then {
+		const Iarch v = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${v} =${float_qt(elem)} load${float_qt(elem)} %t${addr}\n")
+		eop = "%t${v}"
+	} else {
+		const Iarch v = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${v} =l loadl %t${addr}\n")
+		eop = "%t${v}"
+	}
+	let [TupElem] notel = []
+	emit_stringify(ctx, env, vh, elem, notel, eop)
+	const Iarch inc = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${inc} =l add %t${iv}, 1\n")
+	write_str(ctx.fd, "\tstorel %t${inc}, %t${ic}\n")
+	write_str(ctx.fd, "\tjmp @arloop${lid}\n")
+	write_str(ctx.fd, "@ardone${lid}\n")
+	emit_lit_str(ctx, vh, "]")
 	return 0
 }
 
@@ -874,6 +949,8 @@ const emit_interp = (*Emit ctx, [Seg] segs, [Binding] env): Str -> {
 				ctx.next = ctx.next + 1
 				write_str(ctx.fd, "\t%t${bext} =l extsw ${hv}\n")
 				write_str(ctx.fd, "\tcall $cf_bool_append(l %t${vh}, l %t${bext})\n")
+			} else if str_eq(aggt, "$dyn") then {
+				emit_stringify_array(ctx, env, "%t${vh}", hole_elem(ctx, env, sg.expr), hv)
 			} else if str_eq(aggt, "$tuple") || find_rec(ctx.recs, aggt) >= 0 || (find_union(ctx.unions, aggt) >= 0 && union_is_boxed(ctx.unions, aggt)) then {
 				emit_stringify(ctx, env, "%t${vh}", aggt, init_telems(ctx, env, sg.expr), hv)
 			} else if is_tagonly_union(ctx, hsc) then {
@@ -1425,6 +1502,19 @@ const var_agg_type = ([Binding] env, Str name): Str -> {
 	const Iarch idx = lookup_index(env, name)
 	if idx < 0 then return ""
 	return env[idx].rec_type
+}
+# The `[T]` element type name of a bound array variable (its binding's `elem`), "" if unbound.
+const var_elem = ([Binding] env, Str name): Str -> {
+	const Iarch idx = lookup_index(env, name)
+	if idx < 0 then return ""
+	return env[idx].elem
+}
+# The element type of a `$dyn` interpolation hole. `init_elem` covers a literal / field / index / call
+# but NOT a bare `Expr.Var` (the common `"${xs}"`), whose element rides on its binding — resolve that
+# here without disturbing `init_elem`'s other callers.
+const hole_elem = (*Emit ctx, [Binding] env, Expr e): Str -> match e {
+	Expr.Var(n) -> var_elem(env, n),
+	_ -> init_elem(ctx, env, e)
 }
 
 # The outer env AUGMENTED with an arm's payload binds as TYPE-ONLY bindings — the same rec_type/elem

@@ -1790,8 +1790,8 @@ const str_in = ([Str] xs, Str s): Bool -> {
 }
 # Is a value of type `t` renderable by `emit_stringify` (interpolation)? A scalar leaf — an
 # integer word, a fixed-width, a `Bool`, a `Float` (naive `%f`), or a `Str` — always is. An
-# aggregate is iff every component is: a tuple's positions, a record's fields, a union's payloads.
-# An array, a raw pointer, `Unit`, or a function type is NOT. `seen` guards against a RECURSIVE
+# aggregate is iff every component is: a tuple's positions, a record's fields, a union's payloads,
+# an array's element. A raw pointer, `Unit`, or a function type is NOT. `seen` guards against a RECURSIVE
 # aggregate (a list/tree): `emit_stringify` inlines its recursion, so a self-referential type would
 # emit unbounded code — a revisit is rejected here so it never reaches emit.
 const ty_stringifiable = (Ty t, Ctx ctx, [Str] seen): Bool -> {
@@ -1801,6 +1801,7 @@ const ty_stringifiable = (Ty t, Ctx ctx, [Str] seen): Bool -> {
 	if is_tstr(t) then return true
 	if is_tfloat(t) then return true
 	if is_ttuple(t) then return telems_stringifiable(tuple_elems(t), ctx, seen)
+	if is_tdyn(t) then return elem_stringifiable(dyn_of(t), ctx, seen)
 	const Str rn = rec_of(t)
 	if !str_eq(rn, "") then {
 		if str_in(seen, rn) then return false
@@ -1813,6 +1814,18 @@ const ty_stringifiable = (Ty t, Ctx ctx, [Str] seen): Bool -> {
 	}
 	return false
 }
+# An array `[Elem]` is stringifiable iff its element type is. A nested array (`[[T]]`, spelled
+# `[T]` here) recurses; an empty/unknown element (`""`, the default-int `[]`) is a word and fine; a
+# tuple- or function-typed element is not supported by the array renderer. `seen` still threads so a
+# recursive type reached THROUGH an array (a record with a `[SelfRecord]` field) is caught.
+const elem_stringifiable = (Str elem, Ctx ctx, [Str] seen): Bool -> {
+	if str_eq(elem, "") then return true
+	if is_nested(elem) then return elem_stringifiable(nested_inner(elem), ctx, seen)
+	if str_eq(elem, "$tuple") then return false
+	if str_eq(elem, "$fn") then return false
+	return ty_stringifiable(named_ty(elem, "", ctx.recs, ctx.unions), ctx, seen)
+}
+const is_tdyn = (Ty t): Bool -> match t { Ty.TDyn(n) -> true, _ -> false }
 const telems_stringifiable = ([TupElem] tels, Ctx ctx, [Str] seen): Bool -> {
 	let Iarch i = 0
 	loop {
@@ -1865,7 +1878,7 @@ const union_payloads_stringifiable = (Str un, Ctx ctx, [Str] seen): Bool -> {
 # An interpolated string `"…${expr}…"` is a `Str`. Each hole's expression must be stringifiable:
 # a scalar (an integer / fixed-width itoa, a `Bool` → `true`/`false`, a `Float` → naive `%f`, a
 # `Str` → its bytes) or a NON-recursive aggregate rendered structurally (a tuple `(…)`, a record
-# `T({…})`, a union `T.M(…)`). An array or a recursive aggregate is rejected.
+# `T({…})`, a union `T.M(…)`, an array `[…]`). Only a recursive aggregate is rejected.
 const interp_type = ([Seg] segs, [VarTy] env, Ctx ctx): Ty -> {
 	let [Str] none = []
 	let Iarch i = 0
