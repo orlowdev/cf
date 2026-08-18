@@ -521,11 +521,31 @@ const emit_binop = (*Emit ctx, Str op, Expr l, Expr r, [Binding] env): Str -> {
 	const Iarch t = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${t} =l ${realop} ${a}, ${b}\n")
+	# `% 0` is a DEFINED 0 (§5.6): arm64 has no rem trap — `sdiv`/`udiv` by zero yield 0, so
+	# `rem = a - (a/0)*0 = a` leaks the dividend. Mask the remainder to 0 when the divisor is 0
+	# (branchless: `mask = (b != 0) ? -1 : 0`, then `rem & mask`). Division needs no guard — the
+	# hardware `div`-by-zero-is-0 already matches the spec.
+	let Str res = "%t${t}"
+	if str_eq(op, "rem") then {
+		const Iarch nz = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${nz} =w cnel ${b}, 0\n")
+		const Iarch nzl = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${nzl} =l extuw %t${nz}\n")
+		const Iarch mask = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${mask} =l sub 0, %t${nzl}\n")
+		const Iarch g = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${g} =l and %t${t}, %t${mask}\n")
+		res = "%t${g}"
+	}
 	# a fixed-width comparison yields a Bool (no wrap); a fixed-width arithmetic result is
 	# wrapped to the type's width; a plain word op is returned as-is.
-	if str_eq(fx, "") then return "%t${t}"
-	if op_is_cmp(op) then return "%t${t}"
-	return emit_fixed_canon(ctx, fixed_bits(fx), fixed_signed(fx), "%t${t}")
+	if str_eq(fx, "") then return res
+	if op_is_cmp(op) then return res
+	return emit_fixed_canon(ctx, fixed_bits(fx), fixed_signed(fx), res)
 }
 
 # Emit a unary operator whose result is `<op> <operand>` (a two-operand QBE
