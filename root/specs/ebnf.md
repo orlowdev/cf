@@ -15,6 +15,11 @@ _(temporary)_ are placeholders that will be widened in later rounds.
   `[`, or `{` is not a terminator: a parameter list, aggregate, or data literal
   may still span lines.) Statement termination is a lexer concern and is likewise
   omitted from the rules below.
+- **Multi-line blocks set their braces alone.** A statement block `{ … }` that
+  spans more than one line puts its opening `{` and closing `}` each on their own
+  line — neither shares a line with a statement. A block that fits entirely on one
+  line (`… -> { one_stmt }`, a short value block `{ <- v }`) stays inline. This is
+  enforced by the parser, not merely a style convention.
 - **Comments** start with `#` and run to the end of the line; there are no block
   comments. Like whitespace, a comment is a lexer concern and is stripped before
   the rules below apply.

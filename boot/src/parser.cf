@@ -15,7 +15,7 @@ import "ast" as { Expr, Stmt, Param, Func, Ty, FieldInit, RecDecl, UnionMember, 
 import "astutil" as { tel_leaf, tel_nest }
 
 # The parse cursor: the token stream, the source (for keyword text), a position.
-pub data Parser = { [Token] toks, *[Uint8] src, Iarch pos }
+pub data Parser = { [Token] toks, *[Uint8] src, Iarch pos, Str file }
 
 # The current token's kind.
 const peek = (*Parser p): TokKind -> p.toks[p.pos].kind
@@ -97,7 +97,7 @@ const parse_hole = (*[Uint8] src, Iarch hstart, Iarch hlen): Expr -> {
 		i = i + 1
 	}
 	const [Token] toks = lex(hbuf, hlen)
-	let Parser hp = Parser({ toks: toks, src: hbuf, pos: 0 })
+	let Parser hp = Parser({ toks: toks, src: hbuf, pos: 0, file: "" })
 	const Expr e = parse_expr(&hp)
 	if !is_eof(peek(&hp)) then die("cf0: parse: an interpolation hole must be a single expression\n")
 	return e
@@ -635,7 +635,10 @@ const parse_arm_head = (*Parser p): MatchArm -> {
 		const [Str] nob = []
 		loop {
 			let Bool neg = false
-			if is_minus(peek(p)) then { neg = true  p.pos = p.pos + 1 }
+			if is_minus(peek(p)) then {
+				neg = true
+				p.pos = p.pos + 1
+			}
 			if !is_intlit(peek(p)) then die("cf0: parse: expected an integer pattern\n")
 			let Iarch v = p.toks[p.pos].ival
 			if neg then v = 0 - v
@@ -671,7 +674,10 @@ const parse_arm_head = (*Parser p): MatchArm -> {
 			loop {
 				if is_intlit(peek(p)) || is_minus(peek(p)) then {
 					let Bool gneg = false
-					if is_minus(peek(p)) then { gneg = true  p.pos = p.pos + 1 }
+					if is_minus(peek(p)) then {
+						gneg = true
+						p.pos = p.pos + 1
+					}
 					if !is_intlit(peek(p)) then die("cf0: parse: expected an integer sub-pattern\n")
 					let Iarch gv = p.toks[p.pos].ival
 					if gneg then gv = 0 - gv
@@ -1390,7 +1396,11 @@ const parse_stmt = (*Parser p): Stmt -> {
 			# build the base pointer expr `name.f0…f(n-2)`, leaving `f(n-1)` as the assign target
 			let Expr base = Expr.Field(name, fchain[0])
 			let Iarch k = 1
-			loop { if k >= nf - 1 then break  base = Expr.FieldExpr(base, fchain[k])  k = k + 1 }
+			loop {
+				if k >= nf - 1 then break
+				base = Expr.FieldExpr(base, fchain[k])
+				k = k + 1
+			}
 			return Stmt.DeepFieldAssign(base, fchain[nf - 1], rhs)
 		}
 		# `name[i] = value` — a dynamic-array element write
@@ -1420,11 +1430,53 @@ const parse_stmt = (*Parser p): Stmt -> {
 
 # Parse a `{ … }` block into its statement list (statement boundaries are implicit —
 # cf0 does not yet track newlines, so a statement ends where its expression does).
+# Is there a raw newline in the source gap immediately before token `i` (between the previous
+# token's end and this token's start)? A comment's trailing newline counts; a newline INSIDE a
+# token's own span (a multi-line string literal) does not, since the gap is between tokens. The
+# statement sequencer uses this to enforce the ebnf rule that each statement sits on its own line.
+const nl_before = (*Parser p, Iarch i): Bool -> {
+	if i <= 0 then return true
+	const Iarch from = p.toks[i - 1].start + p.toks[i - 1].len
+	const Iarch to = p.toks[i].start
+	let Iarch k = from
+	loop {
+		if k >= to then break
+		if Iarch(p.src[k]) == 10 then return true
+		k = k + 1
+	}
+	return false
+}
+# The 1-based source line of byte offset `off` (newlines counted from the start) — for diagnostics.
+const line_of = (*Parser p, Iarch off): Iarch -> {
+	let Iarch ln = 1
+	let Iarch k = 0
+	loop {
+		if k >= off then break
+		if Iarch(p.src[k]) == 10 then ln = ln + 1
+		k = k + 1
+	}
+	return ln
+}
+
+# A brace-delimited statement block. Statements are NEWLINE-TERMINATED (ebnf §Conventions): two
+# statements may never share a line. Additionally, a MULTI-LINE block sets its braces on their own
+# lines — the opening `{` may not share its line with the first statement, nor the closing `}` with
+# the last. (A whole block that fits on ONE line — `{ <one stmt> }`, a short value block `{ <- v }` —
+# stays inline.) A statement's own expression may still span lines inside brackets / a `|>` chain;
+# the checks fire only at statement boundaries and the block's braces.
 const parse_block = (*Parser p): [Stmt] -> {
+	const Iarch open_line = line_of(p, p.toks[p.pos - 1].start)
+	const Iarch first_pos = p.pos
 	let [Stmt] stmts = []
 	loop {
 		if is_rbrace(peek(p)) then break
+		if Iarch(stmts.len) > 0 && !nl_before(p, p.pos) then die("cf0: parse: two statements share a line — each statement needs its own line\nAT ${p.file} OFFSET ${p.toks[p.pos].start} LINE ${line_of(p, p.toks[p.pos].start)}\n")
 		stmts = [...stmts, parse_stmt(p)]
+	}
+	const Iarch close_line = line_of(p, p.toks[p.pos].start)
+	if open_line != close_line && Iarch(stmts.len) > 0 then {
+		if !nl_before(p, first_pos) then die("cf0: parse: the opening `{` of a multi-line block shares its line with a statement — put the first statement on its own line\nAT ${p.file} OFFSET ${p.toks[first_pos].start} LINE ${line_of(p, p.toks[first_pos].start)}\n")
+		if !nl_before(p, p.pos) then die("cf0: parse: the closing `}` of a multi-line block shares its line with a statement — put it on its own line\nAT ${p.file} OFFSET ${p.toks[p.pos].start} LINE ${line_of(p, p.toks[p.pos].start)}\n")
 	}
 	p.pos = p.pos + 1 # `}`
 	return stmts
@@ -1950,7 +2002,11 @@ const parse_func = (*Parser p): Func -> {
 	# `= ['T](…)` / `= [Color 'T](…)` — a generic function's (optionally bounded) type parameters
 	let [Str] typarams = []
 	let [Str] tbounds = []
-	if typarams_ahead(p) then { const TyParams tpb = parse_typarams(p)  typarams = tpb.names  tbounds = tpb.bounds }
+	if typarams_ahead(p) then {
+		const TyParams tpb = parse_typarams(p)
+		typarams = tpb.names
+		tbounds = tpb.bounds
+	}
 	const [Str] no_tp = []
 	# `[pub] const NAME = <expr>` with no `(` — a top-level VALUE const (module_system /
 	# ebnf § Modules), modeled as a nullary function returning the value; a bare reference
@@ -2010,7 +2066,11 @@ const parse_data = (*Parser p): RecDecl -> {
 	# `data Pair['A, 'B] = …` / `data Tagged[Color 'T] = …` — a record's (bounded) type parameters
 	let [Str] typarams = []
 	let [Str] tbounds = []
-	if typarams_ahead(p) then { const TyParams tpb = parse_typarams(p)  typarams = tpb.names  tbounds = tpb.bounds }
+	if typarams_ahead(p) then {
+		const TyParams tpb = parse_typarams(p)
+		typarams = tpb.names
+		tbounds = tpb.bounds
+	}
 	if !is_eq(peek(p)) then die("cf0: parse: expected `=` in a data declaration\n")
 	p.pos = p.pos + 1
 	if !is_lbrace(peek(p)) then die("cf0: parse: expected `{` in a data declaration\n")
@@ -2128,7 +2188,11 @@ const parse_group = (*Parser p): RecDecl -> {
 	p.pos = p.pos + 1
 	let [Str] typarams = []
 	let [Str] tbounds = []
-	if typarams_ahead(p) then { const TyParams tpb = parse_typarams(p)  typarams = tpb.names  tbounds = tpb.bounds }
+	if typarams_ahead(p) then {
+		const TyParams tpb = parse_typarams(p)
+		typarams = tpb.names
+		tbounds = tpb.bounds
+	}
 	if !is_eq(peek(p)) then die("cf0: parse: expected `=` in a group `type` declaration\n")
 	p.pos = p.pos + 1
 	if !is_lbrace(peek(p)) then die("cf0: parse: expected `{` in a group `type` declaration\n")
@@ -2142,7 +2206,11 @@ const parse_group = (*Parser p): RecDecl -> {
 		if di >= Iarch(g.fields.len) then break
 		if str_eq(g.ftypes[di], "$spread") then die("cf0: parse: a grouped-parameter `type` cannot use a `...` spread\n")
 		let Iarch dj = 0
-		loop { if dj >= di then break  if str_eq(g.fields[dj], g.fields[di]) then die("cf0: parse: a duplicate field in a grouped-parameter `type`\n")  dj = dj + 1 }
+		loop {
+			if dj >= di then break
+			if str_eq(g.fields[dj], g.fields[di]) then die("cf0: parse: a duplicate field in a grouped-parameter `type`\n")
+			dj = dj + 1
+		}
 		di = di + 1
 	}
 	return g
@@ -2159,7 +2227,11 @@ const parse_union = (*Parser p): UnionDecl -> {
 	# `union Maybe['V] = …` / `union Wrapper[Color 'T] = …` — a union's (bounded) type parameters
 	let [Str] typarams = []
 	let [Str] tbounds = []
-	if typarams_ahead(p) then { const TyParams tpb = parse_typarams(p)  typarams = tpb.names  tbounds = tpb.bounds }
+	if typarams_ahead(p) then {
+		const TyParams tpb = parse_typarams(p)
+		typarams = tpb.names
+		tbounds = tpb.bounds
+	}
 	if !is_eq(peek(p)) then die("cf0: parse: expected `=` in a union declaration\n")
 	p.pos = p.pos + 1
 	if !is_lbrace(peek(p)) then die("cf0: parse: expected `{` in a union declaration\n")
