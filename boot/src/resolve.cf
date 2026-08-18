@@ -14,7 +14,7 @@
 # imports.
 
 import "io" as { open, read, close, die, o_rdonly }
-import "token" as { Token }
+import "token" as { Token, is_ident, is_strlit, is_lbrace, is_dot }
 import "ast" as { Expr, Stmt, MatchArm, StmtArm, Seg, FieldInit, RecDecl, UnionDecl, UnionMember, TupElem, Param, Func, Import, Program }
 import "lexer" as { lex }
 import "typealias" as { strip_type_aliases }
@@ -85,6 +85,62 @@ const build_path = (Str dir, Str name): Str -> {
 # Read, lex, and parse one module file into its Program. Its read buffer is a local, and
 # the parser interns every name into the arena, so the returned Program is self-contained
 # and the buffer can be discarded.
+# The decoded text of a token — the source slice it points at, as a `Str`.
+const tok_text = (*[Uint8] src, Token t): Str -> {
+	let [Uint8] out = []
+	let Iarch i = 0
+	loop {
+		if i >= t.len then break
+		out = [...out, src[t.start + i]]
+		i = i + 1
+	}
+	return Str(out)
+}
+
+# Is `n` one of the collected namespace-alias names?
+const is_alias = ([Str] aliases, Str n): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(aliases.len) then break
+		if str_eq(aliases[i], n) then return true
+		i = i + 1
+	}
+	return false
+}
+
+# A pre-parse token pass for namespace imports (module_system §4). A namespace import
+# `import "m" as ns` binds a local alias `ns`, and a use `ns.member` means module `m`'s `member`.
+# Because resolve flattens every module's public declarations into one whole-program namespace, a
+# namespace-qualified access is a pure syntactic prefix: pass 1 collects each alias name from an
+# `import … as <ident>` (the non-`{` form; `pub import` too — the `pub` sits before `import`), and
+# pass 2 deletes every leading `<alias> .` token pair, rewriting `ns.member` to a bare `member` and
+# `ns.T.M` to `T.M` (only the leading `ns.` is stripped — after it, `T` is not an alias). The
+# import declaration's own `as ns` is left untouched: its `ns` is not followed by a `.`.
+const strip_import_namespaces = (*[Uint8] src, [Token] toks): [Token] -> {
+	let [Str] aliases = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(toks.len) then break
+		if is_ident(toks[i].kind) && str_eq(tok_text(src, toks[i]), "import") && i + 3 < Iarch(toks.len) && is_strlit(toks[i + 1].kind) && is_ident(toks[i + 2].kind) && str_eq(tok_text(src, toks[i + 2]), "as") && is_ident(toks[i + 3].kind) then {
+			aliases = [...aliases, tok_text(src, toks[i + 3])]
+		}
+		i = i + 1
+	}
+	if Iarch(aliases.len) == 0 then return toks
+	let [Token] out = []
+	let Iarch k = 0
+	loop {
+		if k >= Iarch(toks.len) then break
+		if is_ident(toks[k].kind) && k + 1 < Iarch(toks.len) && is_dot(toks[k + 1].kind) && is_alias(aliases, tok_text(src, toks[k])) then {
+			k = k + 2
+		} else {
+			out = [...out, toks[k]]
+			k = k + 1
+		}
+	}
+	return out
+}
+
 const load_module = (Str path): Program -> {
 	let [262144 Uint8] buf
 	const Iarch fd = open(path.bytes, Uarch(o_rdonly), 0)
@@ -92,7 +148,7 @@ const load_module = (Str path): Program -> {
 	const Iarch n = read(Uarch(fd), buf, Uarch(mod_cap))
 	close(Uarch(fd))
 	if n < 0 then die("cf0: reading an imported module failed\n")
-	const [Token] toks = strip_type_aliases(buf, lex(buf, n))
+	const [Token] toks = strip_import_namespaces(buf, strip_type_aliases(buf, lex(buf, n)))
 	let Parser p = Parser({ toks: toks, src: buf, pos: 0, file: path })
 	return parse_program(&p)
 }
