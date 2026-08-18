@@ -1,0 +1,3306 @@
+# typecheck — the type-checking phase (lex → parse → TYPECHECK → emit).
+#
+# cf0's type discipline. It assigns every expression a type — an integer (`Int`, a
+# word), a `Bool`, an opaque pointer (`Ptr`, argv/envp), or a record (`Rec name`) —
+# and rejects programs that misuse them: a non-Bool `if`/`&&`/`||`/`!` condition
+# (there is NO truthiness, §5), a non-integer arithmetic or comparison operand, an
+# integer literal beyond the 32-bit word, an `if` whose branches disagree, a pointer
+# or record used as an integer value, a field read on a non-record or of an
+# undeclared field, a data literal that does not set every declared field exactly
+# once, a call to an undefined function or with the wrong arity, and the binding
+# errors an environment surfaces (undeclared / duplicate / self-referential name, a
+# `const`/parameter reassignment, a return not matching the declared type).
+#
+# Types flow bottom-up (`type_of`); a call's result uses the callee's DECLARED
+# return type, so forward references and recursion type without walking the callee.
+# The emitter runs only on programs this phase accepts.
+
+import "io" as { die }
+import "ast" as { Expr, Stmt, Param, Func, Ty, FieldInit, RecDecl, UnionMember, UnionDecl, MatchArm, StmtArm, Seg, TupElem, Program }
+import "astutil" as { is_spread, spread_inner, is_skip, skip_count, is_nested, nested_inner, tel_leaf, tel_nest, tel_is_nest, tel_fn, tel_is_fn, is_fixed_name, fixed_bits, fixed_signed, is_float_name, float_bits, is_pat_guard, is_member_guard, is_int_guard, guard_body, guard_qual, guard_member }
+
+# A name in scope during checking: its type and whether it is reassignable (`let`).
+# `esc` — this binding is, or (by construction) transitively contains, an explicit pointer into a
+# function-LOCAL residence (`&x`, a `*T` pointer local, or a record/union/tuple built holding one).
+# Storing such a value into a longer-lived home (a `return`, or a caller-provided `*T` param's field)
+# dangles once the local dies — the region-outlives check (memory_model §6). `outer` — this binding
+# is a caller-provided pointer parameter (a home that OUTLIVES the function), the destination whose
+# rehome is checked. (cf0 collapses `*Point`≡`Point`, so an EXPLICIT `&`/pointer-local is the only
+# alias to a specific local residence it can track; an owned aggregate field moves with its parent.)
+# `fixed` — this binding is a FIXED array `[N T]` (not a growable `[T]`). cf0 represents both as a
+# dynamic header (they share index/`.len`/`for`), so this bit is the only fixed-vs-dyn distinction:
+# a fixed array may not be a `[...src, e]` spread SOURCE (nor grown in place) — memory_model / §2.
+# `is_ref` — this binding is a REFERENCE (a `*T` pointer to a referent owned elsewhere), not an owned
+# value: a `*Record` pointer parameter, or a pointer local `const *P p = &x` (its initializer is an
+# `&`). cf0 collapses `*Point`≡`Point` at the type level, so this bit is how a `*Record` argument
+# (which must be a reference — `&x` or a forwarded pointer, memory_model §6, NOT a "borrow": C! has
+# none — a `*T` is a first-class reference to a `let`-owned referent) is told apart from a bare value.
+pub data VarTy = { Str name, Ty ty, Bool mutable, Bool esc, Bool outer, Bool fixed, Bool is_ref, Iarch fsize }
+
+# The whole-program context threaded through typing: the functions (a call resolves
+# its callee here), the record declarations (a data literal / field read), and the
+# union declarations (a `Type.member` construction / a `match`).
+# `frt` is the CURRENT function's declared return type, threaded on `Ctx` so `type_of` can
+# check a value-yielding loop's body (which may itself `return`) without a separate parameter.
+pub data Ctx = { [Func] funcs, [RecDecl] recs, [UnionDecl] unions, Ty frt, Iarch frsize }
+
+# --- small helpers --------------------------------------------------------------------
+
+const is_tint = (Ty t): Bool -> match t { Ty.TInt -> true, _ -> false }
+const is_tbool = (Ty t): Bool -> match t { Ty.TBool -> true, _ -> false }
+const is_tstr = (Ty t): Bool -> match t { Ty.TStr -> true, _ -> false }
+const is_tunit = (Ty t): Bool -> match t { Ty.TUnit -> true, _ -> false }
+const is_tfixed = (Ty t): Bool -> match t { Ty.TFixed(b, s) -> true, _ -> false }
+const is_tfloat = (Ty t): Bool -> match t { Ty.TFloat(b) -> true, _ -> false }
+# A register-WIDTH integer: the word `Iarch`/`Int` (`TInt`) or a 64-bit fixed leaf (`Uarch`/`Uint64`/
+# `Int64`). These all ride an 8-byte register and interconvert freely in WORD contexts (a call
+# argument, a return, an assignment) — only an OPERATOR keeps them distinct (`Uarch + Iarch`, §4).
+const is_wordish = (Ty t): Bool -> is_tint(t) || (is_tfixed(t) && tfixed_bits(t) == 64)
+# A type-variable name (`'T`) — an apostrophe-led name (byte 39). After monomorphization no
+# concrete program has these, so one surviving into a declaration is an undeclared type var.
+const name_is_typevar = (Str s): Bool -> if Iarch(s.len) == 0 then false else Iarch(s[0]) == 39
+const telems_have_typevar = ([TupElem] tels): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(tels.len) then break
+		if tel_is_nest(tels[i]) then { if telems_have_typevar(tels[i].sub) then return true }
+		if !tel_is_nest(tels[i]) && name_is_typevar(tels[i].name) then return true
+		i = i + 1
+	}
+	return false
+}
+# Whether a function's signature still mentions a type variable in ANY type position (a scalar
+# name, a `[T]` element, or a tuple position — of a parameter or the return). After
+# monomorphization every function is concrete, so a survivor is an undeclared type variable
+# (a `'T` used in a non-generic function, or a substitution the mono pass failed to reach).
+const sig_has_typevar = (Func fn): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(fn.params.len) then break
+		if name_is_typevar(fn.params[i].type_name) then return true
+		if name_is_typevar(fn.params[i].elem) then return true
+		if telems_have_typevar(fn.params[i].telems) then return true
+		i = i + 1
+	}
+	if name_is_typevar(fn.ret_name) then return true
+	if name_is_typevar(fn.ret_elem) then return true
+	if telems_have_typevar(fn.ret_telems) then return true
+	return false
+}
+const tfloat_bits = (Ty t): Iarch -> match t { Ty.TFloat(b) -> b, _ -> 0 }
+# The `Ty` a fixed-width name denotes (`Int8` → signed 8-bit, …).
+const fixed_ty = (Str name): Ty -> Ty.TFixed(fixed_bits(name), fixed_signed(name))
+const is_tptr = (Ty t): Bool -> match t { Ty.TPtr -> true, _ -> false }
+
+# The record / union / dynamic-array-element type name of a type, or "" otherwise.
+const rec_of = (Ty t): Str -> match t { Ty.TRec(n) -> n, _ -> "" }
+const union_of = (Ty t): Str -> match t { Ty.TUnion(n) -> n, _ -> "" }
+pub const dyn_of = (Ty t): Str -> match t { Ty.TDyn(n) -> n, _ -> "" }
+const is_ttuple = (Ty t): Bool -> match t { Ty.TTuple(e) -> true, _ -> false }
+const is_tfn = (Ty t): Bool -> match t { Ty.TFn(s) -> true, _ -> false }
+# The signature positions of a function type (args then return), or an empty list otherwise.
+const tfn_sig = (Ty t): [TupElem] -> {
+	let [TupElem] r = []
+	match t { Ty.TFn(s) -> { r = s }, _ -> {} }
+	return r
+}
+
+# The nominal name a function SIGNATURE position carries: the implicit-`Int` return (`""`) and
+# the `Int` alias both normalize to `Iarch`, so `(Iarch) -> Iarch` matches an unannotated `inc =
+# (Iarch n) -> …`; every other name (`Uarch`, `Float64`, a record, …) stays distinct, so a
+# signature distinguishes them (type_system §8: function values match nominally).
+const fn_sig_name = (Str name): Str -> {
+	if str_eq(name, "") then return "Iarch"
+	if str_eq(name, "Int") then return "Iarch"
+	return name
+}
+# Canonicalize a signature-position LEAF name: a `[Elem]` array component canonicalizes its element
+# name (so `[Int]` and `[Iarch]` name the same array component), every other name via `fn_sig_name`.
+const canon_comp_name = (Str name): Str -> {
+	if is_nested(name) then return "[${fn_sig_name(nested_inner(name))}]"
+	return fn_sig_name(name)
+}
+# Normalize one signature position into the canonical `TFn` form: a scalar/array leaf keeps its
+# canonical name (`canon_comp_name`), a NESTED tuple (`(A, B)`, a `tel_nest`) or FUNCTION-type
+# component (`(A) -> B`, a `tel_fn`) recurses over its own sub-positions. So `((Iarch) -> Iarch) ->
+# Iarch` and a function taking that same signature canonicalize to the SAME telem and match by
+# `tuple_elems_eq`.
+const canon_sig_telem = (TupElem te): TupElem -> {
+	if tel_is_fn(te) then {
+		let [TupElem] s = []
+		let Iarch i = 0
+		loop {
+			if i >= Iarch(te.sub.len) then break
+			s = [...s, canon_sig_telem(te.sub[i])]
+			i = i + 1
+		}
+		return tel_fn(s)
+	}
+	if tel_is_nest(te) then {
+		let [TupElem] s = []
+		let Iarch i = 0
+		loop {
+			if i >= Iarch(te.sub.len) then break
+			s = [...s, canon_sig_telem(te.sub[i])]
+			i = i + 1
+		}
+		return tel_nest(s)
+	}
+	return tel_leaf(canon_comp_name(te.name))
+}
+# The `TFn` of a `(A, …) -> R` PARAMETER: its `telems` are the WHOLE signature — the argument
+# positions then the return position — each canonicalized into one nominal signature list.
+const fn_ty_of_param = (Param p): Ty -> {
+	let [TupElem] sig = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(p.telems.len) then break
+		sig = [...sig, canon_sig_telem(p.telems[i])]
+		i = i + 1
+	}
+	return Ty.TFn(sig)
+}
+# A signature POSITION is well-formed iff it is a scalar component (a word/fixed/float/Bool), a
+# by-reference aggregate that rides an 8-byte pointer (a record, a union, a `Str`, or a `[Elem]`
+# dynamic array whose element is itself a well-formed component), or a nested tuple/function type
+# whose own positions are (recursively) well-formed — every case is an 8-byte value in a QBE `l`.
+const fn_component_ok = (Str name, Ctx ctx): Bool -> {
+	if is_nested(name) then return fn_component_ok(nested_inner(name), ctx)
+	if is_cast_type(name) then return true
+	if is_float_name(name) then return true
+	if str_eq(name, "Bool") then return true
+	if str_eq(name, "Str") then return true
+	if find_rec(ctx.recs, name) >= 0 then return true
+	if find_union(ctx.unions, name) >= 0 then return true
+	return false
+}
+const sig_telem_ok = (TupElem te, Ctx ctx): Bool -> {
+	if tel_is_fn(te) || tel_is_nest(te) then {
+		let Iarch i = 0
+		loop {
+			if i >= Iarch(te.sub.len) then break
+			if !sig_telem_ok(te.sub[i], ctx) then return false
+			i = i + 1
+		}
+		return true
+	}
+	return fn_component_ok(te.name, ctx)
+}
+# Validate a `(A, …) -> R` function-type PARAMETER: at most 32 arguments (the indirect-call emit
+# arrays are fixed, 680), and every argument + the return a well-formed component (scalar, a
+# by-reference aggregate, or a nested function type).
+const check_fn_param_sig = (Param p, Ctx ctx): Iarch -> {
+	if !str_eq(p.type_name, "$fn") then return 0
+	# `telems` is the whole signature `[args…, ret]`; its length is arity + 1
+	if Iarch(p.telems.len) - 1 > 32 then die("cf0: type: a function type takes at most 32 parameters\n")
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(p.telems.len) then break
+		if !sig_telem_ok(p.telems[i], ctx) then die("cf0: type: a function-type component must be a scalar, a record/union/Str/array, or a nested tuple/function type\n")
+		i = i + 1
+	}
+	return 0
+}
+# One position of a top-level FUNCTION's signature: a function-value parameter (`$fn`) contributes a
+# nested function-type telem built from ITS own argument telems + return; any other parameter its
+# nominal type name. Keeps `fn_ty_of_func` in lockstep with `fn_ty_of_param` so a function reference
+# matches a function-type parameter that expects it.
+const param_sig_telem = (Param p): TupElem -> {
+	if str_eq(p.type_name, "$fn") then {
+		# `telems` is already the whole `[args…, ret]` signature — canonicalize it position for position
+		let [TupElem] s = []
+		let Iarch i = 0
+		loop {
+			if i >= Iarch(p.telems.len) then break
+			s = [...s, canon_sig_telem(p.telems[i])]
+			i = i + 1
+		}
+		return tel_fn(s)
+	}
+	# a `(A, B) t` tuple parameter contributes a nested telem built from its own position telems;
+	# a `[Elem] a` dynamic-array parameter (`$dyn`) contributes the `[Elem]` array component
+	if str_eq(p.type_name, "$tuple") then {
+		let [TupElem] s = []
+		let Iarch i = 0
+		loop {
+			if i >= Iarch(p.telems.len) then break
+			s = [...s, canon_sig_telem(p.telems[i])]
+			i = i + 1
+		}
+		return tel_nest(s)
+	}
+	if str_eq(p.type_name, "$dyn") then return tel_leaf(canon_comp_name("[${p.elem}]"))
+	return tel_leaf(canon_comp_name(p.type_name))
+}
+# The return signature position of a referenced FUNCTION: a `$tuple` return contributes its position
+# telems as a nested telem, a `$dyn` return the `[Elem]` array component, else the nominal name — so
+# a function returning a tuple/array matches a function-type parameter that expects that return.
+const func_ret_telem = (Func fn): TupElem -> {
+	if str_eq(fn.ret_name, "$tuple") then {
+		let [TupElem] s = []
+		let Iarch i = 0
+		loop {
+			if i >= Iarch(fn.ret_telems.len) then break
+			s = [...s, canon_sig_telem(fn.ret_telems[i])]
+			i = i + 1
+		}
+		return tel_nest(s)
+	}
+	if str_eq(fn.ret_name, "$dyn") then return tel_leaf(canon_comp_name("[${fn.ret_elem}]"))
+	return tel_leaf(canon_comp_name(fn.ret_name))
+}
+# The `TFn` of a top-level FUNCTION referenced by name (to match against a function-type parameter):
+# each parameter's signature position, then the return position.
+const fn_ty_of_func = (Func fn): Ty -> {
+	let [TupElem] sig = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(fn.params.len) then break
+		sig = [...sig, param_sig_telem(fn.params[i])]
+		i = i + 1
+	}
+	sig = [...sig, func_ret_telem(fn)]
+	return Ty.TFn(sig)
+}
+pub const tuple_elems = (Ty t): [TupElem] -> {
+	let [TupElem] r = []
+	match t {
+		Ty.TTuple(e) -> { r = e },
+		_ -> {}
+	}
+	return r
+}
+
+# Structural (recursive) equality of two tuples' position lists — a leaf compares by name,
+# a nested position recurses into its sub-positions.
+const tuple_elems_eq = ([TupElem] a, [TupElem] b): Bool -> {
+	if a.len != b.len then return false
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(a.len) then break
+		if !str_eq(a[i].name, b[i].name) then return false
+		if !tuple_elems_eq(a[i].sub, b[i].sub) then return false
+		i = i + 1
+	}
+	return true
+}
+
+# The `Ty` a tuple position denotes: a nested position is a `TTuple`, else its named type.
+pub const tel_to_ty = (TupElem te, Ctx ctx): Ty -> {
+	if tel_is_nest(te) then return Ty.TTuple(te.sub)
+	# a `[Elem]`-spelled position is a dynamic array (the nested-array convention)
+	if is_nested(te.name) then return Ty.TDyn(nested_inner(te.name))
+	return named_ty(te.name, "", ctx.recs, ctx.unions)
+}
+
+# Whether an expression is a freshly-constructed record — a call or a `T({…})` / union
+# construction. A record tuple element must be one of these: it rules out every alias form
+# (a bare name, a field read, an index) so the element cannot alias an owned value, AND it
+# keeps the element to a shape the emitter classifies the same way the type gate does (an
+# `if`/`match`-valued record element is a later brick).
+const is_fresh_record = (Expr e): Bool -> match e {
+	Expr.Call(c, ta, a) -> true,
+	Expr.Record(n, fs) -> true,
+	Expr.UnionMk(t, m, args) -> true,
+	_ -> false
+}
+
+# Whether an expression is a tuple literal or a call — the value forms a whole-tuple
+# binding may take (a literal `(a,b)` or a tuple-returning call `f(…)`). Aliasing a tuple
+# name or a tuple from a field/index is a later brick.
+const is_tuple_lit = (Expr e): Bool -> match e { Expr.Tuple(es) -> true, _ -> false }
+const is_call_expr = (Expr e): Bool -> match e { Expr.Call(c, ta, a) -> true, _ -> false }
+# The value forms a whole-tuple binding may take — every form emit resolves telems for: a
+# literal, a call result, a bound tuple name, a tuple element/field (indexed or via `.field`).
+const is_tuple_bindable = (Expr e): Bool -> match e {
+	Expr.Tuple(es) -> true,
+	Expr.Call(c, ta, a) -> true,
+	Expr.Var(n) -> true,
+	Expr.Index(a, i) -> true,
+	Expr.IndexExpr(b, i) -> true,
+	Expr.Field(b, f) -> true,
+	Expr.FieldExpr(b, f) -> true,
+	Expr.IndexField(a, i, f) -> true,
+	# a value-`if` yielding a tuple: both branches share a type (checked elsewhere), so the `then`
+	# branch's bindability stands for the whole — emit resolves telems the same way
+	Expr.If(c, t, el) -> is_tuple_bindable(t),
+	_ -> false
+}
+
+# The written type NAME for a tuple element — `Iarch` for any integer width, `Bool`, `Str`,
+# or a record type. A record element must be a FRESH value (see `is_fresh_record`). Arrays,
+# unions, and nested tuples are a later tuple brick.
+# A freshly-constructed UNION value (not an alias): `Type.member(...)` (a payload construction) or a
+# bare `Type.Member` (a tag-only member — a `Field` whose base names a union type), or a call. Rules
+# out a bound union name / a union-typed record field read, which would put a borrowed value in the tuple.
+const is_fresh_union = (Expr e, Ctx ctx): Bool -> match e {
+	Expr.UnionMk(t, m, args) -> true,
+	Expr.Call(c, ta, a) -> true,
+	Expr.Field(base, member) -> find_union(ctx.unions, base) >= 0,
+	_ -> false
+}
+const element_type_name = (Ty t, Expr e, Ctx ctx): TupElem -> {
+	if is_tint(t) then return tel_leaf("Iarch")
+	if is_tbool(t) then return tel_leaf("Bool")
+	if is_tstr(t) then return tel_leaf("Str")
+	if is_tunit(t) then return tel_leaf("Unit")
+	# a float position rides in its own 8-byte slot with `stored`/`loadd` (`stores`/`loads` for
+	# Float32); its telem name round-trips through `named_ty`, so `t[k]` recovers `TFloat`
+	if is_tfloat(t) then return tel_leaf(if tfloat_bits(t) == 32 then "Float32" else "Float64")
+	# a NESTED tuple position carries its own positions structurally (any depth)
+	if is_ttuple(t) then return tel_nest(tuple_elems(t))
+	const Str rn = rec_of(t)
+	if !str_eq(rn, "") then {
+		if !is_fresh_record(e) then die("cf0: type: a record tuple element must be a freshly constructed value (a call or a `T({…})` construction), not an alias\n")
+		return tel_leaf(rn)
+	}
+	# a UNION position rides as its 8-byte value (a boxed pointer, or a bare tag for a tag-only union),
+	# recovered via `named_ty` → `TUnion`; like a record it must be a fresh construction, not an alias
+	const Str un = union_of(t)
+	if !str_eq(un, "") then {
+		if !is_fresh_union(e, ctx) then die("cf0: type: a union tuple element must be a freshly constructed value (`Type.Member` / `Type.member(...)`), not an alias\n")
+		return tel_leaf(un)
+	}
+	# a dynamic-ARRAY position rides as its 8-byte header pointer, spelled `[Elem]` (the nested-array
+	# convention, so `tel_to_ty`/`elem_ty` recover `TDyn`). Like a record it must be a fresh value (an
+	# array literal or a call result), never an aliased array binding.
+	const Str aen = dyn_of(t)
+	if !str_eq(aen, "") then {
+		const Bool afresh = match e { Expr.ArrayLit(h, s, el, et) -> true, Expr.Call(c, ta, a) -> true, _ -> false }
+		if !afresh then die("cf0: type: an array tuple element must be a fresh array literal or a call result, not an alias\n")
+		return tel_leaf("[${aen}]")
+	}
+	die("cf0: type: a tuple element must be an Iarch, Bool, Str, a fresh record/union/array, or a nested tuple\n")
+	return tel_leaf("Iarch")
+}
+
+# The comptime literal value of an index expression, or -1 when it is not a bare literal.
+const lit_val = (Expr e): Iarch -> match e { Expr.Lit(v) -> v, _ -> 0 - 1 }
+
+# Structural equality of two types (records/unions/arrays equal iff same name/element).
+const ty_eq = (Ty a, Ty b): Bool -> match a {
+	Ty.TInt -> is_tint(b),
+	Ty.TBool -> is_tbool(b),
+	Ty.TPtr -> match b { Ty.TPtr -> true, _ -> false },
+	Ty.TRec(an) -> str_eq(an, rec_of(b)),
+	Ty.TUnion(an) -> str_eq(an, union_of(b)),
+	Ty.TDyn(an) -> str_eq(an, dyn_of(b)),
+	Ty.TStr -> is_tstr(b),
+	Ty.TUnit -> is_tunit(b),
+	Ty.TFixed(ab, asg) -> match b { Ty.TFixed(bb, bsg) -> ab == bb && (if asg then bsg else !bsg), _ -> false },
+	Ty.TFloat(ab) -> match b { Ty.TFloat(bb) -> ab == bb, _ -> false },
+	Ty.TTuple(ae) -> match b { Ty.TTuple(be) -> tuple_elems_eq(ae, be), _ -> false },
+	Ty.TFn(asig) -> match b { Ty.TFn(bsig) -> tuple_elems_eq(asig, bsig), _ -> false }
+}
+
+# Byte-wise `Str` equality (name lookup).
+const str_eq = (Str a, Str b): Bool -> {
+	if a.len != b.len then return false
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(a.len) then break
+		if Iarch(a[i]) != Iarch(b[i]) then return false
+		i = i + 1
+	}
+	return true
+}
+
+const find_func = ([Func] funcs, Str name): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(funcs.len) then break
+		if str_eq(funcs[i].name, name) then return i
+		i = i + 1
+	}
+	return 0 - 1
+}
+
+const find_rec = ([RecDecl] recs, Str name): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(recs.len) then break
+		if str_eq(recs[i].name, name) then return i
+		i = i + 1
+	}
+	return 0 - 1
+}
+
+const find_union = ([UnionDecl] unions, Str name): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(unions.len) then break
+		if str_eq(unions[i].name, name) then return i
+		i = i + 1
+	}
+	return 0 - 1
+}
+
+# Does the union declared as `name` have any payload-carrying member? A union with
+# no payload anywhere is tag-only — a bare word tag, so `==`/`!=` compares the words.
+const union_has_payload = ([UnionDecl] unions, Str name): Bool -> {
+	const Iarch ui = find_union(unions, name)
+	if ui < 0 then return false
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(unions[ui].members.len) then break
+		if Iarch(unions[ui].members[i].payloads.len) > 0 then return true
+		i = i + 1
+	}
+	return false
+}
+
+# The index (tag) of member `name` among a union's members, or -1.
+const union_member_index = ([UnionMember] members, Str name): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(members.len) then break
+		if str_eq(members[i].name, name) then return i
+		i = i + 1
+	}
+	return 0 - 1
+}
+
+# Resolve a parameter's declared type to a `Ty`: an opaque pointer, a declared
+# record (`TRec`) or union (`TUnion`), a `Bool`, or an integer (`Iarch`/`Int`). An
+# unrecognized type name is rejected.
+# Resolve a written type name (+ `[T]` element) to a `Ty`: a dynamic array, a declared
+# record/union, or a builtin scalar (`Bool`/`Str`/`Iarch`/`Int`). Shared by parameters,
+# record fields, and union payloads.
+pub const named_ty = (Str type_name, Str elem, [RecDecl] recs, [UnionDecl] unions): Ty -> {
+	if str_eq(type_name, "$dyn") then return Ty.TDyn(elem)
+	if str_eq(type_name, "$ptr") then return Ty.TPtr
+	if find_rec(recs, type_name) >= 0 then return Ty.TRec(type_name)
+	if find_union(unions, type_name) >= 0 then return Ty.TUnion(type_name)
+	if str_eq(type_name, "Bool") then return Ty.TBool
+	if str_eq(type_name, "Str") then return Ty.TStr
+	if str_eq(type_name, "Unit") then return Ty.TUnit
+	# a fixed-width leaf (`Int8`…`Uint64`) is its own width/signedness type, NOT the word `TInt`
+	if is_fixed_name(type_name) then return Ty.TFixed(fixed_bits(type_name), fixed_signed(type_name))
+	if is_float_name(type_name) then return Ty.TFloat(float_bits(type_name))
+	# any integer-family name (`Iarch`/`Int`/`Uarch`/`Uint8`/… — the same set a cast names)
+	# is one word: cf0 tracks every integer width as `TInt` (a genesis narrowing).
+	if is_cast_type(type_name) then return Ty.TInt
+	die("cf0: type: an undeclared type name\n")
+	return Ty.TInt
+}
+# The concrete type NAME a `Ty` denotes — the inverse of `named_ty`, used by the monomorph pass
+# to record an inferred type argument. A `TDyn`/`TPtr`/`TTuple` has no bare scalar name (a type
+# variable is never inferred to an array/pointer/tuple type — that structural inference is a
+# separate brick), so those yield `""`.
+const fixed_name = (Iarch b, Bool s): Str -> {
+	if s then {
+		if b == 8 then return "Int8"
+		if b == 16 then return "Int16"
+		if b == 32 then return "Int32"
+		return "Int64"
+	}
+	if b == 8 then return "Uint8"
+	if b == 16 then return "Uint16"
+	if b == 32 then return "Uint32"
+	return "Uint64"
+}
+pub const ty_name = (Ty t): Str -> match t {
+	Ty.TInt -> "Iarch",
+	Ty.TBool -> "Bool",
+	Ty.TStr -> "Str",
+	Ty.TUnit -> "Unit",
+	Ty.TRec(n) -> n,
+	Ty.TUnion(n) -> n,
+	Ty.TFixed(b, s) -> fixed_name(b, s),
+	Ty.TFloat(b) -> if b == 32 then "Float32" else "Float64",
+	# a dynamic array is encoded as an EMPTY-base bracket string `[Elem]` — distinct from a
+	# generic application `Base[Args]` (non-empty base) — so a type variable can be inferred to
+	# and instantiated at an array type. A tuple/pointer type variable is a later brick.
+	Ty.TDyn(n) -> "[${n}]",
+	Ty.TPtr -> "",
+	Ty.TTuple(e) -> "",
+	Ty.TFn(s) -> ""
+}
+
+pub const param_ty = (Param p, [RecDecl] recs, [UnionDecl] unions): Ty -> {
+	# a `*[Uint8]` byte pointer is opaque (`TPtr`); a `*Record` pointer resolves to the record
+	if p.is_ptr then {
+		if str_eq(p.type_name, "$ptr") then return Ty.TPtr
+		return named_ty(p.type_name, p.elem, recs, unions)
+	}
+	# a `(A, B) name` tuple parameter — its position types (canonicalized like a tuple return)
+	if str_eq(p.type_name, "$tuple") then return Ty.TTuple(canon_telems(p.telems, recs, unions))
+	# a `(A, …) -> R name` function-value parameter — its nominal signature
+	if str_eq(p.type_name, "$fn") then return fn_ty_of_param(p)
+	return named_ty(p.type_name, p.elem, recs, unions)
+}
+
+# Whether a parameter is a mutable `*Record` pointer (fields written through it).
+const param_is_recptr = (Param p, [RecDecl] recs): Bool -> {
+	if !p.is_ptr then return false
+	if str_eq(p.type_name, "$ptr") then return false
+	return find_rec(recs, p.type_name) >= 0
+}
+# A valid element for a `*[T]` raw pointer that is INDEXED — an indexable scalar (an `Iarch`/`Int`/
+# `Uarch` word, or a fixed-width integer, `Uint8` included). A `Str`/record/aggregate element has no
+# meaningful element stride; it is neither a pointer-FIELD type (874) nor written through as a param.
+const is_ptr_field_elem = (Str elem): Bool -> {
+	if str_eq(elem, "Iarch") || str_eq(elem, "Int") || str_eq(elem, "Uarch") then return true
+	return is_fixed_name(elem)
+}
+# A `*[T]` raw-pointer parameter with an indexable element (`*[Uint8]`, `*[Iarch]`, a fixed-width) —
+# its elements are written through it (`p[i] = v`), so it binds mutable. An opaque `*[Str]`
+# (argv/envp) has no indexable element and stays a read-only view.
+const param_is_indexptr = (Param p): Bool -> {
+	if !p.is_ptr then return false
+	if !str_eq(p.type_name, "$ptr") then return false
+	return is_ptr_field_elem(p.elem)
+}
+
+# A `*T` pointer may only point to an aggregate — a declared record or a PAYLOAD-BEARING union
+# (type_system §6.4: no pointer to a scalar). A `*[Uint8]` byte pointer (`$ptr`) is exempt (it is
+# an address into a buffer, not a `*Scalar`). An all-tag-only union lowers to a plain integer tag
+# (§8.4), so `*Flag` would be a `*Scalar` — rejected. Dies on `*Int8`/`*Iarch`/`*Bool`/`*Flag`/… .
+const check_ptr_pointee = (Param p, [RecDecl] recs, [UnionDecl] unions): Iarch -> {
+	if !p.is_ptr then return 0
+	if str_eq(p.type_name, "$ptr") then return 0
+	if find_rec(recs, p.type_name) >= 0 then return 0
+	if find_union(unions, p.type_name) >= 0 then {
+		if union_has_payload(unions, p.type_name) then return 0
+		die("cf0: type: a pointer to an all-tag-only union is illegal (it lowers to a scalar tag)\n")
+	}
+	die("cf0: type: a pointer may not point to a scalar (only a record or union)\n")
+	return 0
+}
+
+# Resolve a function's declared return type to a `Ty` (`""` → the implicit `Int`).
+# Canonicalize a declared tuple element type name to the form a returned tuple carries
+# (`element_type_name` collapses every integer width to `Iarch`), so a declared `(Int, Int)`
+# return matches a returned `(Iarch, Iarch)`. Dies on an unknown type name.
+const canon_elem = (TupElem te, [RecDecl] recs, [UnionDecl] unions): TupElem -> {
+	if tel_is_nest(te) then return tel_nest(canon_telems(te.sub, recs, unions))
+	const Ty t = named_ty(te.name, "", recs, unions)
+	if is_tint(t) then return tel_leaf("Iarch")
+	if is_tbool(t) then return tel_leaf("Bool")
+	if is_tstr(t) then return tel_leaf("Str")
+	return te
+}
+const canon_telems = ([TupElem] telems, [RecDecl] recs, [UnionDecl] unions): [TupElem] -> {
+	let [TupElem] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(telems.len) then break
+		r = [...r, canon_elem(telems[i], recs, unions)]
+		i = i + 1
+	}
+	return r
+}
+
+# The declared type of record `recs[ri]`'s field `fi` — a `TTuple` for a `(A, B)` tuple
+# field (its position types canonicalized like a tuple return), else the named type.
+const field_decl_ty = (Iarch ri, Iarch fi, Ctx ctx): Ty -> {
+	if str_eq(ctx.recs[ri].ftypes[fi], "$tuple") then return Ty.TTuple(canon_telems(ctx.recs[ri].ftelems[fi], ctx.recs, ctx.unions))
+	return named_ty(ctx.recs[ri].ftypes[fi], ctx.recs[ri].felems[fi], ctx.recs, ctx.unions)
+}
+
+# The declared type of union `unions[ui]` member `mi`'s payload position `i` — a `TTuple`
+# for a `(A, B)` tuple payload, else the named type.
+const payload_decl_ty = (Iarch ui, Iarch mi, Iarch i, Ctx ctx): Ty -> {
+	if str_eq(ctx.unions[ui].members[mi].payloads[i], "$tuple") then return Ty.TTuple(canon_telems(ctx.unions[ui].members[mi].ptelems[i], ctx.recs, ctx.unions))
+	return named_ty(ctx.unions[ui].members[mi].payloads[i], ctx.unions[ui].members[mi].pelems[i], ctx.recs, ctx.unions)
+}
+
+const func_ret_ty = (Func fn, [RecDecl] recs, [UnionDecl] unions): Ty -> {
+	if str_eq(fn.ret_name, "") then return Ty.TInt
+	if str_eq(fn.ret_name, "$tuple") then return Ty.TTuple(canon_telems(fn.ret_telems, recs, unions))
+	if str_eq(fn.ret_name, "$dyn") then return Ty.TDyn(fn.ret_elem)
+	if find_rec(recs, fn.ret_name) >= 0 then return Ty.TRec(fn.ret_name)
+	if find_union(unions, fn.ret_name) >= 0 then return Ty.TUnion(fn.ret_name)
+	if str_eq(fn.ret_name, "Bool") then return Ty.TBool
+	if str_eq(fn.ret_name, "Str") then return Ty.TStr
+	if str_eq(fn.ret_name, "Unit") then return Ty.TUnit
+	if is_fixed_name(fn.ret_name) then return Ty.TFixed(fixed_bits(fn.ret_name), fixed_signed(fn.ret_name))
+	if is_float_name(fn.ret_name) then return Ty.TFloat(float_bits(fn.ret_name))
+	return Ty.TInt
+}
+
+# The index of field `name` among a record's declared fields, or -1.
+const field_index = ([Str] fields, Str name): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(fields.len) then break
+		if str_eq(fields[i], name) then return i
+		i = i + 1
+	}
+	return 0 - 1
+}
+
+const env_index = ([VarTy] env, Str name): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(env.len) then break
+		if str_eq(env[i].name, name) then return i
+		i = i + 1
+	}
+	return 0 - 1
+}
+
+# --- expression typing ----------------------------------------------------------------
+# `type_of` and these helpers are mutually recursive: a helper types its operands
+# (validating them) and yields the result type.
+
+# An integer literal must fit the 32-bit signed word — 0..2147483647. cf0 has no
+# negative literals (unary `-` negates a non-negative literal).
+const lit_type = (Iarch v): Ty -> {
+	if v > 2147483647 then die("cf0: type: integer literal out of range (0..2147483647)\n")
+	return Ty.TInt
+}
+
+# `2^k` (k ≤ 32 at every call site — the fixed-width range bounds).
+const ipow2 = (Iarch k): Iarch -> {
+	let Iarch r = 1
+	let Iarch i = 0
+	loop {
+		if i >= k then break
+		r = r * 2
+		i = i + 1
+	}
+	return r
+}
+# A bare integer literal `v` or a negated one `-v` — the forms a fixed-width annotation ADOPTS
+# (type_system §3), range-checked against the target. `lit_signed_val` is its signed value.
+const is_adoptable_lit = (Expr e): Bool -> match e {
+	Expr.Lit(v) -> true,
+	Expr.Neg(x) -> match x { Expr.Lit(v) -> true, _ -> false },
+	_ -> false
+}
+const lit_signed_val = (Expr e): Iarch -> match e {
+	Expr.Lit(v) -> v,
+	Expr.Neg(x) -> match x { Expr.Lit(v) -> 0 - v, _ -> 0 },
+	_ -> 0
+}
+# Check an adopted integer literal fits a `b`-bit `s`-signed range (signed `[-2^(b-1), 2^(b-1)-1]`,
+# unsigned `[0, 2^b-1]`); dies otherwise. Widths ≥ 64 always hold a cf0 literal (capped at
+# 2^31-1), so only the sign is checked there.
+const fixed_lit_fits = (Expr e, Iarch b, Bool s): Iarch -> {
+	const Iarch sv = lit_signed_val(e)
+	if !s && sv < 0 then die("cf0: type: a negative literal does not fit an unsigned fixed-width type\n")
+	if b < 64 then {
+		if s then {
+			const Iarch half = ipow2(b - 1)
+			if sv > half - 1 then die("cf0: type: an integer literal is out of range for its fixed-width type\n")
+			if sv < 0 - half then die("cf0: type: an integer literal is out of range for its fixed-width type\n")
+		} else {
+			if sv > ipow2(b) - 1 then die("cf0: type: an integer literal is out of range for its fixed-width type\n")
+		}
+	}
+	return 0
+}
+const tfixed_bits = (Ty t): Iarch -> match t { Ty.TFixed(b, s) -> b, _ -> 0 }
+const tfixed_signed = (Ty t): Bool -> match t { Ty.TFixed(b, s) -> s, _ -> false }
+# Adopt an integer literal into a fixed-width annotation (range-checked), yielding the type.
+const adopt_fixed = (Expr e, Str ann): Ty -> {
+	fixed_lit_fits(e, fixed_bits(ann), fixed_signed(ann))
+	return fixed_ty(ann)
+}
+
+const var_type = ([VarTy] env, Str name, Ctx ctx): Ty -> {
+	const Iarch idx = env_index(env, name)
+	if idx >= 0 then return env[idx].ty
+	# not a local — a top-level VALUE const (a nullary function) referenced bare, auto-called
+	const Iarch fidx = find_func(ctx.funcs, name)
+	if fidx < 0 then die("cf0: type: reference to an undeclared name\n")
+	if Iarch(ctx.funcs[fidx].params.len) != 0 then die("cf0: type: a function reference needs arguments\n")
+	return func_ret_ty(ctx.funcs[fidx], ctx.recs, ctx.unions)
+}
+
+# An integer-like operand — the register word (`TInt`) or a fixed-width leaf (`TFixed`).
+const is_int_like = (Ty t): Bool -> is_tint(t) || is_tfixed(t)
+
+# The result type of a binary integer op over `l`/`r` (typed `lt`/`rt`). Two words → a word.
+# A fixed-width operand makes the op fixed-width: the OTHER operand must be the SAME fixed
+# type (no implicit widen/narrow — `Int8 + Int16` is rejected) OR a bare integer literal,
+# which ADOPTS the fixed type (range-checked, §3 — `a + 2`). The result is that fixed type.
+const int_result_ty = (Ty lt, Ty rt, Expr l, Expr r): Ty -> {
+	if is_tfixed(lt) && is_tfixed(rt) then {
+		if !ty_eq(lt, rt) then die("cf0: type: an operator needs both operands of the same fixed-width type\n")
+		return lt
+	}
+	if is_tfixed(lt) then {
+		if !is_adoptable_lit(r) then die("cf0: type: a fixed-width operand needs a matching fixed value or an integer literal, not a bare word\n")
+		fixed_lit_fits(r, tfixed_bits(lt), tfixed_signed(lt))
+		return lt
+	}
+	if is_tfixed(rt) then {
+		if !is_adoptable_lit(l) then die("cf0: type: a fixed-width operand needs a matching fixed value or an integer literal, not a bare word\n")
+		fixed_lit_fits(l, tfixed_bits(rt), tfixed_signed(rt))
+		return rt
+	}
+	return Ty.TInt
+}
+
+# `~x` — bitwise complement of any integer (word or fixed); the result keeps the operand's type.
+const bitnot_unop = (Expr x, [VarTy] env, Ctx ctx): Ty -> {
+	const Ty t = type_of(x, env, ctx)
+	if !is_int_like(t) then die("cf0: type: the operand of unary `~` must be an integer\n")
+	return t
+}
+# `-x` — arithmetic negation; defined on a word or a SIGNED fixed type, never an unsigned one
+# (type_system §8.5 — negating an unsigned value is undefined). Result keeps the operand's type.
+const neg_unop = (Expr x, [VarTy] env, Ctx ctx): Ty -> {
+	const Ty t = type_of(x, env, ctx)
+	# a float negates fine (`-2.5`); an integer negates unless unsigned (§8.5)
+	if is_tfloat(t) then return t
+	if !is_int_like(t) then die("cf0: type: the operand of unary `-` must be an integer\n")
+	if is_tfixed(t) && !tfixed_signed(t) then die("cf0: type: unary `-` is undefined on an unsigned type\n")
+	return t
+}
+
+# `+ - * /` where either operand may be a FLOAT: two floats of the SAME width (no int/float
+# mix, no adoption — floats are strict, type_system §4) yield that float; otherwise it is an
+# integer op (`num_int_result`, the word/fixed rules). `%` and the bitwise ops stay integer-only.
+const num_binop = (Expr l, Expr r, [VarTy] env, Ctx ctx): Ty -> {
+	const Ty lt = type_of(l, env, ctx)
+	const Ty rt = type_of(r, env, ctx)
+	if is_tfloat(lt) || is_tfloat(rt) then {
+		if !is_tfloat(lt) || !is_tfloat(rt) then die("cf0: type: a float operator needs two floats — no int/float mixing\n")
+		if !ty_eq(lt, rt) then die("cf0: type: a float operator needs both operands of the same float width\n")
+		return lt
+	}
+	if !is_int_like(lt) then die("cf0: type: an arithmetic operand must be a number\n")
+	if !is_int_like(rt) then die("cf0: type: an arithmetic operand must be a number\n")
+	return int_result_ty(lt, rt, l, r)
+}
+
+# `!x` — a Bool operand (no truthiness), a Bool result.
+const not_op = (Expr x, [VarTy] env, Ctx ctx): Ty -> {
+	if !is_tbool(type_of(x, env, ctx)) then die("cf0: type: the operand of `!` must be a Bool (no truthiness)\n")
+	return Ty.TBool
+}
+
+# `+ - * / % & | ^ << >>` — integer operands, an integer result (a word, or a fixed-width
+# type when either operand is fixed; see `int_result_ty` for the matching/adoption rules).
+const int_binop = (Expr l, Expr r, [VarTy] env, Ctx ctx): Ty -> {
+	const Ty lt = type_of(l, env, ctx)
+	const Ty rt = type_of(r, env, ctx)
+	if !is_int_like(lt) then die("cf0: type: an arithmetic operand must be an integer\n")
+	if !is_int_like(rt) then die("cf0: type: an arithmetic operand must be an integer\n")
+	return int_result_ty(lt, rt, l, r)
+}
+
+# `== != < > <= >=` — integer operands, a Bool result. `==`/`!=` (`is_eq`) also
+# compare two values of the SAME tag-only union: both lower to a word tag, so the
+# comparison is a tag compare (type_system §5 — equality is structural). Ordering
+# (`< > <= >=`) stays integer-only, and a payload-carrying union is recovered with
+# `match`, not compared by tag.
+const cmp_op = (Expr l, Expr r, [VarTy] env, Ctx ctx, Bool is_eq): Ty -> {
+	const Ty lt = type_of(l, env, ctx)
+	const Ty rt = type_of(r, env, ctx)
+	const Str lu = union_of(lt)
+	if is_eq && !str_eq(lu, "") then {
+		if !str_eq(lu, union_of(rt)) then die("cf0: type: `==`/`!=` on a union needs both operands to be the same union\n")
+		if union_has_payload(ctx.unions, lu) then die("cf0: type: a union with a payload is recovered with `match`, not compared\n")
+		return Ty.TBool
+	}
+	# a float comparison: two floats of the same width, yielding a Bool
+	if is_tfloat(lt) || is_tfloat(rt) then {
+		if !is_tfloat(lt) || !is_tfloat(rt) then die("cf0: type: a float comparison needs two floats — no int/float mixing\n")
+		if !ty_eq(lt, rt) then die("cf0: type: a float comparison needs both operands of the same float width\n")
+		return Ty.TBool
+	}
+	if !is_int_like(lt) then die("cf0: type: a comparison operand must be a number\n")
+	if !is_int_like(rt) then die("cf0: type: a comparison operand must be a number\n")
+	# a fixed-width comparison follows the same match/adopt rules as arithmetic (both operands
+	# the same fixed type, or one an adopting literal); the emitter reads their signedness to
+	# pick a signed vs unsigned compare. The result is always a Bool.
+	int_result_ty(lt, rt, l, r)
+	return Ty.TBool
+}
+
+# `&& ||` — Bool operands (no truthiness), a Bool result.
+const bool_binop = (Expr l, Expr r, [VarTy] env, Ctx ctx): Ty -> {
+	if !is_tbool(type_of(l, env, ctx)) then die("cf0: type: an operand of `&&`/`||` must be a Bool (no truthiness)\n")
+	if !is_tbool(type_of(r, env, ctx)) then die("cf0: type: an operand of `&&`/`||` must be a Bool (no truthiness)\n")
+	return Ty.TBool
+}
+
+# `if c then t else e` — a Bool condition (no truthiness), matching branch types.
+const if_type = (Expr c, Expr t, Expr e, [VarTy] env, Ctx ctx): Ty -> {
+	if !is_tbool(type_of(c, env, ctx)) then die("cf0: type: an `if` condition must be a Bool (no truthiness)\n")
+	const Ty tt = type_of(t, env, ctx)
+	const Ty te = type_of(e, env, ctx)
+	if !ty_eq(tt, te) then die("cf0: type: the branches of an `if` must have the same type\n")
+	return tt
+}
+
+# `callee(args)` — the callee must exist, the argument count must match, and each
+# argument must be an integer. The result type is the callee's declared return type.
+# A builtin numeric type name — used as a one-argument cast `T(x)`. cf0 represents
+# every integer width as a word, so a cast is an identity on the operand; the target's
+# nominal type (`Iarch` vs `Int64` …) is not tracked (a genesis narrowing).
+const is_cast_type = (Str name): Bool -> {
+	if str_eq(name, "Iarch") then return true
+	if str_eq(name, "Uarch") then return true
+	if str_eq(name, "Int") then return true
+	if str_eq(name, "Int8") then return true
+	if str_eq(name, "Int16") then return true
+	if str_eq(name, "Int32") then return true
+	if str_eq(name, "Int64") then return true
+	if str_eq(name, "Uint8") then return true
+	if str_eq(name, "Uint16") then return true
+	if str_eq(name, "Uint32") then return true
+	if str_eq(name, "Uint64") then return true
+	if str_eq(name, "Float32") then return true
+	if str_eq(name, "Float64") then return true
+	return false
+}
+
+# `T(x)` — a numeric cast. It takes exactly one SCALAR INTEGER (a Bool, pointer, or
+# aggregate is rejected — type_system §4) and yields an integer.
+const cast_type = (Str callee, [Expr] args, [VarTy] env, Ctx ctx): Ty -> {
+	if Iarch(args.len) != 1 then die("cf0: type: a numeric cast takes exactly one argument\n")
+	const Ty ot = type_of(args[0], env, ctx)
+	# the operand is any number — a word, a fixed-width int, or a float; a pointer/Bool/aggregate
+	# is rejected. Casts cross the integer/float boundary (`Float64(7)`, `Int32(f)`).
+	if !is_tint(ot) && !is_tfixed(ot) && !is_tfloat(ot) then die("cf0: type: a numeric cast takes a scalar number (no pointer<->number conversion)\n")
+	# `Int8(x)`… yields that fixed-width type; `Float32`/`Float64` a float; `Iarch`/`Int`/`Uarch`
+	# the register word. Each is a real conversion of the operand's value.
+	if is_fixed_name(callee) then return fixed_ty(callee)
+	if is_float_name(callee) then return Ty.TFloat(float_bits(callee))
+	return Ty.TInt
+}
+
+# `Str(v)` — seal a `[Uint8]` byte vector into a `Str`. Takes exactly one dynamic array of
+# bytes; yields a `Str` borrowing the vector's backing.
+const str_seal_type = ([Expr] args, [VarTy] env, Ctx ctx): Ty -> {
+	# `Str(buf, n)` — build a `Str` over the first `n` bytes of a raw byte buffer / `[Uint8]` pointer
+	# (the file-read → Str path); the header borrows those bytes with an explicit length.
+	if Iarch(args.len) == 2 then {
+		const Ty bt = type_of(args[0], env, ctx)
+		if !is_tptr(bt) && !str_eq(dyn_of(bt), "Uint8") then die("cf0: type: `Str(buf, n)` needs a byte buffer or a `[Uint8]` as its first argument\n")
+		const Ty lt = type_of(args[1], env, ctx)
+		if !is_tint(lt) && !is_tfixed(lt) then die("cf0: type: `Str(buf, n)`'s length must be an integer\n")
+		return Ty.TStr
+	}
+	if Iarch(args.len) != 1 then die("cf0: type: `Str(...)` takes one argument (a `[Uint8]` vector) or two (a buffer + length)\n")
+	const Ty at = type_of(args[0], env, ctx)
+	if !str_eq(dyn_of(at), "Uint8") then die("cf0: type: `Str(...)` seals a `[Uint8]` byte vector\n")
+	return Ty.TStr
+}
+
+# The `tyargs` are ignored here: the monomorphization pass has already resolved every generic
+# call to a concrete instance (a stripped, concretely-named `Call`), so by typecheck a `Call`
+# carries no live type arguments.
+# The name of a bare `Var` expression, or "" (used to recognize a function reference passed as
+# an argument — the only expression a function-type parameter accepts).
+const as_var_name = (Expr e): Str -> match e { Expr.Var(n) -> n, _ -> "" }
+
+# Whether an array-typed expression is a shape `emit_ptr_arg` can lower to its data pointer (data@0)
+# when passed to a `*[T]` raw pointer — exactly the forms emit's `init_agg_type` classifies as a
+# `$dyn` header: a literal, a variable, a field/index read (name- or expression-based), or a call
+# result. A value-COMPOUND that yields an array opaquely (`if`/`match`/value-`loop`) types as an array
+# but emit cannot classify its header, so it is rejected cleanly here rather than miscompiled. (A
+# field/index whose BASE is such a compound — `(if…).items` — cannot compile at all: cf0 already
+# crashes on an `if`/`match` that yields an aggregate, independent of this gate.)
+const is_ptr_arr_arg = (Expr e): Bool -> match e {
+	Expr.ArrayLit(_, _, _, _) -> true,
+	Expr.Var(_) -> true,
+	Expr.Field(_, _) -> true,
+	Expr.FieldExpr(_, _) -> true,
+	Expr.Index(_, _) -> true,
+	Expr.IndexExpr(_, _) -> true,
+	Expr.IndexField(_, _, _) -> true,
+	Expr.Call(_, _, _) -> true,
+	_ -> false
+}
+
+# Check the argument passed to a function-type parameter: it must be a bare function reference —
+# a function-value parameter in scope, or a top-level function by name — whose signature matches
+# the parameter's (nominally). Anything else (a non-function value, an arbitrary expression) is
+# rejected: cf0 has no first-class function values beyond passing a name (closures are a later
+# brick).
+const check_fn_arg = (Ty expected, Expr arg, [VarTy] env, Ctx ctx): Iarch -> {
+	const Str nm = as_var_name(arg)
+	if str_eq(nm, "") then die("cf0: type: a function-type argument must be a function name\n")
+	const Iarch ei = env_index(env, nm)
+	if ei >= 0 then {
+		if !is_tfn(env[ei].ty) then die("cf0: type: a function-type argument must be a function\n")
+		if !ty_eq(env[ei].ty, expected) then die("cf0: type: a function argument's signature does not match the parameter\n")
+		return 0
+	}
+	const Iarch fi = find_func(ctx.funcs, nm)
+	if fi < 0 then die("cf0: type: a function-type argument names no function\n")
+	if !ty_eq(fn_ty_of_func(ctx.funcs[fi]), expected) then die("cf0: type: a function argument's signature does not match the parameter\n")
+	return 0
+}
+
+# The `Ty` of a signature position: a nested function-type telem becomes a `TFn`, a nested tuple a
+# `TTuple`, a `[Elem]` array name a `TDyn`, and a scalar/aggregate leaf resolves nominally.
+const sig_telem_ty = (TupElem te, Ctx ctx): Ty -> {
+	if tel_is_fn(te) then return Ty.TFn(te.sub)
+	if tel_is_nest(te) then return Ty.TTuple(te.sub)
+	if is_nested(te.name) then return Ty.TDyn(nested_inner(te.name))
+	return named_ty(te.name, "", ctx.recs, ctx.unions)
+}
+# Type an INDIRECT call `f(args)` where `f` is a function-value binding (a `TFn`): check the
+# argument count and each argument's type against the signature, and yield its return type. A
+# function-type argument position (`f` takes a function) is matched like a direct function-type
+# argument — the argument must be a function reference whose signature matches.
+const indirect_call_type = (Ty fty, [Expr] args, [VarTy] env, Ctx ctx): Ty -> {
+	const [TupElem] sig = tfn_sig(fty)
+	const Iarch arity = Iarch(sig.len) - 1
+	if Iarch(args.len) != arity then die("cf0: type: wrong number of arguments in an indirect call\n")
+	let Iarch i = 0
+	loop {
+		if i >= arity then break
+		if tel_is_fn(sig[i]) then {
+			check_fn_arg(sig_telem_ty(sig[i], ctx), args[i], env, ctx)
+		} else {
+			const Ty at = type_of(args[i], env, ctx)
+			const Ty pt = sig_telem_ty(sig[i], ctx)
+			if !ty_eq(at, pt) then {
+				if is_tptr(at) then { if !is_tint(pt) then die("cf0: type: an indirect-call argument's type does not match\n") } else die("cf0: type: an indirect-call argument's type does not match\n")
+			}
+		}
+		i = i + 1
+	}
+	return sig_telem_ty(sig[arity], ctx)
+}
+
+# The write-capability of an argument, traced to the binding it is ROOTED in: a `let` (or a
+# writable `*T` parameter) is mutable, a `const` binding or a by-value (read-only) parameter is
+# not. A name not in scope (a top-level scalar `const`, never an aggregate) and a freshly-built
+# value (a literal, a call result, a `buffer` — owned by the caller, so writable) default to
+# mutable. Used to enforce the memory model's write-through-`const` rule: a `*T`/`*[T]` pointer
+# into a `const` is read-only, so it may not be handed to a parameter that writes through it.
+const name_mutable = ([VarTy] env, Str n): Bool -> {
+	const Iarch i = env_index(env, n)
+	if i < 0 then return true
+	return env[i].mutable
+}
+const arg_root_mutable = (Expr e, [VarTy] env): Bool -> match e {
+	Expr.Var(n) -> name_mutable(env, n),
+	Expr.Addr(n) -> name_mutable(env, n),
+	Expr.Field(base, f) -> name_mutable(env, base),
+	Expr.Index(base, ix) -> name_mutable(env, base),
+	Expr.IndexField(base, ix, f) -> name_mutable(env, base),
+	Expr.FieldExpr(base, f) -> arg_root_mutable(base, env),
+	Expr.IndexExpr(base, ix) -> arg_root_mutable(base, env),
+	_ -> true
+}
+# The ROOT variable name of an lvalue chain (`t.top.a` → "t", `n.val` → "n"); "" if not name-rooted.
+const lvalue_root_name = (Expr e): Str -> match e {
+	Expr.Var(n) -> n,
+	Expr.Field(base, f) -> base,
+	Expr.Index(base, ix) -> base,
+	Expr.IndexField(base, ix, f) -> base,
+	Expr.FieldExpr(base, f) -> lvalue_root_name(base),
+	Expr.IndexExpr(base, ix) -> lvalue_root_name(base),
+	Expr.Addr(n) -> n,
+	_ -> ""
+}
+# Whether an lvalue chain's ROOT is WRITABLE — a mutable binding (a `let` local or a writable `*T`
+# param) OR a reference (`is_ref`: a `const` binding aliasing an existing aggregate, written THROUGH).
+# Drives a deep field assignment `a.b.c = v`, mirroring the single-level `mutable || is_ref` rule.
+const lvalue_root_writable = (Expr e, [VarTy] env): Bool -> {
+	const Str r = lvalue_root_name(e)
+	if str_eq(r, "") then return true
+	const Iarch i = env_index(env, r)
+	if i < 0 then return true
+	return env[i].mutable || env[i].is_ref
+}
+# Whether an argument to a `*Record` parameter is an explicit REFERENCE (not a bare record value):
+# `&x` (the address of a `let` aggregate), or the FORWARD of a pointer parameter/local (a `Var`
+# naming an `is_ref` binding). A record VALUE — a `let`/`const` record, a `T({…})` construction —
+# needs `&` (memory_model §6: `*T` receives the address of a `let` aggregate, never a by-value
+# record). cf0 collapses `*Point`≡`Point` at the type level, so this is caught here.
+const is_addr_expr = (Expr e): Bool -> match e { Expr.Addr(n) -> true, _ -> false }
+# Whether a binding's initializer makes it a REFERENCE into an existing aggregate — an explicit `&x`,
+# or a field READ whose result is a record/union (in cf0's arena model every aggregate field is an
+# 8-byte pointer, so `const q = o.p` / `const s = a.b.c` binds the EXISTING node, not a copy). Such a
+# binding may be WRITTEN THROUGH even while `const` (the reference is fixed; its referent is not) —
+# distinct from a `const` VALUE (a construction, literal, or call result), which stays immutable.
+const inits_ref = (Expr e, [VarTy] env, Ctx ctx): Bool -> {
+	if is_addr_expr(e) then return true
+	const Bool fr = match e { Expr.Field(b, f) -> true, Expr.FieldExpr(b, f) -> true, _ -> false }
+	if !fr then return false
+	const Ty t = type_of(e, env, ctx)
+	return !str_eq(rec_of(t), "") || !str_eq(union_of(t), "")
+}
+const name_is_ref = ([VarTy] env, Str n): Bool -> {
+	const Iarch i = env_index(env, n)
+	if i < 0 then return false
+	return env[i].is_ref
+}
+# A `*Record` argument must not be a bare record VALUE. The clearly-value forms are a `Var` naming a
+# non-reference binding (a `let`/`const` record, a by-value record param) and a `T({…})`/`({…})`
+# construction; those are rejected. Everything else — `&x`, a forwarded reference, or a call/field/`if`
+# yielding a pointer (whose `*Record`-vs-`Record` return cf0 collapses) — is allowed.
+const is_ref_arg = (Expr e, [VarTy] env): Bool -> match e {
+	Expr.Var(n) -> name_is_ref(env, n),
+	Expr.Record(tn, inits) -> false,
+	_ -> true
+}
+# Whether a function body WRITES through the pointer named `pn` — a `pn.field = v` (FieldAssign) or
+# `pn[i] = v` (IndexAssign) whose base names the parameter, anywhere in the body (recursing into
+# loops / ifs / matches / blocks). Write-capability is inferred from the body (memory_model §6): a
+# read-only pointer param may receive a `const` aggregate, only a writer demands a `let`. Names never
+# shadow a parameter (shadowing is rejected), so `pn` always denotes the parameter here. A pointer
+# FORWARDED to another writer is not traced — transitive write-capability remains a gap (it would
+# only ever ACCEPT more; under-checking preserves the prior lenient behavior, never miscompiles).
+const stmt_writes_name = (Stmt s, Str pn): Bool -> match s {
+	Stmt.FieldAssign(base, f, v) -> str_eq(base, pn),
+	Stmt.DeepFieldAssign(be, f, v) -> str_eq(lvalue_root_name(be), pn),
+	Stmt.IndexAssign(base, ix, v) -> str_eq(base, pn),
+	Stmt.Loop(bd) -> stmts_write_name(bd, pn),
+	Stmt.ForIn(fv, fa, bd) -> stmts_write_name(bd, pn),
+	Stmt.Block(bd) -> stmts_write_name(bd, pn),
+	Stmt.IfThen(c, b) -> stmt_writes_name(b, pn),
+	Stmt.IfElse(c, tb, eb) -> stmt_writes_name(tb, pn) || stmt_writes_name(eb, pn),
+	Stmt.Match(sc, arms) -> arm_stmts_write_name(arms, pn),
+	_ -> false
+}
+const stmts_write_name = ([Stmt] ss, Str pn): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		if stmt_writes_name(ss[i], pn) then return true
+		i = i + 1
+	}
+	return false
+}
+const arm_stmts_write_name = ([StmtArm] arms, Str pn): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		if stmts_write_name(arms[i].body, pn) then return true
+		i = i + 1
+	}
+	return false
+}
+const func_writes_ptr_param = (Func fn, Iarch pidx): Bool -> stmts_write_name(fn.body, fn.params[pidx].name)
+const call_type = (Str callee, [Str] tyargs, [Expr] args, [VarTy] env, Ctx ctx): Ty -> {
+	if is_cast_type(callee) then return cast_type(callee, args, env, ctx)
+	if str_eq(callee, "Str") then return str_seal_type(args, env, ctx)
+	# an INDIRECT call: the callee names a function-value binding (a HOF's function parameter)
+	const Iarch cei = env_index(env, callee)
+	if cei >= 0 then { if is_tfn(env[cei].ty) then return indirect_call_type(env[cei].ty, args, env, ctx) }
+	const Iarch fidx = find_func(ctx.funcs, callee)
+	if fidx < 0 then die("cf0: type: call to an undefined function\n")
+	const Iarch np = Iarch(ctx.funcs[fidx].params.len)
+	const Iarch na = Iarch(args.len)
+	if np != na then die("cf0: type: wrong number of call arguments\n")
+	let Iarch i = 0
+	loop {
+		if i >= na then break
+		const Ty pt = param_ty(ctx.funcs[fidx].params[i], ctx.recs, ctx.unions)
+		# a function-type parameter takes a function reference (checked nominally), not a value
+		if is_tfn(pt) then { check_fn_arg(pt, args[i], env, ctx) }
+		else {
+			# a pointer parameter the body WRITES through (a `*Record` field store, or a `*[T]` element
+			# store) may only receive a pointer into a `let`: the argument's ROOT binding must be mutable.
+			# A `const` aggregate's pointer — or a by-value parameter's, a read-only view — is rejected
+			# (memory_model §6 write-through-`const`). A read-only pointer param accepts a `const`.
+			if param_is_recptr(ctx.funcs[fidx].params[i], ctx.recs) || param_is_indexptr(ctx.funcs[fidx].params[i]) then {
+				if func_writes_ptr_param(ctx.funcs[fidx], i) then {
+					if !arg_root_mutable(args[i], env) then die("cf0: type: a `*T` parameter that writes needs a `let` aggregate — a pointer into a `const` (or a by-value view) is read-only\n")
+				}
+			}
+			# a `*Record` parameter takes an explicit reference — `&x` or a forwarded pointer — never a
+			# bare record value (700): `*Point`≡`Point` in the type, so it is distinguished here
+			if param_is_recptr(ctx.funcs[fidx].params[i], ctx.recs) then {
+				if !is_ref_arg(args[i], env) then die("cf0: type: a `*Record` parameter needs an explicit reference `&x` (or a forwarded pointer), not a bare record value\n")
+			}
+			const Ty at = type_of(args[i], env, ctx)
+			# a byte pointer is a pointer-width address, acceptable where a register word is expected
+			# (the syscall-argument idiom)
+			if !ty_eq(at, pt) then {
+				if is_tptr(at) && is_wordish(pt) then { }
+				# register-width words interconvert in argument position (`Iarch`↔`Uarch`, and a bare
+				# literal → `Uarch`) — the word idiom; a NARROW fixed param (`Int8`/…) stays strict (731)
+				else if is_wordish(at) && is_wordish(pt) then { }
+				# a `*[T]` raw-pointer parameter accepts another raw pointer (forwarding a `*[T]`
+				# onward), or a dynamic-/fixed-array expression `emit_ptr_arg` can lower to its element
+				# base (data@0) — a bare variable, or a field/index/call result (`is_ptr_arr_arg`). An
+				# array yielded opaquely by an `if`/`match` is rejected (emit cannot classify its header).
+				else if is_tptr(pt) && is_tptr(at) then { }
+				else if is_tptr(pt) && !str_eq(dyn_of(at), "") && is_ptr_arr_arg(args[i]) then { }
+				else die("cf0: type: a call argument's type does not match the parameter\n")
+			}
+			# a `[N T]` FIXED-array parameter — the argument's statically-known length must equal N (918);
+			# a wrong-width element is caught by the type check above (919). An unknown-length arg passes.
+			const Iarch psz = ctx.funcs[fidx].params[i].size
+			if psz > 0 then {
+				const Iarch al = fixed_expr_len(args[i], env, ctx)
+				if al >= 0 && al != psz then die("cf0: type: a fixed-array argument's length must match the parameter's `[N …]`\n")
+			}
+		}
+		i = i + 1
+	}
+	return func_ret_ty(ctx.funcs[fidx], ctx.recs, ctx.unions)
+}
+
+# `{ f: v, … }` — the record type must exist and the literal must set every declared
+# field exactly once (order-independent), each with an integer value.
+# Whether field `fname` has an explicit (non-spread) override among a data literal's inits.
+const is_overridden = ([FieldInit] inits, Str fname): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(inits.len) then break
+		if !str_eq(inits[i].field, "$spread") && str_eq(inits[i].field, fname) then return true
+		i = i + 1
+	}
+	return false
+}
+# Whether a field's type is stored as an 8-byte POINTER (a record/array/Str/tuple/byte-ptr or a
+# boxed union) rather than a word — such a field cannot be spread-COPIED (a shallow copy aliases).
+const is_ptr_field_ty = (Ty ft, Ctx ctx): Bool -> match ft {
+	Ty.TRec(n) -> true,
+	Ty.TDyn(n) -> true,
+	Ty.TStr -> true,
+	Ty.TTuple(e) -> true,
+	Ty.TPtr -> true,
+	Ty.TUnion(n) -> union_has_payload(ctx.unions, n),
+	_ -> false
+}
+# Whether `e` reads an aggregate-POINTER field `o.p` where `p` was declared `*Record`/`*Union` (a
+# reference to a referent, tracked in the record's `fptrs`). Such a read yields a reference, not an
+# owned value, so binding it with `let` would permit repointing — an inferred pointer local binds
+# `const` (993), mirroring the explicit `const *P p = &x` rule. A bare value-field read (`fptr` false)
+# and any non-`Field` expression are NOT flagged.
+# Whether field `fld` of the record-typed local/param `base` was declared an aggregate POINTER
+# (`fptrs[fi]`) — the core `*Record`/`*Union`-field test shared by the `let`-reference gate and the
+# region-outlives field-read propagation.
+const field_is_ptr = (Str base, Str fld, [VarTy] env, Ctx ctx): Bool -> {
+	const Iarch vi = env_index(env, base)
+	if vi < 0 then return false
+	const Str tn = rec_of(env[vi].ty)
+	if str_eq(tn, "") then return false
+	const Iarch ri = find_rec(ctx.recs, tn)
+	if ri < 0 then return false
+	const Iarch fi = field_index(ctx.recs[ri].fields, fld)
+	if fi < 0 then return false
+	return ctx.recs[ri].fptrs[fi]
+}
+const is_ptr_field_read = (Expr e, [VarTy] env, Ctx ctx): Bool -> {
+	let Str base = ""
+	let Str fld = ""
+	match e { Expr.Field(b, f) -> {
+			base = b
+			fld = f
+		}, _ -> {} }
+	if str_eq(base, "") then return false
+	return field_is_ptr(base, fld, env, ctx)
+}
+# A bare `{ … }` record literal (an inline NESTED literal) — a `Record` whose type_name is empty,
+# to be resolved from its FIELD's declared record type. `record_inits` reads its field inits.
+const is_bare_record = (Expr e): Bool -> match e {
+	Expr.Record(tn, fs) -> str_eq(tn, ""),
+	_ -> false
+}
+const record_inits = (Expr e): [FieldInit] -> {
+	let [FieldInit] r = []
+	match e { Expr.Record(tn, fs) -> { r = fs }, _ -> {} }
+	return r
+}
+const record_type = (Str type_name, [FieldInit] inits, [VarTy] env, Ctx ctx): Ty -> {
+	const Iarch ri = find_rec(ctx.recs, type_name)
+	if ri < 0 then die("cf0: type: unknown record type in a data literal\n")
+	const Iarch nf = Iarch(ctx.recs[ri].fields.len)
+	const Iarch ni = Iarch(inits.len)
+	# a VALUE spread `{ ...src, … }` — must be the FIRST entry, single, and copy a record of the SAME
+	# type; the overrides that follow are a subset (the spread supplies the remaining fields)
+	let Bool has_spread = false
+	let Iarch s = 0
+	loop {
+		if s >= ni then break
+		if str_eq(inits[s].field, "$spread") then {
+			if s != 0 then die("cf0: type: a value spread `...` must be the first entry in a data literal\n")
+			has_spread = true
+			const Ty srct = type_of(inits[s].value, env, ctx)
+			if !str_eq(rec_of(srct), type_name) then die("cf0: type: a value spread source must be a record of the same type\n")
+		}
+		s = s + 1
+	}
+	if !has_spread then { if ni != nf then die("cf0: type: a data literal must set every field exactly once\n") }
+	let Iarch a = 0
+	loop {
+		if a >= ni then break
+		if !str_eq(inits[a].field, "$spread") then {
+			const Iarch fi = field_index(ctx.recs[ri].fields, inits[a].field)
+			if fi < 0 then die("cf0: type: unknown field in a data literal\n")
+			let Iarch b = 0
+			loop {
+				if b >= a then break
+				if !str_eq(inits[b].field, "$spread") && str_eq(inits[b].field, inits[a].field) then die("cf0: type: a field is set twice in a data literal\n")
+				b = b + 1
+			}
+			const Ty ft = field_decl_ty(ri, fi, ctx)
+			# a bare `[]` field value adopts the field's declared element type (context-directed —
+			# `type_of` would default it to `[Iarch]` and spuriously mismatch a `[Str]`/`[T]` field)
+			if is_empty_arraylit(inits[a].value) then {
+				if str_eq(dyn_of(ft), "") then die("cf0: type: `[]` may only initialize a dynamic-array field\n")
+			} else if is_bare_record(inits[a].value) then {
+				# an inline nested `{ … }` — resolved against the field's OWN record type (recursively,
+				# so literals nest to any depth); a bare `{}` on a non-record field is rejected (981)
+				const Str frt = rec_of(ft)
+				if str_eq(frt, "") then die("cf0: type: a bare `{…}` record literal does not fit a non-record field\n")
+				record_type(frt, record_inits(inits[a].value), env, ctx)
+			} else if is_tfixed(ft) && is_adoptable_lit(inits[a].value) then {
+				# a bare integer literal adopts the fixed-width field's type (range-checked), as at a `let`
+				fixed_lit_fits(inits[a].value, tfixed_bits(ft), tfixed_signed(ft))
+			} else {
+				const Ty vt = type_of(inits[a].value, env, ctx)
+					# a `*[T]` raw-pointer field stores another raw pointer, or ANY dynamic-/fixed-array
+					# array whose element base (data@0) is stored — mirroring a `*[T]` parameter argument
+					if is_tptr(ft) then {
+						if !is_tptr(vt) && (str_eq(dyn_of(vt), "") || !is_ptr_arr_arg(inits[a].value)) then die("cf0: type: a `*[T]` field needs a raw pointer or an array\n")
+					} else if !ty_eq(vt, ft) then die("cf0: type: a data-literal field value's type must match the field\n")
+			}
+		}
+		a = a + 1
+	}
+	# a spread that COPIES (does not override) a POINTER field would shallow-copy an aliasing pointer
+	if has_spread then {
+		let Iarch f = 0
+		loop {
+			if f >= nf then break
+			if !is_overridden(inits, ctx.recs[ri].fields[f]) then {
+				if is_ptr_field_ty(field_decl_ty(ri, f, ctx), ctx) then die("cf0: type: a value spread cannot copy an aggregate field (a shallow copy would alias) — override it explicitly\n")
+			}
+			f = f + 1
+		}
+	}
+	return Ty.TRec(type_name)
+}
+
+# `base.field` — either a tag-only union construction (`base` is a union type name,
+# `field` a member → a `TUnion` value) or a record field read (`base` is a record
+# local, `field` a declared field → an `Int`).
+# `Type.member(args)` — the union must exist, the member must exist, and the argument
+# count and (integer) types must match the member's declared payload.
+const unionmk_type = (Str type_name, Str member, [Expr] args, [VarTy] env, Ctx ctx): Ty -> {
+	const Iarch ui = find_union(ctx.unions, type_name)
+	if ui < 0 then die("cf0: type: unknown union type in a construction\n")
+	const Iarch mi = union_member_index(ctx.unions[ui].members, member)
+	if mi < 0 then die("cf0: type: unknown union member in a construction\n")
+	const Iarch np = Iarch(ctx.unions[ui].members[mi].payloads.len)
+	const Iarch na = Iarch(args.len)
+	if np != na then die("cf0: type: union member payload arity mismatch\n")
+	let Iarch a = 0
+	loop {
+		if a >= na then break
+		const Ty pt = payload_decl_ty(ui, mi, a, ctx)
+		if !ty_eq(type_of(args[a], env, ctx), pt) then die("cf0: type: a union payload's type must match the member\n")
+		a = a + 1
+	}
+	return Ty.TUnion(type_name)
+}
+
+const field_type = (Str base, Str field, [VarTy] env, Ctx ctx): Ty -> {
+	const Iarch ui = find_union(ctx.unions, base)
+	if ui >= 0 then {
+		const Iarch mi = union_member_index(ctx.unions[ui].members, field)
+		if mi < 0 then die("cf0: type: `${base}` has no such union member\n")
+		if Iarch(ctx.unions[ui].members[mi].payloads.len) > 0 then die("cf0: type: this member needs a payload — write `${base}.${field}(...)`\n")
+		return Ty.TUnion(base)
+	}
+	# the base's type — a local, or a top-level VALUE const auto-called (`var_type` handles both,
+	# and dies on a truly undeclared name); so `greeting.len` works on a `const greeting = "…"`
+	const Ty bt = var_type(env, base, ctx)
+	# a string exposes `.len` (an Int byte count) and `.bytes` (a byte pointer)
+	if is_tstr(bt) then {
+		if str_eq(field, "len") then return Ty.TInt
+		if str_eq(field, "bytes") then return Ty.TPtr
+		die("cf0: type: a string has only `.len` and `.bytes`\n")
+	}
+	# a dynamic array exposes only `.len` (an Int)
+	if !str_eq(dyn_of(bt), "") then {
+		if !str_eq(field, "len") then die("cf0: type: a dynamic array has only `.len`\n")
+		return Ty.TInt
+	}
+	const Str tn = rec_of(bt)
+	if str_eq(tn, "") then die("cf0: type: field access on a non-record value\n")
+	const Iarch ri = find_rec(ctx.recs, tn)
+	if ri < 0 then die("cf0: type: unknown record type\n")
+	const Iarch fi = field_index(ctx.recs[ri].fields, field)
+	if fi < 0 then die("cf0: type: reading a field the record does not declare\n")
+	return field_decl_ty(ri, fi, ctx)
+}
+
+# The environment a match arm's body is checked in: the outer env extended with the arm's
+# payload bindings (each name takes its member's declared payload type; `_` binds nothing).
+# A non-binding arm (a wildcard, an or-pattern, or a tag-only member) returns the outer env
+# unchanged. Shared by the expression arm (`type_arm_body`) and the statement arm
+# (`check_stmt_match`).
+pub const arm_bind_env = (Str type_name, [Str] members, [Str] binds, [VarTy] env, Ctx ctx): [VarTy] -> {
+	let [VarTy] benv = []
+	let Iarch e0 = 0
+	loop {
+		if e0 >= Iarch(env.len) then break
+		benv = [...benv, env[e0]]
+		e0 = e0 + 1
+	}
+	if Iarch(binds.len) == 0 then return benv
+	# a binding arm is single-member; each bound name takes the member's declared payload type
+	const Iarch ui = find_union(ctx.unions, type_name)
+	# a `Bool` (or otherwise non-table) scrutinee has no table payloads: bind nothing and let the
+	# caller's arity check report the mistake (a Bool member is nullary, so `Bool.True(x)` is invalid)
+	if ui < 0 then return benv
+	const Iarch mi = union_member_index(ctx.unions[ui].members, members[0])
+	let Iarch bi = 0
+	loop {
+		if bi >= Iarch(binds.len) then break
+		# a `_` skips and a sub-pattern GUARD (`=Member`/`#int`) constrains but binds no name
+		if !str_eq(binds[bi], "_") && !is_pat_guard(binds[bi]) then {
+			const Ty bt = payload_decl_ty(ui, mi, bi, ctx)
+			benv = [...benv, VarTy({ name: binds[bi], ty: bt, mutable: false, esc: false, outer: false, fixed: false, is_ref: false, fsize: 0 })]
+		}
+		bi = bi + 1
+	}
+	return benv
+}
+
+# Type an arm's body, extending the environment with the arm's payload bindings.
+const type_arm_body = (MatchArm arm, [VarTy] env, Ctx ctx): Ty -> {
+	return type_of(arm.body, arm_bind_env(arm.type_name, arm.members, arm.binds, env, ctx), ctx)
+}
+
+# The members of the builtin `Bool` union `{ False, True }` (§8.6, tag 0/1) — Bool is the primitive
+# `TBool` and is not in the union tables, so `match` on a Bool sources its members here. Both are
+# nullary (no payload), so the arm machinery treats them as tag-only members.
+const bool_members = (): [UnionMember] -> {
+	let [Str] nop = []
+	let [[TupElem]] nopt = []
+	const UnionMember mf = UnionMember({ name: "False", payloads: nop, pelems: nop, ptelems: nopt })
+	const UnionMember mt = UnionMember({ name: "True", payloads: nop, pelems: nop, ptelems: nopt })
+	let [UnionMember] r = [mf, mt]
+	return r
+}
+
+# `match scrut { arms }` — the scrutinee must be a union; every arm must name that
+# union and one of its members (no member twice), no arm may follow a `_` wildcard,
+# every member must be covered (unless a `_` is present), a payload pattern's arity
+# must match its member with no repeated binding name, and all arm bodies must share
+# a type — which is the match's type.
+# A STRING match — the first non-wildcard arm carries the sentinel type_name "$str" (the parser's
+# string-literal arm). Its arms are constant Str patterns compared for equality, so a `_` is always
+# required (the domain is open), and a repeated pattern is rejected.
+const arms_are_str = ([MatchArm] arms): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		if !arms[i].is_wild then return str_eq(arms[i].type_name, "$str")
+		i = i + 1
+	}
+	return false
+}
+# Validate a string match's ARM METADATA (shared by the expression and statement forms): the
+# scrutinee must be a `Str`, no arm may follow `_`, every non-wildcard arm must be a "$str" arm with
+# no pattern repeated across the whole match, and a `_` is mandatory. Returns 0 on success.
+const check_str_arms = (Ty sty, [Iarch] wilds, [Str] tns, [[Str]] memss): Iarch -> {
+	if !is_tstr(sty) then die("cf0: type: a string match arm requires a Str scrutinee\n")
+	const Iarch na = Iarch(wilds.len)
+	if na == 0 then die("cf0: type: a match needs at least one arm\n")
+	let [Str] seen = []
+	let Bool wild_seen = false
+	let Iarch i = 0
+	loop {
+		if i >= na then break
+		if wild_seen then die("cf0: type: no match arm may follow a `_` wildcard\n")
+		# `wilds` is 0/1 (a `[Bool]` array element would read as a word, not a Bool, breaking the `if`)
+		if wilds[i] == 1 then { wild_seen = true }
+		else {
+			if !str_eq(tns[i], "$str") then die("cf0: type: a string match cannot mix string and union arms\n")
+			let Iarch mj = 0
+			loop {
+				if mj >= Iarch(memss[i].len) then break
+				let Iarch d = 0
+				loop {
+					if d >= Iarch(seen.len) then break
+					if str_eq(seen[d], memss[i][mj]) then die("cf0: type: a duplicate string match pattern\n")
+					d = d + 1
+				}
+				seen = [...seen, memss[i][mj]]
+				mj = mj + 1
+			}
+		}
+		i = i + 1
+	}
+	if !wild_seen then die("cf0: type: a string match must carry a `_` (it is never exhaustive)\n")
+	return 0
+}
+const match_arm_meta = ([MatchArm] arms): [[Str]] -> {
+	let [[Str]] out = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		out = [...out, arms[i].members]
+		i = i + 1
+	}
+	return out
+}
+const str_match_type = (Ty sty, [MatchArm] arms, [VarTy] env, Ctx ctx): Ty -> {
+	let [Iarch] wilds = []
+	let [Str] tns = []
+	let Iarch j = 0
+	loop {
+		if j >= Iarch(arms.len) then break
+		if arms[j].is_wild then wilds = [...wilds, 1] else wilds = [...wilds, 0]
+		tns = [...tns, arms[j].type_name]
+		j = j + 1
+	}
+	check_str_arms(sty, wilds, tns, match_arm_meta(arms))
+	const Ty rty = type_arm_body(arms[0], env, ctx)
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		if !ty_eq(type_arm_body(arms[i], env, ctx), rty) then die("cf0: type: all match arms must have the same type\n")
+		i = i + 1
+	}
+	return rty
+}
+# An INTEGER match — the first non-wildcard arm carries the sentinel type_name "$int" (the parser's
+# integer-literal arm). Its arms are constant integer patterns compared for equality, so a `_` is
+# always required (the domain is open), and a repeated literal is rejected.
+const arms_are_int = ([MatchArm] arms): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		if !arms[i].is_wild then return str_eq(arms[i].type_name, "$int")
+		i = i + 1
+	}
+	return false
+}
+# Validate an integer match's ARM METADATA: the scrutinee must be an integer (a word or a
+# fixed-width), no arm may follow `_`, every non-wildcard arm must be an "$int" arm (no union
+# mixing), no literal repeated across the match, and a `_` is mandatory. Returns 0 on success.
+const check_int_arms = (Ty sty, [Iarch] wilds, [Str] tns, [[Str]] memss): Iarch -> {
+	if !is_tint(sty) && !is_tfixed(sty) then die("cf0: type: an integer match arm requires an integer scrutinee\n")
+	const Iarch na = Iarch(wilds.len)
+	if na == 0 then die("cf0: type: a match needs at least one arm\n")
+	let [Str] seen = []
+	let Bool wild_seen = false
+	let Iarch i = 0
+	loop {
+		if i >= na then break
+		if wild_seen then die("cf0: type: no match arm may follow a `_` wildcard\n")
+		if wilds[i] == 1 then { wild_seen = true }
+		else {
+			if !str_eq(tns[i], "$int") then die("cf0: type: an integer match cannot mix integer and union arms\n")
+			let Iarch mj = 0
+			loop {
+				if mj >= Iarch(memss[i].len) then break
+				let Iarch d = 0
+				loop {
+					if d >= Iarch(seen.len) then break
+					if str_eq(seen[d], memss[i][mj]) then die("cf0: type: a duplicate integer match pattern\n")
+					d = d + 1
+				}
+				seen = [...seen, memss[i][mj]]
+				mj = mj + 1
+			}
+		}
+		i = i + 1
+	}
+	if !wild_seen then die("cf0: type: an integer match must carry a `_` (it is never exhaustive)\n")
+	return 0
+}
+const int_match_type = (Ty sty, [MatchArm] arms, [VarTy] env, Ctx ctx): Ty -> {
+	let [Iarch] wilds = []
+	let [Str] tns = []
+	let Iarch j = 0
+	loop {
+		if j >= Iarch(arms.len) then break
+		if arms[j].is_wild then wilds = [...wilds, 1] else wilds = [...wilds, 0]
+		tns = [...tns, arms[j].type_name]
+		j = j + 1
+	}
+	check_int_arms(sty, wilds, tns, match_arm_meta(arms))
+	const Ty rty = type_arm_body(arms[0], env, ctx)
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		if !ty_eq(type_arm_body(arms[i], env, ctx), rty) then die("cf0: type: all match arms must have the same type\n")
+		i = i + 1
+	}
+	return rty
+}
+# Validate an arm's payload SUB-PATTERN guards against the member's declared payload types, and
+# report whether the arm is guarded (constrains a field beyond the outer tag, so it does NOT prove
+# the member exhausted). An integer guard needs an integer field (999); a member guard needs a
+# union field (1000), names an existing member of it (994), and any qualifier must name that field's
+# union (1015). `un`/`ui`/`mi` identify the arm's outer member.
+const check_arm_guards = (Iarch ui, [UnionMember] mems, Iarch mi, [Str] binds, Ctx ctx): Bool -> {
+	let Bool guarded = false
+	let Iarch bi = 0
+	loop {
+		if bi >= Iarch(binds.len) then break
+		if is_pat_guard(binds[bi]) then {
+			guarded = true
+			const Ty ft = payload_decl_ty(ui, mi, bi, ctx)
+			if is_int_guard(binds[bi]) then {
+				if !is_tint(ft) && !is_tfixed(ft) then die("cf0: type: an integer sub-pattern needs an integer payload field\n")
+			} else {
+				const Str fu = union_of(ft)
+				if str_eq(fu, "") then die("cf0: type: a member sub-pattern needs a union-typed payload field\n")
+				const Str body = guard_body(binds[bi])
+				const Str q = guard_qual(body)
+				if !str_eq(q, "") && !str_eq(q, fu) then die("cf0: type: a member sub-pattern qualifier must name the field's union\n")
+				const Iarch fui = find_union(ctx.unions, fu)
+				if union_member_index(ctx.unions[fui].members, guard_member(body)) < 0 then die("cf0: type: a member sub-pattern names a nonexistent member\n")
+			}
+		}
+		bi = bi + 1
+	}
+	return guarded
+}
+const int_in = ([Iarch] xs, Iarch v): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(xs.len) then break
+		if xs[i] == v then return true
+		i = i + 1
+	}
+	return false
+}
+const match_type = (Expr scrut, [MatchArm] arms, [VarTy] env, Ctx ctx): Ty -> {
+	const Ty sty = type_of(scrut, env, ctx)
+	# a STRING match (`match s { "add" -> …, _ -> … }`) — arms are constant Str patterns, not union members
+	if arms_are_str(arms) then return str_match_type(sty, arms, env, ctx)
+	# an INTEGER match (`match n { 0 -> …, 1 | 2 -> …, _ -> … }`) — arms are constant integer patterns
+	if arms_are_int(arms) then return int_match_type(sty, arms, env, ctx)
+	# a `Bool` scrutinee matches as the tag-only union `{ False, True }` (§8.6) — `Bool` is not in
+	# the union tables (it is the primitive `TBool`), so its members come from `bool_members()`
+	let Str un = union_of(sty)
+	if str_eq(un, "") && is_tbool(sty) then un = "Bool"
+	if str_eq(un, "") then die("cf0: type: a match scrutinee must be a union\n")
+	const Iarch ui = find_union(ctx.unions, un)
+	let [UnionMember] mems = bool_members()
+	if ui >= 0 then mems = ctx.unions[ui].members
+	const Iarch na = Iarch(arms.len)
+	if na == 0 then die("cf0: type: a match needs at least one arm\n")
+	const Ty rty = type_arm_body(arms[0], env, ctx)
+	let [Iarch] covered = []
+	let Bool wild_seen = false
+	let Iarch i = 0
+	loop {
+		if i >= na then break
+		if wild_seen then die("cf0: type: no match arm may follow a `_` wildcard\n")
+		if arms[i].is_wild then {
+			wild_seen = true
+		} else {
+			if !str_eq(arms[i].type_name, un) then die("cf0: type: a match arm must name the scrutinee's union\n")
+			# a payload-binding arm is single-member: validate arity + no repeated bind name, and
+			# resolve its sub-pattern guards — a GUARDED arm only partially covers its member.
+			let Bool guarded = false
+			if Iarch(arms[i].binds.len) > 0 then {
+				const Iarch mi0 = union_member_index(mems, arms[i].members[0])
+				if Iarch(arms[i].binds.len) != Iarch(mems[mi0].payloads.len) then die("cf0: type: a payload pattern's arity must match the member\n")
+				let Iarch di = 0
+				loop {
+					if di >= Iarch(arms[i].binds.len) then break
+					if !str_eq(arms[i].binds[di], "_") && !is_pat_guard(arms[i].binds[di]) then {
+						let Iarch dj = 0
+						loop {
+							if dj >= di then break
+							if str_eq(arms[i].binds[dj], arms[i].binds[di]) then die("cf0: type: a payload binding name may not repeat\n")
+							dj = dj + 1
+						}
+					}
+					di = di + 1
+				}
+				guarded = check_arm_guards(ui, mems, mi0, arms[i].binds, ctx)
+			}
+			let Iarch mj = 0
+			loop {
+				if mj >= Iarch(arms[i].members.len) then break
+				const Iarch mi = union_member_index(mems, arms[i].members[mj])
+				if mi < 0 then die("cf0: type: a match arm names a nonexistent union member\n")
+				if guarded then {
+					# a guarded arm only partially covers its member: it never proves the member
+					# exhausted, and it is unreachable if an earlier unguarded arm already did (1002)
+					if int_in(covered, mi) then die("cf0: type: a guarded match arm is unreachable (its member is already fully covered)\n")
+				} else {
+					if int_in(covered, mi) then die("cf0: type: a union member is matched twice\n")
+					covered = [...covered, mi]
+				}
+				mj = mj + 1
+			}
+		}
+		if !ty_eq(type_arm_body(arms[i], env, ctx), rty) then die("cf0: type: all match arms must have the same type\n")
+		i = i + 1
+	}
+	if !wild_seen then {
+		if Iarch(covered.len) != Iarch(mems.len) then die("cf0: type: a match must cover every union member or carry a `_`\n")
+	}
+	return rty
+}
+
+# The `Ty` of a dynamic array's element, given the element type NAME: a record name
+# yields `TRec` and a union name `TUnion` (each element an arena pointer), a `Str` yields
+# `TStr`, anything else (`Iarch`, `Int`, …) an `Int` word. A `[Expr]` element is thus the
+# recursive union, not a truncated word — needed to index cf0's own `[Expr]`/`[Stmt]` lists.
+pub const elem_ty = (Str en, Ctx ctx): Ty -> {
+	if is_nested(en) then return Ty.TDyn(nested_inner(en))
+	if str_eq(en, "Str") then return Ty.TStr
+	if str_eq(en, "Bool") then return Ty.TBool
+	if is_float_name(en) then return Ty.TFloat(float_bits(en))
+	if find_rec(ctx.recs, en) >= 0 then return Ty.TRec(en)
+	if find_union(ctx.unions, en) >= 0 then return Ty.TUnion(en)
+	return Ty.TInt
+}
+
+# The element type NAME for a value used as a dynamic-array element — `Str`, a record's
+# name, else `Iarch` (a word element).
+const elem_name_of = (Ty t): Str -> {
+	if is_tstr(t) then return "Str"
+	if is_tbool(t) then return "Bool"
+	if is_tfloat(t) then return if tfloat_bits(t) == 32 then "Float32" else "Float64"
+	# a nested-array element (`[[Str]]`'s element is a `[Str]`) is named by its spelling
+	const Str dn = dyn_of(t)
+	if !str_eq(dn, "") then return "[${dn}]"
+	const Str rn = rec_of(t)
+	if str_eq(rn, "") then return "Iarch"
+	return rn
+}
+
+# The element type name of an array literal: a spread `[...src, e]` takes the source's
+# element type (and the source must be a dynamic array); otherwise a `let [Elem]`
+# annotation (`elem_type`), else the first element's type, else `Iarch` for an empty
+# `[]`.
+# Whether a spread source `[...src, e]` names a FIXED array `[N T]` binding — such an array is not
+# a growable `[T]`, so it may neither be copy-appended from nor grown in place (`fx = [...fx, e]`).
+const name_is_fixed = ([VarTy] env, Str n): Bool -> {
+	const Iarch i = env_index(env, n)
+	if i < 0 then return false
+	return env[i].fixed
+}
+const spread_src_fixed = (Expr src, [VarTy] env): Bool -> match src {
+	Expr.Var(n) -> name_is_fixed(env, n),
+	_ -> false
+}
+const arraylit_elem = (Bool has_spread, Expr spread_src, [Expr] elems, Str elem_type, [VarTy] env, Ctx ctx): Str -> {
+	if has_spread then {
+		if spread_src_fixed(spread_src, env) then die("cf0: type: a fixed array `[N T]` cannot be a spread source — only a dynamic `[T]` may be copy-appended or grown\n")
+		const Str sen = dyn_of(type_of(spread_src, env, ctx))
+		if str_eq(sen, "") then die("cf0: type: a spread source must be a dynamic array\n")
+		return sen
+	}
+	if !str_eq(elem_type, "") then return elem_type
+	if Iarch(elems.len) > 0 then return elem_name_of(type_of(elems[0], env, ctx))
+	return "Iarch"
+}
+
+# Is `e` an empty `[]` literal (no spread, no elements)? Such a reset adopts its target's
+# element type rather than the `Iarch` default `arraylit_type` would assign.
+const is_empty_arraylit = (Expr e): Bool -> match e {
+	Expr.ArrayLit(hs, sn, elems, et) -> if hs then false else Iarch(elems.len) == 0,
+	_ -> false
+}
+# A PLAIN array literal — non-spread and non-empty (`[1, 2, 3]`, not `[...src, e]` or `[]`). A
+# dynamic-array binding may not be reassigned from one (growth uses the spread form).
+const is_plain_arraylit_e = (Expr e): Bool -> match e {
+	Expr.ArrayLit(hs, sn, elems, et) -> !hs && Iarch(elems.len) > 0,
+	_ -> false
+}
+
+# `[a, b]` / `[]` — a dynamic-array literal. Every listed element must match the array's
+# element type (records or words alike).
+const arraylit_type = (Bool has_spread, Expr spread_src, [Expr] elems, Str elem_type, [VarTy] env, Ctx ctx): Ty -> {
+	const Str en = arraylit_elem(has_spread, spread_src, elems, elem_type, env, ctx)
+	# a general fixed-WIDTH element array (`[Int32]`, `[Int16]`, …) types its element at that exact
+	# width; `[Uint8]` stays byte-special (word bytes are one byte). Every other element via `elem_ty`.
+	const Bool en_fixed = is_fixed_name(en) && !str_eq(en, "Uint8")
+	const Ty ety = if en_fixed then fixed_ty(en) else elem_ty(en, ctx)
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(elems.len) then break
+		const Ty evt = type_of(elems[i], env, ctx)
+		# a general fixed-width element accepts an exact fixed VALUE (`Int32(x)`) or an adopting integer
+		# literal (`[3 Int32] = [1,2,3]`); a `[Uint8]` byte buffer stores plain word bytes and an explicit
+		# 8-bit fixed value (`Uint8(x)`/`Int8(x)`) — a WIDER fixed value there is a silently-truncating store.
+		if en_fixed then {
+			if !ty_eq(evt, ety) && !is_adoptable_lit(elems[i]) then die("cf0: type: a dynamic-array element's type must match the array's element type\n")
+		} else if !ty_eq(evt, ety) && !(str_eq(en, "Uint8") && tfixed_bits(evt) == 8) then die("cf0: type: a dynamic-array element's type must match the array's element type\n")
+		i = i + 1
+	}
+	return Ty.TDyn(en)
+}
+# Type an array LITERAL forcing a given element type (context-directed) — used to adopt a fixed-WIDTH
+# return element (`[3 Int32]`) so bare-int elements take the width instead of defaulting to `Iarch`.
+const arraylit_ret_ty = (Expr e, Str elem, [VarTy] env, Ctx ctx): Ty -> {
+	let Bool hs = false
+	let Expr sn = Expr.Lit(0)
+	let [Expr] els = []
+	match e { Expr.ArrayLit(h, s, es, et) -> {
+			hs = h
+			sn = s
+			els = es
+		}, _ -> {} }
+	return arraylit_type(hs, sn, els, elem, env, ctx)
+}
+
+# `Spread` is valid ONLY inside a tuple literal (the tuple typing/emit handle it); a bare
+# `type_of(Spread)` is a misuse. (`is_spread`/`spread_inner` live in `astutil`.)
+# A spread source must be a form the emitter can lower slot-for-slot: a tuple name, a
+# tuple-returning call, or a tuple literal. (A `match`/`if`-valued tuple source is a later
+# brick — the emit `init_telems` has no arm for it, so the type gate rejects it here rather
+# than letting emit silently copy zero slots.)
+const is_spreadable_src = (Expr e): Bool -> match e {
+	Expr.Var(n) -> true,
+	Expr.Call(c, ta, a) -> true,
+	Expr.Tuple(es) -> true,
+	_ -> false
+}
+const spread_bad_type = (): Ty -> {
+	die("cf0: type: `...` spread is only valid inside a tuple\n")
+	return Ty.TInt
+}
+
+# `(a, ...src, b)` — a tuple literal. Each plain element's type names a position; a
+# `...src` spread splices the source tuple's position types (the source must be a tuple).
+# Yields a `TTuple` carrying the flattened position types.
+const tuple_type = ([Expr] elems, [VarTy] env, Ctx ctx): Ty -> {
+	let [TupElem] names = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(elems.len) then break
+		if is_spread(elems[i]) then {
+			if !is_spreadable_src(spread_inner(elems[i])) then die("cf0: type: a tuple spread source must be a tuple name, a tuple-returning call, or a tuple literal\n")
+			const Ty st = type_of(spread_inner(elems[i]), env, ctx)
+			if !is_ttuple(st) then die("cf0: type: a tuple spread source must be a tuple value\n")
+			const [TupElem] se = tuple_elems(st)
+			let Iarch j = 0
+			loop {
+				if j >= Iarch(se.len) then break
+				names = [...names, se[j]]
+				j = j + 1
+			}
+		} else {
+			names = [...names, element_type_name(type_of(elems[i], env, ctx), elems[i], ctx)]
+		}
+		i = i + 1
+	}
+	return Ty.TTuple(names)
+}
+
+# `t[k]` — a tuple indexed at a COMPTIME literal position `k`, yielding position `k`'s
+# type. A runtime (non-literal) index or an out-of-range position is rejected.
+const tuple_index_type = ([TupElem] names, Expr idx, Ctx ctx): Ty -> {
+	const Iarch k = lit_val(idx)
+	if k < 0 then die("cf0: type: a tuple position must be a comptime literal, not a runtime value\n")
+	if k >= Iarch(names.len) then die("cf0: type: a tuple index is out of range\n")
+	return tel_to_ty(names[k], ctx)
+}
+
+# `t[k].field` — position `k` (a comptime literal) must be a `Str` (only `.len`) or a
+# record that declares `field`; yields the field's declared type.
+const tuple_indexfield_type = ([TupElem] names, Expr idx, Str field, Ctx ctx): Ty -> {
+	const Iarch k = lit_val(idx)
+	if k < 0 then die("cf0: type: a tuple position must be a comptime literal, not a runtime value\n")
+	if k >= Iarch(names.len) then die("cf0: type: a tuple index is out of range\n")
+	if tel_is_nest(names[k]) then die("cf0: type: a nested-tuple element has no fields — index it (`t[k][j]`)\n")
+	const Str tn = names[k].name
+	if str_eq(tn, "Str") then {
+		if !str_eq(field, "len") then die("cf0: type: a string element has only `.len`\n")
+		return Ty.TInt
+	}
+	# a dynamic-array element (`[Elem]`-spelled) answers only `.len` (its header len @8)
+	if is_nested(tn) then {
+		if !str_eq(field, "len") then die("cf0: type: an array element has only `.len` (index it for values, `t[k][i]`)\n")
+		return Ty.TInt
+	}
+	const Iarch ri = find_rec(ctx.recs, tn)
+	if ri < 0 then die("cf0: type: a field read needs a record, string, or array element\n")
+	const Iarch fi = field_index(ctx.recs[ri].fields, field)
+	if fi < 0 then die("cf0: type: the element record has no such field\n")
+	return field_decl_ty(ri, fi, ctx)
+}
+
+# Check `const/let (a, _, c) = rhs`: rhs must be a tuple; each pattern name binds its
+# position's type (no shadow/dup); a skip drops position(s); the pattern must cover the
+# whole tuple exactly; a `let` position must be a scalar (a record/Str position is const).
+# Returns the environment extended with the pattern's bindings.
+pub const check_destructure = ([Str] pat, Bool mutable, Expr rhs, [VarTy] env, Ctx ctx): [VarTy] -> {
+	const Ty rt = type_of(rhs, env, ctx)
+	if !is_ttuple(rt) then die("cf0: type: destructuring needs a tuple value\n")
+	const [TupElem] names = tuple_elems(rt)
+	let [VarTy] e2 = env
+	let Iarch pos = 0
+	let Iarch pi = 0
+	loop {
+		if pi >= Iarch(pat.len) then break
+		const Str tok = pat[pi]
+		if is_skip(tok) then {
+			pos = pos + skip_count(tok)
+			pi = pi + 1
+			continue
+		}
+		if pos >= Iarch(names.len) then die("cf0: type: a destructure pattern has more positions than the tuple\n")
+		if env_index(e2, tok) >= 0 then die("cf0: type: a destructure name cannot shadow an existing or duplicate binding\n")
+		const Ty pty = tel_to_ty(names[pos], ctx)
+		if mutable then {
+			if !is_tint(pty) && !is_tbool(pty) then die("cf0: type: a `let` destructure position must be a scalar (a record/Str position binds `const`)\n")
+		}
+		e2 = [...e2, VarTy({ name: tok, ty: pty, mutable: mutable, esc: false, outer: false, fixed: false, is_ref: false, fsize: 0 })]
+		pos = pos + 1
+		pi = pi + 1
+	}
+	if pos != Iarch(names.len) then die("cf0: type: a destructure pattern must cover the whole tuple\n")
+	return e2
+}
+
+# `xs[i]` — a dynamic array indexed by an integer, yielding its element type (an `Int`
+# word, or a record for a `[Record]`).
+const index_type = (Str arr, Expr idx, [VarTy] env, Ctx ctx): Ty -> {
+	const Iarch vi = env_index(env, arr)
+	if vi < 0 then die("cf0: type: index of an undeclared name\n")
+	# a tuple is comptime-indexed, each position independently typed
+	if is_ttuple(env[vi].ty) then return tuple_index_type(tuple_elems(env[vi].ty), idx, ctx)
+	# a string index `s[i]` yields a byte (an Int)
+	if is_tstr(env[vi].ty) then {
+		if !is_tint(type_of(idx, env, ctx)) then die("cf0: type: a string index must be an integer\n")
+		return Ty.TInt
+	}
+	# a byte-pointer / buffer index `p[i]` yields a byte (an Int)
+	if is_tptr(env[vi].ty) then {
+		if !is_tint(type_of(idx, env, ctx)) then die("cf0: type: a buffer index must be an integer\n")
+		return Ty.TInt
+	}
+	const Str en = dyn_of(env[vi].ty)
+	if str_eq(en, "") then die("cf0: type: indexing a non-array value\n")
+	if !is_tint(type_of(idx, env, ctx)) then die("cf0: type: an array index must be an integer\n")
+	# a general fixed-WIDTH element (`[Int32]`) indexes to that exact width; `[Uint8]` stays a byte word
+	if is_fixed_name(en) && !str_eq(en, "Uint8") then return fixed_ty(en)
+	return elem_ty(en, ctx)
+}
+
+# `base[i]` on a general expression base (`p.toks[p.pos]`, `prog.recs[r]`) — the base's
+# type decides the element: a `Str` or byte-pointer index yields a byte (`Int`), a
+# `[T]` index yields the element type. The index must be an integer. Mirrors
+# `index_type` but takes the base as an expression rather than a bare name.
+const indexexpr_type = (Expr base, Expr idx, [VarTy] env, Ctx ctx): Ty -> {
+	const Ty bt = type_of(base, env, ctx)
+	# a tuple base (`r.pair[0]`) is comptime-indexed, each position independently typed
+	if is_ttuple(bt) then return tuple_index_type(tuple_elems(bt), idx, ctx)
+	if is_tstr(bt) then {
+		if !is_tint(type_of(idx, env, ctx)) then die("cf0: type: a string index must be an integer\n")
+		return Ty.TInt
+	}
+	if is_tptr(bt) then {
+		if !is_tint(type_of(idx, env, ctx)) then die("cf0: type: a buffer index must be an integer\n")
+		return Ty.TInt
+	}
+	const Str en = dyn_of(bt)
+	if str_eq(en, "") then die("cf0: type: indexing a non-array value\n")
+	if !is_tint(type_of(idx, env, ctx)) then die("cf0: type: an array index must be an integer\n")
+	return elem_ty(en, ctx)
+}
+
+# `arr[i].field` — `arr` must be a dynamic array of records and `field` must be declared
+# on that element record. Yields the field's DECLARED type (a word, a `Str`, a `[T]`, a
+# nested record, or a union — cf0's own `[FieldInit]`/`[Param]` lists read `Str` fields).
+const indexfield_type = (Str arr, Expr idx, Str field, [VarTy] env, Ctx ctx): Ty -> {
+	const Iarch vi = env_index(env, arr)
+	if vi < 0 then die("cf0: type: index of an undeclared name\n")
+	# a tuple position's field: position k (a comptime literal) is a Str or a record
+	if is_ttuple(env[vi].ty) then return tuple_indexfield_type(tuple_elems(env[vi].ty), idx, field, ctx)
+	const Str en = dyn_of(env[vi].ty)
+	if str_eq(en, "") then die("cf0: type: indexing a non-array value\n")
+	if !is_tint(type_of(idx, env, ctx)) then die("cf0: type: an array index must be an integer\n")
+	# a `[Str]` element or a nested-array element (`[[Str]]`'s element is a `[Str]`) exposes
+	# only `.len` — both ride as a header whose length word is at +8
+	if str_eq(en, "Str") then {
+		if !str_eq(field, "len") then die("cf0: type: a string element has only `.len`\n")
+		return Ty.TInt
+	}
+	if is_nested(en) then {
+		if !str_eq(field, "len") then die("cf0: type: a nested-array element has only `.len`\n")
+		return Ty.TInt
+	}
+	const Iarch ri = find_rec(ctx.recs, en)
+	if ri < 0 then die("cf0: type: a field read needs a record element\n")
+	const Iarch fi = field_index(ctx.recs[ri].fields, field)
+	if fi < 0 then die("cf0: type: the element record has no such field\n")
+	return field_decl_ty(ri, fi, ctx)
+}
+
+# A string literal is a `Str`.
+const strlit_type = ([Uint8] bytes): Ty -> Ty.TStr
+
+const str_in = ([Str] xs, Str s): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(xs.len) then break
+		if str_eq(xs[i], s) then return true
+		i = i + 1
+	}
+	return false
+}
+# Is a value of type `t` renderable by `emit_stringify` (interpolation)? A scalar leaf — an
+# integer word, a fixed-width, a `Bool`, a `Float` (naive `%f`), or a `Str` — always is. An
+# aggregate is iff every component is: a tuple's positions, a record's fields, a union's payloads,
+# an array's element. A raw pointer, `Unit`, or a function type is NOT. `seen` guards against a RECURSIVE
+# aggregate (a list/tree): `emit_stringify` inlines its recursion, so a self-referential type would
+# emit unbounded code — a revisit is rejected here so it never reaches emit.
+const ty_stringifiable = (Ty t, Ctx ctx, [Str] seen): Bool -> {
+	if is_tint(t) then return true
+	if is_tfixed(t) then return true
+	if is_tbool(t) then return true
+	if is_tstr(t) then return true
+	if is_tfloat(t) then return true
+	if is_ttuple(t) then return telems_stringifiable(tuple_elems(t), ctx, seen)
+	if is_tdyn(t) then return elem_stringifiable(dyn_of(t), ctx, seen)
+	const Str rn = rec_of(t)
+	if !str_eq(rn, "") then {
+		if str_in(seen, rn) then return false
+		return rec_fields_stringifiable(rn, ctx, [...seen, rn])
+	}
+	const Str un = union_of(t)
+	if !str_eq(un, "") then {
+		if str_in(seen, un) then return false
+		return union_payloads_stringifiable(un, ctx, [...seen, un])
+	}
+	return false
+}
+# An array `[Elem]` is stringifiable iff its element type is. A nested array (`[[T]]`, spelled
+# `[T]` here) recurses; an empty/unknown element (`""`, the default-int `[]`) is a word and fine; a
+# tuple- or function-typed element is not supported by the array renderer. `seen` still threads so a
+# recursive type reached THROUGH an array (a record with a `[SelfRecord]` field) is caught.
+const elem_stringifiable = (Str elem, Ctx ctx, [Str] seen): Bool -> {
+	if str_eq(elem, "") then return true
+	if is_nested(elem) then return elem_stringifiable(nested_inner(elem), ctx, seen)
+	if str_eq(elem, "$tuple") then return false
+	if str_eq(elem, "$fn") then return false
+	return ty_stringifiable(named_ty(elem, "", ctx.recs, ctx.unions), ctx, seen)
+}
+const is_tdyn = (Ty t): Bool -> match t { Ty.TDyn(n) -> true, _ -> false }
+const telems_stringifiable = ([TupElem] tels, Ctx ctx, [Str] seen): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(tels.len) then break
+		if tel_is_nest(tels[i]) then {
+			if !telems_stringifiable(tels[i].sub, ctx, seen) then return false
+		} else {
+			if !ty_stringifiable(named_ty(tels[i].name, "", ctx.recs, ctx.unions), ctx, seen) then return false
+		}
+		i = i + 1
+	}
+	return true
+}
+const rec_fields_stringifiable = (Str rn, Ctx ctx, [Str] seen): Bool -> {
+	const Iarch ri = find_rec(ctx.recs, rn)
+	let Iarch f = 0
+	loop {
+		if f >= Iarch(ctx.recs[ri].fields.len) then break
+		const Str ft = ctx.recs[ri].ftypes[f]
+		if str_eq(ft, "$tuple") then {
+			if !telems_stringifiable(ctx.recs[ri].ftelems[f], ctx, seen) then return false
+		} else {
+			if !ty_stringifiable(named_ty(ft, ctx.recs[ri].felems[f], ctx.recs, ctx.unions), ctx, seen) then return false
+		}
+		f = f + 1
+	}
+	return true
+}
+const union_payloads_stringifiable = (Str un, Ctx ctx, [Str] seen): Bool -> {
+	const Iarch ui = find_union(ctx.unions, un)
+	let Iarch m = 0
+	loop {
+		if m >= Iarch(ctx.unions[ui].members.len) then break
+		let Iarch p = 0
+		loop {
+			if p >= Iarch(ctx.unions[ui].members[m].payloads.len) then break
+			const Str pt = ctx.unions[ui].members[m].payloads[p]
+			if str_eq(pt, "$tuple") then {
+				if !telems_stringifiable(ctx.unions[ui].members[m].ptelems[p], ctx, seen) then return false
+			} else {
+				if !ty_stringifiable(named_ty(pt, ctx.unions[ui].members[m].pelems[p], ctx.recs, ctx.unions), ctx, seen) then return false
+			}
+			p = p + 1
+		}
+		m = m + 1
+	}
+	return true
+}
+
+# An interpolated string `"…${expr}…"` is a `Str`. Each hole's expression must be stringifiable:
+# a scalar (an integer / fixed-width itoa, a `Bool` → `true`/`false`, a `Float` → naive `%f`, a
+# `Str` → its bytes) or a NON-recursive aggregate rendered structurally (a tuple `(…)`, a record
+# `T({…})`, a union `T.M(…)`, an array `[…]`). Only a recursive aggregate is rejected.
+const interp_type = ([Seg] segs, [VarTy] env, Ctx ctx): Ty -> {
+	let [Str] none = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(segs.len) then break
+		if segs[i].is_hole then {
+			const Ty ht = type_of(segs[i].expr, env, ctx)
+			if !ty_stringifiable(ht, ctx, none) then die("cf0: type: an interpolation hole must be a stringifiable value (an integer, a string, a Bool, a Float, or a non-recursive tuple/record/union)\n")
+		}
+		i = i + 1
+	}
+	return Ty.TStr
+}
+
+# `e.field` on a general (non-name) base — only `.len` on a `Str` in this brick, its
+# byte count (an Int).
+const fieldexpr_type = (Expr base, Str field, [VarTy] env, Ctx ctx): Ty -> {
+	const Ty bt = type_of(base, env, ctx)
+	# a string exposes `.len` (an Int) and `.bytes` (a byte pointer)
+	if is_tstr(bt) then {
+		if str_eq(field, "len") then return Ty.TInt
+		if str_eq(field, "bytes") then return Ty.TPtr
+		die("cf0: type: a string has only `.len` and `.bytes`\n")
+	}
+	# a dynamic array (chained off a field read, e.g. `fn.params.len`) exposes only `.len`
+	if !str_eq(dyn_of(bt), "") then {
+		if !str_eq(field, "len") then die("cf0: type: a dynamic array has only `.len`\n")
+		return Ty.TInt
+	}
+	# a record base (a general expression yielding a record — `p.toks[i].kind`,
+	# `prog.recs[r].name`): read the field's declared type off the element record
+	const Str tn = rec_of(bt)
+	if str_eq(tn, "") then die("cf0: type: field access `.` needs a string, a dynamic array, or a record on the left\n")
+	const Iarch ri = find_rec(ctx.recs, tn)
+	if ri < 0 then die("cf0: type: unknown record type\n")
+	const Iarch fi = field_index(ctx.recs[ri].fields, field)
+	if fi < 0 then die("cf0: type: reading a field the record does not declare\n")
+	return field_decl_ty(ri, fi, ctx)
+}
+
+# The type a `let`/`const` binding takes: a fixed-width annotation ADOPTS a bare literal
+# (range-checked) or demands the exact type; otherwise it is inferred from the value. Shared
+# by the statement checker and the value-loop yield walk (which threads bindings the same way).
+# A FIXED-array binding annotation is encoded `"$fix<N>"` (`[4 Iarch] xs` → `"$fix4"`); a plain
+# `"$fix"` (no digits, a pre-size literal binding) reads as size 0. The element type is recovered
+# from the initializer, so only the length `N` rides in the annotation (for the length check).
+const is_fix_ann = (Str a): Bool -> {
+	if Iarch(a.len) < 4 then return false
+	return Iarch(a[0]) == 36 && Iarch(a[1]) == 102 && Iarch(a[2]) == 105 && Iarch(a[3]) == 120
+}
+const fix_ann_size = (Str a): Iarch -> {
+	if !is_fix_ann(a) then return 0
+	let Iarch n = 0
+	let Iarch i = 4
+	loop {
+		if i >= Iarch(a.len) then break
+		const Iarch c = Iarch(a[i])
+		if c < 48 || c > 57 then break
+		n = n * 10 + (c - 48)
+		i = i + 1
+	}
+	return n
+}
+# The statically-known length of a fixed-array-valued expression, or -1 if unknown: a plain array
+# LITERAL's element count (a spread `[...src]` is unknown), an array-returning CALL's `ret_size`, or
+# a `Var` naming a FIXED binding's `fsize`. Used to length-check fixed-array returns/bindings/args.
+const arraylit_len = (Expr e): Iarch -> match e {
+	Expr.ArrayLit(hs, sn, elems, et) -> if hs then 0 - 1 else Iarch(elems.len),
+	_ -> 0 - 1
+}
+const call_ret_size = (Expr e, Ctx ctx): Iarch -> {
+	const Str cn = match e { Expr.Call(n, ta, args) -> n, _ -> "" }
+	if str_eq(cn, "") then return 0 - 1
+	const Iarch fi = find_func(ctx.funcs, cn)
+	if fi < 0 then return 0 - 1
+	return ctx.funcs[fi].ret_size
+}
+const fixed_expr_len = (Expr e, [VarTy] env, Ctx ctx): Iarch -> {
+	const Iarch la = arraylit_len(e)
+	if la >= 0 then return la
+	const Iarch lc = call_ret_size(e, ctx)
+	if lc > 0 then return lc
+	const Str vn = match e { Expr.Var(n) -> n, _ -> "" }
+	if str_eq(vn, "") then return 0 - 1
+	const Iarch vi = env_index(env, vn)
+	if vi < 0 then return 0 - 1
+	if env[vi].fsize > 0 then return env[vi].fsize
+	return 0 - 1
+}
+pub const binding_ty = (Str ann, Expr e, [VarTy] env, Ctx ctx): Ty -> {
+	# `Int` is a numeric union BOUND (§8.6), not a concrete value type — a bare integer is `Iarch`, a
+	# specific width is its own type. Naming it as a scalar binding's type is rejected (768).
+	if str_eq(ann, "Int") then die("cf0: type: `Int` is a numeric bound, not a value type — a bare integer is `Iarch`\n")
+	if is_fixed_name(ann) then {
+		if is_adoptable_lit(e) then return adopt_fixed(e, ann)
+		const Ty t = type_of(e, env, ctx)
+		if !ty_eq(t, fixed_ty(ann)) then die("cf0: type: a fixed-width binding needs a value of that exact type or an adopting integer literal\n")
+		return t
+	}
+	# a bare `({…})` record literal is typed by the binding's record annotation (its own type_name is
+	# empty); an unannotated `const x = ({…})` has no record context and is rejected by `record_type`
+	if is_bare_record(e) && find_rec(ctx.recs, ann) >= 0 then return record_type(ann, record_inits(e), env, ctx)
+	# a RECORD-annotated binding's value must be that exact record — `const Vec v = Point({…})` (a
+	# different constructed record) is rejected, as is a non-record value under a record annotation
+	if find_rec(ctx.recs, ann) >= 0 then {
+		const Ty rt = type_of(e, env, ctx)
+		if !str_eq(rec_of(rt), ann) then die("cf0: type: a binding's value does not match its record annotation\n")
+		return rt
+	}
+	# an array-literal binding must be annotated — the element type is NOT inferred from the elements
+	# (`const xs = [1, 2, 3]` is rejected; write `const [3 Iarch] xs = …`). An annotated binding carries
+	# the element type in the literal's `elem_type` (the parser sets it for `let [Elem]`/`[N Elem]`).
+	match e {
+		Expr.ArrayLit(hs, sn, elems, et) -> { if str_eq(et, "") then die("cf0: type: an array literal binding needs a `[…]` annotation\n") },
+		_ -> {}
+	}
+	return type_of(e, env, ctx)
+}
+
+# The enclosing-loop kind threaded through statement checking, so `break`/`continue`/`<-`
+# validate against the NEAREST loop: none, a value-yielding `loop` (exits with `<- v`, so a
+# bare `break` is rejected), a statement `loop`, or a `for` (both statement-only — no `<-`).
+const lk_none = 0
+const lk_value = 1
+const lk_stmt = 2
+const lk_for = 3
+
+# The types every `<- v` in a value-loop body yields — walked so the `loop` expression gets
+# one type. Recurses through `if`/`match`/block bodies but NOT a nested `loop`/`for` (each
+# opens its own value context). (Typed-list helpers avoid a bare `[]` mis-inferring in a
+# match arm; a yield's value is typed in the loop's ENTRY env — sufficient for cf0's uses.)
+const no_tys = (): [Ty] -> {
+	let [Ty] r = []
+	return r
+}
+const one_ty = (Ty t): [Ty] -> {
+	let [Ty] r = [t]
+	return r
+}
+const cat_tys = ([Ty] a, [Ty] b): [Ty] -> {
+	let [Ty] r = a
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(b.len) then break
+		r = [...r, b[i]]
+		i = i + 1
+	}
+	return r
+}
+const yields_of_list = ([Stmt] ss, [VarTy] env0, Ctx ctx): [Ty] -> {
+	# thread the env through bindings so a `<- v` sees `let`s declared earlier in the body
+	# (e.g. a nested loop bound to a name and then yielded) — mirroring the statement checker
+	let [VarTy] env = []
+	let Iarch e0 = 0
+	loop {
+		if e0 >= Iarch(env0.len) then break
+		env = [...env, env0[e0]]
+		e0 = e0 + 1
+	}
+	let [Ty] r = no_tys()
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		const Stmt s = ss[i]
+		match s {
+			Stmt.Let(n, m, ann, e) -> { env = [...env, VarTy({ name: n, ty: binding_ty(ann, e, env, ctx), mutable: m, esc: false, outer: false, fixed: false, is_ref: false, fsize: 0 })] },
+			Stmt.Destructure(pat, m, e) -> { env = check_destructure(pat, m, e, env, ctx) },
+			_ -> { r = cat_tys(r, yields_of_stmt(s, env, ctx)) }
+		}
+		i = i + 1
+	}
+	return r
+}
+const yields_of_arms = ([StmtArm] arms, [VarTy] env, Ctx ctx): [Ty] -> {
+	let [Ty] r = no_tys()
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		# type the arm's `<- v` in the arm's payload-bound env (a `<- boundvar` must resolve)
+		const [VarTy] benv = arm_bind_env(arms[i].type_name, arms[i].members, arms[i].binds, env, ctx)
+		r = cat_tys(r, yields_of_list(arms[i].body, benv, ctx))
+		i = i + 1
+	}
+	return r
+}
+const yields_of_stmt = (Stmt s, [VarTy] env, Ctx ctx): [Ty] -> match s {
+	Stmt.Yield(e) -> one_ty(type_of(e, env, ctx)),
+	Stmt.IfThen(c, b) -> yields_of_stmt(b, env, ctx),
+	Stmt.IfElse(c, tb, eb) -> cat_tys(yields_of_stmt(tb, env, ctx), yields_of_stmt(eb, env, ctx)),
+	Stmt.Block(ss) -> yields_of_list(ss, env, ctx),
+	Stmt.Match(scrut, arms) -> yields_of_arms(arms, env, ctx),
+	_ -> no_tys()
+}
+# The type of a value-yielding `loop { … }`: validate its body in a value-loop context (so
+# `<- v` is allowed, a bare `break` rejected, reachability and returns checked), then require
+# it to reach at least one `<- v` and that all yields share one type.
+const loop_expr_type = ([Stmt] body, [VarTy] env, Ctx ctx): Ty -> {
+	check_stmts(body, env, ctx, lk_value)
+	const [Ty] ys = yields_of_list(body, env, ctx)
+	if Iarch(ys.len) == 0 then die("cf0: type: a `loop` used as a value must reach a `<- v`\n")
+	let Iarch i = 1
+	loop {
+		if i >= Iarch(ys.len) then break
+		if !ty_eq(ys[0], ys[i]) then die("cf0: type: a value-yielding loop's `<- v` yields must all have the same type\n")
+		i = i + 1
+	}
+	return ys[0]
+}
+
+pub const type_of = (Expr e, [VarTy] env, Ctx ctx): Ty -> match e {
+	Expr.Lit(v) -> lit_type(v),
+	Expr.BoolLit(b) -> Ty.TBool,
+	Expr.StrLit(bytes) -> strlit_type(bytes),
+	Expr.FloatLit(t) -> Ty.TFloat(64),
+	Expr.Interp(segs) -> interp_type(segs, env, ctx),
+	Expr.Var(name) -> var_type(env, name, ctx),
+	Expr.FieldExpr(base, f) -> fieldexpr_type(base, f, env, ctx),
+	Expr.Record(tn, inits) -> record_type(tn, inits, env, ctx),
+	Expr.Field(base, f) -> field_type(base, f, env, ctx),
+	Expr.UnionMk(tn, mem, args) -> unionmk_type(tn, mem, args, env, ctx),
+	Expr.Match(scrut, arms) -> match_type(scrut, arms, env, ctx),
+	Expr.ArrayLit(hs, sn, elems, et) -> arraylit_type(hs, sn, elems, et, env, ctx),
+	Expr.Index(arr, idx) -> index_type(arr, idx, env, ctx),
+	Expr.IndexField(arr, idx, f) -> indexfield_type(arr, idx, f, env, ctx),
+	Expr.IndexExpr(base, idx) -> indexexpr_type(base, idx, env, ctx),
+	Expr.Tuple(elems) -> tuple_type(elems, env, ctx),
+	Expr.Unit -> Ty.TUnit,
+	Expr.Loop(body) -> loop_expr_type(body, env, ctx),
+	Expr.Spread(x) -> spread_bad_type(),
+	Expr.Buffer(sz) -> Ty.TPtr,
+	Expr.Addr(name) -> var_type(env, name, ctx),
+	Expr.Neg(x) -> neg_unop(x, env, ctx),
+	Expr.BitNot(x) -> bitnot_unop(x, env, ctx),
+	Expr.Not(x) -> not_op(x, env, ctx),
+	Expr.Add(l, r) -> num_binop(l, r, env, ctx),
+	Expr.Sub(l, r) -> num_binop(l, r, env, ctx),
+	Expr.Mul(l, r) -> num_binop(l, r, env, ctx),
+	Expr.Div(l, r) -> num_binop(l, r, env, ctx),
+	Expr.Mod(l, r) -> int_binop(l, r, env, ctx),
+	Expr.BitAnd(l, r) -> int_binop(l, r, env, ctx),
+	Expr.BitOr(l, r) -> int_binop(l, r, env, ctx),
+	Expr.BitXor(l, r) -> int_binop(l, r, env, ctx),
+	Expr.Shl(l, r) -> int_binop(l, r, env, ctx),
+	Expr.Shr(l, r) -> int_binop(l, r, env, ctx),
+	Expr.CmpEq(l, r) -> cmp_op(l, r, env, ctx, true),
+	Expr.CmpNe(l, r) -> cmp_op(l, r, env, ctx, true),
+	Expr.CmpLt(l, r) -> cmp_op(l, r, env, ctx, false),
+	Expr.CmpGt(l, r) -> cmp_op(l, r, env, ctx, false),
+	Expr.CmpLe(l, r) -> cmp_op(l, r, env, ctx, false),
+	Expr.CmpGe(l, r) -> cmp_op(l, r, env, ctx, false),
+	Expr.And(l, r) -> bool_binop(l, r, env, ctx),
+	Expr.Or(l, r) -> bool_binop(l, r, env, ctx),
+	Expr.If(c, t, e2) -> if_type(c, t, e2, env, ctx),
+	Expr.Call(callee, tyargs, args) -> call_type(callee, tyargs, args, env, ctx),
+	Expr.DeferTap(fn, args) -> defertap_type(fn, args, env, ctx)
+}
+# `defer fn(args)` in value position: the scheduled call must typecheck (arity + argument types,
+# via `call_type`, whose result — fn's return — is discarded), and the expression's type is the
+# TAPPED value: its LAST argument. A no-arg call has nothing to tap (also caught at parse).
+const defertap_type = (Str fn, [Expr] args, [VarTy] env, Ctx ctx): Ty -> {
+	if Iarch(args.len) == 0 then die("cf0: type: `defer` as a value has no tapped argument\n")
+	const [Str] no_ty = []
+	call_type(fn, no_ty, args, env, ctx)
+	return type_of(args[Iarch(args.len) - 1], env, ctx)
+}
+
+# --- statement / function checking ----------------------------------------------------
+# A `Stmt` is dispatched by shape (match arms are expressions, so the components are
+# pulled out and handled inline — mirroring the emitter).
+
+# Check a `for lv in arr { body }`: `arr` must be a dynamic array, and the body is
+# checked with `lv` bound as an `Int`. Called directly from `check_stmts`'s `ForIn`
+# match arm, which binds the loop variable, array name, and body.
+const check_for_body = (Str lv, Str arr, [Stmt] body, [VarTy] env, Ctx ctx): Iarch -> {
+	const Iarch ai = env_index(env, arr)
+	if ai < 0 then die("cf0: type: `for` over an undeclared name\n")
+	if str_eq(dyn_of(env[ai].ty), "") then die("cf0: type: `for` needs a dynamic array\n")
+	if env_index(env, lv) >= 0 then die("cf0: type: a `for` loop variable cannot shadow an existing binding\n")
+	# a `for` binds a loop variable of the array's ELEMENT type (`elem_ty`): a `Str`/record/union
+	# element so `s.len` / `p.field` / a `match` resolve, a float/`[Bool]` element so `if x` / arith
+	# typecheck, a word (or a fixed-width, which `elem_ty` words) as before. (Was: every non-float/Bool
+	# element narrowed to a word — a genesis simplification; now the element type flows through.)
+	const Str fen = dyn_of(env[ai].ty)
+	const Ty lvt = elem_ty(fen, ctx)
+	const [VarTy] benv = [...env, VarTy({ name: lv, ty: lvt, mutable: false, esc: false, outer: false, fixed: false, is_ref: false, fsize: 0 })]
+	return check_stmts(body, benv, ctx, lk_for)
+}
+
+# Check one function: seed the environment with its parameters (immutable; a word
+# `Iarch` is `Int`, a `*[Str]` is `Ptr`), then walk the body growing the environment
+# as `let`/`const` locals bind. A `Let` initializer is typed against the env WITHOUT
+# its own name (so a self-reference is an undeclared-name error); a name may not
+# shadow an existing one; an `Assign` targets an existing mutable name and keeps its
+# type; every `Return` must match the function's declared return type; the body must
+# Whether a value carries an explicit pointer into a function-LOCAL residence — the region-outlives
+# taint (memory_model §6). `&x` always does (in cf0 you can only `&` an aggregate the function owns
+# by value, so `&x` addresses a local). A binding carries it iff its own `esc` flag is set (a `*T`
+# pointer local `= &x`, or a laundering `let q = p`). A record/union/tuple/array literal, or an
+# `if`/`match`/value-block, carries it iff any constituent value does — so `Holder({ p: &x })` and
+# arbitrarily nested constructions are caught. A field/index read propagates its base's taint (a
+# caller's aggregate — a non-`esc` param — reads as outer). A call returns a well-formed (checked)
+# value, never local; scalars/literals carry nothing. (An owned aggregate stored by value into a
+# field moves with its parent and is NOT tainted — cf0 cannot and need not distinguish it from a
+# reference, so only an explicit `&`/pointer-local escaping is flagged.)
+const name_esc = ([VarTy] env, Str n): Bool -> {
+	const Iarch i = env_index(env, n)
+	if i < 0 then return false
+	return env[i].esc
+}
+const carries_local = (Expr e, [VarTy] env, Ctx ctx): Bool -> match e {
+	Expr.Addr(n) -> true,
+	Expr.Var(n) -> name_esc(env, n),
+	# a field READ propagates the local-escape taint iff it reads an aggregate POINTER field (`fptrs`)
+	# of a TAINTED local aggregate — `return localAgg.ptrField` hands up the `&local` stored in it, a
+	# pointer into a dying residence (memory_model §6). A scalar-field read (`p.x`) carries no pointer,
+	# and a pointer field of a PARAM (`param.p`, non-`esc`) points into the caller's region and is safe.
+	# (An index read `a[i]` and a nested `FieldExpr` base stay unpropagated — a further edge.)
+	Expr.Field(base, f) -> name_esc(env, base) && field_is_ptr(base, f, env, ctx),
+	Expr.Record(tn, inits) -> inits_carry_local(inits, env, ctx),
+	Expr.UnionMk(tn, mem, args) -> exprs_carry_local(args, env, ctx),
+	Expr.Tuple(elems) -> exprs_carry_local(elems, env, ctx),
+	Expr.ArrayLit(hs, sn, elems, et) -> exprs_carry_local(elems, env, ctx),
+	Expr.If(c, t, el) -> carries_local(t, env, ctx) || carries_local(el, env, ctx),
+	Expr.Match(sc, arms) -> arms_carry_local(arms, env, ctx),
+	Expr.Loop(body) -> body_yields_local(body, env, ctx),
+	_ -> false
+}
+const exprs_carry_local = ([Expr] es, [VarTy] env, Ctx ctx): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(es.len) then break
+		if carries_local(es[i], env, ctx) then return true
+		i = i + 1
+	}
+	return false
+}
+const inits_carry_local = ([FieldInit] inits, [VarTy] env, Ctx ctx): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(inits.len) then break
+		if carries_local(inits[i].value, env, ctx) then return true
+		i = i + 1
+	}
+	return false
+}
+const arms_carry_local = ([MatchArm] arms, [VarTy] env, Ctx ctx): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		if carries_local(arms[i].body, env, ctx) then return true
+		i = i + 1
+	}
+	return false
+}
+# A value block / value-yielding loop carries a local pointer iff any `<- v` yields one (recursing
+# into nested if/block/match statements, but NOT a nested loop — it opens its own value context).
+const stmt_yields_local = (Stmt s, [VarTy] env, Ctx ctx): Bool -> match s {
+	Stmt.Yield(v) -> carries_local(v, env, ctx),
+	Stmt.IfThen(c, b) -> stmt_yields_local(b, env, ctx),
+	Stmt.IfElse(c, tb, eb) -> stmt_yields_local(tb, env, ctx) || stmt_yields_local(eb, env, ctx),
+	Stmt.Block(ss) -> body_yields_local(ss, env, ctx),
+	Stmt.Match(sc, arms) -> stmt_arms_yield_local(arms, env, ctx),
+	_ -> false
+}
+const body_yields_local = ([Stmt] ss, [VarTy] env, Ctx ctx): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		if stmt_yields_local(ss[i], env, ctx) then return true
+		i = i + 1
+	}
+	return false
+}
+const stmt_arms_yield_local = ([StmtArm] arms, [VarTy] env, Ctx ctx): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		if body_yields_local(arms[i].body, env, ctx) then return true
+		i = i + 1
+	}
+	return false
+}
+# return.
+# Check a single "simple" statement — one that neither binds a name nor opens a block:
+# a loop exit, an early `return`, an assignment, or a statement-position `if` guard.
+# It is the body of every `IfThen` guard and the fall-through case of `check_stmts`.
+# Returns a reachability code: 2 = an unconditional `return`, 1 = `break`/`continue`,
+# 0 = falls through (an assignment, or a guard — the guarded statement is conditional,
+# so a guard never terminates the enclosing flow). A binding or block statement in a
+# guard body is rejected.
+const check_simple_stmt = (Stmt s, [VarTy] env, Ctx ctx, Iarch loop_kind): Iarch -> {
+	let Iarch code = 0
+	match s {
+		Stmt.Break -> {
+			if loop_kind == lk_none then die("cf0: type: `break` is only valid inside a loop\n")
+			# a value-yielding loop exits with `<- v`, never a bare `break`
+			if loop_kind == lk_value then die("cf0: type: a value-yielding loop exits with `<- v`, not a bare `break`\n")
+			code = 1
+		},
+		Stmt.Continue -> {
+			if loop_kind == lk_none then die("cf0: type: `continue` is only valid inside a loop\n")
+			code = 1
+		},
+		Stmt.Yield(e) -> {
+			# `<- v` yields a value from the nearest loop; only a `loop` used as an expression
+			# has a value slot (a statement `loop`/`for` does not). The value merges through one
+			# 8-byte slot, so it must be a scalar OR an 8-byte-pointer aggregate (a record, a union,
+			# or a Str — each an arena pointer); a tuple/array yield is rejected (its binding would
+			# need element/telem metadata the merge slot does not carry).
+			if loop_kind != lk_value then die("cf0: type: `<- v` is only valid inside a value-yielding `loop`\n")
+			const Ty yt = type_of(e, env, ctx)
+			if !is_int_like(yt) && !is_tbool(yt) && !is_tfloat(yt) && str_eq(rec_of(yt), "") && str_eq(union_of(yt), "") && !is_tstr(yt) then die("cf0: type: a value-yielding loop yields a scalar, a record, a union, or a Str — not a tuple or array\n")
+			code = 1
+		},
+		Stmt.Return(e) -> {
+			# region-outlives: a returned value handed up to the caller may not carry a pointer into a
+			# function-LOCAL residence — it would dangle once this call's locals die (memory_model §6).
+			# (Returning a local aggregate BY VALUE is fine — it re-homes upward; only an explicit `&`
+			# pointer, or an aggregate built holding one, escapes.)
+			if carries_local(e, env, ctx) then die("cf0: type: a returned value cannot carry a pointer into a local — it would dangle once the call returns\n")
+			# a bare `[]` return adopts the function's declared element type (context-directed —
+			# `type_of` would default it to `[Iarch]` and spuriously mismatch a `[Str]`/`[T]` return)
+			if is_empty_arraylit(e) then {
+				if str_eq(dyn_of(ctx.frt), "") then die("cf0: type: `[]` may only be returned as a dynamic array\n")
+			} else if is_bare_record(e) then {
+				# a bare `({…})` record literal is typed by the return annotation (its own type_name is
+				# empty); a non-record return type cannot accept it (437)
+				const Str rrt = rec_of(ctx.frt)
+				if str_eq(rrt, "") then die("cf0: type: a bare `({…})` record literal does not fit a non-record return type\n")
+				record_type(rrt, record_inits(e), env, ctx)
+			} else if is_fixed_name(dyn_of(ctx.frt)) && arraylit_len(e) >= 0 then {
+				# a returned array LITERAL adopts a fixed-WIDTH element type: bare integer elements take the
+				# width (`[3 Int32] -> [1,2,3]`) instead of defaulting to `[Iarch]` and spuriously mismatching (913).
+				const Ty rty = arraylit_ret_ty(e, dyn_of(ctx.frt), env, ctx)
+				if !ty_eq(rty, ctx.frt) then die("cf0: type: a returned value's type must match the function's return type\n")
+			} else {
+				# register-width words interconvert on return (`Iarch`/`Uarch`/a bare literal → `Uarch`),
+				# e.g. a folded `[Uarch n]` value-param body returning `42`; a narrow fixed return (733) is strict
+				const Ty rty = type_of(e, env, ctx)
+				if !ty_eq(rty, ctx.frt) && !(is_wordish(rty) && is_wordish(ctx.frt)) then die("cf0: type: a returned value's type must match the function's return type\n")
+			}
+			# a `[N T]` FIXED-array return: a returned array LITERAL must have exactly N elements (904).
+			# (A non-literal return — a param/call/binding — is not statically length-checked here.)
+			if ctx.frsize > 0 && arraylit_len(e) >= 0 && arraylit_len(e) != ctx.frsize then die("cf0: type: a fixed-array return's length must match the declared `[N …]`\n")
+			code = 2
+		},
+		Stmt.Assign(n, e) -> {
+			const Iarch idx = env_index(env, n)
+			if idx < 0 then die("cf0: type: assignment to an undeclared name\n")
+			if !env[idx].mutable then die("cf0: type: cannot reassign a `const` binding or a parameter\n")
+			# an empty `[]` reset keeps a dynamic-array binding's type (its element is unknown,
+			# adopted from the target — `arraylit_type` would otherwise default it to `Iarch`)
+			if is_empty_arraylit(e) then {
+				if str_eq(dyn_of(env[idx].ty), "") then die("cf0: type: `[]` may only be assigned to a dynamic array\n")
+			} else if !str_eq(dyn_of(env[idx].ty), "") && is_plain_arraylit_e(e) then {
+				# a `[T]` is grown/reset, not overwritten: reassign via `xs = [...xs, e]` or `xs = []`,
+				# never a plain literal `xs = [9, 9]` (which would silently drop the old vector)
+				die("cf0: type: a `[T]` is reassigned only by growth `[...xs, e]` or reset `[]`, not a plain literal\n")
+			} else if is_tfixed(env[idx].ty) && is_adoptable_lit(e) then {
+				# a bare integer literal adopts the fixed-width binding's type (range-checked),
+				# just as at its declaration — `let Uint8 x = 5; x = 99`
+				fixed_lit_fits(e, tfixed_bits(env[idx].ty), tfixed_signed(env[idx].ty))
+			} else {
+				const Ty vty = type_of(e, env, ctx)
+				if !ty_eq(vty, env[idx].ty) then die("cf0: type: a reassignment must keep the binding's type\n")
+			}
+		},
+		Stmt.FieldAssign(b, f, e) -> {
+			const Iarch idx = env_index(env, b)
+			if idx < 0 then die("cf0: type: field assignment to an undeclared name\n")
+			if !env[idx].mutable && !env[idx].is_ref then die("cf0: type: cannot mutate a `const` record's fields\n")
+			const Str tn = rec_of(env[idx].ty)
+			if str_eq(tn, "") then die("cf0: type: field assignment needs a record on the left\n")
+			const Iarch ri = find_rec(ctx.recs, tn)
+			const Iarch fi = field_index(ctx.recs[ri].fields, f)
+			if fi < 0 then die("cf0: type: mutating a field the record does not declare\n")
+			const Ty ft = field_decl_ty(ri, fi, ctx)
+			# region-outlives: rehoming a pointer into a caller-provided aggregate (an `outer` param, which
+			# OUTLIVES this call) may not store a pointer into a function-LOCAL — it would dangle once the
+			# local dies (memory_model §6). A store into a local record is same-rank and permitted.
+			if env[idx].outer && carries_local(e, env, ctx) then die("cf0: type: cannot rehome a pointer into a local through a caller's aggregate — it would dangle once the call returns\n")
+			if !ty_eq(type_of(e, env, ctx), ft) then die("cf0: type: a field value's type must match the field\n")
+		},
+		Stmt.DeepFieldAssign(be, f, e) -> {
+			# a chained lvalue `a.b.c = v`: `be` addresses the penultimate record (a Field/FieldExpr chain,
+			# each hop an 8-byte arena-pointer load), `f` its final field. The chain's ROOT must be writable
+			# (a mutable binding or an `is_ref` reference — like the single-level `mutable || is_ref` rule).
+			const Ty bt = type_of(be, env, ctx)
+			const Str tn = rec_of(bt)
+			if str_eq(tn, "") then die("cf0: type: field assignment needs a record on the left\n")
+			if !lvalue_root_writable(be, env) then die("cf0: type: cannot mutate a `const` record's fields\n")
+			const Iarch ri = find_rec(ctx.recs, tn)
+			const Iarch fi = field_index(ctx.recs[ri].fields, f)
+			if fi < 0 then die("cf0: type: mutating a field the record does not declare\n")
+			const Ty ft = field_decl_ty(ri, fi, ctx)
+			# region-outlives: rehoming through a caller-provided (`outer`) aggregate may not store a local pointer
+			const Str rn = lvalue_root_name(be)
+			const Iarch rIdx = env_index(env, rn)
+			if rIdx >= 0 && env[rIdx].outer && carries_local(e, env, ctx) then die("cf0: type: cannot rehome a pointer into a local through a caller's aggregate — it would dangle once the call returns\n")
+			if !ty_eq(type_of(e, env, ctx), ft) then die("cf0: type: a field value's type must match the field\n")
+		},
+		Stmt.IndexAssign(a, ix, val) -> {
+			const Iarch idx = env_index(env, a)
+			if idx < 0 then die("cf0: type: element assignment to an undeclared name\n")
+			if !env[idx].mutable then die("cf0: type: cannot write to a `const`/borrowed array\n")
+			if str_eq(dyn_of(env[idx].ty), "") && !is_tptr(env[idx].ty) then die("cf0: type: element assignment needs a dynamic array or a byte buffer\n")
+			if !is_tint(type_of(ix, env, ctx)) then die("cf0: type: an array index must be an integer\n")
+			# a byte buffer (`[N Uint8]`, a `$ptr`) holds `Uint8`: a literal element must fit 0..255.
+			# (A non-literal stays a byte word — a byte read `src[i]` types `Int`, not `Uint8`, so no
+			# implicit-narrowing gate is possible without also rejecting the legitimate byte-copy path.)
+			if is_tptr(env[idx].ty) && is_adoptable_lit(val) then {
+				const Iarch lv = lit_signed_val(val)
+				if lv < 0 || lv > 255 then die("cf0: type: a byte-buffer element literal must be in 0..255\n")
+			}
+			# a FLOAT-element array (`[Float64]`/`[Float32]`) takes a matching float value; otherwise the
+			# element value is any integer word — a plain `Iarch`/`Int` OR a fixed-width (`Int16`, `Uint8`, …)
+			const Ty vt = type_of(val, env, ctx)
+			const Str aen = dyn_of(env[idx].ty)
+			if is_float_name(aen) then {
+				if !ty_eq(vt, elem_ty(aen, ctx)) then die("cf0: type: a float array element needs a matching float value\n")
+			} else if str_eq(aen, "Bool") then {
+				if !is_tbool(vt) then die("cf0: type: a `[Bool]` array element needs a Bool value\n")
+			} else if !is_tint(vt) && !is_tfixed(vt) then die("cf0: type: an array element must be an integer\n")
+		},
+		Stmt.IfThen(c, body) -> {
+			if !is_tbool(type_of(c, env, ctx)) then die("cf0: type: an `if` condition must be a Bool (no truthiness)\n")
+			check_simple_stmt(body, env, ctx, loop_kind)
+		},
+		Stmt.IfElse(c, tb, eb) -> {
+			if !is_tbool(type_of(c, env, ctx)) then die("cf0: type: an `if` condition must be a Bool (no truthiness)\n")
+			const Iarch tc = check_simple_stmt(tb, env, ctx, loop_kind)
+			const Iarch ec = check_simple_stmt(eb, env, ctx, loop_kind)
+			# terminal only if BOTH branches terminate; the function returns on this path
+			# only if both branches `return` (a `break`/`continue` leaves the loop, not the fn).
+			if tc >= 1 then { if ec >= 1 then code = 1 }
+			if tc == 2 then { if ec == 2 then code = 2 }
+		},
+		Stmt.Do(e) -> {
+			# a call-for-effect: type it (validates the callee and arguments), discard the result
+			type_of(e, env, ctx)
+		},
+		Stmt.Block(stmts) -> {
+			# a `{ … }` guard body — its own scope; its terminal code is the block's.
+			code = check_stmts(stmts, env, ctx, loop_kind)
+		},
+		Stmt.Match(scrut, arms) -> {
+			# a statement-position `match` — dispatched for effect; terminal iff every arm is.
+			code = check_stmt_match(scrut, arms, env, ctx, loop_kind)
+		},
+		_ -> {
+			die("cf0: type: a statement `if` may guard only a block, a `return`, an assignment, a call, or `break`/`continue`\n")
+		}
+	}
+	return code
+}
+
+# Check a statement list against a starting environment (reconstructed into a local
+# so a nested block's bindings do not leak). Returns the list's terminal code — 2 if it
+# ends by returning, 1 by `break`/`continue`, 0 if it falls through — the same code
+# `check_simple_stmt` uses. A `Let` initializer is typed without its own name (a
+# self-reference is undeclared) and may not shadow; a `for` iterates a dynamic array with
+# its loop variable an `Int` bound in the (recursively checked) body; every other statement
+# is a "simple" one delegated to `check_simple_stmt`, whose reachability code drives the
+# unreachable-after-terminator and must-return checks.
+# --- closures (memory_model §7) — validated here; the lift pass lowers them after -----------
+# A closure's declared return type (an unannotated closure yields the implicit `Int`, like a
+# value function), and its nominal function-value signature (its parameter types then its
+# return) — bound in the environment so a call `f(x)` typechecks (via `indirect_call_type`) and
+# using it as a plain value is rejected (`use(f)` where an `Iarch` is expected).
+const closure_ret_ty = (Str ret, Ctx ctx): Ty -> {
+	if str_eq(ret, "") then return Ty.TInt
+	return named_ty(ret, "", ctx.recs, ctx.unions)
+}
+const closure_tfn = (Str ret, [Param] params): Ty -> {
+	let [TupElem] sig = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(params.len) then break
+		sig = [...sig, tel_leaf(fn_sig_name(params[i].type_name))]
+		i = i + 1
+	}
+	sig = [...sig, tel_leaf(fn_sig_name(ret))]
+	return Ty.TFn(sig)
+}
+# Does a closure body directly contain another closure? v1 forbids nesting.
+const body_has_closure = ([Stmt] ss): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		const Bool isc = match ss[i] { Stmt.Closure(a, b, c, d) -> true, _ -> false }
+		if isc then return true
+		i = i + 1
+	}
+	return false
+}
+# Does a statement contain a closure ANYWHERE at any depth (in nested blocks, loops, `if`
+# branches, `for` bodies, or match arms)? v1 admits a closure ONLY as a direct statement of its
+# enclosing function's body — the lift pass lowers those; one buried in control flow would slip
+# through to emit. `check_func` uses this to reject the buried case with a clean diagnostic.
+const stmt_arms_have_closure = ([StmtArm] arms): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		if stmts_have_closure(arms[i].body) then return true
+		i = i + 1
+	}
+	return false
+}
+const stmts_have_closure = ([Stmt] ss): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		if stmt_has_closure(ss[i]) then return true
+		i = i + 1
+	}
+	return false
+}
+const stmt_has_closure = (Stmt s): Bool -> match s {
+	Stmt.Closure(a, b, c, d) -> true,
+	Stmt.Block(ss) -> stmts_have_closure(ss),
+	Stmt.Loop(ss) -> stmts_have_closure(ss),
+	Stmt.ForIn(v, a, body) -> stmts_have_closure(body),
+	Stmt.IfThen(c, st) -> stmt_has_closure(st),
+	Stmt.IfElse(c, t, e) -> stmt_has_closure(t) || stmt_has_closure(e),
+	Stmt.Match(scrut, arms) -> stmt_arms_have_closure(arms),
+	_ -> false
+}
+# A closure may appear ONLY as a direct statement of the function body (v1). A top-level closure
+# is allowed (its own body must contain no closure); any closure buried in a nested statement is
+# rejected here rather than surviving unlowered to emit.
+const enforce_toplevel_closures = ([Stmt] body): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(body.len) then break
+		match body[i] {
+			Stmt.Closure(nm, params, ret, cbody) -> { if stmts_have_closure(cbody) then die("cf0: type: a closure cannot be nested in another closure\n") },
+			_ -> { if stmt_has_closure(body[i]) then die("cf0: type: a closure must be a top-level statement of its function (v1)\n") }
+		}
+		i = i + 1
+	}
+	return 0
+}
+# --- defer (memory_model §6) — validated here; the defer.cf pass lowers it after ------------
+# Does a statement contain a `defer` anywhere at any depth (in a nested block, loop, `if`
+# branch, `for` body, match arm, or another defer)? A defer is admitted ONLY as a direct
+# statement of the function body (v1) — the lowering pass rewrites the returns of a
+# defer-bearing body; one buried in control flow would slip through unlowered.
+const stmt_arms_have_defer = ([StmtArm] arms): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		if stmts_have_defer(arms[i].body) then return true
+		i = i + 1
+	}
+	return false
+}
+const stmts_have_defer = ([Stmt] ss): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		if stmt_has_defer(ss[i]) then return true
+		i = i + 1
+	}
+	return false
+}
+const stmt_has_defer = (Stmt s): Bool -> match s {
+	Stmt.Defer(ss) -> true,
+	Stmt.Block(ss) -> stmts_have_defer(ss),
+	Stmt.Loop(ss) -> stmts_have_defer(ss),
+	Stmt.ForIn(v, a, body) -> stmts_have_defer(body),
+	Stmt.IfThen(c, st) -> stmt_has_defer(st),
+	Stmt.IfElse(c, t, e) -> stmt_has_defer(t) || stmt_has_defer(e),
+	Stmt.Match(scrut, arms) -> stmt_arms_have_defer(arms),
+	_ -> false
+}
+# Does a statement contain a `return` anywhere at any depth? A defer body runs at scope exit,
+# after the return value is fixed, so it cannot itself `return`.
+const stmt_arms_have_return = ([StmtArm] arms): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		if stmts_have_return(arms[i].body) then return true
+		i = i + 1
+	}
+	return false
+}
+const stmts_have_return = ([Stmt] ss): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		if stmt_has_return(ss[i]) then return true
+		i = i + 1
+	}
+	return false
+}
+const stmt_has_return = (Stmt s): Bool -> match s {
+	Stmt.Return(e) -> true,
+	Stmt.Block(ss) -> stmts_have_return(ss),
+	Stmt.Loop(ss) -> stmts_have_return(ss),
+	Stmt.ForIn(v, a, body) -> stmts_have_return(body),
+	Stmt.IfThen(c, st) -> stmt_has_return(st),
+	Stmt.IfElse(c, t, e) -> stmt_has_return(t) || stmt_has_return(e),
+	Stmt.Match(scrut, arms) -> stmt_arms_have_return(arms),
+	_ -> false
+}
+# A `defer` may appear ONLY as a direct statement of the function body (v1). A defer nested in
+# a loop / `if` / block / match / another defer is rejected here rather than surviving
+# unlowered to emit; a defer body may not `return`.
+const enforce_toplevel_defer = ([Stmt] body): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(body.len) then break
+		match body[i] {
+			Stmt.Defer(dbody) -> {
+				if stmts_have_defer(dbody) then die("cf0: type: a `defer` cannot be nested in another `defer`\n")
+				if stmts_have_return(dbody) then die("cf0: type: a `defer` body runs at scope exit and cannot `return`\n")
+			},
+			_ -> { if stmt_has_defer(body[i]) then die("cf0: type: a `defer` must be a top-level statement of its function (v1)\n") }
+		}
+		i = i + 1
+	}
+	return 0
+}
+# Does an expression contain a `defer`-tap (`defer f(x)` / `|> defer f`) anywhere? A defer-tap is
+# a value form admitted ONLY in a direct function-body binding/return (v1) — the hoist pass lifts
+# those; one buried elsewhere would slip through. Recurses into the sub-expression-bearing forms
+# (emit's `DeferTap` die-arm is the final backstop for any exotic nesting this misses).
+const exprs_have_defertap = ([Expr] es): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(es.len) then break
+		if expr_has_defertap(es[i]) then return true
+		i = i + 1
+	}
+	return false
+}
+const expr_has_defertap = (Expr e): Bool -> match e {
+	Expr.DeferTap(fn, args) -> true,
+	Expr.Call(n, ta, args) -> exprs_have_defertap(args),
+	Expr.UnionMk(t, m, args) -> exprs_have_defertap(args),
+	Expr.Tuple(elems) -> exprs_have_defertap(elems),
+	Expr.ArrayLit(hs, sn, elems, et) -> expr_has_defertap(sn) || exprs_have_defertap(elems),
+	Expr.FieldExpr(b, f) -> expr_has_defertap(b),
+	Expr.IndexExpr(b, i) -> expr_has_defertap(b) || expr_has_defertap(i),
+	Expr.Spread(x) -> expr_has_defertap(x),
+	Expr.Buffer(sz) -> expr_has_defertap(sz),
+	Expr.Neg(x) -> expr_has_defertap(x),
+	Expr.Not(x) -> expr_has_defertap(x),
+	Expr.BitNot(x) -> expr_has_defertap(x),
+	Expr.Add(l, r) -> expr_has_defertap(l) || expr_has_defertap(r),
+	Expr.Sub(l, r) -> expr_has_defertap(l) || expr_has_defertap(r),
+	Expr.Mul(l, r) -> expr_has_defertap(l) || expr_has_defertap(r),
+	Expr.Div(l, r) -> expr_has_defertap(l) || expr_has_defertap(r),
+	Expr.Mod(l, r) -> expr_has_defertap(l) || expr_has_defertap(r),
+	Expr.BitAnd(l, r) -> expr_has_defertap(l) || expr_has_defertap(r),
+	Expr.BitOr(l, r) -> expr_has_defertap(l) || expr_has_defertap(r),
+	Expr.BitXor(l, r) -> expr_has_defertap(l) || expr_has_defertap(r),
+	Expr.Shl(l, r) -> expr_has_defertap(l) || expr_has_defertap(r),
+	Expr.Shr(l, r) -> expr_has_defertap(l) || expr_has_defertap(r),
+	Expr.CmpEq(l, r) -> expr_has_defertap(l) || expr_has_defertap(r),
+	Expr.CmpNe(l, r) -> expr_has_defertap(l) || expr_has_defertap(r),
+	Expr.CmpLt(l, r) -> expr_has_defertap(l) || expr_has_defertap(r),
+	Expr.CmpGt(l, r) -> expr_has_defertap(l) || expr_has_defertap(r),
+	Expr.CmpLe(l, r) -> expr_has_defertap(l) || expr_has_defertap(r),
+	Expr.CmpGe(l, r) -> expr_has_defertap(l) || expr_has_defertap(r),
+	Expr.And(l, r) -> expr_has_defertap(l) || expr_has_defertap(r),
+	Expr.Or(l, r) -> expr_has_defertap(l) || expr_has_defertap(r),
+	Expr.If(c, t, e2) -> expr_has_defertap(c) || expr_has_defertap(t) || expr_has_defertap(e2),
+	_ -> false
+}
+# Does a statement (or any statement it nests) contain a `defer`-tap in one of its expressions?
+const arms_have_defertap = ([StmtArm] arms): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		if stmts_have_defertap(arms[i].body) then return true
+		i = i + 1
+	}
+	return false
+}
+const stmts_have_defertap = ([Stmt] ss): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		if stmt_has_defertap(ss[i]) then return true
+		i = i + 1
+	}
+	return false
+}
+const stmt_has_defertap = (Stmt s): Bool -> match s {
+	Stmt.Let(n, m, ann, e) -> expr_has_defertap(e),
+	Stmt.Assign(n, e) -> expr_has_defertap(e),
+	Stmt.FieldAssign(b, f, e) -> expr_has_defertap(e),
+	Stmt.DeepFieldAssign(be, f, e) -> expr_has_defertap(be) || expr_has_defertap(e),
+	Stmt.IndexAssign(a, i, v) -> expr_has_defertap(i) || expr_has_defertap(v),
+	Stmt.Return(e) -> expr_has_defertap(e),
+	Stmt.Do(e) -> expr_has_defertap(e),
+	Stmt.Yield(e) -> expr_has_defertap(e),
+	Stmt.Destructure(pat, m, e) -> expr_has_defertap(e),
+	Stmt.ForIn(v, a, body) -> stmts_have_defertap(body),
+	Stmt.Loop(body) -> stmts_have_defertap(body),
+	Stmt.IfThen(c, st) -> expr_has_defertap(c) || stmt_has_defertap(st),
+	Stmt.IfElse(c, t, e) -> expr_has_defertap(c) || stmt_has_defertap(t) || stmt_has_defertap(e),
+	Stmt.Block(ss) -> stmts_have_defertap(ss),
+	Stmt.Match(scrut, arms) -> expr_has_defertap(scrut) || arms_have_defertap(arms),
+	Stmt.Closure(nm, params, ret, body) -> stmts_have_defertap(body),
+	Stmt.Defer(body) -> stmts_have_defertap(body),
+	_ -> false
+}
+# Is every `defer`-tap in `e` in a position the hoist pass can lift — the whole value, or nested
+# only through call arguments (`dbl(x |> defer log)`)? A defer-tap as an operand of any other form
+# (`defer f(x) + 1`, a tuple/record/array element, …) is not lifted (v1), so it is rejected with a
+# clean message rather than reaching emit's internal die-arm.
+const exprs_defertap_hoistable = ([Expr] es): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(es.len) then break
+		if !defertap_hoistable(es[i]) then return false
+		i = i + 1
+	}
+	return true
+}
+const defertap_hoistable = (Expr e): Bool -> match e {
+	Expr.DeferTap(fn, args) -> exprs_defertap_hoistable(args),
+	Expr.Call(n, ta, args) -> exprs_defertap_hoistable(args),
+	_ -> !expr_has_defertap(e)
+}
+# A `defer`-tap value is admitted ONLY as (part of) a direct function-body binding / return / call
+# statement, and only in a hoistable position within it (v1). One in a nested statement (a loop
+# body, an `if` branch, a defer body), in any other top-level statement, or embedded in a larger
+# expression is rejected here with a clean message.
+const enforce_toplevel_defertap = ([Stmt] body): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(body.len) then break
+		match body[i] {
+			Stmt.Let(n, m, ann, e) -> { if !defertap_hoistable(e) then die("cf0: type: a `defer`-tap value must be the whole bound value or a pipe target, not part of a larger expression (v1)\n") },
+			Stmt.Return(e) -> { if !defertap_hoistable(e) then die("cf0: type: a `defer`-tap value must be the whole returned value or a pipe target, not part of a larger expression (v1)\n") },
+			Stmt.Do(e) -> { if !defertap_hoistable(e) then die("cf0: type: a `defer`-tap value must be a pipe target, not part of a larger expression (v1)\n") },
+			_ -> { if stmt_has_defertap(body[i]) then die("cf0: type: `defer` as a value is only valid in a function's top-level binding or return (v1)\n") }
+		}
+		i = i + 1
+	}
+	return 0
+}
+# Validate a closure: check its body in the enclosing environment extended with its (immutable)
+# parameters, requiring a return; a captured `const`/parameter is thus non-mutable, so mutating
+# it through the closure is rejected there. Returns the environment extended with the closure
+# name bound as a function value.
+# A by-reference aggregate type (record / union / tuple / dynamic array / `Str`) — captured as a
+# borrowed pointer, not a repointable slot. A scalar (int/fixed/float/Bool) is not.
+const ty_is_agg = (Ty t): Bool -> !str_eq(rec_of(t), "") || !str_eq(union_of(t), "") || is_ttuple(t) || is_tdyn(t) || is_tstr(t)
+# Does `n` name a CAPTURED aggregate — a var from the enclosing env `caps` whose type is by-reference?
+const assign_hits_capture_agg = (Str n, [VarTy] caps): Bool -> {
+	const Iarch i = env_index(caps, n)
+	if i < 0 then return false
+	return ty_is_agg(caps[i].ty)
+}
+# Scan a closure body for a WHOLE-reassign of a captured aggregate (`cap = mk(9)`): a captured
+# record/union/tuple/array/Str is a by-reference borrow with no repointable slot, so the reassign
+# has no storage and silently miscompiles (1054). Field mutation through the capture, and
+# reassigning a captured SCALAR (held by its slot address), stay legal. `caps` is the enclosing env.
+const stmts_reassign_capture_agg = ([Stmt] ss, [VarTy] caps): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		if stmt_reassigns_capture_agg(ss[i], caps) then return true
+		i = i + 1
+	}
+	return false
+}
+const arms_reassign_capture_agg = ([StmtArm] arms, [VarTy] caps): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		if stmts_reassign_capture_agg(arms[i].body, caps) then return true
+		i = i + 1
+	}
+	return false
+}
+const stmt_reassigns_capture_agg = (Stmt s, [VarTy] caps): Bool -> match s {
+	Stmt.Assign(n, e) -> assign_hits_capture_agg(n, caps),
+	Stmt.Block(ss) -> stmts_reassign_capture_agg(ss, caps),
+	Stmt.IfThen(c, b) -> stmt_reassigns_capture_agg(b, caps),
+	Stmt.IfElse(c, t, el) -> stmt_reassigns_capture_agg(t, caps) || stmt_reassigns_capture_agg(el, caps),
+	Stmt.Loop(bd) -> stmts_reassign_capture_agg(bd, caps),
+	Stmt.ForIn(v, a, bd) -> stmts_reassign_capture_agg(bd, caps),
+	Stmt.Match(sc, arms) -> arms_reassign_capture_agg(arms, caps),
+	_ -> false
+}
+const check_closure = (Str nm, [Param] params, Str ret, [Stmt] body, [VarTy] env, Ctx ctx): [VarTy] -> {
+	if stmts_reassign_capture_agg(body, env) then die("cf0: type: cannot whole-reassign a captured aggregate — it is a by-reference borrow with no repointable slot (mutate its fields instead)\n")
+	if env_index(env, nm) >= 0 then die("cf0: type: a binding cannot shadow an existing name\n")
+	if body_has_closure(body) then die("cf0: type: a closure cannot be nested in another closure\n")
+	const Ty crt = closure_ret_ty(ret, ctx)
+	const Ctx cctx = Ctx({ funcs: ctx.funcs, recs: ctx.recs, unions: ctx.unions, frt: crt, frsize: 0 })
+	let [VarTy] cenv = env
+	let Iarch pi = 0
+	loop {
+		if pi >= Iarch(params.len) then break
+		check_ptr_pointee(params[pi], ctx.recs, ctx.unions)
+		cenv = [...cenv, VarTy({ name: params[pi].name, ty: param_ty(params[pi], ctx.recs, ctx.unions), mutable: false, esc: false, outer: false, fixed: false, is_ref: false, fsize: 0 })]
+		pi = pi + 1
+	}
+	const Iarch dr = check_stmts(body, cenv, cctx, lk_none)
+	if dr != 2 then die("cf0: type: a closure body must end with `return`\n")
+	return [...env, VarTy({ name: nm, ty: closure_tfn(ret, params), mutable: false, esc: false, outer: false, fixed: false, is_ref: false, fsize: 0 })]
+}
+
+const check_stmts = ([Stmt] stmts, [VarTy] env0, Ctx ctx, Iarch loop_kind): Iarch -> {
+	let [VarTy] env = []
+	let Iarch e0 = 0
+	loop {
+		if e0 >= Iarch(env0.len) then break
+		env = [...env, env0[e0]]
+		e0 = e0 + 1
+	}
+	let Bool terminated = false
+	let Iarch term_code = 0
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(stmts.len) then break
+		if terminated then die("cf0: type: unreachable statement after `break`/`continue`/`return`\n")
+		const Stmt s = stmts[i]
+		match s {
+			Stmt.Loop(bd) -> { check_stmts(bd, env, ctx, lk_stmt) },
+			Stmt.ForIn(fv, fa, fbd) -> { check_for_body(fv, fa, fbd, env, ctx) },
+			Stmt.Let(n, m, ann, e) -> {
+				if env_index(env, n) >= 0 then die("cf0: type: a binding cannot shadow an existing name\n")
+				# an inferred pointer local — a read of a `*Record`/`*Union` reference field — binds `const`,
+				# not `let`: a reference cannot be repointed (993, the inferred analog of `const *P p = &x`).
+				if m && is_ptr_field_read(e, env, ctx) then die("cf0: type: an inferred pointer local (a `*` reference field read) binds `const`, not `let` — a reference cannot be repointed\n")
+				const Ty ty = binding_ty(ann, e, env, ctx)
+				# a `[N T]` FIXED binding whose initializer length is statically known (an array-returning
+				# CALL, or a literal not already caught at parse) must match N (905).
+				const Iarch fs = fix_ann_size(ann)
+				if fs > 0 then {
+					const Iarch il = fixed_expr_len(e, env, ctx)
+					if il >= 0 && il != fs then die("cf0: type: a fixed-array binding's length must match the declared `[N …]`\n")
+				}
+				if m && is_ttuple(ty) then die("cf0: type: a tuple binds `const` only (a mutable tuple is a later brick)\n")
+				if is_ttuple(ty) && !is_tuple_bindable(e) then die("cf0: type: this expression cannot bind a tuple\n")
+				# a binding inherits the region-outlives taint of its initializer: `const *P p = &x`, or a
+				# `let q = p` that launders one, carries a local pointer that a later escape must catch.
+				env = [...env, VarTy({ name: n, ty: ty, mutable: m, esc: carries_local(e, env, ctx), outer: false, fixed: is_fix_ann(ann), is_ref: inits_ref(e, env, ctx), fsize: fix_ann_size(ann) })]
+			},
+			Stmt.Destructure(pat, m, e) -> { env = check_destructure(pat, m, e, env, ctx) },
+			Stmt.Closure(nm, params, ret, body) -> { env = check_closure(nm, params, ret, body, env, ctx) },
+			# a `defer` body is checked in the current environment (its call/mutations must resolve
+			# and typecheck); a captured `const`/parameter stays non-mutable, so mutating it is
+			# rejected here. A defer is NON-terminal (like a `Do`) — control falls through to the
+			# real `return` that follows. The top-level-only / no-`return`-inside rules are enforced
+			# separately by `enforce_toplevel_defer`.
+			Stmt.Defer(dbody) -> { check_stmts(dbody, env, ctx, lk_none) },
+			_ -> {
+				const Iarch t = check_simple_stmt(s, env, ctx, loop_kind)
+				if t >= 1 then {
+					terminated = true
+					term_code = t
+				}
+			}
+		}
+		i = i + 1
+	}
+	return term_code
+}
+
+# Check a statement-position `match scrut { arms }` — the scrutinee must be a union; the
+# same coverage rules as an expression match (every arm names that union and one of its
+# members, no member twice, no arm after `_`, exhaustive unless a `_` is present, and a
+# payload pattern's arity/uniqueness matches its member). Each arm body is a statement list
+# checked in the outer env extended with the arm's payload binds (its own scope, so its
+# locals do not leak). A statement `match` is always treated as NON-terminal (returns 0, so
+# a function still needs an explicit trailing `return` after it) — matching the genesis
+# compiler, and correct for cf0's own use where every arm falls through.
+# The statement analogues of `arms_are_str` / string-arm validation (StmtArm bodies are `[Stmt]`).
+const stmt_arms_are_str = ([StmtArm] arms): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		if !arms[i].is_wild then return str_eq(arms[i].type_name, "$str")
+		i = i + 1
+	}
+	return false
+}
+const check_str_stmt_match = (Ty sty, [StmtArm] arms, [VarTy] env, Ctx ctx, Iarch loop_kind): Iarch -> {
+	let [Iarch] wilds = []
+	let [Str] tns = []
+	let [[Str]] memss = []
+	let Iarch j = 0
+	loop {
+		if j >= Iarch(arms.len) then break
+		if arms[j].is_wild then wilds = [...wilds, 1] else wilds = [...wilds, 0]
+		tns = [...tns, arms[j].type_name]
+		memss = [...memss, arms[j].members]
+		j = j + 1
+	}
+	check_str_arms(sty, wilds, tns, memss)
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		check_stmts(arms[i].body, env, ctx, loop_kind)
+		i = i + 1
+	}
+	return 0
+}
+# The statement analogue of `arms_are_int` — the arms are `$int`-sentinel integer-literal patterns.
+const stmt_arms_are_int = ([StmtArm] arms): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		if !arms[i].is_wild then return str_eq(arms[i].type_name, "$int")
+		i = i + 1
+	}
+	return false
+}
+# A statement-position integer match (`match n { 0 -> {…}, 1 | 2 -> {…}, _ -> {…} }`): validate the
+# arm metadata via the shared `check_int_arms` (integer scrutinee, mandatory `_`, no dup literal, no
+# union mixing), then check each arm's statement body in the outer env (an int arm binds nothing).
+const check_int_stmt_match = (Ty sty, [StmtArm] arms, [VarTy] env, Ctx ctx, Iarch loop_kind): Iarch -> {
+	let [Iarch] wilds = []
+	let [Str] tns = []
+	let [[Str]] memss = []
+	let Iarch j = 0
+	loop {
+		if j >= Iarch(arms.len) then break
+		if arms[j].is_wild then wilds = [...wilds, 1] else wilds = [...wilds, 0]
+		tns = [...tns, arms[j].type_name]
+		memss = [...memss, arms[j].members]
+		j = j + 1
+	}
+	check_int_arms(sty, wilds, tns, memss)
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		check_stmts(arms[i].body, env, ctx, loop_kind)
+		i = i + 1
+	}
+	return 0
+}
+const check_stmt_match = (Expr scrut, [StmtArm] arms, [VarTy] env, Ctx ctx, Iarch loop_kind): Iarch -> {
+	const Ty sty = type_of(scrut, env, ctx)
+	# a STRING statement-match — arms are constant Str patterns, not union members
+	if stmt_arms_are_str(arms) then return check_str_stmt_match(sty, arms, env, ctx, loop_kind)
+	# an INTEGER statement-match — arms are constant integer patterns, not union members
+	if stmt_arms_are_int(arms) then return check_int_stmt_match(sty, arms, env, ctx, loop_kind)
+	# a `Bool` scrutinee matches as the tag-only union `{ False, True }` (§8.6); `Bool` is the
+	# primitive `TBool`, not a table union, so its members come from `bool_members()`
+	let Str un = union_of(sty)
+	if str_eq(un, "") && is_tbool(sty) then un = "Bool"
+	if str_eq(un, "") then die("cf0: type: a match scrutinee must be a union\n")
+	const Iarch ui = find_union(ctx.unions, un)
+	let [UnionMember] mems = bool_members()
+	if ui >= 0 then mems = ctx.unions[ui].members
+	const Iarch na = Iarch(arms.len)
+	if na == 0 then die("cf0: type: a match needs at least one arm\n")
+	let [Iarch] covered = []
+	let Bool wild_seen = false
+	let Iarch i = 0
+	loop {
+		if i >= na then break
+		if arms[i].is_wild then {
+			if wild_seen then die("cf0: type: a match has at most one `_`\n")
+			wild_seen = true
+		} else {
+			if wild_seen then die("cf0: type: no match arm may follow `_`\n")
+			if !str_eq(arms[i].type_name, un) then die("cf0: type: a match arm must name the scrutinee's union\n")
+			# a payload-binding arm is single-member: validate arity + no repeated bind name (skipping
+			# guards), and resolve its sub-pattern guards — a GUARDED arm only partially covers its member.
+			let Bool guarded = false
+			if Iarch(arms[i].binds.len) > 0 then {
+				const Iarch mi0 = union_member_index(mems, arms[i].members[0])
+				if Iarch(arms[i].binds.len) != Iarch(mems[mi0].payloads.len) then die("cf0: type: a payload pattern's arity must match the member\n")
+				let Iarch di = 0
+				loop {
+					if di >= Iarch(arms[i].binds.len) then break
+					if !str_eq(arms[i].binds[di], "_") && !is_pat_guard(arms[i].binds[di]) then {
+						let Iarch dj = 0
+						loop {
+							if dj >= di then break
+							if str_eq(arms[i].binds[dj], arms[i].binds[di]) then die("cf0: type: a payload binding name may not repeat\n")
+							dj = dj + 1
+						}
+					}
+					di = di + 1
+				}
+				guarded = check_arm_guards(ui, mems, mi0, arms[i].binds, ctx)
+			}
+			let Iarch mj = 0
+			loop {
+				if mj >= Iarch(arms[i].members.len) then break
+				const Iarch mi = union_member_index(mems, arms[i].members[mj])
+				if mi < 0 then die("cf0: type: a match arm names a nonexistent union member\n")
+				if guarded then {
+					# a guarded arm only partially covers its member: it never proves the member
+					# exhausted, and it is unreachable if an earlier unguarded arm already did
+					if int_in(covered, mi) then die("cf0: type: a guarded match arm is unreachable (its member is already fully covered)\n")
+				} else {
+					if int_in(covered, mi) then die("cf0: type: a union member is matched twice\n")
+					covered = [...covered, mi]
+				}
+				mj = mj + 1
+			}
+		}
+		const [VarTy] benv = arm_bind_env(arms[i].type_name, arms[i].members, arms[i].binds, env, ctx)
+		check_stmts(arms[i].body, benv, ctx, loop_kind)
+		i = i + 1
+	}
+	if !wild_seen then {
+		if Iarch(covered.len) != Iarch(mems.len) then die("cf0: type: a match must cover every union member or carry a `_`\n")
+	}
+	return 0
+}
+
+# Check one function: seed the environment with its parameters (immutable), then
+# check the body — which must return.
+const check_func = (Func fn, Ctx ctx): Iarch -> {
+	# a `(A, B, …)` tuple return: `main` yields the process exit code (an Iarch) so it may
+	# not return a tuple, and each element must name a real type (Iarch/Bool/Str/a record).
+	if str_eq(fn.ret_name, "$tuple") then {
+		if str_eq(fn.name, "main") then die("cf0: type: main must return an Iarch exit code, not a tuple\n")
+		# validate each element names a real type (recursing into nested tuples) — canon dies
+		# on an unknown name
+		canon_telems(fn.ret_telems, ctx.recs, ctx.unions)
+	}
+	# `main` yields the process exit code (an Iarch), so an explicit `Unit`/`()` return type
+	# (or the valueless `return` that desugars to `()`) is rejected there.
+	if str_eq(fn.name, "main") && str_eq(fn.ret_name, "Unit") then die("cf0: type: main must return an Iarch exit code, not Unit\n")
+	# an asm-bodied function has no statement body to check — its parameters and return type
+	# still register it for callers (call_type resolves them); the asm is emitted verbatim.
+	if fn.is_asm then {
+		# at most 8 parameters (the arm64 argument registers x0..x7, 174) and a MANDATORY return
+		# type (the spec requires it — an untyped `-> asm …` is rejected, 175)
+		if Iarch(fn.params.len) > 8 then die("cf0: type: an asm function takes at most 8 parameters (the arm64 argument registers)\n")
+		if str_eq(fn.ret_name, "") then die("cf0: type: an asm function must declare its return type\n")
+		return 0
+	}
+	# a concrete function's signature may not mention a type variable (an undeclared `'T` in a
+	# non-generic function, or one the monomorph pass left unsubstituted)
+	if sig_has_typevar(fn) then die("cf0: type: an undeclared type variable in a function signature\n")
+	const Ty frt = func_ret_ty(fn, ctx.recs, ctx.unions)
+	# thread this function's return type on the Ctx so `type_of` (a value-loop body) can reach it
+	const Ctx fctx = Ctx({ funcs: ctx.funcs, recs: ctx.recs, unions: ctx.unions, frt: frt, frsize: fn.ret_size })
+	let [VarTy] env = []
+	let Iarch pi = 0
+	loop {
+		if pi >= Iarch(fn.params.len) then break
+		# a `*T` pointer parameter must point to a record or union, never a scalar (§6.4)
+		check_ptr_pointee(fn.params[pi], ctx.recs, ctx.unions)
+		# a `(A, …) -> R` function-type parameter: arity cap + scalar components (679/680)
+		check_fn_param_sig(fn.params[pi], ctx)
+		const Ty pty = param_ty(fn.params[pi], ctx.recs, ctx.unions)
+		# a `*Record` pointer parameter is mutable — its fields are written through it
+		const Bool pmut = param_is_recptr(fn.params[pi], ctx.recs) || param_is_indexptr(fn.params[pi])
+		# a `*T` pointer parameter is a caller-provided home that OUTLIVES this call (`outer`): the
+		# region-outlives check rejects rehoming a pointer-into-local through it (memory_model §6).
+		env = [...env, VarTy({ name: fn.params[pi].name, ty: pty, mutable: pmut, esc: false, outer: fn.params[pi].is_ptr, fixed: false, is_ref: fn.params[pi].is_ptr, fsize: 0 })]
+		pi = pi + 1
+	}
+	# a closure is admitted only as a direct function-body statement (v1); reject one buried in
+	# control flow before it survives unlowered to emit
+	enforce_toplevel_closures(fn.body)
+	# a defer is admitted only as a direct function-body statement (v1), and its body may not
+	# `return`; reject the buried / returning cases before the lowering pass runs
+	enforce_toplevel_defer(fn.body)
+	# a defer-tap VALUE (`defer f(x)` / `|> defer f`) is admitted only in a top-level binding/return
+	enforce_toplevel_defertap(fn.body)
+	const Iarch dr = check_stmts(fn.body, env, fctx, lk_none)
+	if dr != 2 then die("cf0: type: a function body must end with `return`\n")
+	return 0
+}
+
+# Whether a field/return type NAME is one cf0 recognizes — a builtin scalar, `Str`/`Bool`/`Unit`, an
+# array/pointer/tuple marker, or a declared record/union. An unknown name (`Nope`, or a generic
+# application `Point[Iarch]` on a non-generic type left un-mangled by resolve) is rejected, rather
+# than silently falling through `named_ty` to the word `TInt`.
+const name_has_byte = (Str n, Iarch ch): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(n.len) then break
+		if Iarch(n[i]) == ch then return true
+		i = i + 1
+	}
+	return false
+}
+const is_known_typename = (Str name, [RecDecl] recs, [UnionDecl] unions): Bool -> {
+	# a generic APPLICATION (`U[Iarch]`, byte 91 `[`) or MEMBER type (`Maybe[Iarch].Just`, byte 46 `.`)
+	# is validated by resolve/monomorph, not here — pass it through (applying to a non-generic type is
+	# a separate later gate, so `Point[Iarch]` on a plain record is NOT caught by this field-type check)
+	if name_has_byte(name, 91) || name_has_byte(name, 46) then return true
+	if str_eq(name, "$dyn") || str_eq(name, "$ptr") || str_eq(name, "$tuple") then return true
+	if str_eq(name, "Str") || str_eq(name, "Bool") || str_eq(name, "Unit") then return true
+	if is_cast_type(name) then return true
+	if is_float_name(name) then return true
+	if find_rec(recs, name) >= 0 then return true
+	if find_union(unions, name) >= 0 then return true
+	return false
+}
+# Whole-program structure: no two records or functions share a name, and there is
+# exactly one `pub const main` (the entry) with at most three parameters.
+const check_whole = (Program prog): Iarch -> {
+	let Iarch r = 0
+	loop {
+		if r >= Iarch(prog.recs.len) then break
+		let Iarch q = 0
+		loop {
+			if q >= r then break
+			if str_eq(prog.recs[q].name, prog.recs[r].name) then die("cf0: type: two records share a name\n")
+			q = q + 1
+		}
+		# a record may not reuse a union's name (a data/union name clash, either declaration order)
+		if find_union(prog.unions, prog.recs[r].name) >= 0 then die("cf0: type: a data type and a union cannot share a name\n")
+		# a record needs at least one field, and its field names must be distinct
+		const Iarch nf = Iarch(prog.recs[r].fields.len)
+		if nf == 0 then die("cf0: type: a record needs at least one field\n")
+		let Iarch a = 0
+		loop {
+			if a >= nf then break
+			let Iarch b = 0
+			loop {
+				if b >= a then break
+				if str_eq(prog.recs[r].fields[b], prog.recs[r].fields[a]) then die("cf0: type: a record declares a field twice\n")
+				b = b + 1
+			}
+			# a type variable `'T` in a field needs a generic data declaration to bind it; a
+			# plain `data` record is not generic, so the `'T` is undeclared (validated here at the
+			# declaration, since a never-USED field would otherwise slip past resolution)
+			if name_is_typevar(prog.recs[r].ftypes[a]) then die("cf0: type: an undeclared type variable in a record field\n")
+			# a field type must name a known type — a builtin, `Str`/`Bool`, or a declared record/union
+			# (an unknown name like `Nope`, or a generic application on a non-generic type, is rejected)
+			if !is_known_typename(prog.recs[r].ftypes[a], prog.recs, prog.unions) then die("cf0: type: a record field names an unknown type\n")
+			if str_eq(prog.recs[r].ftypes[a], "$tuple") && telems_have_typevar(prog.recs[r].ftelems[a]) then die("cf0: type: an undeclared type variable in a tuple field\n")
+			# a `*[T]` raw-pointer field is indexed `f[i]` by element width, so its element must be a
+			# word scalar — `*[Uint8]` (byte) or `*[Iarch]`/a fixed-width (word). A `*[Str]`/record
+			# element has no meaningful stride and is rejected (874); a `*Record` field has `felem` ""
+			if str_eq(prog.recs[r].ftypes[a], "$ptr") && !str_eq(prog.recs[r].felems[a], "") && !is_ptr_field_elem(prog.recs[r].felems[a]) then die("cf0: type: a `*[T]` pointer field element must be `Uint8`, `Iarch`, or a fixed-width integer\n")
+			a = a + 1
+		}
+		r = r + 1
+	}
+	let Iarch mains = 0
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(prog.funcs.len) then break
+		let Iarch j = 0
+		loop {
+			if j >= i then break
+			if str_eq(prog.funcs[j].name, prog.funcs[i].name) then die("cf0: type: two functions share a name\n")
+			j = j + 1
+		}
+		# `asm` is a reserved keyword (it heads an assembly body), so it cannot name a function
+		if str_eq(prog.funcs[i].name, "asm") then die("cf0: type: `asm` is a reserved keyword and cannot name a function\n")
+		if str_eq(prog.funcs[i].name, "main") then {
+			if !prog.funcs[i].is_pub then die("cf0: type: `main` must be `pub`\n")
+			if Iarch(prog.funcs[i].params.len) > 3 then die("cf0: type: `main` takes at most three parameters\n")
+			# `main`'s value is the process exit code, so it returns a word `Iarch` (or is unannotated);
+			# a record/union/Str/array/tuple return is rejected
+			const Str mrt = prog.funcs[i].ret_name
+			if !str_eq(mrt, "") && !str_eq(mrt, "Iarch") && !str_eq(mrt, "Int") && !str_eq(mrt, "Uarch") then die("cf0: type: `main` must return `Iarch` (its value is the exit code)\n")
+			mains = mains + 1
+		}
+		i = i + 1
+	}
+	if mains == 0 then die("cf0: type: no `pub const main` entry point\n")
+	return 0
+}
+
+# Typecheck the whole program: its structure, then every function. This phase is the
+# authority for all semantic validation; the emitter does no re-checking.
+pub const check_program = (Program prog): Iarch -> {
+	check_whole(prog)
+	let Ctx ctx = Ctx({ funcs: prog.funcs, recs: prog.recs, unions: prog.unions, frt: Ty.TInt, frsize: 0 })
+	let Iarch f = 0
+	loop {
+		if f >= Iarch(prog.funcs.len) then break
+		check_func(prog.funcs[f], ctx)
+		f = f + 1
+	}
+	return 0
+}

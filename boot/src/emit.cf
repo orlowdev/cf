@@ -1,0 +1,3905 @@
+# emit — the AST to QBE IL + an asm floor.
+#
+# `emit_expr` walks the expression tree with `match`, writing one QBE
+# instruction per interior node and returning the operand (`%tN`, or an inline
+# literal) that holds the node's value. A `*Emit` context threads the output fd
+# and the temp/label counters; a `[Binding]` environment (a read-only borrow)
+# resolves variable references to their stack slots. `emit_program` walks the
+# body's statement list and appends the freestanding `_start` floor.
+#
+# cf0 cannot yet spawn `qbe`/`cc`, so it emits the QBE IL and the arm64 asm floor
+# to two file descriptors and the external driver runs the `qbe`→`cc` tail.
+#
+# ⚠ THROWAWAY codegen — NOT the cf0 `%node`/`%ret` ABI or the real page/arena
+# runtime (reintroduced at the M6/M9 representation gate). Integer ops are word
+# (`w`) ops; every local is a word stack slot (`alloc4`/`storew`/`loadw`); `/`/`%`
+# do not yet apply the §5.6 divide-by-zero guard; `const` vs `let` mutability is
+# not yet enforced (that is the typecheck brick).
+
+import "io" as { write_str, die }
+import "ast" as { Expr, Stmt, Param, Func, FieldInit, RecDecl, UnionMember, UnionDecl, MatchArm, StmtArm, Seg, TupElem, Program }
+import "astutil" as { is_spread, spread_inner, is_skip, skip_count, is_nested, nested_inner, tel_leaf, tel_nest, tel_is_nest, tel_is_fn, is_fixed_name, fixed_bits, fixed_signed, is_pat_guard, is_member_guard, is_int_guard, guard_body, guard_qual, guard_member }
+
+# The emit context: the QBE-IL output fd, the next free temp number, the next free
+# basic-block label id, the program's functions (a call resolves its callee — by
+# name to a function index — for the `$f<i>` symbol), its record declarations (a
+# field read / data literal resolves a field's byte offset), and its union
+# declarations (a `Type.member` / `match` resolves a member's tag). `next`/`label`
+# reset per function; `funcs`/`recs`/`unions` are constant across the program.
+# `cur_slot` is the merge-slot temp of the nearest value-yielding `loop` (or -1) — a `<- v`
+# stores into it and jumps to `@lend${cur_loop}`, and the `loop` expression loads it afterward.
+data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs, [RecDecl] recs, [UnionDecl] unions, Iarch cur_loop, Iarch cur_slot, Str cur_ret }
+
+# A local/parameter in scope: its interned name, `slot`, its `rec_type` (a record/union
+# type name, `"$dyn"`, `"$ptr"`, or `"Str"` — `""` for a word), and `elem` (a dynamic
+# array's element type name, `rec_type` then `"$dyn"`).
+# `is_cell` distinguishes the two slot representations. When true, `slot` is a stack cell
+# holding the value/pointer — read with `loadl`, REASSIGNED with `storel`: every word local
+# and every MUTABLE (`let`) aggregate (so `xs = []` / `acc = Expr.Add(acc, r)` repoint it).
+# When false, `slot` is a write-once temp holding the aggregate base pointer directly (read
+# as the operand): a `const` aggregate and every aggregate/pointer PARAMETER (a borrow).
+# `telems` carries a tuple binding's per-position element type names (a record name,
+# `"Str"`, or `""` for a word); it is the empty list for every non-tuple binding.
+# `fixed` is the binding's fixed-width type NAME (`Int8`…`Uint64`) or `""` for a plain word /
+# aggregate — kept SEPARATE from `rec_type` because a fixed value is a WORD (it must not read
+# as an aggregate pointer), yet emit still needs its width/signedness to drive fixed-width ops.
+data Binding = { Str name, Iarch slot, Str rec_type, Str elem, Bool is_cell, [TupElem] telems, Str fixed }
+
+# Byte-wise `Str` equality (variable-name lookup).
+const str_eq = (Str a, Str b): Bool -> {
+	if a.len != b.len then return false
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(a.len) then break
+		if Iarch(a[i]) != Iarch(b[i]) then return false
+		i = i + 1
+	}
+	return true
+}
+
+# The index of `name`'s binding in `env`, or -1. The typecheck phase has resolved
+# every reference, so a hit is guaranteed for well-typed input.
+const lookup_index = ([Binding] env, Str name): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(env.len) then break
+		if str_eq(env[i].name, name) then return i
+		i = i + 1
+	}
+	return 0 - 1
+}
+
+# The value/base-pointer operand of binding `idx`: for a cell binding (a word or a mutable
+# aggregate — `is_cell`) load the current contents; for a write-once temp (a `const`
+# aggregate / a parameter) the temp IS the operand. Callers that need a record base, a `$dyn`
+# header, or a `$ptr` go through this so a repointed `let` aggregate reads its live pointer.
+const binding_ptr = (*Emit ctx, [Binding] env, Iarch idx): Str -> {
+	if !env[idx].is_cell then return "%t${env[idx].slot}"
+	const Iarch t = ctx.next
+	ctx.next = ctx.next + 1
+	# a float cell loads with its QBE type (`loadd`/`loads`); every other word/pointer is `loadl`
+	if is_float_name(env[idx].fixed) then {
+		const Str qt = float_qt(env[idx].fixed)
+		write_str(ctx.fd, "\t%t${t} =${qt} load${qt} %t${env[idx].slot}\n")
+	} else {
+		write_str(ctx.fd, "\t%t${t} =l loadl %t${env[idx].slot}\n")
+	}
+	return "%t${t}"
+}
+# The QBE store op for a scalar-typed value: `stored`/`stores` for a float, else `storel`.
+const store_op = (Str scalar): Str -> if is_float_name(scalar) then "store${float_qt(scalar)}" else "storel"
+
+# The index of the record declared as `name`, or -1.
+const find_rec = ([RecDecl] recs, Str name): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(recs.len) then break
+		if str_eq(recs[i].name, name) then return i
+		i = i + 1
+	}
+	return 0 - 1
+}
+
+# Is a dynamic-array element an aggregate that rides as an 8-byte pointer (a record or
+# a `Str`), rather than a word? Records and strings store `storel`/`loadl`; `Iarch`/""
+# store `storew`/`loadw`.
+const elem_is_agg = (*Emit ctx, Str elem): Bool -> {
+	if is_nested(elem) then return true
+	if str_eq(elem, "Str") then return true
+	if find_rec(ctx.recs, elem) >= 0 then return true
+	if find_union(ctx.unions, elem) >= 0 then return union_is_boxed(ctx.unions, elem)
+	return false
+}
+
+# A dynamic array's element STRIDE in bytes: a `[Uint8]` is byte-PACKED (stride 1, so
+# `Str(v)` can borrow its backing as contiguous bytes — the string-builder finish); every
+# other element (a word, a `Str`/`[T]`/record/union pointer) rides in an 8-byte slot.
+const elem_bytes = (Str elem): Iarch -> {
+	if str_eq(elem, "Uint8") then return 1
+	return 8
+}
+
+# A raw pointer's element STRIDE: a `*[Uint8]`/opaque byte pointer or buffer (`elem` "" or an
+# 8-bit fixed type) is byte-packed (stride 1, `loadub`/`storeb`); a `*[Iarch]` word pointer
+# strides 8 (`loadl`/`storel`). Distinct from `elem_bytes` because an EMPTY elem means "byte
+# buffer" here (a `$ptr` from `cf_alloc`/a `[N Uint8]` buffer), not the word default.
+const ptr_stride = (Str elem): Iarch -> {
+	if str_eq(elem, "") then return 1
+	if is_fixed_name(elem) && fixed_bits(elem) == 8 then return 1
+	return 8
+}
+
+# The byte offset of field `field` in record type `rt` — its declaration index × 8
+# (uniform 8-byte slots; a word field rides in the low 4 bytes). Typecheck guarantees both resolve.
+const field_offset = ([RecDecl] recs, Str rt, Str field): Iarch -> {
+	const Iarch ri = find_rec(recs, rt)
+	# `rt` is "" when a value's aggregate type could not be recovered (`init_agg_type` returned "")
+	# — e.g. a record bound from a `match` PAYLOAD (`M.Some(x) -> x`), which this env cannot resolve.
+	# Fail with a clean diagnostic rather than dereferencing `recs[-1]` (a segfault).
+	if ri < 0 then die("cf0: emit: a field access on a value whose record type is unknown here (an aggregate bound from a match payload is not yet supported)\n")
+	let Iarch fi = 0
+	loop {
+		if fi >= Iarch(recs[ri].fields.len) then break
+		if str_eq(recs[ri].fields[fi], field) then return fi * 8
+		fi = fi + 1
+	}
+	return 0
+}
+
+# Is field `field` of record `rt` an 8-byte POINTER (a `Str`, a `[T]`, a record, or a
+# boxed union) rather than a word (`Iarch`/`Int`/`Bool`/a tag-only union)? Drives the
+# store/load width. The field's declared type name is in the record's `ftypes`.
+const field_is_ptr = (*Emit ctx, Str rt, Str field): Bool -> {
+	const Iarch ri = find_rec(ctx.recs, rt)
+	if ri < 0 then return false
+	let Iarch fi = 0
+	loop {
+		if fi >= Iarch(ctx.recs[ri].fields.len) then break
+		if str_eq(ctx.recs[ri].fields[fi], field) then {
+			const Str ft = ctx.recs[ri].ftypes[fi]
+			if str_eq(ft, "$dyn") then return true
+			if str_eq(ft, "$tuple") then return true
+			if str_eq(ft, "$ptr") then return true
+			if str_eq(ft, "Str") then return true
+			if find_rec(ctx.recs, ft) >= 0 then return true
+			if find_union(ctx.unions, ft) >= 0 then return union_is_boxed(ctx.unions, ft)
+			return false
+		}
+		fi = fi + 1
+	}
+	return false
+}
+
+# The `[T]` element type name of field `field` of record `rt` (its `felems` entry, "" for a
+# non-array field) — carried onto a binding that adopts the field's dynamic array.
+const field_elem = (*Emit ctx, Str rt, Str field): Str -> {
+	const Iarch ri = find_rec(ctx.recs, rt)
+	if ri < 0 then return ""
+	let Iarch fi = 0
+	loop {
+		if fi >= Iarch(ctx.recs[ri].fields.len) then break
+		if str_eq(ctx.recs[ri].fields[fi], field) then return ctx.recs[ri].felems[fi]
+		fi = fi + 1
+	}
+	return ""
+}
+
+# The index of the union declared as `name`, or -1; and a member's tag (its index).
+const find_union = ([UnionDecl] unions, Str name): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(unions.len) then break
+		if str_eq(unions[i].name, name) then return i
+		i = i + 1
+	}
+	return 0 - 1
+}
+const member_tag = ([UnionDecl] unions, Str type_name, Str member): Iarch -> {
+	# `Bool` is the primitive tag-only union `{ False, True }` (§8.6), not in the tables: True=1, False=0
+	if str_eq(type_name, "Bool") then {
+		if str_eq(member, "True") then return 1
+		return 0
+	}
+	const Iarch ui = find_union(unions, type_name)
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(unions[ui].members.len) then break
+		if str_eq(unions[ui].members[i].name, member) then return i
+		i = i + 1
+	}
+	return 0
+}
+
+# Is `name` a declared TAG-ONLY union (no member carries a payload)? Such a value rides as a bare
+# word tag with no aggregate marker, so — exactly like `Bool` — its type name is recorded in a
+# binding's `fixed` slot to survive to interpolation, where it renders `Type.Member` via the tag.
+const is_tagonly_union = (*Emit ctx, Str name): Bool -> find_union(ctx.unions, name) >= 0 && !union_is_boxed(ctx.unions, name)
+
+# Is a union boxed (any member carries a payload)? A boxed union value is a pointer
+# to an arena `{tag, payload…}`; a tag-only union value is a bare word tag.
+const union_is_boxed = ([UnionDecl] unions, Str name): Bool -> {
+	const Iarch ui = find_union(unions, name)
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(unions[ui].members.len) then break
+		if Iarch(unions[ui].members[i].payloads.len) > 0 then return true
+		i = i + 1
+	}
+	return false
+}
+
+# Is a parameter an aggregate passed by pointer — a record or a BOXED union (a
+# tag-only union rides as a word tag, not an aggregate)?
+const is_agg_param = (Param p, [RecDecl] recs, [UnionDecl] unions): Bool -> {
+	if p.is_ptr then return false
+	if str_eq(p.type_name, "$tuple") then return true
+	if str_eq(p.type_name, "$dyn") then return true
+	if str_eq(p.type_name, "Str") then return true
+	if find_rec(recs, p.type_name) >= 0 then return true
+	if find_union(unions, p.type_name) >= 0 then return union_is_boxed(unions, p.type_name)
+	return false
+}
+
+# Does a parameter ride in an `l` register — a raw pointer (argv/envp) or an aggregate?
+const param_l = (Param p, [RecDecl] recs, [UnionDecl] unions): Bool -> {
+	if p.is_ptr then return true
+	return is_agg_param(p, recs, unions)
+}
+
+# Does a return type ride in an `l` register — a record or a boxed union pointer?
+const ret_is_l = (Str ret_name, [RecDecl] recs, [UnionDecl] unions): Bool -> {
+	if str_eq(ret_name, "$dyn") then return true
+	if str_eq(ret_name, "$tuple") then return true
+	if str_eq(ret_name, "Str") then return true
+	if find_rec(recs, ret_name) >= 0 then return true
+	if find_union(unions, ret_name) >= 0 then return union_is_boxed(unions, ret_name)
+	return false
+}
+
+# The RETURN signature position of a `$fn` binding — the last telem of its whole `[args…, ret]`
+# signature. A function-value binding always carries at least the return, so this is safe.
+const fn_ret_telem = (Binding b): TupElem -> b.telems[Iarch(b.telems.len) - 1]
+
+# A call argument's operand: the temp holding it, and whether it is a record pointer
+# (emitted `l`) rather than a word (`w`).
+data ArgOp = { Iarch temp, Bool is_rec, Str qt }
+
+# --- expression emit ------------------------------------------------------------------
+
+# The fixed-width type NAME an expression evaluates to (`""` when it is a plain word or a
+# non-integer). cf0 has no typed AST, so emit re-derives it: a `TN(x)` cast is `TN`; a var is
+# its binding's recorded fixed type; a binary/unary op takes its fixed operand's type; a call
+# takes its callee's return type; a literal has none (it adopts). Drives the signed-vs-unsigned
+# op choice and the width to which a fixed result is wrapped.
+# The SCALAR-LEAF type NAME an expression evaluates to — a fixed-width integer (`Int8`…`Uint64`)
+# OR a float (`Float32`/`Float64`), else `""` (a plain word or non-scalar). cf0 has no typed AST,
+# so emit re-derives it: a `TN(x)` cast is `TN`, a var is its binding's recorded scalar type, a
+# binop/unop takes its scalar operand's type, a call its callee's return type, a float literal is
+# `Float64`. It drives fixed signed/unsigned+wrap codegen AND float `d`/`s` codegen (`qtype_of`).
+const call_scalar = (*Emit ctx, Str callee): Str -> {
+	if is_fixed_name(callee) || is_float_name(callee) then return callee
+	const Iarch fidx = find_func(ctx.funcs, callee)
+	if fidx < 0 then return ""
+	if is_fixed_name(ctx.funcs[fidx].ret_name) || is_float_name(ctx.funcs[fidx].ret_name) then return ctx.funcs[fidx].ret_name
+	return ""
+}
+const var_scalar = ([Binding] env, Str n): Str -> {
+	const Iarch idx = lookup_index(env, n)
+	if idx < 0 then return ""
+	return env[idx].fixed
+}
+# The scalar-leaf type of a call result, env-aware: an INDIRECT call through a function-value
+# binding yields its signature's return type (`elem`); a direct call defers to `call_scalar`.
+const call_scalar_e = (*Emit ctx, [Binding] env, Str callee): Str -> {
+	const Iarch bi = lookup_index(env, callee)
+	if bi >= 0 then { if str_eq(env[bi].rec_type, "$fn") then return scalar_only(fn_ret_telem(env[bi]).name) }
+	return call_scalar(ctx, callee)
+}
+# A record field / tuple position / array element type NAME, kept only when it is a scalar leaf.
+const scalar_only = (Str name): Str -> if is_fixed_name(name) || is_float_name(name) then name else ""
+const field_scalar = (*Emit ctx, Str rt, Str field): Str -> scalar_only(field_ftype(ctx, rt, field))
+const idx_scalar = ([Binding] env, Str arr, Expr idx): Str -> {
+	const Iarch ai = lookup_index(env, arr)
+	if ai < 0 then return ""
+	# a FLOAT dynamic-array element (`xs[i]`) reports its float type so an op picks up float codegen;
+	# other arrays keep the tuple-position path (empty for a word/aggregate element)
+	if str_eq(env[ai].rec_type, "$dyn") && is_float_name(env[ai].elem) then return env[ai].elem
+	return scalar_only(telem_name(env[ai].telems, tuple_lit_index(idx)))
+}
+const idxexpr_scalar = (*Emit ctx, [Binding] env, Expr base, Expr idx): Str -> scalar_only(telem_name(init_telems(ctx, env, base), tuple_lit_index(idx)))
+const match_scalar = (*Emit ctx, [Binding] env, [MatchArm] arms): Str -> {
+	if Iarch(arms.len) == 0 then return ""
+	return scalar_of(ctx, env, arms[0].body)
+}
+# The scalar type a value-yielding `loop` produces — the first `<- v`'s type (all yields agree,
+# per typecheck). Walks the body like the type checker's yield walk, recursing into if/match/block
+# but NOT a nested loop, so a fixed/float-yielding loop used in an op still gets the right codegen.
+const loop_yield_scalar_list = (*Emit ctx, [Binding] env, [Stmt] ss): Str -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		const Str f = loop_yield_scalar_stmt(ctx, env, ss[i])
+		if !str_eq(f, "") then return f
+		i = i + 1
+	}
+	return ""
+}
+const loop_yield_scalar_arms = (*Emit ctx, [Binding] env, [StmtArm] arms): Str -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		const Str f = loop_yield_scalar_list(ctx, env, arms[i].body)
+		if !str_eq(f, "") then return f
+		i = i + 1
+	}
+	return ""
+}
+const loop_yield_scalar_stmt = (*Emit ctx, [Binding] env, Stmt s): Str -> match s {
+	Stmt.Yield(e) -> scalar_of(ctx, env, e),
+	Stmt.IfThen(c, b) -> loop_yield_scalar_stmt(ctx, env, b),
+	Stmt.IfElse(c, tb, eb) -> loop_yield_scalar_either(ctx, env, tb, eb),
+	Stmt.Block(ss) -> loop_yield_scalar_list(ctx, env, ss),
+	Stmt.Match(scrut, arms) -> loop_yield_scalar_arms(ctx, env, arms),
+	_ -> ""
+}
+const loop_yield_scalar_either = (*Emit ctx, [Binding] env, Stmt a, Stmt b): Str -> {
+	const Str f = loop_yield_scalar_stmt(ctx, env, a)
+	if !str_eq(f, "") then return f
+	return loop_yield_scalar_stmt(ctx, env, b)
+}
+# The AGGREGATE type a value-yielding `loop` produces (a record/union/Str name / `$dyn` / `$tuple`,
+# else "") — the first `<- v` whose value is an aggregate. Mirrors `loop_yield_scalar_*` but reports
+# the aggregate marker (`init_agg_type`), so `let R r = loop { … <- R({…}) }` binds `r` as its record.
+# A scalar yield is "" (not an aggregate) and the walk continues; since all yields share a type
+# (typecheck), the first aggregate found is the loop's type. A `match` arm's body is walked in that
+# arm's payload-binding env (`arm_bind_types`), so a `<- x` yielding a bound payload aggregate is
+# recovered correctly (and consistently with the value `emit_match` stores).
+const loop_yield_agg_list = (*Emit ctx, [Binding] env, [Stmt] ss): Str -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		const Str f = loop_yield_agg_stmt(ctx, env, ss[i])
+		if !str_eq(f, "") then return f
+		i = i + 1
+	}
+	return ""
+}
+const loop_yield_agg_arms = (*Emit ctx, [Binding] env, [StmtArm] arms): Str -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		const [Binding] aenv = arm_bind_types(ctx, env, arms[i].type_name, arms[i].members, arms[i].binds)
+		const Str f = loop_yield_agg_list(ctx, aenv, arms[i].body)
+		if !str_eq(f, "") then return f
+		i = i + 1
+	}
+	return ""
+}
+const loop_yield_agg_either = (*Emit ctx, [Binding] env, Stmt a, Stmt b): Str -> {
+	const Str f = loop_yield_agg_stmt(ctx, env, a)
+	if !str_eq(f, "") then return f
+	return loop_yield_agg_stmt(ctx, env, b)
+}
+const loop_yield_agg_stmt = (*Emit ctx, [Binding] env, Stmt s): Str -> match s {
+	Stmt.Yield(e) -> init_agg_type(ctx, env, e),
+	Stmt.IfThen(c, b) -> loop_yield_agg_stmt(ctx, env, b),
+	Stmt.IfElse(c, tb, eb) -> loop_yield_agg_either(ctx, env, tb, eb),
+	Stmt.Block(ss) -> loop_yield_agg_list(ctx, env, ss),
+	Stmt.Match(scrut, arms) -> loop_yield_agg_arms(ctx, env, arms),
+	_ -> ""
+}
+# The scalar type of `base.f`: a TAG-ONLY union member construction (`Color.Red`) reports its union
+# name (a bare tag word carrying no aggregate marker — recorded like `Bool` so `"${c}"` renders it);
+# any other `base.f` is an ordinary record-field projection.
+const field_scalar_or_tagunion = (*Emit ctx, [Binding] env, Str base, Str f): Str -> {
+	if is_tagonly_union(ctx, base) then return base
+	return field_scalar(ctx, var_agg_type(env, base), f)
+}
+const scalar_of = (*Emit ctx, [Binding] env, Expr e): Str -> match e {
+	Expr.Call(callee, tyargs, args) -> call_scalar_e(ctx, env, callee),
+	Expr.Var(n) -> var_scalar(env, n),
+	Expr.FloatLit(t) -> "Float64",
+	# a Bool leaf: the literal, a comparison, or a logical connective all yield the word `Bool`
+	# (0/1). `Bool` is inert to the fixed/float filters (`is_fixed_name`/`is_float_name` reject it),
+	# so it only records the scalar type — the interpolation path reads it to render `true`/`false`.
+	Expr.BoolLit(b) -> "Bool",
+	Expr.Not(x) -> "Bool",
+	Expr.And(l, r) -> "Bool",
+	Expr.Or(l, r) -> "Bool",
+	Expr.CmpEq(l, r) -> "Bool",
+	Expr.CmpNe(l, r) -> "Bool",
+	Expr.CmpLt(l, r) -> "Bool",
+	Expr.CmpGt(l, r) -> "Bool",
+	Expr.CmpLe(l, r) -> "Bool",
+	Expr.CmpGe(l, r) -> "Bool",
+	Expr.Loop(body) -> loop_yield_scalar_list(ctx, env, body),
+	Expr.Add(l, r) -> bin_scalar(ctx, env, l, r),
+	Expr.Sub(l, r) -> bin_scalar(ctx, env, l, r),
+	Expr.Mul(l, r) -> bin_scalar(ctx, env, l, r),
+	Expr.Div(l, r) -> bin_scalar(ctx, env, l, r),
+	Expr.Mod(l, r) -> bin_scalar(ctx, env, l, r),
+	Expr.BitAnd(l, r) -> bin_scalar(ctx, env, l, r),
+	Expr.BitOr(l, r) -> bin_scalar(ctx, env, l, r),
+	Expr.BitXor(l, r) -> bin_scalar(ctx, env, l, r),
+	Expr.Shl(l, r) -> bin_scalar(ctx, env, l, r),
+	Expr.Shr(l, r) -> bin_scalar(ctx, env, l, r),
+	Expr.Neg(x) -> scalar_of(ctx, env, x),
+	Expr.BitNot(x) -> scalar_of(ctx, env, x),
+	# a scalar value projected out of an aggregate or a value-form: re-derive its type so the op
+	# still gets the right codegen (else a Uint64 field-compare / narrow field-arith / float field
+	# would silently miscompile)
+	Expr.Field(base, f) -> field_scalar_or_tagunion(ctx, env, base, f),
+	Expr.FieldExpr(be, f) -> field_scalar(ctx, init_agg_type(ctx, env, be), f),
+	Expr.Index(arr, idx) -> idx_scalar(env, arr, idx),
+	Expr.IndexExpr(be, idx) -> idxexpr_scalar(ctx, env, be, idx),
+	Expr.IndexField(arr, idx, f) -> field_scalar(ctx, index_agg_type(ctx, env, arr, idx), f),
+	Expr.If(c, t, el) -> scalar_of(ctx, env, t),
+	Expr.Match(scrut, arms) -> match_scalar(ctx, env, arms),
+	_ -> ""
+}
+const bin_scalar = (*Emit ctx, [Binding] env, Expr l, Expr r): Str -> {
+	const Str a = scalar_of(ctx, env, l)
+	if !str_eq(a, "") then return a
+	return scalar_of(ctx, env, r)
+}
+# Filters over `scalar_of`: the fixed-width name (for signed/unsigned + wrap), the float name,
+# and the QBE type class of a value — `d` (Float64), `s` (Float32), else `l` (int/word/pointer).
+const emit_fixed_of = (*Emit ctx, [Binding] env, Expr e): Str -> {
+	const Str s = scalar_of(ctx, env, e)
+	if is_fixed_name(s) then return s
+	return ""
+}
+const float_name_of = (*Emit ctx, [Binding] env, Expr e): Str -> {
+	const Str s = scalar_of(ctx, env, e)
+	if is_float_name(s) then return s
+	return ""
+}
+const qtype_of = (*Emit ctx, [Binding] env, Expr e): Str -> {
+	const Str f = float_name_of(ctx, env, e)
+	if str_eq(f, "Float64") then return "d"
+	if str_eq(f, "Float32") then return "s"
+	return "l"
+}
+const bin_fixed = (*Emit ctx, [Binding] env, Expr l, Expr r): Str -> {
+	const Str a = emit_fixed_of(ctx, env, l)
+	if !str_eq(a, "") then return a
+	return emit_fixed_of(ctx, env, r)
+}
+# A comparison op string (`ceq`/`cne`/`cslt`…) begins with `c` (byte 99); arithmetic
+# (`add`/`div`/`and`…) does not. Its result is a Bool word — never wrapped to a fixed width.
+const op_is_cmp = (Str op): Bool -> if Iarch(op.len) == 0 then false else Iarch(op[0]) == 99
+# The unsigned variant of an op for an unsigned fixed operand: `div`/`rem` → `udiv`/`urem`,
+# arithmetic `sar` (`>>`) → logical `shr`, and each signed ordering compare → its unsigned form.
+const unsigned_op = (Str op): Str -> {
+	if str_eq(op, "div") then return "udiv"
+	if str_eq(op, "rem") then return "urem"
+	if str_eq(op, "sar") then return "shr"
+	if str_eq(op, "csltl") then return "cultl"
+	if str_eq(op, "csgtl") then return "cugtl"
+	if str_eq(op, "cslel") then return "culel"
+	if str_eq(op, "csgel") then return "cugel"
+	return op
+}
+
+# The QBE type of a float type name (`d` for Float64, `s` for Float32) and the float form of a
+# comparison op (`csltl` → `cltd`/`clts`, …) — a float compare still yields an integer Bool.
+const float_qt = (Str name): Str -> if str_eq(name, "Float32") then "s" else "d"
+# The QBE type of a declared type NAME for a signature/slot: `d`/`s` for a float, else `l`
+# (words, pointers, records — all `l`). Used for a function's return, its params, and calls.
+const qtype_of_name = (Str name): Str -> {
+	if str_eq(name, "Float64") then return "d"
+	if str_eq(name, "Float32") then return "s"
+	return "l"
+}
+# The QBE class a signature RETURN position is called in: a nested tuple/function-type return rides
+# an `l` pointer, a leaf defers to its name (`d`/`s` for a float, else `l`).
+const telem_qtype = (TupElem te): Str -> {
+	if tel_is_fn(te) || tel_is_nest(te) then return "l"
+	return qtype_of_name(te.name)
+}
+const float_cmp_op = (Str op, Str qt): Str -> {
+	if str_eq(op, "csltl") then return "clt${qt}"
+	if str_eq(op, "csgtl") then return "cgt${qt}"
+	if str_eq(op, "cslel") then return "cle${qt}"
+	if str_eq(op, "csgel") then return "cge${qt}"
+	if str_eq(op, "ceql") then return "ceq${qt}"
+	if str_eq(op, "cnel") then return "cne${qt}"
+	return op
+}
+
+# Emit a binary operator node: evaluate both operands, then combine into a fresh temp. A FLOAT
+# op emits in the operand's QBE type (`=d`/`=s`) for `+ - * /` and a float compare for ordering
+# (result an `l` Bool). A fixed-width integer op picks the unsigned variant and wraps the
+# arithmetic result; a plain word op is `=l` as-is.
+const emit_binop = (*Emit ctx, Str op, Expr l, Expr r, [Binding] env): Str -> {
+	const Str a = emit_expr(l, ctx, env)
+	const Str b = emit_expr(r, ctx, env)
+	const Str fl = float_name_of(ctx, env, l)
+	const Str fr = float_name_of(ctx, env, r)
+	if !str_eq(fl, "") || !str_eq(fr, "") then {
+		let Str qt = float_qt(fl)
+		if str_eq(fl, "") then qt = float_qt(fr)
+		const Iarch tf = ctx.next
+		ctx.next = ctx.next + 1
+		if op_is_cmp(op) then write_str(ctx.fd, "\t%t${tf} =l ${float_cmp_op(op, qt)} ${a}, ${b}\n")
+		else write_str(ctx.fd, "\t%t${tf} =${qt} ${op} ${a}, ${b}\n")
+		return "%t${tf}"
+	}
+	const Str fx = bin_fixed(ctx, env, l, r)
+	let Str realop = op
+	if !str_eq(fx, "") && !fixed_signed(fx) then realop = unsigned_op(op)
+	const Iarch t = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${t} =l ${realop} ${a}, ${b}\n")
+	# `% 0` is a DEFINED 0 (§5.6): arm64 has no rem trap — `sdiv`/`udiv` by zero yield 0, so
+	# `rem = a - (a/0)*0 = a` leaks the dividend. Mask the remainder to 0 when the divisor is 0
+	# (branchless: `mask = (b != 0) ? -1 : 0`, then `rem & mask`). Division needs no guard — the
+	# hardware `div`-by-zero-is-0 already matches the spec.
+	let Str res = "%t${t}"
+	if str_eq(op, "rem") then {
+		const Iarch nz = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${nz} =w cnel ${b}, 0\n")
+		const Iarch nzl = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${nzl} =l extuw %t${nz}\n")
+		const Iarch mask = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${mask} =l sub 0, %t${nzl}\n")
+		const Iarch g = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${g} =l and %t${t}, %t${mask}\n")
+		res = "%t${g}"
+	}
+	# a fixed-width comparison yields a Bool (no wrap); a fixed-width arithmetic result is
+	# wrapped to the type's width; a plain word op is returned as-is.
+	if str_eq(fx, "") then return res
+	if op_is_cmp(op) then return res
+	return emit_fixed_canon(ctx, fixed_bits(fx), fixed_signed(fx), res)
+}
+
+# Emit a unary operator whose result is `<op> <operand>` (a two-operand QBE
+# instruction with a constant): negation `sub 0, x`, logical not `ceql x, 0` (a
+# Bool 0/1 → its complement), bitwise not `xor x, -1` (all bits flipped). A fixed-width
+# operand (`-`/`~` on a fixed value) wraps the result to the type's width.
+const emit_unop = (*Emit ctx, Str pre, Expr x, Str post, [Binding] env): Str -> {
+	const Str a = emit_expr(x, ctx, env)
+	# a float operand: only `-` reaches here (`~` is integer-only) — emit `=<qt> neg <a>`
+	const Str ff = float_name_of(ctx, env, x)
+	if !str_eq(ff, "") then {
+		const Str qt = float_qt(ff)
+		const Iarch tf = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${tf} =${qt} neg ${a}\n")
+		return "%t${tf}"
+	}
+	const Iarch t = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${t} =l ${pre}${a}${post}\n")
+	const Str fx = emit_fixed_of(ctx, env, x)
+	if str_eq(fx, "") then return "%t${t}"
+	return emit_fixed_canon(ctx, fixed_bits(fx), fixed_signed(fx), "%t${t}")
+}
+
+# Emit a variable reference. A const-aggregate local's slot IS its base pointer (a temp,
+# returned directly — e.g. a record being returned); a word or a mutable-aggregate local's
+# slot is a cell, so its current value/pointer is loaded (see `binding_ptr`).
+const emit_var = (*Emit ctx, [Binding] env, Str name): Str -> {
+	const Iarch idx = lookup_index(env, name)
+	if idx < 0 then {
+		# not a local — a top-level VALUE const (a nullary function), auto-called
+		const [Expr] noargs = []
+		return emit_call(ctx, name, noargs, env)
+	}
+	return binding_ptr(ctx, env, idx)
+}
+
+# Emit `base.field`. If `base` is a union type name, this is a tag-only union
+# construction — the member's tag, an inline word literal. Otherwise it is a record
+# field read: load the word at the record's base + the field's offset (`base` names
+# a record local whose slot holds the base pointer).
+const emit_field = (*Emit ctx, [Binding] env, Str base, Str field): Str -> {
+	if find_union(ctx.unions, base) >= 0 then {
+		const Iarch tag = member_tag(ctx.unions, base, field)
+		if !union_is_boxed(ctx.unions, base) then return "${tag}"
+		# a boxed union's tag-only member is still a one-word arena box holding the tag
+		const Iarch b = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${b} =l call $cf_alloc(w 8)\n")
+		write_str(ctx.fd, "\tstorel ${tag}, %t${b}\n")
+		return "%t${b}"
+	}
+	const Iarch idx = lookup_index(env, base)
+	let Str bp = ""
+	let Str rt = ""
+	if idx < 0 then {
+		# not a local — a top-level VALUE const (a nullary function): auto-call it for its base
+		# pointer, and take its aggregate type from the function's return type (`call_agg_type`)
+		const [Expr] noargs = []
+		bp = emit_call(ctx, base, noargs, env)
+		rt = call_agg_type(ctx, env, base)
+	} else {
+		bp = binding_ptr(ctx, env, idx)
+		rt = env[idx].rec_type
+	}
+	# a string's `.len` — loadl the header's len@8 (`bp` is the header pointer)
+	if str_eq(rt, "Str") then {
+		# `s.bytes` — the header's byte pointer at offset 0
+		if str_eq(field, "bytes") then return load_at(ctx, bp, 0)
+		return load_at(ctx, bp, 8)  # `s.len`
+	}
+	# a dynamic array's `.len` — loadl the header's len@8
+	if str_eq(rt, "$dyn") then return load_at(ctx, bp, 8)
+	return load_field_at(ctx, bp, field_offset(ctx.recs, rt, field), field_scalar(ctx, rt, field))
+}
+
+# Emit a string literal: materialize its bytes in the arena (a byte buffer written one
+# `storeb` at a time, plus a trailing NUL) and a `{bytes*@0, len@8}` header the Str
+# value points at (matching the throwaway `{bytes, len}` layout). Returns the header
+# pointer. `.len` reads the len word at +8; `.bytes` (a later brick) the ptr at +0.
+const emit_str_lit = (*Emit ctx, [Uint8] bytes): Str -> {
+	const Iarch n = Iarch(bytes.len)
+	const Iarch buf = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${buf} =l call $cf_alloc(w ${n + 1})\n")
+	let Iarch i = 0
+	loop {
+		if i >= n then break
+		const Iarch b = Iarch(bytes[i])
+		const Iarch a = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${a} =l add %t${buf}, ${i}\n")
+		write_str(ctx.fd, "\tstoreb ${b}, %t${a}\n")
+		i = i + 1
+	}
+	const Iarch za = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${za} =l add %t${buf}, ${n}\n")
+	write_str(ctx.fd, "\tstoreb 0, %t${za}\n")
+	const Iarch hdr = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${hdr} =l call $cf_alloc(w 16)\n")
+	write_str(ctx.fd, "\tstorel %t${buf}, %t${hdr}\n")
+	const Iarch hl = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${hl} =l add %t${hdr}, 8\n")
+	write_str(ctx.fd, "\tstorel ${n}, %t${hl}\n")
+	return "%t${hdr}"
+}
+
+# Load the 8-byte value at `base + off` (a field / element slot), returning its operand.
+# A `+ 0` offset rides through as a harmless `add`.
+const load_at = (*Emit ctx, Str base, Iarch off): Str -> {
+	const Iarch a = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${a} =l add ${base}, ${off}\n")
+	const Iarch v = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${v} =l loadl %t${a}\n")
+	return "%t${v}"
+}
+# Load the value at an already-computed address `addr` in its scalar QBE type: a FLOAT reads with
+# `loadd`/`loads` into a `d`/`s` temp, everything else (`scalar` = "" / a fixed-width) with `loadl`.
+const load_typed = (*Emit ctx, Str addr, Str scalar): Str -> {
+	const Str qt = if is_float_name(scalar) then float_qt(scalar) else "l"
+	const Iarch v = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${v} =${qt} load${qt} ${addr}\n")
+	return "%t${v}"
+}
+# Load a field slot at `base + off` in its scalar QBE type: a FLOAT field reads with `loadd`/`loads`
+# into a `d`/`s` temp (so a `p.x + p.y` picks up float operands), everything else (word / pointer /
+# fixed-width, `scalar` = "") reads 8 bytes with `loadl` — identical to `load_at`.
+const load_field_at = (*Emit ctx, Str base, Iarch off, Str scalar): Str -> {
+	if !is_float_name(scalar) then return load_at(ctx, base, off)
+	const Iarch a = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${a} =l add ${base}, ${off}\n")
+	return load_typed(ctx, "%t${a}", scalar)
+}
+
+# Emit `base.field` on a general expression base. Emit the base to a pointer, then read
+# the field: a `$dyn` array's `.len` @8; a `Str`'s `.bytes` @0 or `.len` @8; a RECORD base
+# (`p.toks[i].kind`, `prog.recs[r].name`) — the field at its declared 8-byte-slot offset.
+# All loads are `loadl` (uniform 8-byte slots).
+const emit_field_expr = (*Emit ctx, [Binding] env, Expr base, Str field): Str -> {
+	const Str b = emit_expr(base, ctx, env)
+	const Str bt = init_agg_type(ctx, env, base)
+	# a dynamic array's `.len` — the len word at offset 8
+	if str_eq(bt, "$dyn") then return load_at(ctx, b, 8)
+	# a string's `.bytes` (ptr @0) or `.len` (@8)
+	if str_eq(bt, "Str") then {
+		if str_eq(field, "bytes") then return load_at(ctx, b, 0)
+		return load_at(ctx, b, 8)
+	}
+	# a record base — read the field at its declared offset (a float field reads as `d`/`s`)
+	return load_field_at(ctx, b, field_offset(ctx.recs, bt, field), field_scalar(ctx, bt, field))
+}
+
+# Push a compile-time byte run (a `Str`'s bytes) onto an interpolation vector `vh` — each byte via
+# `cf_dyn_push` (stride 1). Renders the structural punctuation of a stringified aggregate ("(",
+# ", ", "({ ", "})", ".", …) as well as its type/field/member names.
+const emit_lit_str = (*Emit ctx, Str vh, Str s): Iarch -> {
+	let Iarch j = 0
+	loop {
+		if j >= Iarch(s.len) then break
+		const Iarch b = Iarch(s[j])
+		const Iarch slot = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${slot} =l call $cf_dyn_push(l ${vh}, w 1)\n")
+		write_str(ctx.fd, "\tstoreb ${b}, %t${slot}\n")
+		j = j + 1
+	}
+	return 0
+}
+
+# Append the textual form of a value to the interpolation vector `vh`, recursively over its static
+# type. A scalar renders by value (a `Bool` as `true`/`false`, an integer via itoa); a `Str` inlines
+# its bytes; an aggregate renders structurally — a tuple `(e0, e1, …)`, a record `Type({ f0: v0, … })`,
+# a boxed union `Type.Member(p0, …)`. `name` is the value's declared type name (a record/union name,
+# `"$tuple"`, `"Str"`, `"Bool"`, or an integer leaf — a fixed-width name or `""` for a plain word);
+# `telems` supplies a tuple's positional element types; `op` is the value operand (a word for a
+# scalar, a base pointer for an aggregate / boxed-union box).
+# Append a float value's text to the interpolation vector via the `cf_float_append` floor helper.
+# The helper takes a Float64 (`d`); a Float32 (`s`) operand is widened with `exts` first.
+const emit_float_append = (*Emit ctx, Str vh, Str name, Str op): Iarch -> {
+	let Str dv = op
+	if str_eq(name, "Float32") then {
+		const Iarch fd = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${fd} =d exts ${op}\n")
+		dv = "%t${fd}"
+	}
+	write_str(ctx.fd, "\tcall $cf_float_append(l ${vh}, d ${dv})\n")
+	return 0
+}
+const emit_stringify = (*Emit ctx, [Binding] env, Str vh, Str name, [TupElem] telems, Str op): Iarch -> {
+	if str_eq(name, "Str") then {
+		write_str(ctx.fd, "\tcall $cf_str_append(l ${vh}, l ${op})\n")
+		return 0
+	}
+	if str_eq(name, "Bool") then {
+		const Iarch bext = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${bext} =l extsw ${op}\n")
+		write_str(ctx.fd, "\tcall $cf_bool_append(l ${vh}, l %t${bext})\n")
+		return 0
+	}
+	if str_eq(name, "$tuple") then return emit_stringify_tuple(ctx, env, vh, telems, op)
+	# a `[Elem]` array (the bracketed spelling `is_nested` recognizes): `op` is the array header ptr
+	if is_nested(name) then return emit_stringify_array(ctx, env, vh, nested_inner(name), op)
+	if find_rec(ctx.recs, name) >= 0 then return emit_stringify_record(ctx, env, vh, name, op)
+	if find_union(ctx.unions, name) >= 0 then return emit_stringify_union(ctx, env, vh, name, op)
+	if is_float_name(name) then {
+		emit_float_append(ctx, vh, name, op)
+		return 0
+	}
+	# an integer leaf: an unsigned fixed prints its magnitude (no sign extension), everything else
+	# (a signed fixed or a plain word) sign-extends then itoa's
+	if is_fixed_name(name) && !fixed_signed(name) then {
+		write_str(ctx.fd, "\tcall $cf_uint_append(l ${vh}, l ${op})\n")
+		return 0
+	}
+	const Iarch ext = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${ext} =l extsw ${op}\n")
+	write_str(ctx.fd, "\tcall $cf_int_append(l ${vh}, l %t${ext})\n")
+	return 0
+}
+
+# Render a tuple `(e0, e1, …)` — each position read from its 8-byte slot (a float slot as `d`/`s`, a
+# word/pointer slot as 8 bytes) and stringified by its element type; positions joined by `, `.
+const emit_stringify_tuple = (*Emit ctx, [Binding] env, Str vh, [TupElem] telems, Str base): Iarch -> {
+	emit_lit_str(ctx, vh, "(")
+	let Iarch k = 0
+	loop {
+		if k >= Iarch(telems.len) then break
+		if k > 0 then emit_lit_str(ctx, vh, ", ")
+		const TupElem te = telems[k]
+		const Iarch off = k * 8
+		const Str slot = if is_float_name(te.name) then load_field_at(ctx, base, off, te.name) else load_at(ctx, base, off)
+		emit_stringify(ctx, env, vh, te.name, tel_sub(te), slot)
+		k = k + 1
+	}
+	emit_lit_str(ctx, vh, ")")
+	return 0
+}
+
+# Render a record `Type({ f0: v0, f1: v1 })` — the type name, then each field `name: value` in
+# declaration order (read from its 8-byte slot at `f*8`, a float field as `d`/`s`), joined by `, `.
+const emit_stringify_record = (*Emit ctx, [Binding] env, Str vh, Str rt, Str base): Iarch -> {
+	const Iarch ri = find_rec(ctx.recs, rt)
+	emit_lit_str(ctx, vh, rt)
+	emit_lit_str(ctx, vh, "({ ")
+	let Iarch f = 0
+	loop {
+		if f >= Iarch(ctx.recs[ri].fields.len) then break
+		if f > 0 then emit_lit_str(ctx, vh, ", ")
+		emit_lit_str(ctx, vh, ctx.recs[ri].fields[f])
+		emit_lit_str(ctx, vh, ": ")
+		const Str ftype = ctx.recs[ri].ftypes[f]
+		# an array field arrives as `$dyn` + a separate element name — respell it `[Elem]` so the
+		# stringifier's `is_nested` array arm picks it up
+		const Str fname = if str_eq(ftype, "$dyn") then "[${ctx.recs[ri].felems[f]}]" else ftype
+		const Iarch off = f * 8
+		const Str slot = if is_float_name(ftype) then load_field_at(ctx, base, off, ftype) else load_at(ctx, base, off)
+		emit_stringify(ctx, env, vh, fname, ctx.recs[ri].ftelems[f], slot)
+		f = f + 1
+	}
+	emit_lit_str(ctx, vh, " })")
+	return 0
+}
+
+# Render a union member `Type.Member` (a tag-only member) or `Type.Member(p0, p1)` (a payloaded
+# member) via a runtime tag dispatch: read the tag (a boxed value from its box@0, a tag-only value
+# is the word itself), then a compare-chain over the members — the matching arm writes its member
+# name and, for a payloaded member, each payload read from the box (`8 + p*8`) and stringified by its
+# type. Every arm jumps to the shared `@ue` join. A tag-only union nested in an aggregate rides here
+# too: its slot holds the bare tag, which `scrut_tag` returns unchanged.
+const emit_stringify_union = (*Emit ctx, [Binding] env, Str vh, Str un, Str box): Iarch -> {
+	const Iarch ui = find_union(ctx.unions, un)
+	const Str tag = scrut_tag(ctx, un, box)
+	const Iarch lid = ctx.label
+	ctx.label = ctx.label + 1
+	const Iarch nm = Iarch(ctx.unions[ui].members.len)
+	let Iarch m = 0
+	loop {
+		if m >= nm then break
+		const Iarch c = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${c} =w ceql ${tag}, ${m}\n")
+		if m == nm - 1 then {
+			write_str(ctx.fd, "\tjnz %t${c}, @us${lid}_${m}, @ue${lid}\n")
+		} else {
+			write_str(ctx.fd, "\tjnz %t${c}, @us${lid}_${m}, @un${lid}_${m}\n")
+		}
+		write_str(ctx.fd, "@us${lid}_${m}\n")
+		emit_lit_str(ctx, vh, un)
+		emit_lit_str(ctx, vh, ".")
+		emit_lit_str(ctx, vh, ctx.unions[ui].members[m].name)
+		const Iarch np = Iarch(ctx.unions[ui].members[m].payloads.len)
+		if np > 0 then {
+			emit_lit_str(ctx, vh, "(")
+			let Iarch p = 0
+			loop {
+				if p >= np then break
+				if p > 0 then emit_lit_str(ctx, vh, ", ")
+				const Str ptype = ctx.unions[ui].members[m].payloads[p]
+				# an array payload is `$dyn` + a separate element name — respell it `[Elem]` (as records do)
+				const Str pname = if str_eq(ptype, "$dyn") then "[${ctx.unions[ui].members[m].pelems[p]}]" else ptype
+				const Iarch poff = 8 + p * 8
+				const Str pslot = if is_float_name(ptype) then load_field_at(ctx, box, poff, ptype) else load_at(ctx, box, poff)
+				emit_stringify(ctx, env, vh, pname, ctx.unions[ui].members[m].ptelems[p], pslot)
+				p = p + 1
+			}
+			emit_lit_str(ctx, vh, ")")
+		}
+		write_str(ctx.fd, "\tjmp @ue${lid}\n")
+		if m != nm - 1 then write_str(ctx.fd, "@un${lid}_${m}\n")
+		m = m + 1
+	}
+	write_str(ctx.fd, "@ue${lid}\n")
+	return 0
+}
+
+# Render a `[Elem]` array `[e0, e1, …]` via a RUNTIME loop (the length is dynamic, unlike the
+# fixed-arity aggregates): read `data@0`/`len@8`, then for each index read the element at
+# `data + i*stride` (a `[Uint8]` strides 1 with `loadub`, a float loads `d`/`s`, everything else is
+# an 8-byte word/pointer `loadl`) and stringify it by `elem`, joining positions with `, `. The
+# element type is compile-time known, so ONE stringify body is emitted inside the loop.
+const emit_stringify_array = (*Emit ctx, [Binding] env, Str vh, Str elem, Str base): Iarch -> {
+	const Iarch stride = elem_bytes(elem)
+	const Str data = load_at(ctx, base, 0)
+	const Str alen = load_at(ctx, base, 8)
+	emit_lit_str(ctx, vh, "[")
+	const Iarch lid = ctx.label
+	ctx.label = ctx.label + 1
+	const Iarch ic = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${ic} =l alloc8 8\n")
+	write_str(ctx.fd, "\tstorel 0, %t${ic}\n")
+	write_str(ctx.fd, "@arloop${lid}\n")
+	const Iarch iv = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${iv} =l loadl %t${ic}\n")
+	const Iarch cmp = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${cmp} =w csgel %t${iv}, ${alen}\n")
+	write_str(ctx.fd, "\tjnz %t${cmp}, @ardone${lid}, @arbody${lid}\n")
+	write_str(ctx.fd, "@arbody${lid}\n")
+	const Iarch sc = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${sc} =w csgtl %t${iv}, 0\n")
+	write_str(ctx.fd, "\tjnz %t${sc}, @arsep${lid}, @arelem${lid}\n")
+	write_str(ctx.fd, "@arsep${lid}\n")
+	emit_lit_str(ctx, vh, ", ")
+	write_str(ctx.fd, "\tjmp @arelem${lid}\n")
+	write_str(ctx.fd, "@arelem${lid}\n")
+	const Iarch off = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${off} =l mul %t${iv}, ${stride}\n")
+	const Iarch addr = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${addr} =l add ${data}, %t${off}\n")
+	let Str eop = ""
+	if str_eq(elem, "Uint8") then {
+		const Iarch v = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${v} =l loadub %t${addr}\n")
+		eop = "%t${v}"
+	} else if is_float_name(elem) then {
+		const Iarch v = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${v} =${float_qt(elem)} load${float_qt(elem)} %t${addr}\n")
+		eop = "%t${v}"
+	} else {
+		const Iarch v = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${v} =l loadl %t${addr}\n")
+		eop = "%t${v}"
+	}
+	let [TupElem] notel = []
+	emit_stringify(ctx, env, vh, elem, notel, eop)
+	const Iarch inc = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${inc} =l add %t${iv}, 1\n")
+	write_str(ctx.fd, "\tstorel %t${inc}, %t${ic}\n")
+	write_str(ctx.fd, "\tjmp @arloop${lid}\n")
+	write_str(ctx.fd, "@ardone${lid}\n")
+	emit_lit_str(ctx, vh, "]")
+	return 0
+}
+
+# Emit an interpolated string `"…${name}…"`: build a fresh `[Uint8]` byte vector
+# (`{data,len,cap}` zeroed), append each segment — a literal run byte-by-byte via
+# `cf_dyn_push`, a hole via `cf_str_append` (a Str, its bytes), `cf_bool_append` (a Bool,
+# `true`/`false`), `emit_stringify` (an aggregate, its structural text) or `cf_int_append`
+# (an integer, sign-extended then itoa) — then seal a `{bytes@0, len@8}` Str header
+# borrowing the vector's backing. Returns the header pointer.
+const emit_interp = (*Emit ctx, [Seg] segs, [Binding] env): Str -> {
+	const Iarch vh = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${vh} =l call $cf_alloc(w 24)\n")
+	write_str(ctx.fd, "\tstorel 0, %t${vh}\n")
+	const Iarch v8 = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${v8} =l add %t${vh}, 8\n")
+	write_str(ctx.fd, "\tstorel 0, %t${v8}\n")
+	const Iarch v16 = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${v16} =l add %t${vh}, 16\n")
+	write_str(ctx.fd, "\tstorel 0, %t${v16}\n")
+	let Iarch si = 0
+	loop {
+		if si >= Iarch(segs.len) then break
+		const Seg sg = segs[si]
+		if sg.is_hole then {
+			# a hole is any expression; stringify a `Str` by its bytes, a `Bool` as `true`/`false`, an
+			# aggregate (tuple / record / boxed union) or a TAG-ONLY union (`Color.Red`, a bare tag word
+			# whose union rides in the scalar slot) by its structural text, an integer via itoa
+			const Str hv = emit_expr(sg.expr, ctx, env)
+			const Str aggt = init_agg_type(ctx, env, sg.expr)
+			const Str hsc = scalar_of(ctx, env, sg.expr)
+			let [TupElem] notel = []
+			if str_eq(aggt, "Str") then {
+				write_str(ctx.fd, "\tcall $cf_str_append(l %t${vh}, l ${hv})\n")
+			} else if str_eq(hsc, "Bool") then {
+				const Iarch bext = ctx.next
+				ctx.next = ctx.next + 1
+				write_str(ctx.fd, "\t%t${bext} =l extsw ${hv}\n")
+				write_str(ctx.fd, "\tcall $cf_bool_append(l %t${vh}, l %t${bext})\n")
+			} else if str_eq(aggt, "$dyn") then {
+				emit_stringify_array(ctx, env, "%t${vh}", hole_elem(ctx, env, sg.expr), hv)
+			} else if str_eq(aggt, "$tuple") || find_rec(ctx.recs, aggt) >= 0 || (find_union(ctx.unions, aggt) >= 0 && union_is_boxed(ctx.unions, aggt)) then {
+				emit_stringify(ctx, env, "%t${vh}", aggt, init_telems(ctx, env, sg.expr), hv)
+			} else if is_tagonly_union(ctx, hsc) then {
+				emit_stringify(ctx, env, "%t${vh}", hsc, notel, hv)
+			} else if is_float_name(hsc) then {
+				emit_float_append(ctx, "%t${vh}", hsc, hv)
+			} else {
+				const Iarch ext = ctx.next
+				ctx.next = ctx.next + 1
+				write_str(ctx.fd, "\t%t${ext} =l extsw ${hv}\n")
+				write_str(ctx.fd, "\tcall $cf_int_append(l %t${vh}, l %t${ext})\n")
+			}
+		} else {
+			let Iarch bj = 0
+			loop {
+				if bj >= Iarch(sg.lit.len) then break
+				const Iarch b = Iarch(sg.lit[bj])
+				const Iarch slot = ctx.next
+				ctx.next = ctx.next + 1
+				write_str(ctx.fd, "\t%t${slot} =l call $cf_dyn_push(l %t${vh}, w 1)\n")
+				write_str(ctx.fd, "\tstoreb ${b}, %t${slot}\n")
+				bj = bj + 1
+			}
+		}
+		si = si + 1
+	}
+	return emit_str_seal(ctx, "%t${vh}")
+}
+
+# Seal a `[Uint8]` byte-vector operand (a `{data@0, len@8, cap@16}` header) into a
+# `{bytes@0, len@8}` Str header borrowing the vector's backing bytes/len. Returns the
+# Str header operand. Shared by `emit_interp` (the string-builder finish) and the
+# `Str(v)` cast (the explicit seal in cf0's own source).
+# Build a `Str` header `{bytes@0, len@8}` directly over a raw byte pointer and an explicit length —
+# the `Str(buf, n)` two-argument form (a byte buffer / `[Uint8]` data pointer + a runtime length),
+# the file-read → Str path. Unlike `emit_str_seal` there is no vector header to read len from.
+const emit_str_from_buf = (*Emit ctx, Str ptr, Str len): Str -> {
+	const Iarch hdr = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${hdr} =l call $cf_alloc(w 16)\n")
+	write_str(ctx.fd, "\tstorel ${ptr}, %t${hdr}\n")
+	const Iarch hl = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${hl} =l add %t${hdr}, 8\n")
+	write_str(ctx.fd, "\tstorel ${len}, %t${hl}\n")
+	return "%t${hdr}"
+}
+const emit_str_seal = (*Emit ctx, Str vec): Str -> {
+	const Iarch data = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${data} =l loadl ${vec}\n")
+	const Iarch lp = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${lp} =l add ${vec}, 8\n")
+	const Iarch ll = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${ll} =l loadl %t${lp}\n")
+	const Iarch hdr = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${hdr} =l call $cf_alloc(w 16)\n")
+	write_str(ctx.fd, "\tstorel %t${data}, %t${hdr}\n")
+	const Iarch hl = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${hl} =l add %t${hdr}, 8\n")
+	write_str(ctx.fd, "\tstorel %t${ll}, %t${hl}\n")
+	return "%t${hdr}"
+}
+
+# Emit a data literal: allocate the record in the ARENA (`cf_alloc`, 4 bytes/field —
+# so it outlives the current stack frame and may be returned), store each
+# initializer at its field's offset, and return the base-pointer temp. Field
+# initializers may be given in any order; each maps to its declared offset.
+# A bare `{ … }` nested record literal — a `Record` with an empty type_name, typed by its field.
+const is_bare_record_e = (Expr e): Bool -> match e {
+	Expr.Record(tn, fs) -> str_eq(tn, ""),
+	_ -> false
+}
+const record_inits_e = (Expr e): [FieldInit] -> {
+	let [FieldInit] r = []
+	match e { Expr.Record(tn, fs) -> { r = fs }, _ -> {} }
+	return r
+}
+# Emit a data-literal field VALUE: a bare `{ … }` nested literal is built as the field's OWN record
+# type (its base pointer stored like any record field); everything else emits as an ordinary expr.
+const emit_field_value = (*Emit ctx, Str rt, Str fname, Expr val, [Binding] env): Str -> {
+	if is_bare_record_e(val) then {
+		const Iarch b = emit_record_lit(ctx, field_ftype(ctx, rt, fname), record_inits_e(val), env)
+		return "%t${b}"
+	}
+	# a `*[T]` raw-pointer field storing an array: pass its element base (data@0), like a `*[T]`
+	# parameter argument; a raw-pointer value (a `$ptr` buffer/field) passes through unchanged
+	if str_eq(field_ftype(ctx, rt, fname), "$ptr") then return emit_ptr_arg(ctx, env, val)
+	return emit_expr(val, ctx, env)
+}
+# The init index whose (non-spread) field is `fname`, or -1 — the override for a spread-copied field.
+const find_override = ([FieldInit] inits, Str fname): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(inits.len) then break
+		if !str_eq(inits[i].field, "$spread") && str_eq(inits[i].field, fname) then return i
+		i = i + 1
+	}
+	return 0 - 1
+}
+const emit_record_lit = (*Emit ctx, Str type_name, [FieldInit] inits, [Binding] env): Iarch -> {
+	const Iarch ri = find_rec(ctx.recs, type_name)
+	const Iarch nfld = Iarch(ctx.recs[ri].fields.len)
+	const Iarch size = nfld * 8
+	const Iarch base = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${base} =l call $cf_alloc(w ${size})\n")
+	# a VALUE spread `{ ...src, … }`: fill each field in declaration order — from its override if
+	# present, else COPY the source's word at that offset (typecheck guarantees copied fields are
+	# words, never aliasing pointers). The source's base pointer is the spread value.
+	if Iarch(inits.len) > 0 && str_eq(inits[0].field, "$spread") then {
+		const Str srcbp = emit_expr(inits[0].value, ctx, env)
+		let Iarch f = 0
+		loop {
+			if f >= nfld then break
+			const Iarch off = f * 8
+			const Iarch addr = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${addr} =l add %t${base}, ${off}\n")
+			const Iarch ov = find_override(inits, ctx.recs[ri].fields[f])
+			if ov >= 0 then {
+				const Str v = emit_field_value(ctx, type_name, inits[ov].field, inits[ov].value, env)
+				write_str(ctx.fd, "\tstorel ${v}, %t${addr}\n")
+			} else {
+				const Iarch sa = ctx.next
+				ctx.next = ctx.next + 1
+				write_str(ctx.fd, "\t%t${sa} =l add ${srcbp}, ${off}\n")
+				const Iarch sv = ctx.next
+				ctx.next = ctx.next + 1
+				write_str(ctx.fd, "\t%t${sv} =l loadl %t${sa}\n")
+				write_str(ctx.fd, "\tstorel %t${sv}, %t${addr}\n")
+			}
+			f = f + 1
+		}
+		return base
+	}
+	let Iarch a = 0
+	loop {
+		if a >= Iarch(inits.len) then break
+		const Str v = emit_field_value(ctx, type_name, inits[a].field, inits[a].value, env)
+		const Iarch off = field_offset(ctx.recs, type_name, inits[a].field)
+		const Iarch addr = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${addr} =l add %t${base}, ${off}\n")
+		# a word or pointer field stores 8 bytes (`storel`); a float field stores `stored`/`stores`
+		write_str(ctx.fd, "\t${store_op(field_scalar(ctx, type_name, inits[a].field))} ${v}, %t${addr}\n")
+		a = a + 1
+	}
+	return base
+}
+
+# A bare `Spread` never reaches `emit_expr` (the tuple emit handles it); if one does, it is
+# a misuse outside a tuple. (`is_spread`/`spread_inner` live in `astutil`.)
+const spread_emit_bad = (): Str -> {
+	die("cf0: emit: `...` spread is only valid inside a tuple\n")
+	return ""
+}
+
+# Build a tuple `(a, ...src, b)` as an arena aggregate of N 8-byte slots — a plain element
+# stores its value/pointer, a `...src` spread copies the source tuple's slots in order
+# (each an 8-byte word/pointer). Yields the base pointer.
+const emit_tuple = (*Emit ctx, [Expr] elems, [Binding] env): Str -> {
+	# total slots: 1 per plain element + each spread source's arity (from its telems)
+	let Iarch total = 0
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(elems.len) then break
+		if is_spread(elems[i]) then total = total + Iarch(init_telems(ctx, env, spread_inner(elems[i])).len)
+		if !is_spread(elems[i]) then total = total + 1
+		i = i + 1
+	}
+	const Iarch size = total * 8
+	const Iarch base = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${base} =l call $cf_alloc(w ${size})\n")
+	let Iarch pos = 0
+	let Iarch k = 0
+	loop {
+		if k >= Iarch(elems.len) then break
+		if is_spread(elems[k]) then {
+			const Str sb = emit_expr(spread_inner(elems[k]), ctx, env)
+			const Iarch sar = Iarch(init_telems(ctx, env, spread_inner(elems[k])).len)
+			let Iarch j = 0
+			loop {
+				if j >= sar then break
+				const Iarch soff = j * 8
+				const Iarch saddr = ctx.next
+				ctx.next = ctx.next + 1
+				write_str(ctx.fd, "\t%t${saddr} =l add ${sb}, ${soff}\n")
+				const Iarch sval = ctx.next
+				ctx.next = ctx.next + 1
+				write_str(ctx.fd, "\t%t${sval} =l loadl %t${saddr}\n")
+				const Iarch doff = pos * 8
+				const Iarch daddr = ctx.next
+				ctx.next = ctx.next + 1
+				write_str(ctx.fd, "\t%t${daddr} =l add %t${base}, ${doff}\n")
+				write_str(ctx.fd, "\tstorel %t${sval}, %t${daddr}\n")
+				pos = pos + 1
+				j = j + 1
+			}
+		} else {
+			const Str v = emit_expr(elems[k], ctx, env)
+			const Iarch off = pos * 8
+			const Iarch addr = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${addr} =l add %t${base}, ${off}\n")
+			# a word/pointer element stores 8 bytes (`storel`); a FLOAT element `stored`/`stores`
+			write_str(ctx.fd, "\t${store_op(scalar_of(ctx, env, elems[k]))} ${v}, %t${addr}\n")
+			pos = pos + 1
+		}
+		k = k + 1
+	}
+	return "%t${base}"
+}
+
+# The comptime literal position of a tuple index — the typecheck has already proven it
+# is a bare in-range literal, so the non-literal arm is unreachable.
+const tuple_lit_index = (Expr idx): Iarch -> match idx { Expr.Lit(v) -> v, _ -> 0 }
+
+# A tuple's per-position element type NAMES — a record name, `"Str"`, or `""` for a word,
+# from `init_agg_type` of each element. A tuple binding carries this list (its `telems`),
+# so `t[k]` / `t[k].field` resolve position k uniformly through the record type-name
+# machinery (field_offset/field_ftype) — no per-type special-casing.
+# One tuple position's emit descriptor from its initializer element: a nested tuple element
+# carries its own positions structurally (`tel_nest`); any other rides by its emit-canonical
+# aggregate name (a record / `"Str"` / `""`-for-word, via `init_agg_type`).
+const pos_telem = (*Emit ctx, [Binding] env, Expr e): TupElem -> {
+	const Str at = init_agg_type(ctx, env, e)
+	if str_eq(at, "$tuple") then return tel_nest(init_telems(ctx, env, e))
+	# a dynamic-array element rides spelled `[Elem]` so its element type survives for `t[k][i]`
+	if str_eq(at, "$dyn") then return tel_leaf("[${init_elem(ctx, env, e)}]")
+	if !str_eq(at, "") then return tel_leaf(at)
+	# a scalar element: a FLOAT records its type so `t[k]` reloads with `loadd`/`loads`; a `Bool`
+	# records "Bool" so an interpolated tuple renders it `true`/`false` (inert to arithmetic, so no
+	# codegen ripple); any other word stays ""
+	const Str sc = scalar_of(ctx, env, e)
+	if is_float_name(sc) then return tel_leaf(sc)
+	if str_eq(sc, "Bool") then return tel_leaf("Bool")
+	return tel_leaf("")
+}
+
+const tuple_pos_types = (*Emit ctx, [Binding] env, [Expr] elems): [TupElem] -> {
+	let [TupElem] r = []
+	let Iarch k = 0
+	loop {
+		if k >= Iarch(elems.len) then break
+		if is_spread(elems[k]) then {
+			const [TupElem] se = init_telems(ctx, env, spread_inner(elems[k]))
+			let Iarch j = 0
+			loop {
+				if j >= Iarch(se.len) then break
+				r = [...r, se[j]]
+				j = j + 1
+			}
+		} else {
+			r = [...r, pos_telem(ctx, env, elems[k])]
+		}
+		k = k + 1
+	}
+	return r
+}
+
+# Emit's SINGLE tuple-telem convention: a leaf position is its record type / `"Str"` (an
+# 8-byte pointer) or `""` (a word); a nested position keeps `"$tuple"` and its sub-positions.
+# `emit_canon_telems` maps DECLARED names (`Iarch`/`Bool`/`Str`/record, recursively) into it,
+# so every tuple binding — literal, call result, param, field — carries one form.
+const emit_telem = (*Emit ctx, TupElem te): TupElem -> {
+	if tel_is_nest(te) then return tel_nest(emit_canon_telems(ctx, te.sub))
+	if find_rec(ctx.recs, te.name) >= 0 then return tel_leaf(te.name)
+	if str_eq(te.name, "Str") then return tel_leaf("Str")
+	# a `Bool` position keeps its name so an interpolated tuple renders it `true`/`false`
+	if str_eq(te.name, "Bool") then return tel_leaf("Bool")
+	return tel_leaf("")
+}
+const emit_canon_telems = (*Emit ctx, [TupElem] telems): [TupElem] -> {
+	let [TupElem] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(telems.len) then break
+		r = [...r, emit_telem(ctx, telems[i])]
+		i = i + 1
+	}
+	return r
+}
+
+# A tuple position's binding rec_type ("$tuple" nested / record / "Str" / "" word) and the
+# telems a binding of it carries (a nested tuple's sub-positions, else empty).
+const tel_agg_type = (*Emit ctx, TupElem te): Str -> {
+	if tel_is_nest(te) then return "$tuple"
+	if elem_is_agg(ctx, te.name) then return te.name
+	return ""
+}
+const tel_sub = (TupElem te): [TupElem] -> {
+	let [TupElem] none = []
+	if tel_is_nest(te) then return te.sub
+	return none
+}
+# The k-th tuple position's leaf name ("" if out of range or nested — a nested position has
+# no leaf field name).
+const telem_name = ([TupElem] tels, Iarch k): Str -> {
+	if k < 0 then return ""
+	if k >= Iarch(tels.len) then return ""
+	return tels[k].name
+}
+# For `base[k]` on a `$tuple` value, the k-th position's sub-telems (empty unless nested).
+const index_pos_sub = (*Emit ctx, [Binding] env, Expr base, Expr idx): [TupElem] -> {
+	let [TupElem] none = []
+	if !str_eq(init_agg_type(ctx, env, base), "$tuple") then return none
+	const [TupElem] tel = init_telems(ctx, env, base)
+	const Iarch k = tuple_lit_index(idx)
+	if k >= Iarch(tel.len) then return none
+	return tel_sub(tel[k])
+}
+
+# A callee's declared dynamic-array element name — so a binding of a `[T]`/nested-array call result
+# (`const rs = build()`) carries its element for later `rs[i]` / `rs[i].len`; "" for a non-array or
+# unknown callee. An INDIRECT call through a `$fn` binding takes it from the return telem's `[Elem]`.
+const call_ret_elem = (*Emit ctx, [Binding] env, Str callee): Str -> {
+	const Iarch bi = lookup_index(env, callee)
+	if bi >= 0 then {
+		if str_eq(env[bi].rec_type, "$fn") then {
+			const Str rn = fn_ret_telem(env[bi]).name
+			if is_nested(rn) then return nested_inner(rn)
+			return ""
+		}
+	}
+	const Iarch fidx = find_func(ctx.funcs, callee)
+	if fidx < 0 then return ""
+	return ctx.funcs[fidx].ret_elem
+}
+
+# A tuple-returning callee's position telems, canonicalized to emit's convention. An INDIRECT call
+# through a `$fn` binding whose return is a nested tuple yields that return telem's sub-positions.
+const call_ret_telems = (*Emit ctx, [Binding] env, Str callee): [TupElem] -> {
+	let [TupElem] none = []
+	const Iarch bi = lookup_index(env, callee)
+	if bi >= 0 then {
+		if str_eq(env[bi].rec_type, "$fn") then {
+			const TupElem rt = fn_ret_telem(env[bi])
+			if tel_is_nest(rt) then return emit_canon_telems(ctx, rt.sub)
+			return none
+		}
+	}
+	const Iarch fidx = find_func(ctx.funcs, callee)
+	if fidx < 0 then return none
+	return emit_canon_telems(ctx, ctx.funcs[fidx].ret_telems)
+}
+
+# A record's tuple FIELD position telems, canonicalized to emit's convention (empty for a
+# non-tuple field / unknown record) — so `r.pair[k]` / `r.pair[k].field` resolve.
+const field_ftelems = (*Emit ctx, Str rectype, Str field): [TupElem] -> {
+	let [TupElem] none = []
+	const Iarch ri = find_rec(ctx.recs, rectype)
+	if ri < 0 then return none
+	let Iarch fi = 0
+	loop {
+		if fi >= Iarch(ctx.recs[ri].fields.len) then break
+		if str_eq(ctx.recs[ri].fields[fi], field) then return emit_canon_telems(ctx, ctx.recs[ri].ftelems[fi])
+		fi = fi + 1
+	}
+	return none
+}
+
+# Position telems of a bound tuple variable (empty for a non-tuple binding).
+const var_telems = ([Binding] env, Str name): [TupElem] -> {
+	let [TupElem] none = []
+	const Iarch idx = lookup_index(env, name)
+	if idx < 0 then return none
+	return env[idx].telems
+}
+
+const init_telems = (*Emit ctx, [Binding] env, Expr e): [TupElem] -> {
+	let [TupElem] r = []
+	match e {
+		Expr.Tuple(elems) -> { r = tuple_pos_types(ctx, env, elems) },
+		Expr.Call(callee, tyargs, args) -> { r = call_ret_telems(ctx, env, callee) },
+		Expr.Var(nm) -> { r = var_telems(env, nm) },
+		Expr.Field(base, f) -> { r = field_ftelems(ctx, var_agg_type(env, base), f) },
+		Expr.FieldExpr(base, f) -> { r = field_ftelems(ctx, init_agg_type(ctx, env, base), f) },
+		Expr.IndexField(arr, idx, f) -> { r = field_ftelems(ctx, index_agg_type(ctx, env, arr, idx), f) },
+		Expr.Index(arr, idx) -> { r = index_pos_sub(ctx, env, Expr.Var(arr), idx) },
+		Expr.IndexExpr(base, idx) -> { r = index_pos_sub(ctx, env, base, idx) },
+		# a value-`if` yielding a tuple carries its `then` branch's telems (both branches share a type)
+		Expr.If(c, t, el) -> { r = init_telems(ctx, env, t) },
+		_ -> {}
+	}
+	return r
+}
+
+# Emit `const/let (a, _, c) = rhs`: materialize the source tuple's base pointer (a bound
+# tuple var is reused; a literal is built), then bind each pattern name to its position —
+# a scalar into a fresh cell (so a `let` position reassigns), a record/Str as the 8-byte
+# pointer (a borrow). Returns the environment extended with the pattern's bindings.
+const emit_destructure = (*Emit ctx, [Binding] env, [Str] pat, Bool mutable, Expr rhs): [Binding] -> {
+	let Str base = ""
+	let [TupElem] tels = []
+	match rhs {
+		Expr.Var(nm) -> {
+			const Iarch vi = lookup_index(env, nm)
+			base = binding_ptr(ctx, env, vi)
+			tels = env[vi].telems
+		},
+		Expr.Tuple(elems) -> {
+			tels = tuple_pos_types(ctx, env, elems)
+			base = emit_tuple(ctx, elems, env)
+		},
+		Expr.Call(callee, tyargs, args) -> {
+			tels = call_ret_telems(ctx, env, callee)
+			base = emit_call(ctx, callee, args, env)
+		},
+		# Any other tuple-valued expression (a record's tuple field, or a nested tuple reached
+		# by index/field): position telems come from `init_telems`, and the base pointer from
+		# emitting it — a tuple-valued expr yields the 8-byte pointer to the tuple's storage,
+		# exactly the base the position loop indexes off.
+		Expr.Field(fb, ff) -> {
+			tels = init_telems(ctx, env, rhs)
+			base = emit_expr(rhs, ctx, env)
+		},
+		Expr.FieldExpr(gb, gf) -> {
+			tels = init_telems(ctx, env, rhs)
+			base = emit_expr(rhs, ctx, env)
+		},
+		Expr.Index(ia, ii) -> {
+			tels = init_telems(ctx, env, rhs)
+			base = emit_expr(rhs, ctx, env)
+		},
+		Expr.IndexExpr(ib, ij) -> {
+			tels = init_telems(ctx, env, rhs)
+			base = emit_expr(rhs, ctx, env)
+		},
+		Expr.IndexField(fa, fk, fl) -> {
+			tels = init_telems(ctx, env, rhs)
+			base = emit_expr(rhs, ctx, env)
+		},
+		_ -> { die("cf0: emit: a destructure source must be a tuple literal, a bound tuple, a tuple-returning call, or a tuple field/element\n") }
+	}
+	let [Binding] e2 = env
+	let Iarch pos = 0
+	let Iarch pi = 0
+	loop {
+		if pi >= Iarch(pat.len) then break
+		const Str tok = pat[pi]
+		if is_skip(tok) then {
+			pos = pos + skip_count(tok)
+			pi = pi + 1
+			continue
+		}
+		const Iarch soff = pos * 8
+		const Iarch saddr = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${saddr} =l add ${base}, ${soff}\n")
+		const TupElem ptype = tels[pos]
+		# a record / Str / nested-tuple position is an 8-byte pointer (a borrow); a word
+		# position (`""`) loads into a fresh reassignable cell so a `let` position can reassign.
+		if tel_is_nest(ptype) || str_eq(ptype.name, "Str") || find_rec(ctx.recs, ptype.name) >= 0 then {
+			const Iarch ptr = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${ptr} =l loadl %t${saddr}\n")
+			e2 = [...e2, Binding({ name: tok, slot: ptr, rec_type: tel_agg_type(ctx, ptype), elem: "", is_cell: false, telems: tel_sub(ptype), fixed: "" })]
+		} else {
+			# a word or FLOAT position: copy the 8-byte slot into a fresh cell. A float records its
+			# scalar in `fixed` so `binding_ptr` reloads it with `loadd`/`loads` (the copy is bit-preserving).
+			const Str pf = if is_float_name(ptype.name) then ptype.name else ""
+			const Iarch val = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${val} =l loadl %t${saddr}\n")
+			const Iarch cell = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${cell} =l alloc8 8\n")
+			write_str(ctx.fd, "\tstorel %t${val}, %t${cell}\n")
+			e2 = [...e2, Binding({ name: tok, slot: cell, rec_type: "", elem: "", is_cell: true, telems: [], fixed: pf })]
+		}
+		pos = pos + 1
+		pi = pi + 1
+	}
+	return e2
+}
+
+# A record literal as a value expression — an explicit construction `Type({ … })` in a
+# return, call argument, or array element. Builds the record in the arena and yields
+# its base pointer (a binding initializer takes the faster direct path in emit_block).
+const emit_record_val = (*Emit ctx, Str type_name, [FieldInit] inits, [Binding] env): Str -> {
+	const Iarch base = emit_record_lit(ctx, type_name, inits, env)
+	return "%t${base}"
+}
+
+# Emit `Type.member(args)` — a payload-member union construction: an arena box
+# `{tag@0, arg0@4, arg1@8, …}`, returned as its base pointer.
+# Is payload `i` of union member `uni.member` an 8-byte pointer (a `Str`/`[T]`/record/boxed
+# union) vs a word? And its declared type / `[T]` element (for binding a match's payload).
+const payload_is_ptr = (*Emit ctx, Str uni, Str member, Iarch i): Bool -> {
+	const Iarch ui = find_union(ctx.unions, uni)
+	const Iarch mi = member_tag(ctx.unions, uni, member)
+	const Str pt = ctx.unions[ui].members[mi].payloads[i]
+	if str_eq(pt, "$dyn") then return true
+	if str_eq(pt, "$tuple") then return true
+	if str_eq(pt, "Str") then return true
+	if find_rec(ctx.recs, pt) >= 0 then return true
+	if find_union(ctx.unions, pt) >= 0 then return union_is_boxed(ctx.unions, pt)
+	return false
+}
+
+# A union member payload position's tuple element names, canonicalized to emit's convention
+# (empty for a non-tuple payload) — so a match-bound tuple payload `B.Wrap(p) -> p[k]` works.
+const payload_ptelems = (*Emit ctx, Str uni, Str member, Iarch i): [TupElem] -> {
+	const Iarch ui = find_union(ctx.unions, uni)
+	const Iarch mi = member_tag(ctx.unions, uni, member)
+	return emit_canon_telems(ctx, ctx.unions[ui].members[mi].ptelems[i])
+}
+const payload_type = (*Emit ctx, Str uni, Str member, Iarch i): Str -> {
+	const Iarch ui = find_union(ctx.unions, uni)
+	const Iarch mi = member_tag(ctx.unions, uni, member)
+	return ctx.unions[ui].members[mi].payloads[i]
+}
+const payload_elem = (*Emit ctx, Str uni, Str member, Iarch i): Str -> {
+	const Iarch ui = find_union(ctx.unions, uni)
+	const Iarch mi = member_tag(ctx.unions, uni, member)
+	return ctx.unions[ui].members[mi].pelems[i]
+}
+
+# Construct a boxed union member: `{tag@0, payload_0@8, payload_1@16, …}` in the arena
+# (uniform 8-byte payload slots). A pointer payload stores its 8-byte pointer, a word
+# payload stores its value in the low 4 bytes.
+const emit_union_mk = (*Emit ctx, Str type_name, Str member, [Expr] args, [Binding] env): Str -> {
+	const Iarch tag = member_tag(ctx.unions, type_name, member)
+	const Iarch na = Iarch(args.len)
+	const Iarch size = 8 + na * 8
+	const Iarch b = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${b} =l call $cf_alloc(w ${size})\n")
+	write_str(ctx.fd, "\tstorel ${tag}, %t${b}\n")
+	let Iarch i = 0
+	loop {
+		if i >= na then break
+		const Str v = emit_expr(args[i], ctx, env)
+		const Iarch off = 8 + i * 8
+		const Iarch addr = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${addr} =l add %t${b}, ${off}\n")
+		# a pointer/word payload stores 8 bytes (`storel`); a FLOAT payload stores `stored`/`stores`
+		write_str(ctx.fd, "\t${store_op(scalar_only(payload_type(ctx, type_name, member, i)))} ${v}, %t${addr}\n")
+		i = i + 1
+	}
+	return "%t${b}"
+}
+
+# The aggregate type name a call returns (a record or a BOXED union), or "". A `Str(v)`
+# seal yields a Str aggregate, so a `const s = Str(v)` binding adopts the header pointer.
+const call_agg_type = (*Emit ctx, [Binding] env, Str callee): Str -> {
+	if str_eq(callee, "Str") then return "Str"
+	# an INDIRECT call through a `$fn` binding yields its return telem's aggregate marker when that
+	# return is by-reference — a nested tuple (`$tuple`), a `[Elem]` array (`$dyn`), or a
+	# record/union/`Str` name — so `const P p = g(5)` / `const (a, b) = g(5)` dispatch off the pointer
+	const Iarch bi = lookup_index(env, callee)
+	if bi >= 0 then {
+		if str_eq(env[bi].rec_type, "$fn") then {
+			const TupElem rt = fn_ret_telem(env[bi])
+			if tel_is_nest(rt) then return "$tuple"
+			if is_nested(rt.name) then return "$dyn"
+			if ret_is_l(rt.name, ctx.recs, ctx.unions) then return rt.name
+			return ""
+		}
+	}
+	const Iarch fidx = find_func(ctx.funcs, callee)
+	if fidx < 0 then return ""
+	if ret_is_l(ctx.funcs[fidx].ret_name, ctx.recs, ctx.unions) then return ctx.funcs[fidx].ret_name
+	return ""
+}
+
+# The aggregate type name a `base.field` yields — a boxed union's tag-only member
+# (`Node.Nil`) yields the union; a tag-only union member or a record field does not.
+# The declared type name of field `field` of record `rt` — its aggregate marker when the
+# field is a pointer (`Str`/`$dyn`/a record/a boxed union), matching a binding's `rec_type`.
+const field_ftype = (*Emit ctx, Str rt, Str field): Str -> {
+	const Iarch ri = find_rec(ctx.recs, rt)
+	if ri < 0 then return ""
+	let Iarch fi = 0
+	loop {
+		if fi >= Iarch(ctx.recs[ri].fields.len) then break
+		if str_eq(ctx.recs[ri].fields[fi], field) then return ctx.recs[ri].ftypes[fi]
+		fi = fi + 1
+	}
+	return ""
+}
+
+# The aggregate marker of `base.field` — for binding the result of a field read / a
+# tag-only-member construction. A boxed-union member (`Color.Red`) yields the union; a
+# record field yields its declared type IF the field is a pointer aggregate, else "".
+const field_agg_type = (*Emit ctx, [Binding] env, Str base, Str field): Str -> {
+	if find_union(ctx.unions, base) >= 0 then {
+		if union_is_boxed(ctx.unions, base) then return base
+		return ""
+	}
+	const Iarch idx = lookup_index(env, base)
+	if idx < 0 then return ""
+	const Str rt = env[idx].rec_type
+	if find_rec(ctx.recs, rt) < 0 then return ""
+	if !field_is_ptr(ctx, rt, field) then return ""
+	return field_ftype(ctx, rt, field)
+}
+
+# The aggregate marker of a variable binding — its `rec_type` (a record name, `"$dyn"`,
+# or `"Str"`), so `const b = a` binding an aggregate `a` copies the base pointer rather
+# than truncating it to a word. A word variable (or an unknown name) yields "".
+const var_agg_type = ([Binding] env, Str name): Str -> {
+	const Iarch idx = lookup_index(env, name)
+	if idx < 0 then return ""
+	return env[idx].rec_type
+}
+# The `[T]` element type name of a bound array variable (its binding's `elem`), "" if unbound.
+const var_elem = ([Binding] env, Str name): Str -> {
+	const Iarch idx = lookup_index(env, name)
+	if idx < 0 then return ""
+	return env[idx].elem
+}
+# The element type of a `$dyn` interpolation hole. `init_elem` covers a literal / field / index / call
+# but NOT a bare `Expr.Var` (the common `"${xs}"`), whose element rides on its binding — resolve that
+# here without disturbing `init_elem`'s other callers.
+const hole_elem = (*Emit ctx, [Binding] env, Expr e): Str -> match e {
+	Expr.Var(n) -> var_elem(env, n),
+	_ -> init_elem(ctx, env, e)
+}
+
+# The outer env AUGMENTED with an arm's payload binds as TYPE-ONLY bindings — the same rec_type/elem
+# assignment `arm_body_env` gives each bind (`payload_type`/`payload_elem`), but with a dummy slot and
+# no emitted extraction, since it is used only to recover the aggregate TYPE of an arm body that
+# references a payload (`M.Some(x) -> x`). A `_` and a sub-pattern guard bind no name (skipped). The
+# bind is appended AFTER `env`, so with first-match `lookup_index` a name that collides with an outer
+# binding still resolves to the outer one — exactly as `arm_body_env` does, keeping the recovered type
+# in agreement with the value `emit_match` actually stores.
+const arm_bind_types = (*Emit ctx, [Binding] env, Str type_name, [Str] members, [Str] binds): [Binding] -> {
+	let [Binding] benv = []
+	let Iarch k = 0
+	loop {
+		if k >= Iarch(env.len) then break
+		benv = [...benv, env[k]]
+		k = k + 1
+	}
+	let Iarch bi = 0
+	loop {
+		if bi >= Iarch(binds.len) then break
+		if !str_eq(binds[bi], "_") && !is_pat_guard(binds[bi]) then {
+			if payload_is_ptr(ctx, type_name, members[0], bi) then {
+				const Str pt = payload_type(ctx, type_name, members[0], bi)
+				const Str pe = payload_elem(ctx, type_name, members[0], bi)
+				benv = [...benv, Binding({ name: binds[bi], slot: 0, rec_type: pt, elem: pe, is_cell: false, telems: payload_ptelems(ctx, type_name, members[0], bi), fixed: "" })]
+			} else {
+				benv = [...benv, Binding({ name: binds[bi], slot: 0, rec_type: "", elem: "", is_cell: true, telems: [], fixed: "" })]
+			}
+		}
+		bi = bi + 1
+	}
+	return benv
+}
+# The aggregate type a `match` YIELDS, recovered from its first arm's body evaluated in that arm's
+# payload-binding env (via `arm_bind_types`) — so a payload-bound aggregate (`M.Some(x) -> x`) is
+# recovered as its member's payload type, not lost. The type-only env mirrors `arm_body_env`, so the
+# recovered type agrees with the value `emit_match` stores (no miscompile under a shadowed name). Every
+# arm shares the match's type (typecheck), so the first arm suffices.
+const match_agg_type = (*Emit ctx, [Binding] env, [MatchArm] arms): Str -> {
+	const [Binding] aenv = arm_bind_types(ctx, env, arms[0].type_name, arms[0].members, arms[0].binds)
+	return init_agg_type(ctx, aenv, arms[0].body)
+}
+# The aggregate type name of a binding initializer that yields an aggregate (a record,
+# a boxed union, a dynamic array, a string, or an aggregate variable copied) — so its
+# binding holds a base pointer — else "".
+const init_agg_type = (*Emit ctx, [Binding] env, Expr e): Str -> match e {
+	Expr.Record(tn, inits) -> tn,
+	Expr.UnionMk(tn, mem, args) -> tn,
+	Expr.Field(base, f) -> field_agg_type(ctx, env, base, f),
+	Expr.Call(callee, tyargs, args) -> call_agg_type(ctx, env, callee),
+	Expr.ArrayLit(hs, sn, elems, et) -> "$dyn",
+	Expr.StrLit(bytes) -> "Str",
+	Expr.Interp(id) -> "Str",
+	Expr.Buffer(sz) -> "$ptr",
+	Expr.Addr(name) -> var_agg_type(env, name),
+	Expr.Var(name) -> var_agg_type(env, name),
+	Expr.Index(arr, idx) -> index_agg_type(ctx, env, arr, idx),
+	Expr.IndexExpr(base, idx) -> indexexpr_agg_type(ctx, env, base, idx),
+	Expr.IndexField(arr, idx, f) -> indexfield_agg_type(ctx, env, arr, idx, f),
+	Expr.FieldExpr(base, f) -> fieldexpr_agg_type(ctx, env, base, f),
+	Expr.Tuple(elems) -> "$tuple",
+	# an `if`/`match` that YIELDS an aggregate reports its branch/arm aggregate type (both branches
+	# share a type by typecheck) — so `let R r = if c then a else b` binds `r` as its record and a
+	# later `r.field` (or a direct `(if …).field`) dispatches, instead of losing the type to "" and
+	# dereferencing `recs[-1]`. An `if` branch shares this env, so recursing into the `then` branch is
+	# safe; a `match` arm may bind a payload, so it is handled conservatively by `match_agg_type`.
+	Expr.If(c, t, el) -> init_agg_type(ctx, env, t),
+	Expr.Match(sc, arms) -> match_agg_type(ctx, env, arms),
+	# a value-yielding `loop` that produces an aggregate reports its `<- v` aggregate type, so
+	# `let R r = loop { … <- R({…}) }` binds `r` as its record and `r.field` dispatches.
+	Expr.Loop(body) -> loop_yield_agg_list(ctx, env, body),
+	_ -> ""
+}
+
+# The aggregate marker of `arr[i]` on a bare-name array — the element type name when that
+# element is an aggregate (a record, a `Str`, or a boxed union riding as an 8-byte pointer),
+# so `const sg = segs[i]` binds `sg` as its record/union and `sg.field` reads through it.
+const index_agg_type = (*Emit ctx, [Binding] env, Str arr, Expr idx): Str -> {
+	const Iarch ai = lookup_index(env, arr)
+	if ai < 0 then return ""
+	# a tuple: position idx's element type when it is an aggregate, else a word ("")
+	if str_eq(env[ai].rec_type, "$tuple") then {
+		const Iarch tk = tuple_lit_index(idx)
+		if tk >= Iarch(env[ai].telems.len) then return ""
+		return tel_agg_type(ctx, env[ai].telems[tk])
+	}
+	const Str en = env[ai].elem
+	# indexing a nested array `rs[i]` yields a dynamic array (`rs`'s element is a `[Inner]`)
+	if is_nested(en) then return "$dyn"
+	if elem_is_agg(ctx, en) then return en
+	return ""
+}
+
+# The element name of `arr[i]` when the result is itself a dynamic array (a nested array's
+# element) — the inner element name; else "" (a scalar/record element carries none).
+const index_elem = ([Binding] env, Str arr): Str -> {
+	const Iarch ai = lookup_index(env, arr)
+	if ai < 0 then return ""
+	if is_nested(env[ai].elem) then return nested_inner(env[ai].elem)
+	return ""
+}
+
+# The aggregate marker of `arr[i].field` — the element record's field type when that field
+# is a pointer aggregate (a `Str`/`[T]`/record/boxed union), so a `.field` chained off it
+# (`ps[i].tag.len`) dispatches correctly and a binding of it adopts the pointer. Else "".
+const indexfield_agg_type = (*Emit ctx, [Binding] env, Str arr, Expr idx, Str field): Str -> {
+	const Iarch ai = lookup_index(env, arr)
+	if ai < 0 then return ""
+	# a tuple position `t[k].field` reads its field off position k's element type
+	let Str en = env[ai].elem
+	if str_eq(env[ai].rec_type, "$tuple") then en = telem_name(env[ai].telems, tuple_lit_index(idx))
+	if find_rec(ctx.recs, en) < 0 then return ""
+	if !field_is_ptr(ctx, en, field) then return ""
+	return field_ftype(ctx, en, field)
+}
+
+# The aggregate marker of `base.field` on a general expression base — the field's type when
+# it is a pointer aggregate, so deeper chains (`a.b.c`) dispatch. A Str's `.bytes` is a
+# byte pointer; its `.len` and a `$dyn`'s `.len` are words ("").
+const fieldexpr_agg_type = (*Emit ctx, [Binding] env, Expr base, Str field): Str -> {
+	const Str bt = init_agg_type(ctx, env, base)
+	if str_eq(bt, "Str") then {
+		if str_eq(field, "bytes") then return "$ptr"
+		return ""
+	}
+	if str_eq(bt, "$dyn") then return ""
+	if find_rec(ctx.recs, bt) < 0 then return ""
+	if !field_is_ptr(ctx, bt, field) then return ""
+	return field_ftype(ctx, bt, field)
+}
+
+# The aggregate marker of a `base[i]` element — for binding `const t = p.toks[i]` (whose
+# element is a record or `Str` riding as an 8-byte pointer). The element type name comes
+# from the base's `[T]` element; a word element (`Iarch`/"") yields "".
+# The element name of `base[i]` when that element is itself a nested array — the inner
+# element name; else "". Mirrors `index_elem` but takes the base as an expression.
+const indexexpr_elem = (*Emit ctx, [Binding] env, Expr base): Str -> {
+	const Str be = init_elem(ctx, env, base)
+	if is_nested(be) then return nested_inner(be)
+	return ""
+}
+
+const indexexpr_agg_type = (*Emit ctx, [Binding] env, Expr base, Expr idx): Str -> {
+	# a tuple base `r.pair[k]` — position k's element type when it is an aggregate
+	if str_eq(init_agg_type(ctx, env, base), "$tuple") then {
+		const [TupElem] tel = init_telems(ctx, env, base)
+		const Iarch k = tuple_lit_index(idx)
+		if k >= Iarch(tel.len) then return ""
+		return tel_agg_type(ctx, tel[k])
+	}
+	const Str en = init_elem(ctx, env, base)
+	# indexing a nested array yields a dynamic array, not the nested element name
+	if is_nested(en) then return "$dyn"
+	if elem_is_agg(ctx, en) then return en
+	return ""
+}
+
+# The element type name of a dynamic-array binding initializer — the array literal's
+# `elem_type` (a `let [Elem]` annotation), else "". A record name marks `[Record]`
+# elements (8-byte pointer slots); "" / `Iarch` marks word elements.
+const init_elem = (*Emit ctx, [Binding] env, Expr e): Str -> match e {
+	Expr.ArrayLit(hs, sn, elems, et) -> et,
+	Expr.Field(base, f) -> field_elem(ctx, var_agg_type(env, base), f),
+	Expr.FieldExpr(base, f) -> field_elem(ctx, init_agg_type(ctx, env, base), f),
+	Expr.IndexField(arr, idx, f) -> field_elem(ctx, index_agg_type(ctx, env, arr, idx), f),
+	Expr.Index(arr, idx) -> index_elem(env, arr),
+	Expr.IndexExpr(base, idx) -> indexexpr_elem(ctx, env, base),
+	Expr.Call(callee, tyargs, args) -> call_ret_elem(ctx, env, callee),
+	_ -> ""
+}
+
+# Copy an aggregate operand (a base pointer) into a fresh temp the binding owns.
+const copy_agg = (*Emit ctx, Str v): Iarch -> {
+	const Iarch t = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${t} =l copy ${v}\n")
+	return t
+}
+
+# Emit an aggregate binding initializer, returning the base-pointer temp. A data
+# literal builds directly; anything else (a union construction, a boxed tag-only
+# member, an aggregate-returning call) yields a pointer that the binding adopts.
+const emit_agg_binding = (*Emit ctx, Expr e, [Binding] env): Iarch -> match e {
+	Expr.Record(tn, inits) -> emit_record_lit(ctx, tn, inits, env),
+	_ -> copy_agg(ctx, emit_expr(e, ctx, env))
+}
+
+# Emit an `if <cond> then <a> else <b>` value. The branches merge through a stack
+# slot (not a phi): evaluate the condition, branch, each arm stores its value into
+# the slot, and the join block loads it. Robust under nesting; QBE accepts an
+# `alloc` in a non-entry block.
+const emit_if = (*Emit ctx, Expr cond, Expr then_e, Expr else_e, [Binding] env): Str -> {
+	const Str c = emit_expr(cond, ctx, env)
+	# the merge slot stores/loads in the branches' QBE type (a float `if` value uses `d`/`s`)
+	const Str qt = qtype_of(ctx, env, then_e)
+	const Iarch slot = ctx.next
+	ctx.next = ctx.next + 1
+	const Iarch lid = ctx.label
+	ctx.label = ctx.label + 1
+	write_str(ctx.fd, "\t%t${slot} =l alloc8 8\n")
+	write_str(ctx.fd, "\tjnz ${c}, @then${lid}, @else${lid}\n")
+	write_str(ctx.fd, "@then${lid}\n")
+	const Str a = emit_expr(then_e, ctx, env)
+	write_str(ctx.fd, "\tstore${qt} ${a}, %t${slot}\n")
+	write_str(ctx.fd, "\tjmp @end${lid}\n")
+	write_str(ctx.fd, "@else${lid}\n")
+	const Str b = emit_expr(else_e, ctx, env)
+	write_str(ctx.fd, "\tstore${qt} ${b}, %t${slot}\n")
+	write_str(ctx.fd, "\tjmp @end${lid}\n")
+	write_str(ctx.fd, "@end${lid}\n")
+	const Iarch rt = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${rt} =${qt} load${qt} %t${slot}\n")
+	return "%t${rt}"
+}
+
+# Emit a short-circuit `&&`/`||`. The right operand is emitted in its own block,
+# reached only when the left operand does not already settle the result — so a
+# side-effecting or non-terminating RHS is genuinely skipped. The result (0/1)
+# merges through a slot, like `if`. For `&&`: a false lhs short-circuits to 0; for
+# `||`: a true lhs short-circuits to 1; otherwise the result is `rhs != 0`.
+const emit_logical = (*Emit ctx, Bool is_and, Expr l, Expr r, [Binding] env): Str -> {
+	const Str a = emit_expr(l, ctx, env)
+	const Iarch slot = ctx.next
+	ctx.next = ctx.next + 1
+	const Iarch lid = ctx.label
+	ctx.label = ctx.label + 1
+	write_str(ctx.fd, "\t%t${slot} =l alloc8 8\n")
+	if is_and then write_str(ctx.fd, "\tjnz ${a}, @rhs${lid}, @sc${lid}\n")
+	if !is_and then write_str(ctx.fd, "\tjnz ${a}, @sc${lid}, @rhs${lid}\n")
+	write_str(ctx.fd, "@sc${lid}\n")
+	if is_and then write_str(ctx.fd, "\tstorel 0, %t${slot}\n")
+	if !is_and then write_str(ctx.fd, "\tstorel 1, %t${slot}\n")
+	write_str(ctx.fd, "\tjmp @end${lid}\n")
+	write_str(ctx.fd, "@rhs${lid}\n")
+	const Str b = emit_expr(r, ctx, env)
+	const Iarch bb = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${bb} =l cnel ${b}, 0\n")
+	write_str(ctx.fd, "\tstorel %t${bb}, %t${slot}\n")
+	write_str(ctx.fd, "\tjmp @end${lid}\n")
+	write_str(ctx.fd, "@end${lid}\n")
+	const Iarch rt = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${rt} =l loadl %t${slot}\n")
+	return "%t${rt}"
+}
+
+# The index of the function named `name` in `funcs`, or -1 if none.
+const find_func = ([Func] funcs, Str name): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(funcs.len) then break
+		if str_eq(funcs[i].name, name) then return i
+		i = i + 1
+	}
+	return 0 - 1
+}
+
+# Emit a call `callee(args)`. The callee (existence, arity, and argument types
+# already checked by the typecheck phase) is mapped by name to its function index
+# for the QBE symbol. A word argument is evaluated into a fresh temp (`w`); an
+# aggregate argument (a record or boxed union — any expression yielding a base
+# pointer) is copied into a temp and passed by pointer (`l`). main's QBE symbol is
+# `$main`; every other function is `$f<i>` (positional, so a user name can never
+# collide with `_start`).
+# A builtin numeric type name — a one-argument cast `T(x)`, identity in cf0's word-only
+# codegen (every integer width is a `w`). The typecheck phase has checked the operand.
+const is_cast_type = (Str name): Bool -> {
+	if str_eq(name, "Iarch") then return true
+	if str_eq(name, "Uarch") then return true
+	if str_eq(name, "Int") then return true
+	if str_eq(name, "Int8") then return true
+	if str_eq(name, "Int16") then return true
+	if str_eq(name, "Int32") then return true
+	if str_eq(name, "Int64") then return true
+	if str_eq(name, "Uint8") then return true
+	if str_eq(name, "Uint16") then return true
+	if str_eq(name, "Uint32") then return true
+	if str_eq(name, "Uint64") then return true
+	if str_eq(name, "Float32") then return true
+	if str_eq(name, "Float64") then return true
+	return false
+}
+
+# Canonicalize a value to a fixed-width type: reduce it to the low `bits` and set the upper
+# bits to the type's canonical form (sign-extended when signed, zero when not), by a left
+# shift then an arithmetic (`sar`, signed) or logical (`shr`, unsigned) right shift of the
+# same amount. So the stored `l` register always holds the value's true signed/unsigned
+# meaning — `Iarch(x)` is then a no-op and this same reduction wraps a later arithmetic result.
+# A 64-bit type needs no reduction (the `l` register already holds it).
+const emit_fixed_canon = (*Emit ctx, Iarch bits, Bool signed, Str v): Str -> {
+	if bits >= 64 then return v
+	const Iarch sh = 64 - bits
+	const Iarch t1 = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${t1} =l shl ${v}, ${sh}\n")
+	const Iarch t2 = ctx.next
+	ctx.next = ctx.next + 1
+	if signed then write_str(ctx.fd, "\t%t${t2} =l sar %t${t1}, ${sh}\n")
+	else write_str(ctx.fd, "\t%t${t2} =l shr %t${t1}, ${sh}\n")
+	return "%t${t2}"
+}
+
+# The name of a bare `Var` argument (a function reference), or "".
+const argvar_name = (Expr e): Str -> match e { Expr.Var(n) -> n, _ -> "" }
+
+# The value passed to a `*[T]` raw-pointer parameter. A dynamic-/fixed-array argument is a
+# `{data@0, len@8, cap@16}` HEADER, so pass its DATA pointer (`loadl @0`) — the raw element
+# base the callee indexes. An argument that is already a raw pointer (a `$ptr` buffer, or a
+# forwarded `*[T]` param) is passed through unchanged.
+const emit_ptr_arg = (*Emit ctx, [Binding] env, Expr arg): Str -> {
+	const Str v = emit_expr(arg, ctx, env)
+	# a dynamic-/fixed-array value is a `{data@0, len@8, cap@16}` HEADER — pass its data pointer
+	# (`loadl @0`), the raw element base the callee indexes. A value that is already a raw pointer
+	# (a `$ptr` buffer/field, or a forwarded `*[T]` param) rides through unchanged. `init_agg_type`
+	# classifies the argument by SHAPE, so a non-variable array (a field/index/call result) lowers
+	# the same as a bare-variable array.
+	if !str_eq(init_agg_type(ctx, env, arg), "$dyn") then return v
+	const Iarch data = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${data} =l loadl ${v}\n")
+	return "%t${data}"
+}
+
+# A lifted-closure CAPTURE parameter — a scalar by slot address (`$capref`) or an aggregate by
+# pointer (`$capagg`); both ride an `l` and are passed by reference (no copy) at the call site.
+const is_cap_param = (Str type_name): Bool -> str_eq(type_name, "$capref") || str_eq(type_name, "$capagg")
+
+# The code-address value of a function reference passed to a function-type parameter: a
+# function-value binding in scope loads its held address; a top-level function by name takes its
+# symbol `$f${idx}`. (Only a bare name reaches here — the typecheck phase rejects anything else.)
+const emit_fnval = (*Emit ctx, [Binding] env, Expr arg): Str -> {
+	const Str nm = argvar_name(arg)
+	const Iarch bi = lookup_index(env, nm)
+	if bi >= 0 then return binding_ptr(ctx, env, bi)
+	const Iarch fi = find_func(ctx.funcs, nm)
+	if fi < 0 then die("cf0: emit: internal: a function-type argument names no function\n")
+	const Iarch t = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${t} =l copy $f${fi}\n")
+	return "%t${t}"
+}
+
+# Emit an INDIRECT call `f(args)` through a function-value binding: load its code address, then
+# `call` it with each argument in the signature's QBE class (`telems` the argument type names,
+# `elem` the return type name).
+const emit_indirect_call = (*Emit ctx, [Binding] env, Iarch fpidx, [Expr] args): Str -> {
+	const Str addr = binding_ptr(ctx, env, fpidx)
+	const [TupElem] sig = env[fpidx].telems
+	let [ArgOp] aops = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(args.len) then break
+		# a function-VALUE argument position (`f` takes a function) passes the argument function's code
+		# address (an `l`), not an evaluated value — a bare fn name is not a local binding
+		let Str aqt = qtype_of_name(sig[i].name)
+		let Str op = ""
+		if tel_is_fn(sig[i]) then {
+			aqt = "l"
+			op = emit_fnval(ctx, env, args[i])
+		} else {
+			op = emit_expr(args[i], ctx, env)
+		}
+		const Iarch tt = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${tt} =${aqt} copy ${op}\n")
+		aops = [...aops, ArgOp({ temp: tt, is_rec: false, qt: aqt })]
+		i = i + 1
+	}
+	const Iarch rt = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${rt} =${telem_qtype(fn_ret_telem(env[fpidx]))} call ${addr}(")
+	let Iarch j = 0
+	loop {
+		if j >= Iarch(aops.len) then break
+		if j > 0 then write_str(ctx.fd, ", ")
+		const Iarch tj = aops[j].temp
+		write_str(ctx.fd, "${aops[j].qt} %t${tj}")
+		j = j + 1
+	}
+	write_str(ctx.fd, ")\n")
+	return "%t${rt}"
+}
+
+const emit_call = (*Emit ctx, Str callee, [Expr] args, [Binding] env): Str -> {
+	# `Int8(x)`… narrows to the fixed width (canonicalizing); `Iarch`/`Int`/`Uarch` are identity
+	if is_cast_type(callee) then {
+		const Str v = emit_expr(args[0], ctx, env)
+		const Str src = float_name_of(ctx, env, args[0])
+		const Bool src_float = !str_eq(src, "")
+		if is_float_name(callee) then {
+			# → a float. From a float of a different width: `truncd` (→ single) / `exts` (→ double);
+			# from an integer: `sltof`. Same-width float-to-float is identity.
+			const Str dqt = float_qt(callee)
+			if src_float then {
+				if str_eq(src, callee) then return v
+				const Iarch tc = ctx.next
+				ctx.next = ctx.next + 1
+				if str_eq(callee, "Float32") then write_str(ctx.fd, "\t%t${tc} =s truncd ${v}\n")
+				else write_str(ctx.fd, "\t%t${tc} =d exts ${v}\n")
+				return "%t${tc}"
+			}
+			# an UNSIGNED fixed-width source converts with `ultof`, else signed `sltof` (a
+			# register-width `Uarch` rides cf0's signed-word narrowing — small values are exact)
+			const Str ifx = emit_fixed_of(ctx, env, args[0])
+			let Str icvt = "sltof"
+			if is_fixed_name(ifx) && !fixed_signed(ifx) then icvt = "ultof"
+			const Iarch ti = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${ti} =${dqt} ${icvt} ${v}\n")
+			return "%t${ti}"
+		}
+		# → an integer. A float source converts (`dtosi`/`stosi`, truncating toward zero), then a
+		# fixed-width target canonicalizes to its width; an integer source keeps the existing path.
+		if src_float then {
+			let Str fcvt = "dtosi"
+			if str_eq(src, "Float32") then fcvt = "stosi"
+			const Iarch tf = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${tf} =l ${fcvt} ${v}\n")
+			if is_fixed_name(callee) then return emit_fixed_canon(ctx, fixed_bits(callee), fixed_signed(callee), "%t${tf}")
+			return "%t${tf}"
+		}
+		if !is_fixed_name(callee) then return v
+		return emit_fixed_canon(ctx, fixed_bits(callee), fixed_signed(callee), v)
+	}
+	# `Str(v)` — seal a `[Uint8]` byte vector into a Str header borrowing its backing
+	if str_eq(callee, "Str") then {
+		if Iarch(args.len) == 2 then return emit_str_from_buf(ctx, emit_ptr_arg(ctx, env, args[0]), emit_expr(args[1], ctx, env))
+		return emit_str_seal(ctx, emit_expr(args[0], ctx, env))
+	}
+	# an INDIRECT call: the callee names a function-value binding (a HOF's function parameter)
+	const Iarch fpi = lookup_index(env, callee)
+	if fpi >= 0 then { if str_eq(env[fpi].rec_type, "$fn") then return emit_indirect_call(ctx, env, fpi, args) }
+	const Iarch fidx = find_func(ctx.funcs, callee)
+	if fidx < 0 then die("cf0: emit: internal: unresolved call (should be caught by typecheck)\n")
+	const Iarch nargs = Iarch(args.len)
+	let [ArgOp] aops = []
+	let Iarch i = 0
+	loop {
+		if i >= nargs then break
+		if str_eq(ctx.funcs[fidx].params[i].type_name, "$fn") then {
+			# a function-type argument: pass the callee's code address as an `l` value
+			const Str fv = emit_fnval(ctx, env, args[i])
+			const Iarch tt = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${tt} =l copy ${fv}\n")
+			aops = [...aops, ArgOp({ temp: tt, is_rec: false, qt: "l" })]
+		} else if is_cap_param(ctx.funcs[fidx].params[i].type_name) then {
+			# a CAPTURE argument to a lifted closure (`args[i]` is the captured var by name): a scalar
+			# passes its SLOT ADDRESS (`$capref`), an aggregate its POINTER value (`$capagg`), so the
+			# closure reads/writes it by reference. Passed as a raw `l`, no copy.
+			const Iarch bi = lookup_index(env, argvar_name(args[i]))
+			let Str cv = ""
+			if str_eq(ctx.funcs[fidx].params[i].type_name, "$capref") then cv = "%t${env[bi].slot}"
+			else cv = binding_ptr(ctx, env, bi)
+			const Iarch tt = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${tt} =l copy ${cv}\n")
+			aops = [...aops, ArgOp({ temp: tt, is_rec: false, qt: "l" })]
+		} else if str_eq(ctx.funcs[fidx].params[i].type_name, "$ptr") then {
+			# a `*[T]` raw-pointer parameter: pass the element base (an array header's data@0, or
+			# a raw pointer as-is). Rides an `l`, no aggregate copy.
+			const Str pv = emit_ptr_arg(ctx, env, args[i])
+			const Iarch tt = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${tt} =l copy ${pv}\n")
+			aops = [...aops, ArgOp({ temp: tt, is_rec: false, qt: "l" })]
+		} else if is_agg_param(ctx.funcs[fidx].params[i], ctx.recs, ctx.unions) then {
+			const Str av = emit_expr(args[i], ctx, env)
+			const Iarch tt = copy_agg(ctx, av)
+			aops = [...aops, ArgOp({ temp: tt, is_rec: true, qt: "l" })]
+		} else {
+			# a float argument is copied/passed in its QBE type (`d`/`s`); every other in `l`
+			const Str aqt = qtype_of_name(ctx.funcs[fidx].params[i].type_name)
+			const Str op = emit_expr(args[i], ctx, env)
+			const Iarch tt = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${tt} =${aqt} copy ${op}\n")
+			aops = [...aops, ArgOp({ temp: tt, is_rec: false, qt: aqt })]
+		}
+		i = i + 1
+	}
+	const Iarch rt = ctx.next
+	ctx.next = ctx.next + 1
+	const Bool is_main = str_eq(ctx.funcs[fidx].name, "main")
+	# a float-returning callee yields `d`/`s`; a record yields an `l` pointer; else a word `l`
+	write_str(ctx.fd, "\t%t${rt} =${qtype_of_name(ctx.funcs[fidx].ret_name)} call $")
+	if is_main then write_str(ctx.fd, "main")
+	if !is_main then write_str(ctx.fd, "f${fidx}")
+	write_str(ctx.fd, "(")
+	let Iarch j = 0
+	loop {
+		if j >= Iarch(aops.len) then break
+		if j > 0 then write_str(ctx.fd, ", ")
+		const Iarch tj = aops[j].temp
+		write_str(ctx.fd, "${aops[j].qt} %t${tj}")
+		j = j + 1
+	}
+	write_str(ctx.fd, ")\n")
+	return "%t${rt}"
+}
+
+# The scrutinee's union (the first member arm's type name), or "" if all arms are `_`.
+const match_union = ([MatchArm] arms): Str -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		if !arms[i].is_wild then return arms[i].type_name
+		i = i + 1
+	}
+	return ""
+}
+
+# The environment for an arm body: the outer env plus a fresh word slot per named
+# payload binding, loaded from the box (`s` is the boxed scrutinee's base pointer;
+# payload field `i` sits at offset 4 + i*4). `_` binds nothing. Non-binding arms
+# just get a copy of the outer env.
+const arm_body_env = (*Emit ctx, [Binding] env, Str type_name, [Str] members, [Str] binds, Str s): [Binding] -> {
+	let [Binding] benv = []
+	let Iarch k = 0
+	loop {
+		if k >= Iarch(env.len) then break
+		benv = [...benv, env[k]]
+		k = k + 1
+	}
+	let Iarch bi = 0
+	loop {
+		if bi >= Iarch(binds.len) then break
+		# a `_` binds nothing, and a sub-pattern GUARD (`=Member`/`#int`) constrains but binds no name
+		if !str_eq(binds[bi], "_") && !is_pat_guard(binds[bi]) then {
+			const Iarch off = 8 + bi * 8
+			const Iarch addr = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${addr} =l add ${s}, ${off}\n")
+			if payload_is_ptr(ctx, type_name, members[0], bi) then {
+				# a pointer payload (Str/[T]/record/union): load the 8-byte pointer and bind it
+				# directly as an aggregate (its declared type is the binding's rec_type/elem)
+				const Iarch val = ctx.next
+				ctx.next = ctx.next + 1
+				write_str(ctx.fd, "\t%t${val} =l loadl %t${addr}\n")
+				const Str pt = payload_type(ctx, type_name, members[0], bi)
+				const Str pe = payload_elem(ctx, type_name, members[0], bi)
+				benv = [...benv, Binding({ name: binds[bi], slot: val, rec_type: pt, elem: pe, is_cell: false, telems: payload_ptelems(ctx, type_name, members[0], bi), fixed: "" })]
+			} else {
+				# a word (or FLOAT) payload: copy the 8-byte slot to its own cell. A float payload records
+				# its scalar type in `fixed` so `binding_ptr` reloads it with `loadd`/`loads` (the raw
+				# `loadl`/`storel` copy here is bit-preserving); a plain word keeps `fixed: ""`.
+				const Str psc = payload_type(ctx, type_name, members[0], bi)
+				const Str pf = if is_float_name(psc) then psc else ""
+				const Iarch val = ctx.next
+				ctx.next = ctx.next + 1
+				write_str(ctx.fd, "\t%t${val} =l loadl %t${addr}\n")
+				const Iarch bslot = ctx.next
+				ctx.next = ctx.next + 1
+				write_str(ctx.fd, "\t%t${bslot} =l alloc8 8\n")
+				write_str(ctx.fd, "\tstorel %t${val}, %t${bslot}\n")
+				benv = [...benv, Binding({ name: binds[bi], slot: bslot, rec_type: "", elem: "", is_cell: true, telems: [], fixed: pf })]
+			}
+		}
+		bi = bi + 1
+	}
+	return benv
+}
+
+# The scrutinee's tag operand for union `un`: for a boxed union the tag lives at the box's
+# offset 0 (loaded here); a tag-only union value (or an all-`_` match, `un` = "") IS its tag.
+const scrut_tag = (*Emit ctx, Str un, Str s): Str -> {
+	if str_eq(un, "") then return s
+	# a `Bool` scrutinee IS its tag word (0/1, §8.6); it is not a table union so skip the boxed check
+	if str_eq(un, "Bool") then return s
+	# a string match ("$str") compares the scrutinee Str directly (`cf_str_eq`), not a tag
+	if str_eq(un, "$str") then return s
+	# an integer match ("$int") compares the scrutinee word/fixed value directly (`ceql`), not a tag
+	if str_eq(un, "$int") then return s
+	if !union_is_boxed(ctx.unions, un) then return s
+	const Iarch t = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${t} =l loadl ${s}\n")
+	return "%t${t}"
+}
+
+# Emit a `match` on a union. Evaluate the scrutinee to its tag (loading it from the
+# box for a boxed union), then a compare-chain: each member arm tests the tag and, on
+# a hit, evaluates its body into the result slot and jumps to the end; the LAST arm (a
+# `_` wildcard, or — for an exhaustive match — the final member) is the unconditional
+# else. The result merges through a stack slot, like `if`.
+# Materialize a string `match` PATTERN (its bytes ride in the arm's `members` as a `Str`) into a
+# runtime Str header the compare can pass to `cf_str_eq`. Reuses the string-literal emitter.
+const emit_str_pattern = (*Emit ctx, Str pat): Str -> {
+	let [Uint8] b = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(pat.len) then break
+		b = [...b, pat[i]]
+		i = i + 1
+	}
+	return emit_str_lit(ctx, b)
+}
+# The per-alternative test in a `match` compare-chain: string equality (`cf_str_eq`) for a "$str"
+# arm, else a union tag compare (`ceql`). Writes `%t<c> =l …` and returns nothing.
+const emit_arm_test = (*Emit ctx, Str type_name, Str member, Str scrut, Str tagop, Iarch c): Iarch -> {
+	if str_eq(type_name, "$str") then {
+		const Str patstr = emit_str_pattern(ctx, member)
+		write_str(ctx.fd, "\t%t${c} =l call $cf_str_eq(l ${scrut}, l ${patstr})\n")
+	} else if str_eq(type_name, "$int") then {
+		# an integer arm: word equality against the literal (its decimal spelling rides in `member`)
+		write_str(ctx.fd, "\t%t${c} =l ceql ${scrut}, ${member}\n")
+	} else {
+		const Iarch tag = member_tag(ctx.unions, type_name, member)
+		write_str(ctx.fd, "\t%t${c} =l ceql ${tagop}, ${tag}\n")
+	}
+	return 0
+}
+# Whether an arm carries payload sub-pattern GUARDS (so its tag match alone is not enough).
+const arm_is_guarded = ([Str] binds): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(binds.len) then break
+		if is_pat_guard(binds[i]) then return true
+		i = i + 1
+	}
+	return false
+}
+# The 0/1 test temp for a payload sub-pattern guard at position `bi` (payload slot `s + 8 + bi*8`):
+# an integer guard compares the field word to the literal; a member guard loads the field union's
+# tag (from the box for a boxed field union) and compares it to the guarded member's tag.
+const emit_guard_cmp = (*Emit ctx, Str type_name, Str member, Str guard, Str s, Iarch bi): Str -> {
+	const Iarch off = 8 + bi * 8
+	const Iarch addr = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${addr} =l add ${s}, ${off}\n")
+	const Iarch val = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${val} =l loadl %t${addr}\n")
+	const Iarch cg = ctx.next
+	ctx.next = ctx.next + 1
+	if is_int_guard(guard) then {
+		write_str(ctx.fd, "\t%t${cg} =l ceql %t${val}, ${guard_body(guard)}\n")
+	} else {
+		const Str fu = payload_type(ctx, type_name, member, bi)
+		let Str ftag = "%t${val}"
+		if union_is_boxed(ctx.unions, fu) then {
+			const Iarch tg = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${tg} =l loadl %t${val}\n")
+			ftag = "%t${tg}"
+		}
+		const Iarch gtag = member_tag(ctx.unions, fu, guard_member(guard_body(guard)))
+		write_str(ctx.fd, "\t%t${cg} =l ceql ${ftag}, ${gtag}\n")
+	}
+	return "%t${cg}"
+}
+const emit_match = (*Emit ctx, Expr scrut, [MatchArm] arms, [Binding] env): Str -> {
+	const Str s = emit_expr(scrut, ctx, env)
+	const Str tagop = scrut_tag(ctx, match_union(arms), s)
+	const Iarch slot = ctx.next
+	ctx.next = ctx.next + 1
+	const Iarch lid = ctx.label
+	ctx.label = ctx.label + 1
+	write_str(ctx.fd, "\t%t${slot} =l alloc8 8\n")
+	# the merge slot stores/loads in the arms' QBE type (a float-valued match yields `d`/`s`)
+	const Str qt = qtype_of_name(match_scalar(ctx, env, arms))
+	const Iarch na = Iarch(arms.len)
+	let Iarch i = 0
+	loop {
+		if i >= na then break
+		if i == na - 1 then {
+			const [Binding] benv_e = arm_body_env(ctx, env, arms[i].type_name, arms[i].members, arms[i].binds, s)
+			const Str v = emit_expr(arms[i].body, ctx, benv_e)
+			write_str(ctx.fd, "\tstore${qt} ${v}, %t${slot}\n")
+			write_str(ctx.fd, "\tjmp @mend${lid}\n")
+		} else if arm_is_guarded(arms[i].binds) then {
+			# a GUARDED arm (single member + payload sub-patterns): test the tag, then each guard in
+			# turn; any failure falls through to the next arm, all passing enters the body.
+			const Iarch c0 = ctx.next
+			ctx.next = ctx.next + 1
+			emit_arm_test(ctx, arms[i].type_name, arms[i].members[0], s, tagop, c0)
+			write_str(ctx.fd, "\tjnz %t${c0}, @mg${lid}_${i}_0, @mnext${lid}_${i}\n")
+			let Iarch g = 0
+			let Iarch bg = 0
+			loop {
+				if bg >= Iarch(arms[i].binds.len) then break
+				if is_pat_guard(arms[i].binds[bg]) then {
+					write_str(ctx.fd, "@mg${lid}_${i}_${g}\n")
+					const Str cg = emit_guard_cmp(ctx, arms[i].type_name, arms[i].members[0], arms[i].binds[bg], s, bg)
+					write_str(ctx.fd, "\tjnz ${cg}, @mg${lid}_${i}_${g + 1}, @mnext${lid}_${i}\n")
+					g = g + 1
+				}
+				bg = bg + 1
+			}
+			write_str(ctx.fd, "@mg${lid}_${i}_${g}\n")
+			const [Binding] benv_g = arm_body_env(ctx, env, arms[i].type_name, arms[i].members, arms[i].binds, s)
+			const Str vg = emit_expr(arms[i].body, ctx, benv_g)
+			write_str(ctx.fd, "\tstore${qt} ${vg}, %t${slot}\n")
+			write_str(ctx.fd, "\tjmp @mend${lid}\n")
+			write_str(ctx.fd, "@mnext${lid}_${i}\n")
+		} else {
+			# test each or-pattern alternative: a hit jumps to the arm body, a miss to
+			# the next alternative, and after the last to the next arm.
+			const Iarch k = Iarch(arms[i].members.len)
+			let Iarch j = 0
+			loop {
+				if j >= k then break
+				const Iarch c = ctx.next
+				ctx.next = ctx.next + 1
+				emit_arm_test(ctx, arms[i].type_name, arms[i].members[j], s, tagop, c)
+				if j == k - 1 then write_str(ctx.fd, "\tjnz %t${c}, @marm${lid}_${i}, @mnext${lid}_${i}\n")
+				if j != k - 1 then {
+					write_str(ctx.fd, "\tjnz %t${c}, @marm${lid}_${i}, @malt${lid}_${i}_${j}\n")
+					write_str(ctx.fd, "@malt${lid}_${i}_${j}\n")
+				}
+				j = j + 1
+			}
+			write_str(ctx.fd, "@marm${lid}_${i}\n")
+			const [Binding] benv_m = arm_body_env(ctx, env, arms[i].type_name, arms[i].members, arms[i].binds, s)
+			const Str v = emit_expr(arms[i].body, ctx, benv_m)
+			write_str(ctx.fd, "\tstore${qt} ${v}, %t${slot}\n")
+			write_str(ctx.fd, "\tjmp @mend${lid}\n")
+			write_str(ctx.fd, "@mnext${lid}_${i}\n")
+		}
+		i = i + 1
+	}
+	write_str(ctx.fd, "@mend${lid}\n")
+	const Iarch rt = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${rt} =${qt} load${qt} %t${slot}\n")
+	return "%t${rt}"
+}
+
+# The scrutinee's union for a statement-match (the first non-`_` arm's type name), "" if all `_`.
+const stmt_match_union = ([StmtArm] arms): Str -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		if !arms[i].is_wild then return arms[i].type_name
+		i = i + 1
+	}
+	return ""
+}
+
+# Emit a STATEMENT-position `match` on a union — the same tag-dispatch compare-chain as
+# `emit_match`, but each arm emits its statement BODY (via `emit_block`, own scope, seeing
+# the outer env plus its payload binds) for effect rather than storing a merged value. An
+# arm whose body is terminal (it writes its own `ret`/`jmp`) needs no trailing jump; a
+# fall-through arm jumps to the `@smend` join, which is always emitted as the match's
+# successor. The match is always NON-terminal (returns 0): the enclosing block/loop/guard —
+# or the explicit `return` the typecheck phase requires to follow — terminates `@smend`.
+const emit_stmt_match = (*Emit ctx, [Binding] env, Expr scrut, [StmtArm] arms): Iarch -> {
+	const Str s = emit_expr(scrut, ctx, env)
+	const Str tagop = scrut_tag(ctx, stmt_match_union(arms), s)
+	const Iarch lid = ctx.label
+	ctx.label = ctx.label + 1
+	const Iarch na = Iarch(arms.len)
+	let Iarch i = 0
+	loop {
+		if i >= na then break
+		if i == na - 1 then {
+			const [Binding] benv_e = arm_body_env(ctx, env, arms[i].type_name, arms[i].members, arms[i].binds, s)
+			const Iarch t = emit_block(ctx, arms[i].body, benv_e)
+			if t == 0 then write_str(ctx.fd, "\tjmp @smend${lid}\n")
+		} else if arm_is_guarded(arms[i].binds) then {
+			# a GUARDED arm (single member + payload sub-patterns): test the tag, then each guard in
+			# turn; any failure falls through to the next arm, all passing runs the statement body.
+			const Iarch c0 = ctx.next
+			ctx.next = ctx.next + 1
+			emit_arm_test(ctx, arms[i].type_name, arms[i].members[0], s, tagop, c0)
+			write_str(ctx.fd, "\tjnz %t${c0}, @sg${lid}_${i}_0, @snext${lid}_${i}\n")
+			let Iarch g = 0
+			let Iarch bg = 0
+			loop {
+				if bg >= Iarch(arms[i].binds.len) then break
+				if is_pat_guard(arms[i].binds[bg]) then {
+					write_str(ctx.fd, "@sg${lid}_${i}_${g}\n")
+					const Str cg = emit_guard_cmp(ctx, arms[i].type_name, arms[i].members[0], arms[i].binds[bg], s, bg)
+					write_str(ctx.fd, "\tjnz ${cg}, @sg${lid}_${i}_${g + 1}, @snext${lid}_${i}\n")
+					g = g + 1
+				}
+				bg = bg + 1
+			}
+			write_str(ctx.fd, "@sg${lid}_${i}_${g}\n")
+			const [Binding] benv_g = arm_body_env(ctx, env, arms[i].type_name, arms[i].members, arms[i].binds, s)
+			const Iarch t = emit_block(ctx, arms[i].body, benv_g)
+			if t == 0 then write_str(ctx.fd, "\tjmp @smend${lid}\n")
+			write_str(ctx.fd, "@snext${lid}_${i}\n")
+		} else {
+			# test each or-pattern alternative: a hit jumps to the arm body, a miss to the
+			# next alternative, and after the last to the next arm.
+			const Iarch k = Iarch(arms[i].members.len)
+			let Iarch j = 0
+			loop {
+				if j >= k then break
+				const Iarch c = ctx.next
+				ctx.next = ctx.next + 1
+				emit_arm_test(ctx, arms[i].type_name, arms[i].members[j], s, tagop, c)
+				if j == k - 1 then write_str(ctx.fd, "\tjnz %t${c}, @sarm${lid}_${i}, @snext${lid}_${i}\n")
+				if j != k - 1 then {
+					write_str(ctx.fd, "\tjnz %t${c}, @sarm${lid}_${i}, @salt${lid}_${i}_${j}\n")
+					write_str(ctx.fd, "@salt${lid}_${i}_${j}\n")
+				}
+				j = j + 1
+			}
+			write_str(ctx.fd, "@sarm${lid}_${i}\n")
+			const [Binding] benv_m = arm_body_env(ctx, env, arms[i].type_name, arms[i].members, arms[i].binds, s)
+			const Iarch t = emit_block(ctx, arms[i].body, benv_m)
+			if t == 0 then write_str(ctx.fd, "\tjmp @smend${lid}\n")
+			write_str(ctx.fd, "@snext${lid}_${i}\n")
+		}
+		i = i + 1
+	}
+	write_str(ctx.fd, "@smend${lid}\n")
+	return 0
+}
+
+# Emit a `[…]` array literal: a fresh {data@0, len@8, cap@16} header in the arena,
+# its backing block (n × 8-byte slots) filled with the elements, len = cap = n. `[]`
+# is data=0, len=0, cap=0. Returns the header pointer.
+const emit_array_lit = (*Emit ctx, [Expr] elems, Str elem_type, [Binding] env): Str -> {
+	const Iarch n = Iarch(elems.len)
+	const Iarch hdr = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${hdr} =l call $cf_alloc(w 24)\n")
+	if n == 0 then {
+		write_str(ctx.fd, "\tstorel 0, %t${hdr}\n")
+		const Iarch la = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${la} =l add %t${hdr}, 8\n")
+		write_str(ctx.fd, "\tstorel 0, %t${la}\n")
+		const Iarch ca = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${ca} =l add %t${hdr}, 16\n")
+		write_str(ctx.fd, "\tstorel 0, %t${ca}\n")
+	} else {
+		# a `[Uint8]` element is one byte (`storeb`, stride 1); every other element rides in an
+		# 8-byte slot (`storel`) — a record/Str/[T]/union pointer, or a word in the low half.
+		const Iarch esz = elem_bytes(elem_type)
+		const Iarch bytes = n * esz
+		const Iarch data = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${data} =l call $cf_alloc(w ${bytes})\n")
+		let Iarch i = 0
+		loop {
+			if i >= n then break
+			const Str v = emit_expr(elems[i], ctx, env)
+			const Iarch off = i * esz
+			const Iarch addr = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${addr} =l add %t${data}, ${off}\n")
+			# a `[Uint8]` byte element uses `storeb`; a float element `stored`/`stores`; else `storel`
+			if esz == 1 then write_str(ctx.fd, "\tstoreb ${v}, %t${addr}\n")
+			if esz != 1 then write_str(ctx.fd, "\t${store_op(scalar_only(elem_type))} ${v}, %t${addr}\n")
+			i = i + 1
+		}
+		write_str(ctx.fd, "\tstorel %t${data}, %t${hdr}\n")
+		const Iarch la = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${la} =l add %t${hdr}, 8\n")
+		write_str(ctx.fd, "\tstorel ${n}, %t${la}\n")
+		const Iarch ca = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${ca} =l add %t${hdr}, 16\n")
+		write_str(ctx.fd, "\tstorel ${n}, %t${ca}\n")
+	}
+	return "%t${hdr}"
+}
+
+# Emit `[...src, e…]` into a FRESH binding (NOT a self-append): a new {data,len,cap} header
+# that COPIES all of `src`'s current elements at runtime, then appends the listed `elems`.
+# A self-append `xs = [...xs, e]` grows in place via the Assign path; this is the GENERAL
+# spread (e.g. `check_for_body`'s `[...env, VarTy(...)]` — extend a borrowed env into a new
+# one). Element stride follows `elem_type` (a `[Uint8]` is byte-packed).
+const emit_arraylit_spread = (*Emit ctx, Expr src, [Expr] elems, Str elem_type, [Binding] env): Str -> {
+	const Iarch esz = elem_bytes(elem_type)
+	const Iarch hdr = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${hdr} =l call $cf_alloc(w 24)\n")
+	write_str(ctx.fd, "\tstorel 0, %t${hdr}\n")
+	const Iarch h8 = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${h8} =l add %t${hdr}, 8\n")
+	write_str(ctx.fd, "\tstorel 0, %t${h8}\n")
+	const Iarch h16 = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${h16} =l add %t${hdr}, 16\n")
+	write_str(ctx.fd, "\tstorel 0, %t${h16}\n")
+	# runtime copy of the source array's live elements (0 .. src.len) — the source is any
+	# expression yielding a dynamic-array header (a name, a field read, a call result)
+	const Str shdr = emit_expr(src, ctx, env)
+	const Iarch lid = ctx.label
+	ctx.label = ctx.label + 1
+	const Iarch lp = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${lp} =l add ${shdr}, 8\n")
+	const Iarch slen = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${slen} =l loadl %t${lp}\n")
+	const Iarch ci = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${ci} =l alloc8 8\n")
+	write_str(ctx.fd, "\tstorel 0, %t${ci}\n")
+	write_str(ctx.fd, "@cptop${lid}\n")
+	const Iarch iv = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${iv} =l loadl %t${ci}\n")
+	const Iarch cmp = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${cmp} =l csltl %t${iv}, %t${slen}\n")
+	write_str(ctx.fd, "\tjnz %t${cmp}, @cpbody${lid}, @cpend${lid}\n")
+	write_str(ctx.fd, "@cpbody${lid}\n")
+	const Iarch sdata = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${sdata} =l loadl ${shdr}\n")
+	const Iarch off = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${off} =l mul %t${iv}, ${esz}\n")
+	const Iarch saddr = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${saddr} =l add %t${sdata}, %t${off}\n")
+	const Iarch sval = ctx.next
+	ctx.next = ctx.next + 1
+	if esz == 1 then write_str(ctx.fd, "\t%t${sval} =l loadub %t${saddr}\n")
+	if esz != 1 then write_str(ctx.fd, "\t%t${sval} =l loadl %t${saddr}\n")
+	const Iarch slot = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${slot} =l call $cf_dyn_push(l %t${hdr}, w ${esz})\n")
+	if esz == 1 then write_str(ctx.fd, "\tstoreb %t${sval}, %t${slot}\n")
+	if esz != 1 then write_str(ctx.fd, "\tstorel %t${sval}, %t${slot}\n")
+	const Iarch iv2 = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${iv2} =l loadl %t${ci}\n")
+	const Iarch iv3 = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${iv3} =l add %t${iv2}, 1\n")
+	write_str(ctx.fd, "\tstorel %t${iv3}, %t${ci}\n")
+	write_str(ctx.fd, "\tjmp @cptop${lid}\n")
+	write_str(ctx.fd, "@cpend${lid}\n")
+	# append the listed elements after the copied ones
+	emit_append(ctx, env, "%t${hdr}", elems, elem_type)
+	return "%t${hdr}"
+}
+
+# Allocate an N-byte buffer in the arena; the returned pointer is a byte pointer ("$ptr").
+const buf_size = (Expr sz): Iarch -> match sz {
+	Expr.Lit(v) -> v,
+	_ -> bad_buf_size()
+}
+const bad_buf_size = (): Iarch -> {
+	die("cf0: emit: a buffer size must be a comptime constant\n")
+	return 0
+}
+const emit_buffer = (*Emit ctx, Expr sz): Str -> {
+	const Iarch n = buf_size(sz)
+	const Iarch b = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${b} =l call $cf_alloc(w ${n})\n")
+	return "%t${b}"
+}
+
+# Emit `xs[i]` — load the i-th element (element address = data + i*8).
+const emit_index = (*Emit ctx, [Binding] env, Str arr, Expr idx): Str -> {
+	const Iarch ai = lookup_index(env, arr)
+	const Str hdr = binding_ptr(ctx, env, ai)
+	# a tuple index `t[k]` (k a comptime literal) loads the k-th 8-byte slot directly — the
+	# binding IS the aggregate (no header/data indirection like a dynamic array).
+	if str_eq(env[ai].rec_type, "$tuple") then {
+		const Iarch tk = tuple_lit_index(idx)
+		const Iarch toff = tk * 8
+		const Iarch taddr = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${taddr} =l add ${hdr}, ${toff}\n")
+		# a float position reloads with `loadd`/`loads` (its telem records the type); else `loadl`
+		return load_typed(ctx, "%t${taddr}", scalar_only(telem_name(env[ai].telems, tk)))
+	}
+	# a raw pointer index `p[i]` reads the i-th element at pointer + i*stride (no header): a
+	# `*[Uint8]` byte pointer strides 1 (`loadub`), a `*[Iarch]` word pointer strides 8 (`loadl`).
+	if str_eq(env[ai].rec_type, "$ptr") then {
+		const Iarch pesz = ptr_stride(env[ai].elem)
+		const Str pv = emit_expr(idx, ctx, env)
+		const Iarch pil = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${pil} =l mul ${pv}, ${pesz}\n")
+		const Iarch paddr = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${paddr} =l add ${hdr}, %t${pil}\n")
+		const Iarch pval = ctx.next
+		ctx.next = ctx.next + 1
+		if pesz == 1 then write_str(ctx.fd, "\t%t${pval} =l loadub %t${paddr}\n")
+		if pesz != 1 then write_str(ctx.fd, "\t%t${pval} =l loadl %t${paddr}\n")
+		return "%t${pval}"
+	}
+	# a string index `s[i]` reads the i-th byte: the header's bytes pointer @0, then +i.
+	if str_eq(env[ai].rec_type, "Str") then {
+		const Str siv = emit_expr(idx, ctx, env)
+		const Iarch sbytes = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${sbytes} =l loadl ${hdr}\n")
+		const Iarch sil = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${sil} =l copy ${siv}\n")
+		const Iarch saddr = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${saddr} =l add %t${sbytes}, %t${sil}\n")
+		const Iarch sval = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${sval} =l loadub %t${saddr}\n")
+		return "%t${sval}"
+	}
+	const Str iv = emit_expr(idx, ctx, env)
+	const Iarch esz = elem_bytes(env[ai].elem)
+	const Iarch data = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${data} =l loadl ${hdr}\n")
+	const Iarch il = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${il} =l copy ${iv}\n")
+	const Iarch off = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${off} =l mul %t${il}, ${esz}\n")
+	const Iarch slot = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${slot} =l add %t${data}, %t${off}\n")
+	const Iarch val = ctx.next
+	ctx.next = ctx.next + 1
+	# a `[Uint8]` element is one byte (`loadub`); a float element `loadd`/`loads`; else an 8-byte `loadl`
+	const Str eqt = if is_float_name(env[ai].elem) then float_qt(env[ai].elem) else "l"
+	if esz == 1 then write_str(ctx.fd, "\t%t${val} =l loadub %t${slot}\n")
+	if esz != 1 then write_str(ctx.fd, "\t%t${val} =${eqt} load${eqt} %t${slot}\n")
+	return "%t${val}"
+}
+
+# Emit `arr[i].field` — load the i-th slot's 8-byte record pointer (`loadl` at
+# data + i*8), then read `field` off that record (base + the field's offset). The
+# element record type is the array binding's `elem`.
+const emit_index_field = (*Emit ctx, [Binding] env, Str arr, Expr idx, Str field): Str -> {
+	const Iarch ai = lookup_index(env, arr)
+	const Str hdr = binding_ptr(ctx, env, ai)
+	# a tuple `t[k].field`: load position k's 8-byte slot DIRECTLY (base + k*8) to get the
+	# record/Str pointer, then read `field` off it (a `Str` element answers `.len` at +8).
+	if str_eq(env[ai].rec_type, "$tuple") then {
+		const Iarch tk = tuple_lit_index(idx)
+		const Iarch tsoff = tk * 8
+		const Iarch taddr = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${taddr} =l add ${hdr}, ${tsoff}\n")
+		const Iarch trecp = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${trecp} =l loadl %t${taddr}\n")
+		const Str tn = telem_name(env[ai].telems, tk)
+		# a `Str` or dynamic-array (`[Elem]`) element answers `.len` at +8; a record reads its field offset
+		let Iarch tfoff = 8
+		if !str_eq(tn, "Str") && !is_nested(tn) then tfoff = field_offset(ctx.recs, tn, field)
+		const Iarch tfaddr = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${tfaddr} =l add %t${trecp}, ${tfoff}\n")
+		return load_typed(ctx, "%t${tfaddr}", field_scalar(ctx, tn, field))
+	}
+	const Str iv = emit_expr(idx, ctx, env)
+	const Iarch data = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${data} =l loadl ${hdr}\n")
+	const Iarch il = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${il} =l copy ${iv}\n")
+	const Iarch off = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${off} =l mul %t${il}, 8\n")
+	const Iarch slot = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${slot} =l add %t${data}, %t${off}\n")
+	const Iarch recp = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${recp} =l loadl %t${slot}\n")
+	# a `[Str]` element or a nested-array element rides as a header whose `.len` word is at
+	# +8; a record element's field rides at its declared offset.
+	let Iarch foff = 8
+	if !str_eq(env[ai].elem, "Str") && !is_nested(env[ai].elem) then foff = field_offset(ctx.recs, env[ai].elem, field)
+	const Iarch faddr = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${faddr} =l add %t${recp}, ${foff}\n")
+	return load_typed(ctx, "%t${faddr}", field_scalar(ctx, env[ai].elem, field))
+}
+
+# Emit `base[i]` on a general expression base (`p.toks[p.pos]`, `prog.recs[r]`). The base
+# is emitted to a pointer value (a `$dyn`/`Str` header, or a raw byte pointer), then
+# indexed exactly like `emit_index` — the only difference is the header comes from an
+# emitted expression rather than a binding slot. The aggregate kind is read off the base
+# via `init_agg_type`: `$ptr` reads the i-th byte at pointer + i; `Str` reads the byte at
+# (bytes@0) + i; a `[T]` loads the 8-byte slot at (data@0) + i*8.
+const emit_index_expr = (*Emit ctx, [Binding] env, Expr base, Expr idx): Str -> {
+	const Str bt = init_agg_type(ctx, env, base)
+	const Str hv = emit_expr(base, ctx, env)
+	# a tuple base `t[k]` (k a comptime literal) loads the k-th 8-byte slot directly
+	if str_eq(bt, "$tuple") then {
+		const Iarch toff = tuple_lit_index(idx) * 8
+		const Iarch taddr = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${taddr} =l add ${hv}, ${toff}\n")
+		const Iarch tval = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${tval} =l loadl %t${taddr}\n")
+		return "%t${tval}"
+	}
+	# a raw pointer index `p[i]` reads the i-th element at pointer + i*stride (no header): a
+	# `*[Uint8]` byte pointer/buffer strides 1 (`loadub`), a `*[Iarch]` word pointer strides 8 (`loadl`).
+	if str_eq(bt, "$ptr") then {
+		const Iarch pesz = ptr_stride(init_elem(ctx, env, base))
+		const Str pv = emit_expr(idx, ctx, env)
+		const Iarch pil = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${pil} =l mul ${pv}, ${pesz}\n")
+		const Iarch paddr = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${paddr} =l add ${hv}, %t${pil}\n")
+		const Iarch pval = ctx.next
+		ctx.next = ctx.next + 1
+		if pesz == 1 then write_str(ctx.fd, "\t%t${pval} =l loadub %t${paddr}\n")
+		if pesz != 1 then write_str(ctx.fd, "\t%t${pval} =l loadl %t${paddr}\n")
+		return "%t${pval}"
+	}
+	# a string index `s[i]` reads the i-th byte: the header's bytes pointer @0, then +i.
+	if str_eq(bt, "Str") then {
+		const Str siv = emit_expr(idx, ctx, env)
+		const Iarch sbytes = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${sbytes} =l loadl ${hv}\n")
+		const Iarch sil = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${sil} =l copy ${siv}\n")
+		const Iarch saddr = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${saddr} =l add %t${sbytes}, %t${sil}\n")
+		const Iarch sval = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${sval} =l loadub %t${saddr}\n")
+		return "%t${sval}"
+	}
+	const Str iv = emit_expr(idx, ctx, env)
+	const Iarch esz = elem_bytes(init_elem(ctx, env, base))
+	const Iarch data = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${data} =l loadl ${hv}\n")
+	const Iarch il = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${il} =l copy ${iv}\n")
+	const Iarch off = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${off} =l mul %t${il}, ${esz}\n")
+	const Iarch slot = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${slot} =l add %t${data}, %t${off}\n")
+	const Iarch val = ctx.next
+	ctx.next = ctx.next + 1
+	if esz == 1 then write_str(ctx.fd, "\t%t${val} =l loadub %t${slot}\n")
+	if esz != 1 then write_str(ctx.fd, "\t%t${val} =l loadl %t${slot}\n")
+	return "%t${val}"
+}
+
+# Emit the elements of a `xs = [...xs, e…]` self-growth append: each `cf_dyn_push`es
+# a slot onto the header (growing as needed, bumping len) and stores the element. `hdr` is
+# the header-pointer operand (the array grows IN PLACE, so its binding is untouched).
+const emit_append = (*Emit ctx, [Binding] env, Str hdr, [Expr] elems, Str elem): Iarch -> {
+	const Iarch esz = elem_bytes(elem)
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(elems.len) then break
+		const Str v = emit_expr(elems[i], ctx, env)
+		const Iarch slot = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${slot} =l call $cf_dyn_push(l ${hdr}, w ${esz})\n")
+		# a `[Uint8]` element is one byte (`storeb`); every other rides in an 8-byte slot (`storel`)
+		if esz == 1 then write_str(ctx.fd, "\tstoreb ${v}, %t${slot}\n")
+		if esz != 1 then write_str(ctx.fd, "\tstorel ${v}, %t${slot}\n")
+		i = i + 1
+	}
+	return 0
+}
+const emit_append_expr = (*Emit ctx, [Binding] env, Str hdr, Expr e, Str elem): Iarch -> match e {
+	Expr.ArrayLit(hs, sn, elems, et) -> emit_append(ctx, env, hdr, elems, elem),
+	_ -> 0 - 1
+}
+
+# Is `e` a SELF-spread `[...name, …]` — a grow-in-place append of `name` onto itself? Such an
+# assignment mutates the existing header; any other array value (a spread of a DIFFERENT
+# name, a field/call source, or a fresh literal) REPOINTS the binding.
+const is_self_spread = (Expr e, Str name): Bool -> match e {
+	Expr.ArrayLit(hs, sn, elems, et) -> if hs then is_named_var(sn, name) else false,
+	_ -> false
+}
+# Whether an expression is exactly the variable `name`.
+const is_named_var = (Expr e, Str name): Bool -> match e { Expr.Var(n) -> str_eq(n, name), _ -> false }
+
+const emit_expr = (Expr e, *Emit ctx, [Binding] env): Str -> match e {
+	Expr.Lit(v) -> "${v}",
+	Expr.BoolLit(b) -> if b then "1" else "0",
+	Expr.FloatLit(t) -> "d_${t}",
+	Expr.Var(name) -> emit_var(ctx, env, name),
+	Expr.StrLit(bytes) -> emit_str_lit(ctx, bytes),
+	Expr.Interp(segs) -> emit_interp(ctx, segs, env),
+	Expr.Record(tn, inits) -> emit_record_val(ctx, tn, inits, env),
+	Expr.Field(base, f) -> emit_field(ctx, env, base, f),
+	Expr.FieldExpr(base, f) -> emit_field_expr(ctx, env, base, f),
+	Expr.ArrayLit(hs, sn, elems, et) -> if hs then emit_arraylit_spread(ctx, sn, elems, et, env) else emit_array_lit(ctx, elems, et, env),
+	Expr.Index(arr, idx) -> emit_index(ctx, env, arr, idx),
+	Expr.IndexField(arr, idx, f) -> emit_index_field(ctx, env, arr, idx, f),
+	Expr.IndexExpr(base, idx) -> emit_index_expr(ctx, env, base, idx),
+	Expr.Tuple(elems) -> emit_tuple(ctx, elems, env),
+	Expr.Unit -> "0",
+	Expr.Loop(body) -> emit_loop_value(ctx, env, body),
+	Expr.Spread(x) -> spread_emit_bad(),
+	Expr.Buffer(sz) -> emit_buffer(ctx, sz),
+	Expr.Addr(name) -> emit_var(ctx, env, name),
+	Expr.UnionMk(tn, mem, args) -> emit_union_mk(ctx, tn, mem, args, env),
+	Expr.Match(scrut, arms) -> emit_match(ctx, scrut, arms, env),
+	Expr.Neg(x) -> emit_unop(ctx, "sub 0, ", x, "", env),
+	Expr.Not(x) -> emit_unop(ctx, "ceql ", x, ", 0", env),
+	Expr.BitNot(x) -> emit_unop(ctx, "xor ", x, ", -1", env),
+	Expr.Add(l, r) -> emit_binop(ctx, "add", l, r, env),
+	Expr.Sub(l, r) -> emit_binop(ctx, "sub", l, r, env),
+	Expr.Mul(l, r) -> emit_binop(ctx, "mul", l, r, env),
+	Expr.Div(l, r) -> emit_binop(ctx, "div", l, r, env),
+	Expr.Mod(l, r) -> emit_binop(ctx, "rem", l, r, env),
+	Expr.BitAnd(l, r) -> emit_binop(ctx, "and", l, r, env),
+	Expr.BitOr(l, r) -> emit_binop(ctx, "or", l, r, env),
+	Expr.BitXor(l, r) -> emit_binop(ctx, "xor", l, r, env),
+	Expr.Shl(l, r) -> emit_binop(ctx, "shl", l, r, env),
+	Expr.Shr(l, r) -> emit_binop(ctx, "sar", l, r, env),
+	Expr.CmpEq(l, r) -> emit_binop(ctx, "ceql", l, r, env),
+	Expr.CmpNe(l, r) -> emit_binop(ctx, "cnel", l, r, env),
+	Expr.CmpLt(l, r) -> emit_binop(ctx, "csltl", l, r, env),
+	Expr.CmpGt(l, r) -> emit_binop(ctx, "csgtl", l, r, env),
+	Expr.CmpLe(l, r) -> emit_binop(ctx, "cslel", l, r, env),
+	Expr.CmpGe(l, r) -> emit_binop(ctx, "csgel", l, r, env),
+	Expr.And(l, r) -> emit_logical(ctx, true, l, r, env),
+	Expr.Or(l, r) -> emit_logical(ctx, false, l, r, env),
+	Expr.If(cond, then_e, else_e) -> emit_if(ctx, cond, then_e, else_e, env),
+	Expr.Call(callee, tyargs, args) -> emit_call(ctx, callee, args, env),
+	# a `defer`-tap value is lifted out of expression position by hoist_defertap.cf before emit;
+	# one reaching here is an internal error (a hoist gap), not a user error
+	Expr.DeferTap(fn, args) -> defertap_survived()
+}
+const defertap_survived = (): Str -> {
+	die("cf0: emit: internal: a defer-tap value survived to emit\n")
+	return ""
+}
+
+# --- statement / block emit -----------------------------------------------------------
+# A `Stmt` is dispatched directly by a statement-position `match` in `emit_block`, whose
+# block arms bind each variant's payload and run for effect (no extractor helpers needed).
+
+# Emit a block's statements in order, growing the binding environment as `let`/`const`
+# locals are declared. The env is seeded with the function's word parameters. Every
+# semantic rule (no shadowing, only a mutable name reassigns, a reassignment keeps
+# its type, the body returns) was enforced by the typecheck phase, so this walk just
+# generates code: a `Let`/`const` allocates a slot and stores; an `Assign` stores
+# into the existing slot; a `Return` emits the `ret`.
+# Emit `for <var> in <arr> { body }` — index from 0 to the array's length, loading
+# each element into a fresh word cell bound as the loop variable, then emit the body
+# with that binding in scope. The counter is a stack slot; the element cell is
+# reallocated per iteration (a bounded arena/stack cost for these small loops).
+# Called directly from `emit_block`'s `ForIn` arm, which binds the loop variable, array
+# name, and body.
+const emit_for_body = (*Emit ctx, [Binding] env, Str lv, Str arr, [Stmt] body): Iarch -> {
+	const Iarch ai = lookup_index(env, arr)
+	const Str hdr = binding_ptr(ctx, env, ai)
+	const Iarch lid = ctx.label
+	ctx.label = ctx.label + 1
+	# `for` is a loop, so it registers itself on the nearest-loop stack: `break` targets
+	# `@lend${lid}` and `continue` targets `@ltop${lid}` (matching `emit_loop_body`). The
+	# counter starts at -1 and is incremented at `@ltop`, BEFORE the guard test — so a
+	# `continue` jump to `@ltop` advances to the next element rather than re-reading the
+	# current one. Saved/restored around the body so a nested `for`/`loop` targets itself.
+	const Iarch saved = ctx.cur_loop
+	ctx.cur_loop = lid
+	const Iarch la = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${la} =l add ${hdr}, 8\n")
+	const Iarch lenw = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${lenw} =l loadl %t${la}\n")
+	const Iarch ci = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${ci} =l alloc8 8\n")
+	write_str(ctx.fd, "\tstorel -1, %t${ci}\n")
+	write_str(ctx.fd, "@ltop${lid}\n")
+	const Iarch iv2 = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${iv2} =l loadl %t${ci}\n")
+	const Iarch iv = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${iv} =l add %t${iv2}, 1\n")
+	write_str(ctx.fd, "\tstorel %t${iv}, %t${ci}\n")
+	const Iarch cmp = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${cmp} =l csltl %t${iv}, %t${lenw}\n")
+	write_str(ctx.fd, "\tjnz %t${cmp}, @fbody${lid}, @lend${lid}\n")
+	write_str(ctx.fd, "@fbody${lid}\n")
+	const Iarch data = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${data} =l loadl ${hdr}\n")
+	const Iarch esz = elem_bytes(env[ai].elem)
+	const Iarch off = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${off} =l mul %t${iv}, ${esz}\n")
+	const Iarch eslot = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${eslot} =l add %t${data}, %t${off}\n")
+	# a float array binds each element as a float (the cell records its scalar so `binding_ptr`
+	# reloads with `loadd`/`loads`); the raw `loadl`/`storel` spill is bit-preserving
+	const Str fx = if is_float_name(env[ai].elem) then env[ai].elem else ""
+	# a `Str`/record/union ELEMENT binds the loop variable as that aggregate (its `rec_type`), so
+	# `s.len` / `p.field` / a `match` resolve through the loaded 8-byte pointer.
+	let Str fer = ""
+	if elem_is_agg(ctx, env[ai].elem) && !is_nested(env[ai].elem) then fer = env[ai].elem
+	const Iarch xval = ctx.next
+	ctx.next = ctx.next + 1
+	if esz == 1 then write_str(ctx.fd, "\t%t${xval} =l loadub %t${eslot}\n")
+	if esz != 1 then write_str(ctx.fd, "\t%t${xval} =l loadl %t${eslot}\n")
+	const Iarch xcell = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${xcell} =l alloc8 8\n")
+	write_str(ctx.fd, "\tstorel %t${xval}, %t${xcell}\n")
+	const [Binding] benv = [...env, Binding({ name: lv, slot: xcell, rec_type: fer, elem: "", is_cell: true, telems: [], fixed: fx })]
+	const Iarch term = emit_block(ctx, body, benv)
+	if term == 0 then write_str(ctx.fd, "\tjmp @ltop${lid}\n")
+	write_str(ctx.fd, "@lend${lid}\n")
+	ctx.cur_loop = saved
+	return 0
+}
+
+# Emit a `loop { body }`: `@ltop` / body / a back-edge `jmp @ltop` (omitted when the
+# body tail is terminal — a bare break/continue/return) / `@lend`. The loop's id is
+# the nearest-loop target for break (`@lend`) and continue (`@ltop`); it is saved and
+# restored around the body so a nested loop targets itself. Called directly from
+# `emit_block`'s `Loop` arm, which binds the body.
+const emit_loop_body = (*Emit ctx, [Binding] env, [Stmt] body): Iarch -> {
+	const Iarch lid = ctx.label
+	ctx.label = ctx.label + 1
+	const Iarch saved = ctx.cur_loop
+	ctx.cur_loop = lid
+	write_str(ctx.fd, "@ltop${lid}\n")
+	const Iarch term = emit_block(ctx, body, env)
+	if term == 0 then write_str(ctx.fd, "\tjmp @ltop${lid}\n")
+	write_str(ctx.fd, "@lend${lid}\n")
+	ctx.cur_loop = saved
+	return 0
+}
+
+# Emit a value-yielding `loop { … }` (an expression): allocate ONE merge slot before the loop
+# (so a long loop does not leak — it is not re-alloc'd per iteration), then `@ltop` / body /
+# back-edge / `@lend` like a statement loop, but with `cur_slot` set so each `<- v` stores its
+# value into the slot and jumps to `@lend`. After the loop, load the slot as the result.
+const emit_loop_value = (*Emit ctx, [Binding] env, [Stmt] body): Str -> {
+	const Iarch slot = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${slot} =l alloc8 8\n")
+	const Iarch lid = ctx.label
+	ctx.label = ctx.label + 1
+	const Iarch saved = ctx.cur_loop
+	const Iarch saved_slot = ctx.cur_slot
+	ctx.cur_loop = lid
+	ctx.cur_slot = slot
+	write_str(ctx.fd, "@ltop${lid}\n")
+	const Iarch term = emit_block(ctx, body, env)
+	if term == 0 then write_str(ctx.fd, "\tjmp @ltop${lid}\n")
+	write_str(ctx.fd, "@lend${lid}\n")
+	ctx.cur_loop = saved
+	ctx.cur_slot = saved_slot
+	# the slot loads in the yielded value's QBE type (a float loop yields `d`/`s`)
+	const Str qt = qtype_of_name(loop_yield_scalar_list(ctx, env, body))
+	const Iarch rt = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${rt} =${qt} load${qt} %t${slot}\n")
+	return "%t${rt}"
+}
+
+# Emit a statement-position `if cond then <body>` guard: branch on the condition into a
+# `@then` block that runs the guarded statement, then fall through to `@gnext`. When the
+# guarded statement is itself terminal (`break`/`continue`/`return` writes its own jump)
+# the `@then` block already ends, so the `jmp @gnext` is omitted (QBE forbids an
+# instruction after a block terminator). A guard is conditional, so it never terminates
+# the enclosing block — it returns 0.
+const emit_guard = (*Emit ctx, [Binding] env, Expr cond, Stmt body): Iarch -> {
+	const Str cc = emit_expr(cond, ctx, env)
+	const Iarch gid = ctx.label
+	ctx.label = ctx.label + 1
+	write_str(ctx.fd, "\tjnz ${cc}, @then${gid}, @gnext${gid}\n")
+	write_str(ctx.fd, "@then${gid}\n")
+	const Iarch term = emit_simple_stmt(ctx, env, body)
+	if term == 0 then write_str(ctx.fd, "\tjmp @gnext${gid}\n")
+	write_str(ctx.fd, "@gnext${gid}\n")
+	return 0
+}
+
+# Emit a statement-position `if cond then <then> else <else>`: branch into `@then`/`@else`
+# blocks, each running its guarded statement and, when it falls through (a non-terminal
+# statement), jumping to a shared `@end`. `@end` is emitted only when at least one branch
+# falls through — if BOTH branches terminate (each writes its own `ret`/`jmp`), the whole
+# statement is terminal and there is no join block. Returns 1 in that both-terminal case
+# (so an enclosing loop/block sees the termination), else 0.
+const emit_ifelse = (*Emit ctx, [Binding] env, Expr cond, Stmt tb, Stmt eb): Iarch -> {
+	const Str cc = emit_expr(cond, ctx, env)
+	const Iarch gid = ctx.label
+	ctx.label = ctx.label + 1
+	write_str(ctx.fd, "\tjnz ${cc}, @then${gid}, @else${gid}\n")
+	write_str(ctx.fd, "@then${gid}\n")
+	const Iarch tterm = emit_simple_stmt(ctx, env, tb)
+	if tterm == 0 then write_str(ctx.fd, "\tjmp @end${gid}\n")
+	write_str(ctx.fd, "@else${gid}\n")
+	const Iarch eterm = emit_simple_stmt(ctx, env, eb)
+	if eterm == 0 then write_str(ctx.fd, "\tjmp @end${gid}\n")
+	let Iarch both = 0
+	if tterm == 1 then { if eterm == 1 then both = 1 }
+	if both == 0 then write_str(ctx.fd, "@end${gid}\n")
+	return both
+}
+
+# Emit one "simple" statement — a loop exit, an early return, an assignment, or a nested
+# `if` guard. It is the fall-through case of `emit_block` and the body of every guard, so
+# it reads the environment but never extends it (a binding/block statement is a block
+# concern handled directly in `emit_block`). Returns 1 if the statement terminates the
+# block (a `break`/`continue`/`return` writes its own QBE terminator), else 0.
+const emit_simple_stmt = (*Emit ctx, [Binding] env, Stmt s): Iarch -> {
+	let Iarch term = 0
+	match s {
+		Stmt.Break -> {
+			write_str(ctx.fd, "\tjmp @lend${ctx.cur_loop}\n")
+			term = 1
+		},
+		Stmt.Continue -> {
+			write_str(ctx.fd, "\tjmp @ltop${ctx.cur_loop}\n")
+			term = 1
+		},
+		Stmt.Yield(e) -> {
+			# `<- v` — store the value (in its QBE type, `d`/`s` for a float) into the nearest
+			# value-loop's merge slot and break to `@lend`
+			const Str v = emit_expr(e, ctx, env)
+			write_str(ctx.fd, "\tstore${qtype_of(ctx, env, e)} ${v}, %t${ctx.cur_slot}\n")
+			write_str(ctx.fd, "\tjmp @lend${ctx.cur_loop}\n")
+			term = 1
+		},
+		Stmt.Return(e) -> {
+			# a bare `({…})` record literal is built as the function's return record type (its own
+			# type_name is empty); every other value emits normally
+			let Str v = ""
+			if is_bare_record_e(e) && find_rec(ctx.recs, ctx.cur_ret) >= 0 then {
+				const Iarch b = emit_record_lit(ctx, ctx.cur_ret, record_inits_e(e), env)
+				v = "%t${b}"
+			} else v = emit_expr(e, ctx, env)
+			write_str(ctx.fd, "\tret ${v}\n")
+			term = 1
+		},
+		Stmt.Assign(n, e) -> {
+			# `name = value`. A dynamic-array SELF-spread `xs = [...xs, e]` grows the header in
+			# place (its cell keeps the same pointer). Any other value — a word, a repointed
+			# `let` aggregate (`acc = Expr.Add(acc, r)`), or a fresh/other array (`xs = []`,
+			# `xs = ys`) — is stored into the binding's cell, replacing its contents/pointer.
+			const Iarch idx = lookup_index(env, n)
+			if str_eq(env[idx].rec_type, "$dyn") && is_self_spread(e, n) then {
+				const Str hdr = binding_ptr(ctx, env, idx)
+				emit_append_expr(ctx, env, hdr, e, env[idx].elem)
+			} else {
+				const Str v = emit_expr(e, ctx, env)
+				write_str(ctx.fd, "\t${store_op(env[idx].fixed)} ${v}, %t${env[idx].slot}\n")
+			}
+		},
+		Stmt.FieldAssign(b, f, e) -> {
+			# `base.field = value` — store the value into the record's field in place.
+			# Evaluate the value first (it may read the record's current fields).
+			const Str v = emit_expr(e, ctx, env)
+			const Iarch idx = lookup_index(env, b)
+			const Str bp = binding_ptr(ctx, env, idx)
+			const Str rt = env[idx].rec_type
+			const Iarch off = field_offset(ctx.recs, rt, f)
+			const Iarch addr = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${addr} =l add ${bp}, ${off}\n")
+			# a float field stores `stored`/`stores`; a word/pointer field `storel`
+			write_str(ctx.fd, "\t${store_op(field_scalar(ctx, rt, f))} ${v}, %t${addr}\n")
+		},
+		Stmt.DeepFieldAssign(be, f, e) -> {
+			# `a.b.c = value` — evaluate the value first (it may read the aggregate), then address the
+			# penultimate record by emitting the base chain `a.b` (each hop an arena-pointer load) and
+			# store into its `c` field. `init_agg_type` recovers the base's record type for the offset.
+			const Str v = emit_expr(e, ctx, env)
+			const Str bp = emit_expr(be, ctx, env)
+			const Str rt = init_agg_type(ctx, env, be)
+			const Iarch off = field_offset(ctx.recs, rt, f)
+			const Iarch addr = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${addr} =l add ${bp}, ${off}\n")
+			write_str(ctx.fd, "\t${store_op(field_scalar(ctx, rt, f))} ${v}, %t${addr}\n")
+		},
+		Stmt.IndexAssign(a, ix, val) -> {
+			# `arr[idx] = val` — store the value at data + idx*8
+			const Iarch ai = lookup_index(env, a)
+			const Str hdr = binding_ptr(ctx, env, ai)
+			const Str iv = emit_expr(ix, ctx, env)
+			const Str vv = emit_expr(val, ctx, env)
+			if str_eq(env[ai].rec_type, "$ptr") then {
+				const Iarch besz = ptr_stride(env[ai].elem)
+				const Iarch bil = ctx.next
+				ctx.next = ctx.next + 1
+				write_str(ctx.fd, "\t%t${bil} =l mul ${iv}, ${besz}\n")
+				const Iarch baddr = ctx.next
+				ctx.next = ctx.next + 1
+				write_str(ctx.fd, "\t%t${baddr} =l add ${hdr}, %t${bil}\n")
+				if besz == 1 then write_str(ctx.fd, "\tstoreb ${vv}, %t${baddr}\n")
+				if besz != 1 then write_str(ctx.fd, "\tstorel ${vv}, %t${baddr}\n")
+				return 0
+			}
+			const Iarch esz = elem_bytes(env[ai].elem)
+			const Iarch data = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${data} =l loadl ${hdr}\n")
+			const Iarch il = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${il} =l copy ${iv}\n")
+			const Iarch off = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${off} =l mul %t${il}, ${esz}\n")
+			const Iarch slot = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${slot} =l add %t${data}, %t${off}\n")
+			# a `[Uint8]` byte element uses `storeb`; a float element `stored`/`stores`; else `storel`
+			if esz == 1 then write_str(ctx.fd, "\tstoreb ${vv}, %t${slot}\n")
+			if esz != 1 then write_str(ctx.fd, "\t${store_op(scalar_only(env[ai].elem))} ${vv}, %t${slot}\n")
+		},
+		Stmt.IfThen(c, body) -> {
+			emit_guard(ctx, env, c, body)
+		},
+		Stmt.IfElse(c, tb, eb) -> {
+			term = emit_ifelse(ctx, env, c, tb, eb)
+		},
+		Stmt.Do(e) -> {
+			# a call-for-effect: evaluate it (emits the call), discard the result operand
+			emit_expr(e, ctx, env)
+		},
+		Stmt.Block(stmts) -> {
+			# a `{ … }` guard body: emit it in its own scope; it is terminal iff its last
+			# statement is (so an enclosing guard/if-else knows whether to add a fall-through jump)
+			term = emit_block(ctx, stmts, env)
+		},
+		Stmt.Match(scrut, arms) -> {
+			# a statement-position `match` — tag-dispatch for effect; terminal iff every arm is
+			term = emit_stmt_match(ctx, env, scrut, arms)
+		},
+		_ -> {
+			die("cf0: emit: unexpected guarded statement\n")
+		}
+	}
+	return term
+}
+
+# Emit a statement list, returning 1 if it ends terminally (a bare break/continue/
+# return), else 0 — so an enclosing loop knows whether to emit its back-edge.
+const emit_block = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
+	let [Binding] env = []
+	let Iarch pi = 0
+	loop {
+		if pi >= Iarch(params.len) then break
+		env = [...env, params[pi]]
+		pi = pi + 1
+	}
+	let Iarch terminal = 0
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(stmts.len) then break
+		terminal = 0
+		const Stmt s = stmts[i]
+		match s {
+			Stmt.Loop(bd) -> { emit_loop_body(ctx, env, bd) },
+			Stmt.ForIn(fv, fa, fbd) -> { emit_for_body(ctx, env, fv, fa, fbd) },
+			Stmt.Let(n, m, ann, e) -> {
+				# `const`/`let name = init`. A word allocates a stack cell and stores the value.
+				# An aggregate initializer yields a base pointer: a `const` binds the pointer temp
+				# directly (a write-once borrow); a `let` (mutable) spills the pointer into a stack
+				# cell so a later `name = …` can repoint it (`xs = []`, `acc = Expr.Add(acc, r)`).
+				# a bare `({…})` bound to a record-annotated local builds the annotation's record type
+				const Bool bare_rec = is_bare_record_e(e) && find_rec(ctx.recs, ann) >= 0
+				const Str rt = if bare_rec then ann else init_agg_type(ctx, env, e)
+				if str_eq(rt, "") then {
+					const Str v = emit_expr(e, ctx, env)
+					# a scalar local records its leaf type (fixed OR float, from the annotation else
+					# inferred) so later ops pick the right codegen and the cell stores/loads with its
+					# QBE type (a float uses `stored`/`loadd`, an integer `storel`/`loadl`)
+					const Str fx = if is_fixed_name(ann) || is_float_name(ann) || is_tagonly_union(ctx, ann) then ann else scalar_of(ctx, env, e)
+					const Iarch slot = ctx.next
+					ctx.next = ctx.next + 1
+					write_str(ctx.fd, "\t%t${slot} =l alloc8 8\n")
+					write_str(ctx.fd, "\t${store_op(fx)} ${v}, %t${slot}\n")
+					env = [...env, Binding({ name: n, slot: slot, rec_type: "", elem: "", is_cell: true, telems: [], fixed: fx })]
+				} else {
+					const Iarch base = if bare_rec then emit_record_lit(ctx, ann, record_inits_e(e), env) else emit_agg_binding(ctx, e, env)
+					let Str belem = ""
+					let [TupElem] btel = []
+					if !bare_rec then {
+						belem = init_elem(ctx, env, e)
+						btel = init_telems(ctx, env, e)
+					}
+					if m then {
+						const Iarch cell = ctx.next
+						ctx.next = ctx.next + 1
+						write_str(ctx.fd, "\t%t${cell} =l alloc8 8\n")
+						write_str(ctx.fd, "\tstorel %t${base}, %t${cell}\n")
+						env = [...env, Binding({ name: n, slot: cell, rec_type: rt, elem: belem, is_cell: true, telems: btel, fixed: "" })]
+					} else {
+						env = [...env, Binding({ name: n, slot: base, rec_type: rt, elem: belem, is_cell: false, telems: btel, fixed: "" })]
+					}
+				}
+			},
+			Stmt.Destructure(pat, m, e) -> { env = emit_destructure(ctx, env, pat, m, e) },
+			_ -> { terminal = emit_simple_stmt(ctx, env, s) }
+		}
+		i = i + 1
+	}
+	return terminal
+}
+
+# Emit one function: its signature, parameter spills, and body. main is the exported
+# `$main` (the entry the floor calls); every other function `idx` is the internal
+# `$f<idx>` (positional, so a user name can never collide with `_start`/`_main`).
+#
+# Parameters are named POSITIONALLY in QBE (`%p<i>`), not by source name — the temp
+# only has to match between the signature and the spill, and a Str name cannot be
+# interpolated (cfcc interpolates bare identifiers only). A word parameter (Iarch)
+# is `w` and spills to a stack slot so it reads like a local, and is bound in the
+# env; a pointer parameter (*[Str]) is `l`, rides the signature unused, and is NOT
+# bound (the typecheck phase guarantees it is never referenced). All returns are words.
+const emit_func = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
+	const Bool is_main = str_eq(fn.name, "main")
+	# the current function's return type — supplied to a bare `({…})` record literal returned from
+	# this function (its type_name is empty; the return annotation names its record type)
+	ctx.cur_ret = fn.ret_name
+	# main always returns a word (its Int exit code); a helper returning a record
+	# returns an `l` arena pointer, else a word.
+	if is_main then write_str(ctx.fd, "export function l $main(")
+	# a float-returning helper is typed `d`/`s`; every other return (word/pointer/record) is `l`
+	if !is_main then write_str(ctx.fd, "function ${qtype_of_name(fn.ret_name)} $f${idx}(")
+	let Iarch si = 0
+	loop {
+		if si >= Iarch(fn.params.len) then break
+		if si > 0 then write_str(ctx.fd, ", ")
+		# a float scalar parameter is `d`/`s`; every other parameter (word/pointer/record) is `l`
+		write_str(ctx.fd, "${qtype_of_name(fn.params[si].type_name)} %p${si}")
+		si = si + 1
+	}
+	write_str(ctx.fd, ") {\n")
+	write_str(ctx.fd, "@start\n")
+	let [Binding] params = []
+	let Iarch pi = 0
+	loop {
+		if pi >= Iarch(fn.params.len) then break
+		if fn.params[pi].is_ptr then {
+			# a pointer parameter: copy the pointer into a temp. A `*[Uint8]` byte pointer
+			# binds "$ptr" (indexable, no header); a `*Record` pointer binds its record type
+			# (fields read/written through it).
+			const Iarch slot = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${slot} =l copy %p${pi}\n")
+			if str_eq(fn.params[pi].type_name, "$ptr") then {
+				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: "$ptr", elem: fn.params[pi].elem, is_cell: false, telems: [], fixed: "" })]
+			} else {
+				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: fn.params[pi].type_name, elem: "", is_cell: false, telems: [], fixed: "" })]
+			}
+		} else if str_eq(fn.params[pi].type_name, "$fn") then {
+			# a function-value parameter arrives as a code address in an `l` register; spill it to a
+			# cell (loaded on use) and record its signature — `telems` the argument type names, `elem`
+			# the return type name — so an indirect call `f(x)` picks the right QBE arg/return classes.
+			const Iarch slot = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${slot} =l alloc8 8\n")
+			write_str(ctx.fd, "\tstorel %p${pi}, %t${slot}\n")
+			params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: "$fn", elem: fn.params[pi].elem, is_cell: true, telems: fn.params[pi].telems, fixed: "" })]
+		} else if str_eq(fn.params[pi].type_name, "$capref") then {
+			# a captured SCALAR arrives as its enclosing slot ADDRESS; bind a cell OVER that address
+			# so reads/writes go THROUGH it (by-reference capture). `fixed` carries the scalar type
+			# so a fixed-width/float capture loads/stores in its own QBE class.
+			const Str cfx = if is_fixed_name(fn.params[pi].elem) || is_float_name(fn.params[pi].elem) || str_eq(fn.params[pi].elem, "Bool") then fn.params[pi].elem else ""
+			const Iarch slot = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${slot} =l copy %p${pi}\n")
+			params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: "", elem: "", is_cell: true, telems: [], fixed: cfx })]
+		} else if str_eq(fn.params[pi].type_name, "$capagg") then {
+			# a captured AGGREGATE arrives as its pointer; bind it like an aggregate parameter (its
+			# record/`Str` type in `rec_type`), so field/`.len` reads and field writes hit the shared
+			# arena value the enclosing scope also holds.
+			const Iarch slot = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${slot} =l copy %p${pi}\n")
+			params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: fn.params[pi].elem, elem: "", is_cell: false, telems: [], fixed: "" })]
+		} else {
+			if is_agg_param(fn.params[pi], ctx.recs, ctx.unions) then {
+				# a record/tuple parameter arrives as a pointer to the caller's aggregate; copy
+				# it into a temp used as the base for field/position reads. A tuple param carries
+				# its per-position type names so `p[k]` / `p[k].field` resolve.
+				const Iarch slot = ctx.next
+				ctx.next = ctx.next + 1
+				write_str(ctx.fd, "\t%t${slot} =l copy %p${pi}\n")
+				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: fn.params[pi].type_name, elem: fn.params[pi].elem, is_cell: false, telems: emit_canon_telems(ctx, fn.params[pi].telems), fixed: "" })]
+			} else {
+				# a word/float parameter spills into a stack slot so it reads like a local; a
+				# fixed-width or float parameter records its type name so ops on it and the slot's
+				# store/load use the right codegen (a float spills with `stored`/`stores`).
+				const Str pfx = if is_fixed_name(fn.params[pi].type_name) || is_float_name(fn.params[pi].type_name) || str_eq(fn.params[pi].type_name, "Bool") || is_tagonly_union(ctx, fn.params[pi].type_name) then fn.params[pi].type_name else ""
+				const Iarch slot = ctx.next
+				ctx.next = ctx.next + 1
+				write_str(ctx.fd, "\t%t${slot} =l alloc8 8\n")
+				write_str(ctx.fd, "\t${store_op(pfx)} %p${pi}, %t${slot}\n")
+				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: "", elem: "", is_cell: true, telems: [], fixed: pfx })]
+			}
+		}
+		pi = pi + 1
+	}
+	emit_block(ctx, fn.body, params)
+	write_str(ctx.fd, "}\n")
+	return 0
+}
+
+# The arena's QBE side: a single global bump cursor `{cf_top, cf_limit}` over one OS
+# mapping, and `cf_alloc(n)` — lazily mints the page on the first call (if cf_limit
+# is 0, call the asm `cf_arena_init`), 8-aligns the request, bumps the cursor, and
+# traps via `cf_oom` on overflow. Records (which may escape via a return) live here;
+# scalars stay in stack slots. (⚠ THROWAWAY: one bounded 256 MiB mapping, no teardown
+# or remap — the M6 std runtime does the real page/arena arc.)
+const emit_arena_qbe = (Uarch fd): Iarch -> {
+	write_str(fd, "export data $cf_top = { l 0 }\n")
+	write_str(fd, "export data $cf_limit = { l 0 }\n")
+	write_str(fd, "function l $cf_alloc(w %n) {\n")
+	write_str(fd, "@start\n")
+	write_str(fd, "\t%lim0 =l loadl $cf_limit\n")
+	write_str(fd, "\t%uninit =w ceql %lim0, 0\n")
+	write_str(fd, "\tjnz %uninit, @init, @ready\n")
+	write_str(fd, "@init\n")
+	write_str(fd, "\tcall $cf_arena_init()\n")
+	write_str(fd, "\tjmp @ready\n")
+	write_str(fd, "@ready\n")
+	write_str(fd, "\t%r7 =w add %n, 7\n")
+	write_str(fd, "\t%ra =w and %r7, -8\n")
+	write_str(fd, "\t%sz =l extuw %ra\n")
+	write_str(fd, "\t%p =l loadl $cf_top\n")
+	write_str(fd, "\t%nt =l add %p, %sz\n")
+	write_str(fd, "\t%lim =l loadl $cf_limit\n")
+	write_str(fd, "\t%ok =w culel %nt, %lim\n")
+	write_str(fd, "\tjnz %ok, @ok, @oom\n")
+	write_str(fd, "@oom\n")
+	write_str(fd, "\tcall $cf_oom()\n")
+	write_str(fd, "\tret %p\n")
+	write_str(fd, "@ok\n")
+	write_str(fd, "\tstorel %nt, $cf_top\n")
+	write_str(fd, "\tret %p\n")
+	write_str(fd, "}\n")
+	# `[T]` grow-in-place append: given the 24-byte header {data@0, len@8, cap@16} and
+	# the element stride, ensure room for one more (amortized doubling: cap 0→4 else
+	# ×2, with a byte-copy of the live elements to a fresh cf_alloc block), then RETURN
+	# the new (len-th) slot address and bump len. The caller stores the element there.
+	write_str(fd, "function l $cf_dyn_push(l %hdr, w %esize) {\n")
+	write_str(fd, "@start\n")
+	write_str(fd, "\t%ip =l alloc8 8\n")
+	write_str(fd, "\t%es =l extuw %esize\n")
+	write_str(fd, "\t%hlen =l add %hdr, 8\n")
+	write_str(fd, "\t%hcap =l add %hdr, 16\n")
+	write_str(fd, "\t%len =l loadl %hlen\n")
+	write_str(fd, "\t%cap =l loadl %hcap\n")
+	write_str(fd, "\t%full =w ceql %len, %cap\n")
+	write_str(fd, "\tjnz %full, @grow, @store\n")
+	write_str(fd, "@grow\n")
+	write_str(fd, "\t%dbl =l mul %cap, 2\n")
+	write_str(fd, "\t%z =w ceql %cap, 0\n")
+	write_str(fd, "\t%zl =l extuw %z\n")
+	write_str(fd, "\t%z4 =l mul %zl, 4\n")
+	write_str(fd, "\t%ncap =l add %dbl, %z4\n")
+	write_str(fd, "\t%nbytes =l mul %ncap, %es\n")
+	write_str(fd, "\t%nbw =w copy %nbytes\n")
+	write_str(fd, "\t%ndata =l call $cf_alloc(w %nbw)\n")
+	write_str(fd, "\t%odata =l loadl %hdr\n")
+	write_str(fd, "\t%obytes =l mul %len, %es\n")
+	write_str(fd, "\tstorel 0, %ip\n")
+	write_str(fd, "@copytop\n")
+	write_str(fd, "\t%ci =l loadl %ip\n")
+	write_str(fd, "\t%cdone =w cugel %ci, %obytes\n")
+	write_str(fd, "\tjnz %cdone, @copydone, @copybody\n")
+	write_str(fd, "@copybody\n")
+	write_str(fd, "\t%src =l add %odata, %ci\n")
+	write_str(fd, "\t%dst =l add %ndata, %ci\n")
+	write_str(fd, "\t%cb =w loadub %src\n")
+	write_str(fd, "\tstoreb %cb, %dst\n")
+	write_str(fd, "\t%ci1 =l add %ci, 1\n")
+	write_str(fd, "\tstorel %ci1, %ip\n")
+	write_str(fd, "\tjmp @copytop\n")
+	write_str(fd, "@copydone\n")
+	write_str(fd, "\tstorel %ndata, %hdr\n")
+	write_str(fd, "\tstorel %ncap, %hcap\n")
+	write_str(fd, "\tjmp @store\n")
+	write_str(fd, "@store\n")
+	write_str(fd, "\t%data =l loadl %hdr\n")
+	write_str(fd, "\t%len2 =l loadl %hlen\n")
+	write_str(fd, "\t%soff =l mul %len2, %es\n")
+	write_str(fd, "\t%slot =l add %data, %soff\n")
+	write_str(fd, "\t%len3 =l add %len2, 1\n")
+	write_str(fd, "\tstorel %len3, %hlen\n")
+	write_str(fd, "\tret %slot\n")
+	write_str(fd, "}\n")
+	# Interpolation append helpers — push a value's TEXT onto a `[Uint8]` vector (via
+	# cf_dyn_push, stride 1). cf_uint_append: unsigned itoa (two-pass extract-then-reverse
+	# over a stack digit buffer). cf_int_append: a sign, then the magnitude. cf_str_append:
+	# a Str's bytes. (Void functions — they mutate the vector and return nothing.)
+	write_str(fd, "function $cf_uint_append(l %vhdr, l %val) {\n")
+	write_str(fd, "@start\n")
+	write_str(fd, "\t%buf =l alloc4 24\n")
+	write_str(fd, "\t%ip =l alloc8 8\n")
+	write_str(fd, "\t%vp =l alloc8 8\n")
+	write_str(fd, "\tstorel %val, %vp\n")
+	write_str(fd, "\tstorel 0, %ip\n")
+	write_str(fd, "\t%z =w ceql %val, 0\n")
+	write_str(fd, "\tjnz %z, @zero, @extract\n")
+	write_str(fd, "@zero\n")
+	write_str(fd, "\t%sz =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb 48, %sz\n")
+	write_str(fd, "\tret\n")
+	write_str(fd, "@extract\n")
+	write_str(fd, "\t%v =l loadl %vp\n")
+	write_str(fd, "\t%done =w ceql %v, 0\n")
+	write_str(fd, "\tjnz %done, @emit, @digit\n")
+	write_str(fd, "@digit\n")
+	write_str(fd, "\t%q =l udiv %v, 10\n")
+	write_str(fd, "\t%r =l urem %v, 10\n")
+	write_str(fd, "\t%rc =w copy %r\n")
+	write_str(fd, "\t%ch =w add %rc, 48\n")
+	write_str(fd, "\t%i =l loadl %ip\n")
+	write_str(fd, "\t%da =l add %buf, %i\n")
+	write_str(fd, "\tstoreb %ch, %da\n")
+	write_str(fd, "\t%i1 =l add %i, 1\n")
+	write_str(fd, "\tstorel %i1, %ip\n")
+	write_str(fd, "\tstorel %q, %vp\n")
+	write_str(fd, "\tjmp @extract\n")
+	write_str(fd, "@emit\n")
+	write_str(fd, "\t%cnt =l loadl %ip\n")
+	write_str(fd, "\tstorel %cnt, %vp\n")
+	write_str(fd, "@eloop\n")
+	write_str(fd, "\t%k =l loadl %vp\n")
+	write_str(fd, "\t%kz =w ceql %k, 0\n")
+	write_str(fd, "\tjnz %kz, @edone, @estep\n")
+	write_str(fd, "@estep\n")
+	write_str(fd, "\t%k1 =l sub %k, 1\n")
+	write_str(fd, "\t%dap =l add %buf, %k1\n")
+	write_str(fd, "\t%dch =w loadub %dap\n")
+	write_str(fd, "\t%es =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb %dch, %es\n")
+	write_str(fd, "\tstorel %k1, %vp\n")
+	write_str(fd, "\tjmp @eloop\n")
+	write_str(fd, "@edone\n")
+	write_str(fd, "\tret\n")
+	write_str(fd, "}\n")
+	write_str(fd, "function $cf_int_append(l %vhdr, l %val) {\n")
+	write_str(fd, "@start\n")
+	write_str(fd, "\t%neg =w csltl %val, 0\n")
+	write_str(fd, "\tjnz %neg, @isneg, @pos\n")
+	write_str(fd, "@isneg\n")
+	write_str(fd, "\t%s =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb 45, %s\n")
+	write_str(fd, "\t%nv =l sub 0, %val\n")
+	write_str(fd, "\tcall $cf_uint_append(l %vhdr, l %nv)\n")
+	write_str(fd, "\tret\n")
+	write_str(fd, "@pos\n")
+	write_str(fd, "\tcall $cf_uint_append(l %vhdr, l %val)\n")
+	write_str(fd, "\tret\n")
+	write_str(fd, "}\n")
+	# cf_bool_append(vhdr, val) — append the textual form of a `Bool`: a nonzero word writes
+	# `true` (4 bytes), zero writes `false` (5 bytes), each byte pushed via cf_dyn_push (stride 1).
+	write_str(fd, "function $cf_bool_append(l %vhdr, l %val) {\n")
+	write_str(fd, "@start\n")
+	write_str(fd, "\t%nz =w cnel %val, 0\n")
+	write_str(fd, "\tjnz %nz, @true, @false\n")
+	write_str(fd, "@true\n")
+	write_str(fd, "\t%t0 =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb 116, %t0\n")
+	write_str(fd, "\t%t1 =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb 114, %t1\n")
+	write_str(fd, "\t%t2 =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb 117, %t2\n")
+	write_str(fd, "\t%t3 =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb 101, %t3\n")
+	write_str(fd, "\tret\n")
+	write_str(fd, "@false\n")
+	write_str(fd, "\t%f0 =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb 102, %f0\n")
+	write_str(fd, "\t%f1 =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb 97, %f1\n")
+	write_str(fd, "\t%f2 =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb 108, %f2\n")
+	write_str(fd, "\t%f3 =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb 115, %f3\n")
+	write_str(fd, "\t%f4 =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb 101, %f4\n")
+	write_str(fd, "\tret\n")
+	write_str(fd, "}\n")
+	# cf_float_append(vhdr, val) — a NAIVE fixed-precision `%f` (no libc dtoa): NaN/±Inf via a bit
+	# type-pun (store double, load long; exponent all-ones), then sign, the integer part (`dtosi` +
+	# cf_uint_append), `.`, and up to 6 fractional digits pulled by multiply-by-10 — trailing zeros
+	# trimmed but always ≥1 digit (`2.0`). Truncates (no rounding) and assumes |val| < 2^63; a shortest
+	# round-trip (Ryū) is a stdlib concern, not this debug renderer.
+	write_str(fd, "function $cf_float_append(l %vhdr, d %val) {\n")
+	write_str(fd, "@start\n")
+	write_str(fd, "\t%bslot =l alloc8 8\n")
+	write_str(fd, "\tstored %val, %bslot\n")
+	write_str(fd, "\t%bits =l loadl %bslot\n")
+	write_str(fd, "\t%exps =l shr %bits, 52\n")
+	write_str(fd, "\t%exp =l and %exps, 2047\n")
+	write_str(fd, "\t%mant =l and %bits, 4503599627370495\n")
+	write_str(fd, "\t%special =w ceql %exp, 2047\n")
+	write_str(fd, "\tjnz %special, @spec, @finite\n")
+	write_str(fd, "@spec\n")
+	write_str(fd, "\t%isnan =w cnel %mant, 0\n")
+	write_str(fd, "\tjnz %isnan, @nan, @inf\n")
+	write_str(fd, "@nan\n")
+	write_str(fd, "\t%n0 =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb 78, %n0\n")
+	write_str(fd, "\t%n1 =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb 97, %n1\n")
+	write_str(fd, "\t%n2 =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb 78, %n2\n")
+	write_str(fd, "\tret\n")
+	write_str(fd, "@inf\n")
+	write_str(fd, "\t%sgn =l shr %bits, 63\n")
+	write_str(fd, "\tjnz %sgn, @neginf, @posinf\n")
+	write_str(fd, "@neginf\n")
+	write_str(fd, "\t%mm0 =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb 45, %mm0\n")
+	write_str(fd, "\tjmp @posinf\n")
+	write_str(fd, "@posinf\n")
+	write_str(fd, "\t%i0 =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb 73, %i0\n")
+	write_str(fd, "\t%i1 =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb 110, %i1\n")
+	write_str(fd, "\t%i2 =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb 102, %i2\n")
+	write_str(fd, "\tret\n")
+	write_str(fd, "@finite\n")
+	write_str(fd, "\t%vs =l alloc8 8\n")
+	write_str(fd, "\tstored %val, %vs\n")
+	write_str(fd, "\t%isneg =w cltd %val, d_0\n")
+	write_str(fd, "\tjnz %isneg, @doneg, @pos\n")
+	write_str(fd, "@doneg\n")
+	write_str(fd, "\t%s0 =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb 45, %s0\n")
+	write_str(fd, "\t%vld =d loadd %vs\n")
+	write_str(fd, "\t%vng =d neg %vld\n")
+	write_str(fd, "\tstored %vng, %vs\n")
+	write_str(fd, "\tjmp @pos\n")
+	write_str(fd, "@pos\n")
+	write_str(fd, "\t%vv =d loadd %vs\n")
+	write_str(fd, "\t%ip =l dtosi %vv\n")
+	write_str(fd, "\tcall $cf_uint_append(l %vhdr, l %ip)\n")
+	write_str(fd, "\t%dot =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb 46, %dot\n")
+	write_str(fd, "\t%ipf =d sltof %ip\n")
+	write_str(fd, "\t%frac =d sub %vv, %ipf\n")
+	write_str(fd, "\t%fbuf =l alloc4 8\n")
+	write_str(fd, "\t%fs =l alloc8 8\n")
+	write_str(fd, "\tstored %frac, %fs\n")
+	write_str(fd, "\t%ci =l alloc8 8\n")
+	write_str(fd, "\tstorel 0, %ci\n")
+	write_str(fd, "@floop\n")
+	write_str(fd, "\t%i =l loadl %ci\n")
+	write_str(fd, "\t%fdone =w csgel %i, 6\n")
+	write_str(fd, "\tjnz %fdone, @trim, @fstep\n")
+	write_str(fd, "@fstep\n")
+	write_str(fd, "\t%fr =d loadd %fs\n")
+	write_str(fd, "\t%fr10 =d mul %fr, d_10.0\n")
+	write_str(fd, "\t%dg =l dtosi %fr10\n")
+	write_str(fd, "\t%dgc =l add %dg, 48\n")
+	write_str(fd, "\t%faddr =l add %fbuf, %i\n")
+	write_str(fd, "\tstoreb %dgc, %faddr\n")
+	write_str(fd, "\t%dgf =d sltof %dg\n")
+	write_str(fd, "\t%rem =d sub %fr10, %dgf\n")
+	write_str(fd, "\tstored %rem, %fs\n")
+	write_str(fd, "\t%i1f =l add %i, 1\n")
+	write_str(fd, "\tstorel %i1f, %ci\n")
+	write_str(fd, "\tjmp @floop\n")
+	write_str(fd, "@trim\n")
+	write_str(fd, "\t%last =l alloc8 8\n")
+	write_str(fd, "\tstorel -1, %last\n")
+	write_str(fd, "\t%tj =l alloc8 8\n")
+	write_str(fd, "\tstorel 0, %tj\n")
+	write_str(fd, "@tloop\n")
+	write_str(fd, "\t%j =l loadl %tj\n")
+	write_str(fd, "\t%tdone =w csgel %j, 6\n")
+	write_str(fd, "\tjnz %tdone, @emit, @tstep\n")
+	write_str(fd, "@tstep\n")
+	write_str(fd, "\t%ja =l add %fbuf, %j\n")
+	write_str(fd, "\t%jc =w loadub %ja\n")
+	write_str(fd, "\t%isz =w ceqw %jc, 48\n")
+	write_str(fd, "\tjnz %isz, @tskip, @tset\n")
+	write_str(fd, "@tset\n")
+	write_str(fd, "\tstorel %j, %last\n")
+	write_str(fd, "@tskip\n")
+	write_str(fd, "\t%j1 =l add %j, 1\n")
+	write_str(fd, "\tstorel %j1, %tj\n")
+	write_str(fd, "\tjmp @tloop\n")
+	write_str(fd, "@emit\n")
+	write_str(fd, "\t%ln =l loadl %last\n")
+	write_str(fd, "\t%allz =w csltl %ln, 0\n")
+	write_str(fd, "\tjnz %allz, @zero, @digits\n")
+	write_str(fd, "@zero\n")
+	write_str(fd, "\t%z0 =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb 48, %z0\n")
+	write_str(fd, "\tret\n")
+	write_str(fd, "@digits\n")
+	write_str(fd, "\t%ei =l alloc8 8\n")
+	write_str(fd, "\tstorel 0, %ei\n")
+	write_str(fd, "@eloop\n")
+	write_str(fd, "\t%e =l loadl %ei\n")
+	write_str(fd, "\t%eend =w csgtl %e, %ln\n")
+	write_str(fd, "\tjnz %eend, @edone, @estep\n")
+	write_str(fd, "@estep\n")
+	write_str(fd, "\t%ea =l add %fbuf, %e\n")
+	write_str(fd, "\t%ec =w loadub %ea\n")
+	write_str(fd, "\t%esl =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb %ec, %esl\n")
+	write_str(fd, "\t%e1 =l add %e, 1\n")
+	write_str(fd, "\tstorel %e1, %ei\n")
+	write_str(fd, "\tjmp @eloop\n")
+	write_str(fd, "@edone\n")
+	write_str(fd, "\tret\n")
+	write_str(fd, "}\n")
+	write_str(fd, "function $cf_str_append(l %vhdr, l %str) {\n")
+	write_str(fd, "@start\n")
+	write_str(fd, "\t%bytes =l loadl %str\n")
+	write_str(fd, "\t%la =l add %str, 8\n")
+	write_str(fd, "\t%lenw =w loadw %la\n")
+	write_str(fd, "\t%len =l extuw %lenw\n")
+	write_str(fd, "\t%ip =l alloc8 8\n")
+	write_str(fd, "\tstorel 0, %ip\n")
+	write_str(fd, "@sloop\n")
+	write_str(fd, "\t%i =l loadl %ip\n")
+	write_str(fd, "\t%d =w cugel %i, %len\n")
+	write_str(fd, "\tjnz %d, @sdone, @sstep\n")
+	write_str(fd, "@sstep\n")
+	write_str(fd, "\t%ba =l add %bytes, %i\n")
+	write_str(fd, "\t%b =w loadub %ba\n")
+	write_str(fd, "\t%sl =l call $cf_dyn_push(l %vhdr, w 1)\n")
+	write_str(fd, "\tstoreb %b, %sl\n")
+	write_str(fd, "\t%i1 =l add %i, 1\n")
+	write_str(fd, "\tstorel %i1, %ip\n")
+	write_str(fd, "\tjmp @sloop\n")
+	write_str(fd, "@sdone\n")
+	write_str(fd, "\tret\n")
+	write_str(fd, "}\n")
+	# cf_str_eq(a, b) — Str value equality (used by string `match`): compare the low word of the
+	# `len@8` slot (LE, matching `cf_str_append`), then the `bytes@0` run byte-for-byte; returns
+	# 1 if equal, 0 otherwise. Length-driven, so an interior NUL and an empty string compare right.
+	write_str(fd, "function l $cf_str_eq(l %a, l %b) {\n")
+	write_str(fd, "@start\n")
+	write_str(fd, "\t%la =l add %a, 8\n")
+	write_str(fd, "\t%law =w loadw %la\n")
+	write_str(fd, "\t%lb =l add %b, 8\n")
+	write_str(fd, "\t%lbw =w loadw %lb\n")
+	write_str(fd, "\t%lne =w cnew %law, %lbw\n")
+	write_str(fd, "\tjnz %lne, @neq, @lenok\n")
+	write_str(fd, "@lenok\n")
+	write_str(fd, "\t%len =l extuw %law\n")
+	write_str(fd, "\t%ba =l loadl %a\n")
+	write_str(fd, "\t%bb =l loadl %b\n")
+	write_str(fd, "\t%ip =l alloc8 8\n")
+	write_str(fd, "\tstorel 0, %ip\n")
+	write_str(fd, "@eloop\n")
+	write_str(fd, "\t%i =l loadl %ip\n")
+	write_str(fd, "\t%done =w cugel %i, %len\n")
+	write_str(fd, "\tjnz %done, @eq, @estep\n")
+	write_str(fd, "@estep\n")
+	write_str(fd, "\t%pa =l add %ba, %i\n")
+	write_str(fd, "\t%ca =w loadub %pa\n")
+	write_str(fd, "\t%pb =l add %bb, %i\n")
+	write_str(fd, "\t%cb =w loadub %pb\n")
+	write_str(fd, "\t%bne =w cnew %ca, %cb\n")
+	write_str(fd, "\tjnz %bne, @neq, @econt\n")
+	write_str(fd, "@econt\n")
+	write_str(fd, "\t%i1 =l add %i, 1\n")
+	write_str(fd, "\tstorel %i1, %ip\n")
+	write_str(fd, "\tjmp @eloop\n")
+	write_str(fd, "@eq\n")
+	write_str(fd, "\tret 1\n")
+	write_str(fd, "@neq\n")
+	write_str(fd, "\tret 0\n")
+	write_str(fd, "}\n")
+	return 0
+}
+
+# Does the program's `main` take a parameter — `main([Str] args)`? Then the freestanding
+# `_start` must convert the OS's raw `(argc, argv)` into a real cf `[Str]` before calling it
+# (see `emit_argv_qbe`). A bare `main()` takes the registers straight through.
+const main_takes_argv = (Program prog): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(prog.funcs.len) then break
+		if str_eq(prog.funcs[i].name, "main") then {
+			# exactly `main([Str] args)` — one dynamic-array-of-Str parameter. The old raw form
+			# `main(Iarch argc, *[Str] argv)` takes the registers straight (no argv build).
+			if Iarch(prog.funcs[i].params.len) != 1 then return false
+			if !str_eq(prog.funcs[i].params[0].type_name, "$dyn") then return false
+			return str_eq(prog.funcs[i].params[0].elem, "Str")
+		}
+		i = i + 1
+	}
+	return false
+}
+
+# The argv bridge, emitted only for `main([Str] args)`. `cf_strlen` is a C-string length;
+# `cf_build_args` walks the `argc` C-strings in `argv`, wraps each in a `{bytes@0, len@8}` Str
+# header (BORROWING the OS's already-NUL-terminated argv bytes) and pushes it onto a fresh
+# `[Str]` vector, returning the header. `_start` calls it with (argc in x0, argv in x1) — the
+# darwin C-ABI entry values — and hands the result to `main`.
+const emit_argv_qbe = (Uarch fd): Iarch -> {
+	write_str(fd, "function l $cf_strlen(l %p) {\n")
+	write_str(fd, "@start\n")
+	write_str(fd, "\t%pp =l alloc8 8\n")
+	write_str(fd, "\tstorel %p, %pp\n")
+	write_str(fd, "\t%np =l alloc8 8\n")
+	write_str(fd, "\tstorel 0, %np\n")
+	write_str(fd, "@loop\n")
+	write_str(fd, "\t%cp =l loadl %pp\n")
+	write_str(fd, "\t%c =w loadub %cp\n")
+	write_str(fd, "\tjnz %c, @more, @done\n")
+	write_str(fd, "@more\n")
+	write_str(fd, "\t%cp2 =l loadl %pp\n")
+	write_str(fd, "\t%cp3 =l add %cp2, 1\n")
+	write_str(fd, "\tstorel %cp3, %pp\n")
+	write_str(fd, "\t%n0 =l loadl %np\n")
+	write_str(fd, "\t%n1 =l add %n0, 1\n")
+	write_str(fd, "\tstorel %n1, %np\n")
+	write_str(fd, "\tjmp @loop\n")
+	write_str(fd, "@done\n")
+	write_str(fd, "\t%r =l loadl %np\n")
+	write_str(fd, "\tret %r\n")
+	write_str(fd, "}\n")
+	write_str(fd, "export function l $cf_build_args(l %argc, l %argv) {\n")
+	write_str(fd, "@start\n")
+	write_str(fd, "\t%hdr =l call $cf_alloc(w 24)\n")
+	write_str(fd, "\tstorel 0, %hdr\n")
+	write_str(fd, "\t%h8 =l add %hdr, 8\n")
+	write_str(fd, "\tstorel 0, %h8\n")
+	write_str(fd, "\t%h16 =l add %hdr, 16\n")
+	write_str(fd, "\tstorel 0, %h16\n")
+	write_str(fd, "\t%ip =l alloc8 8\n")
+	write_str(fd, "\tstorel 0, %ip\n")
+	write_str(fd, "@loop\n")
+	write_str(fd, "\t%i =l loadl %ip\n")
+	write_str(fd, "\t%adone =w cugel %i, %argc\n")
+	write_str(fd, "\tjnz %adone, @done, @body\n")
+	write_str(fd, "@body\n")
+	write_str(fd, "\t%ao =l mul %i, 8\n")
+	write_str(fd, "\t%ap =l add %argv, %ao\n")
+	write_str(fd, "\t%cs =l loadl %ap\n")
+	write_str(fd, "\t%len =l call $cf_strlen(l %cs)\n")
+	write_str(fd, "\t%sh =l call $cf_alloc(w 16)\n")
+	write_str(fd, "\tstorel %cs, %sh\n")
+	write_str(fd, "\t%sh8 =l add %sh, 8\n")
+	write_str(fd, "\tstorel %len, %sh8\n")
+	write_str(fd, "\t%slot =l call $cf_dyn_push(l %hdr, w 8)\n")
+	write_str(fd, "\tstorel %sh, %slot\n")
+	write_str(fd, "\t%i1 =l add %i, 1\n")
+	write_str(fd, "\tstorel %i1, %ip\n")
+	write_str(fd, "\tjmp @loop\n")
+	write_str(fd, "@done\n")
+	write_str(fd, "\tret %hdr\n")
+	write_str(fd, "}\n")
+	return 0
+}
+
+# The arena's asm side: `cf_arena_init` mmaps 256 MiB (SYS_mmap=197) and seeds the
+# cursor; `cf_oom`/`cf_mmap_fail` exit with distinct nonzero codes. Leaf routines
+# (no `bl`), so calling `cf_arena_init` lazily from `cf_alloc` needs no arg saving.
+const emit_arena_floor = (Uarch fd): Iarch -> {
+	write_str(fd, ".globl _cf_arena_init\n")
+	write_str(fd, ".globl _cf_oom\n")
+	write_str(fd, ".p2align 2\n")
+	write_str(fd, "_cf_arena_init:\n")
+	write_str(fd, "\tmov x0, #0\n")
+	write_str(fd, "\tmov x1, #0x10000000\n")
+	write_str(fd, "\tmov x2, #3\n")
+	write_str(fd, "\tmov x3, #0x1002\n")
+	write_str(fd, "\tmov x4, #-1\n")
+	write_str(fd, "\tmov x5, #0\n")
+	write_str(fd, "\tmov x16, #197\n")
+	write_str(fd, "\tsvc #0x80\n")
+	write_str(fd, "\tb.cs _cf_mmap_fail\n")
+	write_str(fd, "\tadrp x9, _cf_top@PAGE\n")
+	write_str(fd, "\tadd x9, x9, _cf_top@PAGEOFF\n")
+	write_str(fd, "\tstr x0, [x9]\n")
+	write_str(fd, "\tmov x1, #0x10000000\n")
+	write_str(fd, "\tadd x11, x0, x1\n")
+	write_str(fd, "\tadrp x10, _cf_limit@PAGE\n")
+	write_str(fd, "\tadd x10, x10, _cf_limit@PAGEOFF\n")
+	write_str(fd, "\tstr x11, [x10]\n")
+	write_str(fd, "\tret\n")
+	write_str(fd, "_cf_mmap_fail:\n")
+	write_str(fd, "\tmov x0, #71\n")
+	write_str(fd, "\tmov x16, #1\n")
+	write_str(fd, "\tsvc #0x80\n")
+	write_str(fd, "_cf_oom:\n")
+	write_str(fd, "\tmov x0, #70\n")
+	write_str(fd, "\tmov x16, #1\n")
+	write_str(fd, "\tsvc #0x80\n")
+	return 0
+}
+
+# The index of the parameter named `name`, or -1 — resolves an asm `${param}` hole.
+const param_index = ([Param] params, Str name): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(params.len) then break
+		if str_eq(params[i].name, name) then return i
+		i = i + 1
+	}
+	return 0 - 1
+}
+
+# Emit one asm-bodied function naked into the asm floor (ebnf § Assembly): `.globl` so the
+# QBE-lowered callers can `bl` it, then the body's segments verbatim, each `${param}`
+# replaced by the argument register `x<index>` that parameter occupies (arm64 C ABI: param
+# i is in x<i>; the function is naked — no prologue — and supplies its own `ret`). Labeled
+# `_f<idx>` to match the positional symbol QBE-lowered callers reference (`$f<idx>`).
+const emit_asm_func = (Uarch fd, Func fn, Iarch idx): Iarch -> {
+	write_str(fd, ".globl _f${idx}\n")
+	write_str(fd, ".p2align 2\n")
+	write_str(fd, "_f${idx}:")
+	let Iarch si = 0
+	loop {
+		if si >= Iarch(fn.asm_body.len) then break
+		const Seg sg = fn.asm_body[si]
+		if sg.is_hole then {
+			const Iarch pidx = param_index(fn.params, sg.name)
+			if pidx < 0 then die("cf0: emit: an asm interpolation hole must name a parameter\n")
+			write_str(fd, "x${pidx}")
+		} else {
+			write_str(fd, Str(sg.lit))
+		}
+		si = si + 1
+	}
+	write_str(fd, "\n")
+	return 0
+}
+
+# Emit the whole program: the arena runtime, every NON-asm function (main exported, the
+# rest internal, each with a fresh temp/label counter), then the freestanding entry floor
+# plus the arena's asm side, and finally the asm-bodied functions naked beside the floor.
+# Runs only on programs the typecheck phase has accepted.
+#
+# darwin hands the entry point the raw C `(argc, argv, envp)` in x0/x1/x2. For a bare
+# `main()` the `_start` floor does nothing before `bl _main`, so those flow straight
+# through. For `main([Str] args)` it first `bl _cf_build_args` to convert `(argc, argv)`
+# into a real cf `[Str]` header (in x0), which QBE reads as `$main`'s argument.
+pub const emit_program = (Program prog, Uarch qbe_fd, Uarch asm_fd): Iarch -> {
+	emit_arena_qbe(qbe_fd)
+	const Bool argv_form = main_takes_argv(prog)
+	if argv_form then emit_argv_qbe(qbe_fd)
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(prog.funcs.len) then break
+		# an asm function is emitted into the floor, not through QBE
+		if !prog.funcs[i].is_asm then {
+			let Emit ctx = Emit({ fd: qbe_fd, next: 0, label: 0, funcs: prog.funcs, recs: prog.recs, unions: prog.unions, cur_loop: 0 - 1, cur_slot: 0 - 1, cur_ret: "" })
+			emit_func(&ctx, prog.funcs[i], i)
+		}
+		i = i + 1
+	}
+	# asm floor: the freestanding entry. `_start` calls `_main` (argc/argv/envp still
+	# in x0/x1/x2 from the kernel), then exit-syscalls its return (in x0).
+	write_str(asm_fd, ".globl _start\n")
+	write_str(asm_fd, ".p2align 2\n")
+	write_str(asm_fd, "_start:\n")
+	# `main([Str] args)`: convert the raw C `(argc in x0, argv in x1)` into a `[Str]` header
+	# (returned in x0) before calling main; a bare `main()` takes the registers straight.
+	if argv_form then write_str(asm_fd, "\tbl _cf_build_args\n")
+	write_str(asm_fd, "\tbl _main\n")
+	write_str(asm_fd, "\tmov x16, #1\n")
+	write_str(asm_fd, "\tsvc #0x80\n")
+	emit_arena_floor(asm_fd)
+	# the user's asm-bodied functions, naked beside the floor (QBE has no asm/`svc` path)
+	let Iarch k = 0
+	loop {
+		if k >= Iarch(prog.funcs.len) then break
+		if prog.funcs[k].is_asm then emit_asm_func(asm_fd, prog.funcs[k], k)
+		k = k + 1
+	}
+	return 0
+}

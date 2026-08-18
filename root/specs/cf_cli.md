@@ -133,6 +133,13 @@ values of `--stop-at` exist only on the full compiler.
 - **`static` errors on darwin.** Apple does not support statically linking
   libSystem, so `--libc static` with a `darwin-*` target is a compile error, not a
   silent fallback — it is only meaningful for `linux-*`.
+- **On darwin, `none` still links libSystem.** Apple's linker refuses a dynamic
+  Mach-O with no libSystem load command, and arm64 has no static-executable path
+  (a static binary is killed on exec), so on a `darwin-*` target `none` lowers to
+  `-nostdlib -lSystem`, not `-nostdlib` alone. libSystem is present only to satisfy
+  the loader — no C-runtime symbol is referenced, the binary stays freestanding in
+  every other sense and still reaches the kernel through raw `svc` (see
+  [[ebnf.md]], Assembly). The bare `-nostdlib` in the table is the non-darwin form.
 
 `--libc` has no short flag on purpose: every candidate letter (`-C`, `-c`, `-l`,
 `-L`) is a `cc` landmine. The full C-extern surface — declaring externs, naming C
@@ -151,10 +158,11 @@ darwin-arm64  darwin-amd64  linux-arm64  linux-amd64  linux-riscv64  wasm
 ```
 
 The pair splits into the two values the `comptime` module exposes for conditional
-imports (see [[ebnf.md]], Modules): `comptime.os.target` ∈ `{darwin, linux, wasm}`
-and `comptime.arch.target` ∈ `{arm64, amd64, riscv64, wasm}`. `wasm` is the one
-token that does not split on `-`: it sets **both** `os` and `arch` to `wasm`.
-Default is the **host** pair — the os and arch `cf` itself runs on.
+imports (see [[ebnf.md]], Modules; [[module_system.md]] §7): `comptime.os.target` ∈
+`{darwin, linux}` and `comptime.arch.target` ∈ `{arm64, amd64, riscv64, wasm}`. `wasm`
+is the one token that does not split on `-`: **Wasm is not an OS**, so it sets the
+**arch** to `wasm` and leaves `os` at its default. Default is the **host** pair — the os
+and arch `cf` itself runs on (so a bare `wasm` target is the Wasm arch on the host os).
 
 Two targets carry known asterisks, both deferred (§8):
 

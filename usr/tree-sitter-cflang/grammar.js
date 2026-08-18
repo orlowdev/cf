@@ -37,8 +37,13 @@ module.exports = grammar({
   supertypes: $ => [$._expression, $._statement, $._type, $._literal],
 
   conflicts: $ => [
-    // `() T` — a lambda's param_list + return type, or a func type.
+    // `(A, B) …` — a lambda's param_list, a tuple type, or a func type; all open
+    // with `(` and fork only at the `)` (a following `->` → func).
     [$.func_type, $.param_list],
+    [$.func_type, $.tuple_type],
+    // `()` / `(a, b)` in value position — a tuple value or (at type position) a
+    // tuple type, forked by whether a type or a value follows the `(`.
+    [$.tuple, $.tuple_type],
     // `(x)` — a bare param of a lambda, or a parenthesized value (→ `->` lookahead).
     [$.param, $._primary],
     // `[n …]` fixed-array-type size vs a bracketed literal/index element.
@@ -55,10 +60,31 @@ module.exports = grammar({
     // receiver's type, unknown here — bias toward indexing (the common case).
     [$._type_arg, $._literal],
     [$._type_arg, $._primary],
+    // `Foo` / `Foo[T]` / `Foo.Bar` — a named type or a bare type_name
+    // construction callee, forked by a trailing `.`/`[`/`(`.
+    [$.named_type, $._primary],
+    // A PascalCase token inside `[ … ]` is a type (array/type-arg) or a
+    // construction callee (aggregate element) — kept live for both readings.
+    [$._type, $._primary],
+    // `Name['V] …` — a member carrying its own generics vs a bare generic type.
+    [$.named_type, $.member_name],
+    // `then x …` in a branch — a bare expression, or the target of an assignment
+    // statement branch (`if c then x = 1`), forked by a following `assign_op`.
+    [$.assignment_statement, $._expression],
   ],
 
   rules: {
-    module: $ => repeat(choice($.import_declaration, $._declaration)),
+    module: $ => repeat($._module_item),
+    _module_item: $ => choice($.import_declaration, $._declaration, $.comptime_if),
+
+    // Build-time conditional compilation at the top level: it reuses
+    // `if … then … else`, but a module item is never an expression, so a
+    // top-level `if` is always this comptime form. A branch is one item or a
+    // braced group; `else if` chains as a branch may itself be a comptime_if.
+    comptime_if: $ => prec.right(seq(
+      'if', $._expression, 'then', $._module_branch, optional(seq('else', $._module_branch)),
+    )),
+    _module_branch: $ => choice($._module_item, seq('{', repeat($._module_item), '}')),
 
     comment: _ => token(seq('#', /.*/)),
 
@@ -70,12 +96,14 @@ module.exports = grammar({
     type_var: $ => seq("'", $.type_name),
 
     // ---- types -------------------------------------------------------------
+    // No `&T` type — `&` is only the address-of operator on a value (see EBNF).
     _type: $ => choice(
       $.pointer_type,
-      $.reference_type,
       $.bracket_type,
       $.named_type,
+      $.member_access,
       $.type_var,
+      $.tuple_type,
       $.func_type,
     ),
 
@@ -84,21 +112,30 @@ module.exports = grammar({
       optional(seq('[', commaSep1($._type_arg), ']')),
     )),
 
-    pointer_type: $ => prec.right(seq('*', $._type)),
-    reference_type: $ => prec.right(seq('&', $._type)),
-
-    func_type: $ => prec.right(seq(
-      '(', optional(commaSep1($._type)), ')', $._type,
+    // A qualified member type/callee: `Maybe.Just`, `Maybe[Int32].Just`,
+    // `Tree.Node[Int32]` — usable as a type, a construction callee, and a
+    // `type_pattern` head.
+    member_access: $ => prec.left(seq(
+      $.named_type, '.', $.type_name,
+      optional(seq('[', commaSep1($._type_arg), ']')),
     )),
+
+    pointer_type: $ => prec.right(seq('*', $._type)),
+
+    // `(A, B) -> R` — parameter types, `->`, return type (a tuple type + arrow).
+    func_type: $ => prec.right(seq(
+      '(', optional(commaSep1($._type)), ')', '->', $._type,
+    )),
+
+    // `(A, B)` — a positional product; `()` is unit, `(T)` is just `T`.
+    tuple_type: $ => seq('(', optional(commaSep1($._type)), ')'),
 
     bracket_type: $ => seq('[', optional(choice(
       $.fixed_array_type,
-      $.tuple_type,
       $._type, // array
     )), ']'),
 
     fixed_array_type: $ => seq(choice($.integer, $.var_name), $._type),
-    tuple_type: $ => seq($._type, ',', commaSep1($._type)),
 
     // A type argument is a type or a comptime value (`[Int]`, `[8, Int]`).
     // Narrowed to types + simple comptime literals/names rather than the full
@@ -113,6 +150,7 @@ module.exports = grammar({
       $.string,
       $.boolean,
       $.aggregate,
+      $.tuple,
       $.data_literal,
     ),
 
@@ -144,11 +182,27 @@ module.exports = grammar({
     aggregate: $ => seq('[', optional(commaSep1(choice($.spread_element, $._expression))), ']'),
     spread_element: $ => seq('...', $._expression),
 
-    data_literal: $ => seq('{', optional(commaSep1($.field_init)), '}'),
+    // A `tuple` value shares the parens of a group/arg list: `()` is unit, and
+    // a genuine product needs a comma (`(1, true)`, `(...t, 4)`); the one-element
+    // `(e)` is `parenthesized_expression` (a one-tuple ≅ its element).
+    // A comma (or a leading spread) is what marks a tuple apart from a `(e)`
+    // grouping. The EBNF product has no trailing comma, but the one-tuple `(a,)`
+    // and a trailing comma are admitted here (leniency, as records/arrays allow).
+    tuple: $ => choice(
+      seq('(', ')'),                                                                    // unit
+      seq('(', $.spread_element, repeat(seq(',', $._tuple_element)), optional(','), ')'), // (...t), (...t, 4)
+      seq('(', $._expression, repeat1(seq(',', $._tuple_element)), optional(','), ')'),   // (a, b), (a, ...b)
+      seq('(', $._expression, ',', ')'),                                                // (a,) one-tuple
+    ),
+    _tuple_element: $ => choice($.spread_element, $._expression),
+
+    data_literal: $ => seq('{', optional(commaSep1($._field_entry)), '}'),
+    _field_entry: $ => choice($.field_init, $.field_spread),
     field_init: $ => choice(
       seq($.var_name, ':', $._expression),
       $.var_name, // pun: { value }
     ),
+    field_spread: $ => seq('...', $._expression),   // ...other — splice a record value's fields
 
     // ---- declarations ------------------------------------------------------
     _declaration: $ => seq(optional('pub'), choice(
@@ -171,7 +225,23 @@ module.exports = grammar({
     spread: $ => seq('...', $.named_type),
 
     union_declaration: $ => seq('union', $.type_name, optional($.generic_params),
-      '=', seq('{', commaSep1($._type), optional(','), '}')),
+      '=', $.union_body),
+    union_body: $ => seq('{', commaSep1($.union_member), optional(','), '}'),
+    union_member: $ => choice(
+      // named/payload member; may carry its own generics
+      seq($.member_name, optional($.generic_params), $.member_payload),
+      $.member_spread,
+      $._type,   // bare: compose over an existing type, else a fresh nullary tag
+    ),
+    member_name: $ => $.type_name,   // a member is PascalCase, like any type
+    member_payload: $ => choice(
+      seq('(', optional(commaSep1($._type)), ')'),          // positional tuple payload
+      seq('=', choice($.struct_body, $._type, $._singleton)), // struct / typed / literal
+    ),
+    member_spread: $ => seq('...', $.named_type),
+    struct_body: $ => seq('{', commaSep1($.field_declaration), optional(','), '}'),
+    // a literal singleton member (`Semicolon = ";"`): number | string | bool
+    _singleton: $ => choice($.integer, $.float, $.string, $.boolean),
 
     let_declaration: $ => seq('let', choice(
       seq($._type, $.var_name, optional(seq('=', $._expression))),
@@ -181,14 +251,20 @@ module.exports = grammar({
 
     destructure_declaration: $ => seq(choice('let', 'const'), $._pattern, '=', $._expression),
 
-    intrinsic_declaration: $ => seq('intrinsic', $.var_name, '=', $.intrinsic_signature),
-    intrinsic_signature: $ => seq(optional($.generic_params), $.param_list, $._type),
+    intrinsic_declaration: $ => choice(
+      seq('intrinsic', $.var_name, '=', $.intrinsic_signature),
+      // type-valued intrinsic + its constructor; nullary form omits the `=`
+      seq('intrinsic', 'type', $.type_name, optional(seq('=', $.constructor_signature))),
+    ),
+    intrinsic_signature: $ => seq(optional($.generic_params), $.param_list, '->', $._type),
+    constructor_signature: $ => seq($.param_list, '->', $._type),
 
     // ---- functions ---------------------------------------------------------
+    // A stated return type is set off with `:` between the params and the `->`.
     function: $ => prec.right(seq(
       optional($.generic_params),
       $.param_list,
-      optional($._type),
+      optional(seq(':', $._type)),
       '->',
       choice($.block, $.asm_block, $._expression),
     )),
@@ -280,7 +356,8 @@ module.exports = grammar({
       field('operator', choice('-', '&', '~', '!')),
       $._postfix,
     )),
-    defer_expression: $ => prec.right(PREC.unary, seq('defer', $._postfix)),
+    // `defer f(x)` taps a call; `defer { … }` schedules a whole block at scope exit.
+    defer_expression: $ => prec.right(PREC.unary, seq('defer', choice($._postfix, $.block))),
 
     _postfix: $ => choice(
       $.field_expression,
@@ -302,8 +379,13 @@ module.exports = grammar({
     type_args: $ => seq('[', commaSep1($._type_arg), ']'),
     arguments: $ => seq('(', optional(commaSep1($._expression)), ')'),
 
+    // A `type_name`/`member_access` in value position is a construction callee
+    // (`Point(1, 2)`, `Uarch(fd)`, `Maybe.Just(1)`) — the PascalCase casing tells
+    // a construction apart from an ordinary snake_case call.
     _primary: $ => choice(
       $.var_name,
+      $.type_name,
+      $.member_access,
       $._literal,
       $.function,
       $.parenthesized_expression,
@@ -311,14 +393,28 @@ module.exports = grammar({
     parenthesized_expression: $ => seq('(', $._expression, ')'),
 
     // ---- control flow ------------------------------------------------------
+    // `if` is primarily an expression, but its statement form drives control
+    // flow — a branch may `return`, `<-`, or assign (`if err then return None`,
+    // `if done then break`). break/continue are already expressions; the extra
+    // statement forms are admitted here so both `if` shapes share one rule. The
+    // grammar stays permissive; the compiler enforces the value/statement split.
     if_expression: $ => prec.right(seq(
       'if', $._expression, 'then', $._branch, optional(seq('else', $._branch)),
     )),
-    _branch: $ => choice($.block, $._expression),
+    _branch: $ => choice(
+      $.block,
+      $.return_statement,
+      $.yield_statement,
+      $.assignment_statement,
+      $._expression,
+    ),
 
     match_expression: $ => seq('match', $._expression, '{',
       commaSep1($.match_arm), optional(','), '}'),
-    match_arm: $ => seq($._match_pattern, '->', $._branch),
+    match_arm: $ => seq($.or_pattern, '->', $._branch),
+    // `p0 | p1 | …` matches any one alternative; a single `|`, never `||` (a
+    // pattern is never an expression, so `|` here is unambiguously alternation).
+    or_pattern: $ => seq($._match_pattern, repeat(seq('|', $._match_pattern))),
     _match_pattern: $ => choice(
       $.wildcard_pattern,
       $._literal_pattern,
@@ -327,8 +423,14 @@ module.exports = grammar({
       $.record_pattern,
       $.array_pattern,
     ),
-    _literal_pattern: $ => choice($.integer, $.float, $.string, $.boolean),
-    type_pattern: $ => seq($.named_type, optional(seq('(', commaSep1($._match_pattern), ')'))),
+    // A leading `-` negates a NUMBER pattern (`-5`); string/bool take no sign.
+    _literal_pattern: $ => choice($.integer, $.float, $.string, $.boolean, $.negative_pattern),
+    negative_pattern: $ => seq('-', choice($.integer, $.float)),
+    // The head may be a bare named type or a qualified member (`Node.IntLit(v)`).
+    type_pattern: $ => seq(
+      choice($.named_type, $.member_access),
+      optional(seq('(', commaSep1($._match_pattern), ')')),
+    ),
 
     loop_expression: $ => seq('loop', optional($.var_name), $.block),
     for_expression: $ => seq('for', $.var_name, 'in', $._expression, $._branch),
@@ -341,10 +443,14 @@ module.exports = grammar({
     continue_expression: _ => 'continue',
 
     // ---- patterns (destructuring) -----------------------------------------
-    _pattern: $ => choice($.record_pattern, $.array_pattern),
+    // Arrays match by position in `[…]`, tuples/positional records in `(…)`.
+    _pattern: $ => choice($.record_pattern, $.array_pattern, $.tuple_pattern),
+    // `_` skips one element, `_3` skips three (skip = "_" , { dec_digit }).
     wildcard_pattern: _ => token(prec(1, /_[0-9]*/)),
+    _pattern_elem: $ => choice($.var_name, $.wildcard_pattern),
     record_pattern: $ => seq('{', commaSep1($.var_name), optional(','), '}'),
-    array_pattern: $ => seq('[', commaSep1(choice($.var_name, $.wildcard_pattern)), optional(','), ']'),
+    array_pattern: $ => seq('[', commaSep1($._pattern_elem), optional(','), ']'),
+    tuple_pattern: $ => seq('(', commaSep1($._pattern_elem), optional(','), ')'),
 
     // ---- imports -----------------------------------------------------------
     import_declaration: $ => seq(optional('pub'), 'import', $.string, 'as', $._import_alias),

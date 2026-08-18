@@ -1,0 +1,67 @@
+# cf0 — the self-hosted C! compiler (the KEEPER), entry point.
+#
+# This is the compiler cf0's genesis produces and then reproduces: seed-subset
+# C! source, compiled during bootstrap by the throwaway `cfcc` genesis tool, and
+# eventually by itself. It runs the same pipeline the ratified specs pin —
+# lex, parse, (typecheck, …), emit — degenerately (seed_subset §5).
+#
+# Tracer-bullet scope: read a `.cf` file, parse `[pub] const main = () -> <int>`,
+# and emit QBE IL + an asm floor that an external driver assembles into a running
+# darwin/arm64 binary. Everything past `main`'s constant exit code fills in as the
+# front end grows. cf0 cannot yet spawn `qbe`/`cc`, so it stops at emitting text
+# to two output paths; the driver runs the `qbe`→`cc` tail.
+#
+#   cf0 <input.cf> <out.qbe> <out.s>
+
+import "io" as { open, close, die, o_wronly_creat_trunc, mode_644 }
+import "cli" as { Cli, cli_parse }
+import "ast" as { Program }
+import "resolve" as { resolve_program }
+import "monomorph" as { mono_program }
+import "typecheck" as { check_program }
+import "hoist_defertap" as { hoist_defertaps }
+import "defer" as { lower_defers }
+import "closures" as { lift_program }
+import "emit" as { emit_program }
+
+pub const main = ([Str] args) -> {
+	const Cli c = cli_parse(args)
+
+	# front end: resolve the entry module and its transitive imports (lexing and parsing
+	# each) into one flattened AST — module_system §8
+	const Str inp = c.input
+	const Program raw = resolve_program(inp)
+
+	# monomorphize generic functions into concrete instances (type_system §8.1) — after this
+	# the program has no generic templates, only ordinary functions
+	const Program prog = mono_program(raw)
+
+	# middle: typecheck (rejects type errors before any output is produced)
+	check_program(prog)
+
+	# lift `defer`-tap VALUES (`defer f(x)` / `|> defer f`) out of expression position into a
+	# snapshot binding + a scheduled `defer` statement (memory_model §6) — before lower_defers, so
+	# the emitted `Stmt.Defer`s are lowered like any other
+	const Program tapped = hoist_defertaps(prog)
+
+	# lower `defer` to explicit scope-exit code (memory_model §6): rewrite each `return e` in a
+	# defer-bearing function to snapshot the value, run the pending defers (LIFO), then return —
+	# before the closure lift, so a `defer f()` calling a local closure is a plain call site
+	const Program deferred = lower_defers(tapped)
+
+	# lower local closures to top-level functions with hidden capture parameters (memory_model
+	# §7) — after typecheck (which validated them), before emit
+	const Program lowered = lift_program(deferred)
+
+	# back end: emit QBE IL + the asm floor to the two output paths
+	const Str oq = c.out_qbe
+	const Iarch qf = open(oq.bytes, Uarch(o_wronly_creat_trunc), Uarch(mode_644))
+	if qf < 0 then die("cf0: cannot create the QBE output\n")
+	const Str oa = c.out_asm
+	const Iarch af = open(oa.bytes, Uarch(o_wronly_creat_trunc), Uarch(mode_644))
+	if af < 0 then die("cf0: cannot create the asm output\n")
+	emit_program(lowered, Uarch(qf), Uarch(af))
+	close(Uarch(qf))
+	close(Uarch(af))
+	return 0
+}

@@ -1,0 +1,152 @@
+# defer — lower `defer` statements to explicit scope-exit code (memory_model §6), after typecheck.
+#
+# A `defer f(x)` / `defer { … }` schedules work to run when the enclosing function returns, in
+# LIFO order, AFTER the return value is fixed. This pass removes every `Defer` node and rewrites
+# each `return e` reachable with pending defers into
+#     { const $ret = e; <defers, last-declared first>; return $ret }
+# The `$ret` binding SNAPSHOTS the value before the defers run: a word return keeps the value it
+# read (a later mutation of the source does not change it), while a record return keeps the arena
+# POINTER — so defers that mutate the record through it are observed by the caller.
+#
+# v1 (typecheck enforces): a `defer` is only a direct function-body statement, so defers accumulate
+# purely along the top-level statement list. A `return` nested in a loop / `if` still fires the
+# defers declared before the enclosing construct (they are threaded in as `pending`); one declared
+# after that construct is not yet pending, so it does not fire. Runs BEFORE the closure lift, so a
+# `defer f()` calling a local closure is a plain call site the lift then redirects.
+
+import "ast" as { Expr, Stmt, MatchArm, StmtArm, Seg, FieldInit, TupElem, Param, RecDecl, UnionDecl, Func, Import, Program }
+
+# Does a function body contain a `defer` anywhere? (Only funcs that do are rewritten; every other
+# is returned byte-identical.) A defer is top-level, but scan recursively to be safe.
+const stmts_have_defer = ([Stmt] ss): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		if stmt_has_defer(ss[i]) then return true
+		i = i + 1
+	}
+	return false
+}
+const arms_have_defer = ([StmtArm] arms): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		if stmts_have_defer(arms[i].body) then return true
+		i = i + 1
+	}
+	return false
+}
+const stmt_has_defer = (Stmt s): Bool -> match s {
+	Stmt.Defer(ss) -> true,
+	Stmt.Block(ss) -> stmts_have_defer(ss),
+	Stmt.Loop(ss) -> stmts_have_defer(ss),
+	Stmt.ForIn(v, a, body) -> stmts_have_defer(body),
+	Stmt.IfThen(c, st) -> stmt_has_defer(st),
+	Stmt.IfElse(c, t, e) -> stmt_has_defer(t) || stmt_has_defer(e),
+	Stmt.Match(scrut, arms) -> arms_have_defer(arms),
+	_ -> false
+}
+
+# A fresh copy of a pending-defers list — never `let cur = pending` then append, which would grow
+# the caller's list in place (cf0-array-aliasing-hazard); build from `[]` and copy so the local
+# accumulator is unaliased.
+const clone_pending = ([[Stmt]] xs): [[Stmt]] -> {
+	let [[Stmt]] out = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(xs.len) then break
+		out = [...out, xs[i]]
+		i = i + 1
+	}
+	return out
+}
+
+# `{ const $ret = e; <defers LIFO>; return $ret }` — snapshot the return value, run the pending
+# defers last-declared-first, then return the snapshot. Each defer body is spliced as its OWN
+# `Stmt.Block` (its own scope), matching the source: two sibling `defer { … }` blocks are separate
+# scopes that typecheck validated independently, so each may reuse a local name — flattening them
+# into one scope would collide those names (typecheck already ran, so the clash would slip to emit).
+const synth_return = (Expr e, [[Stmt]] pending): Stmt -> {
+	let [Stmt] blk = [Stmt.Let("$ret", false, "", e)]
+	let Iarch i = Iarch(pending.len) - 1
+	loop {
+		if i < 0 then break
+		blk = [...blk, Stmt.Block(pending[i])]
+		i = i - 1
+	}
+	blk = [...blk, Stmt.Return(Expr.Var("$ret"))]
+	return Stmt.Block(blk)
+}
+
+const rw_arms = ([StmtArm] arms, [[Stmt]] pending): [StmtArm] -> {
+	let [StmtArm] out = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		const StmtArm a = arms[i]
+		out = [...out, StmtArm({ is_wild: a.is_wild, type_name: a.type_name, members: a.members, binds: a.binds, body: rw_stmts(a.body, pending) })]
+		i = i + 1
+	}
+	return out
+}
+
+# Rewrite a single statement (an `if`-guard body position) with the given pending defers. It never
+# accumulates (a defer cannot appear here), only rewrites the `return`s reachable through it.
+const rw_one = (Stmt s, [[Stmt]] pending): Stmt -> match s {
+	Stmt.Return(e) -> if Iarch(pending.len) == 0 then s else synth_return(e, pending),
+	Stmt.Block(ss) -> Stmt.Block(rw_stmts(ss, pending)),
+	Stmt.Loop(bd) -> Stmt.Loop(rw_stmts(bd, pending)),
+	Stmt.ForIn(v, a, bd) -> Stmt.ForIn(v, a, rw_stmts(bd, pending)),
+	Stmt.IfThen(c, st) -> Stmt.IfThen(c, rw_one(st, pending)),
+	Stmt.IfElse(c, t, e) -> Stmt.IfElse(c, rw_one(t, pending), rw_one(e, pending)),
+	Stmt.Match(scrut, arms) -> Stmt.Match(scrut, rw_arms(arms, pending)),
+	_ -> s
+}
+
+# Rewrite a statement list: accumulate top-level defers into `cur` (dropping the `Defer` node), and
+# rewrite each `return` — and each nested construct's returns — against the defers pending at that
+# point. Nested constructs cannot themselves hold a defer (v1), so they only read `cur`.
+const rw_stmts = ([Stmt] stmts, [[Stmt]] pending): [Stmt] -> {
+	let [Stmt] out = []
+	let [[Stmt]] cur = clone_pending(pending)
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(stmts.len) then break
+		const Stmt s = stmts[i]
+		match s {
+			Stmt.Defer(dbody) -> { cur = [...cur, dbody] },
+			Stmt.Return(e) -> {
+				if Iarch(cur.len) == 0 then out = [...out, s]
+				else out = [...out, synth_return(e, cur)]
+			},
+			Stmt.Loop(bd) -> { out = [...out, Stmt.Loop(rw_stmts(bd, cur))] },
+			Stmt.ForIn(v, a, bd) -> { out = [...out, Stmt.ForIn(v, a, rw_stmts(bd, cur))] },
+			Stmt.IfThen(c, st) -> { out = [...out, Stmt.IfThen(c, rw_one(st, cur))] },
+			Stmt.IfElse(c, t, e) -> { out = [...out, Stmt.IfElse(c, rw_one(t, cur), rw_one(e, cur))] },
+			Stmt.Block(ss) -> { out = [...out, Stmt.Block(rw_stmts(ss, cur))] },
+			Stmt.Match(scrut, arms) -> { out = [...out, Stmt.Match(scrut, rw_arms(arms, cur))] },
+			_ -> { out = [...out, s] }
+		}
+		i = i + 1
+	}
+	return out
+}
+
+# Lower every defer-bearing function's body; leave defer-free functions (and asm bodies) untouched.
+pub const lower_defers = (Program prog): Program -> {
+	let [Func] funcs = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(prog.funcs.len) then break
+		const Func fn = prog.funcs[i]
+		if fn.is_asm then { funcs = [...funcs, fn] }
+		else if !stmts_have_defer(fn.body) then { funcs = [...funcs, fn] }
+		else {
+			const [[Stmt]] none = []
+			const [Stmt] nb = rw_stmts(fn.body, none)
+			funcs = [...funcs, Func({ name: fn.name, is_pub: fn.is_pub, ret_name: fn.ret_name, ret_elem: fn.ret_elem, params: fn.params, body: nb, is_asm: false, asm_body: fn.asm_body, is_value: fn.is_value, ret_telems: fn.ret_telems, typarams: fn.typarams, tbounds: fn.tbounds, ret_size: fn.ret_size })]
+		}
+		i = i + 1
+	}
+	return Program({ imports: prog.imports, recs: prog.recs, unions: prog.unions, funcs: funcs, groups: prog.groups })
+}

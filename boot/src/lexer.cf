@@ -1,0 +1,363 @@
+# lexer — source bytes to a token stream.
+#
+# Tracer-bullet scope: enough of the grammar to lex `pub const main = () -> N`
+# and `{ return N }`. It grows into the full lexer as cf0's front end fills in.
+# A token records its KIND (a `TokKind` union) plus the (start, len) slice into
+# the source buffer; the parser compares identifier slices against keywords, so
+# the lexer stays allocation-light (no per-token Str). Integer tokens carry their
+# decoded value.
+
+import "io" as { die }
+import "token" as { TokKind, Token }
+
+# Byte classes (ASCII).
+const is_space = (Iarch c): Bool -> c == 32 || c == 9 || c == 10 || c == 13
+const is_digit = (Iarch c): Bool -> c >= 48 && c <= 57
+const is_alpha = (Iarch c): Bool -> (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95
+const is_alnum = (Iarch c): Bool -> is_alpha(c) || is_digit(c)
+
+# The byte a char-literal escape `\<e>` decodes to. Mirrors the parser's string `escape_byte`,
+# plus `\'` (a quote inside a char literal) and minus the string-only `\"`/`\$`.
+const char_escape_byte = (Iarch e): Iarch -> {
+	if e == 110 then return 10  # \n
+	if e == 116 then return 9   # \t
+	if e == 114 then return 13  # \r
+	if e == 48 then return 0    # \0
+	if e == 92 then return 92   # backslash
+	if e == 39 then return 39   # \'
+	die("cf0: lex: unknown char escape (allowed: \\n \\t \\r \\0 \\\\ \\')\n")
+	return 0
+}
+
+# The numeric value of a hex digit byte (`0-9`, `a-f`, `A-F`), or -1 if not a hex digit. Callers
+# gate it by the radix (octal accepts only values <8, binary <2).
+const digit_value = (Iarch c): Iarch -> {
+	if c >= 48 && c <= 57 then return c - 48         # 0-9
+	if c >= 97 && c <= 102 then return c - 97 + 10   # a-f
+	if c >= 65 && c <= 70 then return c - 65 + 10     # A-F
+	return 0 - 1
+}
+# The radix of a base-prefix letter following a leading `0` (`x`/`o`/`b`, case-insensitive), or 0
+# if the byte is not a base prefix (so the `0` begins an ordinary decimal literal).
+const base_radix = (Iarch c): Iarch -> {
+	if c == 120 || c == 88 then return 16   # x / X
+	if c == 111 || c == 79 then return 8    # o / O
+	if c == 98 || c == 66 then return 2     # b / B
+	return 0
+}
+# Whether byte `c` is a digit valid in `radix`.
+const in_radix = (Iarch c, Iarch radix): Bool -> {
+	const Iarch dv = digit_value(c)
+	return dv >= 0 && dv < radix
+}
+
+# Lex the first `n` bytes of `src` into a token stream terminated by `Eof`.
+pub const lex = (*[Uint8] src, Iarch n): [Token] -> {
+	let [Token] toks = []
+	let Iarch i = 0
+	loop {
+		if i >= n then break
+		const Iarch c = Iarch(src[i])
+		if is_space(c) then {
+			i = i + 1
+			continue
+		}
+		# `#` line comment — skip to end of line (cf0 strips comments like cfcc).
+		if c == 35 then {
+			loop {
+				if i >= n then break
+				if Iarch(src[i]) == 10 then break
+				i = i + 1
+			}
+			continue
+		}
+		# string literal: `"..."` — record the RAW content slice (between the quotes);
+		# the parser decodes escapes. A `\` escapes the next byte (so `\"` stays inside);
+		# a raw newline is content; an unclosed string runs to EOF and is rejected.
+		if c == 34 then {
+			const Iarch start = i + 1
+			let Iarch j = i + 1
+			loop {
+				if j >= n then die("cf0: lex: unterminated string literal\n")
+				const Iarch d = Iarch(src[j])
+				if d == 92 then {
+					j = j + 2
+					continue
+				}
+				if d == 34 then break
+				j = j + 1
+			}
+			toks = [...toks, Token({ kind: TokKind.StrLit, ival: 0, start: start, len: j - start })]
+			i = j + 1
+			continue
+		}
+		# a CHARACTER literal `'A'` / `'\n'` — a single byte. It is distinguished from a type
+		# variable `'T` (lexed by the identifier branch below) by the CLOSING apostrophe, which a
+		# type var never has. Emitted straight as an `IntLit` of the byte value, so the parser reads
+		# it as an ordinary integer (`p.toks[..].ival`) — no dedicated char token or parser arm.
+		if c == 39 then {
+			if i + 3 < n && Iarch(src[i + 1]) == 92 && Iarch(src[i + 3]) == 39 then {
+				toks = [...toks, Token({ kind: TokKind.IntLit, ival: char_escape_byte(Iarch(src[i + 2])), start: i, len: 4 })]
+				i = i + 4
+				continue
+			}
+			if i + 2 < n && Iarch(src[i + 1]) != 92 && Iarch(src[i + 2]) == 39 then {
+				toks = [...toks, Token({ kind: TokKind.IntLit, ival: Iarch(src[i + 1]), start: i, len: 3 })]
+				i = i + 3
+				continue
+			}
+		}
+		# identifier / keyword: [A-Za-z_][A-Za-z0-9_]* — and a TYPE VARIABLE `'T` (a leading
+		# apostrophe, byte 39, then an identifier), lexed as one ident token whose text keeps the
+		# `'` so the parser can tell a type var (generics) from an ordinary name.
+		if is_alpha(c) || c == 39 then {
+			const Iarch start = i
+			if c == 39 then i = i + 1
+			loop {
+				if i >= n then break
+				if is_alnum(Iarch(src[i])) then i = i + 1 else break
+			}
+			toks = [...toks, Token({ kind: TokKind.Ident, ival: 0, start: start, len: i - start })]
+			continue
+		}
+		# a number literal: an integer `[0-9]+` (with `_` separators), or a FLOAT if a `.` and a
+		# digit follow — `1.5`, `1_000.500_5`. cf0 has no floats itself, so a float literal is kept
+		# as its SOURCE SPAN (the parser strips `_` and passes the text to QBE as a `d_…` constant).
+		if is_digit(c) then {
+			const Iarch start = i
+			# a BASE-prefixed integer: `0x`/`0o`/`0b` (case-insensitive) + digits in that radix, with
+			# `_` separators BETWEEN digits. A leading `0` followed by a base letter; else it is decimal.
+			if c == 48 && i + 1 < n && base_radix(Iarch(src[i + 1])) > 0 then {
+				const Iarch radix = base_radix(Iarch(src[i + 1]))
+				i = i + 2 # `0` + the base letter
+				let Iarch bv = 0
+				let Iarch ndig = 0
+				loop {
+					if i >= n then break
+					const Iarch d = Iarch(src[i])
+					const Iarch dv = digit_value(d)
+					if dv >= 0 && dv < radix then {
+						bv = bv * radix + dv
+						ndig = ndig + 1
+						i = i + 1
+					}
+					else if d == 95 && ndig > 0 && i + 1 < n && in_radix(Iarch(src[i + 1]), radix) then i = i + 1
+					else break
+				}
+				if ndig == 0 then die("cf0: lex: a based integer literal needs at least one digit\n")
+				toks = [...toks, Token({ kind: TokKind.IntLit, ival: bv, start: start, len: i - start })]
+				continue
+			}
+			let Iarch v = 0
+			loop {
+				if i >= n then break
+				const Iarch d = Iarch(src[i])
+				# a `_` separator is consumed only BETWEEN digits — a trailing/doubled `_` (`1_`, `1__0`)
+				# stops the number, leaving a stray `_` identifier the parser rejects
+				if is_digit(d) then {
+					v = v * 10 + (d - 48)
+					i = i + 1
+				}
+				else if d == 95 && i + 1 < n && is_digit(Iarch(src[i + 1])) then i = i + 1
+				else break
+			}
+			if i + 1 < n && Iarch(src[i]) == 46 && is_digit(Iarch(src[i + 1])) then {
+				i = i + 1
+				loop {
+					if i >= n then break
+					const Iarch d = Iarch(src[i])
+					if is_digit(d) || d == 95 then i = i + 1 else break
+				}
+				toks = [...toks, Token({ kind: TokKind.FloatLit, ival: 0, start: start, len: i - start })]
+				continue
+			}
+			toks = [...toks, Token({ kind: TokKind.IntLit, ival: v, start: start, len: i - start })]
+			continue
+		}
+		# `-` begins either the arrow `->` or the minus operator (unary/binary).
+		if c == 45 then {
+			if i + 1 < n && Iarch(src[i + 1]) == 62 then {
+				toks = [...toks, Token({ kind: TokKind.Arrow, ival: 0, start: i, len: 2 })]
+				i = i + 2
+				continue
+			}
+			toks = [...toks, Token({ kind: TokKind.Minus, ival: 0, start: i, len: 1 })]
+			i = i + 1
+			continue
+		}
+		# arithmetic operators
+		if c == 43 then {
+			toks = [...toks, Token({ kind: TokKind.Plus, ival: 0, start: i, len: 1 })]
+			i = i + 1
+			continue
+		}
+		if c == 42 then {
+			toks = [...toks, Token({ kind: TokKind.Star, ival: 0, start: i, len: 1 })]
+			i = i + 1
+			continue
+		}
+		if c == 47 then {
+			toks = [...toks, Token({ kind: TokKind.Slash, ival: 0, start: i, len: 1 })]
+			i = i + 1
+			continue
+		}
+		if c == 37 then {
+			toks = [...toks, Token({ kind: TokKind.Percent, ival: 0, start: i, len: 1 })]
+			i = i + 1
+			continue
+		}
+		# `&` begins `&&` (logical) or `&` (bitwise).
+		if c == 38 then {
+			if i + 1 < n && Iarch(src[i + 1]) == 38 then {
+				toks = [...toks, Token({ kind: TokKind.LogAnd, ival: 0, start: i, len: 2 })]
+				i = i + 2
+				continue
+			}
+			toks = [...toks, Token({ kind: TokKind.Amp, ival: 0, start: i, len: 1 })]
+			i = i + 1
+			continue
+		}
+		# `|` begins `||` (logical), `|>` (pipe), or `|` (bitwise).
+		if c == 124 then {
+			if i + 1 < n && Iarch(src[i + 1]) == 124 then {
+				toks = [...toks, Token({ kind: TokKind.LogOr, ival: 0, start: i, len: 2 })]
+				i = i + 2
+				continue
+			}
+			if i + 1 < n && Iarch(src[i + 1]) == 62 then {
+				toks = [...toks, Token({ kind: TokKind.PipeArrow, ival: 0, start: i, len: 2 })]
+				i = i + 2
+				continue
+			}
+			toks = [...toks, Token({ kind: TokKind.Pipe, ival: 0, start: i, len: 1 })]
+			i = i + 1
+			continue
+		}
+		if c == 94 then {
+			toks = [...toks, Token({ kind: TokKind.Caret, ival: 0, start: i, len: 1 })]
+			i = i + 1
+			continue
+		}
+		# `<` begins `<-` (yield-from-loop), `<<` (shift), `<=` (compare), or `<` (compare).
+		if c == 60 then {
+			if i + 1 < n && Iarch(src[i + 1]) == 45 then {
+				toks = [...toks, Token({ kind: TokKind.Yield, ival: 0, start: i, len: 2 })]
+				i = i + 2
+				continue
+			}
+			if i + 1 < n && Iarch(src[i + 1]) == 60 then {
+				toks = [...toks, Token({ kind: TokKind.Shl, ival: 0, start: i, len: 2 })]
+				i = i + 2
+				continue
+			}
+			if i + 1 < n && Iarch(src[i + 1]) == 61 then {
+				toks = [...toks, Token({ kind: TokKind.Le, ival: 0, start: i, len: 2 })]
+				i = i + 2
+				continue
+			}
+			toks = [...toks, Token({ kind: TokKind.Lt, ival: 0, start: i, len: 1 })]
+			i = i + 1
+			continue
+		}
+		# `>` begins `>>` (shift), `>=` (compare), or `>` (compare).
+		if c == 62 then {
+			if i + 1 < n && Iarch(src[i + 1]) == 62 then {
+				toks = [...toks, Token({ kind: TokKind.Shr, ival: 0, start: i, len: 2 })]
+				i = i + 2
+				continue
+			}
+			if i + 1 < n && Iarch(src[i + 1]) == 61 then {
+				toks = [...toks, Token({ kind: TokKind.Ge, ival: 0, start: i, len: 2 })]
+				i = i + 2
+				continue
+			}
+			toks = [...toks, Token({ kind: TokKind.Gt, ival: 0, start: i, len: 1 })]
+			i = i + 1
+			continue
+		}
+		# `!` begins `!=` (compare) or `!` (logical not).
+		if c == 33 then {
+			if i + 1 < n && Iarch(src[i + 1]) == 61 then {
+				toks = [...toks, Token({ kind: TokKind.Ne, ival: 0, start: i, len: 2 })]
+				i = i + 2
+				continue
+			}
+			toks = [...toks, Token({ kind: TokKind.Bang, ival: 0, start: i, len: 1 })]
+			i = i + 1
+			continue
+		}
+		# `~` — bitwise not.
+		if c == 126 then {
+			toks = [...toks, Token({ kind: TokKind.Tilde, ival: 0, start: i, len: 1 })]
+			i = i + 1
+			continue
+		}
+		# single-character punctuation — one guarded block each (a union has no
+		# reassignment, so each kind is constructed and appended in place).
+		if c == 40 then {
+			toks = [...toks, Token({ kind: TokKind.LParen, ival: 0, start: i, len: 1 })]
+			i = i + 1
+			continue
+		}
+		if c == 41 then {
+			toks = [...toks, Token({ kind: TokKind.RParen, ival: 0, start: i, len: 1 })]
+			i = i + 1
+			continue
+		}
+		if c == 123 then {
+			toks = [...toks, Token({ kind: TokKind.LBrace, ival: 0, start: i, len: 1 })]
+			i = i + 1
+			continue
+		}
+		if c == 125 then {
+			toks = [...toks, Token({ kind: TokKind.RBrace, ival: 0, start: i, len: 1 })]
+			i = i + 1
+			continue
+		}
+		if c == 91 then {
+			toks = [...toks, Token({ kind: TokKind.LBracket, ival: 0, start: i, len: 1 })]
+			i = i + 1
+			continue
+		}
+		if c == 93 then {
+			toks = [...toks, Token({ kind: TokKind.RBracket, ival: 0, start: i, len: 1 })]
+			i = i + 1
+			continue
+		}
+		if c == 44 then {
+			toks = [...toks, Token({ kind: TokKind.Comma, ival: 0, start: i, len: 1 })]
+			i = i + 1
+			continue
+		}
+		if c == 58 then {
+			toks = [...toks, Token({ kind: TokKind.Colon, ival: 0, start: i, len: 1 })]
+			i = i + 1
+			continue
+		}
+		# `.` begins the spread `...` or a single `.`.
+		if c == 46 then {
+			if i + 2 < n && Iarch(src[i + 1]) == 46 && Iarch(src[i + 2]) == 46 then {
+				toks = [...toks, Token({ kind: TokKind.Ellipsis, ival: 0, start: i, len: 3 })]
+				i = i + 3
+				continue
+			}
+			toks = [...toks, Token({ kind: TokKind.Dot, ival: 0, start: i, len: 1 })]
+			i = i + 1
+			continue
+		}
+		# `=` begins `==` (compare) or `=` (binding).
+		if c == 61 then {
+			if i + 1 < n && Iarch(src[i + 1]) == 61 then {
+				toks = [...toks, Token({ kind: TokKind.EqEq, ival: 0, start: i, len: 2 })]
+				i = i + 2
+				continue
+			}
+			toks = [...toks, Token({ kind: TokKind.Eq, ival: 0, start: i, len: 1 })]
+			i = i + 1
+			continue
+		}
+		die("cf0: lex: unexpected character\n")
+	}
+	toks = [...toks, Token({ kind: TokKind.Eof, ival: 0, start: n, len: 0 })]
+	return toks
+}

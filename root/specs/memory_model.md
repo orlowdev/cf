@@ -249,16 +249,31 @@ comptime region-outlives check replace them.
   inferred from a function body and checked against the argument at the call site
   (passing a `const`'s pointer where the body writes is an error).
 - Passing **by value** yields a **read-only view**, regardless of `let`/`const`.
-  To mutate a by-value argument you must explicitly `copy` (or `copy_deep`) it
+  To mutate a by-value argument you must explicitly `copy` (or `copy_transitive`) it
   into your own writable instance.
 - An aggregate cannot be bound to a second variable — `const y = x` on an
   aggregate is forbidden. That would be a borrow, and C! has none. Want your
   own — `copy` it.
 
+**`copy` duplicates the owned value; `copy_transitive` also follows references.**
+`copy` reproduces the entire *owned* tree — the aggregate and, transitively, everything
+it holds by value — and copies each **`*T` field as an alias** of the same referent; it
+stops at reference edges. `copy_transitive` is `copy` applied across every `*T` edge in
+turn — it follows references and clones their targets, so the result shares nothing with
+the source. ("Shallow" is a misnomer for `copy`: it is fully deep over what the value
+*owns*; the axis is whether it **crosses pointer edges**, and only `copy_transitive`
+does.) Neither makes a second owner — an *inline* owned sub-aggregate is duplicated (the
+copy owns its own), and a `*T` referent is owned by a `let` elsewhere, so `copy`'s
+aliasing is the permitted multi-pointer case, not shared ownership. Hence a `const`'s
+owned contents are never mutable through a copy of it. `copy_transitive` over a **cyclic**
+reference graph is **identity-preserving**: each reachable aggregate is cloned once and
+the clones mirror the source's sharing and cycles (the node-identity handling is the
+memory arc's).
+
 **Pointers point only to aggregates, and only into a `let`.** Two restrictions
 keep the pointer story minimal:
 
-- **No pointers to scalars.** There is no `*Int`, `*Uint8`, etc. A scalar is
+- **No pointers to scalars.** There is no `*Int32`, `*Uint8`, etc. A scalar is
   always passed by value (a read-only view); to "mutate a scalar" you return the
   new value, or the scalar is a **field of an aggregate** you pass by `*T`. All
   mutable shared state therefore lives in aggregates.

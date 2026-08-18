@@ -1,0 +1,2438 @@
+# parser — token stream to an expression AST.
+#
+# Recursive descent with a `*Parser` cursor over the token stream. `main`'s body
+# is an integer arithmetic expression with the usual precedence: additive over
+# multiplicative over unary over primary (a literal or a parenthesised
+# expression). It grows a level per construct as the grammar fills in.
+#
+# Left-associative operators fold in a loop that reassigns an `Expr` accumulator
+# (`acc = Expr.Add(acc, rhs)`) — one function per precedence level.
+
+import "io" as { die }
+import "token" as { Token, TokKind, is_eof, is_ident, is_intlit, is_strlit, is_lparen, is_rparen, is_lbrace, is_rbrace, is_lbracket, is_rbracket, is_comma, is_colon, is_dot, is_ellipsis, is_eq, is_arrow, is_minus, is_plus, is_star, is_slash, is_percent, is_amp, is_pipe, is_caret, is_tilde, is_bang, is_shl, is_shr, is_eqeq, is_ne, is_lt, is_gt, is_le, is_ge, is_logand, is_logor, is_yield, is_floatlit, is_pipearrow }
+import "lexer" as { lex }
+import "ast" as { Expr, Stmt, Param, Func, Ty, FieldInit, RecDecl, UnionMember, UnionDecl, MatchArm, StmtArm, Seg, RetSig, TupElem, Import, Program }
+import "astutil" as { tel_leaf, tel_nest, tel_fn, tel_is_fn }
+
+# The parse cursor: the token stream, the source (for keyword text), a position.
+pub data Parser = { [Token] toks, *[Uint8] src, Iarch pos, Str file }
+
+# The current token's kind.
+const peek = (*Parser p): TokKind -> p.toks[p.pos].kind
+
+# Is the current token the identifier `kw`?
+const kw = (*Parser p, Str word): Bool -> {
+	if !is_ident(peek(p)) then return false
+	return slice_eq(p.src, p.toks[p.pos].start, p.toks[p.pos].len, word)
+}
+
+# Does the token slice at (start, len) equal the keyword `word`?
+const slice_eq = (*[Uint8] src, Iarch start, Iarch len, Str word): Bool -> {
+	if len != Iarch(word.len) then return false
+	let Iarch i = 0
+	loop {
+		if i >= len then break
+		if Iarch(src[start + i]) != Iarch(word[i]) then return false
+		i = i + 1
+	}
+	return true
+}
+
+# Intern a source slice into an owned `Str` (a binding name / a variable reference),
+# copying the bytes so the name outlives the source buffer.
+const intern = (*[Uint8] src, Iarch start, Iarch len): Str -> {
+	let [Uint8] v = []
+	let Iarch i = 0
+	loop {
+		if i >= len then break
+		v = [...v, src[start + i]]
+		i = i + 1
+	}
+	return Str(v)
+}
+
+# The current token's interned text (for a binding name or a variable reference).
+const cur_name = (*Parser p): Str -> intern(p.src, p.toks[p.pos].start, p.toks[p.pos].len)
+
+# A float literal's text with `_` separators removed — the spelling handed to QBE as a
+# `d_…` constant (cf0 never evaluates the value itself).
+const float_text = (*[Uint8] src, Iarch start, Iarch len): Str -> {
+	let [Uint8] v = []
+	let Iarch i = 0
+	loop {
+		if i >= len then break
+		if Iarch(src[start + i]) != 95 then v = [...v, src[start + i]]
+		i = i + 1
+	}
+	return Str(v)
+}
+
+# The single byte an escape `\<e>` decodes to (`\n \t \r \0 \\ \" \$`); an unknown
+# escape is rejected.
+const escape_byte = (Iarch e): Iarch -> {
+	if e == 110 then return 10  # \n
+	if e == 116 then return 9   # \t
+	if e == 114 then return 13  # \r
+	if e == 48 then return 0    # \0
+	if e == 92 then return 92   # backslash
+	if e == 34 then return 34   # quote
+	if e == 36 then return 36   # dollar
+	die("cf0: parse: unknown string escape (allowed: \\n \\t \\r \\0 \\\\ \\\" \\$)\n")
+	return 0
+}
+
+# Parse an interpolation hole's RAW byte slice (src[hstart .. hstart+hlen]) into the Expr it
+# holds. The hole is its own little source: its bytes are copied into a fresh buffer (sealed
+# as a `Str` for a `.bytes` pointer), lexed, and run through the ordinary expression parser —
+# so a hole is any expression (`a + 8`, `ctx.next`, `xs[i].f`), not just a bare name. The
+# interned names in the resulting tree are copied into the arena, so they outlive the buffer.
+# A hole must be exactly one expression (trailing tokens are an error).
+const parse_hole = (*[Uint8] src, Iarch hstart, Iarch hlen): Expr -> {
+	let [1024 Uint8] hbuf
+	if hlen >= 1024 then die("cf0: parse: an interpolation hole is too long\n")
+	let Iarch i = 0
+	loop {
+		if i >= hlen then break
+		hbuf[i] = src[hstart + i]
+		i = i + 1
+	}
+	const [Token] toks = lex(hbuf, hlen)
+	let Parser hp = Parser({ toks: toks, src: hbuf, pos: 0, file: "" })
+	const Expr e = parse_expr(&hp)
+	if !is_eof(peek(&hp)) then die("cf0: parse: an interpolation hole must be a single expression\n")
+	return e
+}
+
+# Parse a string literal's RAW content slice (src[start .. start+len]) into an Expr: a
+# plain `StrLit` (its decoded bytes) when there is no interpolation, else an `Interp`
+# (alternating literal-run / hole segments, assembled at runtime). Escapes collapse to
+# one byte; a raw newline is content; `\$` / a lone `$` are literal; `${expr}` is a hole
+# (an expression — an empty `${}` or a missing `}` is an error). The accumulated literal
+# run `cur` is flushed to a segment and RESET at each hole.
+const parse_string = (*[Uint8] src, Iarch start, Iarch len): Expr -> {
+	let [Seg] segs = []
+	let [Uint8] cur = []
+	let Bool any_hole = false
+	let Iarch i = 0
+	loop {
+		if i >= len then break
+		const Iarch c = Iarch(src[start + i])
+		if c == 92 then {
+			if i + 1 >= len then die("cf0: parse: a dangling `\\` in a string\n")
+			cur = [...cur, escape_byte(Iarch(src[start + i + 1]))]
+			i = i + 2
+			continue
+		}
+		if c == 36 && i + 1 < len && Iarch(src[start + i + 1]) == 123 then {
+			# `${expr}` — flush the pending literal run, reset it, then scan to the matching
+			# `}` and lex+parse the enclosed bytes as an expression hole.
+			segs = [...segs, Seg({ is_hole: false, lit: cur, name: "", expr: Expr.Lit(0) })]
+			cur = []
+			const Iarch hstart = i + 2
+			let Iarch j = hstart
+			loop {
+				if j >= len then die("cf0: parse: an unterminated interpolation hole (missing `}`)\n")
+				if Iarch(src[start + j]) == 125 then break
+				j = j + 1
+			}
+			if j == hstart then die("cf0: parse: an empty interpolation hole\n")
+			const Expr he = parse_hole(src, start + hstart, j - hstart)
+			segs = [...segs, Seg({ is_hole: true, lit: cur, name: "", expr: he })]
+			any_hole = true
+			i = j + 1
+			continue
+		}
+		cur = [...cur, c]
+		i = i + 1
+	}
+	if !any_hole then return Expr.StrLit(cur)
+	segs = [...segs, Seg({ is_hole: false, lit: cur, name: "", expr: Expr.Lit(0) })]
+	return Expr.Interp(segs)
+}
+
+# --- expression grammar --------------------------------------------------------------
+# precedence, loosest to tightest:
+#   logical-or `||` < logical-and `&&` < comparison `== != < > <= >=`
+#     < bit-or `|` < bit-xor `^` < bit-and `&` < shift `<< >>` < additive `+ -`
+#     < multiplicative `* / %` < unary `-` < primary
+# every binary level except comparison is left-associative, folded by a loop that reassigns
+# an `Expr` accumulator (`acc = Expr.Add(acc, rhs)`). Comparison is NON-associative — a single
+# compare, no chaining.
+
+const parse_expr = (*Parser p): Expr -> parse_pipe(p)
+
+# `x |> f` / `x |> f(a, …)` — the pipe threads the left value in as the callee's LAST
+# positional argument: `f(x)` / `f(a, …, x)`. It is the LOOSEST operator (looser than
+# arithmetic and the logical/comparison ladder, so `1 + 2 |> inc` is `inc(1 + 2)`) and
+# left-associative, so a chain `3 |> inc |> sum(10)` reads left to right as
+# `sum(10, inc(3))`. A newline before a leading `|>` is whitespace, so a chain may wrap.
+const parse_pipe = (*Parser p): Expr -> {
+	let Expr acc = parse_or(p)
+	loop {
+		if !is_pipearrow(peek(p)) then break
+		p.pos = p.pos + 1
+		acc = parse_pipe_target(p, acc)
+	}
+	return acc
+}
+
+# The target after a `|>`: a bare function name, or a partially-applied call `f(a, …)`
+# whose remaining slot the piped value fills. The name must be lowercase (a value binding),
+# not a PascalCase type — there is no first-class construction pipe.
+const parse_pipe_target = (*Parser p, Expr piped): Expr -> {
+	# `x |> defer f` / `x |> defer f(a)` — schedule `f(…, x)` at scope exit and TAP x through (the
+	# pipe forwards its input). A `defer { … }` block taps no value, so it is not a pipe target.
+	if kw(p, "defer") then {
+		p.pos = p.pos + 1
+		if is_lbrace(peek(p)) then die("cf0: parse: `|> defer { … }` — a defer block taps no value; pipe into `defer f`\n")
+		if !is_ident(peek(p)) then die("cf0: parse: `|> defer` needs a function name\n")
+		const Iarch dc = Iarch(p.src[p.toks[p.pos].start])
+		if dc >= 65 && dc <= 90 then die("cf0: parse: a `|> defer` target must be a function, not a type\n")
+		const Str dn = cur_name(p)
+		p.pos = p.pos + 1
+		let [Expr] dargs = []
+		if is_lparen(peek(p)) then dargs = parse_args(p)
+		return Expr.DeferTap(dn, [...dargs, piped])
+	}
+	if !is_ident(peek(p)) then die("cf0: parse: a `|>` target must be a function name\n")
+	const Iarch c0 = Iarch(p.src[p.toks[p.pos].start])
+	if c0 >= 65 && c0 <= 90 then die("cf0: parse: a `|>` target must be a function, not a type\n")
+	const Str name = cur_name(p)
+	p.pos = p.pos + 1
+	let [Expr] args = []
+	if is_lparen(peek(p)) then args = parse_args(p)
+	const [Str] no_ty = []
+	return Expr.Call(name, no_ty, [...args, piped])
+}
+
+const parse_or = (*Parser p): Expr -> {
+	let Expr acc = parse_and(p)
+	loop {
+		if !is_logor(peek(p)) then break
+		p.pos = p.pos + 1
+		acc = Expr.Or(acc, parse_and(p))
+	}
+	return acc
+}
+
+const parse_and = (*Parser p): Expr -> {
+	let Expr acc = parse_comparison(p)
+	loop {
+		if !is_logand(peek(p)) then break
+		p.pos = p.pos + 1
+		acc = Expr.And(acc, parse_comparison(p))
+	}
+	return acc
+}
+
+const parse_comparison = (*Parser p): Expr -> {
+	const Expr lhs = parse_bitor(p)
+	if is_eqeq(peek(p)) then {
+		p.pos = p.pos + 1
+		return Expr.CmpEq(lhs, parse_bitor(p))
+	}
+	if is_ne(peek(p)) then {
+		p.pos = p.pos + 1
+		return Expr.CmpNe(lhs, parse_bitor(p))
+	}
+	if is_lt(peek(p)) then {
+		p.pos = p.pos + 1
+		return Expr.CmpLt(lhs, parse_bitor(p))
+	}
+	if is_gt(peek(p)) then {
+		p.pos = p.pos + 1
+		return Expr.CmpGt(lhs, parse_bitor(p))
+	}
+	if is_le(peek(p)) then {
+		p.pos = p.pos + 1
+		return Expr.CmpLe(lhs, parse_bitor(p))
+	}
+	if is_ge(peek(p)) then {
+		p.pos = p.pos + 1
+		return Expr.CmpGe(lhs, parse_bitor(p))
+	}
+	return lhs
+}
+
+const parse_bitor = (*Parser p): Expr -> {
+	let Expr acc = parse_bitxor(p)
+	loop {
+		if !is_pipe(peek(p)) then break
+		p.pos = p.pos + 1
+		acc = Expr.BitOr(acc, parse_bitxor(p))
+	}
+	return acc
+}
+
+const parse_bitxor = (*Parser p): Expr -> {
+	let Expr acc = parse_bitand(p)
+	loop {
+		if !is_caret(peek(p)) then break
+		p.pos = p.pos + 1
+		acc = Expr.BitXor(acc, parse_bitand(p))
+	}
+	return acc
+}
+
+const parse_bitand = (*Parser p): Expr -> {
+	let Expr acc = parse_shift(p)
+	loop {
+		if !is_amp(peek(p)) then break
+		p.pos = p.pos + 1
+		acc = Expr.BitAnd(acc, parse_shift(p))
+	}
+	return acc
+}
+
+const parse_shift = (*Parser p): Expr -> {
+	let Expr acc = parse_additive(p)
+	loop {
+		if is_shl(peek(p)) then {
+			p.pos = p.pos + 1
+			acc = Expr.Shl(acc, parse_additive(p))
+		} else if is_shr(peek(p)) then {
+			p.pos = p.pos + 1
+			acc = Expr.Shr(acc, parse_additive(p))
+		} else break
+	}
+	return acc
+}
+
+const parse_additive = (*Parser p): Expr -> {
+	let Expr acc = parse_multiplicative(p)
+	loop {
+		if is_plus(peek(p)) then {
+			p.pos = p.pos + 1
+			acc = Expr.Add(acc, parse_multiplicative(p))
+		} else if is_minus(peek(p)) then {
+			p.pos = p.pos + 1
+			acc = Expr.Sub(acc, parse_multiplicative(p))
+		} else break
+	}
+	return acc
+}
+
+const parse_multiplicative = (*Parser p): Expr -> {
+	let Expr acc = parse_unary(p)
+	loop {
+		if is_star(peek(p)) then {
+			p.pos = p.pos + 1
+			acc = Expr.Mul(acc, parse_unary(p))
+		} else if is_slash(peek(p)) then {
+			p.pos = p.pos + 1
+			acc = Expr.Div(acc, parse_unary(p))
+		} else if is_percent(peek(p)) then {
+			p.pos = p.pos + 1
+			acc = Expr.Mod(acc, parse_unary(p))
+		} else break
+	}
+	return acc
+}
+
+const parse_unary = (*Parser p): Expr -> {
+	if is_minus(peek(p)) then {
+		p.pos = p.pos + 1
+		return Expr.Neg(parse_unary(p))
+	}
+	if is_bang(peek(p)) then {
+		p.pos = p.pos + 1
+		return Expr.Not(parse_unary(p))
+	}
+	if is_tilde(peek(p)) then {
+		p.pos = p.pos + 1
+		return Expr.BitNot(parse_unary(p))
+	}
+	# `&<primary>` — address-of, yielding a `*Record`/`*Union` pointer. cf0's aggregates are
+	# already arena pointers, so `&` is the identity on the operand's pointer value: a bare local
+	# `&pt` becomes `Addr(pt)` (its slot holds the base pointer); a constructor `&Point({…})` (or
+	# any other aggregate-valued primary) already evaluates to a pointer, so it is taken as-is.
+	if is_amp(peek(p)) then {
+		p.pos = p.pos + 1
+		const Expr operand = parse_primary(p)
+		return match operand {
+			Expr.Var(n) -> Expr.Addr(n),
+			_ -> operand
+		}
+	}
+	return parse_primary(p)
+}
+
+# The value produced by an `if`/`match` branch: a bare expression, or — when the branch
+# opens with `{` — a value BLOCK `{ … <- v }` (a nested scope that yields with `<-`, per
+# ebnf.md §Control Flow). A value block is lowered to a run-once `Expr.Loop`: its first
+# `<- v` stores the value and breaks, so the body runs exactly once and the whole loop
+# machinery (type, aggregate yield, merge slot) applies unchanged. A bare `{` was never a
+# valid expression start before, so this is purely additive (record literals use `({…})`).
+const parse_branch_body = (*Parser p): Expr -> {
+	if is_lbrace(peek(p)) then {
+		p.pos = p.pos + 1 # `{`
+		return Expr.Loop(parse_block(p))
+	}
+	return parse_expr(p)
+}
+# `if <cond> then <a> else <b>` — a value-producing conditional expression. `else`
+# is required (an else-less `if` is an `Option`, a later brick). The condition is a
+# `Bool` (a comparison); no truthiness (§5).
+const parse_if = (*Parser p): Expr -> {
+	p.pos = p.pos + 1 # `if`
+	const Expr cond = parse_expr(p)
+	if !kw(p, "then") then die("cf0: parse: expected `then`\n")
+	p.pos = p.pos + 1
+	const Expr then_e = parse_branch_body(p)
+	if !kw(p, "else") then die("cf0: parse: expected `else` (an else-less `if` is a later brick)\n")
+	p.pos = p.pos + 1
+	const Expr else_e = parse_branch_body(p)
+	return Expr.If(cond, then_e, else_e)
+}
+
+# `name(args)` — a call. `(` is already the current token. The callee is resolved
+# whole-program at emit time (so forward references and recursion work); here we
+# only collect the comma-separated argument expressions.
+const parse_args = (*Parser p): [Expr] -> {
+	p.pos = p.pos + 1 # `(`
+	let [Expr] args = []
+	if !is_rparen(peek(p)) then {
+		loop {
+			# a `{ … }` argument is a grouped-parameter literal (a bare `Record` with empty type_name,
+			# expanded to positional field values by the resolve group splat)
+			if is_lbrace(peek(p)) then args = [...args, parse_record_lit(p, "")]
+			else args = [...args, parse_expr(p)]
+			if !is_comma(peek(p)) then break
+			p.pos = p.pos + 1
+		}
+	}
+	if !is_rparen(peek(p)) then die("cf0: parse: expected `)` in a call\n")
+	p.pos = p.pos + 1
+	return args
+}
+const parse_call = (*Parser p, Str name): Expr -> {
+	const [Str] no_ty = []
+	return Expr.Call(name, no_ty, parse_args(p))
+}
+
+# `f[T1, T2](args)` — a call to a generic function with explicit type arguments. Each type
+# argument is a type NAME (`Iarch`/a record/a `'T` in a generic body/a fixed or float leaf).
+const parse_tyargs = (*Parser p): [Str] -> {
+	p.pos = p.pos + 1 # `[`
+	let [Str] tys = []
+	loop {
+		# a TYPE argument (an ident) or a comptime VALUE argument (an int literal, `f[8]()`) —
+		# either is kept as its source text; the monomorph pass tells them apart by the parameter
+		if !is_ident(peek(p)) && !is_intlit(peek(p)) then die("cf0: parse: expected a type or value argument in `[...]`\n")
+		tys = [...tys, cur_name(p)]
+		p.pos = p.pos + 1
+		if !is_comma(peek(p)) then break
+		p.pos = p.pos + 1
+	}
+	if !is_rbracket(peek(p)) then die("cf0: parse: expected `]` after type arguments\n")
+	p.pos = p.pos + 1
+	return tys
+}
+const parse_generic_call = (*Parser p, Str name): Expr -> {
+	const [Str] tys = parse_tyargs(p)
+	if !is_lparen(peek(p)) then die("cf0: parse: expected `(` after type arguments\n")
+	return Expr.Call(name, tys, parse_args(p))
+}
+# Scan a bracket group starting at token index `br` (a `[`) to its matching `]`, returning the
+# index of the token AFTER the `]` (or -1 if unbalanced).
+const after_brackets = (*Parser p, Iarch br): Iarch -> {
+	let Iarch depth = 0
+	let Iarch j = br
+	loop {
+		if j >= Iarch(p.toks.len) then return 0 - 1
+		const TokKind k = p.toks[j].kind
+		if is_lbracket(k) then depth = depth + 1
+		if is_rbracket(k) then {
+			depth = depth - 1
+			if depth == 0 then break
+		}
+		j = j + 1
+	}
+	return j + 1
+}
+# Do the tokens between the `[` at index `br` and its matching `]` look like a type-argument
+# list — only commas and TYPE-shaped identifiers, each uppercase-initial (`Iarch`, `Color`) or a
+# type variable (`'T`) — rather than an index expression (`xs[1]`, `xs[i + 1]`, `fs[i]`)? A
+# concrete type or type variable is never lowercase, and a value/index name never uppercase, so
+# this is what separates a generic form `Maybe[Iarch].Just` / `f[Iarch](x)` from an index-then
+# accessor `fs[i].field` / `xs[i](…)` (both are `name[…]` followed by `.`/`(`).
+const tyargs_shaped = (*Parser p, Iarch br): Bool -> {
+	let Iarch j = br + 1
+	loop {
+		if j >= Iarch(p.toks.len) then return false
+		const TokKind k = p.toks[j].kind
+		if is_rbracket(k) then break
+		if !is_ident(k) && !is_comma(k) then return false
+		if is_ident(k) then {
+			const Iarch c = Iarch(p.src[p.toks[j].start])
+			if !((c >= 65 && c <= 90) || c == 39) then return false  # uppercase-initial or `'T`
+		}
+		j = j + 1
+	}
+	if j == br + 1 then return false
+	return true
+}
+# Like `tyargs_shaped`, but a bracket token may ALSO be a comptime VALUE argument — an int literal
+# (`f[8]()`, `f[3, Iarch](x)`). Used to disambiguate a generic CALL only (a construction keeps the
+# strict type-shaped check, so `xs[1].field` stays an index-then-field, not a `[1]`-construction).
+const callargs_shaped = (*Parser p, Iarch br): Bool -> {
+	let Iarch j = br + 1
+	loop {
+		if j >= Iarch(p.toks.len) then return false
+		const TokKind k = p.toks[j].kind
+		if is_rbracket(k) then break
+		if is_comma(k) || is_intlit(k) then j = j + 1
+		else {
+			if !is_ident(k) then return false
+			const Iarch c = Iarch(p.src[p.toks[j].start])
+			if !((c >= 65 && c <= 90) || c == 39) then return false  # uppercase-initial or `'T`
+			j = j + 1
+		}
+	}
+	if j == br + 1 then return false
+	return true
+}
+# At a `[` right after a NAME: is it `[tyargs](` (a generic call) or `[idx]` (an array index)?
+const generic_call_ahead = (*Parser p): Bool -> {
+	if !is_lbracket(peek(p)) then return false
+	if !callargs_shaped(p, p.pos) then return false
+	const Iarch after = after_brackets(p, p.pos)
+	if after < 0 then return false
+	if after >= Iarch(p.toks.len) then return false
+	return is_lparen(p.toks[after].kind)
+}
+# At a `[` right after a NAME: is it `[tyargs].Member` — a generic union member construction
+# (`Maybe[Iarch].Just(…)`) — rather than a generic call or an index?
+const generic_ctor_ahead = (*Parser p): Bool -> {
+	if !is_lbracket(peek(p)) then return false
+	if !tyargs_shaped(p, p.pos) then return false
+	const Iarch after = after_brackets(p, p.pos)
+	if after < 0 then return false
+	if after >= Iarch(p.toks.len) then return false
+	return is_dot(p.toks[after].kind)
+}
+# At a statement head (the current token is a name): is the statement `name[T](…)` — a generic
+# call evaluated for effect — rather than an index-assignment `name[i] = …`?
+const generic_call_stmt_ahead = (*Parser p): Bool -> {
+	if p.pos + 1 >= Iarch(p.toks.len) then return false
+	if !is_lbracket(p.toks[p.pos + 1].kind) then return false
+	if !callargs_shaped(p, p.pos + 1) then return false
+	const Iarch after = after_brackets(p, p.pos + 1)
+	if after < 0 then return false
+	if after >= Iarch(p.toks.len) then return false
+	return is_lparen(p.toks[after].kind)
+}
+
+# A `[…]` dynamic-array literal: `[]`, `[a, b]`, or a spread `[...src, e, …]`. `[` is
+# the current token.
+const parse_array_lit = (*Parser p): Expr -> {
+	p.pos = p.pos + 1 # `[`
+	if is_ellipsis(peek(p)) then {
+		p.pos = p.pos + 1
+		# the spread source is any expression yielding a dynamic array (a name, a field read
+		# `h.xs`, a call result, …) — not only a bare local
+		const Expr src = parse_expr(p)
+		let [Expr] sp_elems = []
+		loop {
+			if !is_comma(peek(p)) then break
+			p.pos = p.pos + 1
+			sp_elems = [...sp_elems, parse_expr(p)]
+		}
+		if !is_rbracket(peek(p)) then die("cf0: parse: expected `]` in an array spread\n")
+		p.pos = p.pos + 1
+		return Expr.ArrayLit(true, src, sp_elems, "")
+	}
+	let [Expr] lit_elems = []
+	if !is_rbracket(peek(p)) then {
+		loop {
+			lit_elems = [...lit_elems, parse_expr(p)]
+			if !is_comma(peek(p)) then break
+			p.pos = p.pos + 1
+		}
+	}
+	if !is_rbracket(peek(p)) then die("cf0: parse: expected `]` in an array literal\n")
+	p.pos = p.pos + 1
+	# a non-spread literal carries an unread `Lit(0)` in the spread-source slot (read only
+	# when `has_spread`)
+	return Expr.ArrayLit(false, Expr.Lit(0), lit_elems, "")
+}
+
+# `Type.member(args)` — a payload-member union construction. `(` is the current token.
+const parse_union_mk = (*Parser p, Str type_name, Str member): Expr -> {
+	p.pos = p.pos + 1 # `(`
+	let [Expr] args = []
+	if !is_rparen(peek(p)) then {
+		loop {
+			args = [...args, parse_expr(p)]
+			if !is_comma(peek(p)) then break
+			p.pos = p.pos + 1
+		}
+	}
+	if !is_rparen(peek(p)) then die("cf0: parse: expected `)` in a union construction\n")
+	p.pos = p.pos + 1
+	return Expr.UnionMk(type_name, member, args)
+}
+
+# The signed decimal spelling of an integer value — used to normalize an integer match arm's
+# literal (so different bases collapse to one canonical key `members` compares and emit uses).
+const int_to_dec = (Iarch v): Str -> {
+	if v == 0 then return "0"
+	let Bool neg = v < 0
+	let Iarch x = v
+	if neg then x = 0 - v
+	let [Uint8] rev = []
+	loop {
+		if x == 0 then break
+		rev = [...rev, Uint8(48 + (x % 10))]
+		x = x / 10
+	}
+	let [Uint8] out = []
+	if neg then out = [...out, Uint8(45)] # '-'
+	let Iarch i = Iarch(rev.len) - 1
+	loop {
+		if i < 0 then break
+		out = [...out, rev[i]]
+		i = i - 1
+	}
+	return Str(out)
+}
+
+# Parse a `match` arm's PATTERN and the `->` that follows, returning a `MatchArm` whose
+# body is a placeholder (`Expr.Lit(0)`) the caller replaces. Shared by the expression-arm
+# (`parse_arm`, body = an expression) and the statement-arm (`parse_stmt_arm`, body = a
+# `{ … }` block). The pattern is a wildcard `_`, an or-pattern `Type.a | Type.b`, or a
+# single member with a positional payload binding `Type.m(v, _)`.
+const parse_arm_head = (*Parser p): MatchArm -> {
+	# a STRING-literal match arm — Str-equality dispatch (`"add" -> …`), with `|` or-alternatives
+	# (`"mul" | "imul"`). The patterns' decoded bytes ride in `members` under the sentinel type_name
+	# "$str"; an interpolated pattern (`"${x}"`) is rejected (a pattern must be a constant).
+	if is_strlit(peek(p)) then {
+		let [Str] pats = []
+		const [Str] nob = []
+		loop {
+			if !is_strlit(peek(p)) then die("cf0: parse: expected a string pattern after `|`\n")
+			const Expr se = parse_string(p.src, p.toks[p.pos].start, p.toks[p.pos].len)
+			let [Uint8] patb = []
+			match se {
+				Expr.StrLit(bytes) -> { patb = bytes },
+				_ -> { die("cf0: parse: a string match pattern cannot interpolate\n") }
+			}
+			pats = [...pats, Str(patb)]
+			p.pos = p.pos + 1
+			if !is_pipe(peek(p)) then break
+			p.pos = p.pos + 1
+		}
+		if !is_arrow(peek(p)) then die("cf0: parse: expected `->` in a match arm\n")
+		p.pos = p.pos + 1
+		return MatchArm({ is_wild: false, type_name: "$str", members: pats, binds: nob, body: Expr.Lit(0) })
+	}
+	# an INTEGER-literal match arm — word/fixed-width equality dispatch (`0 -> …`), with `|`
+	# or-alternatives (`1 | 2 | 3`) and negative literals (`-5 -> …`). The literal VALUES normalized
+	# to decimal (so different bases collapse) ride in `members` under the sentinel type_name "$int";
+	# a `_` is always required (the integer domain is open).
+	if is_intlit(peek(p)) || is_minus(peek(p)) then {
+		let [Str] pats = []
+		const [Str] nob = []
+		loop {
+			let Bool neg = false
+			if is_minus(peek(p)) then {
+				neg = true
+				p.pos = p.pos + 1
+			}
+			if !is_intlit(peek(p)) then die("cf0: parse: expected an integer pattern\n")
+			let Iarch v = p.toks[p.pos].ival
+			if neg then v = 0 - v
+			pats = [...pats, int_to_dec(v)]
+			p.pos = p.pos + 1
+			if !is_pipe(peek(p)) then break
+			p.pos = p.pos + 1
+		}
+		if !is_arrow(peek(p)) then die("cf0: parse: expected `->` in a match arm\n")
+		p.pos = p.pos + 1
+		return MatchArm({ is_wild: false, type_name: "$int", members: pats, binds: nob, body: Expr.Lit(0) })
+	}
+	if !is_ident(peek(p)) then die("cf0: parse: expected a match-arm pattern\n")
+	let Str first = cur_name(p)
+	p.pos = p.pos + 1
+	# a match arm may qualify by the union's exact INSTANCE (`U[Iarch].Pair`), not only its base
+	# name (`U.Pair`); the bracketed application is kept as the arm's type name, which the
+	# monomorph pass mangles to the concrete union (and rejects a wrong instance at typecheck).
+	if is_lbracket(peek(p)) then first = parse_type_app_tail(p, first)
+	if is_dot(peek(p)) then {
+		p.pos = p.pos + 1
+		if !is_ident(peek(p)) then die("cf0: parse: expected a member name after `.`\n")
+		let [Str] members = []
+		members = [...members, cur_name(p)]
+		p.pos = p.pos + 1
+		let [Str] binds = []
+		if is_lparen(peek(p)) then {
+			# a payload pattern (single member): each position is a bind NAME, `_`, an INTEGER
+			# sub-pattern guard (`0`/`-5` → `#<dec>`), or a union-MEMBER sub-pattern guard (`Add`
+			# bare / `Op.Add` qualified → `=<qual>.<member>`). A guard constrains that payload field
+			# beyond the outer tag; a member guard may not itself carry a payload (one level only).
+			p.pos = p.pos + 1
+			loop {
+				if is_intlit(peek(p)) || is_minus(peek(p)) then {
+					let Bool gneg = false
+					if is_minus(peek(p)) then {
+						gneg = true
+						p.pos = p.pos + 1
+					}
+					if !is_intlit(peek(p)) then die("cf0: parse: expected an integer sub-pattern\n")
+					let Iarch gv = p.toks[p.pos].ival
+					if gneg then gv = 0 - gv
+					binds = [...binds, "#${int_to_dec(gv)}"]
+					p.pos = p.pos + 1
+				} else {
+					if !is_ident(peek(p)) then die("cf0: parse: expected a binding name, `_`, or a sub-pattern\n")
+					const Str nm = cur_name(p)
+					p.pos = p.pos + 1
+					if is_dot(peek(p)) then {
+						p.pos = p.pos + 1
+						if !is_ident(peek(p)) then die("cf0: parse: expected a member name after `.`\n")
+						const Str gm = cur_name(p)
+						p.pos = p.pos + 1
+						if is_lparen(peek(p)) then die("cf0: parse: a nested sub-pattern is one level only\n")
+						binds = [...binds, "=${nm}.${gm}"]
+					} else if is_pascal_name(nm) then {
+						if is_lparen(peek(p)) then die("cf0: parse: a nested sub-pattern is one level only\n")
+						binds = [...binds, "=${nm}"]
+					} else {
+						binds = [...binds, nm]
+					}
+				}
+				if !is_comma(peek(p)) then break
+				p.pos = p.pos + 1
+			}
+			if !is_rparen(peek(p)) then die("cf0: parse: expected `)` in a payload pattern\n")
+			p.pos = p.pos + 1
+		} else {
+			# an or-pattern: further `Type.member` alternatives sharing the qualifier
+			loop {
+				if !is_pipe(peek(p)) then break
+				p.pos = p.pos + 1
+				if !is_ident(peek(p)) then die("cf0: parse: expected `Type.member` after `|`\n")
+				const Str q = cur_name(p)
+				p.pos = p.pos + 1
+				if !str_eq(q, first) then die("cf0: parse: or-pattern alternatives must share the union qualifier\n")
+				if !is_dot(peek(p)) then die("cf0: parse: expected `.` in an or-pattern alternative\n")
+				p.pos = p.pos + 1
+				if !is_ident(peek(p)) then die("cf0: parse: expected a member name after `.`\n")
+				members = [...members, cur_name(p)]
+				p.pos = p.pos + 1
+			}
+		}
+		if !is_arrow(peek(p)) then die("cf0: parse: expected `->` in a match arm\n")
+		p.pos = p.pos + 1
+		return MatchArm({ is_wild: false, type_name: first, members: members, binds: binds, body: Expr.Lit(0) })
+	}
+	if !str_eq(first, "_") then die("cf0: parse: a match-arm pattern is `_` or `Type.member`\n")
+	if is_pipe(peek(p)) then die("cf0: parse: `_` is a standalone wildcard, not an or-pattern alternative\n")
+	if !is_arrow(peek(p)) then die("cf0: parse: expected `->` after `_`\n")
+	p.pos = p.pos + 1
+	const [Str] no_members = []
+	const [Str] no_binds = []
+	return MatchArm({ is_wild: true, type_name: "", members: no_members, binds: no_binds, body: Expr.Lit(0) })
+}
+
+# One expression-`match` arm: the pattern (via `parse_arm_head`) with an expression body —
+# a bare expression or, when it opens with `{`, a value block `{ … <- v }` (via `parse_branch_body`).
+const parse_arm = (*Parser p): MatchArm -> {
+	const MatchArm h = parse_arm_head(p)
+	return MatchArm({ is_wild: h.is_wild, type_name: h.type_name, members: h.members, binds: h.binds, body: parse_branch_body(p) })
+}
+
+# One statement-`match` arm: the pattern (via `parse_arm_head`) with a statement body — a
+# `{ … }` block (its statements, own scope) or, without braces, a single statement.
+const parse_stmt_arm = (*Parser p): StmtArm -> {
+	const MatchArm h = parse_arm_head(p)
+	let [Stmt] body = []
+	if is_lbrace(peek(p)) then {
+		p.pos = p.pos + 1
+		body = parse_block(p)
+	} else {
+		body = [...body, parse_stmt(p)]
+	}
+	return StmtArm({ is_wild: h.is_wild, type_name: h.type_name, members: h.members, binds: h.binds, body: body })
+}
+
+# `match <scrutinee> { arm, arm, … }` — dispatch on a union value's tag.
+const parse_match = (*Parser p): Expr -> {
+	p.pos = p.pos + 1 # `match`
+	const Expr scrut = parse_expr(p)
+	if !is_lbrace(peek(p)) then die("cf0: parse: expected `{` after a match scrutinee\n")
+	p.pos = p.pos + 1
+	let [MatchArm] arms = []
+	loop {
+		if is_rbrace(peek(p)) then break
+		arms = [...arms, parse_arm(p)]
+		if !is_comma(peek(p)) then break
+		p.pos = p.pos + 1
+	}
+	if !is_rbrace(peek(p)) then die("cf0: parse: expected `}` to close a match\n")
+	p.pos = p.pos + 1
+	return Expr.Match(scrut, arms)
+}
+
+# `match <scrutinee> { arm, arm, … }` in STATEMENT position — a union tag-dispatch
+# evaluated for effect. Same arm-list shape as the expression form (comma-separated,
+# optional trailing comma), but each arm carries a statement-block body (`parse_stmt_arm`)
+# and the whole thing is a `Stmt.Match`, not an `Expr.Match`.
+const parse_stmt_match = (*Parser p): Stmt -> {
+	p.pos = p.pos + 1 # `match`
+	const Expr scrut = parse_expr(p)
+	if !is_lbrace(peek(p)) then die("cf0: parse: expected `{` after a match scrutinee\n")
+	p.pos = p.pos + 1
+	let [StmtArm] arms = []
+	loop {
+		if is_rbrace(peek(p)) then break
+		arms = [...arms, parse_stmt_arm(p)]
+		if !is_comma(peek(p)) then break
+		p.pos = p.pos + 1
+	}
+	if !is_rbrace(peek(p)) then die("cf0: parse: expected `}` to close a match\n")
+	p.pos = p.pos + 1
+	return Stmt.Match(scrut, arms)
+}
+
+# The general postfix chain on a non-name primary — a string literal, a parenthesised
+# expression, or a value already carrying a base (a field read like `p.toks`). Applies
+# any run of trailing `.field` accessors (chained as `FieldExpr`, e.g. `fn.params.len`)
+# and `[i]` index accessors (chained as `IndexExpr`, e.g. `p.toks[p.pos].kind`),
+# interleaved in source order, until neither a `.` nor a `[` follows. A bare-name
+# `name[i]` is handled by the wired `Index`/`IndexField` fast paths in `parse_primary`;
+# this loop is what lets an index ride on a field base (`p.toks[p.pos]`) or another
+# index (`ctx.unions[ui].members[mi]`). A base with no trailing accessor is returned
+# unchanged.
+const postfix_chain = (*Parser p, Expr base): Expr -> {
+	let Expr acc = base
+	loop {
+		let Bool advanced = false
+		if is_dot(peek(p)) then {
+			p.pos = p.pos + 1
+			if !is_ident(peek(p)) then die("cf0: parse: expected a field name after `.`\n")
+			const Str f = cur_name(p)
+			p.pos = p.pos + 1
+			acc = Expr.FieldExpr(acc, f)
+			advanced = true
+		}
+		if is_lbracket(peek(p)) then {
+			p.pos = p.pos + 1
+			const Expr idx = parse_expr(p)
+			if !is_rbracket(peek(p)) then die("cf0: parse: expected `]` in an index\n")
+			p.pos = p.pos + 1
+			acc = Expr.IndexExpr(acc, idx)
+			advanced = true
+		}
+		if !advanced then break
+	}
+	return acc
+}
+
+const parse_primary = (*Parser p): Expr -> {
+	if kw(p, "if") then return parse_if(p)
+	if kw(p, "match") then return parse_match(p)
+	# `defer f(x)` in VALUE position (a binding RHS / a return value): schedule `f(x)` at scope
+	# exit and evaluate to the tapped last argument x. A statement-position `defer` is intercepted
+	# by `parse_stmt` first, so this is only the value form; it needs a call with at least one arg
+	# (a no-arg call has nothing to tap; a block taps no value).
+	if kw(p, "defer") then {
+		p.pos = p.pos + 1
+		if is_lbrace(peek(p)) then die("cf0: parse: `defer { … }` is a statement, not a value\n")
+		if !is_ident(peek(p)) then die("cf0: parse: `defer` as a value needs a call `defer f(x)`\n")
+		const Str dn = cur_name(p)
+		p.pos = p.pos + 1
+		if !is_lparen(peek(p)) then die("cf0: parse: `defer` as a value needs a call `defer f(x)`\n")
+		const [Expr] dargs = parse_args(p)
+		if Iarch(dargs.len) == 0 then die("cf0: parse: `defer f()` as a value has no tapped argument\n")
+		return Expr.DeferTap(dn, dargs)
+	}
+	# `loop { … }` in expression position is a VALUE-yielding loop (`<- v` breaks with a value);
+	# in statement position `parse_stmt` reads it as an effect-only `Stmt.Loop`.
+	if kw(p, "loop") then {
+		p.pos = p.pos + 1
+		if !is_lbrace(peek(p)) then die("cf0: parse: expected `{` after `loop`\n")
+		p.pos = p.pos + 1
+		return Expr.Loop(parse_block(p))
+	}
+	if is_lbracket(peek(p)) then return parse_array_lit(p)
+	# `true`/`false` — Bool literals. Typed `Bool` by the typecheck phase; lowered to
+	# the 1/0 words a Bool is represented by at emit.
+	if kw(p, "true") then {
+		p.pos = p.pos + 1
+		return Expr.BoolLit(true)
+	}
+	if kw(p, "false") then {
+		p.pos = p.pos + 1
+		return Expr.BoolLit(false)
+	}
+	# an identifier — a call `name(args)` if followed by `(`, a field read `name.f` if
+	# followed by `.`, else a reference to a local binding / parameter.
+	if is_ident(peek(p)) then {
+		const Str name = cur_name(p)
+		p.pos = p.pos + 1
+		if is_lparen(peek(p)) then {
+			# `Type({ … })` — an explicit record construction (a PascalCase type name). A lowercase
+			# name with a `{ … }` argument is instead a grouped-parameter CALL (`sum({ a: 1 })`),
+			# handled by `parse_call`/`parse_args`; any other `(` is an ordinary call.
+			if is_lbrace(p.toks[p.pos + 1].kind) && is_pascal_name(name) then {
+				p.pos = p.pos + 1
+				const Expr rec = parse_record_lit(p, name)
+				if !is_rparen(peek(p)) then die("cf0: parse: expected `)` after a record construction\n")
+				p.pos = p.pos + 1
+				return rec
+			}
+			# a call result may be chained: `f(x).field`, `f(x).len`, `f(x)[i]`
+			return postfix_chain(p, parse_call(p, name))
+		}
+		if is_dot(peek(p)) then {
+			p.pos = p.pos + 1
+			if !is_ident(peek(p)) then die("cf0: parse: expected a field name after `.`\n")
+			const Str field = cur_name(p)
+			p.pos = p.pos + 1
+			# `Bool.True` / `Bool.False` — the explicit qualified form of the `true`/`false` literal
+			# sugar (§8.6: `Bool` is the union `{ False, True }`, which cf0 lowers to a 1-byte int).
+			# Both members are nullary, so this is a bare value; a stray `(…)` after is a parse error.
+			if str_eq(name, "Bool") then {
+				if str_eq(field, "True") then return Expr.BoolLit(true)
+				if str_eq(field, "False") then return Expr.BoolLit(false)
+				die("cf0: parse: `Bool` has only the members `True` and `False`\n")
+			}
+			# `Type.member(args)` is a payload-member construction; `base.field` (no
+			# args) is a field read or a tag-only-member construction.
+			if is_lparen(peek(p)) then return parse_union_mk(p, name, field)
+			return postfix_chain(p, Expr.Field(name, field))
+		}
+		# `Name[T].Member(args)` — a construction of a generic union INSTANCE (checked before the
+		# call/index forms; all three start with `[`)
+		if generic_ctor_ahead(p) then {
+			const Str tyapp = parse_type_app_tail(p, name)
+			if !is_dot(peek(p)) then die("cf0: parse: expected `.member` after a generic type\n")
+			p.pos = p.pos + 1
+			if !is_ident(peek(p)) then die("cf0: parse: expected a union member name\n")
+			const Str member = cur_name(p)
+			p.pos = p.pos + 1
+			if is_lparen(peek(p)) then return postfix_chain(p, parse_union_mk(p, tyapp, member))
+			const [Expr] noargs = []
+			return postfix_chain(p, Expr.UnionMk(tyapp, member, noargs))
+		}
+		# `name[T](args)` — a call to a generic function with explicit type arguments (must be
+		# checked before the index form, since both start with `[`)
+		if generic_call_ahead(p) then return postfix_chain(p, parse_generic_call(p, name))
+		# `name[i]` — a dynamic-array index, optionally followed by `.field` to read a
+		# field off a record element (`name[i].field`).
+		if is_lbracket(peek(p)) then {
+			p.pos = p.pos + 1
+			const Expr idx = parse_expr(p)
+			if !is_rbracket(peek(p)) then die("cf0: parse: expected `]` in an index\n")
+			p.pos = p.pos + 1
+			if is_dot(peek(p)) then {
+				p.pos = p.pos + 1
+				if !is_ident(peek(p)) then die("cf0: parse: expected a field name after `.`\n")
+				const Str ifield = cur_name(p)
+				p.pos = p.pos + 1
+				return postfix_chain(p, Expr.IndexField(name, idx, ifield))
+			}
+			# chain further indexing/field access off the element: `rs[i][j]`, `rs[i].len`
+			return postfix_chain(p, Expr.Index(name, idx))
+		}
+		return Expr.Var(name)
+	}
+	if is_intlit(peek(p)) then {
+		const Iarch v = p.toks[p.pos].ival
+		p.pos = p.pos + 1
+		return Expr.Lit(v)
+	}
+	if is_floatlit(peek(p)) then {
+		const Str t = float_text(p.src, p.toks[p.pos].start, p.toks[p.pos].len)
+		p.pos = p.pos + 1
+		return Expr.FloatLit(t)
+	}
+	# a string literal — split into literal/hole segments now (a plain string is one
+	# `StrLit`, an interpolated one an `Interp`); an optional `.len` rides as a postfix.
+	if is_strlit(peek(p)) then {
+		const Iarch start = p.toks[p.pos].start
+		const Iarch len = p.toks[p.pos].len
+		p.pos = p.pos + 1
+		return postfix_chain(p, parse_string(p.src, start, len))
+	}
+	if is_lparen(peek(p)) then {
+		p.pos = p.pos + 1
+		# `({ … })` — a parenthesized bare record literal (empty type_name), typed by its context
+		# (an enclosing return annotation, a `return` target, or an annotated binding). The parens
+		# distinguish a record literal from a block body in value position (`-> ({…})` vs `-> {…}`).
+		if is_lbrace(peek(p)) then {
+			const Expr rec = parse_record_lit(p, "")
+			if !is_rparen(peek(p)) then die("cf0: parse: expected `)` after a parenthesized record literal\n")
+			p.pos = p.pos + 1
+			return postfix_chain(p, rec)
+		}
+		# `()` — the unit value (type_system §6.1: the zero-tuple), a zero-information word.
+		if is_rparen(peek(p)) then {
+			p.pos = p.pos + 1
+			return Expr.Unit
+		}
+		# a comma-separated list of tuple elements, each `...src` (a spread of a tuple's
+		# positions) or a plain expression. `(e)` is grouping and `(e,)` a one-tuple — both
+		# collapse to `e`; a spread (even a lone `(...t)`) or ≥2 elements stays a tuple.
+		let [Expr] elems = []
+		loop {
+			if is_ellipsis(peek(p)) then {
+				p.pos = p.pos + 1
+				elems = [...elems, Expr.Spread(parse_expr(p))]
+			} else {
+				elems = [...elems, parse_expr(p)]
+			}
+			if !is_comma(peek(p)) then break
+			p.pos = p.pos + 1
+			if is_rparen(peek(p)) then break
+		}
+		if !is_rparen(peek(p)) then die("cf0: parse: expected `)` in a tuple\n")
+		p.pos = p.pos + 1
+		if Iarch(elems.len) == 1 then {
+			if !is_spread_p(elems[0]) then return postfix_chain(p, elems[0])
+		}
+		return Expr.Tuple(elems)
+	}
+	die("cf0: parse: expected an integer or `(`\n")
+	return Expr.Lit(0)
+}
+
+# --- statements & block bodies --------------------------------------------------------
+
+# `{ field: value, … }` — a data literal for a record of type `type_name`. Fields
+# may be given in any order (mapped to declaration order at typecheck); each is
+# `name: expr`, or a pun `name` (shorthand for `name: name`, binding the field to the
+# like-named local). A trailing comma is allowed.
+const parse_record_lit = (*Parser p, Str type_name): Expr -> {
+	p.pos = p.pos + 1 # `{`
+	let [FieldInit] inits = []
+	loop {
+		if is_rbrace(peek(p)) then break
+		# a VALUE spread `...src` — copy the source record's fields, then apply the overrides that
+		# follow (an immutable update). The source rides in a `$spread` FieldInit as a bare `Var`;
+		# typecheck enforces first-position, single, same-type, and no aliasing copy of a pointer field.
+		if is_ellipsis(peek(p)) then {
+			p.pos = p.pos + 1
+			if !is_ident(peek(p)) then die("cf0: parse: expected a record variable after `...` in a data literal\n")
+			const Str src = cur_name(p)
+			p.pos = p.pos + 1
+			inits = [...inits, FieldInit({ field: "$spread", value: Expr.Var(src) })]
+		} else {
+			if !is_ident(peek(p)) then die("cf0: parse: expected a field name in a data literal\n")
+			const Str field = cur_name(p)
+			p.pos = p.pos + 1
+			if is_colon(peek(p)) then {
+				p.pos = p.pos + 1
+				# a bare `{ … }` field value is an inline NESTED record literal, typed by the field's
+				# declared record type (`Record` with an empty type_name; typecheck/emit resolve it)
+				if is_lbrace(peek(p)) then {
+					inits = [...inits, FieldInit({ field: field, value: parse_record_lit(p, "") })]
+				} else {
+					inits = [...inits, FieldInit({ field: field, value: parse_expr(p) })]
+				}
+			} else {
+				inits = [...inits, FieldInit({ field: field, value: Expr.Var(field) })]
+			}
+		}
+		if !is_comma(peek(p)) then break
+		p.pos = p.pos + 1
+	}
+	if !is_rbrace(peek(p)) then die("cf0: parse: expected `}` in a data literal\n")
+	p.pos = p.pos + 1
+	return Expr.Record(type_name, inits)
+}
+
+# A `const`/`let` binding. An optional type annotation (`const Iarch x = …`, or
+# `const Point p = …`) is a `TYPE name` pair before the `=`. The type name is
+# ignored for a scalar, but names the record type for a data-literal initializer.
+# The initializer after `=`: a data literal `{ … }` (a record of type `type_name`,
+# which is `""` when there is no annotation — an error caught at typecheck) or an
+# ordinary expression.
+const parse_init = (*Parser p, Str type_name): Expr -> {
+	if is_lbrace(peek(p)) then return parse_record_lit(p, type_name)
+	return parse_expr(p)
+}
+
+# The element type name of a `[Elem]` type, or "" otherwise — pulls the annotation's
+# element type out of `parse_type`'s `Ty` for a dynamic-array `let`.
+const dyn_elem_of = (Ty t): Str -> match t {
+	Ty.TDyn(n) -> n,
+	_ -> ""
+}
+
+# Stamp an array literal's element type from a `let [Elem] x = …` annotation, so an
+# empty `[]` (which has no element to infer from) still carries its element layout.
+# Non-array initializers pass through unchanged.
+const set_arr_elem = (Expr e, Str elem): Expr -> match e {
+	Expr.ArrayLit(hs, sn, elems, et) -> Expr.ArrayLit(hs, sn, elems, elem),
+	_ -> e
+}
+
+# Whether a tuple element is a `...src` spread (which keeps a lone `(...t)` a tuple).
+const is_spread_p = (Expr e): Bool -> match e { Expr.Spread(x) -> true, _ -> false }
+
+# Whether an initializer is a plain (non-spread) array literal of exactly `n`
+# elements — the shape a `[N Elem]` fixed-array binding requires.
+const is_fixed_arraylit = (Expr e, Iarch n): Bool -> match e {
+	Expr.ArrayLit(hs, sn, elems, et) -> if hs then false else Iarch(elems.len) == n,
+	_ -> false
+}
+const is_arraylit_e = (Expr e): Bool -> match e { Expr.ArrayLit(hs, sn, elems, et) -> true, _ -> false }
+const is_call_e = (Expr e): Bool -> match e { Expr.Call(c, ta, args) -> true, _ -> false }
+
+# Validate a destructure pattern token: a bare name binds a position; a `_`-led token is a
+# skip — `_` (one) or `_<digits>` (n) — and anything else (`_foo`) is rejected.
+const check_pat_tok = (Str tok): Iarch -> {
+	if Iarch(tok.len) == 0 then die("cf0: parse: an empty destructure pattern token\n")
+	if Iarch(tok[0]) != 95 then return 0
+	let Iarch i = 1
+	loop {
+		if i >= Iarch(tok.len) then break
+		const Iarch d = Iarch(tok[i])
+		if d < 48 then die("cf0: parse: a skip token must be `_` or `_<digits>`\n")
+		if d > 57 then die("cf0: parse: a skip token must be `_` or `_<digits>`\n")
+		i = i + 1
+	}
+	return 0
+}
+
+# `const/let (a, _, c) = <tuple>` — a tuple destructure pattern (positional names + skips).
+# The comma-separated tokens (a trailing comma allowed) are collected raw; the type gate
+# maps each to a position and checks arity/skips/duplicates.
+const parse_destructure = (*Parser p, Bool mutable): Stmt -> {
+	p.pos = p.pos + 1 # `(`
+	let [Str] pat = []
+	loop {
+		if !is_ident(peek(p)) then die("cf0: parse: expected a pattern name or `_` in a destructure\n")
+		const Str tok = cur_name(p)
+		check_pat_tok(tok)
+		pat = [...pat, tok]
+		p.pos = p.pos + 1
+		if !is_comma(peek(p)) then break
+		p.pos = p.pos + 1
+		if is_rparen(peek(p)) then break
+	}
+	if !is_rparen(peek(p)) then die("cf0: parse: expected `)` in a destructure pattern\n")
+	p.pos = p.pos + 1
+	if !is_eq(peek(p)) then die("cf0: parse: expected `=` in a destructure\n")
+	p.pos = p.pos + 1
+	return Stmt.Destructure(pat, mutable, parse_expr(p))
+}
+
+const parse_let = (*Parser p, Bool mutable): Stmt -> {
+	# `(a, b) = <tuple>` — a destructure pattern (positional binds + `_` skips)
+	if is_lparen(peek(p)) then return parse_destructure(p, mutable)
+	# `[Elem] name` — a dynamic-array annotation. The element type is carried onto the
+	# initializer's array literal (an empty `[]` cannot infer it from elements).
+	# `[N Elem] name` — either a fixed-size array with an initializer (`const [4 Iarch] xs =
+	# [1,2,3,4]`) or, WITHOUT an `=`, an uninitialized N-byte read buffer (`let [65536 Uint8]
+	# buf`, bound as a byte pointer). The `=` disambiguates the two forms. A fixed array is
+	# represented as an ordinary dynamic array whose literal is length-checked here against N
+	# (a genesis narrowing: no distinct inline value type yet — a later growth reassignment is
+	# not rejected, and fixed-width elements / array params are follow-ups); index/`for`/`.len`
+	# reuse the dynamic-array machinery.
+	if is_lbracket(peek(p)) then {
+		if is_intlit(p.toks[p.pos + 1].kind) then {
+			p.pos = p.pos + 1 # `[`
+			const Iarch n = p.toks[p.pos].ival
+			p.pos = p.pos + 1 # N
+			const Str felem = parse_fixed_elem(p)
+			if !is_rbracket(peek(p)) then die("cf0: parse: expected `]` in a fixed-array type\n")
+			p.pos = p.pos + 1 # `]`
+			if !is_ident(peek(p)) then die("cf0: parse: expected a binding name\n")
+			const Str bname = cur_name(p)
+			p.pos = p.pos + 1
+			if is_eq(peek(p)) then {
+				p.pos = p.pos + 1 # `=`
+				const Expr init = set_arr_elem(parse_init(p, ""), felem)
+				# a LITERAL initializer is length-checked here (exactly N, no spread); an array-returning
+				# CALL defers its length check to typecheck (against the callee `ret_size`); anything else —
+				# a scalar `= 0`, a spread — is not a fixed-array initializer (190).
+				if is_arraylit_e(init) then { if !is_fixed_arraylit(init, n) then die("cf0: parse: a fixed-array initializer must be a plain array literal of exactly N elements (no spread)\n") }
+				else if !is_call_e(init) then die("cf0: parse: a fixed-array binding needs an array literal or an array-returning call\n")
+				# tag the binding `$fix<N>` so typecheck marks it FIXED and knows its length: it may not be
+				# a spread source or grown in place (typing is otherwise the shared dynamic-array machinery).
+				return Stmt.Let(bname, mutable, "$fix${n}", init)
+			}
+			# an UNINITIALIZED `[N Elem] buf` is a byte buffer (a read target): it needs a POSITIVE size
+			# and holds `Uint8` only — a `[0 Uint8]` (188) or a non-`Uint8` element (189) is rejected
+			if n <= 0 then die("cf0: parse: a byte buffer needs a positive comptime length\n")
+			if !str_eq(felem, "Uint8") then die("cf0: parse: an uninitialized byte buffer holds `Uint8` only\n")
+			return Stmt.Let(bname, mutable, "", Expr.Buffer(Expr.Lit(n)))
+		}
+		# `[n Elem] buf` — a buffer whose size is a comptime VALUE PARAMETER (two idents in the
+		# brackets, no initializer); the size folds to its literal at monomorphization
+		if is_ident(p.toks[p.pos + 1].kind) && p.pos + 2 < Iarch(p.toks.len) && is_ident(p.toks[p.pos + 2].kind) then {
+			p.pos = p.pos + 1 # `[`
+			const Str szname = cur_name(p)
+			p.pos = p.pos + 1 # size name
+			const Str felem2 = cur_name(p)
+			p.pos = p.pos + 1 # element type
+			if !is_rbracket(peek(p)) then die("cf0: parse: expected `]` in a value-parameter-sized buffer\n")
+			p.pos = p.pos + 1 # `]`
+			if !is_ident(peek(p)) then die("cf0: parse: expected a binding name\n")
+			const Str bufname = cur_name(p)
+			p.pos = p.pos + 1
+			return Stmt.Let(bufname, mutable, "", Expr.Buffer(Expr.Var(szname)))
+		}
+		const Str elem = dyn_elem_of(parse_type(p))
+		if !is_ident(peek(p)) then die("cf0: parse: expected a binding name\n")
+		const Str dname = cur_name(p)
+		p.pos = p.pos + 1
+		if !is_eq(peek(p)) then die("cf0: parse: expected `=` in a binding\n")
+		p.pos = p.pos + 1
+		return Stmt.Let(dname, mutable, "", set_arr_elem(parse_init(p, ""), elem))
+	}
+	# `const *Point p = &x` — an explicit pointer LOCAL. cf0's records/unions are already by-pointer,
+	# so `*Point` names a `Point` (§6.4); the binding must be `const` (repointing a `let` pointer is a
+	# later brick) and its initializer must be an address `&x` (a bare aggregate value is NOT an
+	# implicit pointer). §6.4's `*Scalar` ban is enforced by `parse_star_agg_name`.
+	if is_star(peek(p)) then {
+		if mutable then die("cf0: parse: a `*` pointer binding must be `const`\n")
+		const Str pointee = parse_star_agg_name(p)
+		if !is_ident(peek(p)) then die("cf0: parse: expected a binding name after a pointer type\n")
+		const Str pname = cur_name(p)
+		p.pos = p.pos + 1
+		if !is_eq(peek(p)) then die("cf0: parse: expected `=` in a binding\n")
+		p.pos = p.pos + 1
+		const Expr pinit = parse_init(p, pointee)
+		const Bool is_addr = match pinit { Expr.Addr(_) -> true, _ -> false }
+		if !is_addr then die("cf0: parse: a `*` pointer binding's initializer must be an address (`&x`)\n")
+		return Stmt.Let(pname, false, pointee, pinit)
+	}
+	if !is_ident(peek(p)) then die("cf0: parse: expected a binding name\n")
+	# `TYPE name` (an annotation) vs a bare `name`. A generic type-application annotation
+	# `Box[Iarch] b` is recognized by the `[` after the first name (in a binding, `Name[…]` is
+	# always a type, never an index); otherwise the first ident is the name unless a second
+	# ident follows, in which case the first was the type.
+	let Str type_name = ""
+	let Str name = ""
+	if is_lbracket(p.toks[p.pos + 1].kind) || is_dot(p.toks[p.pos + 1].kind) then {
+		# a `Box[Iarch]` generic-application annotation, or a member-type annotation `Color.Red` /
+		# `Maybe[Iarch].Just` (the `.` after the first name — §8.1, collapsed to its union by resolve)
+		type_name = parse_member_type(p)
+		if !is_ident(peek(p)) then die("cf0: parse: expected a binding name after a type\n")
+		name = cur_name(p)
+		p.pos = p.pos + 1
+	} else {
+		name = cur_name(p)
+		p.pos = p.pos + 1
+		if is_ident(peek(p)) then {
+			type_name = name
+			name = cur_name(p)
+			p.pos = p.pos + 1
+		}
+	}
+	if !is_eq(peek(p)) then die("cf0: parse: expected `=` in a binding\n")
+	p.pos = p.pos + 1
+	# `const name = (params) -> …` — a local closure (memory_model §7). A `let`-bound closure is
+	# rejected (no reassignable closures); a closure takes no type annotation.
+	if is_lparen(peek(p)) && lambda_ahead(p) then {
+		if mutable then die("cf0: parse: a closure must be bound with `const`\n")
+		return parse_closure(p, name)
+	}
+	return Stmt.Let(name, mutable, type_name, parse_init(p, type_name))
+}
+
+# `loop { body }` — an infinite loop (exit via `break`/`return`).
+const parse_loop = (*Parser p): Stmt -> {
+	p.pos = p.pos + 1 # `loop`
+	if !is_lbrace(peek(p)) then die("cf0: parse: expected `{` after `loop`\n")
+	p.pos = p.pos + 1
+	const [Stmt] body = parse_block(p)
+	return Stmt.Loop(body)
+}
+
+# A guard-branch body: a brace-delimited block `{ … }` (its own scope) or a single
+# statement (an early `return`, an assignment, a loop exit, a call-for-effect, or a nested
+# `if`). Both `then` and `else` take one of these.
+const parse_guard_body = (*Parser p): Stmt -> {
+	if is_lbrace(peek(p)) then {
+		p.pos = p.pos + 1
+		return Stmt.Block(parse_block(p))
+	}
+	return parse_stmt(p)
+}
+
+# A statement-position `if <cond> then <body> [else <body>]` — where a body is a block or a
+# single statement (see `parse_guard_body`). A nested `if` chains (`if a then … else if b
+# then …`). Without `else` it is a plain guard (`IfThen`).
+const parse_guard = (*Parser p): Stmt -> {
+	p.pos = p.pos + 1 # `if`
+	const Expr cond = parse_expr(p)
+	if !kw(p, "then") then die("cf0: parse: expected `then`\n")
+	p.pos = p.pos + 1
+	const Stmt body = parse_guard_body(p)
+	if kw(p, "else") then {
+		p.pos = p.pos + 1
+		const Stmt ebody = parse_guard_body(p)
+		return Stmt.IfElse(cond, body, ebody)
+	}
+	return Stmt.IfThen(cond, body)
+}
+
+# Whether a token kind is an operator that can head a compound assignment
+# (`+= -= *= /= %= &= |= ^= <<= >>=`) — the ten arithmetic/bitwise/shift operators.
+const is_compound_op = (TokKind k): Bool -> is_plus(k) || is_minus(k) || is_star(k) || is_slash(k) || is_percent(k) || is_amp(k) || is_pipe(k) || is_caret(k) || is_shl(k) || is_shr(k)
+
+# Build `lhs <op> rhs` for a compound-assignment operator token — the RHS of the
+# `name op= rhs` → `name = name op rhs` desugar. `k` is an `is_compound_op` kind.
+const compound_apply = (TokKind k, Expr lhs, Expr rhs): Expr -> {
+	if is_plus(k) then return Expr.Add(lhs, rhs)
+	if is_minus(k) then return Expr.Sub(lhs, rhs)
+	if is_star(k) then return Expr.Mul(lhs, rhs)
+	if is_slash(k) then return Expr.Div(lhs, rhs)
+	if is_percent(k) then return Expr.Mod(lhs, rhs)
+	if is_amp(k) then return Expr.BitAnd(lhs, rhs)
+	if is_pipe(k) then return Expr.BitOr(lhs, rhs)
+	if is_caret(k) then return Expr.BitXor(lhs, rhs)
+	if is_shl(k) then return Expr.Shl(lhs, rhs)
+	return Expr.Shr(lhs, rhs)
+}
+
+# `for <var> in <arr> { body }` — iterate a dynamic array's elements.
+const parse_for = (*Parser p): Stmt -> {
+	p.pos = p.pos + 1 # `for`
+	if !is_ident(peek(p)) then die("cf0: parse: expected a loop variable after `for`\n")
+	const Str lv = cur_name(p)
+	p.pos = p.pos + 1
+	if !kw(p, "in") then die("cf0: parse: expected `in` in a for-loop\n")
+	p.pos = p.pos + 1
+	if !is_ident(peek(p)) then die("cf0: parse: expected an array name after `in`\n")
+	const Str arr = cur_name(p)
+	p.pos = p.pos + 1
+	if !is_lbrace(peek(p)) then die("cf0: parse: expected `{` for a for-loop body\n")
+	p.pos = p.pos + 1
+	const [Stmt] body = parse_block(p)
+	return Stmt.ForIn(lv, arr, body)
+}
+
+# `defer f(args)` / `defer { … }` — schedule a call (result discarded) or a block to run at
+# scope exit (LIFO, after the return value is fixed). The call form's target must be a call:
+# a bare name or any non-call expression has nothing to schedule and is rejected here. The
+# top-level-only and no-`return`-inside restrictions are enforced by typecheck.
+const parse_defer = (*Parser p): Stmt -> {
+	p.pos = p.pos + 1 # `defer`
+	if is_lbrace(peek(p)) then {
+		p.pos = p.pos + 1
+		const [Stmt] body = parse_block(p)
+		return Stmt.Defer(body)
+	}
+	const Expr e = parse_expr(p)
+	const Bool isc = match e { Expr.Call(cn, ct, ca) -> true, _ -> false }
+	if !isc then die("cf0: parse: `defer` schedules a call `f(…)` or a block `{ … }`\n")
+	const [Stmt] one = [Stmt.Do(e)]
+	return Stmt.Defer(one)
+}
+
+const parse_stmt = (*Parser p): Stmt -> {
+	if kw(p, "const") then {
+		p.pos = p.pos + 1
+		return parse_let(p, false)
+	}
+	if kw(p, "let") then {
+		p.pos = p.pos + 1
+		return parse_let(p, true)
+	}
+	if kw(p, "for") then return parse_for(p)
+	if kw(p, "loop") then return parse_loop(p)
+	if kw(p, "if") then return parse_guard(p)
+	if kw(p, "match") then return parse_stmt_match(p)
+	if kw(p, "defer") then return parse_defer(p)
+	# `<- v` — yield `v` from the nearest value-yielding loop (break-with-value). Only valid
+	# inside a `loop` used as an expression; the typecheck phase enforces the context.
+	if is_yield(peek(p)) then {
+		p.pos = p.pos + 1
+		return Stmt.Yield(parse_expr(p))
+	}
+	if kw(p, "break") then {
+		p.pos = p.pos + 1
+		return Stmt.Break
+	}
+	if kw(p, "continue") then {
+		p.pos = p.pos + 1
+		return Stmt.Continue
+	}
+	if kw(p, "return") then {
+		p.pos = p.pos + 1
+		# a valueless `return` is sugar for `return ()` — the unit value (type_system §6.1);
+		# typecheck then requires a `Unit`-returning fn. cf0's grammar has no statement
+		# separator, so a bare `return` is only unambiguous before a boundary token that
+		# cannot begin an expression: `}` (end of block / braced guard body / last match arm)
+		# or `,` (a `,`-separated statement-match arm). Everywhere else `return` greedily
+		# takes the following expression — so a valueless guarded return must be braced
+		# (`if c then { return }`), never `if c then return <more…>` (that returns the value).
+		if is_rbrace(peek(p)) || is_comma(peek(p)) then return Stmt.Return(Expr.Unit)
+		return Stmt.Return(parse_expr(p))
+	}
+	# otherwise a call-for-effect statement (`name(args)`), a field mutation
+	# (`name.field = expr`), an element write (`name[i] = expr`), or a whole-name
+	# reassignment (`name = expr`, a `let` local).
+	if is_ident(peek(p)) then {
+		# `name(...)` / `name[T](...)` — a call (possibly generic) evaluated for its effect
+		if is_lparen(p.toks[p.pos + 1].kind) then {
+			return Stmt.Do(parse_expr(p))
+		}
+		if generic_call_stmt_ahead(p) then return Stmt.Do(parse_expr(p))
+		const Str name = cur_name(p)
+		p.pos = p.pos + 1
+		if is_dot(peek(p)) then {
+			# collect the dotted field chain `name.f0.f1…`; a single field is a plain `FieldAssign`,
+			# a chain (`a.b.c = v`) a `DeepFieldAssign` over the base pointer expr `a.b` + last field `c`.
+			let [Str] fchain = []
+			loop {
+				if !is_dot(peek(p)) then break
+				p.pos = p.pos + 1
+				if !is_ident(peek(p)) then die("cf0: parse: expected a field name after `.`\n")
+				fchain = [...fchain, cur_name(p)]
+				p.pos = p.pos + 1
+			}
+			# `= v` (plain) or a compound `op= v` — `p.f += y` desugars to `p.f = p.f op y`, reading the
+			# field target once as the left operand (a `Field` for a single field, a `FieldExpr` through
+			# the base pointer for a chain).
+			const Bool compound = is_compound_op(peek(p)) && is_eq(p.toks[p.pos + 1].kind)
+			const TokKind cop = peek(p)
+			if compound then {
+				p.pos = p.pos + 2
+			} else {
+				if !is_eq(peek(p)) then die("cf0: parse: expected `=` in a field assignment\n")
+				p.pos = p.pos + 1
+			}
+			const Expr rhs0 = parse_expr(p)
+			const Iarch nf = Iarch(fchain.len)
+			if nf == 1 then {
+				let Expr rhs = rhs0
+				if compound then rhs = compound_apply(cop, Expr.Field(name, fchain[0]), rhs0)
+				return Stmt.FieldAssign(name, fchain[0], rhs)
+			}
+			# build the base pointer expr `name.f0…f(n-2)`, leaving `f(n-1)` as the assign target
+			let Expr base = Expr.Field(name, fchain[0])
+			let Iarch k = 1
+			loop {
+				if k >= nf - 1 then break
+				base = Expr.FieldExpr(base, fchain[k])
+				k = k + 1
+			}
+			let Expr drhs = rhs0
+			if compound then drhs = compound_apply(cop, Expr.FieldExpr(base, fchain[nf - 1]), rhs0)
+			return Stmt.DeepFieldAssign(base, fchain[nf - 1], drhs)
+		}
+		# `name[i] = value` — a dynamic-array element write
+		if is_lbracket(peek(p)) then {
+			p.pos = p.pos + 1
+			const Expr idx = parse_expr(p)
+			if !is_rbracket(peek(p)) then die("cf0: parse: expected `]` in an element assignment\n")
+			p.pos = p.pos + 1
+			if !is_eq(peek(p)) then die("cf0: parse: expected `=` in an element assignment\n")
+			p.pos = p.pos + 1
+			return Stmt.IndexAssign(name, idx, parse_expr(p))
+		}
+		# `name op= expr` — a compound assignment desugars to `name = name op expr`
+		if is_compound_op(peek(p)) then {
+			const TokKind op = peek(p)
+			if !is_eq(p.toks[p.pos + 1].kind) then die("cf0: parse: expected `=` in a compound assignment\n")
+			p.pos = p.pos + 2 # operator + `=`
+			return Stmt.Assign(name, compound_apply(op, Expr.Var(name), parse_expr(p)))
+		}
+		if !is_eq(peek(p)) then die("cf0: parse: expected `=` in an assignment\n")
+		p.pos = p.pos + 1
+		return Stmt.Assign(name, parse_expr(p))
+	}
+	die("cf0: parse: expected a statement\n")
+	return Stmt.Return(Expr.Lit(0))
+}
+
+# Is there a raw newline in the source gap immediately before token `i` (between the previous
+# token's end and this token's start)? A comment's trailing newline counts; a newline INSIDE a
+# token's own span (a multi-line string literal) does not, since the gap is between tokens. The
+# statement sequencer uses this to enforce the ebnf rule that each statement sits on its own line.
+const nl_before = (*Parser p, Iarch i): Bool -> {
+	if i <= 0 then return true
+	const Iarch from = p.toks[i - 1].start + p.toks[i - 1].len
+	const Iarch to = p.toks[i].start
+	let Iarch k = from
+	loop {
+		if k >= to then break
+		if Iarch(p.src[k]) == 10 then return true
+		k = k + 1
+	}
+	return false
+}
+# The 1-based source line of byte offset `off` (newlines counted from the start) — for diagnostics.
+const line_of = (*Parser p, Iarch off): Iarch -> {
+	let Iarch ln = 1
+	let Iarch k = 0
+	loop {
+		if k >= off then break
+		if Iarch(p.src[k]) == 10 then ln = ln + 1
+		k = k + 1
+	}
+	return ln
+}
+
+# A brace-delimited statement block. Statements are NEWLINE-TERMINATED (ebnf §Conventions): two
+# statements may never share a line. Additionally, a MULTI-LINE block sets its braces on their own
+# lines — the opening `{` may not share its line with the first statement, nor the closing `}` with
+# the last. (A whole block that fits on ONE line — `{ <one stmt> }`, a short value block `{ <- v }` —
+# stays inline.) A statement's own expression may still span lines inside brackets / a `|>` chain;
+# the checks fire only at statement boundaries and the block's braces.
+const parse_block = (*Parser p): [Stmt] -> {
+	const Iarch open_line = line_of(p, p.toks[p.pos - 1].start)
+	const Iarch first_pos = p.pos
+	let [Stmt] stmts = []
+	loop {
+		if is_rbrace(peek(p)) then break
+		if Iarch(stmts.len) > 0 && !nl_before(p, p.pos) then die("cf0: parse: two statements share a line — each statement needs its own line\nAT ${p.file} OFFSET ${p.toks[p.pos].start} LINE ${line_of(p, p.toks[p.pos].start)}\n")
+		stmts = [...stmts, parse_stmt(p)]
+	}
+	const Iarch close_line = line_of(p, p.toks[p.pos].start)
+	if open_line != close_line && Iarch(stmts.len) > 0 then {
+		if !nl_before(p, first_pos) then die("cf0: parse: the opening `{` of a multi-line block shares its line with a statement — put the first statement on its own line\nAT ${p.file} OFFSET ${p.toks[first_pos].start} LINE ${line_of(p, p.toks[first_pos].start)}\n")
+		if !nl_before(p, p.pos) then die("cf0: parse: the closing `}` of a multi-line block shares its line with a statement — put it on its own line\nAT ${p.file} OFFSET ${p.toks[p.pos].start} LINE ${line_of(p, p.toks[p.pos].start)}\n")
+	}
+	p.pos = p.pos + 1 # `}`
+	return stmts
+}
+
+# --- parameters -----------------------------------------------------------------------
+
+# Byte-wise `Str` equality (duplicate-parameter detection).
+# A PascalCase name (leading A-Z) — a TYPE, so `Name({…})` is a record construction; a lowercase
+# name with a `{…}` argument is instead a grouped-parameter call.
+const is_pascal_name = (Str n): Bool -> {
+	if Iarch(n.len) == 0 then return false
+	const Iarch c = Iarch(n[0])
+	return c >= 65 && c <= 90
+}
+const str_eq = (Str a, Str b): Bool -> {
+	if a.len != b.len then return false
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(a.len) then break
+		if Iarch(a[i]) != Iarch(b[i]) then return false
+		i = i + 1
+	}
+	return true
+}
+
+# Is `name` already among the parameters parsed so far?
+const params_has = ([Param] params, Str name): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(params.len) then break
+		if str_eq(params[i].name, name) then return true
+		i = i + 1
+	}
+	return false
+}
+
+# Parse a type reference into the `Ty` the typecheck phase tracks: a pointer type
+# `*[Elem]` (`*[Str]`) or a dynamic-array type `[Elem]` → `TPtr`; a bare `Bool` →
+# `TBool`; any other type-name identifier (`Iarch`, `Int`, …) → `TInt`.
+# Parse a dynamic-array ELEMENT type into its name: a bare type name (`Str`, a record, …),
+# or a NESTED array `[Inner]` whose name is its spelling `"[Inner]"` (recursively). Used to
+# support `[[Str]]` and deeper nesting.
+const parse_elem_name = (*Parser p): Str -> {
+	if is_lbracket(peek(p)) then {
+		p.pos = p.pos + 1
+		const Str inner = parse_elem_name(p)
+		if !is_rbracket(peek(p)) then die("cf0: parse: expected `]` in a nested array type\n")
+		p.pos = p.pos + 1
+		return "[${inner}]"
+	}
+	if !is_ident(peek(p)) then die("cf0: parse: expected an element type name\n")
+	const Str n = cur_name(p)
+	p.pos = p.pos + 1
+	return n
+}
+
+# Parse one tuple position type into a `TupElem`: a NESTED `(A, B)` tuple (recursively) or a
+# bare type name leaf. `parse_tuple_telems` parses the comma-separated positions AFTER the
+# opening `(`, consuming the closing `)` — used by every `(A, B)` tuple type (value,
+# param, return, field, payload) so tuples nest to any depth.
+const parse_tel = (*Parser p): TupElem -> {
+	if is_lparen(peek(p)) then {
+		# a parenthesised position — a NESTED FUNCTION TYPE `(A, …) -> R` (if a `->` follows the `)`)
+		# or a NESTED TUPLE `(A, B, …)` (≥2 positions, no arrow). Parse the inner positions, then fork.
+		p.pos = p.pos + 1 # `(`
+		let [TupElem] inner = []
+		if !is_rparen(peek(p)) then {
+			loop {
+				inner = [...inner, parse_tel(p)]
+				if !is_comma(peek(p)) then break
+				p.pos = p.pos + 1
+			}
+		}
+		if !is_rparen(peek(p)) then die("cf0: parse: expected `)` in a parenthesised type\n")
+		p.pos = p.pos + 1
+		if is_arrow(peek(p)) then {
+			p.pos = p.pos + 1 # `->`
+			const TupElem ret = parse_tel(p)
+			return tel_fn([...inner, ret])
+		}
+		if Iarch(inner.len) < 2 then die("cf0: parse: a tuple type needs at least two elements\n")
+		return tel_nest(inner)
+	}
+	# a `[Elem]` dynamic-array position — a component of a tuple or a function-type signature. The
+	# element name rides in the leaf's `[Elem]` spelling (the nested-array convention `is_nested`).
+	if is_lbracket(peek(p)) then {
+		p.pos = p.pos + 1 # `[`
+		if !is_ident(peek(p)) then die("cf0: parse: expected an element type name in an array component\n")
+		const Str en = cur_name(p)
+		p.pos = p.pos + 1
+		if !is_rbracket(peek(p)) then die("cf0: parse: expected `]` in an array component\n")
+		p.pos = p.pos + 1
+		return tel_leaf("[${en}]")
+	}
+	if !is_ident(peek(p)) then die("cf0: parse: expected a tuple element type name\n")
+	const Str n = cur_name(p)
+	p.pos = p.pos + 1
+	return tel_leaf(n)
+}
+const parse_tuple_telems = (*Parser p): [TupElem] -> {
+	let [TupElem] tel = []
+	loop {
+		tel = [...tel, parse_tel(p)]
+		if !is_comma(peek(p)) then break
+		p.pos = p.pos + 1
+	}
+	if !is_rparen(peek(p)) then die("cf0: parse: expected `)` in a tuple type\n")
+	p.pos = p.pos + 1
+	if Iarch(tel.len) < 2 then die("cf0: parse: a tuple type needs at least two elements\n")
+	return tel
+}
+
+const parse_type = (*Parser p): Ty -> {
+	if is_star(peek(p)) then {
+		p.pos = p.pos + 1
+		if !is_lbracket(peek(p)) then die("cf0: parse: expected `[` in a pointer type\n")
+		p.pos = p.pos + 1
+		if !is_ident(peek(p)) then die("cf0: parse: expected an element type name\n")
+		p.pos = p.pos + 1
+		if !is_rbracket(peek(p)) then die("cf0: parse: expected `]`\n")
+		p.pos = p.pos + 1
+		return Ty.TPtr
+	}
+	if is_lbracket(peek(p)) then {
+		p.pos = p.pos + 1
+		const Str elem = parse_elem_name(p)
+		if !is_rbracket(peek(p)) then die("cf0: parse: expected `]`\n")
+		p.pos = p.pos + 1
+		return Ty.TDyn(elem)
+	}
+	if !is_ident(peek(p)) then die("cf0: parse: expected a type\n")
+	const Bool is_bool = kw(p, "Bool")
+	const Bool is_str = kw(p, "Str")
+	p.pos = p.pos + 1
+	if is_bool then return Ty.TBool
+	if is_str then return Ty.TStr
+	return Ty.TInt
+}
+
+# A builtin non-aggregate type name a `*T` pointer may not name (§6.4 — a pointee must be a
+# declared record or union). Covers the number widths and `Bool` (`*Iarch`/`*Bool` are `*Scalar`)
+# AND `Str`: a `Str` is a byte-vector, and cf0's typecheck rejects a `*Str` PARAMETER (the pointee
+# is neither record nor union), so `*Str` in a return/field is rejected here for parity (test 690).
+# The one allowed byte pointer is `*[Uint8]`, spelled with brackets — it never reaches this helper.
+# Mirrors typecheck's `is_cast_type` + `Bool` + `Str`.
+const is_ptr_scalar_kw = (Str n): Bool -> {
+	if str_eq(n, "Iarch") then return true
+	if str_eq(n, "Uarch") then return true
+	if str_eq(n, "Int") then return true
+	if str_eq(n, "Int8") then return true
+	if str_eq(n, "Int16") then return true
+	if str_eq(n, "Int32") then return true
+	if str_eq(n, "Int64") then return true
+	if str_eq(n, "Uint8") then return true
+	if str_eq(n, "Uint16") then return true
+	if str_eq(n, "Uint32") then return true
+	if str_eq(n, "Uint64") then return true
+	if str_eq(n, "Float32") then return true
+	if str_eq(n, "Float64") then return true
+	if str_eq(n, "Bool") then return true
+	if str_eq(n, "Str") then return true
+	return false
+}
+
+# Parse the explicit `*Rec` / `*Union` pointer spelling into its pointee NAME (the leading `*`
+# is the current token). cf0's records/unions are already by-pointer (arena aggregates, §8.4), so
+# `*Point` is representationally identical to a bare `Point` — the star is accepted and elided,
+# leaving the same `type_name`/`ftype`/`ret_name` the implicit form produces. §6.4's `*Scalar`
+# ban is enforced here. (A `*[Elem]` byte pointer is handled separately by its callers.)
+const parse_star_agg_name = (*Parser p): Str -> {
+	p.pos = p.pos + 1 # `*`
+	if !is_ident(peek(p)) then die("cf0: parse: expected a pointee type name after `*`\n")
+	const Str n = cur_name(p)
+	if is_ptr_scalar_kw(n) then die("cf0: parse: a pointer may not point to a scalar (only a record or union)\n")
+	p.pos = p.pos + 1
+	# a pointer to a generic INSTANCE — `*Ctx[Iarch]` — keeps the application as its pointee name
+	if is_lbracket(peek(p)) then return parse_type_app_tail(p, n)
+	return n
+}
+# The ELEMENT type of a fixed array `[N Elem]`: a plain type name, or a `*Record`/`*Union` pointer
+# element (the star elided — an aggregate element is already an arena pointer in cf0's model, 912).
+const parse_fixed_elem = (*Parser p): Str -> {
+	if is_star(peek(p)) then return parse_star_agg_name(p)
+	if !is_ident(peek(p)) then die("cf0: parse: expected a fixed-array element type\n")
+	const Str e = cur_name(p)
+	p.pos = p.pos + 1
+	return e
+}
+
+# A single parameter: `<type> <name>`. A pointer type (`*[Elem]`/`[Elem]`) becomes a
+# pointer parameter (no type name); a bare type-name identifier (`Iarch`, `Bool`, or
+# a record type) is kept in `type_name` for the typecheck phase to resolve.
+const parse_param = (*Parser p): Param -> {
+	if is_star(peek(p)) then {
+		p.pos = p.pos + 1 # `*`
+		# `*[Elem]` is a byte pointer (`$ptr`); `*Record` is a mutable record pointer whose
+		# fields are read and written through it (`type_name` names the record).
+		if is_lbracket(peek(p)) then {
+			p.pos = p.pos + 1 # `[`
+			if !is_ident(peek(p)) then die("cf0: parse: expected an element type name\n")
+			# the element name rides in `elem` so indexing strides by its width: a `*[Uint8]`
+			# byte pointer stays byte-packed, a `*[Iarch]` word pointer strides 8 (loadl/storel).
+			const Str pelem = cur_name(p)
+			p.pos = p.pos + 1 # elem
+			if !is_rbracket(peek(p)) then die("cf0: parse: expected `]`\n")
+			p.pos = p.pos + 1 # `]`
+			if !is_ident(peek(p)) then die("cf0: parse: expected a parameter name\n")
+			const Str bname = cur_name(p)
+			p.pos = p.pos + 1
+			return Param({ name: bname, is_ptr: true, type_name: "$ptr", elem: pelem, telems: [], size: 0 })
+		}
+		if !is_ident(peek(p)) then die("cf0: parse: expected a pointee type name\n")
+		let Str rec = cur_name(p)
+		p.pos = p.pos + 1
+		# a pointer to a generic INSTANCE — `*Ctx[Iarch]` — keeps the application as its pointee name
+		if is_lbracket(peek(p)) then rec = parse_type_app_tail(p, rec)
+		if !is_ident(peek(p)) then die("cf0: parse: expected a parameter name\n")
+		const Str name = cur_name(p)
+		p.pos = p.pos + 1
+		return Param({ name: name, is_ptr: true, type_name: rec, elem: "", telems: [], size: 0 })
+	}
+	if is_lbracket(peek(p)) then {
+		# a `[N Elem]` FIXED-array parameter (by value, read-only): a `$dyn` array at runtime, its
+		# comptime length `N` kept in `size` so the callee's `.len`/`for` and the call-site length/
+		# element checks (918/919) can use it. A bare `[Elem]` is a plain dynamic-array parameter.
+		if is_intlit(p.toks[p.pos + 1].kind) then {
+			p.pos = p.pos + 1 # `[`
+			const Iarch fn = p.toks[p.pos].ival
+			p.pos = p.pos + 1 # N
+			const Str felem = parse_fixed_elem(p)
+			if !is_rbracket(peek(p)) then die("cf0: parse: expected `]` in a fixed-array parameter type\n")
+			p.pos = p.pos + 1 # `]`
+			if !is_ident(peek(p)) then die("cf0: parse: expected a parameter name\n")
+			const Str fpname = cur_name(p)
+			p.pos = p.pos + 1
+			return Param({ name: fpname, is_ptr: false, type_name: "$dyn", elem: felem, telems: [], size: fn })
+		}
+		# a bare `[Elem]` is a dynamic-array parameter (a `*[Elem]` is an opaque pointer);
+		# its element type is kept in `elem` so the callee can index/read it.
+		const Str elem = dyn_elem_of(parse_type(p))
+		if !is_ident(peek(p)) then die("cf0: parse: expected a parameter name\n")
+		const Str name = cur_name(p)
+		p.pos = p.pos + 1
+		return Param({ name: name, is_ptr: false, type_name: "$dyn", elem: elem, telems: [], size: 0 })
+	}
+	# `() name` — the unit type spelled with empty parens (`()` and `Unit` name the same type,
+	# type_system §6.1). A following `->` instead means a nullary function type, so it is excluded.
+	if is_lparen(peek(p)) && is_rparen(p.toks[p.pos + 1].kind) && !is_arrow(p.toks[p.pos + 2].kind) then {
+		p.pos = p.pos + 2 # `()`
+		if !is_ident(peek(p)) then die("cf0: parse: expected a parameter name after `()`\n")
+		const Str uname = cur_name(p)
+		p.pos = p.pos + 1
+		return Param({ name: uname, is_ptr: false, type_name: "Unit", elem: "", telems: [], size: 0 })
+	}
+	# a parenthesised parameter type — either a `(A, B, …) name` tuple (≥2 positions, passed by
+	# pointer) OR a `(A, …) -> R name` function-value parameter (a HOF callee). The `->` after
+	# the `)` disambiguates: a function type stores its WHOLE signature in `telems` (the argument
+	# positions then the return position — the same `[args…, ret]` shape a nested `tel_fn` carries),
+	# and marks `type_name` "$fn"; a tuple keeps its ≥2-position telems.
+	if is_lparen(peek(p)) then {
+		p.pos = p.pos + 1 # `(`
+		let [TupElem] tel = []
+		loop {
+			tel = [...tel, parse_tel(p)]
+			if !is_comma(peek(p)) then break
+			p.pos = p.pos + 1
+		}
+		if !is_rparen(peek(p)) then die("cf0: parse: expected `)` in a parameter type\n")
+		p.pos = p.pos + 1
+		if is_arrow(peek(p)) then {
+			p.pos = p.pos + 1 # `->`
+			# the return position — a scalar, a record/union/Str name, an array `[T]`, or a nested
+			# tuple `(A, B)` (parsed by `parse_tel`). A function type deliberately CANNOT return a
+			# function: currying adds nothing over C!'s partial application (a lambda closing over the
+			# fixed arguments), which already covers incomplete argument provision.
+			const TupElem rett = parse_tel(p)
+			if tel_is_fn(rett) then die("cf0: parse: a function type cannot return a function; use partial application (a lambda over the fixed arguments)\n")
+			if !is_ident(peek(p)) then die("cf0: parse: expected a parameter name\n")
+			const Str fname = cur_name(p)
+			p.pos = p.pos + 1
+			return Param({ name: fname, is_ptr: false, type_name: "$fn", elem: "", telems: [...tel, rett], size: 0 })
+		}
+		if Iarch(tel.len) < 2 then die("cf0: parse: a tuple type needs at least two elements\n")
+		if !is_ident(peek(p)) then die("cf0: parse: expected a parameter name\n")
+		const Str tname = cur_name(p)
+		p.pos = p.pos + 1
+		return Param({ name: tname, is_ptr: false, type_name: "$tuple", elem: "", telems: tel, size: 0 })
+	}
+	if !is_ident(peek(p)) then die("cf0: parse: expected a parameter type\n")
+	# a scalar/aggregate parameter type — a name, a type variable, a generic type application, or a
+	# member-type annotation `Maybe[Iarch].Just` (§8.1, collapsed to its union by resolve)
+	const Str type_name = parse_member_type(p)
+	if !is_ident(peek(p)) then die("cf0: parse: expected a parameter name\n")
+	const Str name = cur_name(p)
+	p.pos = p.pos + 1
+	return Param({ name: name, is_ptr: false, type_name: type_name, elem: "", telems: [], size: 0 })
+}
+
+# Does a `(` at the current position open a LAMBDA parameter list (a closure `(params) ->
+# body`) rather than a parenthesised expression or a tuple? Scan to the matching `)` and check
+# whether a `->` (or a `: ret ->` return annotation) follows — the same one-token-past-`)`
+# lookahead the grammar (ebnf) uses to fork a function type from a tuple.
+const lambda_ahead = (*Parser p): Bool -> {
+	let Iarch i = p.pos
+	let Iarch depth = 0
+	loop {
+		if i >= Iarch(p.toks.len) then return false
+		const TokKind k = p.toks[i].kind
+		if is_lparen(k) then depth = depth + 1
+		if is_rparen(k) then {
+			depth = depth - 1
+			if depth == 0 then {
+				const Iarch j = i + 1
+				if j >= Iarch(p.toks.len) then return false
+				return is_arrow(p.toks[j].kind) || is_colon(p.toks[j].kind)
+			}
+		}
+		i = i + 1
+	}
+	return false
+}
+
+# Parse a closure body `const name = (params) [: ret] -> ( expr | { block } )` into a
+# `Stmt.Closure`; `(` is the current token. The body forks like a function's — a `{` opens a
+# statement block, else a single expression becomes the returned value.
+const parse_closure = (*Parser p, Str name): Stmt -> {
+	p.pos = p.pos + 1 # `(`
+	const [Param] params = parse_params(p)
+	if !is_rparen(peek(p)) then die("cf0: parse: expected `)` in a closure\n")
+	p.pos = p.pos + 1
+	const RetSig rs = parse_ret_name(p)
+	if !is_arrow(peek(p)) then die("cf0: parse: expected `->` in a closure\n")
+	p.pos = p.pos + 1
+	const [Stmt] nobody = []
+	if is_lbrace(peek(p)) then {
+		p.pos = p.pos + 1
+		const [Stmt] body = parse_block(p)
+		return Stmt.Closure(name, params, rs.name, body)
+	}
+	const [Stmt] one = [...nobody, Stmt.Return(parse_expr(p))]
+	return Stmt.Closure(name, params, rs.name, one)
+}
+
+# The parenthesised parameter list; a repeated name is rejected. Any arity is
+# accepted here — `main`'s ≤3 cap is a whole-program rule checked at resolve time.
+const parse_params = (*Parser p): [Param] -> {
+	let [Param] params = []
+	if is_rparen(peek(p)) then return params
+	loop {
+		const Param pm = parse_param(p)
+		if params_has(params, pm.name) then die("cf0: parse: duplicate parameter name\n")
+		params = [...params, pm]
+		if !is_comma(peek(p)) then break
+		p.pos = p.pos + 1
+	}
+	return params
+}
+
+# --- functions & the whole program ----------------------------------------------------
+
+# The optional `: RetType` return annotation as a raw type NAME: `""` when absent
+# (an implicit `Int`, e.g. `main`), else the bare type-name identifier (resolved to a
+# `Ty` at typecheck). Pointer/array return types are a later brick.
+
+const parse_ret_name = (*Parser p): RetSig -> {
+	if !is_colon(peek(p)) then return RetSig({ name: "", elem: "", telems: [], size: 0 })
+	p.pos = p.pos + 1
+	# a `[Elem]` return is a dynamic array (its element kept in `elem`); a bare
+	# identifier is a named type
+	if is_lbracket(peek(p)) then {
+		# `[N Elem]` — a fixed-size array return: represented as a `$dyn` array (an arena pointer with
+		# a length header, so emit is unchanged), the comptime length `N` kept in `size` for the length check.
+		if is_intlit(p.toks[p.pos + 1].kind) then {
+			p.pos = p.pos + 1 # `[`
+			const Iarch n = p.toks[p.pos].ival
+			p.pos = p.pos + 1 # N
+			const Str felem = parse_fixed_elem(p)
+			if !is_rbracket(peek(p)) then die("cf0: parse: expected `]` in a fixed-array return type\n")
+			p.pos = p.pos + 1 # `]`
+			return RetSig({ name: "$dyn", elem: felem, telems: [], size: n })
+		}
+		const Str elem = dyn_elem_of(parse_type(p))
+		return RetSig({ name: "$dyn", elem: elem, telems: [], size: 0 })
+	}
+	# a `(A, B, …)` tuple return type — at least two comma-separated element type names;
+	# `()` is the unit type (type_system §6.1: `()` and `Unit` name the same zero-tuple type).
+	if is_lparen(peek(p)) then {
+		p.pos = p.pos + 1 # `(`
+		if is_rparen(peek(p)) then {
+			p.pos = p.pos + 1
+			return RetSig({ name: "Unit", elem: "", telems: [], size: 0 })
+		}
+		const [TupElem] tel = parse_tuple_telems(p)
+		if Iarch(tel.len) < 2 then die("cf0: parse: a tuple return type needs at least two elements\n")
+		return RetSig({ name: "$tuple", elem: "", telems: tel, size: 0 })
+	}
+	# an explicit `*Point` pointer return — cf0's records/unions are already by-pointer, so it is
+	# the bare pointee name (the star elided; §6.4 `*Scalar` rejected in `parse_star_agg_name`)
+	if is_star(peek(p)) then return RetSig({ name: parse_star_agg_name(p), elem: "", telems: [], size: 0 })
+	if !is_ident(peek(p)) then die("cf0: parse: expected a return type name after `:`\n")
+	# a named return type — possibly a generic type application `Box['T]` or a member-type
+	# annotation `Maybe[Iarch].Just` (§8.1, collapsed to its union by resolve)
+	const Str n = parse_member_type(p)
+	return RetSig({ name: n, elem: "", telems: [], size: 0 })
+}
+
+# Split an `asm "…"` body string into segments — literal runs and `${param}` holes —
+# VERBATIM (no escape decoding; the assembler wants the raw bytes). A hole names a
+# parameter, resolved to its argument register at emit. Mirrors `parse_string`'s segment
+# loop but keeps every byte literal.
+const scan_asm_segs = (*[Uint8] src, Iarch start, Iarch len): [Seg] -> {
+	let [Seg] segs = []
+	let [Uint8] cur = []
+	let Iarch i = 0
+	loop {
+		if i >= len then break
+		const Iarch c = Iarch(src[start + i])
+		if c == 36 && i + 1 < len && Iarch(src[start + i + 1]) == 123 then {
+			# `${name}` — flush the literal run, then read the bare name up to `}`
+			segs = [...segs, Seg({ is_hole: false, lit: cur, name: "", expr: Expr.Lit(0) })]
+			cur = []
+			let Iarch j = i + 2
+			loop {
+				if j >= len then die("cf0: parse: an unterminated asm hole (missing `}`)\n")
+				if Iarch(src[start + j]) == 125 then break
+				j = j + 1
+			}
+			const Str nm = intern(src, start + i + 2, j - i - 2)
+			segs = [...segs, Seg({ is_hole: true, lit: cur, name: nm, expr: Expr.Lit(0) })]
+			cur = []
+			i = j + 1
+		} else {
+			cur = [...cur, src[start + i]]
+			i = i + 1
+		}
+	}
+	segs = [...segs, Seg({ is_hole: false, lit: cur, name: "", expr: Expr.Lit(0) })]
+	return segs
+}
+
+# One top-level function: `[pub] const NAME = (params)[: RetType] -> body`. The body
+# is a block `{ … }`, a bare expression (sugar for `{ return <expr> }`), or an `asm "…"`
+# naked assembly body. The return type is parsed and ignored (no typecheck yet; every
+# function returns a word).
+# A type-variable name — an apostrophe-led identifier (`'T`), the form a generic type parameter
+# and its uses take.
+const is_typar_name = (Str s): Bool -> if Iarch(s.len) == 0 then false else Iarch(s[0]) == 39
+# `['T, 'U]` — a generic type-parameter list (each a type variable). Consumes the brackets.
+# The parsed type parameters of a declaration — the bare variable NAMES (`["'A", "'B"]`) and the
+# per-parameter BOUNDS (`["Color", ""]`; the empty string for an unbounded parameter).
+data TyParams = { [Str] names, [Str] bounds }
+const parse_typarams = (*Parser p): TyParams -> {
+	p.pos = p.pos + 1 # `[`
+	let [Str] tps = []
+	let [Str] tbs = []
+	loop {
+		if !is_ident(peek(p)) then die("cf0: parse: expected a type variable in a `['T]` list\n")
+		# a non-`'T` ident preceding the name is either a BOUND on a type variable (`[Color 'T]`)
+		# or the TYPE of a comptime VALUE parameter (`[Iarch n]` — the name is a plain ident, not
+		# a `'T`); whether it is a bound or a value type is told apart later by the name's `'T`.
+		let Str bound = ""
+		if !is_typar_name(cur_name(p)) then {
+			bound = cur_name(p)
+			p.pos = p.pos + 1
+			if !is_ident(peek(p)) then die("cf0: parse: a bound or value-parameter type must be followed by a name\n")
+		}
+		tps = [...tps, cur_name(p)]
+		tbs = [...tbs, bound]
+		p.pos = p.pos + 1
+		if !is_comma(peek(p)) then break
+		p.pos = p.pos + 1
+	}
+	if !is_rbracket(peek(p)) then die("cf0: parse: expected `]` after type parameters\n")
+	p.pos = p.pos + 1
+	return TyParams({ names: tps, bounds: tbs })
+}
+# Whether a `[...]` at the current position opens a (possibly bounded) type-parameter list —
+# `['T…]` (a `'T` right after `[`) or `[Bound 'T…]` (a non-`'T` ident then a `'T`) — rather than
+# an array-literal value const (`const N = [1,2]`). A type-parameter list is ALSO recognized by
+# its trailing token — a function's type params are followed by `(` (the value params) and a
+# data/union's by `=`, whereas a value-const array literal is followed by neither — so a MALFORMED
+# bound `[Color](…)` / `[Color] =` is still routed here to get the precise "a bound must be
+# followed by a type variable" diagnostic (an array literal is never followed by `(`/`=`).
+const typarams_ahead = (*Parser p): Bool -> {
+	if !is_lbracket(peek(p)) then return false
+	if p.pos + 1 >= Iarch(p.toks.len) then return false
+	const Token t2 = p.toks[p.pos + 1]
+	if !is_ident(t2.kind) then return false
+	if Iarch(p.src[t2.start]) == 39 then return true
+	const Iarch after = after_brackets(p, p.pos)
+	if after >= 0 && after < Iarch(p.toks.len) then {
+		if is_lparen(p.toks[after].kind) then return true
+		if is_eq(p.toks[after].kind) then return true
+	}
+	if p.pos + 2 >= Iarch(p.toks.len) then return false
+	const Token t3 = p.toks[p.pos + 2]
+	if !is_ident(t3.kind) then return false
+	return Iarch(p.src[t3.start]) == 39
+}
+
+# Read a type REFERENCE in a type position: a bare name (`Iarch`, `Point`, `'T`) or a generic
+# type APPLICATION `Base[arg, …]` whose arguments are themselves type references (nested, e.g.
+# `Box[Pair[Iarch, Iarch]]`). A type application is returned as a canonical bracketed string
+# (no spaces) that the monomorphization pass substitutes and mangles to a concrete instance
+# name (`Maybe[Iarch]` → `Maybe$Iarch`); a bare name is returned as-is.
+# Read a generic application's `[arg, …]` (the `[` is current) after its already-consumed base
+# name, returning the canonical bracketed string `Base[arg,…]`.
+const parse_type_app_tail = (*Parser p, Str base): Str -> {
+	p.pos = p.pos + 1 # `[`
+	let Str s = "${base}["
+	let Bool first = true
+	loop {
+		if !first then s = "${s},"
+		first = false
+		s = "${s}${parse_type_ref(p)}"
+		if !is_comma(peek(p)) then break
+		p.pos = p.pos + 1
+	}
+	if !is_rbracket(peek(p)) then die("cf0: parse: expected `]` in a type application\n")
+	p.pos = p.pos + 1
+	return "${s}]"
+}
+const parse_type_ref = (*Parser p): Str -> {
+	if !is_ident(peek(p)) then die("cf0: parse: expected a type name\n")
+	const Str base = cur_name(p)
+	p.pos = p.pos + 1
+	if is_lbracket(peek(p)) then return parse_type_app_tail(p, base)
+	return base
+}
+
+# A type reference optionally suffixed by a `.Member` — a MEMBER-TYPE annotation (`Color.Red`,
+# `Maybe[Iarch].Just`, type_system §8.1: a union member is a first-class type, denoting its union).
+# The dotted form is preserved as `Base.Member` for the resolve pass to VALIDATE the member and
+# COLLAPSE it to the union `Base` (before monomorph). Used only where a member type is accepted: a
+# parameter, a return type, and a binding annotation (not fields/payloads/generic args — a `.` there
+# stays a parse error, a later brick). Match-arm `Type.Member` patterns are parsed elsewhere.
+const parse_member_type = (*Parser p): Str -> {
+	const Str base = parse_type_ref(p)
+	if is_dot(peek(p)) then {
+		p.pos = p.pos + 1 # `.`
+		if !is_ident(peek(p)) then die("cf0: parse: expected a member name after `.` in a type\n")
+		const Str member = cur_name(p)
+		p.pos = p.pos + 1
+		return "${base}.${member}"
+	}
+	return base
+}
+
+const parse_func = (*Parser p): Func -> {
+	let Bool is_pub = false
+	if kw(p, "pub") then {
+		is_pub = true
+		p.pos = p.pos + 1
+	}
+	if !kw(p, "const") then die("cf0: parse: expected `const`\n")
+	p.pos = p.pos + 1
+	if !is_ident(peek(p)) then die("cf0: parse: expected a function name\n")
+	const Str name = cur_name(p)
+	p.pos = p.pos + 1
+	if !is_eq(peek(p)) then die("cf0: parse: expected `=`\n")
+	p.pos = p.pos + 1
+	# `= ['T](…)` / `= [Color 'T](…)` — a generic function's (optionally bounded) type parameters
+	let [Str] typarams = []
+	let [Str] tbounds = []
+	if typarams_ahead(p) then {
+		const TyParams tpb = parse_typarams(p)
+		typarams = tpb.names
+		tbounds = tpb.bounds
+	}
+	const [Str] no_tp = []
+	# `[pub] const NAME = <expr>` with no `(` — a top-level VALUE const (module_system /
+	# ebnf § Modules), modeled as a nullary function returning the value; a bare reference
+	# to NAME auto-calls it (typecheck/emit). Its return type is inferred from a LITERAL value:
+	# a string (`Str`) or a Bool (`Bool`) keeps its type, anything else defaults to the `Int`
+	# word (`ret_name` "") — cf0's value consts are literals (flags, sizes, greetings).
+	if !is_lparen(peek(p)) then {
+		if Iarch(typarams.len) > 0 then die("cf0: parse: a top-level value const cannot be generic\n")
+		const [Param] noparams = []
+		const [Stmt] vempty = []
+		const Expr vexpr = parse_expr(p)
+		const Str vret = match vexpr {
+			Expr.StrLit(_) -> "Str",
+			Expr.BoolLit(_) -> "Bool",
+			_ -> ""
+		}
+		const [Stmt] vbody = [...vempty, Stmt.Return(vexpr)]
+		const [Seg] vnoasm = []
+		return Func({ name: name, is_pub: is_pub, ret_name: vret, ret_elem: "", params: noparams, body: vbody, is_asm: false, asm_body: vnoasm, is_value: true, ret_telems: [], typarams: no_tp, tbounds: no_tp, ret_size: 0 })
+	}
+	p.pos = p.pos + 1
+	const [Param] params = parse_params(p)
+	if !is_rparen(peek(p)) then die("cf0: parse: expected `)`\n")
+	p.pos = p.pos + 1
+	const RetSig rs = parse_ret_name(p)
+	if !is_arrow(peek(p)) then die("cf0: parse: expected `->`\n")
+	p.pos = p.pos + 1
+	const [Stmt] nobody = []
+	const [Seg] noasm = []
+	# `-> asm "…"` — a naked assembly-bodied function (ebnf § Assembly). The string's
+	# segments (literal runs + `${param}` holes) are emitted verbatim into the asm floor.
+	if kw(p, "asm") then {
+		p.pos = p.pos + 1
+		if !is_strlit(peek(p)) then die("cf0: parse: expected a string after `asm`\n")
+		const [Seg] segs = scan_asm_segs(p.src, p.toks[p.pos].start, p.toks[p.pos].len)
+		p.pos = p.pos + 1
+		return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: nobody, is_asm: true, asm_body: segs, is_value: false, ret_telems: rs.telems, typarams: typarams, tbounds: tbounds, ret_size: rs.size })
+	}
+	if is_lbrace(peek(p)) then {
+		p.pos = p.pos + 1
+		const [Stmt] body = parse_block(p)
+		return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: body, is_asm: false, asm_body: noasm, is_value: false, ret_telems: rs.telems, typarams: typarams, tbounds: tbounds, ret_size: rs.size })
+	}
+	const [Stmt] one = [...nobody, Stmt.Return(parse_expr(p))]
+	return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: one, is_asm: false, asm_body: noasm, is_value: false, ret_telems: rs.telems, typarams: typarams, tbounds: tbounds, ret_size: rs.size })
+}
+
+# `data Name = { Iarch a, Iarch b }` — a record declaration (Iarch fields only, at
+# least one; a trailing comma is allowed). The field types are consumed and ignored
+# (part 1 assumes every field is an `Iarch` word).
+const parse_data = (*Parser p): RecDecl -> {
+	if kw(p, "pub") then p.pos = p.pos + 1 # optional `pub` (visibility filtering is a later brick)
+	p.pos = p.pos + 1 # `data`
+	if !is_ident(peek(p)) then die("cf0: parse: expected a record type name\n")
+	const Str name = cur_name(p)
+	p.pos = p.pos + 1
+	# `data Pair['A, 'B] = …` / `data Tagged[Color 'T] = …` — a record's (bounded) type parameters
+	let [Str] typarams = []
+	let [Str] tbounds = []
+	if typarams_ahead(p) then {
+		const TyParams tpb = parse_typarams(p)
+		typarams = tpb.names
+		tbounds = tpb.bounds
+	}
+	if !is_eq(peek(p)) then die("cf0: parse: expected `=` in a data declaration\n")
+	p.pos = p.pos + 1
+	if !is_lbrace(peek(p)) then die("cf0: parse: expected `{` in a data declaration\n")
+	p.pos = p.pos + 1
+	return parse_record_body(p, name, typarams, tbounds)
+}
+
+# Parse a record/group FIELD BODY — the fields between `{` and `}` (the opening `{` already
+# consumed) — into a `RecDecl`. Shared by `data` records and grouped-parameter `type` declarations
+# (§7); each field is a scalar/aggregate/pointer/array/tuple type + a name, with `...Src` spreads.
+const parse_record_body = (*Parser p, Str name, [Str] typarams, [Str] tbounds): RecDecl -> {
+	let [Str] fields = []
+	let [Str] ftypes = []
+	let [Str] felems = []
+	let [[TupElem]] ftelems = []
+	let [Bool] fptrs = []
+	const [TupElem] no_tel = []
+	loop {
+		if is_rbrace(peek(p)) then break
+		# the field type: a `[Elem]` dynamic array (`ftype` = "$dyn", `felem` = Elem), a
+		# `(A, B)` tuple (`ftype` = "$tuple", `ftelem` = the element names), or a
+		# scalar/aggregate type name (`Iarch`/`Bool`/`Str`/a record/a union).
+		if is_ellipsis(peek(p)) then {
+			# `...Src` — a declaration spread: splice another record's fields in place. The
+			# source name rides in the field slot with the sentinel ftype "$spread"; the
+			# resolve pass expands it once every declaration is visible. A generic APPLICATION
+			# `...Box[Iarch]` cannot be spread (rejected here); a generic TEMPLATE `...Box` is
+			# rejected at resolve time (its arity is only known there).
+			p.pos = p.pos + 1 # `...`
+			if !is_ident(peek(p)) then die("cf0: parse: expected a record name after `...`\n")
+			const Str src = cur_name(p)
+			p.pos = p.pos + 1
+			if is_lbracket(peek(p)) then die("cf0: parse: cannot spread a generic type application in a declaration\n")
+			fields = [...fields, src]
+			ftypes = [...ftypes, "$spread"]
+			felems = [...felems, ""]
+			ftelems = [...ftelems, no_tel]
+			fptrs = [...fptrs, false]
+		} else if is_star(peek(p)) then {
+			# a pointer field: `*[Uint8]` is an opaque byte pointer (`$ptr`); `*Point` is an explicit
+			# record/union pointer, representationally identical to a bare `Point` field (both are
+			# 8-byte arena pointers), so it keeps the pointee name as its `ftype`.
+			let Str ft = "$ptr"
+			let Str fe = ""
+			if is_lbracket(p.toks[p.pos + 1].kind) then {
+				# `*[Elem]` raw pointer field — capture the element in `felem` so `field[i]` strides by
+				# its width (a `*[Uint8]` stays byte-packed, a `*[Iarch]` strides 8), like a `*[T]` param.
+				p.pos = p.pos + 1 # `*`
+				p.pos = p.pos + 1 # `[`
+				if !is_ident(peek(p)) then die("cf0: parse: expected an element type name\n")
+				fe = cur_name(p)
+				p.pos = p.pos + 1 # elem
+				if !is_rbracket(peek(p)) then die("cf0: parse: expected `]` in a pointer field type\n")
+				p.pos = p.pos + 1 # `]`
+			} else ft = parse_star_agg_name(p)
+			if !is_ident(peek(p)) then die("cf0: parse: expected a field name\n")
+			fields = [...fields, cur_name(p)]
+			ftypes = [...ftypes, ft]
+			felems = [...felems, fe]
+			ftelems = [...ftelems, no_tel]
+			# an aggregate pointer `*Record`/`*Union` is a reference (fptr); a `*[Elem]` byte pointer ($ptr) is not
+			fptrs = [...fptrs, !str_eq(ft, "$ptr")]
+			p.pos = p.pos + 1
+		} else if is_lbracket(peek(p)) then {
+			const Str felem = dyn_elem_of(parse_type(p))
+			if !is_ident(peek(p)) then die("cf0: parse: expected a field name\n")
+			fields = [...fields, cur_name(p)]
+			ftypes = [...ftypes, "$dyn"]
+			felems = [...felems, felem]
+			ftelems = [...ftelems, no_tel]
+			fptrs = [...fptrs, false]
+			p.pos = p.pos + 1
+		} else if is_lparen(peek(p)) then {
+			# a `(A, B, …) name` tuple field — at least two comma-separated element type names
+			p.pos = p.pos + 1 # `(`
+			const [TupElem] tel = parse_tuple_telems(p)
+			if !is_ident(peek(p)) then die("cf0: parse: expected a field name\n")
+			fields = [...fields, cur_name(p)]
+			ftypes = [...ftypes, "$tuple"]
+			felems = [...felems, ""]
+			ftelems = [...ftelems, tel]
+			fptrs = [...fptrs, false]
+			p.pos = p.pos + 1
+		} else {
+			# a scalar/aggregate field type — a name, a type variable `'T`, or a generic type
+			# application `Box[Iarch]` (kept as a bracketed string for the monomorph pass)
+			const Str ftype = parse_type_ref(p)
+			if !is_ident(peek(p)) then die("cf0: parse: expected a field name\n")
+			fields = [...fields, cur_name(p)]
+			ftypes = [...ftypes, ftype]
+			felems = [...felems, ""]
+			ftelems = [...ftelems, no_tel]
+			fptrs = [...fptrs, false]
+			p.pos = p.pos + 1
+		}
+		if !is_comma(peek(p)) then break
+		p.pos = p.pos + 1
+	}
+	if !is_rbrace(peek(p)) then die("cf0: parse: expected `}` in a data declaration\n")
+	p.pos = p.pos + 1
+	return RecDecl({ name: name, fields: fields, ftypes: ftypes, felems: felems, ftelems: ftelems, fptrs: fptrs, typarams: typarams, tbounds: tbounds })
+}
+
+# A grouped-parameter `type X = { … }` declaration (§7) — a record-shaped parameter bundle. Parsed
+# like a `data` record (into a `RecDecl`), but resolve SPLATS it: a `(X g)` parameter becomes the
+# group's fields, and a `{ … }` call argument expands to positional values. An empty group is
+# rejected here (623); a duplicate field is caught by the shared body parser (like a record).
+# NOTE: `type X = <type-expr>` ALIASES are erased before parse (typealias.cf); only `type X = { … }`
+# groups reach the parser.
+const parse_group = (*Parser p): RecDecl -> {
+	# a group is never `pub` — a `pub type …` is already rejected earlier (typealias.cf)
+	p.pos = p.pos + 1 # `type`
+	if !is_ident(peek(p)) then die("cf0: parse: expected a group type name after `type`\n")
+	const Str name = cur_name(p)
+	p.pos = p.pos + 1
+	let [Str] typarams = []
+	let [Str] tbounds = []
+	if typarams_ahead(p) then {
+		const TyParams tpb = parse_typarams(p)
+		typarams = tpb.names
+		tbounds = tpb.bounds
+	}
+	if !is_eq(peek(p)) then die("cf0: parse: expected `=` in a group `type` declaration\n")
+	p.pos = p.pos + 1
+	if !is_lbrace(peek(p)) then die("cf0: parse: expected `{` in a group `type` declaration\n")
+	p.pos = p.pos + 1
+	const RecDecl g = parse_record_body(p, name, typarams, tbounds)
+	if Iarch(g.fields.len) == 0 then die("cf0: parse: a grouped-parameter `type` must declare at least one field\n")
+	# reject a duplicate field name AND a `...` declaration spread (a group is never used as a record,
+	# so neither typecheck-of-use nor the record-spread expansion — which handle these for `data` — runs)
+	let Iarch di = 0
+	loop {
+		if di >= Iarch(g.fields.len) then break
+		if str_eq(g.ftypes[di], "$spread") then die("cf0: parse: a grouped-parameter `type` cannot use a `...` spread\n")
+		let Iarch dj = 0
+		loop {
+			if dj >= di then break
+			if str_eq(g.fields[dj], g.fields[di]) then die("cf0: parse: a duplicate field in a grouped-parameter `type`\n")
+			dj = dj + 1
+		}
+		di = di + 1
+	}
+	return g
+}
+
+# `union Name = { A, B, C }` — a tag-only union declaration (at least one member; a
+# trailing comma and interior newlines are fine). Payload members are a later brick.
+const parse_union = (*Parser p): UnionDecl -> {
+	if kw(p, "pub") then p.pos = p.pos + 1 # optional `pub` (visibility filtering is a later brick)
+	p.pos = p.pos + 1 # `union`
+	if !is_ident(peek(p)) then die("cf0: parse: expected a union type name\n")
+	const Str name = cur_name(p)
+	p.pos = p.pos + 1
+	# `union Maybe['V] = …` / `union Wrapper[Color 'T] = …` — a union's (bounded) type parameters
+	let [Str] typarams = []
+	let [Str] tbounds = []
+	if typarams_ahead(p) then {
+		const TyParams tpb = parse_typarams(p)
+		typarams = tpb.names
+		tbounds = tpb.bounds
+	}
+	if !is_eq(peek(p)) then die("cf0: parse: expected `=` in a union declaration\n")
+	p.pos = p.pos + 1
+	if !is_lbrace(peek(p)) then die("cf0: parse: expected `{` in a union declaration\n")
+	p.pos = p.pos + 1
+	let [UnionMember] members = []
+	loop {
+		if is_rbrace(peek(p)) then break
+		if is_ellipsis(peek(p)) then {
+			# `...Src` — a member spread: splice another union's members in place. The source
+			# name rides in the member `name` slot with the sentinel payload `["$spread"]`; the
+			# resolve pass expands it. A generic application `...Box[Iarch]` is rejected here; a
+			# generic template `...Box` at resolve time.
+			p.pos = p.pos + 1 # `...`
+			if !is_ident(peek(p)) then die("cf0: parse: expected a union name after `...`\n")
+			const Str usrc = cur_name(p)
+			p.pos = p.pos + 1
+			if is_lbracket(peek(p)) then die("cf0: parse: cannot spread a generic type application in a declaration\n")
+			const [Str] sp_mark = ["$spread"]
+			const [Str] sp_pe = []
+			const [[TupElem]] sp_pt = []
+			members = [...members, UnionMember({ name: usrc, payloads: sp_mark, pelems: sp_pe, ptelems: sp_pt })]
+			if !is_comma(peek(p)) then break
+			p.pos = p.pos + 1
+			continue
+		}
+		if !is_ident(peek(p)) then die("cf0: parse: expected a member name\n")
+		const Str mname = cur_name(p)
+		p.pos = p.pos + 1
+		# an optional payload `(T, T, …)` — positional payload types (any type: a word,
+		# `Str`, a `[Elem]` dynamic array, a record, or a recursive union), with parallel
+		# `[T]` element names in `pelems`.
+		let [Str] payloads = []
+		let [Str] pelems = []
+		let [[TupElem]] ptelems = []
+		const [TupElem] no_ptel = []
+		if is_lparen(peek(p)) then {
+			p.pos = p.pos + 1
+			loop {
+				if is_star(peek(p)) then {
+					# a pointer payload: `*Rec`/`*Union` — including a recursive `*List` self-link and a
+					# generic `*List['T]` — is representationally identical to the bare aggregate (cf0's
+					# records/unions are already 8-byte arena pointers, §8.4), so the star is elided and
+					# the pointee name (possibly a generic application) kept via `parse_type_ref`. A
+					# builtin-scalar pointee is rejected here; a pointee that is a tag-only union (also a
+					# `*Scalar` per §8.4) is NOT caught in payload position — the union table isn't visible
+					# at parse time and payloads aren't re-gated post-monomorph, so it is elided to the bare
+					# tag word (runtime-harmless). A `*[Uint8]` byte-pointer payload is a later brick (emit's
+					# `payload_is_ptr` has no `$ptr` payload case yet).
+					if is_lbracket(p.toks[p.pos + 1].kind) then die("cf0: parse: a `*[…]` byte-pointer payload is not yet supported\n")
+					p.pos = p.pos + 1 # `*`
+					if !is_ident(peek(p)) then die("cf0: parse: expected a pointee type name after `*`\n")
+					if is_ptr_scalar_kw(cur_name(p)) then die("cf0: parse: a pointer may not point to a scalar (only a record or union)\n")
+					payloads = [...payloads, parse_type_ref(p)]
+					pelems = [...pelems, ""]
+					ptelems = [...ptelems, no_ptel]
+				} else if is_lbracket(peek(p)) then {
+					const Str pelem = dyn_elem_of(parse_type(p))
+					payloads = [...payloads, "$dyn"]
+					pelems = [...pelems, pelem]
+					ptelems = [...ptelems, no_ptel]
+				} else if is_lparen(peek(p)) then {
+					# a `(A, B)` TUPLE payload — at least two element type names
+					p.pos = p.pos + 1 # `(`
+					const [TupElem] tel = parse_tuple_telems(p)
+					payloads = [...payloads, "$tuple"]
+					pelems = [...pelems, ""]
+					ptelems = [...ptelems, tel]
+				} else {
+					# a scalar/aggregate payload type — a name, a type variable `'T`, or a generic
+					# type application `List['T]` (kept as a bracketed string for the monomorph pass)
+					payloads = [...payloads, parse_type_ref(p)]
+					pelems = [...pelems, ""]
+					ptelems = [...ptelems, no_ptel]
+				}
+				if !is_comma(peek(p)) then break
+				p.pos = p.pos + 1
+			}
+			if !is_rparen(peek(p)) then die("cf0: parse: expected `)` after a payload\n")
+			p.pos = p.pos + 1
+		}
+		members = [...members, UnionMember({ name: mname, payloads: payloads, pelems: pelems, ptelems: ptelems })]
+		if !is_comma(peek(p)) then break
+		p.pos = p.pos + 1
+	}
+	if !is_rbrace(peek(p)) then die("cf0: parse: expected `}` in a union declaration\n")
+	p.pos = p.pos + 1
+	return UnionDecl({ name: name, members: members, typarams: typarams, tbounds: tbounds })
+}
+
+# A top-level import `import "path" as { a, b, … }` (module_system §4). The path is a
+# string literal; the members are a brace-enclosed, comma-separated list of names (value
+# or type). Brick 1 accepts the destructured form only — a namespace alias (`as ns`) is
+# rejected. The path's raw content is interned (module paths carry no escapes).
+const parse_import = (*Parser p): Import -> {
+	p.pos = p.pos + 1 # `import`
+	if !is_strlit(peek(p)) then die("cf0: parse: expected a module path string after `import`\n")
+	const Str path = cur_name(p)
+	p.pos = p.pos + 1
+	if !kw(p, "as") then die("cf0: parse: expected `as` after the import path\n")
+	p.pos = p.pos + 1
+	if !is_lbrace(peek(p)) then die("cf0: parse: cf0 imports only the destructured form `import \"m\" as { names }`\n")
+	p.pos = p.pos + 1
+	let [Str] names = []
+	loop {
+		if is_rbrace(peek(p)) then break
+		if !is_ident(peek(p)) then die("cf0: parse: expected an imported member name\n")
+		names = [...names, cur_name(p)]
+		p.pos = p.pos + 1
+		if is_comma(peek(p)) then p.pos = p.pos + 1
+	}
+	p.pos = p.pos + 1 # `}`
+	return Import({ path: path, names: names })
+}
+
+# Does the current top-level item start a `word` declaration — bare (`data …`) or
+# `pub`-prefixed (`pub data …`)? Routes `parse_program` past an optional `pub` so a
+# `pub data`/`pub union` reaches the right parser (each consumes the `pub` itself).
+const heads = (*Parser p, Str word): Bool -> {
+	if kw(p, word) then return true
+	if !kw(p, "pub") then return false
+	const Iarch k = p.pos + 1
+	return slice_eq(p.src, p.toks[k].start, p.toks[k].len, word)
+}
+
+# The whole program: a sequence of top-level imports, `data`/`union` declarations, and
+# functions (each optionally `pub`), in any order. One function must be `pub const main`
+# (checked later). Imports are resolved and flattened away before typecheck (module_system §8).
+pub const parse_program = (*Parser p): Program -> {
+	let [Import] imports = []
+	let [RecDecl] recs = []
+	let [UnionDecl] unions = []
+	let [Func] funcs = []
+	let [RecDecl] groups = []
+	loop {
+		if is_eof(peek(p)) then break
+		if kw(p, "import") then {
+			imports = [...imports, parse_import(p)]
+		} else if heads(p, "data") then {
+			recs = [...recs, parse_data(p)]
+		} else if heads(p, "union") then {
+			unions = [...unions, parse_union(p)]
+		} else if heads(p, "type") then {
+			# only grouped-parameter `type X = { … }` decls reach here — `type` ALIASES are erased
+			# before parse (typealias.cf token pass)
+			groups = [...groups, parse_group(p)]
+		} else {
+			funcs = [...funcs, parse_func(p)]
+		}
+	}
+	return Program({ imports: imports, recs: recs, unions: unions, funcs: funcs, groups: groups })
+}
