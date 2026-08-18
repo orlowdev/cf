@@ -6,10 +6,10 @@ tiny hand-written assembly floor to avoid libc where it is possible.
 Programs are freestanding: a C! binary talks to the OS directly through
 syscalls.
 
-> **Status.** C! is at the bootstrapping stage. cf0 is self-hosting and passes
-> its corpus, but the language is still a reduced subset (`cf0`) and the target
-> is currently **arm64 macOS** only. The language specs live in
-> [`root/specs/`](root/specs/).
+> **Status.** C! is at the bootstrapping stage. The compiler, `cf`, is
+> self-hosting and passes its corpus, but it still accepts only a reduced subset
+> of the full language, and the target is currently **arm64 macOS** only. The
+> language specs live in [`root/specs/`](root/specs/).
 
 ## Why C!
 
@@ -127,7 +127,7 @@ pub const main = () -> {
 ```
 
 ```sh
-sh boot/driver.sh hello.cf hello   # cf0 -> qbe -> cc  ->  ./hello
+sh boot/driver.sh hello.cf hello   # cf -> qbe -> cc  ->  ./hello
 ./hello                            # Hello, world!
 ```
 
@@ -137,9 +137,9 @@ C! takes reproducibility and provenance seriously. The trust chain has exactly
 two external dependencies, and both are pinned or reproducible.
 
 **The seed is public** The permanent root of the build is
-[`boot/seed/`](boot/seed/): `cf0.qbe` (the QBE IL of the compiler) and `floor.s`
-(its assembly floor). This is cf0 compiling its own source. It is a
-**self-reproducing fixpoint** — a cf0 built from the seed recompiles the source
+[`boot/seed/`](boot/seed/): `cf.qbe` (the QBE IL of the compiler) and `floor.s`
+(its assembly floor). This is cf compiling its own source. It is a
+**self-reproducing fixpoint** — a cf built from the seed recompiles the source
 to a byte-identical seed. That fixpoint has been checked with
 [Diverse Double-Compilation](https://dwheeler.com/trusting-trust/) across two
 independent C compilers (clang and gcc).
@@ -158,32 +158,32 @@ fixpoint) → **pinned QBE** → **system `cc`**. Nothing else is trusted.
 
 ```sh
 sh boot/fetch-qbe.sh     # 1. fetch + build the pinned QBE backend into opt/qbe
-sh boot/build.sh         # 2. build cf0 from the committed seed  ->  var/cf0
+sh boot/build.sh         # 2. build cf from the committed seed  ->  var/cf
 sh boot/test.sh          # 3. run the corpus regression suite
 ```
 
 `boot/build.sh` never needs a C! compiler you don't already have: it assembles
-the committed seed (`boot/seed/cf0.qbe` + `floor.s`) straight through
+the committed seed (`boot/seed/cf.qbe` + `floor.s`) straight through
 `qbe → cc`. The compiler's own source is the C! modules in
-[`boot/src/`](boot/src/) (`cf0.cf` and its imports).
+[`boot/src/`](boot/src/) (`cf.cf` and its imports).
 
 ### Changing the compiler
 
-Because cf0 is built from the seed, editing its source leaves the seed stale.
+Because cf is built from the seed, editing its source leaves the seed stale.
 After changing anything in `boot/src/*.cf`, regenerate and re-verify the seed:
 
 ```sh
 sh boot/reseed.sh
 ```
 
-`reseed.sh` builds cf0 from the _old_ seed, has it recompile the _new_ source,
-then confirms the result is a true fixpoint (a cf0 built from the new seed
+`reseed.sh` builds cf from the _old_ seed, has it recompile the _new_ source,
+then confirms the result is a true fixpoint (a cf built from the new seed
 reproduces it exactly). Only then is the committed seed replaced; a
 non-fixpoint aborts without touching it. Commit the regenerated seed alongside
 the source change.
 
-> One bootstrap constraint: the old cf0 must already accept the new source. A
-> change to the language subset cf0 itself uses needs a transitional two-step
+> One bootstrap constraint: the old cf must already accept the new source. A
+> change to the language subset cf itself uses needs a transitional two-step
 > reseed.
 
 ## Repository layout
@@ -191,13 +191,13 @@ the source change.
 ```
 boot/            build system + compiler (the trust root)
   fetch-qbe.sh   fetch/verify/build the pinned QBE backend
-  build.sh       build cf0 from the committed seed
-  driver.sh      compile+assemble+link one program (cf0 -> qbe -> cc)
+  build.sh       build cf from the committed seed
+  driver.sh      compile+assemble+link one program (cf -> qbe -> cc)
   reseed.sh      regenerate + fixpoint-verify the seed after a source edit
   test.sh        corpus regression suite
-  seed/          cf0.qbe + floor.s — the DDC-verified self-hosting seed
+  seed/          cf.qbe + floor.s — the DDC-verified self-hosting seed
   src/           the compiler, written in C!
-  tests/         corpus/ (the test programs) + manifest (the cf0 subset)
+  tests/         corpus/ (the test programs) + manifest (the cf subset)
 root/specs/      the language specification
 opt/             vendored QBE (fetched, gitignored)
 var/             build outputs (gitignored)
