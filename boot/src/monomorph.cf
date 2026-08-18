@@ -519,6 +519,61 @@ const find_union_template = ([UnionDecl] unions, Str n): Iarch -> {
 	}
 	return 0 - 1
 }
+# Is a declared type NAME a well-formed generic application (or not an application at all)? A
+# `Base[args]` must name a generic record/union TEMPLATE; the empty-base `[Elem]` is the array
+# encoding, not an application. Applying `[…]` to a non-generic (or undeclared) type is an error
+# (247) — and is otherwise missed for a declaration that is never instantiated (a non-generic
+# program never runs `mangle_concrete_sigs`).
+const type_app_ok = (*MonoCtx m, Str name): Bool -> {
+	if !is_type_app(name) then return true
+	const Str base = type_base(name)
+	if str_eq(base, "") then return true
+	return find_rec_template(m.rec_templates, base) >= 0 || find_union_template(m.union_templates, base) >= 0
+}
+const check_names_type_apps = (*MonoCtx m, [Str] names): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(names.len) then break
+		if !type_app_ok(m, names[i]) then die("cf0: type: a generic type application names a non-generic or undeclared type\n")
+		i = i + 1
+	}
+	return 0
+}
+# Validate every generic type-application named in a CONCRETE declaration — record fields, union
+# member payloads, and function parameter/return types — so an unused bogus application (247) is
+# still rejected.
+const check_concrete_type_apps = (*MonoCtx m): Iarch -> {
+	let Iarch r = 0
+	loop {
+		if r >= Iarch(m.crecs.len) then break
+		check_names_type_apps(m, m.crecs[r].ftypes)
+		r = r + 1
+	}
+	let Iarch u = 0
+	loop {
+		if u >= Iarch(m.cunions.len) then break
+		let Iarch mi = 0
+		loop {
+			if mi >= Iarch(m.cunions[u].members.len) then break
+			check_names_type_apps(m, m.cunions[u].members[mi].payloads)
+			mi = mi + 1
+		}
+		u = u + 1
+	}
+	let Iarch f = 0
+	loop {
+		if f >= Iarch(m.cfuncs.len) then break
+		let Iarch pi = 0
+		loop {
+			if pi >= Iarch(m.cfuncs[f].params.len) then break
+			if !type_app_ok(m, m.cfuncs[f].params[pi].type_name) then die("cf0: type: a generic type application names a non-generic or undeclared type\n")
+			pi = pi + 1
+		}
+		if !type_app_ok(m, m.cfuncs[f].ret_name) then die("cf0: type: a generic type application names a non-generic or undeclared type\n")
+		f = f + 1
+	}
+	return 0
+}
 # A generic type application resolves to a concrete record OR union instance.
 const ensure_type_instance = (*MonoCtx m, Str base, [Str] margs): Str -> {
 	if find_rec_template(m.rec_templates, base) >= 0 then return ensure_rec_instance(m, base, margs)
@@ -1347,6 +1402,8 @@ pub const mono_program = (Program prog): Program -> {
 	check_rec_templates(&m)
 	check_union_templates(&m)
 	check_template_bounds(&m)
+	# reject applying type arguments to a non-generic type in any concrete declaration (247)
+	check_concrete_type_apps(&m)
 	# resolve any generic type NAMED in a concrete signature to its instance, so the shared
 	# `type_of` sees only concrete decls (skipped when there are no generics — the identity path)
 	if has_gen then mangle_concrete_sigs(&m)
