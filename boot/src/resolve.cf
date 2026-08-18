@@ -6,7 +6,7 @@
 #
 # Brick-1 scope (narrowings, each a later brick): destructured imports only; paths
 # resolve relative to the ENTRY file's directory — correct for a flat layout, where
-# every module sits beside the entry, as cf0's own sources do (the spec resolves each
+# every module sits beside the entry, as cf's own sources do (the spec resolves each
 # import relative to its own importer's directory); no name mangling, so imported
 # modules must not collide on a private top-level name; no visibility filtering, so every
 # merged declaration is visible (the typecheck phase still rejects a reference to a name
@@ -14,13 +14,13 @@
 # imports.
 
 import "io" as { open, read, close, die, o_rdonly }
-import "token" as { Token }
+import "token" as { Token, is_ident, is_strlit, is_lbrace, is_dot }
 import "ast" as { Expr, Stmt, MatchArm, StmtArm, Seg, FieldInit, RecDecl, UnionDecl, UnionMember, TupElem, Param, Func, Import, Program }
 import "lexer" as { lex }
 import "typealias" as { strip_type_aliases }
 import "parser" as { Parser, parse_program }
 
-# One module's read buffer size — large enough for cf0's own sources (its largest module,
+# One module's read buffer size — large enough for cf's own sources (its largest module,
 # emit.cf, is ~77 KB and growing; 256 KB leaves comfortable headroom). A single `read`
 # fills it (regular files return the whole requested count); a growable read arrives when a
 # module outgrows even this.
@@ -85,14 +85,70 @@ const build_path = (Str dir, Str name): Str -> {
 # Read, lex, and parse one module file into its Program. Its read buffer is a local, and
 # the parser interns every name into the arena, so the returned Program is self-contained
 # and the buffer can be discarded.
+# The decoded text of a token — the source slice it points at, as a `Str`.
+const tok_text = (*[Uint8] src, Token t): Str -> {
+	let [Uint8] out = []
+	let Iarch i = 0
+	loop {
+		if i >= t.len then break
+		out = [...out, src[t.start + i]]
+		i = i + 1
+	}
+	return Str(out)
+}
+
+# Is `n` one of the collected namespace-alias names?
+const is_alias = ([Str] aliases, Str n): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(aliases.len) then break
+		if str_eq(aliases[i], n) then return true
+		i = i + 1
+	}
+	return false
+}
+
+# A pre-parse token pass for namespace imports (module_system §4). A namespace import
+# `import "m" as ns` binds a local alias `ns`, and a use `ns.member` means module `m`'s `member`.
+# Because resolve flattens every module's public declarations into one whole-program namespace, a
+# namespace-qualified access is a pure syntactic prefix: pass 1 collects each alias name from an
+# `import … as <ident>` (the non-`{` form; `pub import` too — the `pub` sits before `import`), and
+# pass 2 deletes every leading `<alias> .` token pair, rewriting `ns.member` to a bare `member` and
+# `ns.T.M` to `T.M` (only the leading `ns.` is stripped — after it, `T` is not an alias). The
+# import declaration's own `as ns` is left untouched: its `ns` is not followed by a `.`.
+const strip_import_namespaces = (*[Uint8] src, [Token] toks): [Token] -> {
+	let [Str] aliases = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(toks.len) then break
+		if is_ident(toks[i].kind) && str_eq(tok_text(src, toks[i]), "import") && i + 3 < Iarch(toks.len) && is_strlit(toks[i + 1].kind) && is_ident(toks[i + 2].kind) && str_eq(tok_text(src, toks[i + 2]), "as") && is_ident(toks[i + 3].kind) then {
+			aliases = [...aliases, tok_text(src, toks[i + 3])]
+		}
+		i = i + 1
+	}
+	if Iarch(aliases.len) == 0 then return toks
+	let [Token] out = []
+	let Iarch k = 0
+	loop {
+		if k >= Iarch(toks.len) then break
+		if is_ident(toks[k].kind) && k + 1 < Iarch(toks.len) && is_dot(toks[k + 1].kind) && is_alias(aliases, tok_text(src, toks[k])) then {
+			k = k + 2
+		} else {
+			out = [...out, toks[k]]
+			k = k + 1
+		}
+	}
+	return out
+}
+
 const load_module = (Str path): Program -> {
 	let [262144 Uint8] buf
 	const Iarch fd = open(path.bytes, Uarch(o_rdonly), 0)
-	if fd < 0 then die("cf0: cannot open an imported module\n")
+	if fd < 0 then die("cf: cannot open an imported module\n")
 	const Iarch n = read(Uarch(fd), buf, Uarch(mod_cap))
 	close(Uarch(fd))
-	if n < 0 then die("cf0: reading an imported module failed\n")
-	const [Token] toks = strip_type_aliases(buf, lex(buf, n))
+	if n < 0 then die("cf: reading an imported module failed\n")
+	const [Token] toks = strip_import_namespaces(buf, strip_type_aliases(buf, lex(buf, n)))
 	let Parser p = Parser({ toks: toks, src: buf, pos: 0, file: path })
 	return parse_program(&p)
 }
@@ -108,7 +164,7 @@ const seen = ([Str] loaded, Str path): Bool -> {
 	return false
 }
 
-# Append every element of `src` onto `dst` (cf0 has no two-spread merge, so grow one at a
+# Append every element of `src` onto `dst` (cf has no two-spread merge, so grow one at a
 # time). One helper per declaration list — the payload types differ.
 const cat_recs = ([RecDecl] dst, [RecDecl] src): [RecDecl] -> {
 	let [RecDecl] out = dst
@@ -158,9 +214,9 @@ const cat_imports = ([Import] dst, [Import] src): [Import] -> {
 # per-module tag (`str_eq` → `str_eq__2`) and every reference to one, within that module,
 # is rewritten to match. Exported (`pub`) names are left alone — they are unique across
 # modules and are how imports resolve — so an import binds the same bare name the flatten
-# keeps. Brick scope: private FUNCTIONS only (cf0's collisions are all private helpers;
+# keeps. Brick scope: private FUNCTIONS only (cf's collisions are all private helpers;
 # records/unions live once and are imported, never redefined). A private function is only
-# ever referenced by a `Call` (cf0 has no function values), so the rewrite renames each
+# ever referenced by a `Call` (cf has no function values), so the rewrite renames each
 # private `Func` definition and every `Call` callee that names one.
 
 # Is `n` one of this module's private names?
@@ -327,7 +383,7 @@ const mangle_stmts = ([Stmt] ss, [Str] priv, Iarch tag): [Stmt] -> {
 # (`is_value`) is EXCLUDED: it is referenced as a bare `Var` and auto-called, and the
 # reference-rewrite only renames `Call` callees, so mangling its definition would orphan the
 # reference. A genuine zero-arg FUNCTION is referenced by `Call` and is mangled normally.
-# cf0's value consts are all `pub` anyway, so none collide across modules regardless.
+# cf's value consts are all `pub` anyway, so none collide across modules regardless.
 const priv_names = ([Func] fs): [Str] -> {
 	let [Str] out = []
 	let Iarch i = 0
@@ -626,7 +682,7 @@ const compose_member = (UnionMember mem, [RecDecl] recs, [UnionDecl] unions): Un
 		const [[TupElem]] pt = [empty_tel]
 		return UnionMember({ name: nm, payloads: ps, pelems: pe, ptelems: pt })
 	}
-	if is_builtin_scalar_name(nm) then die("cf0: type: a union member composing over a builtin type is not yet supported\n")
+	if is_builtin_scalar_name(nm) then die("cf: type: a union member composing over a builtin type is not yet supported\n")
 	return mem
 }
 
@@ -635,7 +691,7 @@ const compose_member = (UnionMember mem, [RecDecl] recs, [UnionDecl] unions): Un
 # and its fields spliced in place — preserving order and rejecting name collisions. The depth
 # guard turns an accidental spread cycle into a clean error instead of a hang.
 const expand_rec = (RecDecl d, [RecDecl] recs, [UnionDecl] unions, Iarch depth): RecDecl -> {
-	if depth > 64 then die("cf0: spread: a record spread cycle\n")
+	if depth > 64 then die("cf: spread: a record spread cycle\n")
 	let [Str] fields = []
 	let [Str] ftypes = []
 	let [Str] felems = []
@@ -648,16 +704,16 @@ const expand_rec = (RecDecl d, [RecDecl] recs, [UnionDecl] unions, Iarch depth):
 			const Str src = d.fields[k]
 			const Iarch si = find_rec(recs, src)
 			if si < 0 then {
-				if find_union(unions, src) >= 0 then die("cf0: spread: a record can only spread a record, not a union\n")
-				die("cf0: spread: `...` names an undeclared record\n")
+				if find_union(unions, src) >= 0 then die("cf: spread: a record can only spread a record, not a union\n")
+				die("cf: spread: `...` names an undeclared record\n")
 			}
 			const RecDecl srd = recs[si]
-			if Iarch(srd.typarams.len) > 0 then die("cf0: spread: cannot spread a generic record template\n")
+			if Iarch(srd.typarams.len) > 0 then die("cf: spread: cannot spread a generic record template\n")
 			const RecDecl ex = expand_rec(srd, recs, unions, depth + 1)
 			let Iarch j = 0
 			loop {
 				if j >= Iarch(ex.fields.len) then break
-				if has_name(fields, ex.fields[j]) then die("cf0: spread: a spliced field collides with an existing field\n")
+				if has_name(fields, ex.fields[j]) then die("cf: spread: a spliced field collides with an existing field\n")
 				fields = [...fields, ex.fields[j]]
 				ftypes = [...ftypes, ex.ftypes[j]]
 				felems = [...felems, ex.felems[j]]
@@ -666,7 +722,7 @@ const expand_rec = (RecDecl d, [RecDecl] recs, [UnionDecl] unions, Iarch depth):
 				j = j + 1
 			}
 		} else {
-			if has_name(fields, d.fields[k]) then die("cf0: spread: a field collides with a spliced field\n")
+			if has_name(fields, d.fields[k]) then die("cf: spread: a field collides with a spliced field\n")
 			fields = [...fields, d.fields[k]]
 			ftypes = [...ftypes, d.ftypes[k]]
 			felems = [...felems, d.felems[k]]
@@ -680,7 +736,7 @@ const expand_rec = (RecDecl d, [RecDecl] recs, [UnionDecl] unions, Iarch depth):
 
 # Expand a union's member spreads into a flat member set, mirroring `expand_rec`.
 const expand_union = (UnionDecl d, [RecDecl] recs, [UnionDecl] unions, Iarch depth): UnionDecl -> {
-	if depth > 64 then die("cf0: spread: a union spread cycle\n")
+	if depth > 64 then die("cf: spread: a union spread cycle\n")
 	let [UnionMember] members = []
 	let [Str] names = []
 	let Iarch k = 0
@@ -691,23 +747,23 @@ const expand_union = (UnionDecl d, [RecDecl] recs, [UnionDecl] unions, Iarch dep
 			const Str src = mem.name
 			const Iarch si = find_union(unions, src)
 			if si < 0 then {
-				if find_rec(recs, src) >= 0 then die("cf0: spread: a union can only spread a union, not a record\n")
-				die("cf0: spread: `...` names an undeclared union\n")
+				if find_rec(recs, src) >= 0 then die("cf: spread: a union can only spread a union, not a record\n")
+				die("cf: spread: `...` names an undeclared union\n")
 			}
 			const UnionDecl sud = unions[si]
-			if Iarch(sud.typarams.len) > 0 then die("cf0: spread: cannot spread a generic union template\n")
+			if Iarch(sud.typarams.len) > 0 then die("cf: spread: cannot spread a generic union template\n")
 			const UnionDecl ex = expand_union(sud, recs, unions, depth + 1)
 			let Iarch j = 0
 			loop {
 				if j >= Iarch(ex.members.len) then break
-				if has_name(names, ex.members[j].name) then die("cf0: spread: a spliced member collides with an existing member\n")
+				if has_name(names, ex.members[j].name) then die("cf: spread: a spliced member collides with an existing member\n")
 				members = [...members, ex.members[j]]
 				names = [...names, ex.members[j].name]
 				j = j + 1
 			}
 		} else {
 			const UnionMember cm = compose_member(mem, recs, unions)
-			if has_name(names, cm.name) then die("cf0: spread: a member collides with a spliced member\n")
+			if has_name(names, cm.name) then die("cf: spread: a member collides with a spliced member\n")
 			members = [...members, cm]
 			names = [...names, cm.name]
 		}
@@ -741,7 +797,7 @@ const expand_unions = ([UnionDecl] unions, [RecDecl] recs): [UnionDecl] -> {
 
 # --- member-type annotations (§8.1): validate + collapse `Union.Member` to `Union` -------------
 # A member is a first-class type usable anywhere a type is (`Color.Red`, `Maybe[Iarch].Just`), but
-# it DENOTES its union — cf0 collapses it to that union (a member value already widens to its union).
+# it DENOTES its union — cf collapses it to that union (a member value already widens to its union).
 # The parser preserved the `Base.Member` spelling; this pass (run after expand, before monomorph)
 # validates the member against the now-visible union tables and rewrites the annotation to `Base`.
 
@@ -775,6 +831,17 @@ const str_suffix = (Str t, Iarch k): Str -> {
 	}
 	return Str(v)
 }
+# True when `hay` begins with the bytes of `needle`.
+const has_prefix = (Str hay, Str needle): Bool -> {
+	if hay.len < needle.len then return false
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(needle.len) then break
+		if Iarch(hay[i]) != Iarch(needle[i]) then return false
+		i = i + 1
+	}
+	return true
+}
 const union_has_mem = (UnionDecl u, Str member): Bool -> {
 	let Iarch i = 0
 	loop {
@@ -797,10 +864,10 @@ const collapse_member_type = (Str t, [RecDecl] recs, [UnionDecl] unions): Str ->
 	if lb >= 0 then uname = str_prefix(base, lb)
 	const Iarch ui = find_union(unions, uname)
 	if ui < 0 then {
-		if find_rec(recs, uname) >= 0 then die("cf0: type: a member type requires a union base (a record has no members)\n")
-		die("cf0: type: a member type names an unknown union\n")
+		if find_rec(recs, uname) >= 0 then die("cf: type: a member type requires a union base (a record has no members)\n")
+		die("cf: type: a member type names an unknown union\n")
 	}
-	if !union_has_mem(unions[ui], member) then die("cf0: type: a member type names a non-member of its union\n")
+	if !union_has_mem(unions[ui], member) then die("cf: type: a member type names a non-member of its union\n")
 	return base
 }
 # Rewrite every member-type annotation in a statement (a binding's `ann`), recursing into nested
@@ -870,15 +937,15 @@ const reject_builtin_type_names = ([RecDecl] recs, [UnionDecl] unions): Iarch ->
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(recs.len) then break
-		if is_builtin_scalar_name(recs[i].name) then die("cf0: type: a record may not redeclare a builtin type name\n")
-		if str_eq(recs[i].name, "Unit") then die("cf0: type: a record may not redeclare a builtin type name\n")
+		if is_builtin_scalar_name(recs[i].name) then die("cf: type: a record may not redeclare a builtin type name\n")
+		if str_eq(recs[i].name, "Unit") then die("cf: type: a record may not redeclare a builtin type name\n")
 		i = i + 1
 	}
 	let Iarch j = 0
 	loop {
 		if j >= Iarch(unions.len) then break
-		if is_builtin_scalar_name(unions[j].name) then die("cf0: type: a union may not redeclare a builtin type name\n")
-		if str_eq(unions[j].name, "Unit") then die("cf0: type: a union may not redeclare a builtin type name\n")
+		if is_builtin_scalar_name(unions[j].name) then die("cf: type: a union may not redeclare a builtin type name\n")
+		if str_eq(unions[j].name, "Unit") then die("cf: type: a union may not redeclare a builtin type name\n")
 		j = j + 1
 	}
 	return 0
@@ -926,13 +993,13 @@ const splat_params = ([RecDecl] groups, [Param] params): [Param] -> {
 			loop {
 				if f >= Iarch(g.fields.len) then break
 				const Param fp = group_field_param(g, f)
-				if has_name(names, fp.name) then die("cf0: type: a grouped parameter's field collides with another parameter\n")
+				if has_name(names, fp.name) then die("cf: type: a grouped parameter's field collides with another parameter\n")
 				out = [...out, fp]
 				names = [...names, fp.name]
 				f = f + 1
 			}
 		} else {
-			if has_name(names, params[i].name) then die("cf0: type: a duplicate parameter name\n")
+			if has_name(names, params[i].name) then die("cf: type: a duplicate parameter name\n")
 			out = [...out, params[i]]
 			names = [...names, params[i].name]
 		}
@@ -951,7 +1018,7 @@ const record_inits_r = (Expr e): [FieldInit] -> {
 # order. Every group field must be present exactly once (a missing field 634 or extra field 635 is
 # rejected); each value is itself splatted (a nested group call).
 const expand_group_lit = ([RecDecl] groups, RecDecl g, [FieldInit] inits): [Expr] -> {
-	if Iarch(inits.len) != Iarch(g.fields.len) then die("cf0: type: a group literal must set every field of the group exactly once\n")
+	if Iarch(inits.len) != Iarch(g.fields.len) then die("cf: type: a group literal must set every field of the group exactly once\n")
 	let [Expr] vals = []
 	let Iarch f = 0
 	loop {
@@ -965,7 +1032,7 @@ const expand_group_lit = ([RecDecl] groups, RecDecl g, [FieldInit] inits): [Expr
 				k = Iarch(inits.len)
 			} else k = k + 1
 		}
-		if found < 0 then die("cf0: type: a group literal is missing a field of the group\n")
+		if found < 0 then die("cf: type: a group literal is missing a field of the group\n")
 		vals = [...vals, inits[found].value]
 		f = f + 1
 	}
@@ -993,13 +1060,13 @@ const splat_call = (Str callee, [Str] ta, [Expr] args, [Func] funcs, [RecDecl] g
 	}
 	if !any_group then return Expr.Call(callee, ta, sargs)
 	# a grouped-parameter callee must be called with one argument per ORIGINAL parameter
-	if Iarch(sargs.len) != Iarch(ps.len) then die("cf0: type: a grouped-parameter call needs one argument per parameter (a `{…}` for each group)\n")
+	if Iarch(sargs.len) != Iarch(ps.len) then die("cf: type: a grouped-parameter call needs one argument per parameter (a `{…}` for each group)\n")
 	let [Expr] out = []
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(ps.len) then break
 		if param_is_group(ps[i], groups) then {
-			if !is_bare_record_r(sargs[i]) then die("cf0: type: a grouped parameter must be passed a `{…}` literal argument\n")
+			if !is_bare_record_r(sargs[i]) then die("cf: type: a grouped parameter must be passed a `{…}` literal argument\n")
 			const RecDecl g = groups[find_group(groups, ps[i].type_name)]
 			out = cat_exprs(out, expand_group_lit(groups, g, record_inits_r(sargs[i])))
 		} else {
@@ -1165,14 +1232,14 @@ const reject_group_misuse = ([Func] funcs, [RecDecl] recs, [UnionDecl] unions, [
 	loop {
 		if gi >= Iarch(groups.len) then break
 		const Str gn = groups[gi].name
-		if find_rec(recs, gn) >= 0 || find_union(unions, gn) >= 0 then die("cf0: type: a grouped-parameter `type` name collides with a declared type\n")
-		if is_builtin_scalar_name(gn) || str_eq(gn, "Unit") then die("cf0: type: a grouped-parameter `type` may not redeclare a builtin type name\n")
+		if find_rec(recs, gn) >= 0 || find_union(unions, gn) >= 0 then die("cf: type: a grouped-parameter `type` name collides with a declared type\n")
+		if is_builtin_scalar_name(gn) || str_eq(gn, "Unit") then die("cf: type: a grouped-parameter `type` may not redeclare a builtin type name\n")
 		gi = gi + 1
 	}
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(funcs.len) then break
-		if find_group(groups, funcs[i].ret_name) >= 0 then die("cf0: type: a grouped-parameter `type` may not be a return type\n")
+		if find_group(groups, funcs[i].ret_name) >= 0 then die("cf: type: a grouped-parameter `type` may not be a return type\n")
 		i = i + 1
 	}
 	let Iarch r = 0
@@ -1181,7 +1248,7 @@ const reject_group_misuse = ([Func] funcs, [RecDecl] recs, [UnionDecl] unions, [
 		let Iarch f = 0
 		loop {
 			if f >= Iarch(recs[r].fields.len) then break
-			if find_group(groups, recs[r].ftypes[f]) >= 0 then die("cf0: type: a grouped-parameter `type` may not be a record field type\n")
+			if find_group(groups, recs[r].ftypes[f]) >= 0 then die("cf: type: a grouped-parameter `type` may not be a record field type\n")
 			f = f + 1
 		}
 		r = r + 1
@@ -1228,7 +1295,11 @@ pub const resolve_program = (Str entry): Program -> {
 	loop {
 		if wi >= Iarch(work.len) then break
 		const Import im = work[wi]
-		const Str mpath = build_path(dir, im.path)
+		# `std/`-prefixed imports resolve under the fixed library root, not the entry dir. The lib
+		# root is the cwd-relative literal "lib/" for the fixed-target bootstrap (a later brick may
+		# derive it from argv[0]). `build_path("lib/", "std/math")` → "lib/std/math.cf".
+		let Str mpath = build_path(dir, im.path)
+		if has_prefix(im.path, "std/") then mpath = build_path("lib/", im.path)
 		if !seen(loaded, mpath) then {
 			loaded = [...loaded, mpath]
 			tag = tag + 1 # a distinct tag per loaded module, so private names cannot collide
