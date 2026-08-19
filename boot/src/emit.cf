@@ -31,8 +31,13 @@ import "astutil" as { is_spread, spread_inner, is_skip, skip_count, is_nested, n
 # stores into it and jumps to `@lend${cur_loop}`, and the `loop` expression loads it afterward.
 # `reset_mark` carries the current function's per-frame arena mark (geometry_lowering §2): a temp
 # holding `node_0.top` at entry, restored before each `ret` to reclaim the frame's residue. It is
-# "" for a function that is NOT safe to reset (see `fn_resettable`).
-data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs, [RecDecl] recs, [UnionDecl] unions, Iarch cur_loop, Iarch cur_slot, Str cur_ret, Str reset_mark }
+# "" for a function that is NOT safe to reset (see `fn_resettable`). `fn_ptr` records whether the
+# enclosing function takes a writable `*T` parameter — it gates per-loop-iteration reset, since such
+# a param could carry a rehome of an iteration-local into a caller (loop_reset_safe).
+# `loop_mark` is the nearest enclosing reset-safe loop's entry-cursor temp (or "" if the nearest
+# loop is not reset-safe) — `break`/`continue` restore it so every path back to the loop head or out
+# of it reclaims the iteration's residue, matching the back-edge rewind.
+data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs, [RecDecl] recs, [UnionDecl] unions, Iarch cur_loop, Iarch cur_slot, Str cur_ret, Str reset_mark, Bool fn_ptr, Str loop_mark }
 
 # A local/parameter in scope: its interned name, `slot`, its `rec_type` (a record/union
 # type name, `"$dyn"`, `"$ptr"`, or `"Str"` — `""` for a word), and `elem` (a dynamic
@@ -295,6 +300,181 @@ const fn_resettable = (*Emit ctx, Func fn): Bool -> {
 	if ret_is_l(fn.ret_name, ctx.recs, ctx.unions) then return false
 	if any_ptr_param(fn.params) then return false
 	return true
+}
+
+# ── Per-loop-iteration reset (geometry_lowering §2, scope granularity) ───────────────────────────
+# A loop body may rewind the node cursor to the loop's entry mark each iteration — reclaiming that
+# iteration's residue — but ONLY when nothing allocated in the iteration can outlive it. The checks
+# below are a SOUND over-approximation: any AST form not explicitly cleared is treated as escaping.
+const has_str = ([Str] xs, Str s): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(xs.len) then break
+		if str_eq(xs[i], s) then return true
+		i = i + 1
+	}
+	return false
+}
+
+# Is `name` bound (in `env`) to an aggregate — a record/union/Str/array/tuple, not a scalar word?
+const binding_is_agg = ([Binding] env, Str name): Bool -> {
+	const Iarch i = lookup_index(env, name)
+	if i < 0 then return false
+	if !str_eq(env[i].rec_type, "") then return true
+	if !str_eq(env[i].elem, "") then return true
+	return false
+}
+
+# Does an expression take an address (`&x`)? An `&` hands a writable pointer to a callee, which could
+# rehome an iteration-local into a caller aggregate — so its presence disqualifies the loop. Unknown
+# / value-block forms (Match, Loop, Interp, DeferTap) default to `true` (conservative — no reset).
+const exprs_have_addr = ([Expr] es): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(es.len) then break
+		if expr_has_addr(es[i]) then return true
+		i = i + 1
+	}
+	return false
+}
+const finits_have_addr = ([FieldInit] fs): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(fs.len) then break
+		if expr_has_addr(fs[i].value) then return true
+		i = i + 1
+	}
+	return false
+}
+const expr_has_addr = (Expr e): Bool -> match e {
+	Expr.Lit(_) -> false, Expr.BoolLit(_) -> false, Expr.Var(_) -> false, Expr.StrLit(_) -> false, Expr.FloatLit(_) -> false, Expr.Unit -> false,
+	Expr.Field(_, _) -> false,
+	Expr.Addr(_) -> true,
+	Expr.FieldExpr(b, _) -> expr_has_addr(b),
+	Expr.Index(_, ix) -> expr_has_addr(ix),
+	Expr.IndexField(_, ix, _) -> expr_has_addr(ix),
+	Expr.IndexExpr(b, ix) -> expr_has_addr(b) || expr_has_addr(ix),
+	Expr.Record(_, fs) -> finits_have_addr(fs),
+	Expr.ArrayLit(_, sp, elems, _) -> expr_has_addr(sp) || exprs_have_addr(elems),
+	Expr.Tuple(es) -> exprs_have_addr(es),
+	Expr.UnionMk(_, _, args) -> exprs_have_addr(args),
+	Expr.Call(_, _, args, _) -> exprs_have_addr(args),
+	Expr.If(c, t, e2) -> expr_has_addr(c) || expr_has_addr(t) || expr_has_addr(e2),
+	Expr.Neg(x) -> expr_has_addr(x), Expr.Not(x) -> expr_has_addr(x), Expr.BitNot(x) -> expr_has_addr(x), Expr.Spread(x) -> expr_has_addr(x), Expr.Buffer(x) -> expr_has_addr(x),
+	Expr.Add(a, b) -> expr_has_addr(a) || expr_has_addr(b), Expr.Sub(a, b) -> expr_has_addr(a) || expr_has_addr(b), Expr.Mul(a, b) -> expr_has_addr(a) || expr_has_addr(b), Expr.Div(a, b) -> expr_has_addr(a) || expr_has_addr(b), Expr.Mod(a, b) -> expr_has_addr(a) || expr_has_addr(b),
+	Expr.BitAnd(a, b) -> expr_has_addr(a) || expr_has_addr(b), Expr.BitOr(a, b) -> expr_has_addr(a) || expr_has_addr(b), Expr.BitXor(a, b) -> expr_has_addr(a) || expr_has_addr(b), Expr.Shl(a, b) -> expr_has_addr(a) || expr_has_addr(b), Expr.Shr(a, b) -> expr_has_addr(a) || expr_has_addr(b),
+	Expr.CmpEq(a, b) -> expr_has_addr(a) || expr_has_addr(b), Expr.CmpNe(a, b) -> expr_has_addr(a) || expr_has_addr(b), Expr.CmpLt(a, b) -> expr_has_addr(a) || expr_has_addr(b), Expr.CmpGt(a, b) -> expr_has_addr(a) || expr_has_addr(b), Expr.CmpLe(a, b) -> expr_has_addr(a) || expr_has_addr(b), Expr.CmpGe(a, b) -> expr_has_addr(a) || expr_has_addr(b),
+	Expr.And(a, b) -> expr_has_addr(a) || expr_has_addr(b), Expr.Or(a, b) -> expr_has_addr(a) || expr_has_addr(b),
+	_ -> true
+}
+
+# Names bound anywhere in a statement list (loop-locals) — an assignment/rehome target NOT in this
+# set is OUTER and disqualifies the loop.
+const stmts_locals = ([Stmt] ss): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		r = cat_names(r, stmt_locals(ss[i]))
+		i = i + 1
+	}
+	return r
+}
+const arms_locals = ([StmtArm] arms): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		r = cat_names(r, stmts_locals(arms[i].body))
+		i = i + 1
+	}
+	return r
+}
+const one_name = (Str a): [Str] -> {
+	let [Str] r = [a]
+	return r
+}
+const cat_names = ([Str] a, [Str] b): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(a.len) then break
+		r = [...r, a[i]]
+		i = i + 1
+	}
+	let Iarch j = 0
+	loop {
+		if j >= Iarch(b.len) then break
+		r = [...r, b[j]]
+		j = j + 1
+	}
+	return r
+}
+const stmt_locals = (Stmt s): [Str] -> match s {
+	Stmt.Let(n, _, _, _) -> one_name(n),
+	Stmt.Destructure(ns, _, _) -> ns,
+	Stmt.ForIn(lv, _, ss) -> cat_names(one_name(lv), stmts_locals(ss)),
+	Stmt.Loop(ss) -> stmts_locals(ss),
+	Stmt.Block(ss) -> stmts_locals(ss),
+	Stmt.IfThen(_, s2) -> stmt_locals(s2),
+	Stmt.IfElse(_, t, el) -> cat_names(stmt_locals(t), stmt_locals(el)),
+	Stmt.Match(_, arms) -> arms_locals(arms),
+	_ -> no_names()
+}
+const no_names = (): [Str] -> {
+	let [Str] r = []
+	return r
+}
+
+# Does any statement let an iteration-local aggregate escape (return / yield / write to an outer
+# aggregate / rehome into an outer base / take an `&`)? Conservative: unknown forms escape.
+const body_escapes = ([Binding] env, [Str] locals, [Stmt] ss): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		if stmt_escapes(env, locals, ss[i]) then return true
+		i = i + 1
+	}
+	return false
+}
+const arms_escape = ([Binding] env, [Str] locals, [StmtArm] arms): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		if body_escapes(env, locals, arms[i].body) then return true
+		i = i + 1
+	}
+	return false
+}
+const stmt_escapes = ([Binding] env, [Str] locals, Stmt s): Bool -> match s {
+	Stmt.Return(_) -> true,
+	Stmt.Yield(_) -> true,
+	Stmt.Break -> false,
+	Stmt.Continue -> false,
+	Stmt.Let(_, _, _, init) -> expr_has_addr(init),
+	Stmt.Assign(n, val) -> (!has_str(locals, n) && binding_is_agg(env, n)) || expr_has_addr(val),
+	Stmt.FieldAssign(base, _, val) -> !has_str(locals, base) || expr_has_addr(val),
+	Stmt.IndexAssign(base, ix, val) -> !has_str(locals, base) || expr_has_addr(ix) || expr_has_addr(val),
+	Stmt.DeepFieldAssign(_, _, _) -> true,
+	Stmt.Do(e) -> expr_has_addr(e),
+	Stmt.IfThen(c, s2) -> expr_has_addr(c) || stmt_escapes(env, locals, s2),
+	Stmt.IfElse(c, t, el) -> expr_has_addr(c) || stmt_escapes(env, locals, t) || stmt_escapes(env, locals, el),
+	Stmt.Block(ss) -> body_escapes(env, locals, ss),
+	Stmt.Loop(ss) -> body_escapes(env, locals, ss),
+	Stmt.ForIn(_, _, ss) -> body_escapes(env, locals, ss),
+	Stmt.Match(sc, arms) -> expr_has_addr(sc) || arms_escape(env, locals, arms),
+	Stmt.Destructure(_, _, e) -> expr_has_addr(e),
+	_ -> true
+}
+
+# May a loop body reset the node cursor each iteration? Only if the enclosing function takes no
+# writable pointer (nothing to rehome an iteration-local through) and nothing in the body escapes
+# the iteration. `loopvar` is the `for`-loop element name (a loop-local), or "" for a bare `loop`.
+const loop_reset_safe = (*Emit ctx, [Binding] env, Str loopvar, [Stmt] body): Bool -> {
+	if ctx.fn_ptr then return false
+	let [Str] locals = stmts_locals(body)
+	if !str_eq(loopvar, "") then locals = cat_names(locals, one_name(loopvar))
+	return !body_escapes(env, locals, body)
 }
 
 # The RETURN signature position of a `$fn` binding — the last telem of its whole `[args…, ret]`
@@ -2969,6 +3149,7 @@ const emit_for_body! = (*Emit ctx, [Binding] env, Str lv, Str arr, [Stmt] body):
 	# `continue` jump to `@ltop` advances to the next element rather than re-reading the
 	# current one. Saved/restored around the body so a nested `for`/`loop` targets itself.
 	const Iarch saved = ctx.cur_loop
+	const Str saved_mark = ctx.loop_mark
 	ctx.cur_loop = lid
 	const Iarch la = ctx.next
 	ctx.next = ctx.next + 1
@@ -2980,6 +3161,15 @@ const emit_for_body! = (*Emit ctx, [Binding] env, Str lv, Str arr, [Stmt] body):
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${ci} =l alloc8 8\n")
 	write_str(ctx.fd, "\tstorel -1, %t${ci}\n")
+	# per-iteration reset: mark the cursor before the loop; rewound at the back-edge / break / continue
+	let Str lmark = ""
+	if loop_reset_safe(ctx, env, lv, body) then {
+		const Iarch mk = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${mk} =l loadl %node_0\n")
+		lmark = "%t${mk}"
+	}
+	ctx.loop_mark = lmark
 	write_str(ctx.fd, "@ltop${lid}\n")
 	const Iarch iv2 = ctx.next
 	ctx.next = ctx.next + 1
@@ -3020,9 +3210,11 @@ const emit_for_body! = (*Emit ctx, [Binding] env, Str lv, Str arr, [Stmt] body):
 	write_str(ctx.fd, "\tstorel %t${xval}, %t${xcell}\n")
 	const [Binding] benv = [...env, Binding({ name: lv, slot: xcell, rec_type: fer, elem: "", is_cell: true, telems: [], fixed: fx })]
 	const Iarch term = emit_block!(ctx, body, benv)
+	if term == 0 && !str_eq(lmark, "") then write_str(ctx.fd, "\tstorel ${lmark}, %node_0\n")
 	if term == 0 then write_str(ctx.fd, "\tjmp @ltop${lid}\n")
 	write_str(ctx.fd, "@lend${lid}\n")
 	ctx.cur_loop = saved
+	ctx.loop_mark = saved_mark
 	return 0
 }
 
@@ -3035,12 +3227,25 @@ const emit_loop_body! = (*Emit ctx, [Binding] env, [Stmt] body): Iarch -> {
 	const Iarch lid = ctx.label
 	ctx.label = ctx.label + 1
 	const Iarch saved = ctx.cur_loop
+	const Str saved_mark = ctx.loop_mark
 	ctx.cur_loop = lid
+	# per-iteration reset (geometry_lowering §2): snapshot the cursor at loop entry, rewind at every
+	# back-edge / break / continue, but only for a body whose residue can't escape the iteration.
+	let Str lmark = ""
+	if loop_reset_safe(ctx, env, "", body) then {
+		const Iarch mk = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${mk} =l loadl %node_0\n")
+		lmark = "%t${mk}"
+	}
+	ctx.loop_mark = lmark
 	write_str(ctx.fd, "@ltop${lid}\n")
 	const Iarch term = emit_block!(ctx, body, env)
+	if term == 0 && !str_eq(lmark, "") then write_str(ctx.fd, "\tstorel ${lmark}, %node_0\n")
 	if term == 0 then write_str(ctx.fd, "\tjmp @ltop${lid}\n")
 	write_str(ctx.fd, "@lend${lid}\n")
 	ctx.cur_loop = saved
+	ctx.loop_mark = saved_mark
 	return 0
 }
 
@@ -3056,14 +3261,19 @@ const emit_loop_value! = (*Emit ctx, [Binding] env, [Stmt] body): Str -> {
 	ctx.label = ctx.label + 1
 	const Iarch saved = ctx.cur_loop
 	const Iarch saved_slot = ctx.cur_slot
+	const Str saved_mark = ctx.loop_mark
 	ctx.cur_loop = lid
 	ctx.cur_slot = slot
+	# a value-yielding loop yields across its back-edge, so it is never reset-safe — clear the mark
+	# so a `break`/`continue` inside it does not rewind to an outer loop's mark.
+	ctx.loop_mark = ""
 	write_str(ctx.fd, "@ltop${lid}\n")
 	const Iarch term = emit_block!(ctx, body, env)
 	if term == 0 then write_str(ctx.fd, "\tjmp @ltop${lid}\n")
 	write_str(ctx.fd, "@lend${lid}\n")
 	ctx.cur_loop = saved
 	ctx.cur_slot = saved_slot
+	ctx.loop_mark = saved_mark
 	# the slot loads in the yielded value's QBE type (a float loop yields `d`/`s`)
 	const Str qt = qtype_of_name(loop_yield_scalar_list!(ctx, env, body))
 	const Iarch rt = ctx.next
@@ -3122,10 +3332,14 @@ const emit_simple_stmt! = (*Emit ctx, [Binding] env, Stmt s): Iarch -> {
 	let Iarch term = 0
 	match s {
 		Stmt.Break -> {
+			# a reset-safe loop rewinds the cursor on the way out too — the broken iteration's residue
+			# is dead (nothing escapes a reset-safe loop), and after the loop the cursor sits at entry.
+			if !str_eq(ctx.loop_mark, "") then write_str(ctx.fd, "\tstorel ${ctx.loop_mark}, %node_0\n")
 			write_str(ctx.fd, "\tjmp @lend${ctx.cur_loop}\n")
 			term = 1
 		},
 		Stmt.Continue -> {
+			if !str_eq(ctx.loop_mark, "") then write_str(ctx.fd, "\tstorel ${ctx.loop_mark}, %node_0\n")
 			write_str(ctx.fd, "\tjmp @ltop${ctx.cur_loop}\n")
 			term = 1
 		},
@@ -3353,6 +3567,7 @@ const emit_func! = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 	write_str(ctx.fd, "@start\n")
 	# per-frame reset (geometry_lowering §2): snapshot the node cursor at entry; each `ret` rewinds
 	# to it, reclaiming this frame's residue. Only for frames provably free of escape (fn_resettable).
+	ctx.fn_ptr = any_ptr_param(fn.params)
 	ctx.reset_mark = ""
 	if fn_resettable(ctx, fn) then {
 		const Iarch mk = ctx.next
@@ -4107,7 +4322,7 @@ pub const emit_program! = (Program prog, Uarch qbe_fd, Uarch asm_fd): Iarch -> {
 		if i >= Iarch(prog.funcs.len) then break
 		# an asm function is emitted into the floor, not through QBE
 		if !prog.funcs[i].is_asm then {
-			let Emit ctx = Emit({ fd: qbe_fd, next: 0, label: 0, funcs: prog.funcs, recs: prog.recs, unions: prog.unions, cur_loop: 0 - 1, cur_slot: 0 - 1, cur_ret: "", reset_mark: "" })
+			let Emit ctx = Emit({ fd: qbe_fd, next: 0, label: 0, funcs: prog.funcs, recs: prog.recs, unions: prog.unions, cur_loop: 0 - 1, cur_slot: 0 - 1, cur_ret: "", reset_mark: "", fn_ptr: false, loop_mark: "" })
 			emit_func!(&ctx, prog.funcs[i], i)
 		}
 		i = i + 1
