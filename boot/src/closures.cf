@@ -15,7 +15,7 @@
 # another closure, and not a first-class value. A captured local must be annotated (its type is
 # read from the annotation / parameter). Runs AFTER typecheck (validated) and BEFORE emit.
 
-import "ast" as { Expr, Stmt, MatchArm, StmtArm, Seg, FieldInit, TupElem, Param, RecDecl, UnionDecl, Func, Import, Program }
+import "ast" as { Expr, Stmt, MatchArm, StmtArm, Seg, FieldInit, TupElem, Param, RecDecl, UnionDecl, Func, Import, Program, with_geom }
 
 const no_names = (): [Str] -> {
 	let [Str] e = []
@@ -170,7 +170,7 @@ const uses_expr! = (Expr e): [Str] -> match e {
 	Expr.And(l, r) -> cat(uses_expr!(l), uses_expr!(r)),
 	Expr.Or(l, r) -> cat(uses_expr!(l), uses_expr!(r)),
 	Expr.If(c, t, e2) -> cat(cat(uses_expr!(c), uses_expr!(t)), uses_expr!(e2)),
-	Expr.Call(n, ta, args) -> cat([n], uses_exprs!(args)),
+	Expr.Call(n, ta, args, _) -> cat([n], uses_exprs!(args)),
 	Expr.DeferTap(fn, args) -> uses_exprs!(args)
 }
 const uses_stmt! = (Stmt s): [Str] -> match s {
@@ -425,7 +425,7 @@ const rw_expr! = (Expr e, RwCtx m): Expr -> match e {
 	Expr.And(l, r) -> Expr.And(rw_expr!(l, m), rw_expr!(r, m)),
 	Expr.Or(l, r) -> Expr.Or(rw_expr!(l, m), rw_expr!(r, m)),
 	Expr.If(c, t, e2) -> Expr.If(rw_expr!(c, m), rw_expr!(t, m), rw_expr!(e2, m)),
-	Expr.Call(n, ta, args) -> rw_call!(n, ta, rw_exprs!(args, m), m),
+	Expr.Call(n, ta, args, g) -> with_geom(rw_call!(n, ta, rw_exprs!(args, m), m), g),
 	Expr.DeferTap(fn, args) -> Expr.DeferTap(fn, rw_exprs!(args, m))
 }
 # A bare closure reference used as a value: a capture-free closure becomes its lifted function name
@@ -475,10 +475,10 @@ const subst_exprs = ([Expr] es, [Subst] su): [Expr] -> {
 # to a closure → `clo(x)`, later redirected to the lifted body). The arguments are already substituted.
 const subst_call = (Str c, [Str] ta, [Expr] sargs, [Subst] su): Expr -> {
 	const Iarch si = subst_find(su, c)
-	if si < 0 then return Expr.Call(c, ta, sargs)
+	if si < 0 then return Expr.Call(c, ta, sargs, "")
 	const Str rn = repl_name(su[si].repl)
-	if str_eq(rn, "") then return Expr.Call(c, ta, sargs)
-	return Expr.Call(rn, ta, sargs)
+	if str_eq(rn, "") then return Expr.Call(c, ta, sargs, "")
+	return Expr.Call(rn, ta, sargs, "")
 }
 # Substitute a bare-name BASE (a `p.f` field, a `p[i]` index, an `&p` address on a parameter name):
 # a parameter substituted by a `Var(name)` keeps the name-based form; one substituted by a compound
@@ -545,7 +545,7 @@ const subst_segs = ([Seg] segs, [Subst] su): [Seg] -> {
 }
 pub const subst_expr = (Expr e, [Subst] su): Expr -> match e {
 	Expr.Var(n) -> subst_var(n, su),
-	Expr.Call(c, ta, args) -> subst_call(c, ta, subst_exprs(args, su), su),
+	Expr.Call(c, ta, args, g) -> with_geom(subst_call(c, ta, subst_exprs(args, su), su), g),
 	Expr.DeferTap(fn, args) -> Expr.DeferTap(fn, subst_exprs(args, su)),
 	Expr.Field(b, f) -> subst_field(b, f, su),
 	Expr.Index(a, i) -> subst_index(a, i, su),
@@ -660,14 +660,14 @@ const rw_call! = (Str n, [Str] ta, [Expr] args, RwCtx m): Expr -> {
 			all = [...all, caps[i]]
 			i = i + 1
 		}
-		return Expr.Call(m.clos[ci].lifted, ta, all)
+		return Expr.Call(m.clos[ci].lifted, ta, all, "")
 	}
 	const Iarch fi = find_func(m.fns, n)
 	if fi >= 0 then {
 		const Iarch cp = capturing_clo_arg(m.fns[fi], args, m.clos)
 		if cp >= 0 then return inline_hof!(m.fns[fi], args, cp, m)
 	}
-	return Expr.Call(n, ta, args)
+	return Expr.Call(n, ta, args, "")
 }
 const rw_stmt! = (Stmt s, RwCtx m): Stmt -> match s {
 	Stmt.Let(n, mut, ann, e) -> Stmt.Let(n, mut, ann, rw_expr!(e, m)),

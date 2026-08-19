@@ -15,7 +15,7 @@
 
 import "io" as { open, read, close, die, o_rdonly }
 import "token" as { Token, is_ident, is_strlit, is_lbrace, is_dot }
-import "ast" as { Expr, Stmt, MatchArm, StmtArm, Seg, FieldInit, RecDecl, UnionDecl, UnionMember, TupElem, Param, Func, Import, Program }
+import "ast" as { Expr, Stmt, MatchArm, StmtArm, Seg, FieldInit, RecDecl, UnionDecl, UnionMember, TupElem, Param, Func, Import, Program, with_geom }
 import "lexer" as { lex }
 import "typealias" as { strip_type_aliases! }
 import "parser" as { Parser, parse_program! }
@@ -287,7 +287,7 @@ const mangle_expr = (Expr e, [Str] priv, Iarch tag): Expr -> match e {
 	Expr.And(l, r) -> Expr.And(mangle_expr(l, priv, tag), mangle_expr(r, priv, tag)),
 	Expr.Or(l, r) -> Expr.Or(mangle_expr(l, priv, tag), mangle_expr(r, priv, tag)),
 	Expr.If(c, t, e2) -> Expr.If(mangle_expr(c, priv, tag), mangle_expr(t, priv, tag), mangle_expr(e2, priv, tag)),
-	Expr.Call(n, ta, args) -> Expr.Call(mangle_name(n, priv, tag), ta, mangle_exprs(args, priv, tag)),
+	Expr.Call(n, ta, args, g) -> Expr.Call(mangle_name(n, priv, tag), ta, mangle_exprs(args, priv, tag), g),
 	Expr.DeferTap(fn, args) -> Expr.DeferTap(mangle_name(fn, priv, tag), mangle_exprs(args, priv, tag))
 }
 
@@ -524,7 +524,7 @@ const lnames_expr! = (Expr e): [Str] -> match e {
 	Expr.And(l, r) -> cat_names(lnames_expr!(l), lnames_expr!(r)),
 	Expr.Or(l, r) -> cat_names(lnames_expr!(l), lnames_expr!(r)),
 	Expr.If(c, t, e2) -> cat_names(cat_names(lnames_expr!(c), lnames_expr!(t)), lnames_expr!(e2)),
-	Expr.Call(n, ta, args) -> lnames_exprs!(args),
+	Expr.Call(n, ta, args, _) -> lnames_exprs!(args),
 	Expr.DeferTap(fn, args) -> lnames_exprs!(args)
 }
 const lnames_stmt! = (Stmt s): [Str] -> match s {
@@ -1049,7 +1049,7 @@ const splat_call = (Str callee, [Str] ta, [Expr] args, [Func] funcs, [RecDecl] g
 	}
 	# does the callee have group parameters? (look up its ORIGINAL, pre-splat signature)
 	const Iarch fi = find_func_r(funcs, callee)
-	if fi < 0 then return Expr.Call(callee, ta, sargs)
+	if fi < 0 then return Expr.Call(callee, ta, sargs, "")
 	const [Param] ps = funcs[fi].params
 	let Bool any_group = false
 	let Iarch pg = 0
@@ -1058,7 +1058,7 @@ const splat_call = (Str callee, [Str] ta, [Expr] args, [Func] funcs, [RecDecl] g
 		if param_is_group(ps[pg], groups) then any_group = true
 		pg = pg + 1
 	}
-	if !any_group then return Expr.Call(callee, ta, sargs)
+	if !any_group then return Expr.Call(callee, ta, sargs, "")
 	# a grouped-parameter callee must be called with one argument per ORIGINAL parameter
 	if Iarch(sargs.len) != Iarch(ps.len) then die("cf: type: a grouped-parameter call needs one argument per parameter (a `{…}` for each group)\n")
 	let [Expr] out = []
@@ -1074,7 +1074,7 @@ const splat_call = (Str callee, [Str] ta, [Expr] args, [Func] funcs, [RecDecl] g
 		}
 		i = i + 1
 	}
-	return Expr.Call(callee, ta, out)
+	return Expr.Call(callee, ta, out, "")
 }
 const find_func_r = ([Func] funcs, Str name): Iarch -> {
 	let Iarch i = 0
@@ -1181,7 +1181,7 @@ const splat_expr = (Expr e, [Func] funcs, [RecDecl] groups): Expr -> match e {
 	Expr.And(l, r) -> Expr.And(splat_expr(l, funcs, groups), splat_expr(r, funcs, groups)),
 	Expr.Or(l, r) -> Expr.Or(splat_expr(l, funcs, groups), splat_expr(r, funcs, groups)),
 	Expr.If(c, t, e2) -> Expr.If(splat_expr(c, funcs, groups), splat_expr(t, funcs, groups), splat_expr(e2, funcs, groups)),
-	Expr.Call(n, ta, args) -> splat_call(n, ta, args, funcs, groups),
+	Expr.Call(n, ta, args, g) -> with_geom(splat_call(n, ta, args, funcs, groups), g),
 	Expr.DeferTap(fn, args) -> Expr.DeferTap(fn, splat_exprs(args, funcs, groups))
 }
 const splat_stmts = ([Stmt] ss, [Func] funcs, [RecDecl] groups): [Stmt] -> {

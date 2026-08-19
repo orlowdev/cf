@@ -397,7 +397,7 @@ const field_scalar_or_tagunion = (*Emit ctx, [Binding] env, Str base, Str f): St
 	return field_scalar(ctx, var_agg_type(env, base), f)
 }
 const scalar_of! = (*Emit ctx, [Binding] env, Expr e): Str -> match e {
-	Expr.Call(callee, tyargs, args) -> call_scalar_e(ctx, env, callee),
+	Expr.Call(callee, tyargs, args, _) -> call_scalar_e(ctx, env, callee),
 	Expr.Var(n) -> var_scalar(env, n),
 	Expr.FloatLit(t) -> "Float64",
 	# a Bool leaf: the literal, a comparison, or a logical connective all yield the word `Bool`
@@ -590,7 +590,7 @@ const emit_var! = (*Emit ctx, [Binding] env, Str name): Str -> {
 	if idx < 0 then {
 		# not a local — a top-level VALUE const (a nullary function), auto-called
 		const [Expr] noargs = []
-		return emit_call!(ctx, name, noargs, env)
+		return emit_call!(ctx, name, noargs, "", env)
 	}
 	return binding_ptr!(ctx, env, idx)
 }
@@ -617,7 +617,7 @@ const emit_field! = (*Emit ctx, [Binding] env, Str base, Str field): Str -> {
 		# not a local — a top-level VALUE const (a nullary function): auto-call it for its base
 		# pointer, and take its aggregate type from the function's return type (`call_agg_type`)
 		const [Expr] noargs = []
-		bp = emit_call!(ctx, base, noargs, env)
+		bp = emit_call!(ctx, base, noargs, "", env)
 		rt = call_agg_type(ctx, env, base)
 	} else {
 		bp = binding_ptr!(ctx, env, idx)
@@ -1370,7 +1370,7 @@ const init_telems! = (*Emit ctx, [Binding] env, Expr e): [TupElem] -> {
 	let [TupElem] r = []
 	match e {
 		Expr.Tuple(elems) -> { r = tuple_pos_types!(ctx, env, elems) },
-		Expr.Call(callee, tyargs, args) -> { r = call_ret_telems(ctx, env, callee) },
+		Expr.Call(callee, tyargs, args, _) -> { r = call_ret_telems(ctx, env, callee) },
 		Expr.Var(nm) -> { r = var_telems(env, nm) },
 		Expr.Field(base, f) -> { r = field_ftelems(ctx, var_agg_type(env, base), f) },
 		Expr.FieldExpr(base, f) -> { r = field_ftelems(ctx, init_agg_type!(ctx, env, base), f) },
@@ -1401,9 +1401,9 @@ const emit_destructure! = (*Emit ctx, [Binding] env, [Str] pat, Bool mutable, Ex
 			tels = tuple_pos_types!(ctx, env, elems)
 			base = emit_tuple!(ctx, elems, env)
 		},
-		Expr.Call(callee, tyargs, args) -> {
+		Expr.Call(callee, tyargs, args, _) -> {
 			tels = call_ret_telems(ctx, env, callee)
-			base = emit_call!(ctx, callee, args, env)
+			base = emit_call!(ctx, callee, args, "", env)
 		},
 		# Any other tuple-valued expression (a record's tuple field, or a nested tuple reached
 		# by index/field): position telems come from `init_telems`, and the base pointer from
@@ -1665,7 +1665,7 @@ const init_agg_type! = (*Emit ctx, [Binding] env, Expr e): Str -> match e {
 	Expr.Record(tn, inits) -> tn,
 	Expr.UnionMk(tn, mem, args) -> tn,
 	Expr.Field(base, f) -> field_agg_type(ctx, env, base, f),
-	Expr.Call(callee, tyargs, args) -> call_agg_type(ctx, env, callee),
+	Expr.Call(callee, tyargs, args, _) -> call_agg_type(ctx, env, callee),
 	Expr.ArrayLit(hs, sn, elems, et) -> "$dyn",
 	Expr.StrLit(bytes) -> "Str",
 	Expr.Interp(id) -> "Str",
@@ -1783,7 +1783,7 @@ const init_elem! = (*Emit ctx, [Binding] env, Expr e): Str -> match e {
 	Expr.IndexField(arr, idx, f) -> field_elem(ctx, index_agg_type(ctx, env, arr, idx), f),
 	Expr.Index(arr, idx) -> index_elem!(env, arr),
 	Expr.IndexExpr(base, idx) -> indexexpr_elem!(ctx, env, base),
-	Expr.Call(callee, tyargs, args) -> call_ret_elem!(ctx, env, callee),
+	Expr.Call(callee, tyargs, args, _) -> call_ret_elem!(ctx, env, callee),
 	_ -> ""
 }
 
@@ -2003,7 +2003,25 @@ const emit_indirect_call! = (*Emit ctx, [Binding] env, Iarch fpidx, [Expr] args)
 	return "%t${rt}"
 }
 
-const emit_call! = (*Emit ctx, Str callee, [Expr] args, [Binding] env): Str -> {
+const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env): Str -> {
+	# `mem.arena.of(n)` — carve a fixed arena from the ambient node (%node_0) and yield its handle.
+	if str_eq(callee, "cf__arena_of") then {
+		const Str nv = emit_expr!(args[0], ctx, env)
+		const Iarch tw = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${tw} =w copy ${nv}\n")
+		const Iarch tr = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${tr} =l call $cf_arena_of(l %node_0, w %t${tw})\n")
+		return "%t${tr}"
+	}
+	# `mem.page` — the root page node handle (the address of the $cf_page struct)
+	if str_eq(callee, "cf__page") then {
+		const Iarch tp = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${tp} =l copy $cf_page\n")
+		return "%t${tp}"
+	}
 	# `Int8(x)`… narrows to the fixed width (canonicalizing); `Iarch`/`Int`/`Uarch` are identity
 	if is_cast_type(callee) then {
 		const Str v = emit_expr!(args[0], ctx, env)
@@ -2102,6 +2120,10 @@ const emit_call! = (*Emit ctx, Str callee, [Expr] args, [Binding] env): Str -> {
 		}
 		i = i + 1
 	}
+	# the ambient node handle: `%node_0`, unless an `in <geometry>` clause names a node binding,
+	# whose handle we load here (a MemoryNode is a pointer-sized value in the binding's slot).
+	let Str node_op = "%node_0"
+	if !str_eq(geom, "") then node_op = emit_expr!(Expr.Var(geom), ctx, env)
 	const Iarch rt = ctx.next
 	ctx.next = ctx.next + 1
 	const Bool is_main = str_eq(ctx.funcs[fidx].name, "main")
@@ -2110,10 +2132,11 @@ const emit_call! = (*Emit ctx, Str callee, [Expr] args, [Binding] env): Str -> {
 	if is_main then write_str(ctx.fd, "main")
 	if !is_main then write_str(ctx.fd, "f${fidx}")
 	write_str(ctx.fd, "(")
-	# thread the enclosing function's ambient node into arg 0 (geometry_lowering §4). An asm
-	# intrinsic (syscall wrapper) is below the algebra — no node — so calls to it pass none.
+	# thread the ambient node into arg 0 (geometry_lowering §4): the enclosing function's `%node_0`
+	# by default, or the node bound by an `in <geometry>` clause (its handle loaded from `geom`'s
+	# binding). An asm intrinsic (syscall wrapper) is below the algebra — no node.
 	const Bool node_first = !ctx.funcs[fidx].is_asm
-	if node_first then write_str(ctx.fd, "l %node_0")
+	if node_first then write_str(ctx.fd, "l ${node_op}")
 	let Iarch j = 0
 	loop {
 		if j >= Iarch(aops.len) then break
@@ -2858,7 +2881,7 @@ const emit_expr! = (Expr e, *Emit ctx, [Binding] env): Str -> match e {
 	Expr.And(l, r) -> emit_logical!(ctx, true, l, r, env),
 	Expr.Or(l, r) -> emit_logical!(ctx, false, l, r, env),
 	Expr.If(cond, then_e, else_e) -> emit_if!(ctx, cond, then_e, else_e, env),
-	Expr.Call(callee, tyargs, args) -> emit_call!(ctx, callee, args, env),
+	Expr.Call(callee, tyargs, args, geom) -> emit_call!(ctx, callee, args, geom, env),
 	# a `defer`-tap value is lifted out of expression position by hoist_defertap.cf before emit;
 	# one reaching here is an internal error (a hoist gap), not a user error
 	Expr.DeferTap(fn, args) -> defertap_survived()
@@ -3384,6 +3407,27 @@ const emit_arena_qbe = (Uarch fd): Iarch -> {
 	write_str(fd, "@store\n")
 	write_str(fd, "\tstorel %nt, %node\n")
 	write_str(fd, "\tret %p\n")
+	write_str(fd, "}\n")
+	# `mem.arena.of(n)` — carve a fixed arena from the parent node: pull a 32-byte node header and an
+	# n-byte block from `%node`, then init the arena node { top=blk, committed=blk+n, limit=blk+n,
+	# parent=node }. committed==limit, so cf_alloc traps at the bound (a FIXED arena). No reset yet
+	# (geometry_lowering §5) — the block simply leaks back into the parent page. Returns the header.
+	write_str(fd, "function l $cf_arena_of(l %node, w %n) {\n")
+	write_str(fd, "@start\n")
+	write_str(fd, "\t%r7 =w add %n, 7\n")
+	write_str(fd, "\t%ra =w and %r7, -8\n")
+	write_str(fd, "\t%sz =l extuw %ra\n")
+	write_str(fd, "\t%hdr =l call $cf_alloc(l %node, w 32)\n")
+	write_str(fd, "\t%blk =l call $cf_alloc(l %node, w %n)\n")
+	write_str(fd, "\tstorel %blk, %hdr\n")
+	write_str(fd, "\t%end =l add %blk, %sz\n")
+	write_str(fd, "\t%c8 =l add %hdr, 8\n")
+	write_str(fd, "\tstorel %end, %c8\n")
+	write_str(fd, "\t%c16 =l add %hdr, 16\n")
+	write_str(fd, "\tstorel %end, %c16\n")
+	write_str(fd, "\t%c24 =l add %hdr, 24\n")
+	write_str(fd, "\tstorel %node, %c24\n")
+	write_str(fd, "\tret %hdr\n")
 	write_str(fd, "}\n")
 	# `[T]` grow-in-place append: given the 24-byte header {data@0, len@8, cap@16} and
 	# the element stride, ensure room for one more (amortized doubling: cap 0→4 else

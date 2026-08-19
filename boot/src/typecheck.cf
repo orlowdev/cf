@@ -299,7 +299,7 @@ pub const tel_to_ty! = (TupElem te, Ctx ctx): Ty -> {
 # keeps the element to a shape the emitter classifies the same way the type gate does (an
 # `if`/`match`-valued record element is a later brick).
 const is_fresh_record = (Expr e): Bool -> match e {
-	Expr.Call(c, ta, a) -> true,
+	Expr.Call(c, ta, a, _) -> true,
 	Expr.Record(n, fs) -> true,
 	Expr.UnionMk(t, m, args) -> true,
 	_ -> false
@@ -309,12 +309,12 @@ const is_fresh_record = (Expr e): Bool -> match e {
 # binding may take (a literal `(a,b)` or a tuple-returning call `f(…)`). Aliasing a tuple
 # name or a tuple from a field/index is a later brick.
 const is_tuple_lit = (Expr e): Bool -> match e { Expr.Tuple(es) -> true, _ -> false }
-const is_call_expr = (Expr e): Bool -> match e { Expr.Call(c, ta, a) -> true, _ -> false }
+const is_call_expr = (Expr e): Bool -> match e { Expr.Call(c, ta, a, _) -> true, _ -> false }
 # The value forms a whole-tuple binding may take — every form emit resolves telems for: a
 # literal, a call result, a bound tuple name, a tuple element/field (indexed or via `.field`).
 const is_tuple_bindable = (Expr e): Bool -> match e {
 	Expr.Tuple(es) -> true,
-	Expr.Call(c, ta, a) -> true,
+	Expr.Call(c, ta, a, _) -> true,
 	Expr.Var(n) -> true,
 	Expr.Index(a, i) -> true,
 	Expr.IndexExpr(b, i) -> true,
@@ -335,7 +335,7 @@ const is_tuple_bindable = (Expr e): Bool -> match e {
 # out a bound union name / a union-typed record field read, which would put a borrowed value in the tuple.
 const is_fresh_union = (Expr e, Ctx ctx): Bool -> match e {
 	Expr.UnionMk(t, m, args) -> true,
-	Expr.Call(c, ta, a) -> true,
+	Expr.Call(c, ta, a, _) -> true,
 	Expr.Field(base, member) -> find_union(ctx.unions, base) >= 0,
 	_ -> false
 }
@@ -366,7 +366,7 @@ const element_type_name! = (Ty t, Expr e, Ctx ctx): TupElem -> {
 	# array literal or a call result), never an aliased array binding.
 	const Str aen = dyn_of(t)
 	if !str_eq(aen, "") then {
-		const Bool afresh = match e { Expr.ArrayLit(h, s, el, et) -> true, Expr.Call(c, ta, a) -> true, _ -> false }
+		const Bool afresh = match e { Expr.ArrayLit(h, s, el, et) -> true, Expr.Call(c, ta, a, _) -> true, _ -> false }
 		if !afresh then die("cf: type: an array tuple element must be a fresh array literal or a call result, not an alias\n")
 		return tel_leaf("[${aen}]")
 	}
@@ -905,7 +905,7 @@ const is_ptr_arr_arg = (Expr e): Bool -> match e {
 	Expr.Index(_, _) -> true,
 	Expr.IndexExpr(_, _) -> true,
 	Expr.IndexField(_, _, _) -> true,
-	Expr.Call(_, _, _) -> true,
+	Expr.Call(_, _, _, _) -> true,
 	_ -> false
 }
 
@@ -1075,6 +1075,10 @@ const arm_stmts_write_name = ([StmtArm] arms, Str pn): Bool -> {
 }
 const func_writes_ptr_param = (Func fn, Iarch pidx): Bool -> stmts_write_name(fn.body, fn.params[pidx].name)
 const call_type! = (Str callee, [Str] tyargs, [Expr] args, [VarTy] env, Ctx ctx): Ty -> {
+	# the geometry intrinsics (`mem.arena.of(n)`, `mem.page`) yield an opaque node HANDLE — a
+	# pointer-sized value the compiler threads but never inspects; typed as the register word.
+	if str_eq(callee, "cf__arena_of") then return Ty.TInt
+	if str_eq(callee, "cf__page") then return Ty.TInt
 	if is_cast_type(callee) then return cast_type!(callee, args, env, ctx)
 	if str_eq(callee, "Str") then return str_seal_type!(args, env, ctx)
 	# an INDIRECT call: the callee names a function-value binding (a HOF's function parameter)
@@ -1744,7 +1748,7 @@ const arraylit_ret_ty! = (Expr e, Str elem, [VarTy] env, Ctx ctx): Ty -> {
 # than letting emit silently copy zero slots.)
 const is_spreadable_src = (Expr e): Bool -> match e {
 	Expr.Var(n) -> true,
-	Expr.Call(c, ta, a) -> true,
+	Expr.Call(c, ta, a, _) -> true,
 	Expr.Tuple(es) -> true,
 	_ -> false
 }
@@ -2095,7 +2099,7 @@ const arraylit_len = (Expr e): Iarch -> match e {
 	_ -> 0 - 1
 }
 const call_ret_size = (Expr e, Ctx ctx): Iarch -> {
-	const Str cn = match e { Expr.Call(n, ta, args) -> n, _ -> "" }
+	const Str cn = match e { Expr.Call(n, ta, args, _) -> n, _ -> "" }
 	if str_eq(cn, "") then return 0 - 1
 	const Iarch fi = find_func(ctx.funcs, cn)
 	if fi < 0 then return 0 - 1
@@ -2277,7 +2281,7 @@ pub const type_of! = (Expr e, [VarTy] env, Ctx ctx): Ty -> match e {
 	Expr.And(l, r) -> bool_binop!(l, r, env, ctx),
 	Expr.Or(l, r) -> bool_binop!(l, r, env, ctx),
 	Expr.If(c, t, e2) -> if_type!(c, t, e2, env, ctx),
-	Expr.Call(callee, tyargs, args) -> call_type!(callee, tyargs, args, env, ctx),
+	Expr.Call(callee, tyargs, args, _) -> call_type!(callee, tyargs, args, env, ctx),
 	Expr.DeferTap(fn, args) -> defertap_type!(fn, args, env, ctx)
 }
 # `defer fn(args)` in value position: the scheduled call must typecheck (arity + argument types,
@@ -2762,7 +2766,7 @@ const exprs_have_defertap = ([Expr] es): Bool -> {
 }
 const expr_has_defertap = (Expr e): Bool -> match e {
 	Expr.DeferTap(fn, args) -> true,
-	Expr.Call(n, ta, args) -> exprs_have_defertap(args),
+	Expr.Call(n, ta, args, _) -> exprs_have_defertap(args),
 	Expr.UnionMk(t, m, args) -> exprs_have_defertap(args),
 	Expr.Tuple(elems) -> exprs_have_defertap(elems),
 	Expr.ArrayLit(hs, sn, elems, et) -> expr_has_defertap(sn) || exprs_have_defertap(elems),
@@ -2848,7 +2852,7 @@ const exprs_defertap_hoistable = ([Expr] es): Bool -> {
 }
 const defertap_hoistable = (Expr e): Bool -> match e {
 	Expr.DeferTap(fn, args) -> exprs_defertap_hoistable(args),
-	Expr.Call(n, ta, args) -> exprs_defertap_hoistable(args),
+	Expr.Call(n, ta, args, _) -> exprs_defertap_hoistable(args),
 	_ -> !expr_has_defertap(e)
 }
 # A `defer`-tap value is admitted ONLY as (part of) a direct function-body binding / return / call

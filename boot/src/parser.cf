@@ -11,7 +11,7 @@
 import "io" as { die }
 import "token" as { Token, TokKind, is_eof, is_ident, is_intlit, is_strlit, is_lparen, is_rparen, is_lbrace, is_rbrace, is_lbracket, is_rbracket, is_comma, is_colon, is_dot, is_ellipsis, is_eq, is_arrow, is_minus, is_plus, is_star, is_slash, is_percent, is_amp, is_pipe, is_caret, is_tilde, is_bang, is_shl, is_shr, is_eqeq, is_ne, is_lt, is_gt, is_le, is_ge, is_logand, is_logor, is_yield, is_floatlit, is_pipearrow }
 import "lexer" as { lex }
-import "ast" as { Expr, Stmt, Param, Func, Ty, FieldInit, RecDecl, UnionMember, UnionDecl, MatchArm, StmtArm, Seg, RetSig, TupElem, Import, Program }
+import "ast" as { Expr, Stmt, Param, Func, Ty, FieldInit, RecDecl, UnionMember, UnionDecl, MatchArm, StmtArm, Seg, RetSig, TupElem, Import, Program, with_geom }
 import "astutil" as { tel_leaf, tel_nest, tel_fn, tel_is_fn }
 
 # The parse cursor: the token stream, the source (for keyword text), a position.
@@ -228,7 +228,7 @@ const parse_pipe_target! = (*Parser p, Expr piped): Expr -> {
 	let [Expr] args = []
 	if is_lparen(peek(p)) then args = parse_args!(p)
 	const [Str] no_ty = []
-	return Expr.Call(name, no_ty, [...args, piped])
+	return Expr.Call(name, no_ty, [...args, piped], "")
 }
 
 const parse_or! = (*Parser p): Expr -> {
@@ -433,7 +433,7 @@ const parse_args! = (*Parser p): [Expr] -> {
 }
 const parse_call! = (*Parser p, Str name): Expr -> {
 	const [Str] no_ty = []
-	return Expr.Call(name, no_ty, parse_args!(p))
+	return Expr.Call(name, no_ty, parse_args!(p), "")
 }
 
 # `f[T1, T2](args)` — a call to a generic function with explicit type arguments. Each type
@@ -457,7 +457,7 @@ const parse_tyargs! = (*Parser p): [Str] -> {
 const parse_generic_call! = (*Parser p, Str name): Expr -> {
 	const [Str] tys = parse_tyargs!(p)
 	if !is_lparen(peek(p)) then die("cf: parse: expected `(` after type arguments\n")
-	return Expr.Call(name, tys, parse_args!(p))
+	return Expr.Call(name, tys, parse_args!(p), "")
 }
 # Scan a bracket group starting at token index `br` (a `[`) to its matching `]`, returning the
 # index of the token AFTER the `]` (or -1 if unbalanced).
@@ -899,21 +899,23 @@ const parse_primary! = (*Parser p): Expr -> {
 		p.pos = p.pos + 1
 		# `mem.<geometry>.of(args)` / `mem.<geometry>` — the geometry surface (memory_model §4).
 		# Recognized ONLY when the name after the dot is a known geometry, so an ordinary variable
-		# named `mem` is untouched. PARSE-ONLY stub: lower to a placeholder handle `0`; the real
-		# node constructor is the memory arc. The `.of` arg list is parsed for form, then discarded.
+		# named `mem` is untouched. `.of(n)` lowers to the `cf__arena_of` intrinsic (carve a node
+		# from the ambient one); a bare `mem.<geometry>` (e.g. `mem.page`) to the `cf__page` handle.
 		if str_eq(name, "mem") && is_dot(peek(p)) && is_geometry_kw_at(p, 1) then {
 			p.pos = p.pos + 1
 			const Str geom = cur_name!(p)
 			p.pos = p.pos + 1
+			const [Str] mem_noty = []
 			if is_dot(peek(p)) then {
 				p.pos = p.pos + 1
 				if !kw(p, "of") then die("cf: parse: expected `.of` after `mem.<geometry>`\n")
 				p.pos = p.pos + 1
 				if !is_lparen(peek(p)) then die("cf: parse: expected `(` after `mem.<geometry>.of`\n")
 				const [Expr] margs = parse_args!(p)
-				return Expr.Lit(0)
+				return Expr.Call("cf__arena_of", mem_noty, margs, "")
 			}
-			return Expr.Lit(0)
+			const [Expr] mem_noargs = []
+			return Expr.Call("cf__page", mem_noty, mem_noargs, "")
 		}
 		if is_lparen(peek(p)) then {
 			# `Type({ … })` — an explicit record construction (a PascalCase type name). A lowercase
@@ -1123,7 +1125,7 @@ const is_fixed_arraylit = (Expr e, Iarch n): Bool -> match e {
 	_ -> false
 }
 const is_arraylit_e = (Expr e): Bool -> match e { Expr.ArrayLit(hs, sn, elems, et) -> true, _ -> false }
-const is_call_e = (Expr e): Bool -> match e { Expr.Call(c, ta, args) -> true, _ -> false }
+const is_call_e = (Expr e): Bool -> match e { Expr.Call(c, ta, args, _) -> true, _ -> false }
 
 # Validate a destructure pattern token: a bare name binds a position; a `_`-led token is a
 # skip — `_` (one) or `_<digits>` (n) — and anything else (`_foo`) is rejected.
@@ -1364,7 +1366,7 @@ const parse_defer! = (*Parser p): Stmt -> {
 		return Stmt.Defer(body)
 	}
 	const Expr e = parse_expr!(p)
-	const Bool isc = match e { Expr.Call(cn, ct, ca) -> true, _ -> false }
+	const Bool isc = match e { Expr.Call(cn, ct, ca, _) -> true, _ -> false }
 	if !isc then die("cf: parse: `defer` schedules a call `f(…)` or a block `{ … }`\n")
 	const [Stmt] one = [Stmt.Do(e)]
 	return Stmt.Defer(one)
@@ -1374,26 +1376,35 @@ const parse_defer! = (*Parser p): Stmt -> {
 # now: consume and DROP the clause (the real node threading is the memory arc; there is no AST
 # slot to store it yet). `for x in arr` consumes its own `in` in `parse_for`, so this only ever
 # sees the trailing clause on a binding or a call-for-effect statement.
-const skip_in_clause = (*Parser p): Iarch -> {
-	if !kw(p, "in") then return 0
+const in_clause_name! = (*Parser p): Str -> {
+	if !kw(p, "in") then return ""
 	p.pos = p.pos + 1
 	if !is_ident(peek(p)) then die("cf: parse: expected a geometry name after `in`\n")
+	const Str g = cur_name!(p)
 	p.pos = p.pos + 1
-	return 0
+	return g
+}
+
+# Apply an `in <geometry>` clause to a binding: it governs the binding's initializer call, so
+# stamp the geom onto the init expression (a non-call init is unaffected by `with_geom`).
+const let_with_geom = (Stmt s, Str g): Stmt -> {
+	if str_eq(g, "") then return s
+	return match s {
+		Stmt.Let(n, m, t, init) -> Stmt.Let(n, m, t, with_geom(init, g)),
+		_ -> s
+	}
 }
 
 const parse_stmt! = (*Parser p): Stmt -> {
 	if kw(p, "const") then {
 		p.pos = p.pos + 1
 		const Stmt cb = parse_let!(p, false)
-		const Iarch _ci = skip_in_clause(p)
-		return cb
+		return let_with_geom(cb, in_clause_name!(p))
 	}
 	if kw(p, "let") then {
 		p.pos = p.pos + 1
 		const Stmt lb = parse_let!(p, true)
-		const Iarch _li = skip_in_clause(p)
-		return lb
+		return let_with_geom(lb, in_clause_name!(p))
 	}
 	if kw(p, "for") then return parse_for!(p)
 	if kw(p, "loop") then return parse_loop!(p)
@@ -1424,7 +1435,8 @@ const parse_stmt! = (*Parser p): Stmt -> {
 		# takes the following expression — so a valueless guarded return must be braced
 		# (`if c then { return }`), never `if c then return <more…>` (that returns the value).
 		if is_rbrace(peek(p)) || is_comma(peek(p)) then return Stmt.Return(Expr.Unit)
-		return Stmt.Return(parse_expr!(p))
+		const Expr rv = parse_expr!(p)
+		return Stmt.Return(with_geom(rv, in_clause_name!(p)))
 	}
 	# otherwise a call-for-effect statement (`name(args)`), a field mutation
 	# (`name.field = expr`), an element write (`name[i] = expr`), or a whole-name
@@ -1433,14 +1445,12 @@ const parse_stmt! = (*Parser p): Stmt -> {
 		# `name(...)` / `name[T](...)` — a call (possibly generic) evaluated for its effect,
 		# optionally with a trailing `in <geometry>` clause (dropped for now).
 		if is_lparen(p.toks[p.pos + 1].kind) then {
-			const Stmt d = Stmt.Do(parse_expr!(p))
-			const Iarch _di = skip_in_clause(p)
-			return d
+			const Expr de = parse_expr!(p)
+			return Stmt.Do(with_geom(de, in_clause_name!(p)))
 		}
 		if generic_call_stmt_ahead(p) then {
-			const Stmt gd = Stmt.Do(parse_expr!(p))
-			const Iarch _gi = skip_in_clause(p)
-			return gd
+			const Expr ge = parse_expr!(p)
+			return Stmt.Do(with_geom(ge, in_clause_name!(p)))
 		}
 		const Str name = cur_name!(p)
 		p.pos = p.pos + 1
