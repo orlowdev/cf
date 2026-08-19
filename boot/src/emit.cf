@@ -29,7 +29,10 @@ import "astutil" as { is_spread, spread_inner, is_skip, skip_count, is_nested, n
 # reset per function; `funcs`/`recs`/`unions` are constant across the program.
 # `cur_slot` is the merge-slot temp of the nearest value-yielding `loop` (or -1) — a `<- v`
 # stores into it and jumps to `@lend${cur_loop}`, and the `loop` expression loads it afterward.
-data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs, [RecDecl] recs, [UnionDecl] unions, Iarch cur_loop, Iarch cur_slot, Str cur_ret }
+# `reset_mark` carries the current function's per-frame arena mark (geometry_lowering §2): a temp
+# holding `node_0.top` at entry, restored before each `ret` to reclaim the frame's residue. It is
+# "" for a function that is NOT safe to reset (see `fn_resettable`).
+data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs, [RecDecl] recs, [UnionDecl] unions, Iarch cur_loop, Iarch cur_slot, Str cur_ret, Str reset_mark }
 
 # A local/parameter in scope: its interned name, `slot`, its `rec_type` (a record/union
 # type name, `"$dyn"`, `"$ptr"`, or `"Str"` — `""` for a word), and `elem` (a dynamic
@@ -255,6 +258,43 @@ const ret_is_l = (Str ret_name, [RecDecl] recs, [UnionDecl] unions): Bool -> {
 	if find_rec(recs, ret_name) >= 0 then return true
 	if find_union(unions, ret_name) >= 0 then return union_is_boxed(unions, ret_name)
 	return false
+}
+
+# Does a name carry the `!` allocation marker (a byte 33)?
+const name_has_bang = (Str n): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(n.len) then break
+		if Iarch(n[i]) == 33 then return true
+		i = i + 1
+	}
+	return false
+}
+
+# Does any parameter arrive by writable pointer (`*Record`/`*Union`/`*[T]`, `is_ptr` true)? Such a
+# param is the only way a function can REHOME an allocation into a caller-owned aggregate.
+const any_ptr_param = ([Param] ps): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ps.len) then break
+		if ps[i].is_ptr then return true
+		i = i + 1
+	}
+	return false
+}
+
+# Is `fn`'s frame safe to reset per call (geometry_lowering §2)? A `!` function whose residue is
+# ALL trapped: it returns a SCALAR (nothing escapes via return) and takes no writable pointer param
+# (nothing rehomes into a caller — by-value aggregate params are read-only, memory_model §6). Its
+# whole subtree's allocation therefore lands in this frame, so rewinding the node cursor to entry
+# reclaims exactly the dead residue. `main` (holds the graft) and asm floors are excluded.
+const fn_resettable = (*Emit ctx, Func fn): Bool -> {
+	if fn.is_asm then return false
+	if str_eq(fn.name, "main") then return false
+	if !name_has_bang(fn.name) then return false
+	if ret_is_l(fn.ret_name, ctx.recs, ctx.unions) then return false
+	if any_ptr_param(fn.params) then return false
+	return true
 }
 
 # The RETURN signature position of a `$fn` binding — the last telem of its whole `[args…, ret]`
@@ -3105,6 +3145,9 @@ const emit_simple_stmt! = (*Emit ctx, [Binding] env, Stmt s): Iarch -> {
 				const Iarch b = emit_record_lit!(ctx, ctx.cur_ret, record_inits_e(e), env)
 				v = "%t${b}"
 			} else v = emit_expr!(e, ctx, env)
+			# rewind the node cursor to the frame's entry mark, reclaiming its residue (the scalar
+			# return value rides a register, so it survives the reset). geometry_lowering §2.
+			if !str_eq(ctx.reset_mark, "") then write_str(ctx.fd, "\tstorel ${ctx.reset_mark}, %node_0\n")
 			write_str(ctx.fd, "\tret ${v}\n")
 			term = 1
 		},
@@ -3308,6 +3351,15 @@ const emit_func! = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 	}
 	write_str(ctx.fd, ") {\n")
 	write_str(ctx.fd, "@start\n")
+	# per-frame reset (geometry_lowering §2): snapshot the node cursor at entry; each `ret` rewinds
+	# to it, reclaiming this frame's residue. Only for frames provably free of escape (fn_resettable).
+	ctx.reset_mark = ""
+	if fn_resettable(ctx, fn) then {
+		const Iarch mk = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${mk} =l loadl %node_0\n")
+		ctx.reset_mark = "%t${mk}"
+	}
 	let [Binding] params = []
 	let Iarch pi = 0
 	loop {
@@ -4055,7 +4107,7 @@ pub const emit_program! = (Program prog, Uarch qbe_fd, Uarch asm_fd): Iarch -> {
 		if i >= Iarch(prog.funcs.len) then break
 		# an asm function is emitted into the floor, not through QBE
 		if !prog.funcs[i].is_asm then {
-			let Emit ctx = Emit({ fd: qbe_fd, next: 0, label: 0, funcs: prog.funcs, recs: prog.recs, unions: prog.unions, cur_loop: 0 - 1, cur_slot: 0 - 1, cur_ret: "" })
+			let Emit ctx = Emit({ fd: qbe_fd, next: 0, label: 0, funcs: prog.funcs, recs: prog.recs, unions: prog.unions, cur_loop: 0 - 1, cur_slot: 0 - 1, cur_ret: "", reset_mark: "" })
 			emit_func!(&ctx, prog.funcs[i], i)
 		}
 		i = i + 1
