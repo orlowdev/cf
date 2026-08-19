@@ -2015,6 +2015,17 @@ const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env)
 		write_str(ctx.fd, "\t%t${tr} =l call $cf_arena_of(l %node_0, w %t${tw})\n")
 		return "%t${tr}"
 	}
+	# `mem.arena.grow(n)` — carve an ELASTIC arena from the ambient node (grows on overflow).
+	if str_eq(callee, "cf__arena_grow") then {
+		const Str gv = emit_expr!(args[0], ctx, env)
+		const Iarch gw = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${gw} =w copy ${gv}\n")
+		const Iarch gr = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${gr} =l call $cf_arena_grow(l %node_0, w %t${gw})\n")
+		return "%t${gr}"
+	}
 	# `mem.page` — the root page node handle (the address of the $cf_page struct)
 	if str_eq(callee, "cf__page") then {
 		const Iarch tp = ctx.next
@@ -3376,12 +3387,14 @@ const emit_func! = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 # return) live here; scalars stay in stack slots. (Still the single ambient page — the per-node
 # `%node`/`%ret` ABI and carved arenas are the next arc.)
 const emit_arena_qbe = (Uarch fd): Iarch -> {
-	# A MemoryNode is a pointer to `{ top@0, committed@8, limit@16, parent@24 }` (geometry_lowering
-	# §4). `$cf_page` is the root page node; carved arenas get their own node headers. cf_alloc is
-	# NODE-RELATIVE — it bumps whichever node it is handed (`%node`, threaded as arg 0). For the page,
-	# committed < limit so crossing the watermark commits more pages (cf_grow); for a fixed arena
-	# committed == limit, so the same bound check traps on overflow — one allocator, both geometries.
-	write_str(fd, "export data $cf_page = { l 0, l 0, l 0, l 0 }\n")
+	# A MemoryNode is a pointer to `{ top@0, committed@8, limit@16, parent@24, kind@32, chunk@40 }`
+	# (geometry_lowering §4). `$cf_page` is the root page node; carved arenas get their own headers.
+	# cf_alloc is NODE-RELATIVE — it bumps whichever node it is handed (`%node`, threaded as arg 0).
+	# On a limit overflow the behaviour is the node's: `kind` 0 traps (the page — reservation done —
+	# and a FIXED arena, whose committed==limit), `kind` 1 PULLS a fresh `chunk`-sized block from the
+	# parent (an ELASTIC arena). Below the limit, crossing `committed` commits more pages (cf_grow,
+	# the page only; every arena has committed==limit at rest). One allocator serves all three.
+	write_str(fd, "export data $cf_page = { l 0, l 0, l 0, l 0, l 0, l 0 }\n")
 	write_str(fd, "function l $cf_alloc(l %node, w %n) {\n")
 	write_str(fd, "@start\n")
 	write_str(fd, "\t%r7 =w add %n, 7\n")
@@ -3392,7 +3405,19 @@ const emit_arena_qbe = (Uarch fd): Iarch -> {
 	write_str(fd, "\t%limp =l add %node, 16\n")
 	write_str(fd, "\t%lim =l loadl %limp\n")
 	write_str(fd, "\t%ok =w culel %nt, %lim\n")
-	write_str(fd, "\tjnz %ok, @inbounds, @oom\n")
+	write_str(fd, "\tjnz %ok, @inbounds, @over\n")
+	# overflow: an elastic arena (kind 1) pulls a fresh block and allocates from it; else trap
+	write_str(fd, "@over\n")
+	write_str(fd, "\t%kp =l add %node, 32\n")
+	write_str(fd, "\t%kind =l loadl %kp\n")
+	write_str(fd, "\t%elastic =w cnel %kind, 0\n")
+	write_str(fd, "\tjnz %elastic, @pull, @oom\n")
+	write_str(fd, "@pull\n")
+	write_str(fd, "\tcall $cf_arena_pull(l %node, l %sz)\n")
+	write_str(fd, "\t%p2 =l loadl %node\n")
+	write_str(fd, "\t%nt2 =l add %p2, %sz\n")
+	write_str(fd, "\tstorel %nt2, %node\n")
+	write_str(fd, "\tret %p2\n")
 	write_str(fd, "@oom\n")
 	write_str(fd, "\tcall $cf_oom()\n")
 	write_str(fd, "\tret %p\n")
@@ -3408,16 +3433,45 @@ const emit_arena_qbe = (Uarch fd): Iarch -> {
 	write_str(fd, "\tstorel %nt, %node\n")
 	write_str(fd, "\tret %p\n")
 	write_str(fd, "}\n")
-	# `mem.arena.of(n)` — carve a fixed arena from the parent node: pull a 32-byte node header and an
-	# n-byte block from `%node`, then init the arena node { top=blk, committed=blk+n, limit=blk+n,
-	# parent=node }. committed==limit, so cf_alloc traps at the bound (a FIXED arena). No reset yet
-	# (geometry_lowering §5) — the block simply leaks back into the parent page. Returns the header.
+	# cf_arena_pull(node, sz) — an elastic arena's grow step: pull a fresh block (the larger of the
+	# node's `chunk` and the request `sz`) from the parent node and reset {top, committed, limit} to
+	# it. The old block leaks into the parent (no per-object free yet); returned pointers stay valid.
+	write_str(fd, "function $cf_arena_pull(l %node, l %sz) {\n")
+	write_str(fd, "@start\n")
+	write_str(fd, "\t%chunkp =l add %node, 40\n")
+	write_str(fd, "\t%chunk =l loadl %chunkp\n")
+	write_str(fd, "\t%usec =w culel %sz, %chunk\n")
+	write_str(fd, "\tjnz %usec, @c, @s\n")
+	write_str(fd, "@c\n")
+	write_str(fd, "\t%bc =l copy %chunk\n")
+	write_str(fd, "\tjmp @al\n")
+	write_str(fd, "@s\n")
+	write_str(fd, "\t%bs =l copy %sz\n")
+	write_str(fd, "\tjmp @al\n")
+	write_str(fd, "@al\n")
+	write_str(fd, "\t%blksz =l phi @c %bc, @s %bs\n")
+	write_str(fd, "\t%parentp =l add %node, 24\n")
+	write_str(fd, "\t%parent =l loadl %parentp\n")
+	write_str(fd, "\t%bw =w copy %blksz\n")
+	write_str(fd, "\t%block =l call $cf_alloc(l %parent, w %bw)\n")
+	write_str(fd, "\tstorel %block, %node\n")
+	write_str(fd, "\t%end =l add %block, %blksz\n")
+	write_str(fd, "\t%ecommp =l add %node, 8\n")
+	write_str(fd, "\tstorel %end, %ecommp\n")
+	write_str(fd, "\t%elimp =l add %node, 16\n")
+	write_str(fd, "\tstorel %end, %elimp\n")
+	write_str(fd, "\tret\n")
+	write_str(fd, "}\n")
+	# `mem.arena.of(n)` — carve a FIXED arena from the parent: pull a 48-byte node header and an
+	# n-byte block from `%node`, then init { top=blk, committed=blk+n, limit=blk+n, parent=node,
+	# kind=0, chunk=0 }. committed==limit and kind 0, so cf_alloc traps at the bound. The block leaks
+	# into the parent at teardown (no reset yet, geometry_lowering §5). Returns the header.
 	write_str(fd, "function l $cf_arena_of(l %node, w %n) {\n")
 	write_str(fd, "@start\n")
 	write_str(fd, "\t%r7 =w add %n, 7\n")
 	write_str(fd, "\t%ra =w and %r7, -8\n")
 	write_str(fd, "\t%sz =l extuw %ra\n")
-	write_str(fd, "\t%hdr =l call $cf_alloc(l %node, w 32)\n")
+	write_str(fd, "\t%hdr =l call $cf_alloc(l %node, w 48)\n")
 	write_str(fd, "\t%blk =l call $cf_alloc(l %node, w %n)\n")
 	write_str(fd, "\tstorel %blk, %hdr\n")
 	write_str(fd, "\t%end =l add %blk, %sz\n")
@@ -3427,6 +3481,34 @@ const emit_arena_qbe = (Uarch fd): Iarch -> {
 	write_str(fd, "\tstorel %end, %c16\n")
 	write_str(fd, "\t%c24 =l add %hdr, 24\n")
 	write_str(fd, "\tstorel %node, %c24\n")
+	write_str(fd, "\t%c32 =l add %hdr, 32\n")
+	write_str(fd, "\tstorel 0, %c32\n")
+	write_str(fd, "\t%c40 =l add %hdr, 40\n")
+	write_str(fd, "\tstorel 0, %c40\n")
+	write_str(fd, "\tret %hdr\n")
+	write_str(fd, "}\n")
+	# `mem.arena.grow(n)` — carve an ELASTIC arena from the parent: like the fixed arena but kind=1
+	# and chunk=n, so a limit overflow pulls another n-sized block from the parent (cf_arena_pull)
+	# instead of trapping. Grows until the parent (ultimately the 4 GiB page) is exhausted.
+	write_str(fd, "function l $cf_arena_grow(l %node, w %n) {\n")
+	write_str(fd, "@start\n")
+	write_str(fd, "\t%r7 =w add %n, 7\n")
+	write_str(fd, "\t%ra =w and %r7, -8\n")
+	write_str(fd, "\t%sz =l extuw %ra\n")
+	write_str(fd, "\t%hdr =l call $cf_alloc(l %node, w 48)\n")
+	write_str(fd, "\t%blk =l call $cf_alloc(l %node, w %n)\n")
+	write_str(fd, "\tstorel %blk, %hdr\n")
+	write_str(fd, "\t%end =l add %blk, %sz\n")
+	write_str(fd, "\t%g8 =l add %hdr, 8\n")
+	write_str(fd, "\tstorel %end, %g8\n")
+	write_str(fd, "\t%g16 =l add %hdr, 16\n")
+	write_str(fd, "\tstorel %end, %g16\n")
+	write_str(fd, "\t%g24 =l add %hdr, 24\n")
+	write_str(fd, "\tstorel %node, %g24\n")
+	write_str(fd, "\t%g32 =l add %hdr, 32\n")
+	write_str(fd, "\tstorel 1, %g32\n")
+	write_str(fd, "\t%g40 =l add %hdr, 40\n")
+	write_str(fd, "\tstorel %sz, %g40\n")
 	write_str(fd, "\tret %hdr\n")
 	write_str(fd, "}\n")
 	# `[T]` grow-in-place append: given the 24-byte header {data@0, len@8, cap@16} and
