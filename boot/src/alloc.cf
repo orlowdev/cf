@@ -1,0 +1,667 @@
+# alloc — the `!` allocation algebra, checked both ways (memory_model §5).
+#
+# A function is `!` ("colored") when it NEEDS memory: it holds at least one aggregate that
+# lives and dies within its own frame (residue that never escapes), OR it calls another
+# concrete `!` function (not one received as a parameter), OR it passes a `!` function VALUE
+# as a call argument (the effect rides the visibly-`!` argument). The color propagates up the
+# call chain and terminates at `main`, which the runtime runs under the root — so `main` is the
+# one exemption. The marker `!` is part of the function's NAME (ebnf § Identifiers), written by
+# the user; this pass validates it BOTH WAYS — a missing `!` on an allocator is an error, and a
+# redundant `!` on a colorless function is an error.
+#
+# GATED. cf's own 830 functions are not yet colored, so this runs only when the caller passes
+# `--check-alloc` (a corpus test opts in with `# check: alloc`); cf's normal self-build never
+# does, and compiles its unmarked source unchanged. The global mark-everything rollout is a
+# separate follow-up. Runs after monomorphization (every call is concrete) and after typecheck.
+#
+# Escape (memory_model §5): a value escapes by RETURNING (handed to the caller) or REHOMING
+# (stored into a caller-owned aggregate — an assignment into a parameter aggregate). Allocation
+# that escapes is charged to the destination's owner, not the allocator. So a constructed
+# aggregate is RESIDUE iff it is trapped — neither returned nor rehomed. `compute_esc` finds the
+# local names that escape; `scan_trapped`/`scan_escaping` then decide whether any construction is
+# trapped. A `defer` body is analyzed in the enclosing frame (its residence is the function's); a
+# closure body is analyzed with its OWN context and a `!` closure colors the function that holds it.
+
+import "ast" as { Expr, Stmt, MatchArm, StmtArm, Seg, FieldInit, Param, UnionDecl, UnionMember, Func, Program }
+import "io" as { die, write_str, stdout }
+
+const str_eq = (Str a, Str b): Bool -> {
+	if a.len != b.len then return false
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(a.len) then break
+		if Iarch(a[i]) != Iarch(b[i]) then return false
+		i = i + 1
+	}
+	return true
+}
+
+# A name carries the allocation marker iff it contains a `!` (byte 33). The marker rides directly
+# after the base name in the source (`alloc!`); monomorphization then appends an instance suffix
+# (`alloc!__0`), so the `!` need not be the last byte — but the suffix (`__N`) never contains one,
+# so scanning for any `!` faithfully recovers the declared color.
+const is_bang_name = (Str n): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(n.len) then break
+		if Iarch(n[i]) == 33 then return true
+		i = i + 1
+	}
+	return false
+}
+
+const has_name = ([Str] xs, Str s): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(xs.len) then break
+		if str_eq(xs[i], s) then return true
+		i = i + 1
+	}
+	return false
+}
+
+# Typed empty lists — a bare `[]` in expression position defaults to `[Iarch]`, so a `[Str]`/`[Expr]`
+# result must be produced through an annotated binding.
+const no_strs = (): [Str] -> {
+	let [Str] e = []
+	return e
+}
+
+const no_exprs = (): [Expr] -> {
+	let [Expr] e = []
+	return e
+}
+
+# Concatenate two lists. Built from a FRESH `[]` — `let r = a; r = [...r, x]` would alias and mutate
+# the caller's `a` in place (the array-aliasing hazard), corrupting a list read again later.
+const cat_e = ([Expr] a, [Expr] b): [Expr] -> {
+	let [Expr] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(a.len) then break
+		r = [...r, a[i]]
+		i = i + 1
+	}
+	let Iarch j = 0
+	loop {
+		if j >= Iarch(b.len) then break
+		r = [...r, b[j]]
+		j = j + 1
+	}
+	return r
+}
+
+const cat_s = ([Str] a, [Str] b): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(a.len) then break
+		r = [...r, a[i]]
+		i = i + 1
+	}
+	let Iarch j = 0
+	loop {
+		if j >= Iarch(b.len) then break
+		r = [...r, b[j]]
+		j = j + 1
+	}
+	return r
+}
+
+# Add each name in `b` not already present in `a` (a monotone set union). Fresh backing, as above.
+const union_names = ([Str] a, [Str] b): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(a.len) then break
+		r = [...r, a[i]]
+		i = i + 1
+	}
+	let Iarch j = 0
+	loop {
+		if j >= Iarch(b.len) then break
+		if !has_name(r, b[j]) then r = [...r, b[j]]
+		j = j + 1
+	}
+	return r
+}
+
+# A union is BOXED (its values are `{tag, …}` arena pointers, so a construction allocates) iff any
+# member anywhere carries a payload; a union with no payload anywhere is a bare word tag.
+const union_boxed = ([UnionDecl] unions, Str name): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(unions.len) then break
+		if str_eq(unions[i].name, name) then {
+			let Iarch j = 0
+			loop {
+				if j >= Iarch(unions[i].members.len) then break
+				if Iarch(unions[i].members[j].payloads.len) > 0 then return true
+				j = j + 1
+			}
+			return false
+		}
+		i = i + 1
+	}
+	return false
+}
+
+# The read-only context threaded through the residue scan: the union table (to tell a boxed
+# construction from a bare-word one), the current function's parameter names (a rehome target),
+# and the set of local names that escape.
+data ACtx = { [UnionDecl] unions, [Str] params, [Str] esc }
+
+# The immediate EXPRESSION children of `e`, for the generic residue / call recursion. Every
+# recursive expr form except a value block `Expr.Loop` (which holds STATEMENTS, walked specially)
+# lists its sub-expressions here; leaves return `[]`. Match arm BODIES are expressions.
+const field_values = ([FieldInit] fs): [Expr] -> {
+	let [Expr] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(fs.len) then break
+		r = [...r, fs[i].value]
+		i = i + 1
+	}
+	return r
+}
+
+const hole_exprs = ([Seg] segs): [Expr] -> {
+	let [Expr] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(segs.len) then break
+		if segs[i].is_hole then r = [...r, segs[i].expr]
+		i = i + 1
+	}
+	return r
+}
+
+const arm_bodies = ([MatchArm] arms): [Expr] -> {
+	let [Expr] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		r = [...r, arms[i].body]
+		i = i + 1
+	}
+	return r
+}
+
+# A single-element list `[a]` sets its element type from `a`; longer lists are grown by spread, so a
+# multi-element `[Expr]` of a union type is built through these rather than a plain `[a, b]` literal.
+const exl_one = (Expr a): [Expr] -> {
+	let [Expr] r = [a]
+	return r
+}
+
+const exl_two! = (Expr a, Expr b): [Expr] -> {
+	let [Expr] r = [a]
+	return [...r, b]
+}
+
+const exl_three! = (Expr a, Expr b, Expr c): [Expr] -> {
+	let [Expr] r = [a]
+	r = [...r, b]
+	return [...r, c]
+}
+
+const expr_children! = (Expr e): [Expr] -> match e {
+	Expr.Record(_, inits) -> field_values(inits),
+	Expr.ArrayLit(_, sp, elems, _) -> cat_e(exl_one(sp), elems),
+	Expr.Tuple(elems) -> elems,
+	Expr.UnionMk(_, _, args) -> args,
+	Expr.Interp(segs) -> hole_exprs(segs),
+	Expr.Buffer(sz) -> exl_one(sz),
+	Expr.Match(s, arms) -> cat_e(exl_one(s), arm_bodies(arms)),
+	Expr.If(c, t, el) -> exl_three!(c, t, el),
+	Expr.Call(_, _, args) -> args,
+	Expr.DeferTap(_, args) -> args,
+	Expr.FieldExpr(b, _) -> exl_one(b),
+	Expr.Index(_, i) -> exl_one(i),
+	Expr.IndexField(_, i, _) -> exl_one(i),
+	Expr.IndexExpr(b, i) -> exl_two!(b, i),
+	Expr.Spread(x) -> exl_one(x),
+	Expr.Neg(x) -> exl_one(x),
+	Expr.Not(x) -> exl_one(x),
+	Expr.BitNot(x) -> exl_one(x),
+	Expr.Add(a, b) -> exl_two!(a, b),
+	Expr.Sub(a, b) -> exl_two!(a, b),
+	Expr.Mul(a, b) -> exl_two!(a, b),
+	Expr.Div(a, b) -> exl_two!(a, b),
+	Expr.Mod(a, b) -> exl_two!(a, b),
+	Expr.BitAnd(a, b) -> exl_two!(a, b),
+	Expr.BitOr(a, b) -> exl_two!(a, b),
+	Expr.BitXor(a, b) -> exl_two!(a, b),
+	Expr.Shl(a, b) -> exl_two!(a, b),
+	Expr.Shr(a, b) -> exl_two!(a, b),
+	Expr.CmpEq(a, b) -> exl_two!(a, b),
+	Expr.CmpNe(a, b) -> exl_two!(a, b),
+	Expr.CmpLt(a, b) -> exl_two!(a, b),
+	Expr.CmpGt(a, b) -> exl_two!(a, b),
+	Expr.CmpLe(a, b) -> exl_two!(a, b),
+	Expr.CmpGe(a, b) -> exl_two!(a, b),
+	Expr.And(a, b) -> exl_two!(a, b),
+	Expr.Or(a, b) -> exl_two!(a, b),
+	_ -> no_exprs()
+}
+
+# Does `e` CONSTRUCT an aggregate at this node? Records, arrays, tuples, byte buffers, and
+# runtime-built (interpolated) strings always do; a union construction does iff its union is boxed.
+# A string LITERAL is static data, not residue.
+const is_construction = (ACtx cx, Expr e): Bool -> match e {
+	Expr.Record(_, _) -> true,
+	Expr.ArrayLit(_, _, _, _) -> true,
+	Expr.Tuple(_) -> true,
+	Expr.Buffer(_) -> true,
+	Expr.Interp(_) -> true,
+	Expr.UnionMk(u, _, _) -> union_boxed(cx.unions, u),
+	_ -> false
+}
+
+# Whether ANY of `es` traps a residue (non-escaping context).
+const any_trapped! = (ACtx cx, [Expr] es): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(es.len) then break
+		if scan_trapped!(cx, es[i]) then return true
+		i = i + 1
+	}
+	return false
+}
+
+# `e` is in a NON-escaping position: a construction here is trapped residue, and everything
+# within is likewise non-escaping. Returns whether any trapped construction exists.
+const scan_trapped! = (ACtx cx, Expr e): Bool -> {
+	if is_construction(cx, e) then return true
+	return match e {
+		Expr.Loop(ss) -> body_traps!(cx, false, ss),
+		_ -> any_trapped!(cx, expr_children!(e))
+	}
+}
+
+# Whether ANY of `es` traps a residue while itself in an ESCAPING position.
+const any_escaping! = (ACtx cx, [Expr] es): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(es.len) then break
+		if scan_escaping!(cx, es[i]) then return true
+		i = i + 1
+	}
+	return false
+}
+
+# `e` is in an ESCAPING position (its value is returned or rehomed): a construction HERE is not
+# residue, but a construction inside a call argument, a read base, or an if-condition IS. Returns
+# whether any trapped construction exists within.
+const scan_escaping! = (ACtx cx, Expr e): Bool -> match e {
+	Expr.Record(_, inits) -> any_escaping!(cx, field_values(inits)),
+	Expr.ArrayLit(_, sp, elems, _) -> scan_trapped!(cx, sp) || any_escaping!(cx, elems),
+	Expr.Tuple(elems) -> any_escaping!(cx, elems),
+	Expr.UnionMk(_, _, args) -> any_escaping!(cx, args),
+	Expr.Buffer(sz) -> scan_trapped!(cx, sz),
+	Expr.Interp(segs) -> any_trapped!(cx, hole_exprs(segs)),
+	Expr.If(c, t, el) -> scan_trapped!(cx, c) || scan_escaping!(cx, t) || scan_escaping!(cx, el),
+	Expr.Match(s, arms) -> scan_trapped!(cx, s) || any_escaping!(cx, arm_bodies(arms)),
+	Expr.Loop(ss) -> body_traps!(cx, true, ss),
+	Expr.Call(_, _, args) -> any_trapped!(cx, args),
+	_ -> scan_trapped!(cx, e)
+}
+
+# Walk a statement list for trapped residue. `yesc` says whether a `<- v` yield escapes (true when
+# the enclosing value block is itself in an escaping position).
+const body_traps! = (ACtx cx, Bool yesc, [Stmt] ss): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		if stmt_traps!(cx, yesc, ss[i]) then return true
+		i = i + 1
+	}
+	return false
+}
+
+const stmtarms_traps! = (ACtx cx, Bool yesc, [StmtArm] arms): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		if body_traps!(cx, yesc, arms[i].body) then return true
+		i = i + 1
+	}
+	return false
+}
+
+# A binding target escapes if it is a parameter (rehome into a caller aggregate) or a local already
+# known to escape (its value flows to a return / rehome).
+const target_escapes = (ACtx cx, Str name): Bool -> has_name(cx.params, name) || has_name(cx.esc, name)
+
+const stmt_traps! = (ACtx cx, Bool yesc, Stmt s): Bool -> match s {
+	Stmt.Return(e) -> scan_escaping!(cx, e),
+	Stmt.Yield(e) -> if yesc then scan_escaping!(cx, e) else scan_trapped!(cx, e),
+	Stmt.Let(name, _, _, init) -> if has_name(cx.esc, name) then scan_escaping!(cx, init) else scan_trapped!(cx, init),
+	Stmt.Assign(name, val) -> if target_escapes(cx, name) then scan_escaping!(cx, val) else scan_trapped!(cx, val),
+	Stmt.FieldAssign(base, _, val) -> if target_escapes(cx, base) then scan_escaping!(cx, val) else scan_trapped!(cx, val),
+	Stmt.DeepFieldAssign(be, _, val) -> scan_trapped!(cx, be) || scan_trapped!(cx, val),
+	Stmt.IndexAssign(base, idx, val) -> scan_trapped!(cx, idx) || (if target_escapes(cx, base) then scan_escaping!(cx, val) else scan_trapped!(cx, val)),
+	Stmt.Do(e) -> scan_trapped!(cx, e),
+	Stmt.IfThen(c, s2) -> scan_trapped!(cx, c) || stmt_traps!(cx, yesc, s2),
+	Stmt.IfElse(c, t, el) -> scan_trapped!(cx, c) || stmt_traps!(cx, yesc, t) || stmt_traps!(cx, yesc, el),
+	Stmt.Block(ss) -> body_traps!(cx, yesc, ss),
+	Stmt.Loop(ss) -> body_traps!(cx, yesc, ss),
+	Stmt.ForIn(_, _, ss) -> body_traps!(cx, yesc, ss),
+	Stmt.Match(sc, arms) -> scan_trapped!(cx, sc) || stmtarms_traps!(cx, yesc, arms),
+	Stmt.Destructure(_, _, e) -> scan_trapped!(cx, e),
+	# a `defer` body runs in THIS frame at scope exit (for effect, never returning), so its residue
+	# is the enclosing function's — descend with the same context
+	Stmt.Defer(ss) -> body_traps!(cx, false, ss),
+	# a closure's residue is its own; analyze it with its own context and let a `!` closure color us
+	Stmt.Closure(_, cps, _, cbody) -> closure_traps!(cx.unions, cps, cbody),
+	_ -> false
+}
+
+# The local names that escape when `e` is in an escaping position: bare `Var`s reachable through
+# aggregate components / branches / value-block yields (NOT through call arguments or read bases,
+# which do not escape).
+const yield_vars = ([Stmt] ss): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		r = match ss[i] {
+			Stmt.Yield(e) -> cat_s(r, esc_vars(e)),
+			_ -> r
+		}
+		i = i + 1
+	}
+	return r
+}
+
+const esc_vars = (Expr e): [Str] -> match e {
+	Expr.Var(n) -> [n],
+	Expr.Record(_, inits) -> vars_of(field_values(inits)),
+	Expr.ArrayLit(_, _, elems, _) -> vars_of(elems),
+	Expr.Tuple(elems) -> vars_of(elems),
+	Expr.UnionMk(_, _, args) -> vars_of(args),
+	Expr.If(_, t, el) -> cat_s(esc_vars(t), esc_vars(el)),
+	Expr.Match(_, arms) -> vars_of(arm_bodies(arms)),
+	Expr.Loop(ss) -> yield_vars(ss),
+	Expr.Spread(x) -> esc_vars(x),
+	_ -> no_strs()
+}
+
+const vars_of = ([Expr] es): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(es.len) then break
+		r = cat_s(r, esc_vars(es[i]))
+		i = i + 1
+	}
+	return r
+}
+
+# One pass collecting escape roots and closing aliasing: a return/yield escapes its value's vars; a
+# rehome (assign / field / index into a parameter or escaping aggregate) escapes the stored vars; a
+# binding to an already-escaping name escapes its initializer's vars. Iterated to a fixpoint.
+const esc_roots_stmt = ([Str] params, [Str] esc, Stmt s): [Str] -> match s {
+	Stmt.Return(e) -> esc_vars(e),
+	Stmt.Yield(e) -> esc_vars(e),
+	Stmt.Assign(name, val) -> if has_name(params, name) || has_name(esc, name) then esc_vars(val) else no_strs(),
+	Stmt.FieldAssign(base, _, val) -> if has_name(params, base) || has_name(esc, base) then esc_vars(val) else no_strs(),
+	Stmt.IndexAssign(base, _, val) -> if has_name(params, base) || has_name(esc, base) then esc_vars(val) else no_strs(),
+	Stmt.Let(name, _, _, init) -> if has_name(esc, name) then esc_vars(init) else no_strs(),
+	Stmt.IfThen(_, s2) -> esc_roots_stmt(params, esc, s2),
+	Stmt.IfElse(_, t, el) -> cat_s(esc_roots_stmt(params, esc, t), esc_roots_stmt(params, esc, el)),
+	Stmt.Block(ss) -> esc_roots_body(params, esc, ss),
+	Stmt.Loop(ss) -> esc_roots_body(params, esc, ss),
+	Stmt.ForIn(_, _, ss) -> esc_roots_body(params, esc, ss),
+	Stmt.Match(_, arms) -> esc_roots_stmtarms(params, esc, arms),
+	# a `defer` body shares this frame's locals/params, so a rehome inside it escapes too
+	Stmt.Defer(ss) -> esc_roots_body(params, esc, ss),
+	_ -> no_strs()
+}
+
+const esc_roots_body = ([Str] params, [Str] esc, [Stmt] ss): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		r = cat_s(r, esc_roots_stmt(params, esc, ss[i]))
+		i = i + 1
+	}
+	return r
+}
+
+const esc_roots_stmtarms = ([Str] params, [Str] esc, [StmtArm] arms): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		r = cat_s(r, esc_roots_body(params, esc, arms[i].body))
+		i = i + 1
+	}
+	return r
+}
+
+const compute_esc = ([Str] params, [Stmt] body): [Str] -> {
+	let [Str] esc = []
+	loop {
+		const [Str] add = esc_roots_body(params, esc, body)
+		const [Str] merged = union_names(esc, add)
+		if Iarch(merged.len) == Iarch(esc.len) then break
+		esc = merged
+	}
+	return esc
+}
+
+const plist_names = ([Param] ps): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ps.len) then break
+		r = [...r, ps[i].name]
+		i = i + 1
+	}
+	return r
+}
+
+const param_names = (Func f): [Str] -> plist_names(f.params)
+
+# A local closure (memory_model §7) is lifted to its own top-level function; its residence is its
+# own, escaping to the enclosing caller only when returned. Analyze the body with the CLOSURE's own
+# parameters and a fresh escape set — if it traps residue, the enclosing function (which defines and
+# invokes it) is colored `!`, exactly as if it called a `!` function. Closures do not nest in v1.
+const closure_traps! = ([UnionDecl] unions, [Param] cps, [Stmt] cbody): Bool -> {
+	const [Str] cparams = plist_names(cps)
+	const [Str] cesc = compute_esc(cparams, cbody)
+	const ACtx cx2 = ACtx({ unions: unions, params: cparams, esc: cesc })
+	return body_traps!(cx2, false, cbody)
+}
+
+# Does function `f` hold a trapped (non-escaping) aggregate residence of its own?
+const local_residue! = ([UnionDecl] unions, Func f): Bool -> {
+	const [Str] params = param_names(f)
+	const [Str] esc = compute_esc(params, f.body)
+	const ACtx cx = ACtx({ unions: unions, params: params, esc: esc })
+	return body_traps!(cx, false, f.body)
+}
+
+# The call-side effect check. A call is effectful when its concrete (non-parameter) callee is `!`,
+# or when it hands a `!` function VALUE as an argument. Definition-side: calling a `!` value
+# received as a PARAMETER does NOT color (that effect rides the argument at the call site instead).
+const find_func = ([Func] funcs, Str name): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(funcs.len) then break
+		if str_eq(funcs[i].name, name) then return i
+		i = i + 1
+	}
+	return -1
+}
+
+const named_fn_is_bang = ([Func] funcs, [Bool] bang, Str vn): Bool -> {
+	const Iarch k = find_func(funcs, vn)
+	if k < 0 then return false
+	return bang[k]
+}
+
+const arg_is_bang_fnval = ([Func] funcs, [Bool] bang, Expr arg): Bool -> match arg {
+	Expr.Var(vn) -> named_fn_is_bang(funcs, bang, vn),
+	_ -> false
+}
+
+const args_pass_bang = ([Func] funcs, [Bool] bang, [Expr] args): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(args.len) then break
+		if arg_is_bang_fnval(funcs, bang, args[i]) then return true
+		i = i + 1
+	}
+	return false
+}
+
+const call_is_effectful = ([Func] funcs, [Bool] bang, [Str] params, Str name, [Expr] args): Bool -> {
+	if !has_name(params, name) then {
+		const Iarch k = find_func(funcs, name)
+		if k >= 0 && bang[k] then return true
+	}
+	return args_pass_bang(funcs, bang, args)
+}
+
+const list_calls_bang! = ([Func] funcs, [Bool] bang, [Str] params, [Expr] es): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(es.len) then break
+		if expr_calls_bang!(funcs, bang, params, es[i]) then return true
+		i = i + 1
+	}
+	return false
+}
+
+const expr_calls_bang! = ([Func] funcs, [Bool] bang, [Str] params, Expr e): Bool -> {
+	const Bool here = match e {
+		Expr.Call(name, _, args) -> call_is_effectful(funcs, bang, params, name, args),
+		Expr.DeferTap(name, args) -> call_is_effectful(funcs, bang, params, name, args),
+		_ -> false
+	}
+	if here then return true
+	return match e {
+		Expr.Loop(ss) -> body_calls_bang!(funcs, bang, params, ss),
+		_ -> list_calls_bang!(funcs, bang, params, expr_children!(e))
+	}
+}
+
+const body_calls_bang! = ([Func] funcs, [Bool] bang, [Str] params, [Stmt] ss): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		if stmt_calls_bang!(funcs, bang, params, ss[i]) then return true
+		i = i + 1
+	}
+	return false
+}
+
+const stmtarms_calls_bang! = ([Func] funcs, [Bool] bang, [Str] params, [StmtArm] arms): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		if body_calls_bang!(funcs, bang, params, arms[i].body) then return true
+		i = i + 1
+	}
+	return false
+}
+
+const stmt_calls_bang! = ([Func] funcs, [Bool] bang, [Str] params, Stmt s): Bool -> match s {
+	Stmt.Return(e) -> expr_calls_bang!(funcs, bang, params, e),
+	Stmt.Yield(e) -> expr_calls_bang!(funcs, bang, params, e),
+	Stmt.Let(_, _, _, init) -> expr_calls_bang!(funcs, bang, params, init),
+	Stmt.Assign(_, val) -> expr_calls_bang!(funcs, bang, params, val),
+	Stmt.FieldAssign(_, _, val) -> expr_calls_bang!(funcs, bang, params, val),
+	Stmt.DeepFieldAssign(be, _, val) -> expr_calls_bang!(funcs, bang, params, be) || expr_calls_bang!(funcs, bang, params, val),
+	Stmt.IndexAssign(_, idx, val) -> expr_calls_bang!(funcs, bang, params, idx) || expr_calls_bang!(funcs, bang, params, val),
+	Stmt.Do(e) -> expr_calls_bang!(funcs, bang, params, e),
+	Stmt.IfThen(c, s2) -> expr_calls_bang!(funcs, bang, params, c) || stmt_calls_bang!(funcs, bang, params, s2),
+	Stmt.IfElse(c, t, el) -> expr_calls_bang!(funcs, bang, params, c) || stmt_calls_bang!(funcs, bang, params, t) || stmt_calls_bang!(funcs, bang, params, el),
+	Stmt.Block(ss) -> body_calls_bang!(funcs, bang, params, ss),
+	Stmt.Loop(ss) -> body_calls_bang!(funcs, bang, params, ss),
+	Stmt.ForIn(_, _, ss) -> body_calls_bang!(funcs, bang, params, ss),
+	Stmt.Match(sc, arms) -> expr_calls_bang!(funcs, bang, params, sc) || stmtarms_calls_bang!(funcs, bang, params, arms),
+	Stmt.Destructure(_, _, e) -> expr_calls_bang!(funcs, bang, params, e),
+	# a `!` call inside a `defer` or a closure body colors the enclosing function; the closure's own
+	# parameters join the indirect set so calling a closure fn-value parameter does not count
+	Stmt.Defer(ss) -> body_calls_bang!(funcs, bang, params, ss),
+	Stmt.Closure(_, cps, _, cbody) -> body_calls_bang!(funcs, bang, cat_s(params, plist_names(cps)), cbody),
+	_ -> false
+}
+
+const is_main = (Func f): Bool -> str_eq(f.name, "main")
+
+# The color of every function, as a `[Bool]` parallel to `prog.funcs`. Seeded bottom-up from local
+# residue (an asm/intrinsic body cannot be analyzed, so its declared marker is TRUSTED), then the
+# color is propagated UP the call chain to a fixpoint: a function is `!` if it locally allocates, or
+# transitively makes an effectful call (a concrete `!` callee, or a `!` function VALUE argument).
+const compute_bang! = (Program prog): [Bool] -> {
+	const [Func] funcs = prog.funcs
+	const Iarch n = Iarch(funcs.len)
+	let [Bool] bang = []
+	let Iarch i = 0
+	loop {
+		if i >= n then break
+		const Bool seed = if funcs[i].is_asm then is_bang_name(funcs[i].name) else local_residue!(prog.unions, funcs[i])
+		bang = [...bang, seed]
+		i = i + 1
+	}
+	loop {
+		let Bool changed = false
+		let [Bool] nb = []
+		let Iarch k = 0
+		loop {
+			if k >= n then break
+			let Bool v = bang[k]
+			if !funcs[k].is_asm && !v then {
+				if body_calls_bang!(funcs, bang, param_names(funcs[k]), funcs[k].body) then v = true
+			}
+			# the color is monotone (only false → true), so a change is exactly v rising over bang[k]
+			if v && !bang[k] then changed = true
+			nb = [...nb, v]
+			k = k + 1
+		}
+		bang = nb
+		if !changed then break
+	}
+	return bang
+}
+
+# Validate the declared `!` marker against the computed color, both ways. `main` is exempt; an
+# `asm`/intrinsic body trusts its own marker (it is not re-derived).
+pub const check_alloc_program! = (Program prog) -> {
+	const [Func] funcs = prog.funcs
+	const [Bool] bang = compute_bang!(prog)
+	let Iarch j = 0
+	loop {
+		if j >= Iarch(funcs.len) then break
+		if !funcs[j].is_asm && !is_main(funcs[j]) then {
+			const Bool decl = is_bang_name(funcs[j].name)
+			if decl && !bang[j] then die("cf: alloc: `${funcs[j].name}` is marked `!` but allocates no residue — drop the marker\n")
+			if !decl && bang[j] then die("cf: alloc: `${funcs[j].name}` allocates residue (or calls a `!` function) but is not marked `!`\n")
+		}
+		j = j + 1
+	}
+	return 0
+}
+
+# Suggest mode (Stage C rollout tooling): print, one per line, the SOURCE name of every function the
+# analysis colors `!` but that is not yet marked — the exact set to annotate. Run PRE-monomorph so
+# names are source names and a generic that may allocate in any instantiation is reported once.
+pub const suggest_alloc_program! = (Program prog) -> {
+	const [Func] funcs = prog.funcs
+	const [Bool] bang = compute_bang!(prog)
+	let Iarch j = 0
+	loop {
+		if j >= Iarch(funcs.len) then break
+		if !funcs[j].is_asm && !is_main(funcs[j]) && bang[j] && !is_bang_name(funcs[j].name) then {
+			write_str(Uarch(stdout), funcs[j].name)
+			write_str(Uarch(stdout), "\n")
+		}
+		j = j + 1
+	}
+	return 0
+}
