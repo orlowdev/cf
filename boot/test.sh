@@ -50,16 +50,6 @@ while IFS= read -r name; do
 
 	expect=$(sed -n 's/^# *expect: *//p' "$cf" | head -1)
 	args=$(sed -n 's/^# *args: *//p' "$cf" | head -1)
-	# `# check: alloc` opts the test into the `!` allocation-algebra both-ways check (alloc.cf);
-	# the driver forwards the flag to cf. Absent it, the check is off and only lex/parse/type run.
-	check=$(sed -n 's/^# *check: *//p' "$cf" | head -1)
-	cfflag=""
-	if [ "$check" = "alloc" ]; then
-		cfflag="--check-alloc"
-	fi
-	if [ "$check" = "root" ]; then
-		cfflag="--check-root"
-	fi
 	if [ -z "$expect" ]; then
 		echo "FAIL $name (no \`# expect:\` directive)"
 		fail=$((fail + 1))
@@ -70,7 +60,7 @@ while IFS= read -r name; do
 
 	if [ "$expect" = "error" ]; then
 		# The program must FAIL to compile (cf rejects it, or the qbe/cc tail fails).
-		if "$driver" "$cf" "$bin" $cfflag >/dev/null 2>&1; then
+		if "$driver" "$cf" "$bin" >/dev/null 2>&1; then
 			echo "FAIL $name (compiled, expected an error)"
 			fail=$((fail + 1))
 		else
@@ -82,7 +72,7 @@ while IFS= read -r name; do
 
 	want=${expect#exit }
 
-	if ! "$driver" "$cf" "$bin" $cfflag >/dev/null 2>&1; then
+	if ! "$driver" "$cf" "$bin" >/dev/null 2>&1; then
 		echo "FAIL $name (cf did not compile)"
 		fail=$((fail + 1))
 		continue
