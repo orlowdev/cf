@@ -10,23 +10,31 @@
 # the loader even with no libc symbol used). This is the same tail boot/build.sh
 # uses to assemble the seed into cf itself.
 #
-#   driver.sh <input.cf> <out-binary>
+#   driver.sh <input.cf> <out-binary> [--check-alloc]
+#
+# The optional trailing `--check-alloc` turns on the `!` allocation-algebra both-ways check
+# (alloc.cf); the corpus harness forwards it for a test carrying `# check: alloc`.
 set -eu
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 cf="$root/var/cf"
 qbe="$root/opt/qbe/qbe"
 
-if [ "$#" -ne 2 ]; then
-	echo "usage: driver.sh <input.cf> <out-binary>" >&2
+if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
+	echo "usage: driver.sh <input.cf> <out-binary> [--check-alloc]" >&2
 	exit 2
 fi
 in=$1
 out=$2
+cfflag=${3:-}
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/cf-driver.XXXXXX") || exit 1
 trap 'rm -rf "$tmp"' EXIT
 
-"$cf" "$in" "$tmp/prog.qbe" "$tmp/floor.s"
+if [ -n "$cfflag" ]; then
+	"$cf" "$cfflag" "$in" "$tmp/prog.qbe" "$tmp/floor.s"
+else
+	"$cf" "$in" "$tmp/prog.qbe" "$tmp/floor.s"
+fi
 "$qbe" -t arm64_apple -o "$tmp/prog.s" "$tmp/prog.qbe"
 cc -nostdlib -lSystem -Wl,-e,_start -o "$out" "$tmp/floor.s" "$tmp/prog.s"
