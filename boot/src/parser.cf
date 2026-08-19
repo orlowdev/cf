@@ -26,6 +26,32 @@ const kw = (*Parser p, Str word): Bool -> {
 	return slice_eq(p.src, p.toks[p.pos].start, p.toks[p.pos].len, word)
 }
 
+# Is the token `off` positions ahead the identifier `word`? (A bounded lookahead — the EOF
+# token backstops the end, so an out-of-range `off` reads a non-ident and returns false.)
+const kw_at = (*Parser p, Iarch off, Str word): Bool -> {
+	const Iarch j = p.pos + off
+	if !is_ident(p.toks[j].kind) then return false
+	return slice_eq(p.src, p.toks[j].start, p.toks[j].len, word)
+}
+
+# Is the token `off` ahead one of the standard geometry names? Guards the `mem.<geometry>`
+# surface so that a variable coincidentally named `mem` (`mem.name`, `mem.payloads`) still
+# parses as an ordinary field access — only `mem.<known-geometry>` is the reserved namespace.
+const is_geometry_kw_at = (*Parser p, Iarch off): Bool -> {
+	if kw_at(p, off, "page") then return true
+	if kw_at(p, off, "arena") then return true
+	if kw_at(p, off, "heap") then return true
+	if kw_at(p, off, "pool") then return true
+	if kw_at(p, off, "slab") then return true
+	if kw_at(p, off, "gc") then return true
+	if kw_at(p, off, "rc") then return true
+	if kw_at(p, off, "fixed_buffer") then return true
+	if kw_at(p, off, "ring") then return true
+	if kw_at(p, off, "buddy") then return true
+	if kw_at(p, off, "tlsf") then return true
+	return false
+}
+
 # Does the token slice at (start, len) equal the keyword `word`?
 const slice_eq = (*[Uint8] src, Iarch start, Iarch len, Str word): Bool -> {
 	if len != Iarch(word.len) then return false
@@ -871,6 +897,24 @@ const parse_primary! = (*Parser p): Expr -> {
 	if is_ident(peek(p)) then {
 		const Str name = cur_name!(p)
 		p.pos = p.pos + 1
+		# `mem.<geometry>.of(args)` / `mem.<geometry>` — the geometry surface (memory_model §4).
+		# Recognized ONLY when the name after the dot is a known geometry, so an ordinary variable
+		# named `mem` is untouched. PARSE-ONLY stub: lower to a placeholder handle `0`; the real
+		# node constructor is the memory arc. The `.of` arg list is parsed for form, then discarded.
+		if str_eq(name, "mem") && is_dot(peek(p)) && is_geometry_kw_at(p, 1) then {
+			p.pos = p.pos + 1
+			const Str geom = cur_name!(p)
+			p.pos = p.pos + 1
+			if is_dot(peek(p)) then {
+				p.pos = p.pos + 1
+				if !kw(p, "of") then die("cf: parse: expected `.of` after `mem.<geometry>`\n")
+				p.pos = p.pos + 1
+				if !is_lparen(peek(p)) then die("cf: parse: expected `(` after `mem.<geometry>.of`\n")
+				const [Expr] margs = parse_args!(p)
+				return Expr.Lit(0)
+			}
+			return Expr.Lit(0)
+		}
 		if is_lparen(peek(p)) then {
 			# `Type({ … })` — an explicit record construction (a PascalCase type name). A lowercase
 			# name with a `{ … }` argument is instead a grouped-parameter CALL (`sum({ a: 1 })`),
@@ -1326,14 +1370,30 @@ const parse_defer! = (*Parser p): Stmt -> {
 	return Stmt.Defer(one)
 }
 
+# `<call> in <geometry>` — a geometry clause on a call site (memory_model §4). PARSE-ONLY for
+# now: consume and DROP the clause (the real node threading is the memory arc; there is no AST
+# slot to store it yet). `for x in arr` consumes its own `in` in `parse_for`, so this only ever
+# sees the trailing clause on a binding or a call-for-effect statement.
+const skip_in_clause = (*Parser p): Iarch -> {
+	if !kw(p, "in") then return 0
+	p.pos = p.pos + 1
+	if !is_ident(peek(p)) then die("cf: parse: expected a geometry name after `in`\n")
+	p.pos = p.pos + 1
+	return 0
+}
+
 const parse_stmt! = (*Parser p): Stmt -> {
 	if kw(p, "const") then {
 		p.pos = p.pos + 1
-		return parse_let!(p, false)
+		const Stmt cb = parse_let!(p, false)
+		const Iarch _ci = skip_in_clause(p)
+		return cb
 	}
 	if kw(p, "let") then {
 		p.pos = p.pos + 1
-		return parse_let!(p, true)
+		const Stmt lb = parse_let!(p, true)
+		const Iarch _li = skip_in_clause(p)
+		return lb
 	}
 	if kw(p, "for") then return parse_for!(p)
 	if kw(p, "loop") then return parse_loop!(p)
@@ -1370,11 +1430,18 @@ const parse_stmt! = (*Parser p): Stmt -> {
 	# (`name.field = expr`), an element write (`name[i] = expr`), or a whole-name
 	# reassignment (`name = expr`, a `let` local).
 	if is_ident(peek(p)) then {
-		# `name(...)` / `name[T](...)` — a call (possibly generic) evaluated for its effect
+		# `name(...)` / `name[T](...)` — a call (possibly generic) evaluated for its effect,
+		# optionally with a trailing `in <geometry>` clause (dropped for now).
 		if is_lparen(p.toks[p.pos + 1].kind) then {
-			return Stmt.Do(parse_expr!(p))
+			const Stmt d = Stmt.Do(parse_expr!(p))
+			const Iarch _di = skip_in_clause(p)
+			return d
 		}
-		if generic_call_stmt_ahead(p) then return Stmt.Do(parse_expr!(p))
+		if generic_call_stmt_ahead(p) then {
+			const Stmt gd = Stmt.Do(parse_expr!(p))
+			const Iarch _gi = skip_in_clause(p)
+			return gd
+		}
 		const Str name = cur_name!(p)
 		p.pos = p.pos + 1
 		if is_dot(peek(p)) then {
