@@ -1,7 +1,17 @@
 .globl _start
 .p2align 2
 _start:
+	mov x19, x0
+	mov x20, x1
+	bl _cf_arena_init
+	adrp x0, _cf_page@PAGE
+	add x0, x0, _cf_page@PAGEOFF
+	mov x1, x19
+	mov x2, x20
 	bl _cf_build_args
+	mov x1, x0
+	adrp x0, _cf_page@PAGE
+	add x0, x0, _cf_page@PAGEOFF
 	bl _main
 	mov x16, #1
 	svc #0x80
@@ -20,33 +30,28 @@ _cf_arena_init:
 	svc #0x80
 	b.cs _cf_mmap_fail
 	mov x12, x0
-	adrp x9, _cf_top@PAGE
-	add x9, x9, _cf_top@PAGEOFF
-	str x12, [x9]
-	mov x1, #0x100000000
-	add x11, x12, x1
-	adrp x10, _cf_limit@PAGE
-	add x10, x10, _cf_limit@PAGEOFF
-	str x11, [x10]
 	mov x0, x12
 	mov x1, #0x10000000
 	mov x2, #3
 	mov x16, #74
 	svc #0x80
 	b.cs _cf_mmap_fail
+	adrp x9, _cf_page@PAGE
+	add x9, x9, _cf_page@PAGEOFF
+	str x12, [x9]
 	mov x1, #0x10000000
 	add x13, x12, x1
-	adrp x14, _cf_committed@PAGE
-	add x14, x14, _cf_committed@PAGEOFF
-	str x13, [x14]
+	str x13, [x9, #8]
+	mov x1, #0x100000000
+	add x11, x12, x1
+	str x11, [x9, #16]
 	ret
 _cf_grow:
-	adrp x9, _cf_committed@PAGE
-	add x9, x9, _cf_committed@PAGEOFF
+	add x9, x0, #8
 	ldr x10, [x9]
 	mov x11, #0x10000000
 	sub x12, x11, #1
-	add x13, x0, x12
+	add x13, x1, x12
 	bic x14, x13, x12
 	sub x1, x14, x10
 	mov x0, x10
