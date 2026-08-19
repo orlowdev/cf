@@ -648,6 +648,113 @@ pub const check_alloc_program! = (Program prog) -> {
 	return 0
 }
 
+# ── Root-allocation check (memory_model §2) ────────────────────────────────────────────────────
+# `main` runs under the ROOT page, and the user cannot allocate there — a program must graft a
+# geometry (an `in <arena>` clause) before any residue is placed. The ambient node propagates down
+# BARE calls (no `in`); an `in`-grafted call switches its subtree to the arena. So the set of
+# functions that can run under the root is the closure of `main` over bare callees; if any of them
+# holds trapped residue, that residue would land on the root — a compile error. An `in`-grafted
+# call's ARGUMENTS still evaluate in the caller's ambient, so they keep propagating.
+const bare_calls_expr! = (Expr e): [Str] -> match e {
+	Expr.Call(n, _, args, g) -> if str_eq(g, "") then cat_s(exl_one_s(n), bare_calls_list!(args)) else bare_calls_list!(args),
+	Expr.DeferTap(_, args) -> bare_calls_list!(args),
+	Expr.Loop(ss) -> bare_calls_body!(ss),
+	_ -> bare_calls_list!(expr_children!(e))
+}
+
+const exl_one_s = (Str a): [Str] -> {
+	let [Str] r = [a]
+	return r
+}
+
+const bare_calls_list! = ([Expr] es): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(es.len) then break
+		r = cat_s(r, bare_calls_expr!(es[i]))
+		i = i + 1
+	}
+	return r
+}
+
+const bare_calls_arms! = ([StmtArm] arms): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		r = cat_s(r, bare_calls_body!(arms[i].body))
+		i = i + 1
+	}
+	return r
+}
+
+const bare_calls_stmt! = (Stmt s): [Str] -> match s {
+	Stmt.Return(e) -> bare_calls_expr!(e),
+	Stmt.Yield(e) -> bare_calls_expr!(e),
+	Stmt.Let(_, _, _, init) -> bare_calls_expr!(init),
+	Stmt.Assign(_, val) -> bare_calls_expr!(val),
+	Stmt.FieldAssign(_, _, val) -> bare_calls_expr!(val),
+	Stmt.DeepFieldAssign(be, _, val) -> cat_s(bare_calls_expr!(be), bare_calls_expr!(val)),
+	Stmt.IndexAssign(_, idx, val) -> cat_s(bare_calls_expr!(idx), bare_calls_expr!(val)),
+	Stmt.Do(e) -> bare_calls_expr!(e),
+	Stmt.IfThen(c, s2) -> cat_s(bare_calls_expr!(c), bare_calls_stmt!(s2)),
+	Stmt.IfElse(c, t, el) -> cat_s(bare_calls_expr!(c), cat_s(bare_calls_stmt!(t), bare_calls_stmt!(el))),
+	Stmt.Block(ss) -> bare_calls_body!(ss),
+	Stmt.Loop(ss) -> bare_calls_body!(ss),
+	Stmt.ForIn(_, _, ss) -> bare_calls_body!(ss),
+	Stmt.Match(sc, arms) -> cat_s(bare_calls_expr!(sc), bare_calls_arms!(arms)),
+	Stmt.Destructure(_, _, e) -> bare_calls_expr!(e),
+	Stmt.Defer(ss) -> bare_calls_body!(ss),
+	Stmt.Closure(_, _, _, cbody) -> bare_calls_body!(cbody),
+	_ -> no_strs()
+}
+
+const bare_calls_body! = ([Stmt] ss): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		r = cat_s(r, bare_calls_stmt!(ss[i]))
+		i = i + 1
+	}
+	return r
+}
+
+# The set of functions reachable from `main` through bare (non-`in`) calls — those that can run
+# under the root page. Grown to a fixpoint over the whole program.
+const root_ambient_set! = (Program prog): [Str] -> {
+	const [Func] funcs = prog.funcs
+	let [Str] r = exl_one_s("main")
+	loop {
+		let [Str] add = []
+		let Iarch i = 0
+		loop {
+			if i >= Iarch(r.len) then break
+			const Iarch fi = find_func(funcs, r[i])
+			if fi >= 0 && !funcs[fi].is_asm then add = cat_s(add, bare_calls_body!(funcs[fi].body))
+			i = i + 1
+		}
+		const [Str] merged = union_names(r, add)
+		if Iarch(merged.len) == Iarch(r.len) then break
+		r = merged
+	}
+	return r
+}
+
+pub const check_root_program! = (Program prog) -> {
+	const [Func] funcs = prog.funcs
+	const [Str] root = root_ambient_set!(prog)
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(root.len) then break
+		const Iarch fi = find_func(funcs, root[i])
+		if fi >= 0 && !funcs[fi].is_asm && local_residue!(prog.unions, funcs[fi]) then die("cf: root: `${funcs[fi].name}` allocates residue on the root page — graft a geometry with `in <arena>`\n")
+		i = i + 1
+	}
+	return 0
+}
+
 # Suggest mode (Stage C rollout tooling): print, one per line, the SOURCE name of every function the
 # analysis colors `!` but that is not yet marked — the exact set to annotate. Run PRE-monomorph so
 # names are source names and a generic that may allocate in any instantiation is reported once.

@@ -57,6 +57,9 @@ while IFS= read -r name; do
 	if [ "$check" = "alloc" ]; then
 		cfflag="--check-alloc"
 	fi
+	if [ "$check" = "root" ]; then
+		cfflag="--check-root"
+	fi
 	if [ -z "$expect" ]; then
 		echo "FAIL $name (no \`# expect:\` directive)"
 		fail=$((fail + 1))
