@@ -10,8 +10,9 @@
 # cf cannot yet spawn `qbe`/`cc`, so it emits the QBE IL and the arm64 asm floor
 # to two file descriptors and the external driver runs the `qbe`→`cc` tail.
 #
-# ⚠ THROWAWAY codegen — NOT the cf `%node`/`%ret` ABI or the real page/arena
-# runtime (reintroduced at the M6/M9 representation gate). Integer ops are word
+# ⚠ PARTIAL codegen — the root `page` runtime is now the real ELASTIC reserve-in-place
+# bump (see `emit_arena_qbe`/`emit_arena_floor`), but the per-node `%node`/`%ret` ABI and
+# carved arenas are not landed yet (the next arc). Integer ops are word
 # (`w`) ops; every local is a word stack slot (`alloc4`/`storew`/`loadw`); `/`/`%`
 # do not yet apply the §5.6 divide-by-zero guard; `const` vs `let` mutability is
 # not yet enforced (that is the typecheck brick).
@@ -3334,15 +3335,18 @@ const emit_func! = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 	return 0
 }
 
-# The arena's QBE side: a single global bump cursor `{cf_top, cf_limit}` over one OS
-# mapping, and `cf_alloc(n)` — lazily mints the page on the first call (if cf_limit
-# is 0, call the asm `cf_arena_init`), 8-aligns the request, bumps the cursor, and
-# traps via `cf_oom` on overflow. Records (which may escape via a return) live here;
-# scalars stay in stack slots. (⚠ THROWAWAY: one bounded 256 MiB mapping, no teardown
-# or remap — the M6 std runtime does the real page/arena arc.)
+# The root page's QBE side (geometry_lowering §5, `page`): a global bump cursor over one
+# ELASTIC reserve-in-place mapping — `{cf_top, cf_committed, cf_limit}`. `cf_alloc(n)` lazily
+# mints the page on the first call (if cf_limit is 0, call the asm `cf_arena_init`), 8-aligns
+# the request, bumps the cursor, commits more pages via `cf_grow` when it crosses the committed
+# watermark, and traps via `cf_oom` only at RESERVATION exhaustion. The reservation base never
+# moves, so returned pointers stay valid (memory_model §8). Records (which may escape via a
+# return) live here; scalars stay in stack slots. (Still the single ambient page — the per-node
+# `%node`/`%ret` ABI and carved arenas are the next arc.)
 const emit_arena_qbe = (Uarch fd): Iarch -> {
 	write_str(fd, "export data $cf_top = { l 0 }\n")
 	write_str(fd, "export data $cf_limit = { l 0 }\n")
+	write_str(fd, "export data $cf_committed = { l 0 }\n")
 	write_str(fd, "function l $cf_alloc(w %n) {\n")
 	write_str(fd, "@start\n")
 	write_str(fd, "\t%lim0 =l loadl $cf_limit\n")
@@ -3359,11 +3363,20 @@ const emit_arena_qbe = (Uarch fd): Iarch -> {
 	write_str(fd, "\t%nt =l add %p, %sz\n")
 	write_str(fd, "\t%lim =l loadl $cf_limit\n")
 	write_str(fd, "\t%ok =w culel %nt, %lim\n")
-	write_str(fd, "\tjnz %ok, @ok, @oom\n")
+	write_str(fd, "\tjnz %ok, @inbounds, @oom\n")
 	write_str(fd, "@oom\n")
 	write_str(fd, "\tcall $cf_oom()\n")
 	write_str(fd, "\tret %p\n")
-	write_str(fd, "@ok\n")
+	# The cursor is within the reservation; if it passes the committed watermark, commit
+	# more pages (mprotect, in `cf_grow`) before handing the block out — the elastic step.
+	write_str(fd, "@inbounds\n")
+	write_str(fd, "\t%comm =l loadl $cf_committed\n")
+	write_str(fd, "\t%need =w cugtl %nt, %comm\n")
+	write_str(fd, "\tjnz %need, @grow, @store\n")
+	write_str(fd, "@grow\n")
+	write_str(fd, "\tcall $cf_grow(l %nt)\n")
+	write_str(fd, "\tjmp @store\n")
+	write_str(fd, "@store\n")
 	write_str(fd, "\tstorel %nt, $cf_top\n")
 	write_str(fd, "\tret %p\n")
 	write_str(fd, "}\n")
@@ -3785,31 +3798,68 @@ const emit_argv_qbe = (Uarch fd): Iarch -> {
 	return 0
 }
 
-# The arena's asm side: `cf_arena_init` mmaps 256 MiB (SYS_mmap=197) and seeds the
-# cursor; `cf_oom`/`cf_mmap_fail` exit with distinct nonzero codes. Leaf routines
-# (no `bl`), so calling `cf_arena_init` lazily from `cf_alloc` needs no arg saving.
+# The root page's asm side — the ELASTIC reserve-in-place bump (geometry_lowering §5, `page`).
+# `cf_arena_init` reserves one large virtual range up front with PROT_NONE (SYS_mmap=197), commits
+# an initial 256 MiB chunk with mprotect (SYS_mprotect=74), and seeds the cursor {top, committed,
+# limit}. `cf_grow(target)` commits more pages (rounding up to a 256 MiB step) when the cursor
+# crosses the committed watermark — the same base address throughout, so every outstanding pointer
+# stays valid (memory_model §8). `cf_oom` fires only at RESERVATION exhaustion; `cf_mmap_fail` on a
+# failed map/commit. All are leaf routines (no `bl`) touching only caller-saved regs (x0-x16).
 const emit_arena_floor = (Uarch fd): Iarch -> {
 	write_str(fd, ".globl _cf_arena_init\n")
+	write_str(fd, ".globl _cf_grow\n")
 	write_str(fd, ".globl _cf_oom\n")
 	write_str(fd, ".p2align 2\n")
+	# reserve 4 GiB of address space (PROT_NONE — no physical pages yet)
 	write_str(fd, "_cf_arena_init:\n")
 	write_str(fd, "\tmov x0, #0\n")
-	write_str(fd, "\tmov x1, #0x10000000\n")
-	write_str(fd, "\tmov x2, #3\n")
+	write_str(fd, "\tmov x1, #0x100000000\n")
+	write_str(fd, "\tmov x2, #0\n")
 	write_str(fd, "\tmov x3, #0x1002\n")
 	write_str(fd, "\tmov x4, #-1\n")
 	write_str(fd, "\tmov x5, #0\n")
 	write_str(fd, "\tmov x16, #197\n")
 	write_str(fd, "\tsvc #0x80\n")
 	write_str(fd, "\tb.cs _cf_mmap_fail\n")
+	write_str(fd, "\tmov x12, x0\n")
 	write_str(fd, "\tadrp x9, _cf_top@PAGE\n")
 	write_str(fd, "\tadd x9, x9, _cf_top@PAGEOFF\n")
-	write_str(fd, "\tstr x0, [x9]\n")
-	write_str(fd, "\tmov x1, #0x10000000\n")
-	write_str(fd, "\tadd x11, x0, x1\n")
+	write_str(fd, "\tstr x12, [x9]\n")
+	write_str(fd, "\tmov x1, #0x100000000\n")
+	write_str(fd, "\tadd x11, x12, x1\n")
 	write_str(fd, "\tadrp x10, _cf_limit@PAGE\n")
 	write_str(fd, "\tadd x10, x10, _cf_limit@PAGEOFF\n")
 	write_str(fd, "\tstr x11, [x10]\n")
+	# commit the initial 256 MiB: mprotect(base, 256 MiB, PROT_READ|PROT_WRITE)
+	write_str(fd, "\tmov x0, x12\n")
+	write_str(fd, "\tmov x1, #0x10000000\n")
+	write_str(fd, "\tmov x2, #3\n")
+	write_str(fd, "\tmov x16, #74\n")
+	write_str(fd, "\tsvc #0x80\n")
+	write_str(fd, "\tb.cs _cf_mmap_fail\n")
+	write_str(fd, "\tmov x1, #0x10000000\n")
+	write_str(fd, "\tadd x13, x12, x1\n")
+	write_str(fd, "\tadrp x14, _cf_committed@PAGE\n")
+	write_str(fd, "\tadd x14, x14, _cf_committed@PAGEOFF\n")
+	write_str(fd, "\tstr x13, [x14]\n")
+	write_str(fd, "\tret\n")
+	# cf_grow(x0 = target): commit up to round_up(target, 256 MiB) via mprotect from the old
+	# committed watermark; the reservation bound was already checked by the caller.
+	write_str(fd, "_cf_grow:\n")
+	write_str(fd, "\tadrp x9, _cf_committed@PAGE\n")
+	write_str(fd, "\tadd x9, x9, _cf_committed@PAGEOFF\n")
+	write_str(fd, "\tldr x10, [x9]\n")
+	write_str(fd, "\tmov x11, #0x10000000\n")
+	write_str(fd, "\tsub x12, x11, #1\n")
+	write_str(fd, "\tadd x13, x0, x12\n")
+	write_str(fd, "\tbic x14, x13, x12\n")
+	write_str(fd, "\tsub x1, x14, x10\n")
+	write_str(fd, "\tmov x0, x10\n")
+	write_str(fd, "\tmov x2, #3\n")
+	write_str(fd, "\tmov x16, #74\n")
+	write_str(fd, "\tsvc #0x80\n")
+	write_str(fd, "\tb.cs _cf_mmap_fail\n")
+	write_str(fd, "\tstr x14, [x9]\n")
 	write_str(fd, "\tret\n")
 	write_str(fd, "_cf_mmap_fail:\n")
 	write_str(fd, "\tmov x0, #71\n")
