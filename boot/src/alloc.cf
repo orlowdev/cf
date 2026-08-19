@@ -19,8 +19,8 @@
 # that escapes is charged to the destination's owner, not the allocator. So a constructed
 # aggregate is RESIDUE iff it is trapped — neither returned nor rehomed. `compute_esc` finds the
 # local names that escape; `scan_trapped`/`scan_escaping` then decide whether any construction is
-# trapped. v1 handles the canonical forms; closures/defer bodies are not descended (the gated
-# tests avoid them) and grow as tests demand.
+# trapped. A `defer` body is analyzed in the enclosing frame (its residence is the function's); a
+# closure body is analyzed with its OWN context and a `!` closure colors the function that holds it.
 
 import "ast" as { Expr, Stmt, MatchArm, StmtArm, Seg, FieldInit, Param, UnionDecl, UnionMember, Func, Program }
 import "io" as { die, write_str, stdout }
@@ -349,6 +349,11 @@ const stmt_traps! = (ACtx cx, Bool yesc, Stmt s): Bool -> match s {
 	Stmt.ForIn(_, _, ss) -> body_traps!(cx, yesc, ss),
 	Stmt.Match(sc, arms) -> scan_trapped!(cx, sc) || stmtarms_traps!(cx, yesc, arms),
 	Stmt.Destructure(_, _, e) -> scan_trapped!(cx, e),
+	# a `defer` body runs in THIS frame at scope exit (for effect, never returning), so its residue
+	# is the enclosing function's — descend with the same context
+	Stmt.Defer(ss) -> body_traps!(cx, false, ss),
+	# a closure's residue is its own; analyze it with its own context and let a `!` closure color us
+	Stmt.Closure(_, cps, _, cbody) -> closure_traps!(cx.unions, cps, cbody),
 	_ -> false
 }
 
@@ -409,6 +414,8 @@ const esc_roots_stmt = ([Str] params, [Str] esc, Stmt s): [Str] -> match s {
 	Stmt.Loop(ss) -> esc_roots_body(params, esc, ss),
 	Stmt.ForIn(_, _, ss) -> esc_roots_body(params, esc, ss),
 	Stmt.Match(_, arms) -> esc_roots_stmtarms(params, esc, arms),
+	# a `defer` body shares this frame's locals/params, so a rehome inside it escapes too
+	Stmt.Defer(ss) -> esc_roots_body(params, esc, ss),
 	_ -> no_strs()
 }
 
@@ -445,15 +452,28 @@ const compute_esc = ([Str] params, [Stmt] body): [Str] -> {
 	return esc
 }
 
-const param_names = (Func f): [Str] -> {
+const plist_names = ([Param] ps): [Str] -> {
 	let [Str] r = []
 	let Iarch i = 0
 	loop {
-		if i >= Iarch(f.params.len) then break
-		r = [...r, f.params[i].name]
+		if i >= Iarch(ps.len) then break
+		r = [...r, ps[i].name]
 		i = i + 1
 	}
 	return r
+}
+
+const param_names = (Func f): [Str] -> plist_names(f.params)
+
+# A local closure (memory_model §7) is lifted to its own top-level function; its residence is its
+# own, escaping to the enclosing caller only when returned. Analyze the body with the CLOSURE's own
+# parameters and a fresh escape set — if it traps residue, the enclosing function (which defines and
+# invokes it) is colored `!`, exactly as if it called a `!` function. Closures do not nest in v1.
+const closure_traps! = ([UnionDecl] unions, [Param] cps, [Stmt] cbody): Bool -> {
+	const [Str] cparams = plist_names(cps)
+	const [Str] cesc = compute_esc(cparams, cbody)
+	const ACtx cx2 = ACtx({ unions: unions, params: cparams, esc: cesc })
+	return body_traps!(cx2, false, cbody)
 }
 
 # Does function `f` hold a trapped (non-escaping) aggregate residence of its own?
@@ -565,6 +585,10 @@ const stmt_calls_bang! = ([Func] funcs, [Bool] bang, [Str] params, Stmt s): Bool
 	Stmt.ForIn(_, _, ss) -> body_calls_bang!(funcs, bang, params, ss),
 	Stmt.Match(sc, arms) -> expr_calls_bang!(funcs, bang, params, sc) || stmtarms_calls_bang!(funcs, bang, params, arms),
 	Stmt.Destructure(_, _, e) -> expr_calls_bang!(funcs, bang, params, e),
+	# a `!` call inside a `defer` or a closure body colors the enclosing function; the closure's own
+	# parameters join the indirect set so calling a closure fn-value parameter does not count
+	Stmt.Defer(ss) -> body_calls_bang!(funcs, bang, params, ss),
+	Stmt.Closure(_, cps, _, cbody) -> body_calls_bang!(funcs, bang, cat_s(params, plist_names(cps)), cbody),
 	_ -> false
 }
 
