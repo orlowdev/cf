@@ -1889,7 +1889,7 @@ const init_agg_type! = (*Emit ctx, [Binding] env, Expr e): Str -> match e {
 	Expr.ArrayLit(hs, sn, elems, et) -> "$dyn",
 	Expr.StrLit(bytes) -> "Str",
 	Expr.Interp(id) -> "Str",
-	Expr.Buffer(sz) -> "$ptr",
+	Expr.Buffer(sz) -> "$dyn",
 	Expr.Addr(name) -> var_agg_type(env, name),
 	Expr.Var(name) -> var_agg_type(env, name),
 	Expr.Index(arr, idx) -> index_agg_type(ctx, env, arr, idx),
@@ -2004,6 +2004,7 @@ const init_elem! = (*Emit ctx, [Binding] env, Expr e): Str -> match e {
 	Expr.Index(arr, idx) -> index_elem!(env, arr),
 	Expr.IndexExpr(base, idx) -> indexexpr_elem!(ctx, env, base),
 	Expr.Call(callee, tyargs, args, _) -> call_ret_elem!(ctx, env, callee),
+	Expr.Buffer(sz) -> "Uint8",
 	_ -> ""
 }
 
@@ -2827,12 +2828,28 @@ const bad_buf_size = (): Iarch -> {
 	die("cf: emit: a buffer size must be a comptime constant\n")
 	return 0
 }
+# A `let [N Uint8] buf` byte buffer is a real length-carrying array: a `{data@0, len@8, cap@16}`
+# header over an N-byte block, len = cap = N. So it reports `buf.len` and decays to its `data@0`
+# wherever a `*[Uint8]` raw pointer is wanted (the I/O boundary) — the same shape as any `$dyn`
+# array, distinct from an opaque `*[Uint8]` pointer.
 const emit_buffer! = (*Emit ctx, Expr sz): Str -> {
 	const Iarch n = buf_size(sz)
-	const Iarch b = ctx.next
+	const Iarch hdr = ctx.next
 	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${b} =l call $cf_alloc(l %node_0, w ${n})\n")
-	return "%t${b}"
+	write_str(ctx.fd, "\t%t${hdr} =l call $cf_alloc(l %node_0, w 24)\n")
+	const Iarch data = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${data} =l call $cf_alloc(l %node_0, w ${n})\n")
+	write_str(ctx.fd, "\tstorel %t${data}, %t${hdr}\n")
+	const Iarch la = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${la} =l add %t${hdr}, 8\n")
+	write_str(ctx.fd, "\tstorel ${n}, %t${la}\n")
+	const Iarch ca = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${ca} =l add %t${hdr}, 16\n")
+	write_str(ctx.fd, "\tstorel ${n}, %t${ca}\n")
+	return "%t${hdr}"
 }
 
 # Emit `xs[i]` — load the i-th element (element address = data + i*8).
