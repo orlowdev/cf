@@ -18,6 +18,7 @@
 # not yet enforced (that is the typecheck brick).
 
 import "io" as { write_str, die }
+import "alloc" as { address_taken! }
 import "ast" as { Expr, Stmt, Param, Func, FieldInit, RecDecl, UnionMember, UnionDecl, MatchArm, StmtArm, Seg, TupElem, Program }
 import "astutil" as { is_spread, spread_inner, is_skip, skip_count, is_nested, nested_inner!, tel_leaf, tel_nest, tel_is_nest, tel_is_fn, is_fixed_name, fixed_bits, fixed_signed, is_stack_name, is_pat_guard, is_member_guard, is_int_guard, guard_body!, guard_qual!, guard_member! }
 
@@ -37,7 +38,7 @@ import "astutil" as { is_spread, spread_inner, is_skip, skip_count, is_nested, n
 # `loop_mark` is the nearest enclosing reset-safe loop's entry-cursor temp (or "" if the nearest
 # loop is not reset-safe) — `break`/`continue` restore it so every path back to the loop head or out
 # of it reclaims the iteration's residue, matching the back-edge rewind.
-data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs, [RecDecl] recs, [UnionDecl] unions, Iarch cur_loop, Iarch cur_slot, Str cur_ret, Str reset_mark, Bool fn_ptr, Str loop_mark, Bool alloc_stack, Bool in_loop, Iarch stack_used }
+data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs, [RecDecl] recs, [UnionDecl] unions, Iarch cur_loop, Iarch cur_slot, Str cur_ret, Str reset_mark, Bool fn_ptr, Str loop_mark, Bool alloc_stack, Bool in_loop, Iarch stack_used, [Str] addr_taken }
 
 # A local/parameter in scope: its interned name, `slot`, its `rec_type` (a record/union
 # type name, `"$dyn"`, `"$ptr"`, or `"Str"` — `""` for a word), and `elem` (a dynamic
@@ -179,6 +180,48 @@ const field_is_ptr = (*Emit ctx, Str rt, Str field): Bool -> {
 	return false
 }
 
+# Is `n` in the name list `xs`?
+const name_in = ([Str] xs, Str n): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(xs.len) then break
+		if str_eq(xs[i], n) then return true
+		i = i + 1
+	}
+	return false
+}
+# A record whose every field is a scalar (no pointer/aggregate field, per `field_is_ptr`). Such a
+# record is a single self-contained block, so a returned one is one contiguous closure that `cf_claim`
+# can adopt/slide whole. A nested record/array field would leave part of the closure elsewhere.
+const is_flat_record = (*Emit ctx, Str rt): Bool -> {
+	const Iarch ri = find_rec(ctx.recs, rt)
+	if ri < 0 then return false
+	let Iarch fi = 0
+	loop {
+		if fi >= Iarch(ctx.recs[ri].fields.len) then break
+		if field_is_ptr(ctx, rt, ctx.recs[ri].fields[fi]) then return false
+		fi = fi + 1
+	}
+	return true
+}
+# The byte size of a (flat) record: one 8-byte slot per field.
+const flat_record_size = (*Emit ctx, Str rt): Iarch -> {
+	const Iarch ri = find_rec(ctx.recs, rt)
+	if ri < 0 then return 0
+	return Iarch(ctx.recs[ri].fields.len) * 8
+}
+# Does the function capture any aggregate (a `$cap…` param from closure lifting)? Such a frame can
+# rehome a construction into the captured aggregate — an escape channel `cf_claim` does not cover — so
+# it is excluded from the flat-return reset until `on_rehome` lands.
+const has_cap_param = (Func fn): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(fn.params.len) then break
+		if is_cap_param(fn.params[i].type_name) then return true
+		i = i + 1
+	}
+	return false
+}
 # The `[T]` element type name of field `field` of record `rt` (its `felems` entry, "" for a
 # non-array field) — carried onto a binding that adopts the field's dynamic array.
 const field_elem = (*Emit ctx, Str rt, Str field): Str -> {
@@ -293,12 +336,29 @@ const any_ptr_param = ([Param] ps): Bool -> {
 # (nothing rehomes into a caller — by-value aggregate params are read-only, memory_model §6). Its
 # whole subtree's allocation therefore lands in this frame, so rewinding the node cursor to entry
 # reclaims exactly the dead residue. `main` (holds the graft) and asm floors are excluded.
+# Does this `!` function return a FLAT record via the on_ret/on_alloc_ret path? Then its frame resets
+# and each (direct) call claims the return with `cf_claim`. Gated so the ONLY escape is the return:
+# no writable `*T` param and no capture (both rehome channels), and not address-taken (an indirect
+# call site cannot claim). This single predicate is consulted by BOTH sides — the callee resets iff it
+# holds, a direct call claims iff it holds — so reset and claim never disagree.
+const fn_flat_resettable = (*Emit ctx, Func fn): Bool -> {
+	if fn.is_asm then return false
+	if str_eq(fn.name, "main") then return false
+	if !name_has_bang(fn.name) then return false
+	if any_ptr_param(fn.params) then return false
+	if has_cap_param(fn) then return false
+	if name_in(ctx.addr_taken, fn.name) then return false
+	return is_flat_record(ctx, fn.ret_name)
+}
 const fn_resettable = (*Emit ctx, Func fn): Bool -> {
 	if fn.is_asm then return false
 	if str_eq(fn.name, "main") then return false
 	if !name_has_bang(fn.name) then return false
-	if ret_is_l(fn.ret_name, ctx.recs, ctx.unions) then return false
 	if any_ptr_param(fn.params) then return false
+	# a flat-record return now resets via cf_claim (the return survives the reset, claimed by the
+	# caller); a non-flat aggregate return still rides up to an ancestor (nested closure not yet handled)
+	if fn_flat_resettable(ctx, fn) then return true
+	if ret_is_l(fn.ret_name, ctx.recs, ctx.unions) then return false
 	return true
 }
 
@@ -2413,6 +2473,18 @@ const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env)
 		j = j + 1
 	}
 	write_str(ctx.fd, ")\n")
+	# on_alloc_ret (geometry_lowering §3): a callee that reset its frame (fn_flat_resettable) freed its
+	# own scratch and left the returned flat record above that reset — intact, since no allocation runs
+	# between the callee's reset and here. Claim it into this frame's node: adopt in place if it is
+	# already at the cursor, else slide it down. The claim node is `node_op` — the same node the callee
+	# ran under (`%node_0`, or the `in <geom>` binding).
+	if fn_flat_resettable(ctx, ctx.funcs[fidx]) then {
+		const Iarch sz = flat_record_size(ctx, ctx.funcs[fidx].ret_name)
+		const Iarch cl = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${cl} =l call $cf_claim(l ${node_op}, l %t${rt}, l ${sz})\n")
+		return "%t${cl}"
+	}
 	return "%t${rt}"
 }
 
@@ -3784,6 +3856,39 @@ const emit_arena_qbe! = (Uarch fd, Bool is_bare, Iarch root_size): Iarch -> {
 	write_str(fd, "\tstorel %nt, %node\n")
 	write_str(fd, "\tret %p\n")
 	write_str(fd, "}\n")
+	# cf_claim(node, ptr, size) — on_alloc_ret (geometry_lowering §3): claim a returned flat aggregate
+	# into the caller's node. The callee reset its top BELOW `ptr` (freeing its own scratch); `ptr`'s
+	# bytes are intact because no allocation happens between the callee's reset and this claim (the
+	# claim-once / no-safepoint rule). If `ptr` already sits at the cursor, adopt it in place (advance
+	# top — copy-free). Otherwise slide it down to the cursor (a closure-only, ascending memcpy, sound
+	# because dst < src) and advance. Returns the claimed pointer.
+	write_str(fd, "function l $cf_claim(l %node, l %ptr, l %size) {\n")
+	write_str(fd, "@start\n")
+	write_str(fd, "\t%top =l loadl %node\n")
+	write_str(fd, "\t%eq =w ceql %ptr, %top\n")
+	write_str(fd, "\tjnz %eq, @adopt, @slide\n")
+	write_str(fd, "@adopt\n")
+	write_str(fd, "\t%nta =l add %top, %size\n")
+	write_str(fd, "\tstorel %nta, %node\n")
+	write_str(fd, "\tret %ptr\n")
+	write_str(fd, "@slide\n")
+	write_str(fd, "\tjmp @lc\n")
+	write_str(fd, "@lc\n")
+	write_str(fd, "\t%i =l phi @slide 0, @lb %i2\n")
+	write_str(fd, "\t%more =w cultl %i, %size\n")
+	write_str(fd, "\tjnz %more, @lb, @ld\n")
+	write_str(fd, "@lb\n")
+	write_str(fd, "\t%s =l add %ptr, %i\n")
+	write_str(fd, "\t%bv =w loadub %s\n")
+	write_str(fd, "\t%d =l add %top, %i\n")
+	write_str(fd, "\tstoreb %bv, %d\n")
+	write_str(fd, "\t%i2 =l add %i, 1\n")
+	write_str(fd, "\tjmp @lc\n")
+	write_str(fd, "@ld\n")
+	write_str(fd, "\t%nts =l add %top, %size\n")
+	write_str(fd, "\tstorel %nts, %node\n")
+	write_str(fd, "\tret %top\n")
+	write_str(fd, "}\n")
 	# cf_arena_pull(node, sz) — an elastic arena's grow step: pull a fresh block (the larger of the
 	# node's `chunk` and the request `sz`) from the parent node and reset {top, committed, limit} to
 	# it. The old block leaks into the parent (no per-object free yet); returned pointers stay valid.
@@ -4455,6 +4560,9 @@ pub const emit_program! = (Program prog, Uarch qbe_fd, Uarch asm_fd, Str target_
 	# `root_size` sizes the `Bare` root page (ignored off `Bare`, which mmaps its own reserve).
 	const Bool is_bare = str_eq(target_os, "Bare")
 	emit_arena_qbe!(qbe_fd, is_bare, root_size)
+	# address-taken functions (used as a value anywhere) are excluded from the flat-return reset — an
+	# indirect call site cannot claim. Computed once for the whole program (geometry_lowering §3).
+	const [Str] at = address_taken!(prog)
 	const Bool argv_form = main_takes_argv(prog)
 	if argv_form then emit_argv_qbe(qbe_fd)
 	# STATIC storage: each `static [N Uint8] NAME` gets a zero-filled BSS data block and a
@@ -4475,7 +4583,7 @@ pub const emit_program! = (Program prog, Uarch qbe_fd, Uarch asm_fd, Str target_
 		if i >= Iarch(prog.funcs.len) then break
 		# an asm function is emitted into the floor, not through QBE
 		if !prog.funcs[i].is_asm then {
-			let Emit ctx = Emit({ fd: qbe_fd, next: 0, label: 0, funcs: prog.funcs, recs: prog.recs, unions: prog.unions, cur_loop: 0 - 1, cur_slot: 0 - 1, cur_ret: "", reset_mark: "", fn_ptr: false, loop_mark: "", alloc_stack: false, in_loop: false, stack_used: 0 })
+			let Emit ctx = Emit({ fd: qbe_fd, next: 0, label: 0, funcs: prog.funcs, recs: prog.recs, unions: prog.unions, cur_loop: 0 - 1, cur_slot: 0 - 1, cur_ret: "", reset_mark: "", fn_ptr: false, loop_mark: "", alloc_stack: false, in_loop: false, stack_used: 0, addr_taken: at })
 			emit_func!(&ctx, prog.funcs[i], i)
 		}
 		i = i + 1
