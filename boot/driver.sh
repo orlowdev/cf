@@ -14,7 +14,9 @@
 #     qbe -t arm64 the program, clang assembles both as AArch64 ELF, and an ELF linker links them
 #     with boot/target/bare-arm64.ld (no libc, no loader). clang's own driver links Mach-O on darwin, so
 #     the LINK step needs ld.lld / cross-binutils; absent one, the driver emits the ELF objects and
-#     prints the finishing link command instead of failing.
+#     prints the finishing link command instead of failing. Boot the result under
+#     `qemu-system-aarch64 -machine virt -cpu cortex-a57 -nographic -semihosting -kernel <out>`:
+#     the floor's semihosting SYS_EXIT makes qemu exit with main's return as its status.
 #
 # The `!` allocation algebra and the root-page rule are validated unconditionally by cf.
 set -eu
