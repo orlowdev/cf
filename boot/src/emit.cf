@@ -2273,6 +2273,15 @@ const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env)
 		write_str(ctx.fd, "\t%t${gr} =l call $cf_arena_grow(l %node_0, w %t${gw})\n")
 		return "%t${gr}"
 	}
+	# `mem.fixed_buffer.of(buf)` — wrap a caller `[Uint8]` buffer. The arg is its `{data,len,cap}`
+	# header; cf_buffer_of reads data/len and lays a fixed node over the buffer's own bytes (no carve).
+	if str_eq(callee, "cf__buffer_of") then {
+		const Str bv = emit_expr!(args[0], ctx, env)
+		const Iarch br = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${br} =l call $cf_buffer_of(l %node_0, l ${bv})\n")
+		return "%t${br}"
+	}
 	# `mem.page` — the root page node handle (the address of the $cf_page struct)
 	if str_eq(callee, "cf__page") then {
 		const Iarch tp = ctx.next
@@ -3845,6 +3854,30 @@ const emit_arena_qbe = (Uarch fd): Iarch -> {
 	write_str(fd, "\t%g40 =l add %hdr, 40\n")
 	write_str(fd, "\tstorel %sz, %g40\n")
 	write_str(fd, "\tret %hdr\n")
+	write_str(fd, "}\n")
+	# `mem.fixed_buffer.of(buf)` — wrap a caller `[Uint8]` buffer. `%buf` is its `{data,len,cap}` header;
+	# read data/len and lay a 48-byte fixed node over the FRONT of the buffer's own bytes — carves
+	# nothing from the parent (§5). committed==limit and kind=0 ⇒ a fixed bound (traps at data+len).
+	# The buffer carries its length now, so no size is passed (no compile-time hack).
+	write_str(fd, "function l $cf_buffer_of(l %node, l %buf) {\n")
+	write_str(fd, "@start\n")
+	write_str(fd, "\t%data =l loadl %buf\n")
+	write_str(fd, "\t%lenp =l add %buf, 8\n")
+	write_str(fd, "\t%len =l loadl %lenp\n")
+	write_str(fd, "\t%blk =l add %data, 48\n")
+	write_str(fd, "\t%end =l add %data, %len\n")
+	write_str(fd, "\tstorel %blk, %data\n")
+	write_str(fd, "\t%b8 =l add %data, 8\n")
+	write_str(fd, "\tstorel %end, %b8\n")
+	write_str(fd, "\t%b16 =l add %data, 16\n")
+	write_str(fd, "\tstorel %end, %b16\n")
+	write_str(fd, "\t%b24 =l add %data, 24\n")
+	write_str(fd, "\tstorel %node, %b24\n")
+	write_str(fd, "\t%b32 =l add %data, 32\n")
+	write_str(fd, "\tstorel 0, %b32\n")
+	write_str(fd, "\t%b40 =l add %data, 40\n")
+	write_str(fd, "\tstorel 0, %b40\n")
+	write_str(fd, "\tret %data\n")
 	write_str(fd, "}\n")
 	# `[T]` grow-in-place append: given the 24-byte header {data@0, len@8, cap@16} and
 	# the element stride, ensure room for one more (amortized doubling: cap 0→4 else
