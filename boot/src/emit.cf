@@ -1320,6 +1320,10 @@ const find_override = ([FieldInit] inits, Str fname): Iarch -> {
 # from the ambient geometry node (`cf_alloc`). The non-stack form is byte-identical to the old inline
 # `cf_alloc`, so cf's own (stack-free) source emits unchanged.
 const emit_agg_alloc! = (*Emit ctx, Iarch size): Iarch -> {
+	# a single `$`-stack allocation is capped so one `$` binding can't blow the frame (a huge buffer
+	# belongs in a geometry). Comptime-known size, so this is a comptime error. Per-allocation, not
+	# per-frame — a coarse guard, not an exact stack budget.
+	if ctx.alloc_stack && size > 65536 then die("cf: emit: a `$`-stack allocation of ${size} bytes exceeds the 64 KiB cap — build a buffer this large in a geometry\n")
 	const Iarch t = ctx.next
 	ctx.next = ctx.next + 1
 	if ctx.alloc_stack then write_str(ctx.fd, "\t%t${t} =l alloc8 ${size}\n")
@@ -2706,9 +2710,7 @@ const emit_stmt_match! = (*Emit ctx, [Binding] env, Expr scrut, [StmtArm] arms):
 # is data=0, len=0, cap=0. Returns the header pointer.
 const emit_array_lit! = (*Emit ctx, [Expr] elems, Str elem_type, [Binding] env): Str -> {
 	const Iarch n = Iarch(elems.len)
-	const Iarch hdr = ctx.next
-	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${hdr} =l call $cf_alloc(l %node_0, w 24)\n")
+	const Iarch hdr = emit_agg_alloc!(ctx, 24)
 	if n == 0 then {
 		write_str(ctx.fd, "\tstorel 0, %t${hdr}\n")
 		const Iarch la = ctx.next
@@ -2724,9 +2726,7 @@ const emit_array_lit! = (*Emit ctx, [Expr] elems, Str elem_type, [Binding] env):
 		# 8-byte slot (`storel`) — a record/Str/[T]/union pointer, or a word in the low half.
 		const Iarch esz = elem_bytes(elem_type)
 		const Iarch bytes = n * esz
-		const Iarch data = ctx.next
-		ctx.next = ctx.next + 1
-		write_str(ctx.fd, "\t%t${data} =l call $cf_alloc(l %node_0, w ${bytes})\n")
+		const Iarch data = emit_agg_alloc!(ctx, bytes)
 		let Iarch i = 0
 		loop {
 			if i >= n then break
@@ -2843,12 +2843,8 @@ const bad_buf_size = (): Iarch -> {
 # array, distinct from an opaque `*[Uint8]` pointer.
 const emit_buffer! = (*Emit ctx, Expr sz): Str -> {
 	const Iarch n = buf_size(sz)
-	const Iarch hdr = ctx.next
-	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${hdr} =l call $cf_alloc(l %node_0, w 24)\n")
-	const Iarch data = ctx.next
-	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${data} =l call $cf_alloc(l %node_0, w ${n})\n")
+	const Iarch hdr = emit_agg_alloc!(ctx, 24)
+	const Iarch data = emit_agg_alloc!(ctx, n)
 	write_str(ctx.fd, "\tstorel %t${data}, %t${hdr}\n")
 	const Iarch la = ctx.next
 	ctx.next = ctx.next + 1
