@@ -3730,7 +3730,10 @@ const emit_func! = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 # moves, so returned pointers stay valid (memory_model §8). Records (which may escape via a
 # return) live here; scalars stay in stack slots. (Still the single ambient page — the per-node
 # `%node`/`%ret` ABI and carved arenas are the next arc.)
-const emit_arena_qbe = (Uarch fd): Iarch -> {
+const emit_arena_qbe = (Uarch fd, Bool is_bare): Iarch -> {
+	# a `Bare` target's root is a fixed 1 MiB BSS block (`$cf_root`) — no mmap. cf_arena_init seeds
+	# $cf_page over it with committed==limit, so cf_alloc bumps within it and traps (cf_oom) at the end.
+	if is_bare then write_str(fd, "export data $cf_root = { z 1048576 }\n")
 	# A MemoryNode is a pointer to `{ top@0, committed@8, limit@16, parent@24, kind@32, chunk@40 }`
 	# (geometry_lowering §4). `$cf_page` is the root page node; carved arenas get their own headers.
 	# cf_alloc is NODE-RELATIVE — it bumps whichever node it is handed (`%node`, threaded as arg 0).
@@ -4304,11 +4307,32 @@ const emit_argv_qbe = (Uarch fd): Iarch -> {
 # crosses the committed watermark — the same base address throughout, so every outstanding pointer
 # stays valid (memory_model §8). `cf_oom` fires only at RESERVATION exhaustion; `cf_mmap_fail` on a
 # failed map/commit. All are leaf routines (no `bl`) touching only caller-saved regs (x0-x16).
-const emit_arena_floor = (Uarch fd): Iarch -> {
+const emit_arena_floor = (Uarch fd, Bool is_bare): Iarch -> {
 	write_str(fd, ".globl _cf_arena_init\n")
 	write_str(fd, ".globl _cf_grow\n")
 	write_str(fd, ".globl _cf_oom\n")
 	write_str(fd, ".p2align 2\n")
+	# BARE floor: no OS. cf_arena_init seeds $cf_page over the static 1 MiB $cf_root (committed==limit,
+	# so cf_alloc bumps within it and traps at the end); cf_grow is never reached (defined as a no-op
+	# for the `call` in cf_alloc); cf_oom halts (there is no kernel to exit to).
+	if is_bare then {
+		write_str(fd, "_cf_arena_init:\n")
+		write_str(fd, "\tadrp x9, _cf_page@PAGE\n")
+		write_str(fd, "\tadd x9, x9, _cf_page@PAGEOFF\n")
+		write_str(fd, "\tadrp x12, _cf_root@PAGE\n")
+		write_str(fd, "\tadd x12, x12, _cf_root@PAGEOFF\n")
+		write_str(fd, "\tstr x12, [x9]\n")
+		write_str(fd, "\tmov x1, #0x100000\n")
+		write_str(fd, "\tadd x13, x12, x1\n")
+		write_str(fd, "\tstr x13, [x9, #8]\n")
+		write_str(fd, "\tstr x13, [x9, #16]\n")
+		write_str(fd, "\tret\n")
+		write_str(fd, "_cf_grow:\n")
+		write_str(fd, "\tret\n")
+		write_str(fd, "_cf_oom:\n")
+		write_str(fd, "\tb _cf_oom\n")
+		return 0
+	}
 	# reserve 4 GiB of address space (PROT_NONE — no physical pages yet), commit an initial
 	# 256 MiB, and seed the $cf_page node struct { top@0, committed@8, limit@16, parent@24 }.
 	write_str(fd, "_cf_arena_init:\n")
@@ -4414,8 +4438,11 @@ const emit_asm_func! = (Uarch fd, Func fn, Iarch idx): Iarch -> {
 # `main()` the `_start` floor does nothing before `bl _main`, so those flow straight
 # through. For `main([Str] args)` it first `bl _cf_build_args` to convert `(argc, argv)`
 # into a real cf `[Str]` header (in x0), which QBE reads as `$main`'s argument.
-pub const emit_program! = (Program prog, Uarch qbe_fd, Uarch asm_fd): Iarch -> {
-	emit_arena_qbe(qbe_fd)
+pub const emit_program! = (Program prog, Uarch qbe_fd, Uarch asm_fd, Str target_os): Iarch -> {
+	# a `Bare` target (bare metal / Wasm) links no OS: the root is a static BSS region (no mmap), and
+	# there is no exit syscall — the floor halts. Every other target keeps the darwin mmap/exit floor.
+	const Bool is_bare = str_eq(target_os, "Bare")
+	emit_arena_qbe(qbe_fd, is_bare)
 	const Bool argv_form = main_takes_argv(prog)
 	if argv_form then emit_argv_qbe(qbe_fd)
 	# STATIC storage: each `static [N Uint8] NAME` gets a zero-filled BSS data block and a
@@ -4443,6 +4470,19 @@ pub const emit_program! = (Program prog, Uarch qbe_fd, Uarch asm_fd): Iarch -> {
 	}
 	# asm floor: the freestanding entry. `_start` calls `_main` (argc/argv/envp still
 	# in x0/x1/x2 from the kernel), then exit-syscalls its return (in x0).
+	if is_bare then {
+		# BARE entry: no kernel argv, no exit syscall. Seed the static root, pass &cf_page as main's
+		# node arg, call main, then spin (a real target returns to its boot environment / resets).
+		write_str(asm_fd, ".globl _start\n")
+		write_str(asm_fd, ".p2align 2\n")
+		write_str(asm_fd, "_start:\n")
+		write_str(asm_fd, "\tbl _cf_arena_init\n")
+		write_str(asm_fd, "\tadrp x0, _cf_page@PAGE\n")
+		write_str(asm_fd, "\tadd x0, x0, _cf_page@PAGEOFF\n")
+		write_str(asm_fd, "\tbl _main\n")
+		write_str(asm_fd, "_cf_halt:\n")
+		write_str(asm_fd, "\tb _cf_halt\n")
+	} else {
 	write_str(asm_fd, ".globl _start\n")
 	write_str(asm_fd, ".p2align 2\n")
 	write_str(asm_fd, "_start:\n")
@@ -4467,7 +4507,8 @@ pub const emit_program! = (Program prog, Uarch qbe_fd, Uarch asm_fd): Iarch -> {
 	write_str(asm_fd, "\tbl _main\n")
 	write_str(asm_fd, "\tmov x16, #1\n")
 	write_str(asm_fd, "\tsvc #0x80\n")
-	emit_arena_floor(asm_fd)
+	}
+	emit_arena_floor(asm_fd, is_bare)
 	# the user's asm-bodied functions, naked beside the floor (QBE has no asm/`svc` path)
 	let Iarch k = 0
 	loop {
