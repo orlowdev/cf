@@ -18,6 +18,7 @@
 # not yet enforced (that is the typecheck brick).
 
 import "io" as { write_str, die }
+import "alloc" as { nonstack_names! }
 import "ast" as { Expr, Stmt, Param, Func, FieldInit, RecDecl, UnionMember, UnionDecl, MatchArm, StmtArm, Seg, TupElem, Program }
 import "astutil" as { is_spread, spread_inner, is_skip, skip_count, is_nested, nested_inner!, tel_leaf, tel_nest, tel_is_nest, tel_is_fn, is_fixed_name, fixed_bits, fixed_signed, is_stack_name, is_pat_guard, is_member_guard, is_int_guard, guard_body!, guard_qual!, guard_member! }
 
@@ -37,7 +38,7 @@ import "astutil" as { is_spread, spread_inner, is_skip, skip_count, is_nested, n
 # `loop_mark` is the nearest enclosing reset-safe loop's entry-cursor temp (or "" if the nearest
 # loop is not reset-safe) — `break`/`continue` restore it so every path back to the loop head or out
 # of it reclaims the iteration's residue, matching the back-edge rewind.
-data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs, [RecDecl] recs, [UnionDecl] unions, Iarch cur_loop, Iarch cur_slot, Str cur_ret, Str reset_mark, Bool fn_ptr, Str loop_mark, Bool alloc_stack, Bool in_loop, Iarch stack_used }
+data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs, [RecDecl] recs, [UnionDecl] unions, Iarch cur_loop, Iarch cur_slot, Str cur_ret, Str reset_mark, Bool fn_ptr, Str loop_mark, Bool alloc_stack, Bool in_loop, Iarch stack_used, [Str] no_stack }
 
 # A local/parameter in scope: its interned name, `slot`, its `rec_type` (a record/union
 # type name, `"$dyn"`, `"$ptr"`, or `"Str"` — `""` for a word), and `elem` (a dynamic
@@ -179,6 +180,36 @@ const field_is_ptr = (*Emit ctx, Str rt, Str field): Bool -> {
 	return false
 }
 
+# Is `n` in the name list `xs`?
+const name_in = ([Str] xs, Str n): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(xs.len) then break
+		if str_eq(xs[i], n) then return true
+		i = i + 1
+	}
+	return false
+}
+# A record whose every field is a scalar (no pointer/aggregate field, per `field_is_ptr`). Such a
+# record is entirely self-contained — building it on the stack drags nothing into the arena. This is
+# the shape auto stack-promotion accepts (a nested record/array field would leave residue behind).
+const is_flat_record = (*Emit ctx, Str rt): Bool -> {
+	const Iarch ri = find_rec(ctx.recs, rt)
+	if ri < 0 then return false
+	let Iarch fi = 0
+	loop {
+		if fi >= Iarch(ctx.recs[ri].fields.len) then break
+		if field_is_ptr(ctx, rt, ctx.recs[ri].fields[fi]) then return false
+		fi = fi + 1
+	}
+	return true
+}
+# Is `e` a record literal (`{ … }` or `Rec({ … })`)? Only a fresh construction is a promotion
+# candidate — a call/field-read yields a pointer into memory the frame does not own.
+const is_record_lit = (Expr e): Bool -> match e {
+	Expr.Record(_, _) -> true,
+	_ -> false
+}
 # The `[T]` element type name of field `field` of record `rt` (its `felems` entry, "" for a
 # non-array field) — carried onto a binding that adopts the field's dynamic array.
 const field_elem = (*Emit ctx, Str rt, Str field): Str -> {
@@ -3572,7 +3603,11 @@ const emit_block! = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 					# a `$`-marked binding builds its aggregate on the STACK (reclaimed at frame exit); the
 					# flag rides through the whole initializer emit (nested literals included) and is cleared
 					# after. A call inside the initializer is unaffected — it allocates in its own frame.
-					ctx.alloc_stack = is_stack_name(n)
+					# AUTO-promotion (smart arena): a flat-record literal that provably never leaves the frame
+					# (absent from `no_stack`) and is not in a loop is stack-built too — same machinery, no
+					# `$` sigil. Its dead residue dies with the frame instead of riding the arena upward.
+					const Bool auto_stack = is_record_lit(e) && !ctx.in_loop && is_flat_record(ctx, rt) && !name_in(ctx.no_stack, n)
+					ctx.alloc_stack = is_stack_name(n) || auto_stack
 					const Iarch base = if bare_rec then emit_record_lit!(ctx, ann, record_inits_e(e), env) else emit_agg_binding!(ctx, e, env)
 					ctx.alloc_stack = false
 					let Str belem = ""
@@ -3645,6 +3680,18 @@ const emit_func! = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 	# per-frame reset (geometry_lowering §2): snapshot the node cursor at entry; each `ret` rewinds
 	# to it, reclaiming this frame's residue. Only for frames provably free of escape (fn_resettable).
 	ctx.fn_ptr = any_ptr_param(fn.params)
+	# auto stack-promotion oracle (smart arena, § zero-cost return): the names a frame must NOT build
+	# on the stack — they escape, ride a call, or are reassigned. Every other flat-record literal is
+	# stack-built, so its non-escaping residue is reclaimed by the machine stack at frame exit instead
+	# of riding the arena. Sound because a binding absent here never leaves the frame.
+	let [Str] pn = []
+	let Iarch pj = 0
+	loop {
+		if pj >= Iarch(fn.params.len) then break
+		pn = [...pn, fn.params[pj].name]
+		pj = pj + 1
+	}
+	ctx.no_stack = nonstack_names!(pn, fn.body)
 	ctx.reset_mark = ""
 	if fn_resettable(ctx, fn) then {
 		const Iarch mk = ctx.next
@@ -4475,7 +4522,7 @@ pub const emit_program! = (Program prog, Uarch qbe_fd, Uarch asm_fd, Str target_
 		if i >= Iarch(prog.funcs.len) then break
 		# an asm function is emitted into the floor, not through QBE
 		if !prog.funcs[i].is_asm then {
-			let Emit ctx = Emit({ fd: qbe_fd, next: 0, label: 0, funcs: prog.funcs, recs: prog.recs, unions: prog.unions, cur_loop: 0 - 1, cur_slot: 0 - 1, cur_ret: "", reset_mark: "", fn_ptr: false, loop_mark: "", alloc_stack: false, in_loop: false, stack_used: 0 })
+			let Emit ctx = Emit({ fd: qbe_fd, next: 0, label: 0, funcs: prog.funcs, recs: prog.recs, unions: prog.unions, cur_loop: 0 - 1, cur_slot: 0 - 1, cur_ret: "", reset_mark: "", fn_ptr: false, loop_mark: "", alloc_stack: false, in_loop: false, stack_used: 0, no_stack: [] })
 			emit_func!(&ctx, prog.funcs[i], i)
 		}
 		i = i + 1
