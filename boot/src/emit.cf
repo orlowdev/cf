@@ -52,7 +52,7 @@ data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs, [RecDecl] recs, [
 # `fixed` is the binding's fixed-width type NAME (`Int8`…`Uint64`) or `""` for a plain word /
 # aggregate — kept SEPARATE from `rec_type` because a fixed value is a WORD (it must not read
 # as an aggregate pointer), yet emit still needs its width/signedness to drive fixed-width ops.
-data Binding = { Str name, Iarch slot, Str rec_type, Str elem, Bool is_cell, [TupElem] telems, Str fixed }
+data Binding = { Str name, Iarch slot, Str rec_type, Str elem, Bool is_cell, [TupElem] telems, Str fixed, Iarch bufsz }
 
 # Byte-wise `Str` equality (variable-name lookup).
 const str_eq = (Str a, Str b): Bool -> {
@@ -1673,7 +1673,7 @@ const emit_destructure! = (*Emit ctx, [Binding] env, [Str] pat, Bool mutable, Ex
 			const Iarch ptr = ctx.next
 			ctx.next = ctx.next + 1
 			write_str(ctx.fd, "\t%t${ptr} =l loadl %t${saddr}\n")
-			e2 = [...e2, Binding({ name: tok, slot: ptr, rec_type: tel_agg_type(ctx, ptype), elem: "", is_cell: false, telems: tel_sub(ptype), fixed: "" })]
+			e2 = [...e2, Binding({ name: tok, slot: ptr, rec_type: tel_agg_type(ctx, ptype), elem: "", is_cell: false, telems: tel_sub(ptype), fixed: "", bufsz: 0 })]
 		} else {
 			# a word or FLOAT position: copy the 8-byte slot into a fresh cell. A float records its
 			# scalar in `fixed` so `binding_ptr` reloads it with `loadd`/`loads` (the copy is bit-preserving).
@@ -1685,7 +1685,7 @@ const emit_destructure! = (*Emit ctx, [Binding] env, [Str] pat, Bool mutable, Ex
 			ctx.next = ctx.next + 1
 			write_str(ctx.fd, "\t%t${cell} =l alloc8 8\n")
 			write_str(ctx.fd, "\tstorel %t${val}, %t${cell}\n")
-			e2 = [...e2, Binding({ name: tok, slot: cell, rec_type: "", elem: "", is_cell: true, telems: [], fixed: pf })]
+			e2 = [...e2, Binding({ name: tok, slot: cell, rec_type: "", elem: "", is_cell: true, telems: [], fixed: pf, bufsz: 0 })]
 		}
 		pos = pos + 1
 		pi = pi + 1
@@ -1860,9 +1860,9 @@ const arm_bind_types = (*Emit ctx, [Binding] env, Str type_name, [Str] members, 
 			if payload_is_ptr(ctx, type_name, members[0], bi) then {
 				const Str pt = payload_type(ctx, type_name, members[0], bi)
 				const Str pe = payload_elem(ctx, type_name, members[0], bi)
-				benv = [...benv, Binding({ name: binds[bi], slot: 0, rec_type: pt, elem: pe, is_cell: false, telems: payload_ptelems(ctx, type_name, members[0], bi), fixed: "" })]
+				benv = [...benv, Binding({ name: binds[bi], slot: 0, rec_type: pt, elem: pe, is_cell: false, telems: payload_ptelems(ctx, type_name, members[0], bi), fixed: "", bufsz: 0 })]
 			} else {
-				benv = [...benv, Binding({ name: binds[bi], slot: 0, rec_type: "", elem: "", is_cell: true, telems: [], fixed: "" })]
+				benv = [...benv, Binding({ name: binds[bi], slot: 0, rec_type: "", elem: "", is_cell: true, telems: [], fixed: "", bufsz: 0 })]
 			}
 		}
 		bi = bi + 1
@@ -2246,6 +2246,22 @@ const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env)
 		write_str(ctx.fd, "\t%t${gr} =l call $cf_arena_grow(l %node_0, w %t${gw})\n")
 		return "%t${gr}"
 	}
+	# `mem.fixed_buffer.of(buf)` — wrap a caller-provided `[N Uint8]` buffer as a fixed geometry. The
+	# buffer value is a raw byte pointer; its static byte size rides on the binding (`bufsz`, set at
+	# the `let [N Uint8]` site). cf_buffer_of lays the node header over the front of the buffer — no
+	# carve from %node_0.
+	if str_eq(callee, "cf__buffer_of") then {
+		const Str vn = match args[0] { Expr.Var(n) -> n, _ -> "" }
+		const Iarch bi = lookup_index(env, vn)
+		if bi < 0 then die("cf: emit: mem.fixed_buffer.of expects a buffer variable\n")
+		const Iarch bsz = env[bi].bufsz
+		if bsz <= 48 then die("cf: emit: mem.fixed_buffer.of needs a `[N Uint8]` buffer larger than the 48-byte node header\n")
+		const Str bv = emit_expr!(args[0], ctx, env)
+		const Iarch br = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${br} =l call $cf_buffer_of(l %node_0, l ${bv}, l ${bsz})\n")
+		return "%t${br}"
+	}
 	# `mem.page` — the root page node handle (the address of the $cf_page struct)
 	if str_eq(callee, "cf__page") then {
 		const Iarch tp = ctx.next
@@ -2420,7 +2436,7 @@ const arm_body_env! = (*Emit ctx, [Binding] env, Str type_name, [Str] members, [
 				write_str(ctx.fd, "\t%t${val} =l loadl %t${addr}\n")
 				const Str pt = payload_type(ctx, type_name, members[0], bi)
 				const Str pe = payload_elem(ctx, type_name, members[0], bi)
-				benv = [...benv, Binding({ name: binds[bi], slot: val, rec_type: pt, elem: pe, is_cell: false, telems: payload_ptelems(ctx, type_name, members[0], bi), fixed: "" })]
+				benv = [...benv, Binding({ name: binds[bi], slot: val, rec_type: pt, elem: pe, is_cell: false, telems: payload_ptelems(ctx, type_name, members[0], bi), fixed: "", bufsz: 0 })]
 			} else {
 				# a word (or FLOAT) payload: copy the 8-byte slot to its own cell. A float payload records
 				# its scalar type in `fixed` so `binding_ptr` reloads it with `loadd`/`loads` (the raw
@@ -2434,7 +2450,7 @@ const arm_body_env! = (*Emit ctx, [Binding] env, Str type_name, [Str] members, [
 				ctx.next = ctx.next + 1
 				write_str(ctx.fd, "\t%t${bslot} =l alloc8 8\n")
 				write_str(ctx.fd, "\tstorel %t${val}, %t${bslot}\n")
-				benv = [...benv, Binding({ name: binds[bi], slot: bslot, rec_type: "", elem: "", is_cell: true, telems: [], fixed: pf })]
+				benv = [...benv, Binding({ name: binds[bi], slot: bslot, rec_type: "", elem: "", is_cell: true, telems: [], fixed: pf, bufsz: 0 })]
 			}
 		}
 		bi = bi + 1
@@ -2827,6 +2843,12 @@ const bad_buf_size = (): Iarch -> {
 	die("cf: emit: a buffer size must be a comptime constant\n")
 	return 0
 }
+# The byte size of a `let [N Uint8]` buffer initializer (an `Expr.Buffer`), else 0. Recorded on the
+# binding so `mem.fixed_buffer.of(buf)` can recover the buffer's static size at its use site.
+const let_bufsz = (Expr e): Iarch -> match e {
+	Expr.Buffer(sz) -> buf_size(sz),
+	_ -> 0
+}
 const emit_buffer! = (*Emit ctx, Expr sz): Str -> {
 	const Iarch n = buf_size(sz)
 	const Iarch b = ctx.next
@@ -3208,7 +3230,7 @@ const emit_for_body! = (*Emit ctx, [Binding] env, Str lv, Str arr, [Stmt] body):
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${xcell} =l alloc8 8\n")
 	write_str(ctx.fd, "\tstorel %t${xval}, %t${xcell}\n")
-	const [Binding] benv = [...env, Binding({ name: lv, slot: xcell, rec_type: fer, elem: "", is_cell: true, telems: [], fixed: fx })]
+	const [Binding] benv = [...env, Binding({ name: lv, slot: xcell, rec_type: fer, elem: "", is_cell: true, telems: [], fixed: fx, bufsz: 0 })]
 	const Iarch term = emit_block!(ctx, body, benv)
 	if term == 0 && !str_eq(lmark, "") then write_str(ctx.fd, "\tstorel ${lmark}, %node_0\n")
 	if term == 0 then write_str(ctx.fd, "\tjmp @ltop${lid}\n")
@@ -3504,7 +3526,7 @@ const emit_block! = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 					ctx.next = ctx.next + 1
 					write_str(ctx.fd, "\t%t${slot} =l alloc8 8\n")
 					write_str(ctx.fd, "\t${store_op(fx)} ${v}, %t${slot}\n")
-					env = [...env, Binding({ name: n, slot: slot, rec_type: "", elem: "", is_cell: true, telems: [], fixed: fx })]
+					env = [...env, Binding({ name: n, slot: slot, rec_type: "", elem: "", is_cell: true, telems: [], fixed: fx, bufsz: 0 })]
 				} else {
 					const Iarch base = if bare_rec then emit_record_lit!(ctx, ann, record_inits_e(e), env) else emit_agg_binding!(ctx, e, env)
 					let Str belem = ""
@@ -3518,9 +3540,9 @@ const emit_block! = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 						ctx.next = ctx.next + 1
 						write_str(ctx.fd, "\t%t${cell} =l alloc8 8\n")
 						write_str(ctx.fd, "\tstorel %t${base}, %t${cell}\n")
-						env = [...env, Binding({ name: n, slot: cell, rec_type: rt, elem: belem, is_cell: true, telems: btel, fixed: "" })]
+						env = [...env, Binding({ name: n, slot: cell, rec_type: rt, elem: belem, is_cell: true, telems: btel, fixed: "", bufsz: let_bufsz(e) })]
 					} else {
-						env = [...env, Binding({ name: n, slot: base, rec_type: rt, elem: belem, is_cell: false, telems: btel, fixed: "" })]
+						env = [...env, Binding({ name: n, slot: base, rec_type: rt, elem: belem, is_cell: false, telems: btel, fixed: "", bufsz: let_bufsz(e) })]
 					}
 				}
 			},
@@ -3587,9 +3609,9 @@ const emit_func! = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 			ctx.next = ctx.next + 1
 			write_str(ctx.fd, "\t%t${slot} =l copy %p${pi}\n")
 			if str_eq(fn.params[pi].type_name, "$ptr") then {
-				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: "$ptr", elem: fn.params[pi].elem, is_cell: false, telems: [], fixed: "" })]
+				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: "$ptr", elem: fn.params[pi].elem, is_cell: false, telems: [], fixed: "", bufsz: 0 })]
 			} else {
-				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: fn.params[pi].type_name, elem: "", is_cell: false, telems: [], fixed: "" })]
+				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: fn.params[pi].type_name, elem: "", is_cell: false, telems: [], fixed: "", bufsz: 0 })]
 			}
 		} else if str_eq(fn.params[pi].type_name, "$fn") then {
 			# a function-value parameter arrives as a code address in an `l` register; spill it to a
@@ -3599,7 +3621,7 @@ const emit_func! = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 			ctx.next = ctx.next + 1
 			write_str(ctx.fd, "\t%t${slot} =l alloc8 8\n")
 			write_str(ctx.fd, "\tstorel %p${pi}, %t${slot}\n")
-			params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: "$fn", elem: fn.params[pi].elem, is_cell: true, telems: fn.params[pi].telems, fixed: "" })]
+			params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: "$fn", elem: fn.params[pi].elem, is_cell: true, telems: fn.params[pi].telems, fixed: "", bufsz: 0 })]
 		} else if str_eq(fn.params[pi].type_name, "$capref") then {
 			# a captured SCALAR arrives as its enclosing slot ADDRESS; bind a cell OVER that address
 			# so reads/writes go THROUGH it (by-reference capture). `fixed` carries the scalar type
@@ -3608,7 +3630,7 @@ const emit_func! = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 			const Iarch slot = ctx.next
 			ctx.next = ctx.next + 1
 			write_str(ctx.fd, "\t%t${slot} =l copy %p${pi}\n")
-			params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: "", elem: "", is_cell: true, telems: [], fixed: cfx })]
+			params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: "", elem: "", is_cell: true, telems: [], fixed: cfx, bufsz: 0 })]
 		} else if str_eq(fn.params[pi].type_name, "$capagg") then {
 			# a captured AGGREGATE arrives as its pointer; bind it like an aggregate parameter (its
 			# record/`Str` type in `rec_type`), so field/`.len` reads and field writes hit the shared
@@ -3616,7 +3638,7 @@ const emit_func! = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 			const Iarch slot = ctx.next
 			ctx.next = ctx.next + 1
 			write_str(ctx.fd, "\t%t${slot} =l copy %p${pi}\n")
-			params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: fn.params[pi].elem, elem: "", is_cell: false, telems: [], fixed: "" })]
+			params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: fn.params[pi].elem, elem: "", is_cell: false, telems: [], fixed: "", bufsz: 0 })]
 		} else {
 			if is_agg_param(fn.params[pi], ctx.recs, ctx.unions) then {
 				# a record/tuple parameter arrives as a pointer to the caller's aggregate; copy
@@ -3625,7 +3647,7 @@ const emit_func! = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 				const Iarch slot = ctx.next
 				ctx.next = ctx.next + 1
 				write_str(ctx.fd, "\t%t${slot} =l copy %p${pi}\n")
-				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: fn.params[pi].type_name, elem: fn.params[pi].elem, is_cell: false, telems: emit_canon_telems(ctx, fn.params[pi].telems), fixed: "" })]
+				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: fn.params[pi].type_name, elem: fn.params[pi].elem, is_cell: false, telems: emit_canon_telems(ctx, fn.params[pi].telems), fixed: "", bufsz: 0 })]
 			} else {
 				# a word/float parameter spills into a stack slot so it reads like a local; a
 				# fixed-width or float parameter records its type name so ops on it and the slot's
@@ -3635,7 +3657,7 @@ const emit_func! = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 				ctx.next = ctx.next + 1
 				write_str(ctx.fd, "\t%t${slot} =l alloc8 8\n")
 				write_str(ctx.fd, "\t${store_op(pfx)} %p${pi}, %t${slot}\n")
-				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: "", elem: "", is_cell: true, telems: [], fixed: pfx })]
+				params = [...params, Binding({ name: fn.params[pi].name, slot: slot, rec_type: "", elem: "", is_cell: true, telems: [], fixed: pfx, bufsz: 0 })]
 			}
 		}
 		pi = pi + 1
@@ -3777,6 +3799,28 @@ const emit_arena_qbe = (Uarch fd): Iarch -> {
 	write_str(fd, "\t%g40 =l add %hdr, 40\n")
 	write_str(fd, "\tstorel %sz, %g40\n")
 	write_str(fd, "\tret %hdr\n")
+	write_str(fd, "}\n")
+	# `mem.fixed_buffer.of(buf)` — wrap a caller-provided `[N Uint8]` buffer. `%ptr` is the raw
+	# byte block and `%size` its static byte length. Lay the 48-byte node header over the FRONT of
+	# the buffer and hand out blocks after it — nothing is pulled from the parent, so creating the
+	# geometry allocates zero. committed==limit and kind=0, so cf_alloc traps at the buffer's end
+	# (a fixed bound). `%node` is recorded as the parent (unused while kind=0).
+	write_str(fd, "function l $cf_buffer_of(l %node, l %ptr, l %size) {\n")
+	write_str(fd, "@start\n")
+	write_str(fd, "\t%blk =l add %ptr, 48\n")
+	write_str(fd, "\t%end =l add %ptr, %size\n")
+	write_str(fd, "\tstorel %blk, %ptr\n")
+	write_str(fd, "\t%b8 =l add %ptr, 8\n")
+	write_str(fd, "\tstorel %end, %b8\n")
+	write_str(fd, "\t%b16 =l add %ptr, 16\n")
+	write_str(fd, "\tstorel %end, %b16\n")
+	write_str(fd, "\t%b24 =l add %ptr, 24\n")
+	write_str(fd, "\tstorel %node, %b24\n")
+	write_str(fd, "\t%b32 =l add %ptr, 32\n")
+	write_str(fd, "\tstorel 0, %b32\n")
+	write_str(fd, "\t%b40 =l add %ptr, 40\n")
+	write_str(fd, "\tstorel 0, %b40\n")
+	write_str(fd, "\tret %ptr\n")
 	write_str(fd, "}\n")
 	# `[T]` grow-in-place append: given the 24-byte header {data@0, len@8, cap@16} and
 	# the element stride, ensure room for one more (amortized doubling: cap 0→4 else
