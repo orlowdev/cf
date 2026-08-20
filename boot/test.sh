@@ -14,6 +14,9 @@
 #   # expect: exit <n>   compile + run, exit <n>
 #   # expect: error      must FAIL to compile
 #   # args: <words>      argv for a run test
+#   # cf-flags: <words>  extra flags forwarded to cf (e.g. `--target bare-arm64 --root-size 0`).
+#                        A bare target emits an ELF the host can't run, so this is for `error` tests
+#                        only (compile-rejection); cf fails before the qbe/link tail is reached.
 set -u
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -50,6 +53,7 @@ while IFS= read -r name; do
 
 	expect=$(sed -n 's/^# *expect: *//p' "$cf" | head -1)
 	args=$(sed -n 's/^# *args: *//p' "$cf" | head -1)
+	cfflags=$(sed -n 's/^# *cf-flags: *//p' "$cf" | head -1)
 	if [ -z "$expect" ]; then
 		echo "FAIL $name (no \`# expect:\` directive)"
 		fail=$((fail + 1))
@@ -60,7 +64,8 @@ while IFS= read -r name; do
 
 	if [ "$expect" = "error" ]; then
 		# The program must FAIL to compile (cf rejects it, or the qbe/cc tail fails).
-		if "$driver" "$cf" "$bin" >/dev/null 2>&1; then
+		# shellcheck disable=SC2086
+		if "$driver" $cfflags "$cf" "$bin" >/dev/null 2>&1; then
 			echo "FAIL $name (compiled, expected an error)"
 			fail=$((fail + 1))
 		else
@@ -72,7 +77,8 @@ while IFS= read -r name; do
 
 	want=${expect#exit }
 
-	if ! "$driver" "$cf" "$bin" >/dev/null 2>&1; then
+	# shellcheck disable=SC2086
+	if ! "$driver" $cfflags "$cf" "$bin" >/dev/null 2>&1; then
 		echo "FAIL $name (cf did not compile)"
 		fail=$((fail + 1))
 		continue

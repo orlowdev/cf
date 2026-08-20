@@ -25,13 +25,19 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 cf="$root/var/cf"
 qbe="$root/opt/qbe/qbe"
 
+# collect leading `--flag value` pairs: `target` steers the qbe/link tail, and every flag is also
+# forwarded to cf verbatim (`$flags`) so `--root-size` etc. reach the compiler.
 target=darwin-arm64
-if [ "${1:-}" = "--target" ]; then
-	target=$2
-	shift 2
-fi
+flags=""
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+	--target) target=$2; flags="$flags --target $2"; shift 2 ;;
+	--root-size) flags="$flags --root-size $2"; shift 2 ;;
+	*) break ;;
+	esac
+done
 if [ "$#" -ne 2 ]; then
-	echo "usage: driver.sh [--target <os>-<arch>] <input.cf> <out-binary>" >&2
+	echo "usage: driver.sh [--target <os>-<arch>] [--root-size <bytes>] <input.cf> <out-binary>" >&2
 	exit 2
 fi
 in=$1
@@ -41,7 +47,8 @@ tmp=$(mktemp -d "${TMPDIR:-/tmp}/cf-driver.XXXXXX") || exit 1
 trap 'rm -rf "$tmp"' EXIT
 
 if [ "$target" = "bare-arm64" ]; then
-	"$cf" --target bare-arm64 "$in" "$tmp/prog.qbe" "$tmp/floor.s"
+	# shellcheck disable=SC2086
+	"$cf" $flags "$in" "$tmp/prog.qbe" "$tmp/floor.s"
 	"$qbe" -t arm64 -o "$tmp/prog.s" "$tmp/prog.qbe"
 	# assemble both units as AArch64 ELF — clang carries the aarch64 backend, so this works on a
 	# stock host and validates the emitted ELF asm.
@@ -60,7 +67,8 @@ if [ "$target" = "bare-arm64" ]; then
 		echo "          ld.lld -T $root/boot/target/bare-arm64.ld -o $out ${out}.floor.o ${out}.prog.o" >&2
 	fi
 else
-	"$cf" --target "$target" "$in" "$tmp/prog.qbe" "$tmp/floor.s"
+	# shellcheck disable=SC2086
+	"$cf" $flags "$in" "$tmp/prog.qbe" "$tmp/floor.s"
 	"$qbe" -t arm64_apple -o "$tmp/prog.s" "$tmp/prog.qbe"
 	cc -nostdlib -lSystem -Wl,-e,_start -o "$out" "$tmp/floor.s" "$tmp/prog.s"
 fi

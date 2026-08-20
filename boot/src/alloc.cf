@@ -745,9 +745,14 @@ const root_ambient_set! = (Program prog): [Str] -> {
 	return r
 }
 
-pub const check_root_program! = (Program prog) -> {
+pub const check_root_program! = (Program prog, Bool zero_root) -> {
 	const [Func] funcs = prog.funcs
 	const [Str] root = root_ambient_set!(prog)
+	# ZERO-ROOT mode (`--root-size 0` on `Bare`): the root page has no bytes, so NO page use is legal.
+	# An arena graft carves its header from the ambient node — bare (root-ambient) it draws on the
+	# page. The root-ambient set already collects bare-called names, so a page-carving arena intrinsic
+	# reached without an `in` clause shows up here by name. Reject it up front.
+	if zero_root && (has_name(root, "cf__arena_of") || has_name(root, "cf__arena_grow")) then die("cf: zero-root: an arena grafts its header from the root page, but `--root-size 0` forbids all page use — drop the arena and allocate only in `$`-stack, `static`, or a `fixed_buffer`\n")
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(root.len) then break
@@ -758,6 +763,11 @@ pub const check_root_program! = (Program prog) -> {
 		# calls (the root-ambient set closes over bare calls only; an `in` clause leaves the set). `main`
 		# is never `!`, so it is exempt and may open buffers/records directly on the root.
 		if fi >= 0 && !funcs[fi].is_asm && is_bang_name(funcs[fi].name) then die("cf: root: `${funcs[fi].name}` is a `!` function reached without a geometry — call it `in <arena>` (root does not propagate into `!` functions)\n")
+		# In zero-root there is no page to spill onto, so `main`'s own exemption is revoked too: ANY
+		# root-ambient function that constructs a residue aggregate on the page is rejected. Legal
+		# storage (`$`, `static`, `fixed_buffer` allocations run `in fb`) never lands here — the first
+		# two aren't residue, and a `fixed_buffer` sink is reached `in fb`, off the root-ambient set.
+		if zero_root && fi >= 0 && !funcs[fi].is_asm && local_residue!(prog.unions, funcs[fi]) then die("cf: zero-root: `${funcs[fi].name}` allocates residue on the root page, but `--root-size 0` forbids it — use `$`-stack, `static`, or a `fixed_buffer` instead\n")
 		i = i + 1
 	}
 	return 0

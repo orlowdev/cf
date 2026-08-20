@@ -11,7 +11,7 @@
 # to two file descriptors and the external driver runs the `qbe`→`cc` tail.
 #
 # ⚠ PARTIAL codegen — the root `page` runtime is now the real ELASTIC reserve-in-place
-# bump (see `emit_arena_qbe`/`emit_arena_floor`), but the per-node `%node`/`%ret` ABI and
+# bump (see `emit_arena_qbe!`/`emit_arena_floor!`), but the per-node `%node`/`%ret` ABI and
 # carved arenas are not landed yet (the next arc). Integer ops are word
 # (`w`) ops; every local is a word stack slot (`alloc4`/`storew`/`loadw`); `/`/`%`
 # do not yet apply the §5.6 divide-by-zero guard; `const` vs `let` mutability is
@@ -3730,10 +3730,14 @@ const emit_func! = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 # moves, so returned pointers stay valid (memory_model §8). Records (which may escape via a
 # return) live here; scalars stay in stack slots. (Still the single ambient page — the per-node
 # `%node`/`%ret` ABI and carved arenas are the next arc.)
-const emit_arena_qbe = (Uarch fd, Bool is_bare): Iarch -> {
-	# a `Bare` target's root is a fixed 1 MiB BSS block (`$cf_root`) — no mmap. cf_arena_init seeds
-	# $cf_page over it with committed==limit, so cf_alloc bumps within it and traps (cf_oom) at the end.
-	if is_bare then write_str(fd, "export data $cf_root = { z 1048576 }\n")
+const emit_arena_qbe! = (Uarch fd, Bool is_bare, Iarch root_size): Iarch -> {
+	# a `Bare` target's root is a fixed `root_size`-byte BSS block (`$cf_root`, default 1 MiB) — no
+	# mmap. cf_arena_init seeds $cf_page over it with committed==limit, so cf_alloc bumps within it and
+	# traps (cf_oom) at the end. In zero-root mode (root_size 0) the usable region is empty (the floor
+	# sets limit==base), so any allocation traps — but the check rejects page use at compile time first;
+	# the block still needs a non-zero size for a valid `data` symbol, so clamp the reservation to 16.
+	const Iarch dsz = if root_size < 16 then 16 else root_size
+	if is_bare then write_str(fd, "export data $cf_root = { z ${dsz} }\n")
 	# A MemoryNode is a pointer to `{ top@0, committed@8, limit@16, parent@24, kind@32, chunk@40 }`
 	# (geometry_lowering §4). `$cf_page` is the root page node; carved arenas get their own headers.
 	# cf_alloc is NODE-RELATIVE — it bumps whichever node it is handed (`%node`, threaded as arg 0).
@@ -4307,7 +4311,7 @@ const emit_argv_qbe = (Uarch fd): Iarch -> {
 # crosses the committed watermark — the same base address throughout, so every outstanding pointer
 # stays valid (memory_model §8). `cf_oom` fires only at RESERVATION exhaustion; `cf_mmap_fail` on a
 # failed map/commit. All are leaf routines (no `bl`) touching only caller-saved regs (x0-x16).
-const emit_arena_floor = (Uarch fd, Bool is_bare): Iarch -> {
+const emit_arena_floor! = (Uarch fd, Bool is_bare, Iarch root_size): Iarch -> {
 	# BARE floor (ELF, no OS): `qbe -t arm64` emits SysV symbols with no leading `_`, and ELF uses
 	# `:lo12:` page-offset relocations (vs Mach-O `@PAGE`/`@PAGEOFF`). cf_arena_init seeds $cf_page over
 	# the static 1 MiB $cf_root (committed==limit ⇒ cf_alloc bumps within it and traps at the end);
@@ -4323,7 +4327,9 @@ const emit_arena_floor = (Uarch fd, Bool is_bare): Iarch -> {
 		write_str(fd, "\tadrp x12, cf_root\n")
 		write_str(fd, "\tadd x12, x12, :lo12:cf_root\n")
 		write_str(fd, "\tstr x12, [x9]\n")
-		write_str(fd, "\tmov x1, #0x100000\n")
+		# committed == limit == base + root_size ⇒ a FIXED root (cf_alloc bumps and traps at the end).
+		# `mov` accepts any 64-bit immediate (the assembler expands to movz/movk). root_size 0 ⇒ 0 usable.
+		write_str(fd, "\tmov x1, #${root_size}\n")
 		write_str(fd, "\tadd x13, x12, x1\n")
 		write_str(fd, "\tstr x13, [x9, #8]\n")
 		write_str(fd, "\tstr x13, [x9, #16]\n")
@@ -4443,11 +4449,12 @@ const emit_asm_func! = (Uarch fd, Func fn, Iarch idx): Iarch -> {
 # `main()` the `_start` floor does nothing before `bl _main`, so those flow straight
 # through. For `main([Str] args)` it first `bl _cf_build_args` to convert `(argc, argv)`
 # into a real cf `[Str]` header (in x0), which QBE reads as `$main`'s argument.
-pub const emit_program! = (Program prog, Uarch qbe_fd, Uarch asm_fd, Str target_os): Iarch -> {
+pub const emit_program! = (Program prog, Uarch qbe_fd, Uarch asm_fd, Str target_os, Iarch root_size): Iarch -> {
 	# a `Bare` target (bare metal / Wasm) links no OS: the root is a static BSS region (no mmap), and
 	# there is no exit syscall — the floor halts. Every other target keeps the darwin mmap/exit floor.
+	# `root_size` sizes the `Bare` root page (ignored off `Bare`, which mmaps its own reserve).
 	const Bool is_bare = str_eq(target_os, "Bare")
-	emit_arena_qbe(qbe_fd, is_bare)
+	emit_arena_qbe!(qbe_fd, is_bare, root_size)
 	const Bool argv_form = main_takes_argv(prog)
 	if argv_form then emit_argv_qbe(qbe_fd)
 	# STATIC storage: each `static [N Uint8] NAME` gets a zero-filled BSS data block and a
@@ -4527,7 +4534,7 @@ pub const emit_program! = (Program prog, Uarch qbe_fd, Uarch asm_fd, Str target_
 	write_str(asm_fd, "\tmov x16, #1\n")
 	write_str(asm_fd, "\tsvc #0x80\n")
 	}
-	emit_arena_floor(asm_fd, is_bare)
+	emit_arena_floor!(asm_fd, is_bare, root_size)
 	# the user's asm-bodied functions, naked beside the floor (QBE has no asm/`svc` path)
 	let Iarch k = 0
 	loop {

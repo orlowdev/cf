@@ -17,13 +17,16 @@ import "io" as { exit, eprint }
 # QBE IL + an asm floor to two explicit output paths (it cannot yet spawn
 # qbe/cc itself — process-spawn is deferred to the external driver). Each path is
 # the argv `Str`; the caller passes its `.bytes` to `open`.
-#   cf [--target <os>-<arch>] <input.cf> <out.qbe> <out.s>
+#   cf [--target <os>-<arch>] [--root-size <bytes>] <input.cf> <out.qbe> <out.s>
 # `target_os`/`target_arch` are the `Os`/`Arch` variant names the build targets — `comptime.os`/
 # `comptime.arch` compare against them to select a platform floor. They come from `--target`,
 # defaulting to the host cf was built for (darwin/arm64).
-pub data Cli = { Str input, Str out_qbe, Str out_asm, Str target_os, Str target_arch }
+# `root_size` is the byte size of the `Bare` target's static root page (BSS), default 1 MiB. `0`
+# is a special ZERO-ROOT mode: the binary provably never touches the page (allocation is a compile
+# error) — everything must live in `$`-stack, `static` BSS, or a `fixed_buffer`. Ignored off `Bare`.
+pub data Cli = { Str input, Str out_qbe, Str out_asm, Str target_os, Str target_arch, Iarch root_size }
 
-const str_eq = (Str a, Str b): Bool -> {
+pub const str_eq = (Str a, Str b): Bool -> {
 	if a.len != b.len then return false
 	let Iarch i = 0
 	loop {
@@ -34,36 +37,59 @@ const str_eq = (Str a, Str b): Bool -> {
 	return true
 }
 
-# `[--target <os>-<arch>] <input.cf> <out.qbe> <out.s>`. `--target` selects the platform (default:
-# the host, `darwin-arm64`); the three positional paths follow. The `!` algebra and root rule are
-# validated unconditionally.
+# A non-negative decimal, for `--root-size`. Non-digit bytes are skipped (so `1048576` parses; there
+# is no unit suffix — bytes only).
+const parse_dec = (Str s): Iarch -> {
+	let Iarch v = 0
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(s.len) then break
+		const Iarch c = Iarch(s[i])
+		if c >= 48 && c <= 57 then v = v * 10 + (c - 48)
+		i = i + 1
+	}
+	return v
+}
+
+# `[--target <os>-<arch>] [--root-size <bytes>] <input.cf> <out.qbe> <out.s>`. Leading `--flag value`
+# pairs are consumed in any order; `--target` selects the platform (default: the host, `darwin-arm64`)
+# and `--root-size` the `Bare` root page (default 1 MiB). The three positional paths follow. The `!`
+# algebra and root rule are validated unconditionally.
 pub const cli_parse = ([Str] args): Cli -> {
 	let Str tos = "Darwin"
 	let Str tarch = "Arm64"
+	let Iarch rsize = 1048576
 	let Iarch base = 1
-	if Iarch(args.len) > 2 && str_eq(args[1], "--target") then {
-		const Str t = args[2]
-		let Bool known = false
-		if str_eq(t, "darwin-arm64") then {
-			tos = "Darwin"
-			tarch = "Arm64"
-			known = true
-		}
-		if str_eq(t, "linux-arm64") then {
-			tos = "Linux"
-			tarch = "Arm64"
-			known = true
-		}
-		if str_eq(t, "bare-arm64") then {
-			tos = "Bare"
-			tarch = "Arm64"
-			known = true
-		}
-		if !known then eprint("cf: unknown --target (expected `darwin-arm64`, `linux-arm64`, or `bare-arm64`)\n")
-		if !known then exit(2)
-		base = 3
+	loop {
+		if base + 1 >= Iarch(args.len) then break
+		const Str a = args[base]
+		if str_eq(a, "--target") then {
+			const Str t = args[base + 1]
+			let Bool known = false
+			if str_eq(t, "darwin-arm64") then {
+				tos = "Darwin"
+				tarch = "Arm64"
+				known = true
+			}
+			if str_eq(t, "linux-arm64") then {
+				tos = "Linux"
+				tarch = "Arm64"
+				known = true
+			}
+			if str_eq(t, "bare-arm64") then {
+				tos = "Bare"
+				tarch = "Arm64"
+				known = true
+			}
+			if !known then eprint("cf: unknown --target (expected `darwin-arm64`, `linux-arm64`, or `bare-arm64`)\n")
+			if !known then exit(2)
+			base = base + 2
+		} else if str_eq(a, "--root-size") then {
+			rsize = parse_dec(args[base + 1])
+			base = base + 2
+		} else break
 	}
-	if Iarch(args.len) < base + 3 then eprint("cf: usage: cf [--target <os>-<arch>] <input.cf> <out.qbe> <out.s>\n")
+	if Iarch(args.len) < base + 3 then eprint("cf: usage: cf [--target <os>-<arch>] [--root-size <bytes>] <input.cf> <out.qbe> <out.s>\n")
 	if Iarch(args.len) < base + 3 then exit(2)
-	return Cli({ input: args[base], out_qbe: args[base + 1], out_asm: args[base + 2], target_os: tos, target_arch: tarch })
+	return Cli({ input: args[base], out_qbe: args[base + 1], out_asm: args[base + 2], target_os: tos, target_arch: tarch, root_size: rsize })
 }
