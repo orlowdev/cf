@@ -2700,6 +2700,9 @@ const parse_item! = (*Parser p): Program -> {
 		# only grouped-parameter `type X = { … }` decls reach here — `type` ALIASES are erased
 		# before parse (typealias.cf token pass)
 		groups = [...groups, parse_group!(p)]
+	} else if heads(p, "static") then {
+		# a module-level `static [N Uint8] NAME` — a BSS byte buffer, modeled as a value-const Func
+		funcs = [...funcs, parse_static!(p)]
 	} else {
 		funcs = [...funcs, parse_func!(p)]
 	}
@@ -2710,6 +2713,38 @@ const parse_item! = (*Parser p): Program -> {
 # (each optionally `pub`), and comptime `if` conditionals, in any order. One function must be
 # `pub const main` (checked later). Imports are resolved and flattened away before typecheck
 # (module_system §8).
+# `[pub] static [N Uint8] NAME` — a module-level STATIC byte buffer: N zero bytes in the binary's BSS,
+# program-lifetime, off every geometry node. Modeled as a nullary value-const (a bare `NAME` auto-calls
+# it), with a `$static` return that emit lowers to the persistent BSS header address. Global-lifetime,
+# so it never dangles — no escape rules, not residue.
+const parse_static! = (*Parser p): Func -> {
+	let Bool is_pub = false
+	if kw(p, "pub") then {
+		is_pub = true
+		p.pos = p.pos + 1
+	}
+	if !kw(p, "static") then die("cf: parse: expected `static`\n")
+	p.pos = p.pos + 1
+	if !is_lbracket(peek(p)) then die("cf: parse: a `static` needs a `[N Uint8]` buffer type\n")
+	if !is_intlit(p.toks[p.pos + 1].kind) then die("cf: parse: a `static` buffer needs a comptime size\n")
+	p.pos = p.pos + 1
+	const Iarch n = p.toks[p.pos].ival
+	p.pos = p.pos + 1
+	const Str felem = parse_fixed_elem!(p)
+	if !str_eq(felem, "Uint8") then die("cf: parse: a `static` buffer holds `Uint8` only\n")
+	if !is_rbracket(peek(p)) then die("cf: parse: expected `]` in a `static` type\n")
+	p.pos = p.pos + 1
+	if n <= 0 then die("cf: parse: a `static` buffer needs a positive size\n")
+	if !is_ident(peek(p)) then die("cf: parse: expected a `static` name\n")
+	const Str name = cur_name!(p)
+	p.pos = p.pos + 1
+	const [Param] noparams = []
+	const [Stmt] body = [Stmt.Return(Expr.Buffer(Expr.Lit(n)))]
+	const [Seg] noasm = []
+	const [Str] no_tp = []
+	return Func({ name: name, is_pub: is_pub, ret_name: "$dyn", ret_elem: "Uint8", params: noparams, body: body, is_asm: false, asm_body: noasm, is_value: true, ret_telems: [], typarams: no_tp, tbounds: no_tp, ret_size: n })
+}
+
 pub const parse_program! = (*Parser p): Program -> {
 	let Program acc = empty_program()
 	loop {
