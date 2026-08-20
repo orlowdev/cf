@@ -2360,8 +2360,33 @@ const name_esc = ([VarTy] env, Str n): Bool -> {
 	if i < 0 then return false
 	return env[i].esc
 }
+# Does `callee` return a type that RESIDES in memory — a record, dynamic array/buffer, string,
+# tuple, or union? Classified straight from the declared `ret_name` (no `Ty` is built, so this stays
+# allocation-free — `carries_local` must remain non-`!`). Unions are treated conservatively: a
+# tag-only union is a bare word and never dangles, but a boxed one does, and over-rejecting a rare
+# tag-only return `in fb` is safe. A scalar return (`Iarch`/fixed/`Bool`/`Float`) copies out by value.
+const ret_resides = (Str callee, Ctx ctx): Bool -> {
+	const Iarch fi = find_func(ctx.funcs, callee)
+	if fi < 0 then return false
+	const Str rn = ctx.funcs[fi].ret_name
+	if str_eq(rn, "$tuple") || str_eq(rn, "$dyn") || str_eq(rn, "Str") then return true
+	if find_rec(ctx.recs, rn) >= 0 then return true
+	if find_union(ctx.unions, rn) >= 0 then return true
+	return false
+}
+# A call carries a local when it wraps a `$`-stack buffer into a `fixed_buffer` (the returned handle
+# then addresses frame-local storage — track it like a `$` value), or when it allocates an AGGREGATE
+# `in` a stack-tainted geometry (`make!() in fb`, fb over a `$buf`): the aggregate lives in that
+# frame-local buffer and dangles once the frame pops. A SCALAR return from `f() in fb` copies out by
+# value and is safe (so `span!(n) in fb` returning an `Iarch` is fine).
+const call_carries_local = (Str callee, [Expr] args, Str g, [VarTy] env, Ctx ctx): Bool -> {
+	if str_eq(callee, "cf__buffer_of") && exprs_carry_local(args, env, ctx) then return true
+	if !str_eq(g, "") && name_esc(env, g) && ret_resides(callee, ctx) then return true
+	return false
+}
 const carries_local = (Expr e, [VarTy] env, Ctx ctx): Bool -> match e {
 	Expr.Addr(n) -> true,
+	Expr.Call(callee, tyargs, args, g) -> call_carries_local(callee, args, g, env, ctx),
 	# a `$`-stack aggregate IS a dying local: its storage pops with the frame, so returning/rehoming
 	# the whole value (`$p`) dangles — just like a pointer-into-a-local. A scalar field read (`$p.x`)
 	# copies a value and is fine (handled by the Field arm's `field_is_ptr` gate below).
