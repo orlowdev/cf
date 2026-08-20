@@ -17,7 +17,7 @@
 
 import "io" as { die }
 import "ast" as { Expr, Stmt, Param, Func, Ty, FieldInit, RecDecl, UnionMember, UnionDecl, MatchArm, StmtArm, Seg, TupElem, Program }
-import "astutil" as { is_spread, spread_inner, is_skip, skip_count, is_nested, nested_inner!, tel_leaf, tel_nest, tel_is_nest, tel_fn, tel_is_fn, is_fixed_name, fixed_bits, fixed_signed, is_float_name, float_bits, is_pat_guard, is_member_guard, is_int_guard, guard_body!, guard_qual!, guard_member! }
+import "astutil" as { is_spread, spread_inner, is_skip, skip_count, is_nested, nested_inner!, tel_leaf, tel_nest, tel_is_nest, tel_fn, tel_is_fn, is_fixed_name, fixed_bits, fixed_signed, is_float_name, float_bits, is_stack_name, is_pat_guard, is_member_guard, is_int_guard, guard_body!, guard_qual!, guard_member! }
 
 # A name in scope during checking: its type and whether it is reassignable (`let`).
 # `esc` — this binding is, or (by construction) transitively contains, an explicit pointer into a
@@ -2346,13 +2346,16 @@ const name_esc = ([VarTy] env, Str n): Bool -> {
 }
 const carries_local = (Expr e, [VarTy] env, Ctx ctx): Bool -> match e {
 	Expr.Addr(n) -> true,
-	Expr.Var(n) -> name_esc(env, n),
+	# a `$`-stack aggregate IS a dying local: its storage pops with the frame, so returning/rehoming
+	# the whole value (`$p`) dangles — just like a pointer-into-a-local. A scalar field read (`$p.x`)
+	# copies a value and is fine (handled by the Field arm's `field_is_ptr` gate below).
+	Expr.Var(n) -> is_stack_name(n) || name_esc(env, n),
 	# a field READ propagates the local-escape taint iff it reads an aggregate POINTER field (`fptrs`)
 	# of a TAINTED local aggregate — `return localAgg.ptrField` hands up the `&local` stored in it, a
 	# pointer into a dying residence (memory_model §6). A scalar-field read (`p.x`) carries no pointer,
 	# and a pointer field of a PARAM (`param.p`, non-`esc`) points into the caller's region and is safe.
 	# (An index read `a[i]` and a nested `FieldExpr` base stay unpropagated — a further edge.)
-	Expr.Field(base, f) -> name_esc(env, base) && field_is_ptr(base, f, env, ctx),
+	Expr.Field(base, f) -> (is_stack_name(base) || name_esc(env, base)) && field_is_ptr(base, f, env, ctx),
 	Expr.Record(tn, inits) -> inits_carry_local(inits, env, ctx),
 	Expr.UnionMk(tn, mem, args) -> exprs_carry_local(args, env, ctx),
 	Expr.Tuple(elems) -> exprs_carry_local(elems, env, ctx),
@@ -2485,6 +2488,10 @@ const check_simple_stmt! = (Stmt s, [VarTy] env, Ctx ctx, Iarch loop_kind): Iarc
 			const Iarch idx = env_index(env, n)
 			if idx < 0 then die("cf: type: assignment to an undeclared name\n")
 			if !env[idx].mutable then die("cf: type: cannot reassign a `const` binding or a parameter\n")
+			# a `$`-stack value may not be stored into a non-`$` binding (a heap array/record that may outlive
+			# the frame): the store would dangle once the frame pops, exactly like returning it. A store into
+			# another `$` (same-frame) binding is fine — both die together.
+			if !is_stack_name(n) && carries_local(e, env, ctx) then die("cf: type: a `$`-stack value cannot escape into a heap aggregate — it dangles when the frame pops; keep it in a geometry (or a `$` binding)\n")
 			# an empty `[]` reset keeps a dynamic-array binding's type (its element is unknown,
 			# adopted from the target — `arraylit_type` would otherwise default it to `Iarch`)
 			if is_empty_arraylit(e) then {
@@ -2516,6 +2523,7 @@ const check_simple_stmt! = (Stmt s, [VarTy] env, Ctx ctx, Iarch loop_kind): Iarc
 			# OUTLIVES this call) may not store a pointer into a function-LOCAL — it would dangle once the
 			# local dies (memory_model §6). A store into a local record is same-rank and permitted.
 			if env[idx].outer && carries_local(e, env, ctx) then die("cf: type: cannot rehome a pointer into a local through a caller's aggregate — it would dangle once the call returns\n")
+			if !is_stack_name(b) && carries_local(e, env, ctx) then die("cf: type: a `$`-stack value cannot escape into a heap aggregate — it dangles when the frame pops; keep it in a geometry (or a `$` binding)\n")
 			if !ty_eq(type_of!(e, env, ctx), ft) then die("cf: type: a field value's type must match the field\n")
 		},
 		Stmt.DeepFieldAssign(be, f, e) -> {
@@ -2534,6 +2542,7 @@ const check_simple_stmt! = (Stmt s, [VarTy] env, Ctx ctx, Iarch loop_kind): Iarc
 			const Str rn = lvalue_root_name(be)
 			const Iarch rIdx = env_index(env, rn)
 			if rIdx >= 0 && env[rIdx].outer && carries_local(e, env, ctx) then die("cf: type: cannot rehome a pointer into a local through a caller's aggregate — it would dangle once the call returns\n")
+			if !is_stack_name(rn) && carries_local(e, env, ctx) then die("cf: type: a `$`-stack value cannot escape into a heap aggregate — it dangles when the frame pops; keep it in a geometry (or a `$` binding)\n")
 			if !ty_eq(type_of!(e, env, ctx), ft) then die("cf: type: a field value's type must match the field\n")
 		},
 		Stmt.IndexAssign(a, ix, val) -> {
@@ -2542,6 +2551,7 @@ const check_simple_stmt! = (Stmt s, [VarTy] env, Ctx ctx, Iarch loop_kind): Iarc
 			if !env[idx].mutable then die("cf: type: cannot write to a `const`/borrowed array\n")
 			if str_eq(dyn_of(env[idx].ty), "") && !is_tptr(env[idx].ty) then die("cf: type: element assignment needs a dynamic array or a byte buffer\n")
 			if !is_tint(type_of!(ix, env, ctx)) then die("cf: type: an array index must be an integer\n")
+			if !is_stack_name(a) && carries_local(val, env, ctx) then die("cf: type: a `$`-stack value cannot escape into a heap aggregate — it dangles when the frame pops; keep it in a geometry (or a `$` binding)\n")
 			# a byte element (`[N Uint8]` buffer, a `[Uint8]` array, or a `*[Uint8]` pointer) holds
 			# `Uint8`: a literal element must fit 0..255. (A non-literal stays a byte word — a byte read
 			# `src[i]` types `Int`, not `Uint8`, so no implicit-narrowing gate is possible without also

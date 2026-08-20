@@ -19,7 +19,7 @@
 
 import "io" as { write_str, die }
 import "ast" as { Expr, Stmt, Param, Func, FieldInit, RecDecl, UnionMember, UnionDecl, MatchArm, StmtArm, Seg, TupElem, Program }
-import "astutil" as { is_spread, spread_inner, is_skip, skip_count, is_nested, nested_inner!, tel_leaf, tel_nest, tel_is_nest, tel_is_fn, is_fixed_name, fixed_bits, fixed_signed, is_pat_guard, is_member_guard, is_int_guard, guard_body!, guard_qual!, guard_member! }
+import "astutil" as { is_spread, spread_inner, is_skip, skip_count, is_nested, nested_inner!, tel_leaf, tel_nest, tel_is_nest, tel_is_fn, is_fixed_name, fixed_bits, fixed_signed, is_stack_name, is_pat_guard, is_member_guard, is_int_guard, guard_body!, guard_qual!, guard_member! }
 
 # The emit context: the QBE-IL output fd, the next free temp number, the next free
 # basic-block label id, the program's functions (a call resolves its callee — by
@@ -37,7 +37,7 @@ import "astutil" as { is_spread, spread_inner, is_skip, skip_count, is_nested, n
 # `loop_mark` is the nearest enclosing reset-safe loop's entry-cursor temp (or "" if the nearest
 # loop is not reset-safe) — `break`/`continue` restore it so every path back to the loop head or out
 # of it reclaims the iteration's residue, matching the back-edge rewind.
-data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs, [RecDecl] recs, [UnionDecl] unions, Iarch cur_loop, Iarch cur_slot, Str cur_ret, Str reset_mark, Bool fn_ptr, Str loop_mark }
+data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs, [RecDecl] recs, [UnionDecl] unions, Iarch cur_loop, Iarch cur_slot, Str cur_ret, Str reset_mark, Bool fn_ptr, Str loop_mark, Bool alloc_stack }
 
 # A local/parameter in scope: its interned name, `slot`, its `rec_type` (a record/union
 # type name, `"$dyn"`, `"$ptr"`, or `"Str"` — `""` for a word), and `elem` (a dynamic
@@ -1315,13 +1315,22 @@ const find_override = ([FieldInit] inits, Str fname): Iarch -> {
 	}
 	return 0 - 1
 }
+# Allocate `size` bytes for an aggregate and return its base temp. On the STACK (QBE `alloc8`,
+# reclaimed when the frame pops) when a `$`-marked binding is being built (`ctx.alloc_stack`), else
+# from the ambient geometry node (`cf_alloc`). The non-stack form is byte-identical to the old inline
+# `cf_alloc`, so cf's own (stack-free) source emits unchanged.
+const emit_agg_alloc! = (*Emit ctx, Iarch size): Iarch -> {
+	const Iarch t = ctx.next
+	ctx.next = ctx.next + 1
+	if ctx.alloc_stack then write_str(ctx.fd, "\t%t${t} =l alloc8 ${size}\n")
+	if !ctx.alloc_stack then write_str(ctx.fd, "\t%t${t} =l call $cf_alloc(l %node_0, w ${size})\n")
+	return t
+}
 const emit_record_lit! = (*Emit ctx, Str type_name, [FieldInit] inits, [Binding] env): Iarch -> {
 	const Iarch ri = find_rec(ctx.recs, type_name)
 	const Iarch nfld = Iarch(ctx.recs[ri].fields.len)
 	const Iarch size = nfld * 8
-	const Iarch base = ctx.next
-	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${base} =l call $cf_alloc(l %node_0, w ${size})\n")
+	const Iarch base = emit_agg_alloc!(ctx, size)
 	# a VALUE spread `{ ...src, … }`: fill each field in declaration order — from its override if
 	# present, else COPY the source's word at that offset (typecheck guarantees copied fields are
 	# words, never aliasing pointers). The source's base pointer is the spread value.
@@ -3523,7 +3532,12 @@ const emit_block! = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 					write_str(ctx.fd, "\t${store_op(fx)} ${v}, %t${slot}\n")
 					env = [...env, Binding({ name: n, slot: slot, rec_type: "", elem: "", is_cell: true, telems: [], fixed: fx })]
 				} else {
+					# a `$`-marked binding builds its aggregate on the STACK (reclaimed at frame exit); the
+					# flag rides through the whole initializer emit (nested literals included) and is cleared
+					# after. A call inside the initializer is unaffected — it allocates in its own frame.
+					ctx.alloc_stack = is_stack_name(n)
 					const Iarch base = if bare_rec then emit_record_lit!(ctx, ann, record_inits_e(e), env) else emit_agg_binding!(ctx, e, env)
+					ctx.alloc_stack = false
 					let Str belem = ""
 					let [TupElem] btel = []
 					if !bare_rec then {
@@ -4339,7 +4353,7 @@ pub const emit_program! = (Program prog, Uarch qbe_fd, Uarch asm_fd): Iarch -> {
 		if i >= Iarch(prog.funcs.len) then break
 		# an asm function is emitted into the floor, not through QBE
 		if !prog.funcs[i].is_asm then {
-			let Emit ctx = Emit({ fd: qbe_fd, next: 0, label: 0, funcs: prog.funcs, recs: prog.recs, unions: prog.unions, cur_loop: 0 - 1, cur_slot: 0 - 1, cur_ret: "", reset_mark: "", fn_ptr: false, loop_mark: "" })
+			let Emit ctx = Emit({ fd: qbe_fd, next: 0, label: 0, funcs: prog.funcs, recs: prog.recs, unions: prog.unions, cur_loop: 0 - 1, cur_slot: 0 - 1, cur_ret: "", reset_mark: "", fn_ptr: false, loop_mark: "", alloc_stack: false })
 			emit_func!(&ctx, prog.funcs[i], i)
 		}
 		i = i + 1
