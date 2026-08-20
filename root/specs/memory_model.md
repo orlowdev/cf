@@ -324,20 +324,30 @@ Full capture rules to be specified; the direction above is ratified.
 
 ## 8. Zero-cost return
 
-Returning a value across a geometry boundary is **free** — no copy. Two
-distinct events hide behind "return", and both are copy-free:
+Returning a value across a geometry boundary is **free** — no copy — and it does
+**not** carry the frame's dead residue upward. A return does two independent
+things, and both are copy-free:
 
-1. **Scope exit inside a live node.** The function returns but its node is
-   shared and outlives the call (an `in arena` used by several calls). The
-   return value already sits in storage that outlives the call — there is
-   nothing to do at all. `on_scope_exit` only runs the drop-set for the dead
-   residue.
-2. **Node teardown.** The binding that names the node dies with its scope, and
-   a value is returned out of the dying node. Because a child node is
-   physically carved from its parent, the boundary between them is only
-   bookkeeping: the node's **walls dissolve** and the return's storage is
-   **re-attributed to the parent, in place** — same address, same bytes, and
-   any **returned pointer stays valid**.
+- **The frame reclaims its own residue, in place.** `on_scope_exit` runs the
+  frame's **drop-set** — its own residue *minus everything reachable from the
+  return*. For a bump that is one rewind to the entry mark: the dead residue is
+  freed **at the frame**, on every return, aggregate-returning frames included.
+- **The return is cloaked, and already lives on the claiming node.** `on_ret`
+  removes the return's whole reachable closure from that drop-set, so the rewind
+  cannot touch it — and because an escaping allocation is placed on the **caller's**
+  node to begin with (node-locality), the value the caller binds already sits in
+  storage the caller owns. Nothing crosses but the cloaked return, as a pointer;
+  `on_alloc_ret` has nothing to copy.
+
+So residue is reclaimed where it was born; only the cloaked return leaves the
+frame. One case does move a *block* upward, and only bookkeeping-deep: a value
+escaping an **explicitly-carved sub-node** (`const a = mem.arena.of(n); … return
+x` with `x` in `a`). `a`'s binding dies while `x` must survive; because `a` is
+physically carved from its parent, its **walls dissolve** and `x`'s storage is
+**re-attributed to the parent, in place** — same address, returned pointer stays
+valid. A bump cannot per-object free, so whatever dead residue shared `a`'s block
+rides with it to the **enclosing frame**, where that frame's own rewind reclaims
+it — bounded by that frame, never deferred to program exit.
 
 For teardown to be sound the compiler promotes the **entire reachable closure**
 of the return value, not just its top: anything the return points at is promoted
@@ -347,9 +357,12 @@ return_. This reuses the same escape analysis that computes `!`.
 Reclaiming the _dead_ residue is the geometry's own concern, orthogonal to the
 copy-free return:
 
-- **Arena** — literally free. Arenas never per-object free, so dissolving the
-  walls merges the child bump (dead residue included) into the parent, reclaimed
-  at the parent's reset.
+- **Arena** — the frame's `on_scope_exit` rewind frees its dead residue **in
+  place, at the frame**. The return closure is cloaked out of the drop-set by
+  `on_ret` and lives on the caller's node, so the rewind spares it — no copy, and
+  **nothing dead is carried up to the caller**. (A value escaping an
+  explicitly-carved sub-node rides that node's block to the *enclosing* frame,
+  reclaimed at its rewind — the one bounded exception above.)
 - **RC / GC** — the return is still not copied, but dead residue runs its hooks; a
   compacting collector may relocate by its own policy.
 

@@ -481,14 +481,14 @@ reclamation per-object. That family does **not survive** the `on_ret` /
 
 A free-list's only edge over a bump is freeing an object *before* its scope ends
 and reusing the slot — which matters exactly when a scope both keeps some value
-and drops others (the mixed case). But that is precisely what `on_alloc_ret` /
-`on_ret` hand to the **arena**: the returned aggregate is pre-allocated on the
-**caller** (`on_alloc_ret`), so the returning frame holds only dead scratch
-(`on_ret`), and `on_scope_exit` rewinds the whole frame — the mixed
-return-plus-residue case an older draft leaked now reclaims in bulk. For **every
-statically-placeable lifetime**, the smart arena already reclaims it, at frame
-exit, with no free-list. Same-size churn (`pool`) and size-classed churn (`slab`)
-are just frame residue; they buy nothing over the arena.
+and drops others (the mixed case). But that is precisely what `on_ret` /
+`on_alloc_ret` hand to the **arena**: the return's closure is cloaked out of the
+drop-set (`on_ret`) and placed on the **caller's** node (`on_alloc_ret`), so the
+frame holds only dead scratch, and `on_scope_exit` rewinds it **in place** — the
+mixed keep-and-drop case an older draft leaked now reclaims in bulk, at the frame.
+For **every statically-placeable lifetime**, the smart arena already reclaims it,
+at frame exit, with no free-list. Same-size churn (`pool`) and size-classed churn
+(`slab`) are just frame residue; they buy nothing over the arena.
 
 What a free-list is genuinely for is the **complement**: lifetimes the compiler
 **cannot** place statically — individual objects freed at points fixed only at
