@@ -1861,7 +1861,15 @@ pub const check_destructure! = ([Str] pat, Bool mutable, Expr rhs, [VarTy] env, 
 # word, or a record for a `[Record]`).
 const index_type! = (Str arr, Expr idx, [VarTy] env, Ctx ctx): Ty -> {
 	const Iarch vi = env_index(env, arr)
-	if vi < 0 then die("cf: type: index of an undeclared name\n")
+	if vi < 0 then {
+		# a bare NON-local name — a `static [N Uint8]` (a `$dyn` value-const) is indexable like an array
+		const Iarch sfi = find_func(ctx.funcs, arr)
+		if sfi >= 0 && ctx.funcs[sfi].is_value && str_eq(ctx.funcs[sfi].ret_name, "$dyn") then {
+			if !is_tint(type_of!(idx, env, ctx)) then die("cf: type: an array index must be an integer\n")
+			return elem_ty!(ctx.funcs[sfi].ret_elem, ctx)
+		}
+		die("cf: type: index of an undeclared name\n")
+	}
 	# a tuple is comptime-indexed, each position independently typed
 	if is_ttuple(env[vi].ty) then return tuple_index_type!(tuple_elems(env[vi].ty), idx, ctx)
 	# a string index `s[i]` yields a byte (an Int)
@@ -2550,7 +2558,21 @@ const check_simple_stmt! = (Stmt s, [VarTy] env, Ctx ctx, Iarch loop_kind): Iarc
 		},
 		Stmt.IndexAssign(a, ix, val) -> {
 			const Iarch idx = env_index(env, a)
-			if idx < 0 then die("cf: type: element assignment to an undeclared name\n")
+			# a bare NON-local name — a `static [N Uint8]` (mutable BSS `$dyn` value-const) — is assignable
+			# by index; validate index/value here and skip the local-binding checks (guarded by idx>=0).
+			const Iarch sfi = if idx < 0 then find_func(ctx.funcs, a) else 0 - 1
+			const Bool is_stat = idx < 0 && sfi >= 0 && ctx.funcs[sfi].is_value && str_eq(ctx.funcs[sfi].ret_name, "$dyn")
+			if idx < 0 && !is_stat then die("cf: type: element assignment to an undeclared name\n")
+			if is_stat then {
+				if !is_tint(type_of!(ix, env, ctx)) then die("cf: type: an array index must be an integer\n")
+				if is_adoptable_lit(val) then {
+					const Iarch slv = lit_signed_val(val)
+					if slv < 0 || slv > 255 then die("cf: type: a byte-buffer element literal must be in 0..255\n")
+				}
+				const Ty svt = type_of!(val, env, ctx)
+				if !is_tint(svt) && !is_tfixed(svt) then die("cf: type: an array element must be an integer\n")
+			}
+			if idx >= 0 then {
 			if !env[idx].mutable then die("cf: type: cannot write to a `const`/borrowed array\n")
 			if str_eq(dyn_of(env[idx].ty), "") && !is_tptr(env[idx].ty) then die("cf: type: element assignment needs a dynamic array or a byte buffer\n")
 			if !is_tint(type_of!(ix, env, ctx)) then die("cf: type: an array index must be an integer\n")
@@ -2572,6 +2594,7 @@ const check_simple_stmt! = (Stmt s, [VarTy] env, Ctx ctx, Iarch loop_kind): Iarc
 			} else if str_eq(aen, "Bool") then {
 				if !is_tbool(vt) then die("cf: type: a `[Bool]` array element needs a Bool value\n")
 			} else if !is_tint(vt) && !is_tfixed(vt) then die("cf: type: an array element must be an integer\n")
+			}
 		},
 		Stmt.IfThen(c, body) -> {
 			if !is_tbool(type_of!(c, env, ctx)) then die("cf: type: an `if` condition must be a Bool (no truthiness)\n")

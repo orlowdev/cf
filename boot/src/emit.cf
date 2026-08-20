@@ -2873,10 +2873,16 @@ const emit_buffer! = (*Emit ctx, Expr sz): Str -> {
 # Emit `xs[i]` — load the i-th element (element address = data + i*8).
 const emit_index! = (*Emit ctx, [Binding] env, Str arr, Expr idx): Str -> {
 	const Iarch ai = lookup_index(env, arr)
-	const Str hdr = binding_ptr!(ctx, env, ai)
+	# a bare NON-local name is a `static [N Uint8]` ($dyn value-const): auto-call for its header, then
+	# index the data block like any dynamic array (a static is never a tuple/ptr/Str). `&&` short-
+	# circuits and `if`-else runs only its taken branch, so `env[ai]` is never touched when ai<0.
+	const Bool stat = ai < 0
+	const [Expr] noargs = []
+	const Str hdr = if stat then emit_call!(ctx, arr, noargs, "", env) else binding_ptr!(ctx, env, ai)
+	const Str selem = if stat then call_ret_elem!(ctx, env, arr) else env[ai].elem
 	# a tuple index `t[k]` (k a comptime literal) loads the k-th 8-byte slot directly — the
 	# binding IS the aggregate (no header/data indirection like a dynamic array).
-	if str_eq(env[ai].rec_type, "$tuple") then {
+	if !stat && str_eq(env[ai].rec_type, "$tuple") then {
 		const Iarch tk = tuple_lit_index(idx)
 		const Iarch toff = tk * 8
 		const Iarch taddr = ctx.next
@@ -2887,7 +2893,7 @@ const emit_index! = (*Emit ctx, [Binding] env, Str arr, Expr idx): Str -> {
 	}
 	# a raw pointer index `p[i]` reads the i-th element at pointer + i*stride (no header): a
 	# `*[Uint8]` byte pointer strides 1 (`loadub`), a `*[Iarch]` word pointer strides 8 (`loadl`).
-	if str_eq(env[ai].rec_type, "$ptr") then {
+	if !stat && str_eq(env[ai].rec_type, "$ptr") then {
 		const Iarch pesz = ptr_stride(env[ai].elem)
 		const Str pv = emit_expr!(idx, ctx, env)
 		const Iarch pil = ctx.next
@@ -2903,7 +2909,7 @@ const emit_index! = (*Emit ctx, [Binding] env, Str arr, Expr idx): Str -> {
 		return "%t${pval}"
 	}
 	# a string index `s[i]` reads the i-th byte: the header's bytes pointer @0, then +i.
-	if str_eq(env[ai].rec_type, "Str") then {
+	if !stat && str_eq(env[ai].rec_type, "Str") then {
 		const Str siv = emit_expr!(idx, ctx, env)
 		const Iarch sbytes = ctx.next
 		ctx.next = ctx.next + 1
@@ -2920,7 +2926,7 @@ const emit_index! = (*Emit ctx, [Binding] env, Str arr, Expr idx): Str -> {
 		return "%t${sval}"
 	}
 	const Str iv = emit_expr!(idx, ctx, env)
-	const Iarch esz = elem_bytes(env[ai].elem)
+	const Iarch esz = elem_bytes(selem)
 	const Iarch data = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${data} =l loadl ${hdr}\n")
@@ -2936,7 +2942,7 @@ const emit_index! = (*Emit ctx, [Binding] env, Str arr, Expr idx): Str -> {
 	const Iarch val = ctx.next
 	ctx.next = ctx.next + 1
 	# a `[Uint8]` element is one byte (`loadub`); a float element `loadd`/`loads`; else an 8-byte `loadl`
-	const Str eqt = if is_float_name(env[ai].elem) then float_qt(env[ai].elem) else "l"
+	const Str eqt = if is_float_name(selem) then float_qt(selem) else "l"
 	if esz == 1 then write_str(ctx.fd, "\t%t${val} =l loadub %t${slot}\n")
 	if esz != 1 then write_str(ctx.fd, "\t%t${val} =${eqt} load${eqt} %t${slot}\n")
 	return "%t${val}"
@@ -3453,10 +3459,14 @@ const emit_simple_stmt! = (*Emit ctx, [Binding] env, Stmt s): Iarch -> {
 		Stmt.IndexAssign(a, ix, val) -> {
 			# `arr[idx] = val` — store the value at data + idx*8
 			const Iarch ai = lookup_index(env, a)
-			const Str hdr = binding_ptr!(ctx, env, ai)
+			# a bare NON-local name is a `static [N Uint8]` ($dyn value-const): auto-call for its header
+			const Bool stat = ai < 0
+			const [Expr] noargs = []
+			const Str hdr = if stat then emit_call!(ctx, a, noargs, "", env) else binding_ptr!(ctx, env, ai)
+			const Str selem = if stat then call_ret_elem!(ctx, env, a) else env[ai].elem
 			const Str iv = emit_expr!(ix, ctx, env)
 			const Str vv = emit_expr!(val, ctx, env)
-			if str_eq(env[ai].rec_type, "$ptr") then {
+			if !stat && str_eq(env[ai].rec_type, "$ptr") then {
 				const Iarch besz = ptr_stride(env[ai].elem)
 				const Iarch bil = ctx.next
 				ctx.next = ctx.next + 1
@@ -3468,7 +3478,7 @@ const emit_simple_stmt! = (*Emit ctx, [Binding] env, Stmt s): Iarch -> {
 				if besz != 1 then write_str(ctx.fd, "\tstorel ${vv}, %t${baddr}\n")
 				return 0
 			}
-			const Iarch esz = elem_bytes(env[ai].elem)
+			const Iarch esz = elem_bytes(selem)
 			const Iarch data = ctx.next
 			ctx.next = ctx.next + 1
 			write_str(ctx.fd, "\t%t${data} =l loadl ${hdr}\n")
@@ -3483,7 +3493,7 @@ const emit_simple_stmt! = (*Emit ctx, [Binding] env, Stmt s): Iarch -> {
 			write_str(ctx.fd, "\t%t${slot} =l add %t${data}, %t${off}\n")
 			# a `[Uint8]` byte element uses `storeb`; a float element `stored`/`stores`; else `storel`
 			if esz == 1 then write_str(ctx.fd, "\tstoreb ${vv}, %t${slot}\n")
-			if esz != 1 then write_str(ctx.fd, "\t${store_op(scalar_only(env[ai].elem))} ${vv}, %t${slot}\n")
+			if esz != 1 then write_str(ctx.fd, "\t${store_op(scalar_only(selem))} ${vv}, %t${slot}\n")
 		},
 		Stmt.IfThen(c, body) -> {
 			emit_guard!(ctx, env, c, body)
