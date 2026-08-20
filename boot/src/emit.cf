@@ -37,7 +37,7 @@ import "astutil" as { is_spread, spread_inner, is_skip, skip_count, is_nested, n
 # `loop_mark` is the nearest enclosing reset-safe loop's entry-cursor temp (or "" if the nearest
 # loop is not reset-safe) — `break`/`continue` restore it so every path back to the loop head or out
 # of it reclaims the iteration's residue, matching the back-edge rewind.
-data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs, [RecDecl] recs, [UnionDecl] unions, Iarch cur_loop, Iarch cur_slot, Str cur_ret, Str reset_mark, Bool fn_ptr, Str loop_mark, Bool alloc_stack }
+data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs, [RecDecl] recs, [UnionDecl] unions, Iarch cur_loop, Iarch cur_slot, Str cur_ret, Str reset_mark, Bool fn_ptr, Str loop_mark, Bool alloc_stack, Bool in_loop, Iarch stack_used }
 
 # A local/parameter in scope: its interned name, `slot`, its `rec_type` (a record/union
 # type name, `"$dyn"`, `"$ptr"`, or `"Str"` — `""` for a word), and `elem` (a dynamic
@@ -1320,10 +1320,18 @@ const find_override = ([FieldInit] inits, Str fname): Iarch -> {
 # from the ambient geometry node (`cf_alloc`). The non-stack form is byte-identical to the old inline
 # `cf_alloc`, so cf's own (stack-free) source emits unchanged.
 const emit_agg_alloc! = (*Emit ctx, Iarch size): Iarch -> {
-	# a single `$`-stack allocation is capped so one `$` binding can't blow the frame (a huge buffer
-	# belongs in a geometry). Comptime-known size, so this is a comptime error. Per-allocation, not
-	# per-frame — a coarse guard, not an exact stack budget.
-	if ctx.alloc_stack && size > 65536 then die("cf: emit: a `$`-stack allocation of ${size} bytes exceeds the 64 KiB cap — build a buffer this large in a geometry\n")
+	if ctx.alloc_stack then {
+		# `$` in a LOOP would accumulate: QBE `alloc` is function-lifetime, so a per-iteration stack
+		# alloc is never reclaimed until the frame pops — unbounded. Reject it; hoist the `$` out of the
+		# loop, or use a geometry (whose per-iteration reset reclaims residue).
+		if ctx.in_loop then die("cf: emit: a `$`-stack binding inside a loop accumulates every iteration (stack allocs live to frame exit) — hoist it out of the loop or use a geometry\n")
+		# a SINGLE `$` allocation is capped (64 KiB) so one binding can't blow the frame, and the
+		# per-FRAME running total is capped (256 KiB) so many small ones can't either. Sizes are
+		# comptime, so both are comptime errors; a huge buffer belongs in a geometry.
+		if size > 65536 then die("cf: emit: a `$`-stack allocation of ${size} bytes exceeds the 64 KiB per-binding cap — build a buffer this large in a geometry\n")
+		ctx.stack_used = ctx.stack_used + size
+		if ctx.stack_used > 262144 then die("cf: emit: this function's `$`-stack use exceeds the 256 KiB per-frame budget — move some scratch into a geometry\n")
+	}
 	const Iarch t = ctx.next
 	ctx.next = ctx.next + 1
 	if ctx.alloc_stack then write_str(ctx.fd, "\t%t${t} =l alloc8 ${size}\n")
@@ -3231,7 +3239,10 @@ const emit_for_body! = (*Emit ctx, [Binding] env, Str lv, Str arr, [Stmt] body):
 	write_str(ctx.fd, "\t%t${xcell} =l alloc8 8\n")
 	write_str(ctx.fd, "\tstorel %t${xval}, %t${xcell}\n")
 	const [Binding] benv = [...env, Binding({ name: lv, slot: xcell, rec_type: fer, elem: "", is_cell: true, telems: [], fixed: fx })]
+	const Bool saved_inl = ctx.in_loop
+	ctx.in_loop = true
 	const Iarch term = emit_block!(ctx, body, benv)
+	ctx.in_loop = saved_inl
 	if term == 0 && !str_eq(lmark, "") then write_str(ctx.fd, "\tstorel ${lmark}, %node_0\n")
 	if term == 0 then write_str(ctx.fd, "\tjmp @ltop${lid}\n")
 	write_str(ctx.fd, "@lend${lid}\n")
@@ -3261,8 +3272,11 @@ const emit_loop_body! = (*Emit ctx, [Binding] env, [Stmt] body): Iarch -> {
 		lmark = "%t${mk}"
 	}
 	ctx.loop_mark = lmark
+	const Bool saved_inl = ctx.in_loop
+	ctx.in_loop = true
 	write_str(ctx.fd, "@ltop${lid}\n")
 	const Iarch term = emit_block!(ctx, body, env)
+	ctx.in_loop = saved_inl
 	if term == 0 && !str_eq(lmark, "") then write_str(ctx.fd, "\tstorel ${lmark}, %node_0\n")
 	if term == 0 then write_str(ctx.fd, "\tjmp @ltop${lid}\n")
 	write_str(ctx.fd, "@lend${lid}\n")
@@ -3289,8 +3303,11 @@ const emit_loop_value! = (*Emit ctx, [Binding] env, [Stmt] body): Str -> {
 	# a value-yielding loop yields across its back-edge, so it is never reset-safe — clear the mark
 	# so a `break`/`continue` inside it does not rewind to an outer loop's mark.
 	ctx.loop_mark = ""
+	const Bool saved_inl = ctx.in_loop
+	ctx.in_loop = true
 	write_str(ctx.fd, "@ltop${lid}\n")
 	const Iarch term = emit_block!(ctx, body, env)
+	ctx.in_loop = saved_inl
 	if term == 0 then write_str(ctx.fd, "\tjmp @ltop${lid}\n")
 	write_str(ctx.fd, "@lend${lid}\n")
 	ctx.cur_loop = saved
@@ -4349,7 +4366,7 @@ pub const emit_program! = (Program prog, Uarch qbe_fd, Uarch asm_fd): Iarch -> {
 		if i >= Iarch(prog.funcs.len) then break
 		# an asm function is emitted into the floor, not through QBE
 		if !prog.funcs[i].is_asm then {
-			let Emit ctx = Emit({ fd: qbe_fd, next: 0, label: 0, funcs: prog.funcs, recs: prog.recs, unions: prog.unions, cur_loop: 0 - 1, cur_slot: 0 - 1, cur_ret: "", reset_mark: "", fn_ptr: false, loop_mark: "", alloc_stack: false })
+			let Emit ctx = Emit({ fd: qbe_fd, next: 0, label: 0, funcs: prog.funcs, recs: prog.recs, unions: prog.unions, cur_loop: 0 - 1, cur_slot: 0 - 1, cur_ret: "", reset_mark: "", fn_ptr: false, loop_mark: "", alloc_stack: false, in_loop: false, stack_used: 0 })
 			emit_func!(&ctx, prog.funcs[i], i)
 		}
 		i = i + 1
