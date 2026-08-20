@@ -36,7 +36,7 @@ over both.
 A geometry is never a runtime value, but the model still leans on two
 **intrinsic** (compiler-provided) types, and a third opaque one:
 
-- **`Geometry`** — the *comptime* type of a policy. `arena`, `gc`, `heap` are
+- **`Geometry`** — the *comptime* type of a policy. `arena`, `gc`, `rc` are
   comptime values of type `Geometry`; `in g` takes a `Geometry`; a function may be
   parameterized over one. It has no runtime representation — geometries are pure
   comptime (see [[memory_model.md]], Geometries).
@@ -75,7 +75,7 @@ destination field. Both receive the *target's* `MemoryNode`, not the ambient one
 
 Every geometry implements all nine. A hook a policy does not need is a **pure
 no-op** that returns its value argument unchanged (`on_free` for an arena,
-`on_scope_exit` for a pool). No-ops are not a special case — they are ordinary
+`on_scope_exit` for `rc`). No-ops are not a special case — they are ordinary
 bodies the finisher DCE later erases (§2, The no-op sweep). This is why one
 placement scheme serves every policy: the *placement* is uniform, the *policy*
 decides which placed calls survive.
@@ -187,9 +187,11 @@ dictates. The two standard shapes are duals:
 - **Bulk reclaimers** (arena, fixed_buffer, page) do everything in
   `on_scope_exit` — one reset-to-mark frees the whole scope at once — and make
   `on_free` a **no-op**. The unrolled `on_free` calls vanish in the sweep.
-- **Per-object reclaimers** (pool, slab, rc) do everything in `on_free` — each
-  dead object returns its slot or drops its count — and make `on_scope_exit` a
-  **no-op**.
+- **Per-object reclaimers** (`rc`) do everything in `on_free` — each dead object
+  drops its count and, at zero, returns its slot — and make `on_scope_exit` a
+  **no-op**. (This is the *runtime*-lifetime dual; every *static* lifetime, even
+  the mixed return-plus-dead-residue case, is reclaimed in bulk by the arena — see
+  The free-list family is subsumed, below.)
 
 Same placement, opposite geometry. Neither hook is defined in terms of the other,
 and the Memory arc need not know which policy it is splicing into: it always emits
@@ -214,7 +216,8 @@ overwriting: `rc` increments `new` and decrements old; a generational `gc` marks
 the card / records the SATB snapshot, then writes. A non-barrier geometry (arena,
 pool, …) just does the write, so its `on_store` is **not a no-op** — it **folds to
 a plain store** at the `folded` arc, exactly as `on_alloc` folds to a bump. Only
-genuine no-ops are swept (below); `on_store` always carries the store.
+genuine no-ops are swept (below); `on_store` always carries the store. (The
+non-barrier geometries are `arena`, `fixed_buffer`, `page`.)
 
 Scalar-field writes need no barrier and no hook — they emit as plain stores.
 
@@ -227,7 +230,7 @@ language needs no `on_safepoint` (§1, Reserved for concurrency).
 After placement, each arc may run a **finisher DCE** (see
 [[order_of_compilation.md]], DCE — the per-step kind, not the whole-program pass).
 Here it deletes every hook call whose body a policy left as a **pure no-op**: an
-arena's `on_free`, a pool's `on_scope_exit`. It does **not** touch hooks that fold
+arena's `on_free`, an `rc`'s `on_scope_exit`. It does **not** touch hooks that fold
 to real work — an arena's `on_store` folds to a plain store, not nothing, so it
 stays (and folds later). This is a local sweep over the just-placed calls, and it
 is what makes the observable `memory` `.cf` read cleanly — an arena body shows
@@ -469,37 +472,40 @@ The three members differ only in **where the buffer comes from** and **what
   overflow is a hard trap. The zero-dependency embedded allocator — it differs
   from `arena` only in the buffer's provenance.
 
-### The free-list family: `pool`, `slab`, `heap`
+### The free-list family is subsumed
 
-The dual core: the node owns backing storage and a **free-list**; `on_alloc` pops
-a block, `on_free` pushes it back, and reclamation is **per-object**. So
-`on_scope_exit` is the **no-op** here (the dual of the bump family — §2, The
-drop-set), and the
-drop-set's unrolled `on_free` calls do the work.
+An earlier draft catalogued a free-list family — `pool`, `slab`, `heap` — whose
+node owns a **free-list**: `on_alloc` pops a block, `on_free` pushes it back,
+reclamation per-object. That family does **not survive** the `on_ret` /
+`on_alloc_ret` design, and is dropped.
 
-```
-const on_alloc = ['T] (MemoryNode node, 'T v) -> {
-  let p = free_list_pop(node, size_of(v))                      # reuse a returned block
-  mem.raw.place(p, v)
-  return p
-}
-const on_free = ['T] (MemoryNode node, 'T v) -> {
-  free_list_push(node, addr_of(v), size_of(v))                 # block returns to the list
-}
-const on_scope_exit = (MemoryNode node, Mark mark) -> {}       # no-op; on_free reclaims
-```
+A free-list's only edge over a bump is freeing an object *before* its scope ends
+and reusing the slot — which matters exactly when a scope both keeps some value
+and drops others (the mixed case). But that is precisely what `on_alloc_ret` /
+`on_ret` hand to the **arena**: the returned aggregate is pre-allocated on the
+**caller** (`on_alloc_ret`), so the returning frame holds only dead scratch
+(`on_ret`), and `on_scope_exit` rewinds the whole frame — the mixed
+return-plus-residue case an older draft leaked now reclaims in bulk. For **every
+statically-placeable lifetime**, the smart arena already reclaims it, at frame
+exit, with no free-list. Same-size churn (`pool`) and size-classed churn (`slab`)
+are just frame residue; they buy nothing over the arena.
 
-Members differ in **block sizing**:
+What a free-list is genuinely for is the **complement**: lifetimes the compiler
+**cannot** place statically — individual objects freed at points fixed only at
+runtime (shared ownership, dynamic or cyclic graphs). Those are exactly `rc` and
+`gc`, and the free-list survives **inside them** as their reclamation substrate
+(`rc`'s slot-return when a count hits zero; a `gc` sweep list). It is not a
+standalone static geometry.
 
-- **`pool`** — one fixed block size, a free-list of identical slots, O(1)
-  alloc/free. For many objects of one type. `on_realloc` cannot grow a slot, so it
-  allocates a larger block and frees the old.
-- **`slab`** — a set of `pool`s segregated by **size class**; `on_alloc` routes to
-  the class that fits. A composition of pools.
-- **`heap`** — the general-purpose allocator: size-classed free-lists plus
-  **coalescing** of adjacent free blocks (the `malloc`/GPA analog). `on_realloc`
-  can grow in place by coalescing. `of(n)` pulls from the parent, or is unbounded
-  under `page`. This is the geometry for long-lived heterogeneous data.
+- **`pool`, `slab`** — **dropped**. Subsumed by the smart arena.
+- **`heap`** — heterogeneous, individually-freed, long-lived data is the
+  *runtime*-lifetime case, i.e. the substrate under `rc` / `gc` (size-classed
+  free-lists + coalescing as an implementation detail of those). Not a distinct
+  static geometry.
+
+The line is sharp: **static lifetime → arena** (bulk, `on_scope_exit`); **runtime
+lifetime → `rc` / `gc`** (per-object / tracing, over a free-list). Nothing sits
+between them.
 
 ### `rc` — reference counting
 
@@ -573,8 +579,6 @@ Where each family does its work — the shape of the whole catalog in one view:
 | `page`         | OS pages         | `on_scope_exit` (unmap)  | none                 |
 | `arena`        | parent block     | `on_scope_exit` (rewind) | none                 |
 | `fixed_buffer` | caller's array   | `on_scope_exit` (rewind) | none                 |
-| `pool` / `slab`| parent block     | `on_free` (per object)   | none                 |
-| `heap`         | parent block     | `on_free` (coalesce)     | none                 |
 | `rc`           | parent block     | `on_free` (count → 0)    | inc/dec              |
 | `gc`           | parent block     | `on_alloc` (collect)     | card / SATB          |
 
