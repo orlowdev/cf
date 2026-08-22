@@ -1,0 +1,679 @@
+# routing — the SHADOW escape/routing analysis for the duplex arena (geometry_lowering §2-§3).
+#
+# The duplex node routes every allocation AT BIRTH: a value that escapes its frame (returned,
+# yielded, or rehomed into a caller-owned aggregate) is born on the SURVIVOR side; trapped
+# residue is born on the RESIDUE side and dies with the frame's mark. Routing an escaping
+# value residue is a use-after-free, so the analysis here must be a SOUND OVER-APPROXIMATION:
+# when in doubt, a name ESCAPES (the cost of over-approximation is a leak until node death,
+# never a dangle).
+#
+# SHADOW MODE: this pass currently drives nothing. It runs on the LOWERED program (post
+# monomorphization / defer-tap hoist / defer lowering / closure lift — the AST emit actually
+# consumes, where a capture is an ordinary hidden parameter), computes each function's escape
+# set with the FULL arm coverage the older `!`-oracle (alloc.cf) lacks, and cross-checks:
+# every name the oracle says escapes must also escape here (`routing_check!`). A divergence is
+# a compiler bug reported at compile time, so the whole corpus plus cf itself exercise the new
+# analysis on every build long before any codegen trusts it.
+#
+# Beyond the oracle, this pass closes the alias channels red-teamed against the duplex design:
+#   - a CALL may return or retain any of its arguments (identity `_ -> e` rewriters are
+#     pervasive), so every call argument escapes — maximally conservative until per-function
+#     summaries land;
+#   - an escaping PROJECTION pins its base (`return o.a` keeps `o` alive — the interior box
+#     lives inside the base's construction);
+#   - a match/destructure BIND aliases its scrutinee's payload;
+#   - a `for` variable aliases the array's element;
+#   - a spread copies the SOURCE array's element pointers into the new spine;
+#   - `&x` hands the address out;
+#   - FORWARD aliases: a name bound FROM a parameter/escaping aggregate (`const q = gg.inner`)
+#     becomes a store TARGET — a rehome through it escapes the stored value.
+# An interpolation hole is NOT an escape: cf_str_append copies the hole's bytes.
+#
+# `evars` (the escaping-position walker) is deliberately EXHAUSTIVE with no `_` arm: adding an
+# Expr variant fails this compile until the new form is audited for escape behavior.
+
+import "ast" as { Expr, Stmt, MatchArm, StmtArm, Seg, FieldInit, Param, UnionDecl, Func, Program }
+import "alloc" as { compute_esc! }
+import "io" as { die, eprint }
+
+const str_eq = (Str a, Str b): Bool -> {
+	if a.len != b.len then return false
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(a.len) then break
+		if Iarch(a[i]) != Iarch(b[i]) then return false
+		i = i + 1
+	}
+	return true
+}
+
+const has_name = ([Str] xs, Str s): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(xs.len) then break
+		if str_eq(xs[i], s) then return true
+		i = i + 1
+	}
+	return false
+}
+
+const no_strs = (): [Str] -> {
+	let [Str] e = []
+	return e
+}
+
+const no_exprs = (): [Expr] -> {
+	let [Expr] e = []
+	return e
+}
+
+const one_str = (Str s): [Str] -> {
+	let [Str] r = [s]
+	return r
+}
+
+const cat_s = ([Str] a, [Str] b): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(a.len) then break
+		r = [...r, a[i]]
+		i = i + 1
+	}
+	let Iarch j = 0
+	loop {
+		if j >= Iarch(b.len) then break
+		r = [...r, b[j]]
+		j = j + 1
+	}
+	return r
+}
+
+const union_names = ([Str] a, [Str] b): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(a.len) then break
+		r = [...r, a[i]]
+		i = i + 1
+	}
+	let Iarch j = 0
+	loop {
+		if j >= Iarch(b.len) then break
+		if !has_name(r, b[j]) then r = [...r, b[j]]
+		j = j + 1
+	}
+	return r
+}
+
+const field_values = ([FieldInit] fs): [Expr] -> {
+	let [Expr] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(fs.len) then break
+		r = [...r, fs[i].value]
+		i = i + 1
+	}
+	return r
+}
+
+const plist_names = ([Param] ps): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ps.len) then break
+		r = [...r, ps[i].name]
+		i = i + 1
+	}
+	return r
+}
+
+# ── evars: the names that escape when `e` sits in an ESCAPING position ───────────────────────
+# EXHAUSTIVE over Expr, no wildcard — a new variant fails the build until audited.
+
+const evars_list = ([Expr] es): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(es.len) then break
+		r = cat_s(r, evars(es[i]))
+		i = i + 1
+	}
+	return r
+}
+
+const evars_marms = ([MatchArm] arms): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		r = cat_s(r, evars(arms[i].body))
+		i = i + 1
+	}
+	return r
+}
+
+const evars = (Expr e): [Str] -> match e {
+	Expr.Lit(_) -> no_strs(),
+	Expr.BoolLit(_) -> no_strs(),
+	Expr.Var(n) -> one_str(n),
+	Expr.StrLit(_) -> no_strs(),
+	Expr.FloatLit(_) -> no_strs(),
+	Expr.Record(_, inits) -> evars_list(field_values(inits)),
+	# an escaping projection pins its BASE: the read interior lives inside the base's block
+	Expr.Field(b, _) -> one_str(b),
+	Expr.FieldExpr(b, _) -> evars(b),
+	Expr.UnionMk(_, _, args) -> evars_list(args),
+	# the arm value escapes; a payload bind aliases the scrutinee, so the scrutinee escapes too
+	Expr.Match(s, arms) -> cat_s(evars(s), evars_marms(arms)),
+	# BOTH the spread source (its element pointers are copied into the new spine) and the elements
+	Expr.ArrayLit(_, sp, elems, _) -> cat_s(evars(sp), evars_list(elems)),
+	Expr.Index(b, _) -> one_str(b),
+	Expr.IndexField(b, _, _) -> one_str(b),
+	Expr.IndexExpr(b, _) -> evars(b),
+	# a hole's bytes are COPIED into the string (cf_str_append) — no aliasing, no escape
+	Expr.Interp(_) -> no_strs(),
+	Expr.Tuple(elems) -> evars_list(elems),
+	Expr.Spread(x) -> evars(x),
+	Expr.Unit -> no_strs(),
+	Expr.Loop(ss) -> yvars(ss),
+	Expr.Buffer(_) -> no_strs(),
+	Expr.Addr(n) -> one_str(n),
+	Expr.Neg(_) -> no_strs(),
+	Expr.Not(_) -> no_strs(),
+	Expr.BitNot(_) -> no_strs(),
+	Expr.Add(_, _) -> no_strs(),
+	Expr.Sub(_, _) -> no_strs(),
+	Expr.Mul(_, _) -> no_strs(),
+	Expr.Div(_, _) -> no_strs(),
+	Expr.Mod(_, _) -> no_strs(),
+	Expr.BitAnd(_, _) -> no_strs(),
+	Expr.BitOr(_, _) -> no_strs(),
+	Expr.BitXor(_, _) -> no_strs(),
+	Expr.Shl(_, _) -> no_strs(),
+	Expr.Shr(_, _) -> no_strs(),
+	Expr.CmpEq(_, _) -> no_strs(),
+	Expr.CmpNe(_, _) -> no_strs(),
+	Expr.CmpLt(_, _) -> no_strs(),
+	Expr.CmpGt(_, _) -> no_strs(),
+	Expr.CmpLe(_, _) -> no_strs(),
+	Expr.CmpGe(_, _) -> no_strs(),
+	Expr.And(_, _) -> no_strs(),
+	Expr.Or(_, _) -> no_strs(),
+	Expr.If(_, t, el) -> cat_s(evars(t), evars(el)),
+	# a call may RETURN any of its arguments (identity rewriters are pervasive) — v1 conservative,
+	# refined by per-function summaries later
+	Expr.Call(_, _, args, _) -> evars_list(args),
+	# lowered away by hoist_defertap; conservative if ever seen (evaluates to its last argument)
+	Expr.DeferTap(_, args) -> evars_list(args)
+}
+
+# `<- v` yields of a value block, recursing into nested if/block/match (NOT a nested loop —
+# it opens its own value context), mirroring alloc.cf's yield_vars.
+const yvars_stmt = (Stmt s): [Str] -> match s {
+	Stmt.Yield(e) -> evars(e),
+	Stmt.IfThen(_, b) -> yvars_stmt(b),
+	Stmt.IfElse(_, t, el) -> cat_s(yvars_stmt(t), yvars_stmt(el)),
+	Stmt.Block(ss) -> yvars(ss),
+	Stmt.Match(_, arms) -> yvars_sarms(arms),
+	_ -> no_strs()
+}
+
+const yvars_sarms = ([StmtArm] arms): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		r = cat_s(r, yvars(arms[i].body))
+		i = i + 1
+	}
+	return r
+}
+
+const yvars = ([Stmt] ss): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		r = cat_s(r, yvars_stmt(ss[i]))
+		i = i + 1
+	}
+	return r
+}
+
+# ── generic descent helpers ──────────────────────────────────────────────────────────────────
+
+# The immediate expression children (generic recursion for the call sweep / value-block walk).
+const kids! = (Expr e): [Expr] -> match e {
+	Expr.Record(_, inits) -> field_values(inits),
+	Expr.ArrayLit(_, sp, elems, _) -> spread_kids(sp, elems),
+	Expr.Tuple(elems) -> elems,
+	Expr.UnionMk(_, _, args) -> args,
+	Expr.Interp(segs) -> hole_exprs(segs),
+	Expr.Buffer(sz) -> one_expr(sz),
+	Expr.Match(s, arms) -> marm_exprs(s, arms),
+	Expr.If(c, t, el) -> three_exprs!(c, t, el),
+	Expr.Call(_, _, args, _) -> args,
+	Expr.DeferTap(_, args) -> args,
+	Expr.Field(_, _) -> no_exprs(),
+	Expr.FieldExpr(b, _) -> one_expr(b),
+	Expr.Index(_, i) -> one_expr(i),
+	Expr.IndexField(_, i, _) -> one_expr(i),
+	Expr.IndexExpr(b, i) -> two_exprs!(b, i),
+	Expr.Spread(x) -> one_expr(x),
+	Expr.Neg(x) -> one_expr(x),
+	Expr.Not(x) -> one_expr(x),
+	Expr.BitNot(x) -> one_expr(x),
+	Expr.Add(a, b) -> two_exprs!(a, b),
+	Expr.Sub(a, b) -> two_exprs!(a, b),
+	Expr.Mul(a, b) -> two_exprs!(a, b),
+	Expr.Div(a, b) -> two_exprs!(a, b),
+	Expr.Mod(a, b) -> two_exprs!(a, b),
+	Expr.BitAnd(a, b) -> two_exprs!(a, b),
+	Expr.BitOr(a, b) -> two_exprs!(a, b),
+	Expr.BitXor(a, b) -> two_exprs!(a, b),
+	Expr.Shl(a, b) -> two_exprs!(a, b),
+	Expr.Shr(a, b) -> two_exprs!(a, b),
+	Expr.CmpEq(a, b) -> two_exprs!(a, b),
+	Expr.CmpNe(a, b) -> two_exprs!(a, b),
+	Expr.CmpLt(a, b) -> two_exprs!(a, b),
+	Expr.CmpGt(a, b) -> two_exprs!(a, b),
+	Expr.CmpLe(a, b) -> two_exprs!(a, b),
+	Expr.CmpGe(a, b) -> two_exprs!(a, b),
+	Expr.And(a, b) -> two_exprs!(a, b),
+	Expr.Or(a, b) -> two_exprs!(a, b),
+	_ -> no_exprs()
+}
+
+const one_expr = (Expr a): [Expr] -> {
+	let [Expr] r = [a]
+	return r
+}
+
+const spread_kids = (Expr sp, [Expr] elems): [Expr] -> {
+	let [Expr] r = [sp]
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(elems.len) then break
+		r = [...r, elems[i]]
+		i = i + 1
+	}
+	return r
+}
+
+const two_exprs! = (Expr a, Expr b): [Expr] -> {
+	let [Expr] r = [a]
+	return [...r, b]
+}
+
+const three_exprs! = (Expr a, Expr b, Expr c): [Expr] -> {
+	let [Expr] r = [a]
+	r = [...r, b]
+	return [...r, c]
+}
+
+const hole_exprs = ([Seg] segs): [Expr] -> {
+	let [Expr] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(segs.len) then break
+		if segs[i].is_hole then r = [...r, segs[i].expr]
+		i = i + 1
+	}
+	return r
+}
+
+const marm_exprs = (Expr s, [MatchArm] arms): [Expr] -> {
+	let [Expr] r = [s]
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		r = [...r, arms[i].body]
+		i = i + 1
+	}
+	return r
+}
+
+# The expressions a statement holds directly.
+const stmt_exprs! = (Stmt s): [Expr] -> match s {
+	Stmt.Return(e) -> one_expr(e),
+	Stmt.Yield(e) -> one_expr(e),
+	Stmt.Let(_, _, _, init) -> one_expr(init),
+	Stmt.Assign(_, val) -> one_expr(val),
+	Stmt.FieldAssign(_, _, val) -> one_expr(val),
+	Stmt.DeepFieldAssign(be, _, val) -> two_exprs!(be, val),
+	Stmt.IndexAssign(_, idx, val) -> two_exprs!(idx, val),
+	Stmt.Do(e) -> one_expr(e),
+	Stmt.IfThen(c, _) -> one_expr(c),
+	Stmt.IfElse(c, _, _) -> one_expr(c),
+	Stmt.Match(sc, _) -> one_expr(sc),
+	Stmt.Destructure(_, _, e) -> one_expr(e),
+	_ -> no_exprs()
+}
+
+# ── the conservative call sweep ──────────────────────────────────────────────────────────────
+# EVERY call's arguments escape, in any position (the callee may return an argument or store it
+# through another — statically unknowable without summaries). Position-independent, so it is
+# collected once per function, outside the fixpoint.
+
+const cargs_expr! = (Expr e): [Str] -> {
+	let [Str] r = match e {
+		Expr.Call(_, _, args, _) -> evars_list(args),
+		Expr.DeferTap(_, args) -> evars_list(args),
+		Expr.Loop(ss) -> cargs_body!(ss),
+		_ -> no_strs()
+	}
+	const [Expr] ks = kids!(e)
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ks.len) then break
+		r = cat_s(r, cargs_expr!(ks[i]))
+		i = i + 1
+	}
+	return r
+}
+
+const cargs_stmt! = (Stmt s): [Str] -> {
+	let [Str] r = []
+	const [Expr] es = stmt_exprs!(s)
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(es.len) then break
+		r = cat_s(r, cargs_expr!(es[i]))
+		i = i + 1
+	}
+	r = match s {
+		Stmt.IfThen(_, b) -> cat_s(r, cargs_stmt!(b)),
+		Stmt.IfElse(_, t, el) -> cat_s(r, cat_s(cargs_stmt!(t), cargs_stmt!(el))),
+		Stmt.Block(ss) -> cat_s(r, cargs_body!(ss)),
+		Stmt.Loop(ss) -> cat_s(r, cargs_body!(ss)),
+		Stmt.ForIn(_, _, ss) -> cat_s(r, cargs_body!(ss)),
+		Stmt.Match(_, arms) -> cat_s(r, cargs_sarms!(arms)),
+		Stmt.Defer(ss) -> cat_s(r, cargs_body!(ss)),
+		Stmt.Closure(_, _, _, cb) -> cat_s(r, cargs_body!(cb)),
+		_ -> r
+	}
+	return r
+}
+
+const cargs_sarms! = ([StmtArm] arms): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		r = cat_s(r, cargs_body!(arms[i].body))
+		i = i + 1
+	}
+	return r
+}
+
+const cargs_body! = ([Stmt] ss): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		r = cat_s(r, cargs_stmt!(ss[i]))
+		i = i + 1
+	}
+	return r
+}
+
+# ── forward aliases ──────────────────────────────────────────────────────────────────────────
+# The root names a binding READS from: binding a projection/alias of a store target makes the
+# new name a store target too (`const q = gg.inner; q.p = v` rehomes `v` through `q`).
+
+const aroots = (Expr e): [Str] -> match e {
+	Expr.Var(n) -> one_str(n),
+	Expr.Field(b, _) -> one_str(b),
+	Expr.FieldExpr(b, _) -> aroots(b),
+	Expr.Index(b, _) -> one_str(b),
+	Expr.IndexField(b, _, _) -> one_str(b),
+	Expr.IndexExpr(b, _) -> aroots(b),
+	Expr.Spread(x) -> aroots(x),
+	Expr.If(_, t, el) -> cat_s(aroots(t), aroots(el)),
+	Expr.Match(_, arms) -> aroots_marms(arms),
+	Expr.Loop(ss) -> yvars(ss),
+	_ -> no_strs()
+}
+
+const aroots_marms = ([MatchArm] arms): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		r = cat_s(r, aroots(arms[i].body))
+		i = i + 1
+	}
+	return r
+}
+
+# ── the per-function fixpoint ────────────────────────────────────────────────────────────────
+
+# The two grown sets: `esc` — names whose values escape the frame; `fwd` — forward aliases of
+# store targets. A store target is a parameter, an escaping name, or a forward alias.
+data RSets = { [Str] esc, [Str] fwd }
+
+data RCtx = { [Str] params, [Str] esc, [Str] fwd }
+
+const is_target = (RCtx cx, Str n): Bool -> has_name(cx.params, n) || has_name(cx.esc, n) || has_name(cx.fwd, n)
+
+const any_target = (RCtx cx, [Str] ns): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ns.len) then break
+		if is_target(cx, ns[i]) then return true
+		i = i + 1
+	}
+	return false
+}
+
+const any_in = ([Str] set, [Str] ns): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ns.len) then break
+		if has_name(set, ns[i]) then return true
+		i = i + 1
+	}
+	return false
+}
+
+const deep_root = (Expr e): Str -> match e {
+	Expr.Var(n) -> n,
+	Expr.Field(b, _) -> b,
+	Expr.FieldExpr(b, _) -> deep_root(b),
+	Expr.Index(b, _) -> b,
+	Expr.IndexField(b, _, _) -> b,
+	Expr.IndexExpr(b, _) -> deep_root(b),
+	_ -> ""
+}
+
+# Escape roots of one statement (position-sensitive).
+const eroots_stmt! = (RCtx cx, Stmt s): [Str] -> match s {
+	Stmt.Return(e) -> evars(e),
+	Stmt.Yield(e) -> evars(e),
+	Stmt.Assign(n, val) -> if is_target(cx, n) then evars(val) else no_strs(),
+	Stmt.FieldAssign(b, _, val) -> if is_target(cx, b) then evars(val) else no_strs(),
+	Stmt.IndexAssign(b, _, val) -> if is_target(cx, b) then evars(val) else no_strs(),
+	Stmt.DeepFieldAssign(be, _, val) -> if is_target(cx, deep_root(be)) then evars(val) else no_strs(),
+	Stmt.Let(n, _, _, init) -> if has_name(cx.esc, n) then evars(init) else no_strs(),
+	# a bind escaping pins the destructured source
+	Stmt.Destructure(binds, _, e) -> if any_in(cx.esc, binds) then evars(e) else no_strs(),
+	# the loop variable escaping pins the array (the element lives in the array's block)
+	Stmt.ForIn(v, arr, ss) -> if has_name(cx.esc, v) then cat_s(one_str(arr), eroots_body!(cx, ss)) else eroots_body!(cx, ss),
+	# a payload bind escaping pins the scrutinee
+	Stmt.Match(sc, arms) -> if any_in(cx.esc, sarm_binds(arms)) then cat_s(evars(sc), eroots_sarms!(cx, arms)) else eroots_sarms!(cx, arms),
+	Stmt.IfThen(_, b) -> eroots_stmt!(cx, b),
+	Stmt.IfElse(_, t, el) -> cat_s(eroots_stmt!(cx, t), eroots_stmt!(cx, el)),
+	Stmt.Block(ss) -> eroots_body!(cx, ss),
+	Stmt.Loop(ss) -> eroots_body!(cx, ss),
+	Stmt.Defer(ss) -> eroots_body!(cx, ss),
+	Stmt.Closure(_, _, _, cb) -> eroots_body!(cx, cb),
+	Stmt.Do(_) -> no_strs(),
+	Stmt.Break -> no_strs(),
+	Stmt.Continue -> no_strs()
+}
+
+const sarm_binds = ([StmtArm] arms): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		r = cat_s(r, arms[i].binds)
+		i = i + 1
+	}
+	return r
+}
+
+const eroots_sarms! = (RCtx cx, [StmtArm] arms): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		r = cat_s(r, eroots_body!(cx, arms[i].body))
+		i = i + 1
+	}
+	return r
+}
+
+# Value blocks embedded in a statement's expressions carry frame statements of their own.
+const vb_expr! = (RCtx cx, Expr e): [Str] -> {
+	let [Str] r = match e {
+		Expr.Loop(ss) -> eroots_body!(cx, ss),
+		_ -> no_strs()
+	}
+	const [Expr] ks = kids!(e)
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ks.len) then break
+		r = cat_s(r, vb_expr!(cx, ks[i]))
+		i = i + 1
+	}
+	return r
+}
+
+const eroots_body! = (RCtx cx, [Stmt] ss): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		r = cat_s(r, eroots_stmt!(cx, ss[i]))
+		const [Expr] es = stmt_exprs!(ss[i])
+		let Iarch j = 0
+		loop {
+			if j >= Iarch(es.len) then break
+			r = cat_s(r, vb_expr!(cx, es[j]))
+			j = j + 1
+		}
+		i = i + 1
+	}
+	return r
+}
+
+# Forward-alias growth of one statement: names bound from a target join the target set.
+const fwd_stmt = (RCtx cx, Stmt s): [Str] -> match s {
+	Stmt.Let(n, _, _, init) -> if any_target(cx, aroots(init)) then one_str(n) else no_strs(),
+	Stmt.Destructure(binds, _, e) -> if any_target(cx, aroots(e)) then binds else no_strs(),
+	Stmt.ForIn(v, arr, ss) -> if is_target(cx, arr) then cat_s(one_str(v), fwd_body(cx, ss)) else fwd_body(cx, ss),
+	Stmt.Match(sc, arms) -> if any_target(cx, aroots(sc)) then cat_s(sarm_binds(arms), fwd_sarms(cx, arms)) else fwd_sarms(cx, arms),
+	Stmt.IfThen(_, b) -> fwd_stmt(cx, b),
+	Stmt.IfElse(_, t, el) -> cat_s(fwd_stmt(cx, t), fwd_stmt(cx, el)),
+	Stmt.Block(ss) -> fwd_body(cx, ss),
+	Stmt.Loop(ss) -> fwd_body(cx, ss),
+	Stmt.Defer(ss) -> fwd_body(cx, ss),
+	Stmt.Closure(_, _, _, cb) -> fwd_body(cx, cb),
+	_ -> no_strs()
+}
+
+const fwd_sarms = (RCtx cx, [StmtArm] arms): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		r = cat_s(r, fwd_body(cx, arms[i].body))
+		i = i + 1
+	}
+	return r
+}
+
+const fwd_body = (RCtx cx, [Stmt] ss): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		r = cat_s(r, fwd_stmt(cx, ss[i]))
+		i = i + 1
+	}
+	return r
+}
+
+# Compute a function's shadow sets to a joint fixpoint. The call sweep is position-independent
+# (conservative), so it seeds `esc` once; the root and alias passes iterate.
+const shadow_sets! = ([Str] params, [Stmt] body): RSets -> {
+	let [Str] esc = cargs_body!(body)
+	let [Str] fwd = []
+	loop {
+		const RCtx cx = RCtx({ params: params, esc: esc, fwd: fwd })
+		const [Str] eadd = eroots_body!(cx, body)
+		const [Str] fadd = fwd_body(cx, body)
+		const [Str] esc2 = union_names(esc, eadd)
+		const [Str] fwd2 = union_names(fwd, fadd)
+		if Iarch(esc2.len) == Iarch(esc.len) && Iarch(fwd2.len) == Iarch(fwd.len) then break
+		esc = esc2
+		fwd = fwd2
+	}
+	return RSets({ esc: esc, fwd: fwd })
+}
+
+# ── entry points ─────────────────────────────────────────────────────────────────────────────
+
+# The divergence tripwire, run on every compile: every name the `!`-oracle (alloc.cf) says
+# escapes must also escape per the shadow pass — the shadow set is the sound superset the
+# duplex router will trust, so an oracle-escaping name missing here is a compiler bug.
+pub const routing_check! = (Program prog): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(prog.funcs.len) then break
+		if !prog.funcs[i].is_asm && !prog.funcs[i].is_value then {
+			const [Str] params = plist_names(prog.funcs[i].params)
+			const RSets rs = shadow_sets!(params, prog.funcs[i].body)
+			const [Str] oracle = compute_esc!(params, prog.funcs[i].body)
+			let Iarch j = 0
+			loop {
+				if j >= Iarch(oracle.len) then break
+				if !has_name(rs.esc, oracle[j]) then die("cf: routing: internal divergence in `${prog.funcs[i].name}`: `${oracle[j]}` escapes per the oracle but not per the shadow pass\n")
+				j = j + 1
+			}
+		}
+		i = i + 1
+	}
+	return 0
+}
+
+# Debug dump (`--dump-routing`, temporary — stripped when the duplex router lands, like
+# `--suggest-alloc` before it): each function's shadow escape set and forward aliases.
+pub const routing_dump! = (Program prog): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(prog.funcs.len) then break
+		if !prog.funcs[i].is_asm && !prog.funcs[i].is_value then {
+			const [Str] params = plist_names(prog.funcs[i].params)
+			const RSets rs = shadow_sets!(params, prog.funcs[i].body)
+			eprint("routing ${prog.funcs[i].name}:")
+			let Iarch j = 0
+			loop {
+				if j >= Iarch(rs.esc.len) then break
+				eprint(" ${rs.esc[j]}")
+				j = j + 1
+			}
+			let Iarch k = 0
+			loop {
+				if k >= Iarch(rs.fwd.len) then break
+				eprint(" fwd:${rs.fwd[k]}")
+				k = k + 1
+			}
+			eprint("\n")
+		}
+		i = i + 1
+	}
+	return 0
+}
