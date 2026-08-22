@@ -357,11 +357,16 @@ never reset a child's storage — the pin of
 [geometry_lowering.md](./geometry_lowering.md) §5), so a dropped child node is
 reclaimed by the enclosing **survivor-scope mark** where one qualifies — a frame
 or loop from which nothing escapes frees the whole carve at its exit, bounded by
-that scope. Where no scope qualifies, the carve stays until the *parent node's*
-teardown: **node-bounded, not frame-bounded**. Tightening the unqualified case —
-carving a child that provably dies in-frame from the residue side instead — is
-the named next arc, with the dropped-return loop and the per-call child arena
-(corpus tests 1353 and 1307) pinned as its regression pair.
+that scope. Where no scope qualifies, a **fixed** child (`of(n)`) that provably dies
+in-frame is carved from the **residue side** instead — its handle never escapes
+and no `in`-call under it leaks a pointer out (the geometry-channel rules: an
+aggregate-returning or rehoming callee run `in b` pins `b`) — so the frame or
+iteration bracket reclaims the whole child regardless. Only the remaining
+unqualified cases — an escaping-pinned fixed child, and every **elastic** child
+(its pulls draw real storage from the parent) — stay until the *parent node's*
+teardown: **node-bounded, not frame-bounded**. The dropped-return loop, the
+per-call child arena, and the pointer-param carve (corpus tests 1353, 1307,
+1355; 1356 guards the pin) are the regression set.
 
 For teardown to be sound the compiler promotes the **entire reachable closure**
 of the return value, not just its top: anything the return points at is promoted
