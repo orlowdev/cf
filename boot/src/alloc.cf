@@ -310,6 +310,59 @@ const scan_escaping! = (ACtx cx, Expr e): Bool -> match e {
 	_ -> scan_trapped!(cx, e)
 }
 
+# A `$`-Let with a LITERAL aggregate initializer builds on the machine STACK: emit's `alloc_stack`
+# flag rides through the WHOLE initializer (nested literals included), so record/array/buffer
+# literals anywhere inside are stack storage, not node residue. But three forms draw on the NODE
+# even under the flag — an interpolated Str (the cf_str floor helpers), a tuple, and a boxed-union
+# construction (their emit paths never consult the flag) — and a value block's statements are
+# ordinary frame code. Scan for exactly those, descending the literal spine and call arguments
+# (which ride the flag too).
+const scan_stack_init! = (ACtx cx, Expr e): Bool -> match e {
+	Expr.Record(_, inits) -> stack_scan_list!(cx, field_values(inits)),
+	Expr.ArrayLit(_, sp, elems, _) -> scan_stack_init!(cx, sp) || stack_scan_list!(cx, elems),
+	Expr.Buffer(sz) -> scan_stack_init!(cx, sz),
+	Expr.Interp(_) -> true,
+	Expr.Tuple(_) -> true,
+	Expr.UnionMk(u, _, args) -> if union_boxed(cx.unions, u) then true else stack_scan_list!(cx, args),
+	Expr.Loop(ss) -> body_traps!(cx, false, ss),
+	_ -> stack_scan_list!(cx, expr_children!(e))
+}
+
+const stack_scan_list! = (ACtx cx, [Expr] es): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(es.len) then break
+		if scan_stack_init!(cx, es[i]) then return true
+		i = i + 1
+	}
+	return false
+}
+
+# Route a `$`-Let's initializer: a top-level literal aggregate takes emit's stack branch (the
+# `alloc_stack` flag is set for the whole init), so it scans in stack mode; any other form —
+# a scalar expression, a call, an if/match aggregate — takes emit's scalar/normal path where
+# the flag is never set, so every construction inside is ordinary node residue (this is what
+# made `const $n = "x${y}z".len` allocate invisibly — the old arm skipped the init entirely).
+const scan_stack_let! = (ACtx cx, Expr init): Bool -> match init {
+	Expr.Record(_, _) -> scan_stack_init!(cx, init),
+	Expr.ArrayLit(_, _, _, _) -> scan_stack_init!(cx, init),
+	Expr.Buffer(_) -> scan_stack_init!(cx, init),
+	_ -> scan_trapped!(cx, init)
+}
+
+# The root NAME of a chained lvalue's base (`a.b.c… = v` — the Var/name at the bottom of the
+# Field/Index chain), or "" when the base is not name-rooted (a non-name root is never a
+# parameter, so "" safely reads as non-escaping).
+const deep_root = (Expr e): Str -> match e {
+	Expr.Var(n) -> n,
+	Expr.Field(b, _) -> b,
+	Expr.FieldExpr(b, _) -> deep_root(b),
+	Expr.Index(b, _) -> b,
+	Expr.IndexField(b, _, _) -> b,
+	Expr.IndexExpr(b, _) -> deep_root(b),
+	_ -> ""
+}
+
 # Walk a statement list for trapped residue. `yesc` says whether a `<- v` yield escapes (true when
 # the enclosing value block is itself in an escaping position).
 const body_traps! = (ACtx cx, Bool yesc, [Stmt] ss): Bool -> {
@@ -339,10 +392,10 @@ const target_escapes = (ACtx cx, Str name): Bool -> has_name(cx.params, name) ||
 const stmt_traps! = (ACtx cx, Bool yesc, Stmt s): Bool -> match s {
 	Stmt.Return(e) -> scan_escaping!(cx, e),
 	Stmt.Yield(e) -> if yesc then scan_escaping!(cx, e) else scan_trapped!(cx, e),
-	Stmt.Let(name, _, _, init) -> if is_stack_name(name) then false else if has_name(cx.esc, name) then scan_escaping!(cx, init) else scan_trapped!(cx, init),
+	Stmt.Let(name, _, _, init) -> if has_name(cx.esc, name) then scan_escaping!(cx, init) else if is_stack_name(name) then scan_stack_let!(cx, init) else scan_trapped!(cx, init),
 	Stmt.Assign(name, val) -> if target_escapes(cx, name) then scan_escaping!(cx, val) else scan_trapped!(cx, val),
 	Stmt.FieldAssign(base, _, val) -> if target_escapes(cx, base) then scan_escaping!(cx, val) else scan_trapped!(cx, val),
-	Stmt.DeepFieldAssign(be, _, val) -> scan_trapped!(cx, be) || scan_trapped!(cx, val),
+	Stmt.DeepFieldAssign(be, _, val) -> if target_escapes(cx, deep_root(be)) then scan_trapped!(cx, be) || scan_escaping!(cx, val) else scan_trapped!(cx, be) || scan_trapped!(cx, val),
 	Stmt.IndexAssign(base, idx, val) -> scan_trapped!(cx, idx) || (if target_escapes(cx, base) then scan_escaping!(cx, val) else scan_trapped!(cx, val)),
 	Stmt.Do(e) -> scan_trapped!(cx, e),
 	Stmt.IfThen(c, s2) -> scan_trapped!(cx, c) || stmt_traps!(cx, yesc, s2),
@@ -363,15 +416,35 @@ const stmt_traps! = (ACtx cx, Bool yesc, Stmt s): Bool -> match s {
 # The local names that escape when `e` is in an escaping position: bare `Var`s reachable through
 # aggregate components / branches / value-block yields (NOT through call arguments or read bases,
 # which do not escape).
+# A `<- v` yield may sit inside a nested if/block/match (mirroring typecheck's stmt_yields_local)
+# — but NOT inside a nested loop, which opens its own value context. A yield buried in a branch
+# escapes exactly like a top-level one.
+const yield_vars_stmt = (Stmt s): [Str] -> match s {
+	Stmt.Yield(e) -> esc_vars(e),
+	Stmt.IfThen(_, b) -> yield_vars_stmt(b),
+	Stmt.IfElse(_, t, el) -> cat_s(yield_vars_stmt(t), yield_vars_stmt(el)),
+	Stmt.Block(ss) -> yield_vars(ss),
+	Stmt.Match(_, arms) -> yield_vars_stmtarms(arms),
+	_ -> no_strs()
+}
+
+const yield_vars_stmtarms = ([StmtArm] arms): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		r = cat_s(r, yield_vars(arms[i].body))
+		i = i + 1
+	}
+	return r
+}
+
 const yield_vars = ([Stmt] ss): [Str] -> {
 	let [Str] r = []
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(ss.len) then break
-		r = match ss[i] {
-			Stmt.Yield(e) -> cat_s(r, esc_vars(e)),
-			_ -> r
-		}
+		r = cat_s(r, yield_vars_stmt(ss[i]))
 		i = i + 1
 	}
 	return r
@@ -402,52 +475,90 @@ const vars_of = ([Expr] es): [Str] -> {
 }
 
 # One pass collecting escape roots and closing aliasing: a return/yield escapes its value's vars; a
-# rehome (assign / field / index into a parameter or escaping aggregate) escapes the stored vars; a
-# binding to an already-escaping name escapes its initializer's vars. Iterated to a fixpoint.
-const esc_roots_stmt = ([Str] params, [Str] esc, Stmt s): [Str] -> match s {
+# rehome (assign / field / deep-field / index into a parameter or escaping aggregate) escapes the
+# stored vars; a binding to an already-escaping name escapes its initializer's vars. Iterated to a
+# fixpoint. Every statement's EXPRESSIONS are also walked for embedded value blocks (`Expr.Loop`),
+# whose statement bodies share this frame's params/locals — a rehome inside one escapes exactly
+# like a top-level rehome (it was invisible before: the walk never descended into expressions).
+const esc_roots_stmt! = ([Str] params, [Str] esc, Stmt s): [Str] -> match s {
 	Stmt.Return(e) -> esc_vars(e),
 	Stmt.Yield(e) -> esc_vars(e),
 	Stmt.Assign(name, val) -> if has_name(params, name) || has_name(esc, name) then esc_vars(val) else no_strs(),
 	Stmt.FieldAssign(base, _, val) -> if has_name(params, base) || has_name(esc, base) then esc_vars(val) else no_strs(),
 	Stmt.IndexAssign(base, _, val) -> if has_name(params, base) || has_name(esc, base) then esc_vars(val) else no_strs(),
+	Stmt.DeepFieldAssign(be, _, val) -> if has_name(params, deep_root(be)) || has_name(esc, deep_root(be)) then esc_vars(val) else no_strs(),
 	Stmt.Let(name, _, _, init) -> if has_name(esc, name) then esc_vars(init) else no_strs(),
-	Stmt.IfThen(_, s2) -> esc_roots_stmt(params, esc, s2),
-	Stmt.IfElse(_, t, el) -> cat_s(esc_roots_stmt(params, esc, t), esc_roots_stmt(params, esc, el)),
-	Stmt.Block(ss) -> esc_roots_body(params, esc, ss),
-	Stmt.Loop(ss) -> esc_roots_body(params, esc, ss),
-	Stmt.ForIn(_, _, ss) -> esc_roots_body(params, esc, ss),
-	Stmt.Match(_, arms) -> esc_roots_stmtarms(params, esc, arms),
+	Stmt.IfThen(_, s2) -> esc_roots_stmt!(params, esc, s2),
+	Stmt.IfElse(_, t, el) -> cat_s(esc_roots_stmt!(params, esc, t), esc_roots_stmt!(params, esc, el)),
+	Stmt.Block(ss) -> esc_roots_body!(params, esc, ss),
+	Stmt.Loop(ss) -> esc_roots_body!(params, esc, ss),
+	Stmt.ForIn(_, _, ss) -> esc_roots_body!(params, esc, ss),
+	Stmt.Match(_, arms) -> esc_roots_stmtarms!(params, esc, arms),
 	# a `defer` body shares this frame's locals/params, so a rehome inside it escapes too
-	Stmt.Defer(ss) -> esc_roots_body(params, esc, ss),
+	Stmt.Defer(ss) -> esc_roots_body!(params, esc, ss),
 	_ -> no_strs()
 }
 
-const esc_roots_body = ([Str] params, [Str] esc, [Stmt] ss): [Str] -> {
+# The expressions a statement holds directly — walked for embedded value-block bodies.
+const stmt_exprs! = (Stmt s): [Expr] -> match s {
+	Stmt.Return(e) -> exl_one(e),
+	Stmt.Yield(e) -> exl_one(e),
+	Stmt.Let(_, _, _, init) -> exl_one(init),
+	Stmt.Assign(_, val) -> exl_one(val),
+	Stmt.FieldAssign(_, _, val) -> exl_one(val),
+	Stmt.DeepFieldAssign(be, _, val) -> exl_two!(be, val),
+	Stmt.IndexAssign(_, idx, val) -> exl_two!(idx, val),
+	Stmt.Do(e) -> exl_one(e),
+	Stmt.IfThen(c, _) -> exl_one(c),
+	Stmt.IfElse(c, _, _) -> exl_one(c),
+	Stmt.Match(sc, _) -> exl_one(sc),
+	Stmt.Destructure(_, _, e) -> exl_one(e),
+	_ -> no_exprs()
+}
+
+const esc_roots_expr! = ([Str] params, [Str] esc, Expr e): [Str] -> match e {
+	Expr.Loop(ss) -> esc_roots_body!(params, esc, ss),
+	_ -> esc_roots_elist!(params, esc, expr_children!(e))
+}
+
+const esc_roots_elist! = ([Str] params, [Str] esc, [Expr] es): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(es.len) then break
+		r = cat_s(r, esc_roots_expr!(params, esc, es[i]))
+		i = i + 1
+	}
+	return r
+}
+
+const esc_roots_body! = ([Str] params, [Str] esc, [Stmt] ss): [Str] -> {
 	let [Str] r = []
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(ss.len) then break
-		r = cat_s(r, esc_roots_stmt(params, esc, ss[i]))
+		r = cat_s(r, esc_roots_stmt!(params, esc, ss[i]))
+		r = cat_s(r, esc_roots_elist!(params, esc, stmt_exprs!(ss[i])))
 		i = i + 1
 	}
 	return r
 }
 
-const esc_roots_stmtarms = ([Str] params, [Str] esc, [StmtArm] arms): [Str] -> {
+const esc_roots_stmtarms! = ([Str] params, [Str] esc, [StmtArm] arms): [Str] -> {
 	let [Str] r = []
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(arms.len) then break
-		r = cat_s(r, esc_roots_body(params, esc, arms[i].body))
+		r = cat_s(r, esc_roots_body!(params, esc, arms[i].body))
 		i = i + 1
 	}
 	return r
 }
 
-const compute_esc = ([Str] params, [Stmt] body): [Str] -> {
+const compute_esc! = ([Str] params, [Stmt] body): [Str] -> {
 	let [Str] esc = []
 	loop {
-		const [Str] add = esc_roots_body(params, esc, body)
+		const [Str] add = esc_roots_body!(params, esc, body)
 		const [Str] merged = union_names(esc, add)
 		if Iarch(merged.len) == Iarch(esc.len) then break
 		esc = merged
@@ -545,7 +656,7 @@ const param_names = (Func f): [Str] -> plist_names(f.params)
 # invokes it) is colored `!`, exactly as if it called a `!` function. Closures do not nest in v1.
 const closure_traps! = ([UnionDecl] unions, [Param] cps, [Stmt] cbody): Bool -> {
 	const [Str] cparams = plist_names(cps)
-	const [Str] cesc = compute_esc(cparams, cbody)
+	const [Str] cesc = compute_esc!(cparams, cbody)
 	const ACtx cx2 = ACtx({ unions: unions, params: cparams, esc: cesc })
 	return body_traps!(cx2, false, cbody)
 }
@@ -553,7 +664,7 @@ const closure_traps! = ([UnionDecl] unions, [Param] cps, [Stmt] cbody): Bool -> 
 # Does function `f` hold a trapped (non-escaping) aggregate residence of its own?
 const local_residue! = ([UnionDecl] unions, Func f): Bool -> {
 	const [Str] params = param_names(f)
-	const [Str] esc = compute_esc(params, f.body)
+	const [Str] esc = compute_esc!(params, f.body)
 	const ACtx cx = ACtx({ unions: unions, params: params, esc: esc })
 	return body_traps!(cx, false, f.body)
 }
