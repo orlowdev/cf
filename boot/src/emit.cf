@@ -42,7 +42,7 @@ import "astutil" as { is_spread, spread_inner, is_skip, skip_count, is_nested, n
 # `loop_mark` is the nearest enclosing reset-safe loop's entry mark (same triple shape, or -1 if
 # the nearest loop is not reset-safe) — `break`/`continue` restore it so every path back to the
 # loop head or out of it reclaims the iteration's residue, matching the back-edge rewind.
-data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs, [RecDecl] recs, [UnionDecl] unions, Iarch cur_loop, Iarch cur_slot, Str cur_ret, Iarch reset_mark, Bool fn_ptr, Iarch loop_mark, Bool alloc_stack, Bool in_loop, Iarch stack_used, [RSets] routes, [FnSum] fsums, Iarch cur_fn, Str alloc_node, Iarch sur_mark, Iarch loop_sur_mark }
+data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs, [RecDecl] recs, [UnionDecl] unions, Iarch cur_loop, Iarch cur_slot, Str cur_ret, Iarch reset_mark, Bool fn_ptr, Iarch loop_mark, Bool alloc_stack, Bool in_loop, Iarch stack_used, [RSets] routes, [FnSum] fsums, Iarch cur_fn, Str alloc_node, Str carve_node, Iarch sur_mark, Iarch loop_sur_mark }
 
 # A local/parameter in scope: its interned name, `slot`, its `rec_type` (a record/union
 # type name, `"$dyn"`, `"$ptr"`, or `"Str"` — `""` for a word), and `elem` (a dynamic
@@ -2422,7 +2422,14 @@ const emit_indirect_call! = (*Emit ctx, [Binding] env, Iarch fpidx, [Expr] args)
 }
 
 const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env): Str -> {
-	# `mem.arena.of(n)` — carve a fixed arena from the ambient node (%node_0) and yield its handle.
+	# `mem.arena.of(n)` — carve a fixed arena from the ambient node and yield its handle. The
+	# residue-carve tightening: when the handle binding provably never escapes (the routing
+	# classification, geom-channel rules included — memory_model §8), the carve draws from the
+	# frame's RESIDUE side instead of the survivor side, so the whole child dies with the frame
+	# or iteration bracket instead of leaking until node death. `carve_node` is set by the
+	# binding site; a fixed child never dereferences its parent field (kind 0/2 cannot pull),
+	# so pointing it at a residue subnode is inert. Elastic carves (grow) stay survivor-side —
+	# their pulls draw real storage from the parent.
 	if str_eq(callee, "cf__arena_of") then {
 		const Str nv = emit_expr!(args[0], ctx, env)
 		const Iarch tw = ctx.next
@@ -2430,7 +2437,7 @@ const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env)
 		write_str(ctx.fd, "\t%t${tw} =w copy ${nv}\n")
 		const Iarch tr = ctx.next
 		ctx.next = ctx.next + 1
-		write_str(ctx.fd, "\t%t${tr} =l call $cf_arena_of(l %node_0, w %t${tw})\n")
+		write_str(ctx.fd, "\t%t${tr} =l call $cf_arena_of(l ${ctx.carve_node}, w %t${tw})\n")
 		return "%t${tr}"
 	}
 	# `mem.arena.grow(n)` — carve an ELASTIC arena from the ambient node (grows on overflow).
@@ -3663,10 +3670,12 @@ const emit_simple_stmt! = (*Emit ctx, [Binding] env, Stmt s): Iarch -> {
 			# classification; a scalar's inner constructions are statement-scratch.
 			const Iarch idx = lookup_index(env, n)
 			const Str saved_an = ctx.alloc_node
+			const Str saved_cn = ctx.carve_node
 			if binding_is_agg(env, n) then {
 				if routes_residue(ctx, n) then ctx.alloc_node = "%res_0"
 			} else {
 				if ctx.reset_mark >= 0 then ctx.alloc_node = "%res_0"
+				if routes_residue(ctx, n) then ctx.carve_node = "%res_0"
 			}
 			if str_eq(env[idx].rec_type, "$dyn") && is_self_spread(e, n) then {
 				const Str hdr = binding_ptr!(ctx, env, idx)
@@ -3676,6 +3685,7 @@ const emit_simple_stmt! = (*Emit ctx, [Binding] env, Stmt s): Iarch -> {
 				write_str(ctx.fd, "\t${store_op(env[idx].fixed)} ${v}, %t${env[idx].slot}\n")
 			}
 			ctx.alloc_node = saved_an
+			ctx.carve_node = saved_cn
 		},
 		Stmt.FieldAssign(b, f, e) -> {
 			# `base.field = value` — store the value into the record's field in place.
@@ -3799,11 +3809,17 @@ const emit_block! = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 				if str_eq(rt, "") then {
 					# a scalar init's inner constructions (an interp measured with `.len`, a value
 					# block's transient aggregates) are pure scratch — the binding copies a WORD out,
-					# so no pointer survives the statement: born residue-side in a bracketed frame
+					# so no pointer survives the statement: born residue-side in a bracketed frame.
+					# A node CARVE in the init routes by the binding's own classification (the
+					# residue-carve tightening) — the handle is a word, but the storage it names
+					# lives exactly as long as the name provably does.
 					const Str saved_an = ctx.alloc_node
+					const Str saved_cn = ctx.carve_node
 					if ctx.reset_mark >= 0 then ctx.alloc_node = "%res_0"
+					if routes_residue(ctx, n) then ctx.carve_node = "%res_0"
 					const Str v = emit_expr!(e, ctx, env)
 					ctx.alloc_node = saved_an
+					ctx.carve_node = saved_cn
 					# a scalar local records its leaf type (fixed OR float, from the annotation else
 					# inferred) so later ops pick the right codegen and the cell stores/loads with its
 					# QBE type (a float uses `stored`/`loadd`, an integer `storel`/`loadl`)
@@ -4861,7 +4877,7 @@ pub const emit_program! = (Program prog, RouteInfo ri, Uarch qbe_fd, Uarch asm_f
 		if i >= Iarch(prog.funcs.len) then break
 		# an asm function is emitted into the floor, not through QBE
 		if !prog.funcs[i].is_asm then {
-			let Emit ctx = Emit({ fd: qbe_fd, next: 0, label: 0, funcs: prog.funcs, recs: prog.recs, unions: prog.unions, cur_loop: 0 - 1, cur_slot: 0 - 1, cur_ret: "", reset_mark: 0 - 1, fn_ptr: false, loop_mark: 0 - 1, alloc_stack: false, in_loop: false, stack_used: 0, routes: ri.sets, fsums: ri.sums, cur_fn: 0 - 1, alloc_node: "%node_0", sur_mark: 0 - 1, loop_sur_mark: 0 - 1 })
+			let Emit ctx = Emit({ fd: qbe_fd, next: 0, label: 0, funcs: prog.funcs, recs: prog.recs, unions: prog.unions, cur_loop: 0 - 1, cur_slot: 0 - 1, cur_ret: "", reset_mark: 0 - 1, fn_ptr: false, loop_mark: 0 - 1, alloc_stack: false, in_loop: false, stack_used: 0, routes: ri.sets, fsums: ri.sums, cur_fn: 0 - 1, alloc_node: "%node_0", carve_node: "%node_0", sur_mark: 0 - 1, loop_sur_mark: 0 - 1 })
 			emit_func!(&ctx, prog.funcs[i], i)
 		}
 		i = i + 1

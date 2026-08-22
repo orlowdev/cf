@@ -165,7 +165,14 @@ const plist_names = ([Param] ps): [Str] -> {
 # STORED beyond the callee's frame (`stores`). `all_esc` is ⊤ — every argument escapes — used
 # for asm bodies, indirect/unknown callees, and DFS back-edges (recursion/SCC). Out-of-range
 # bit reads default to TRUE (bit_at), so an arity surprise degrades to escape, never a miss.
-pub data FnSum = { Bool all_esc, [Bool] ret_al, [Bool] stores }
+# The two GEOMETRY-CHANNEL bits drive the in-clause pin (the residue-carve tightening): a
+# value produced by an `in g` call lives in g's node, so leaking one must pin `g` —
+# `agg_ret` (the return is aggregate-typed: a scalar result carries no pointer into the
+# node) pins g positionally via evars; `rehomer` (the callee holds a writable `*T`/capture
+# param, or is ⊤ — value params are read-only, so these are the only rehome channels) pins g
+# unconditionally via the sweep. Both propagate through `in <param>` grafts by the ordinary
+# summary machinery.
+pub data FnSum = { Bool all_esc, [Bool] ret_al, [Bool] stores, Bool agg_ret, Bool rehomer }
 
 # The small per-function callee table the walkers consult: the DISTINCT callee names of one
 # body, resolved once against the whole-program tables (so the fixpoint rounds never re-run
@@ -177,7 +184,7 @@ const bit_at = ([Bool] bs, Iarch i): Bool -> if i >= Iarch(bs.len) then true els
 const top_sum = (): FnSum -> {
 	let [Bool] ra = []
 	let [Bool] sto = []
-	return FnSum({ all_esc: true, ret_al: ra, stores: sto })
+	return FnSum({ all_esc: true, ret_al: ra, stores: sto, agg_ret: true, rehomer: true })
 }
 
 const none_sum = (Iarch n): FnSum -> {
@@ -190,7 +197,7 @@ const none_sum = (Iarch n): FnSum -> {
 		sto = [...sto, false]
 		i = i + 1
 	}
-	return FnSum({ all_esc: false, ret_al: ra, stores: sto })
+	return FnSum({ all_esc: false, ret_al: ra, stores: sto, agg_ret: false, rehomer: false })
 }
 
 # Result may alias argument 0; nothing is retained beyond the call. `Str(v[,n])` BORROWS a
@@ -200,7 +207,7 @@ const none_sum = (Iarch n): FnSum -> {
 const ret0_sum = (): FnSum -> {
 	let [Bool] ra = [true]
 	let [Bool] sto = [false]
-	return FnSum({ all_esc: false, ret_al: ra, stores: sto })
+	return FnSum({ all_esc: false, ret_al: ra, stores: sto, agg_ret: true, rehomer: false })
 }
 
 # The builtin numeric cast names (typecheck's is_cast_type set).
@@ -253,6 +260,23 @@ const lookup_sum = (Sums sm, Str n): FnSum -> {
 		i = i + 1
 	}
 	return top_sum()
+}
+
+# The in-clause pin, positional side: an `in g` call whose callee returns an AGGREGATE may
+# hand out a pointer into g's node — wherever that result escapes to, `g` escapes with it.
+const geom_ret_pin = (Sums sm, Str callee, Str geom): [Str] -> {
+	if str_eq(geom, "") then return no_strs()
+	if lookup_sum(sm, callee).agg_ret then return one_str(geom)
+	return no_strs()
+}
+
+# The in-clause pin, unconditional side: a REHOMING callee (writable pointer / capture
+# params, or ⊤) can store its in-g allocations into memory that outlives the call — the
+# node must be pinned wherever the call sits.
+const geom_sweep_pin = (Sums sm, Str callee, Str geom): [Str] -> {
+	if str_eq(geom, "") then return no_strs()
+	if lookup_sum(sm, callee).rehomer then return one_str(geom)
+	return no_strs()
 }
 
 # The arguments whose values may ride OUT through the call's return value.
@@ -357,8 +381,9 @@ const evars = (Sums sm, Expr e): [Str] -> match e {
 	Expr.Or(_, _) -> no_strs(),
 	Expr.If(_, t, el) -> cat_s(evars(sm, t), evars(sm, el)),
 	# only the arguments the callee's summary says may ride out through the RETURN value —
-	# a `stores` argument escapes via the position-independent sweep instead
-	Expr.Call(n, _, args, _) -> evars_list(sm, ret_args(sm, n, args)),
+	# a `stores` argument escapes via the position-independent sweep instead — plus the
+	# in-clause geometry when the (aggregate) result may point into its node
+	Expr.Call(n, _, args, g) -> cat_s(geom_ret_pin(sm, n, g), evars_list(sm, ret_args(sm, n, args))),
 	# lowered away by hoist_defertap; maximally conservative if ever seen
 	Expr.DeferTap(_, args) -> evars_list(sm, args)
 }
@@ -513,7 +538,7 @@ const stmt_exprs! = (Stmt s): [Expr] -> match s {
 
 const sweep_expr! = (Sums sm, Expr e): [Str] -> {
 	let [Str] r = match e {
-		Expr.Call(n, _, args, _) -> evars_list(sm, sto_args(sm, n, args)),
+		Expr.Call(n, _, args, g) -> cat_s(geom_sweep_pin(sm, n, g), evars_list(sm, sto_args(sm, n, args))),
 		Expr.DeferTap(_, args) -> evars_list(sm, args),
 		Expr.Loop(ss) -> sweep_body!(sm, ss),
 		_ -> no_strs()
@@ -652,7 +677,7 @@ const aroots = (Sums sm, Expr e): [Str] -> match e {
 	Expr.If(_, t, el) -> cat_s(aroots(sm, t), aroots(sm, el)),
 	Expr.Match(_, arms) -> aroots_marms(sm, arms),
 	Expr.Loop(ss) -> yvars(sm, ss),
-	Expr.Call(n, _, args, _) -> aroots_list(sm, ret_args(sm, n, args)),
+	Expr.Call(n, _, args, g) -> cat_s(geom_ret_pin(sm, n, g), aroots_list(sm, ret_args(sm, n, args))),
 	_ -> no_strs()
 }
 
@@ -989,7 +1014,28 @@ const local_sums = (Program prog, *[FnSum] sums, *[Iarch] st, [Str] cns): Sums -
 	return Sums({ names: ln, tbl: lt })
 }
 
-const mk_summary = ([Str] params, RSets rs): FnSum -> {
+# A scalar return carries no pointer into the callee's ambient node; everything else might.
+const is_scalar_ret = (Str rn): Bool -> {
+	if str_eq(rn, "") || str_eq(rn, "Iarch") || str_eq(rn, "Int") || str_eq(rn, "Uarch") then return true
+	if str_eq(rn, "Bool") || str_eq(rn, "Unit") then return true
+	if str_eq(rn, "Float32") || str_eq(rn, "Float64") then return true
+	if str_eq(rn, "Int8") || str_eq(rn, "Int16") || str_eq(rn, "Int32") || str_eq(rn, "Int64") then return true
+	if str_eq(rn, "Uint8") || str_eq(rn, "Uint16") || str_eq(rn, "Uint32") || str_eq(rn, "Uint64") then return true
+	return false
+}
+
+const fn_rehomes = (Func f): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(f.params.len) then break
+		if f.params[i].is_ptr then return true
+		if str_eq(f.params[i].type_name, "$capref") || str_eq(f.params[i].type_name, "$capagg") then return true
+		i = i + 1
+	}
+	return false
+}
+
+const mk_summary = (Func f, [Str] params, RSets rs): FnSum -> {
 	let [Bool] ra = []
 	let [Bool] sto = []
 	let Iarch i = 0
@@ -999,7 +1045,7 @@ const mk_summary = ([Str] params, RSets rs): FnSum -> {
 		sto = [...sto, has_name(rs.sset, params[i])]
 		i = i + 1
 	}
-	return FnSum({ all_esc: false, ret_al: ra, stores: sto })
+	return FnSum({ all_esc: false, ret_al: ra, stores: sto, agg_ret: !is_scalar_ret(f.ret_name), rehomer: fn_rehomes(f) })
 }
 
 const empty_rsets = (): RSets -> {
@@ -1036,7 +1082,7 @@ const summarize! = (Program prog, *[FnSum] sums, *[Iarch] st, *[RSets] rsets, Ia
 	const Sums sm = local_sums(prog, sums, st, cns)
 	const [Str] params = plist_names(prog.funcs[k].params)
 	const RSets rs = shadow_sets!(sm, params, prog.funcs[k].body)
-	sums[k] = mk_summary(params, rs)
+	sums[k] = mk_summary(prog.funcs[k], params, rs)
 	rsets[k] = rs
 	st[k] = 2
 	return 0
