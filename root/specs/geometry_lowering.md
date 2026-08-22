@@ -15,17 +15,26 @@ ratified and **pinned** — read this before touching the Memory arc rather than
 re-deriving it. Concrete geometry bodies (§5) are reference implementations; the
 collection *algorithms* inside `rc`/`gc` are their own subject.
 
-The load-bearing implementation idea is **classification at birth**: a
-whole-program escape analysis classifies every allocation site — a value that
+Classification itself is not the new part — §2 has always driven placement
+from the comptime escape class, and [[memory_model.md]] §8 always promised an
+escaping allocation "placed on the caller's node to begin with." What the
+duplex arc changed is **where the class acts**. Before, it was enacted at the
+ESCAPE site: `on_ret` wrapped the *return expression*, exempting an
+already-placed value from cleanup by bookkeeping (a drop-set edit), and the
+boundary claim repaired placement after the fact — machinery whose soundness
+hung on a no-allocation window, and whose implementation (an adopt-or-slide
+claim) violated this spec's own "neither copies" clause. Now the same class is
+enacted at the ALLOCATION site — **classification at birth**: a value that
 escapes its frame (returned, yielded, or rehomed into caller-visible memory) is
-born a **survivor**; provably-trapped scratch is born **residue**. The bump
-family realizes the split as a **duplex node** (§5): two subnodes in one
-96-byte header, survivors on the handle side, residue on a bracketed side that
-frames and loops reset. The polarity is fail-safe — an unknown or unprovable
-site defaults to survivor, so a classification miss leaks until node death and
-can never dangle. The classification is geometry-agnostic (it is the memory
-model's own residue/survivor separation); the duplex layout is merely the bump
-family's way of consuming it.
+born a **survivor**; provably-trapped scratch is born **residue**. The
+separation is spatial, not bookkept. The bump family realizes it as a **duplex
+node** (§5): two subnodes in one 96-byte header, survivors on the handle side,
+residue on a bracketed side that frames and loops reset — no reclamation path
+can reach a survivor even in principle. The polarity is fail-safe — an unknown
+or unprovable site defaults to survivor, so a classification miss leaks until
+node death and can never dangle. The classification is geometry-agnostic (it is
+the memory model's own residue/survivor separation); the duplex layout is
+merely the bump family's way of consuming it.
 
 This spec spans two altitudes. §1–§3 (the hook contract, placement, and the
 return protocol) are the **`.cf`-level** layer: what the Memory arc emits, still
