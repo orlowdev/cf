@@ -413,17 +413,30 @@ every call site.
 
 ### Node-free pruning: no argument zero at all
 
-A call proven **node-free** carries no `%node`. A function is node-free iff it is
-**colorless, takes no `!` argument, and returns only scalars** (see
-[[memory_model.md]], Allocation algebra) — its whole subtree is pure compute. Its
-emitted signature is just its user parameters, and callers pass no node.
+A call proven **node-free** carries no `%node`. The criterion is **body-driven,
+not color-driven** — an earlier draft said "colorless, no `!` argument, scalar
+return", which is wrong in both directions: a colorless constructor
+(`-> P({…})`) or a rehoming colorless function (`g.inner = P({…})` through a
+`*T` param) still allocates, while a frame holding only `$`-stack aggregates
+does not. A function keeps `%node_0` iff it can ever NEED a node:
 
-The escapes that re-attach a node even to a colorless function — an aggregate
-escaping *through* it, or a `!` value riding *through* it — are all visible at the
-call site, so the presence or absence of `%node` is a **per-call-site comptime
-fact**, never a runtime decision. The consequence is the one [[memory_model.md]]
-promises: a pure-compute subtree emits the *exact same ABI it would have without
-C!* — no hidden parameter, no threading, nothing to pay.
+- it is `!` (every bang frame brackets its residue subnode);
+- its body **allocates** — a construction outside `$`-stack storage, a string
+  literal or string-pattern match (both materialize at runtime), a `Str(…)`
+  seal, or an arena/buffer constructor;
+- it makes an **indirect** call (the target is unknown; the site passes a node
+  uniformly), or is **address-taken** (an indirect site targets it);
+- it makes an un-grafted direct call — including a value-const **auto-call** —
+  to a function whose own signature carries a node (an `in b` call threads the
+  geom binding instead and costs the caller nothing);
+- it is `main` (the floor enters it with the page).
+
+The bits close over the call graph like the `!` fixpoint itself, and everything
+is a **comptime fact** — never a runtime decision. Everything else prunes: its
+emitted signature is just its user parameters, and callers pass no node. The
+consequence is the one [[memory_model.md]] promises: a pure-compute subtree
+emits the *exact same ABI it would have without C!* — no hidden parameter, no
+threading, nothing to pay.
 
 ### `%ret`: the claimed return
 
@@ -711,10 +724,9 @@ keeps `cf0` lean:
 (§2), the in-flight / claim-once **return protocol** (§3), and the `%node`/`%ret`
 **calling convention** (§4) are unchanged — the bootstrap compiler threads nodes
 and returns residue by pointer exactly as the full design prescribes. It simply
-exercises `page` and one `arena` where `cf` exercises the whole catalog. (One
-deviation from this section's original sketch: node-free pruning is not yet
-implemented — the node is over-threaded onto every function, a pending
-optimization.) The duplex substrate and classification-at-birth of §5 are
+exercises `page` and one `arena` where `cf` exercises the whole catalog. The
+node-free pruning of §4 is live (roughly a fifth of the self-hosted compiler's
+own functions emit bare signatures). The duplex substrate and classification-at-birth of §5 are
 **live** in the self-hosted compiler: the classification is `routing.cf` (shadow
 sets + per-function summaries, cross-checked against the `!`-oracle on every
 compile), the birth routing and scope brackets are `emit.cf`, and the corpus
