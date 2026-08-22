@@ -45,6 +45,29 @@ _cf_arena_init:
 	mov x1, #0x100000000
 	add x11, x12, x1
 	str x11, [x9, #16]
+	mov x0, #0
+	mov x1, #0x40000000
+	mov x2, #0
+	mov x3, #0x1002
+	mov x4, #-1
+	mov x5, #0
+	mov x16, #197
+	svc #0x80
+	b.cs _cf_mmap_fail
+	mov x12, x0
+	mov x0, x12
+	mov x1, #0x1000000
+	mov x2, #3
+	mov x16, #74
+	svc #0x80
+	b.cs _cf_mmap_fail
+	str x12, [x9, #48]
+	mov x1, #0x1000000
+	add x13, x12, x1
+	str x13, [x9, #56]
+	mov x1, #0x40000000
+	add x11, x12, x1
+	str x11, [x9, #64]
 	ret
 _cf_grow:
 	add x9, x0, #8

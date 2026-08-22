@@ -3852,29 +3852,68 @@ const emit_arena_qbe! = (Uarch fd, Bool is_bare, Iarch root_size): Iarch -> {
 	# the block still needs a non-zero size for a valid `data` symbol, so clamp the reservation to 16.
 	const Iarch dsz = if root_size < 16 then 16 else root_size
 	if is_bare then write_str(fd, "export data $cf_root = { z ${dsz} }\n")
-	# A MemoryNode is a pointer to `{ top@0, committed@8, limit@16, parent@24, kind@32, chunk@40 }`
-	# (geometry_lowering §4). `$cf_page` is the root page node; carved arenas get their own headers.
-	# cf_alloc is NODE-RELATIVE — it bumps whichever node it is handed (`%node`, threaded as arg 0).
-	# On a limit overflow the behaviour is the node's: `kind` 0 traps (the page — reservation done —
-	# and a FIXED arena, whose committed==limit), `kind` 1 PULLS a fresh `chunk`-sized block from the
-	# parent (an ELASTIC arena). Below the limit, crossing `committed` commits more pages (cf_grow,
-	# the page only; every arena has committed==limit at rest). One allocator serves all three.
-	write_str(fd, "export data $cf_page = { l 0, l 0, l 0, l 0, l 0, l 0 }\n")
+	# A MemoryNode is now DUPLEX (geometry_lowering §5, the duplex arc): a 96-byte pair of
+	# subnodes, each `{ top@0, committed@8, limit@16, parent@24, kind@32, chunk@40 }`. The
+	# SURVIVOR subnode sits at offset 0 — the bare handle KEEPS its old meaning, so every
+	# allocation path that predates the split lands survivor-side (fail-safe polarity: a site
+	# emit forgets to reroute leaks until node death, never dangles). The RESIDUE subnode sits
+	# at +48 and bumps DOWN from the block's tail; frame/loop brackets reset it. In a SHARED
+	# two-ended block the boundary is the other side's cursor: a residue allocation MAINTAINS
+	# the survivor's `limit` (= the new residue top), so the survivor's hot path stays the
+	# plain load-and-compare. `kind`: 0 = up, fixed bound (the page lanes; committed<limit
+	# grows via cf_grow), 1 = up, elastic (pull a chunk from the parent), 2 = down, fixed
+	# (two-ended meet traps), 3 = down, elastic (meet pulls an OWN chunk from the parent and
+	# the subnode continues as kind 1 — a private chunk needs no direction). cf_alloc is
+	# NODE-RELATIVE — it bumps whichever subnode it is handed. `$cf_page` is the root's duplex
+	# node (survivor lane + residue lane, two darwin reservations); carved arenas get 96-byte
+	# headers whose subnodes share one two-ended block.
+	write_str(fd, "export data $cf_page = { l 0, l 0, l 0, l 0, l 0, l 0, l 0, l 0, l 0, l 0, l 0, l 0 }\n")
 	write_str(fd, "function l $cf_alloc(l %node, w %n) {\n")
 	write_str(fd, "@start\n")
 	write_str(fd, "\t%r7 =w add %n, 7\n")
 	write_str(fd, "\t%ra =w and %r7, -8\n")
 	write_str(fd, "\t%sz =l extuw %ra\n")
+	write_str(fd, "\t%kp =l add %node, 32\n")
+	write_str(fd, "\t%kind =l loadl %kp\n")
+	write_str(fd, "\t%isdown =w cugel %kind, 2\n")
+	write_str(fd, "\tjnz %isdown, @down, @up\n")
+	write_str(fd, "@up\n")
 	write_str(fd, "\t%p =l loadl %node\n")
 	write_str(fd, "\t%nt =l add %p, %sz\n")
 	write_str(fd, "\t%limp =l add %node, 16\n")
 	write_str(fd, "\t%lim =l loadl %limp\n")
 	write_str(fd, "\t%ok =w culel %nt, %lim\n")
 	write_str(fd, "\tjnz %ok, @inbounds, @over\n")
+	# a DOWN subnode (a residue side): bump from the tail toward the shared boundary — the
+	# sibling SURVIVOR's cursor at node-48 — and maintain the sibling's limit so its own hot
+	# path never learns about the split. sz is 8-rounded and the tail 8-aligned, so the down
+	# cursor stays aligned. On a meet: kind 2 traps, kind 3 pulls an OWN chunk from the parent
+	# and continues as a plain elastic up-node (kind 1) — the shared-block gap pops back only
+	# via a bracket reset restoring the saved triple.
+	write_str(fd, "@down\n")
+	write_str(fd, "\t%dt =l loadl %node\n")
+	write_str(fd, "\t%dn =l sub %dt, %sz\n")
+	write_str(fd, "\t%sib =l sub %node, 48\n")
+	write_str(fd, "\t%stop =l loadl %sib\n")
+	write_str(fd, "\t%dok =w cugel %dn, %stop\n")
+	write_str(fd, "\tjnz %dok, @downok, @downover\n")
+	write_str(fd, "@downok\n")
+	write_str(fd, "\tstorel %dn, %node\n")
+	write_str(fd, "\t%slimp =l add %sib, 16\n")
+	write_str(fd, "\tstorel %dn, %slimp\n")
+	write_str(fd, "\tret %dn\n")
+	write_str(fd, "@downover\n")
+	write_str(fd, "\t%delastic =w ceql %kind, 3\n")
+	write_str(fd, "\tjnz %delastic, @downpull, @oom\n")
+	write_str(fd, "@downpull\n")
+	write_str(fd, "\tcall $cf_arena_pull(l %node, l %sz)\n")
+	write_str(fd, "\tstorel 1, %kp\n")
+	write_str(fd, "\t%dp2 =l loadl %node\n")
+	write_str(fd, "\t%dnt2 =l add %dp2, %sz\n")
+	write_str(fd, "\tstorel %dnt2, %node\n")
+	write_str(fd, "\tret %dp2\n")
 	# overflow: an elastic arena (kind 1) pulls a fresh block and allocates from it; else trap
 	write_str(fd, "@over\n")
-	write_str(fd, "\t%kp =l add %node, 32\n")
-	write_str(fd, "\t%kind =l loadl %kp\n")
 	write_str(fd, "\t%elastic =w cnel %kind, 0\n")
 	write_str(fd, "\tjnz %elastic, @pull, @oom\n")
 	write_str(fd, "@pull\n")
@@ -3885,7 +3924,7 @@ const emit_arena_qbe! = (Uarch fd, Bool is_bare, Iarch root_size): Iarch -> {
 	write_str(fd, "\tret %p2\n")
 	write_str(fd, "@oom\n")
 	write_str(fd, "\tcall $cf_oom()\n")
-	write_str(fd, "\tret %p\n")
+	write_str(fd, "\tret 0\n")
 	write_str(fd, "@inbounds\n")
 	write_str(fd, "\t%commp =l add %node, 8\n")
 	write_str(fd, "\t%comm =l loadl %commp\n")
@@ -3998,16 +4037,19 @@ const emit_arena_qbe! = (Uarch fd, Bool is_bare, Iarch root_size): Iarch -> {
 	write_str(fd, "\tstorel %end, %elimp\n")
 	write_str(fd, "\tret\n")
 	write_str(fd, "}\n")
-	# `mem.arena.of(n)` — carve a FIXED arena from the parent: pull a 48-byte node header and an
-	# n-byte block from `%node`, then init { top=blk, committed=blk+n, limit=blk+n, parent=node,
-	# kind=0, chunk=0 }. committed==limit and kind 0, so cf_alloc traps at the bound. The block leaks
-	# into the parent at teardown (no reset yet, geometry_lowering §5). Returns the header.
+	# `mem.arena.of(n)` — carve a FIXED arena from the parent: pull a 96-byte DUPLEX header and
+	# an n-byte block from `%node` (the parent's SURVIVOR — headers must outlive frames, so the
+	# carve itself is the MUST-PIN), then lay the two subnodes over the ONE two-ended block:
+	# survivor { top=blk, committed=end, limit=end, parent=node, kind=0 } bumping up, residue
+	# { top=end, committed=end, limit=0, parent=node, kind=2 } bumping down. The cursors meet
+	# at cf_oom, so `of(n)` still means n bytes TOTAL. The block leaks into the parent at
+	# teardown (geometry_lowering §5). Returns the header (= the survivor subnode).
 	write_str(fd, "function l $cf_arena_of(l %node, w %n) {\n")
 	write_str(fd, "@start\n")
 	write_str(fd, "\t%r7 =w add %n, 7\n")
 	write_str(fd, "\t%ra =w and %r7, -8\n")
 	write_str(fd, "\t%sz =l extuw %ra\n")
-	write_str(fd, "\t%hdr =l call $cf_alloc(l %node, w 48)\n")
+	write_str(fd, "\t%hdr =l call $cf_alloc(l %node, w 96)\n")
 	write_str(fd, "\t%blk =l call $cf_alloc(l %node, w %n)\n")
 	write_str(fd, "\tstorel %blk, %hdr\n")
 	write_str(fd, "\t%end =l add %blk, %sz\n")
@@ -4021,17 +4063,30 @@ const emit_arena_qbe! = (Uarch fd, Bool is_bare, Iarch root_size): Iarch -> {
 	write_str(fd, "\tstorel 0, %c32\n")
 	write_str(fd, "\t%c40 =l add %hdr, 40\n")
 	write_str(fd, "\tstorel 0, %c40\n")
+	write_str(fd, "\t%c48 =l add %hdr, 48\n")
+	write_str(fd, "\tstorel %end, %c48\n")
+	write_str(fd, "\t%c56 =l add %hdr, 56\n")
+	write_str(fd, "\tstorel %end, %c56\n")
+	write_str(fd, "\t%c64 =l add %hdr, 64\n")
+	write_str(fd, "\tstorel 0, %c64\n")
+	write_str(fd, "\t%c72 =l add %hdr, 72\n")
+	write_str(fd, "\tstorel %node, %c72\n")
+	write_str(fd, "\t%c80 =l add %hdr, 80\n")
+	write_str(fd, "\tstorel 2, %c80\n")
+	write_str(fd, "\t%c88 =l add %hdr, 88\n")
+	write_str(fd, "\tstorel 0, %c88\n")
 	write_str(fd, "\tret %hdr\n")
 	write_str(fd, "}\n")
-	# `mem.arena.grow(n)` — carve an ELASTIC arena from the parent: like the fixed arena but kind=1
-	# and chunk=n, so a limit overflow pulls another n-sized block from the parent (cf_arena_pull)
-	# instead of trapping. Grows until the parent (ultimately the 4 GiB page) is exhausted.
+	# `mem.arena.grow(n)` — carve an ELASTIC arena: like the fixed arena but the survivor is
+	# kind=1 / chunk=n (a limit overflow pulls another n-sized block from the parent) and the
+	# residue side kind=3 / chunk=n (a two-ended meet pulls its OWN chunk, then runs as kind 1).
+	# The initial block is shared two-ended; after a side pulls, the lanes are private chains.
 	write_str(fd, "function l $cf_arena_grow(l %node, w %n) {\n")
 	write_str(fd, "@start\n")
 	write_str(fd, "\t%r7 =w add %n, 7\n")
 	write_str(fd, "\t%ra =w and %r7, -8\n")
 	write_str(fd, "\t%sz =l extuw %ra\n")
-	write_str(fd, "\t%hdr =l call $cf_alloc(l %node, w 48)\n")
+	write_str(fd, "\t%hdr =l call $cf_alloc(l %node, w 96)\n")
 	write_str(fd, "\t%blk =l call $cf_alloc(l %node, w %n)\n")
 	write_str(fd, "\tstorel %blk, %hdr\n")
 	write_str(fd, "\t%end =l add %blk, %sz\n")
@@ -4045,18 +4100,31 @@ const emit_arena_qbe! = (Uarch fd, Bool is_bare, Iarch root_size): Iarch -> {
 	write_str(fd, "\tstorel 1, %g32\n")
 	write_str(fd, "\t%g40 =l add %hdr, 40\n")
 	write_str(fd, "\tstorel %sz, %g40\n")
+	write_str(fd, "\t%g48 =l add %hdr, 48\n")
+	write_str(fd, "\tstorel %end, %g48\n")
+	write_str(fd, "\t%g56 =l add %hdr, 56\n")
+	write_str(fd, "\tstorel %end, %g56\n")
+	write_str(fd, "\t%g64 =l add %hdr, 64\n")
+	write_str(fd, "\tstorel 0, %g64\n")
+	write_str(fd, "\t%g72 =l add %hdr, 72\n")
+	write_str(fd, "\tstorel %node, %g72\n")
+	write_str(fd, "\t%g80 =l add %hdr, 80\n")
+	write_str(fd, "\tstorel 3, %g80\n")
+	write_str(fd, "\t%g88 =l add %hdr, 88\n")
+	write_str(fd, "\tstorel %sz, %g88\n")
 	write_str(fd, "\tret %hdr\n")
 	write_str(fd, "}\n")
 	# `mem.fixed_buffer.of(buf)` — wrap a caller `[Uint8]` buffer. `%buf` is its `{data,len,cap}` header;
-	# read data/len and lay a 48-byte fixed node over the FRONT of the buffer's own bytes — carves
-	# nothing from the parent (§5). committed==limit and kind=0 ⇒ a fixed bound (traps at data+len).
-	# The buffer carries its length now, so no size is passed (no compile-time hack).
+	# read data/len and lay a 96-byte DUPLEX node over the FRONT of the buffer's own bytes — carves
+	# nothing from the parent (§5): the remainder is ONE two-ended block (survivor up from data+96,
+	# residue down from data+len, meet traps). Saves the static-backed escape (test 1334): survivors
+	# live in the buffer itself. The buffer carries its length, so no size is passed.
 	write_str(fd, "function l $cf_buffer_of(l %node, l %buf) {\n")
 	write_str(fd, "@start\n")
 	write_str(fd, "\t%data =l loadl %buf\n")
 	write_str(fd, "\t%lenp =l add %buf, 8\n")
 	write_str(fd, "\t%len =l loadl %lenp\n")
-	write_str(fd, "\t%blk =l add %data, 48\n")
+	write_str(fd, "\t%blk =l add %data, 96\n")
 	write_str(fd, "\t%end =l add %data, %len\n")
 	write_str(fd, "\tstorel %blk, %data\n")
 	write_str(fd, "\t%b8 =l add %data, 8\n")
@@ -4069,6 +4137,18 @@ const emit_arena_qbe! = (Uarch fd, Bool is_bare, Iarch root_size): Iarch -> {
 	write_str(fd, "\tstorel 0, %b32\n")
 	write_str(fd, "\t%b40 =l add %data, 40\n")
 	write_str(fd, "\tstorel 0, %b40\n")
+	write_str(fd, "\t%b48 =l add %data, 48\n")
+	write_str(fd, "\tstorel %end, %b48\n")
+	write_str(fd, "\t%b56 =l add %data, 56\n")
+	write_str(fd, "\tstorel %end, %b56\n")
+	write_str(fd, "\t%b64 =l add %data, 64\n")
+	write_str(fd, "\tstorel 0, %b64\n")
+	write_str(fd, "\t%b72 =l add %data, 72\n")
+	write_str(fd, "\tstorel %node, %b72\n")
+	write_str(fd, "\t%b80 =l add %data, 80\n")
+	write_str(fd, "\tstorel 2, %b80\n")
+	write_str(fd, "\t%b88 =l add %data, 88\n")
+	write_str(fd, "\tstorel 0, %b88\n")
 	write_str(fd, "\tret %data\n")
 	write_str(fd, "}\n")
 	# `[T]` grow-in-place append: given the 24-byte header {data@0, len@8, cap@16} and
@@ -4518,6 +4598,13 @@ const emit_arena_floor! = (Uarch fd, Bool is_bare, Iarch root_size): Iarch -> {
 		write_str(fd, "\tadd x13, x12, x1\n")
 		write_str(fd, "\tstr x13, [x9, #8]\n")
 		write_str(fd, "\tstr x13, [x9, #16]\n")
+		# the residue lane (duplex, cf_page+48): the SAME BSS block, two-ended — bump DOWN from
+		# base+root_size (kind 2; a meet with the survivor cursor traps). root_size still means
+		# N bytes total; zero-root leaves both lanes empty.
+		write_str(fd, "\tstr x13, [x9, #48]\n")
+		write_str(fd, "\tstr x13, [x9, #56]\n")
+		write_str(fd, "\tmov x14, #2\n")
+		write_str(fd, "\tstr x14, [x9, #80]\n")
 		write_str(fd, "\tret\n")
 		write_str(fd, "cf_grow:\n")
 		write_str(fd, "\tret\n")
@@ -4559,6 +4646,32 @@ const emit_arena_floor! = (Uarch fd, Bool is_bare, Iarch root_size): Iarch -> {
 	write_str(fd, "\tmov x1, #0x100000000\n")
 	write_str(fd, "\tadd x11, x12, x1\n")
 	write_str(fd, "\tstr x11, [x9, #16]\n")
+	# the root RESIDUE lane (duplex, cf_page+48): its own small reservation — 1 GiB PROT_NONE,
+	# 16 MiB committed — an up-bumping kind-0 lane with its own cf_grow watermark (the root
+	# check keeps user residue off the page, so the lane serves only colorless-frame scraps).
+	write_str(fd, "\tmov x0, #0\n")
+	write_str(fd, "\tmov x1, #0x40000000\n")
+	write_str(fd, "\tmov x2, #0\n")
+	write_str(fd, "\tmov x3, #0x1002\n")
+	write_str(fd, "\tmov x4, #-1\n")
+	write_str(fd, "\tmov x5, #0\n")
+	write_str(fd, "\tmov x16, #197\n")
+	write_str(fd, "\tsvc #0x80\n")
+	write_str(fd, "\tb.cs _cf_mmap_fail\n")
+	write_str(fd, "\tmov x12, x0\n")
+	write_str(fd, "\tmov x0, x12\n")
+	write_str(fd, "\tmov x1, #0x1000000\n")
+	write_str(fd, "\tmov x2, #3\n")
+	write_str(fd, "\tmov x16, #74\n")
+	write_str(fd, "\tsvc #0x80\n")
+	write_str(fd, "\tb.cs _cf_mmap_fail\n")
+	write_str(fd, "\tstr x12, [x9, #48]\n")
+	write_str(fd, "\tmov x1, #0x1000000\n")
+	write_str(fd, "\tadd x13, x12, x1\n")
+	write_str(fd, "\tstr x13, [x9, #56]\n")
+	write_str(fd, "\tmov x1, #0x40000000\n")
+	write_str(fd, "\tadd x11, x12, x1\n")
+	write_str(fd, "\tstr x11, [x9, #64]\n")
 	write_str(fd, "\tret\n")
 	# cf_grow(x0 = node, x1 = target): commit up to round_up(target, 256 MiB) via mprotect from the
 	# node's committed watermark; the reservation bound was already checked by the caller.
