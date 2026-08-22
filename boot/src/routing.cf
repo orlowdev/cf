@@ -240,7 +240,10 @@ const intrinsic_sum = (Str n): FnSum -> {
 # The asm floor whitelist: `syscall6` hands pointers to the KERNEL for the duration of the
 # call only (read fills, write copies, open reads the path — nothing is retained after
 # return), and `exit` never returns. Every other asm body is opaque ⇒ ⊤.
-const asm_opaque = (Func f): Bool -> !str_eq(f.name, "syscall6") && !str_eq(f.name, "exit")
+const asm_sum = (Func f): FnSum -> {
+	if str_eq(f.name, "syscall6") || str_eq(f.name, "exit") then return none_sum(Iarch(f.params.len))
+	return top_sum()
+}
 
 const lookup_sum = (Sums sm, Str n): FnSum -> {
 	let Iarch i = 0
@@ -960,39 +963,11 @@ const find_fn = ([Func] funcs, Str name): Iarch -> {
 	return -1
 }
 
-# The driver's mutable state is INTEGER-encoded (an in-place element write takes an integer
-# element): a function's summary is two Iarch bitmasks — bit i set ⇒ parameter i escapes that
-# way — with -1 (all bits) as ⊤. An arity past the word forces ⊤, so a wide function degrades
-# to escape, never a miss. -1 arithmetic-shifts to all-ones, so ⊤ decodes to all-true rows.
-const esc_mask = ([Str] set, [Str] params): Iarch -> {
-	if Iarch(params.len) > 62 then return -1
-	let Iarch m = 0
-	let Iarch i = 0
-	loop {
-		if i >= Iarch(params.len) then break
-		if has_name(set, params[i]) then m = m | (1 << i)
-		i = i + 1
-	}
-	return m
-}
-
-const decode_sum = (Iarch nparams, Iarch rm, Iarch sm): FnSum -> {
-	let [Bool] ra = []
-	let [Bool] sto = []
-	let Iarch i = 0
-	loop {
-		if i >= nparams then break
-		ra = [...ra, ((rm >> i) & 1) == 1]
-		sto = [...sto, ((sm >> i) & 1) == 1]
-		i = i + 1
-	}
-	return FnSum({ all_esc: false, ret_al: ra, stores: sto })
-}
-
 # Resolve one body's distinct callee names into the small table the walkers consult. An
 # in-progress callee (state 1 — a recursion/SCC back-edge) resolves to ⊤ exactly like an
-# unknown one: the memo's "SCC ⇒ all-args-escape", applied at the call site.
-const local_sums = (Program prog, [Iarch] st, [Iarch] sret, [Iarch] ssto, [Str] cns): Sums -> {
+# unknown one: the memo's "SCC ⇒ all-args-escape", applied at the call site. The state
+# tables ride in as `*[T]` references (read here, written by the DFS).
+const local_sums = (Program prog, *[FnSum] sums, *[Iarch] st, [Str] cns): Sums -> {
 	let [Str] ln = []
 	let [FnSum] lt = []
 	let Iarch i = 0
@@ -1002,7 +977,7 @@ const local_sums = (Program prog, [Iarch] st, [Iarch] sret, [Iarch] ssto, [Str] 
 			const Iarch j = find_fn(prog.funcs, cns[i])
 			let FnSum s = top_sum()
 			if j >= 0 then {
-				if st[j] == 2 then s = decode_sum(Iarch(prog.funcs[j].params.len), sret[j], ssto[j])
+				if st[j] == 2 then s = sums[j]
 			} else if is_routing_intrinsic(cns[i]) then {
 				s = intrinsic_sum(cns[i])
 			}
@@ -1012,6 +987,59 @@ const local_sums = (Program prog, [Iarch] st, [Iarch] sret, [Iarch] ssto, [Str] 
 		i = i + 1
 	}
 	return Sums({ names: ln, tbl: lt })
+}
+
+const mk_summary = ([Str] params, RSets rs): FnSum -> {
+	let [Bool] ra = []
+	let [Bool] sto = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(params.len) then break
+		ra = [...ra, has_name(rs.rset, params[i])]
+		sto = [...sto, has_name(rs.sset, params[i])]
+		i = i + 1
+	}
+	return FnSum({ all_esc: false, ret_al: ra, stores: sto })
+}
+
+const empty_rsets = (): RSets -> {
+	let [Str] r = []
+	let [Str] s = []
+	let [Str] f = []
+	return RSets({ rset: r, sset: s, fwd: f })
+}
+
+# Post-order DFS over the call graph: summarize every reachable callee first, then analyze
+# this body against the resolved table and record its summary + shadow sets. `st` is the
+# visit state (0 unvisited, 1 in progress, 2 done); the tables are the caller's preallocated
+# arrays, written in place through the `*[T]` references (they are never grown after the
+# handoff, so the decayed data pointers stay valid). A callee still on the DFS stack at
+# analysis time reads as ⊤ (local_sums), the memo's "SCC ⇒ all-args-escape".
+const summarize! = (Program prog, *[FnSum] sums, *[Iarch] st, *[RSets] rsets, Iarch k): Iarch -> {
+	if st[k] != 0 then return 0
+	st[k] = 1
+	if prog.funcs[k].is_asm || prog.funcs[k].is_value then {
+		if prog.funcs[k].is_asm then sums[k] = asm_sum(prog.funcs[k]) else sums[k] = none_sum(0)
+		st[k] = 2
+		return 0
+	}
+	const [Str] cns = calls_body!(prog.funcs[k].body)
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(cns.len) then break
+		const Iarch j = find_fn(prog.funcs, cns[i])
+		if j >= 0 then {
+			if st[j] == 0 then summarize!(prog, sums, st, rsets, j)
+		}
+		i = i + 1
+	}
+	const Sums sm = local_sums(prog, sums, st, cns)
+	const [Str] params = plist_names(prog.funcs[k].params)
+	const RSets rs = shadow_sets!(sm, params, prog.funcs[k].body)
+	sums[k] = mk_summary(params, rs)
+	rsets[k] = rs
+	st[k] = 2
+	return 0
 }
 
 # ── entry points ─────────────────────────────────────────────────────────────────────────────
@@ -1028,92 +1056,39 @@ pub const routing_check! = (Program prog): Iarch -> routing_run!(prog, false)
 # summary bits (`ret:` return-may-alias, `sto:` stored-beyond-frame, per parameter).
 pub const routing_dump! = (Program prog): Iarch -> routing_run!(prog, true)
 
-# The shared driver: summaries bottom-up, then the per-function check or dump. The DFS is an
-# ITERATIVE post-order with an explicit stack — the state tables are written in place, so
-# they must be `let` locals holding integer elements (an array parameter is borrowed and an
-# element write takes an integer, so neither a recursive helper nor a record table works).
-# A node surfaces twice: first (state 0) it turns in-progress and pushes its unvisited
-# callees; second (state 1) its callees are done, so it is analyzed against the resolved
-# table and its summary masks recorded. A callee still in progress at analysis time is a
-# recursion/SCC back-edge and reads as ⊤ (local_sums), the memo's "SCC ⇒ all-args-escape".
-# A duplicate stack entry surfaces at state 2 and just pops. The check/dump loop then reruns
-# the per-function analysis against the FINISHED tables — the sets the duplex router will
-# eventually trust are the ones cross-checked and printed.
+# The shared driver: summaries bottom-up (the recursive DFS above, writing the preallocated
+# state tables through `*[T]` references), then the per-function check or dump over the
+# RECORDED sets. An SCC member's sets were computed with its siblings at ⊤ — deliberately
+# conservative (the memo's SCC rule), leak-only. The tables are preallocated to their full
+# length before any reference is handed out and never grown after.
 const routing_run! = (Program prog, Bool dump): Iarch -> {
 	const Iarch n = Iarch(prog.funcs.len)
+	let [FnSum] sums = []
 	let [Iarch] st = []
-	let [Iarch] sret = []
-	let [Iarch] ssto = []
+	let [RSets] rsets = []
 	let Iarch p = 0
 	loop {
 		if p >= n then break
+		sums = [...sums, top_sum()]
 		st = [...st, 0]
-		sret = [...sret, -1]
-		ssto = [...ssto, -1]
+		rsets = [...rsets, empty_rsets()]
 		p = p + 1
 	}
-	let [Iarch] stack = []
-	let Iarch sp = 0
-	let Iarch rootk = 0
+	let Iarch d = 0
 	loop {
-		if rootk >= n then break
-		if st[rootk] == 0 then {
-			if sp < Iarch(stack.len) then stack[sp] = rootk else stack = [...stack, rootk]
-			sp = sp + 1
-			loop {
-				if sp == 0 then break
-				const Iarch cur = stack[sp - 1]
-				if st[cur] == 0 then {
-					st[cur] = 1
-					if prog.funcs[cur].is_asm || prog.funcs[cur].is_value then {
-						# an opaque asm body keeps the ⊤ masks it was initialized with
-						if !prog.funcs[cur].is_asm || !asm_opaque(prog.funcs[cur]) then {
-							sret[cur] = 0
-							ssto[cur] = 0
-						}
-						st[cur] = 2
-						sp = sp - 1
-					} else {
-						const [Str] cns = calls_body!(prog.funcs[cur].body)
-						let Iarch ci = 0
-						loop {
-							if ci >= Iarch(cns.len) then break
-							const Iarch cj = find_fn(prog.funcs, cns[ci])
-							if cj >= 0 then {
-								if st[cj] == 0 then {
-									if sp < Iarch(stack.len) then stack[sp] = cj else stack = [...stack, cj]
-									sp = sp + 1
-								}
-							}
-							ci = ci + 1
-						}
-					}
-				} else if st[cur] == 1 then {
-					const [Str] cns = calls_body!(prog.funcs[cur].body)
-					const Sums sm = local_sums(prog, st, sret, ssto, cns)
-					const [Str] params = plist_names(prog.funcs[cur].params)
-					const RSets rs = shadow_sets!(sm, params, prog.funcs[cur].body)
-					sret[cur] = esc_mask(rs.rset, params)
-					ssto[cur] = esc_mask(rs.sset, params)
-					st[cur] = 2
-					sp = sp - 1
-				} else {
-					sp = sp - 1
-				}
-			}
-		}
-		rootk = rootk + 1
+		if d >= n then break
+		summarize!(prog, sums, st, rsets, d)
+		d = d + 1
 	}
 	let Iarch i = 0
 	loop {
 		if i >= n then break
 		if !prog.funcs[i].is_asm && !prog.funcs[i].is_value then {
-			const [Str] cns = calls_body!(prog.funcs[i].body)
-			const Sums sm = local_sums(prog, st, sret, ssto, cns)
-			const [Str] params = plist_names(prog.funcs[i].params)
-			const RSets rs = shadow_sets!(sm, params, prog.funcs[i].body)
+			const RSets rs = rsets[i]
 			const [Str] esc = union_names(rs.rset, rs.sset)
+			const [Str] params = plist_names(prog.funcs[i].params)
 			if dump then {
+				const FnSum fsum = sums[i]
 				eprint("routing ${prog.funcs[i].name}:")
 				let Iarch j = 0
 				loop {
@@ -1130,8 +1105,8 @@ const routing_run! = (Program prog, Bool dump): Iarch -> {
 				let Iarch m = 0
 				loop {
 					if m >= Iarch(params.len) then break
-					if ((sret[i] >> m) & 1) == 1 then eprint(" ret:${params[m]}")
-					if ((ssto[i] >> m) & 1) == 1 then eprint(" sto:${params[m]}")
+					if bit_at(fsum.ret_al, m) then eprint(" ret:${params[m]}")
+					if bit_at(fsum.stores, m) then eprint(" sto:${params[m]}")
 					m = m + 1
 				}
 				eprint("\n")
