@@ -48,7 +48,11 @@ its parent's bound, and an unbounded child (say, a GC heap) requires an
 unbounded ancestor chain up to the root. Violations — an unbounded child
 grafted into a bounded parent, or children whose total cap exceeds the
 parent's — are compile errors. This is checkable precisely because geometries
-are comptime entities and can never be assigned at runtime.
+are comptime entities and can never be assigned at runtime. A node's bound
+covers **both of its sub-regions** (the residue/survivor split of
+[geometry_lowering.md](./geometry_lowering.md) §5): the split is an interior
+layout, never a capacity boundary — `of(n)` means `n` bytes total, however the
+two sides share them.
 
 ## 3. Geometries
 
@@ -345,9 +349,19 @@ escaping an **explicitly-carved sub-node** (`const a = mem.arena.of(n); … retu
 x` with `x` in `a`). `a`'s binding dies while `x` must survive; because `a` is
 physically carved from its parent, its **walls dissolve** and `x`'s storage is
 **re-attributed to the parent, in place** — same address, returned pointer stays
-valid. A bump cannot per-object free, so whatever dead residue shared `a`'s block
-rides with it to the **enclosing frame**, where that frame's own rewind reclaims
-it — bounded by that frame, never deferred to program exit.
+valid.
+
+The carve's *reclamation* is scope-graded rather than unconditional: a child
+node is carved from its parent's **survivor** side (a parent-frame bracket must
+never reset a child's storage — the pin of
+[geometry_lowering.md](./geometry_lowering.md) §5), so a dropped child node is
+reclaimed by the enclosing **survivor-scope mark** where one qualifies — a frame
+or loop from which nothing escapes frees the whole carve at its exit, bounded by
+that scope. Where no scope qualifies, the carve stays until the *parent node's*
+teardown: **node-bounded, not frame-bounded**. Tightening the unqualified case —
+carving a child that provably dies in-frame from the residue side instead — is
+the named next arc, with the dropped-return loop and the per-call child arena
+(corpus tests 1353 and 1307) pinned as its regression pair.
 
 For teardown to be sound the compiler promotes the **entire reachable closure**
 of the return value, not just its top: anything the return points at is promoted
@@ -358,11 +372,12 @@ Reclaiming the _dead_ residue is the geometry's own concern, orthogonal to the
 copy-free return:
 
 - **Arena** — the frame's `on_scope_exit` rewind frees its dead residue **in
-  place, at the frame**. The return closure is cloaked out of the drop-set by
-  `on_ret` and lives on the caller's node, so the rewind spares it — no copy, and
-  **nothing dead is carried up to the caller**. (A value escaping an
-  explicitly-carved sub-node rides that node's block to the *enclosing* frame,
-  reclaimed at its rewind — the one bounded exception above.)
+  place, at the frame**. The return closure was born on the node's survivor side
+  (`on_ret` is placement at birth — geometry_lowering §3), so the rewind cannot
+  reach it by construction — no copy, no cloaking bookkeeping, and **nothing dead
+  is carried up to the caller**. (A dropped explicitly-carved sub-node is
+  reclaimed by an enclosing survivor-scope mark where one qualifies — the
+  scope-graded case above.)
 - **RC / GC** — the return is still not copied, but dead residue runs its hooks; a
   compacting collector may relocate by its own policy.
 

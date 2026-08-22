@@ -7,11 +7,25 @@ It fills in the frame [[order_of_compilation.md]] leaves open (that arc "only
 places the calls") and lands the semantics [[memory_model.md]] describes (the
 manifold, the `!` algebra, zero-cost return) into actual code.
 
-Status: design settled. The hook set, its placement, the return protocol, and
-the calling convention below are ratified and **pinned** — read this before
-touching the Memory arc rather than re-deriving it. Concrete geometry bodies
-(§5) are reference implementations; the collection *algorithms* inside `rc`/`gc`
-are their own subject.
+Status: design settled and **implemented** — the duplex-node arc landed this
+whole contract in cf's own emit (the classification lives in `routing.cf`, the
+routing and brackets in `emit.cf`, the floor in the emitted QBE/asm). The hook
+set, its placement, the return protocol, and the calling convention below are
+ratified and **pinned** — read this before touching the Memory arc rather than
+re-deriving it. Concrete geometry bodies (§5) are reference implementations; the
+collection *algorithms* inside `rc`/`gc` are their own subject.
+
+The load-bearing implementation idea is **classification at birth**: a
+whole-program escape analysis classifies every allocation site — a value that
+escapes its frame (returned, yielded, or rehomed into caller-visible memory) is
+born a **survivor**; provably-trapped scratch is born **residue**. The bump
+family realizes the split as a **duplex node** (§5): two subnodes in one
+96-byte header, survivors on the handle side, residue on a bracketed side that
+frames and loops reset. The polarity is fail-safe — an unknown or unprovable
+site defaults to survivor, so a classification miss leaks until node death and
+can never dangle. The classification is geometry-agnostic (it is the memory
+model's own residue/survivor separation); the duplex layout is merely the bump
+family's way of consuming it.
 
 This spec spans two altitudes. §1–§3 (the hook contract, placement, and the
 return protocol) are the **`.cf`-level** layer: what the Memory arc emits, still
@@ -64,8 +78,8 @@ calls to precisely these. The value hooks are generic over the aggregate type
 | `on_scope_exit`  | `(MemoryNode, Mark)`                   | close a scope; bulk reclaim           |
 | `on_alloc`       | `['T] (MemoryNode, 'T) -> 'T`          | place local residue (dies in frame)   |
 | `on_realloc`     | `['T] (MemoryNode, 'T) -> 'T`          | grow an aggregate in place            |
-| `on_ret`         | `['T] (MemoryNode, 'T) -> 'T`          | mark residue as escaping (in-flight)  |
-| `on_alloc_ret`   | `['T] (MemoryNode, 'T) -> 'T`          | claim an in-flight return into node   |
+| `on_ret`         | `['T] (MemoryNode, 'T) -> 'T`          | place an escaping value, at birth     |
+| `on_alloc_ret`   | `['T] (MemoryNode, 'T) -> 'T`          | claim a returned value into the node  |
 | `on_free`        | `['T] (MemoryNode, 'T)`                | reclaim one dead object               |
 | `on_rehome`      | `['T, 'U] (MemoryNode, 'U, 'T) -> 'T`  | relocate residue into a target's node |
 | `on_store`       | `['T, 'U] (MemoryNode, *'U, 'T)`       | perform a reference-field write       |
@@ -96,8 +110,11 @@ hand-written geometries otherwise.
   `arena.on_alloc(node_0, [1, 2, 3])` is still a `[3 Iarch]`.
 - **Closure law.** `on_ret`'s argument is the **entire reachable closure** of the
   return value, not just its head — anything the return points at escapes with
-  it. This mirrors the escape analysis that computes `!` (see [[memory_model.md]],
-  Zero-cost return) and is what the drop-set is defined against.
+  it. Under classification at birth the law is **discharged statically**: a value
+  feeding an escape is itself classified escaping, so the whole closure is born
+  survivor-side and no runtime closure walk ever happens. This mirrors the escape
+  analysis that computes `!` (see [[memory_model.md]], Zero-cost return) and is
+  what the drop-set is defined against.
 - **Claim-once law.** Every value that passes through `on_ret` is claimed by
   **exactly one** `on_alloc_ret`. This is structural — a return has one
   destination — and it is the invariant the return protocol (§3) rests on.
@@ -141,12 +158,19 @@ fixed placement:
 | ------------------ | --------------------------- | ------------------------------------------- |
 | _local_            | `let/const x = <agg>`       | wrap RHS in `on_alloc(node, …)`             |
 | _grow-in-place_    | `xs = [...xs, e]`           | wrap RHS in `on_realloc(node_xs, …)`        |
-| _escapes-via-return_ | `return <agg>`            | `on_ret(node, …)` in callee; `on_alloc_ret(node, …)` wrapping the call in the caller |
-| _rehomed_          | store `<agg>` into a foreign aggregate | wrap the stored value in `on_rehome(node_target, target, …)` |
+| _escapes-via-return_ | `return <agg>`            | the CONSTRUCTION is `on_ret`-placed at birth (survivor side); `on_alloc_ret(node, …)` stays wrapping the call in the caller (the bump fold is the identity) |
+| _rehomed_          | store `<agg>` into a foreign aggregate | the stored value is classified escaping and `on_ret`-placed at birth; `on_rehome(node_target, target, …)` stays placed at the store (bump fold: no-op) |
 
 The node handle threaded into each hook follows the node-locality law: `on_alloc`
 takes the ambient `node`, but `on_realloc`/`on_rehome` take the *target's* node,
 which the decide substep already resolved to a concrete `node_<i>`.
+
+Birth routing generalizes the third and fourth rows beyond named sites: an
+**anonymous construction in argument position** is `on_alloc`-placed (residue)
+when the callee's summary proves the argument is neither stored beyond the
+callee's frame nor aliased by its return — it is statement scratch, dead once
+the call returns. A `write_str(fd, "…${x}…")` interpolation is the canonical
+shape. Everything the summaries cannot prove defaults to survivor.
 
 ### Scope brackets
 
@@ -238,9 +262,11 @@ resets, not a litter of dead `on_free`s.
 
 ## 3. The return protocol
 
-Escape is **keep-alive**. A value that must outlive the frame that built it is
-**in-flight** — owned by nobody until a destination **claims** it. C! has exactly
-two escape shapes, and they are the *same* mechanism aimed at two destinations:
+Escape is **placement**. A value that must outlive the frame that built it is
+born where its destination can keep it — classified at the site, placed at
+birth, formally **in-flight** until its one destination **claims** it. C! has
+exactly two escape shapes, and they are the *same* mechanism aimed at two
+destinations:
 
 - **Return** — claimed by the caller's binding: `on_ret` (callee) / `on_alloc_ret`
   (caller).
@@ -250,21 +276,24 @@ Both say "hand this up, and don't let my cleanup take it."
 
 ### In-flight and claim-once
 
-`on_ret(node, v)` runs in the **callee** on the **callee's** node. It marks `v`
-and its whole reachable closure (the closure law) as in-flight by **removing it
-from the frame's drop-set** — so whatever `on_scope_exit` / `on_free` reclaim,
-they never touch it.
+`on_ret(node, v)` runs in the **callee** on the **callee's** node. Its meaning is
+**spatial exclusion at birth**: `v` and its whole reachable closure (the closure
+law) are constructed on the node's **survivor side**, which no residue bracket
+ever touches — so whatever `on_scope_exit` / `on_free` reclaim, they cannot reach
+it. There is no cloaking bookkeeping and no drop-set edit at runtime; the
+exclusion was decided when the bytes were placed.
 
 `on_alloc_ret(node, v)` runs in the **caller** on the **caller's** node, wrapping
-the call, and **claims** the in-flight value into the caller.
+the call, and **claims** the returned value into the caller.
 
 The **claim-once law** holds structurally: a return has exactly one destination,
 so every in-flight value is claimed by exactly one `on_alloc_ret` — never
-double-claimed, never leaked. And because collection triggers only inside
-`on_alloc` (no safepoints — §1, Reserved for concurrency), the window between an `on_ret` and its
-`on_alloc_ret` contains **no allocation**: the in-flight value cannot be collected
-mid-flight, so it needs no pinning to stay alive across the boundary. Dropping
-`on_safepoint` bought this for free.
+double-claimed, never leaked. Under birth placement the old no-allocation claim
+**window dissolves**: the value already sits in storage that outlives the
+callee's brackets, so nothing can free or move it between the callee's exit and
+the caller's claim — the fragile "no alloc between reset and claim" discipline
+an earlier stage leaned on is gone by construction. (Collection still triggers
+only inside `on_alloc` — §1, Reserved for concurrency.)
 
 ### Compact-on-claim, and why the boundary is copy-free
 
@@ -274,10 +303,14 @@ one place that knows the value's final home, so it is where a relocating policy
 acts:
 
 - **Bump family** (`page`, `arena`, `fixed_buffer`) — **copy-free**. `on_alloc_ret`
-  either does nothing (the value already sits in a shared node that outlives the
-  call — memory_model's event 1) or, when the callee's node tears down, advances
-  the parent's bump to **adopt the returned closure in place** — walls dissolve,
-  same address, returned pointers stay valid (event 2). Neither copies.
+  folds to the **identity** (and the sweep erases it): a returned value was born
+  on the survivor side of a node that outlives the call, so there is nothing to
+  claim — same address, returned pointers stay valid. When a carved child node
+  tears down, its walls dissolve into the parent it was carved from (event 2).
+  Neither copies — the clause an intermediate stage's slide-down claim violated
+  is restored by construction. The hook nonetheless **stays placed** at every
+  claiming site: the identity is the *bump family's* fold, and a compacting `gc`
+  keeps its only compaction site here.
 - **Compacting `gc`** — **compact-on-claim**: the collector relocates the value
   into compact storage *at the claim*, rather than deferring to a later poll. A
   copy, but the collector's own policy, not a boundary tax.
@@ -287,9 +320,9 @@ it to its own claim — a bump adjust, a compaction, an RC adopt.
 
 ### Rehome is return aimed at an ancestor
 
-`on_rehome(node_target, target, v)` is the same keep-alive, claimed by `target`
-instead of a return slot — `on_ret`'s drop-set removal and rehome's are the same
-operation. The destination is a specific **comptime-known ancestor**: the pointer
+`on_rehome(node_target, target, v)` is the same escape, claimed by `target`
+instead of a return slot — a rehomed value is classified escaping and born
+survivor-side exactly as a returned one is; the two differ only in destination. The destination is a specific **comptime-known ancestor**: the pointer
 to `target` carried its node identity down the call chain, and the call site
 threads the matching handle in (memory_model, Escaping) — never a runtime walk.
 Because the relationship between the ambient node and the target node is therefore
@@ -298,7 +331,7 @@ settled at comptime, rehome resolves to one of three cases:
 | condition (all comptime-known)               | `on_rehome` becomes                                            |
 | -------------------------------------------- | ------------------------------------------------------------- |
 | `v`'s node already outlives `target`'s node  | **no-op** — `v` survives regardless; just wire the reference  |
-| same geometry lineage, `v` below `target`    | **keep-alive** — drop-set removal + compaction toward the target frame (the `on_ret` machinery, driven by the *ambient* node); wall dissolution carries it the rest of the way up. The target handle only names *how far*, and is unused at runtime |
+| same geometry lineage, `v` below `target`    | **no-op** — `v` was classified escaping (a rehomed value is an escape) and born survivor-side, so it already outlives every bracket between it and the target; just wire the reference. The target handle names *how far* only for the classification, and is unused at runtime. (A future geometry that reclaims survivors early would reactivate this row as real work.) |
 | target geometry ≠ ambient geometry           | **relocation** — the target adopts `v` (below)                |
 
 So for the whole intra-geometry world, rehome is exactly the "clean-up-protect"
@@ -348,13 +381,19 @@ argument in position 0**, ahead of the user parameters. In `.cf` it is the first
 parameter (`node_0`); at emit it is `%node_0`, a pointer-sized handle, and QBE's
 platform ABI assigns it a register like any leading argument.
 
-The handle is a **pointer to shared, mutable node state** — a bump `{top, limit}`
-for the arena family, a heap/collector descriptor otherwise. It is threaded *by
-pointer* precisely so every frame and every callee running under the same node
-observes the same state: this is what makes two `in arena` calls share one node
-(see [[memory_model.md]], The `in` clause). To the calling convention the handle
-is **opaque** — only the inlined hooks know the state's layout; the ABI just moves
-a word.
+The handle is a **pointer to shared, mutable node state** — the duplex subnode
+pair for the bump family, a heap/collector descriptor otherwise. It is threaded
+*by pointer* precisely so every frame and every callee running under the same
+node observes the same state: this is what makes two `in arena` calls share one
+node (see [[memory_model.md]], The `in` clause). To the calling convention the
+handle is **opaque** — only the inlined hooks know the state's layout; the ABI
+just moves a word. In particular the duplex split is **hook-private**: the
+handle IS the survivor subnode (offset 0 keeps its pre-duplex meaning), and the
+residue subnode's `+48` derivation appears only inside floor helpers and folded
+hook bodies (in the emitted code, a bracketing frame's single
+`%res_0 = %node_0 + 48` prologue line — a folded `on_scope_enter`). No other
+code may learn the offsets; a `gc`/`rc` node is free to have a completely
+different interior.
 
 Locally minted nodes (`node_1`, `node_2` from a nested `mem.arena.of`) are
 ordinary local handles. A call fills the callee's slot 0 with whichever node
@@ -425,35 +464,79 @@ only expose the trigger points.
 
 ### The bump family: `page`, `arena`, `fixed_buffer`
 
-One shared core: the node is a **cursor and a ceiling**, allocation is a pointer
-bump, reclamation is a cursor reset, and `Mark` is a saved cursor.
+One shared core: the node is a **duplex** — two bump subnodes in one 96-byte
+header. The **survivor** subnode is the handle itself (offset 0, the pre-duplex
+layout unchanged — fail-safe polarity: an unrouted allocation lands here and
+merely leaks). The **residue** subnode sits behind it; frames and loops bracket
+it. Allocation is a pointer bump on the classified side; reclamation is a
+bracket reset of the residue side; `Mark` is the residue subnode's saved
+**triple** `{top, committed, limit}` — a top-only mark cannot survive an elastic
+pull, which relocates all three fields.
 
 ```
-type BumpNode = { top: RawPtr, limit: RawPtr }   # how the family reads MemoryNode
+type BumpSub  = { top: RawPtr, committed: RawPtr, limit: RawPtr,
+                  parent: MemoryNode, kind: Iarch, chunk: Iarch }
+type BumpNode = { survivor: BumpSub, residue: BumpSub }   # the handle points at `survivor`
 
-const on_scope_enter = (MemoryNode node) -> node.top          # Mark = the cursor now
+const on_scope_enter = (MemoryNode node) -> triple_of(node.residue)   # Mark = the triple now
 const on_scope_exit  = (MemoryNode node, Mark mark) -> {
-  node.top = mark                                              # rewind — frees the frame at once
+  # limit unchanged since the mark → restore top alone (the common case; committed
+  # stays advanced so the page never re-commits). Limit MOVED → an elastic pull
+  # relocated the subnode's block since the mark: the reset is a NO-OP — restoring
+  # into the old block would park the cursor at its wall and re-pull a fresh chunk
+  # on every subsequent frame (pull churn). Skipping leaks the marked interval
+  # once per pull, reclaimed at node teardown; it can never dangle.
+  if node.residue.limit == mark.limit then node.residue.top = mark.top
 }
 
-const on_alloc = ['T] (MemoryNode node, 'T v) -> {
-  let p = node.top
-  node.top = p + size_of(v)
-  assert(node.top <= node.limit)                               # bounded families trap here
-  mem.raw.place(p, v)                                          # v now homed at p
-  return p                                                     # same 'T, new address (identity law)
+const on_alloc = ['T] (MemoryNode node, 'T v) -> {         # residue side shown; the
+  let p = bump(side_of(v), size_of(v))                     # survivor side is the same
+  mem.raw.place(p, v)                                      # bump on `node.survivor`
+  return p                                                 # same 'T (identity law)
 }
 ```
+
+**Scope granularity.** Every `!` frame brackets its residue triple. Where the
+classification proves **nothing escapes a scope at all** — a frame with no
+writable `*T` parameter, no capture, and a scalar return; or a loop iteration
+with no return, no outer store, no `&`, and no rehoming callee — the scope
+brackets the **survivor triple too**, so dropped callee returns, carved child
+nodes, and every survivor born inside die with it. These survivor-scope marks
+are pure **optimization gates**: failing one leaks until node death, never
+dangles. The residue-side loop gate is softer — only an aggregate stored into an
+outer target disqualifies it (such a value is residue that outlives the
+iteration); returns, `&` arguments and rehoming callees are survivor-side
+matters and no longer block per-iteration reclamation.
+
+**Two-ended fixed blocks.** A bounded node (`arena.of(n)`, `fixed_buffer`, the
+bare root) lays both subnodes over **one block**: survivors bump up from the
+base, residue bumps down from the tail, and the cursors meeting is the
+capacity trap — `of(n)` still means `n` bytes **total**. The residue side
+maintains the survivor side's `limit` (= the residue cursor) on each
+allocation, so the survivor's hot path stays a plain load-and-compare. The
+sharing is sound precisely because a fixed survivor can never leave the block.
+
+**Elastic nodes share nothing.** An elastic arena's survivor owns the whole
+initial block and pulls chunks from the parent on overflow; its residue side is
+a **lazy private chunk chain** — an empty subnode whose first allocation pulls
+its own chunk. There is deliberately no two-ended sharing here: the maintained
+boundary link breaks the moment the survivor pulls away to a fresh block (a
+still-linked residue would clobber the survivor's limit with stale addresses).
+Residue-free workloads never pay for the lane.
+
+**The pin.** Both subnodes' `parent` points at the parent node's **survivor**
+side, and headers/blocks are carved from it — a child's storage must never sit
+in a region a parent-frame bracket can reset.
 
 The rest of the family's hooks are uniform:
 
 | hook           | bump-family body                                                      |
 | -------------- | -------------------------------------------------------------------- |
 | `on_realloc`   | extend in place if `v` is the top-most block, else bump a fresh copy |
-| `on_ret`       | keep-alive — exclude `v` from the coming rewind (§3)                  |
-| `on_alloc_ret` | copy-free claim — nothing, or wall-dissolve re-attribution (§3)       |
+| `on_ret`       | birth placement — the construction bumps the SURVIVOR side (§3)       |
+| `on_alloc_ret` | **identity** (swept) — the return already lives where it must (§3)    |
 | `on_free`      | **no-op** — a bump never frees per object (swept — §2)                |
-| `on_rehome`    | degenerate per the §3 rehome table (no-op / keep-alive)              |
+| `on_rehome`    | **no-op** — a rehomed value was born survivor-side (§3)               |
 | `on_store`     | **no-op** — folds to a plain store (no barrier)                      |
 
 The three members differ only in **where the buffer comes from** and **what
@@ -468,9 +551,12 @@ The three members differ only in **where the buffer comes from** and **what
   the whole node dissolves into its parent at teardown (memory_model, Zero-cost
   return).
 - **`fixed_buffer`** — `of(buf)` wraps a **caller-provided** array (stack or
-  static); creating the node allocates nothing at all. Bounded by the buffer;
-  overflow is a hard trap. The zero-dependency embedded allocator — it differs
-  from `arena` only in the buffer's provenance.
+  static); creating the node allocates nothing at all — the duplex header lays
+  over the buffer's own front and the remainder is one two-ended block, so
+  survivors live **in the buffer itself** (a static-backed escape stays valid
+  for the buffer's whole life). Bounded by the buffer; the two-ended meet is a
+  hard trap. The zero-dependency embedded allocator — it differs from `arena`
+  only in the buffer's provenance.
 
 ### The free-list family is subsumed
 
@@ -614,9 +700,17 @@ keeps `cf0` lean:
 
 **What stays identical.** The nine-hook **contract** (§1), the **placement** rules
 (§2), the in-flight / claim-once **return protocol** (§3), and the `%node`/`%ret`
-**calling convention** (§4) are unchanged — `cf0` threads nodes, prunes node-free
-subtrees, and returns residue by pointer exactly as `cf` does. It simply exercises
-`page` and one `arena` where `cf` exercises the whole catalog.
+**calling convention** (§4) are unchanged — the bootstrap compiler threads nodes
+and returns residue by pointer exactly as the full design prescribes. It simply
+exercises `page` and one `arena` where `cf` exercises the whole catalog. (One
+deviation from this section's original sketch: node-free pruning is not yet
+implemented — the node is over-threaded onto every function, a pending
+optimization.) The duplex substrate and classification-at-birth of §5 are
+**live** in the self-hosted compiler: the classification is `routing.cf` (shadow
+sets + per-function summaries, cross-checked against the `!`-oracle on every
+compile), the birth routing and scope brackets are `emit.cf`, and the corpus
+pins the reclamation behavior (frame, loop, survivor-scope, two-ended and meet
+tests).
 
 This is what makes the bootstrap tractable: `cf0` implements `page` + `arena`, and
 `cf` (generation 1) restores the full userland set — the barriered and per-object
