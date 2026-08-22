@@ -18,7 +18,8 @@
 # not yet enforced (that is the typecheck brick).
 
 import "io" as { write_str, die }
-import "routing" as { RouteInfo, RSets, FnSum }
+import "routing" as { RouteInfo, RSets, FnSum, kids!, stmt_exprs! }
+import "alloc" as { address_taken! }
 import "ast" as { Expr, Stmt, Param, Func, FieldInit, RecDecl, UnionMember, UnionDecl, MatchArm, StmtArm, Seg, TupElem, Program }
 import "astutil" as { is_spread, spread_inner, is_skip, skip_count, is_nested, nested_inner!, tel_leaf, tel_nest, tel_is_nest, tel_is_fn, is_fixed_name, fixed_bits, fixed_signed, is_stack_name, is_pat_guard, is_member_guard, is_int_guard, guard_body!, guard_qual!, guard_member! }
 
@@ -42,7 +43,7 @@ import "astutil" as { is_spread, spread_inner, is_skip, skip_count, is_nested, n
 # `loop_mark` is the nearest enclosing reset-safe loop's entry mark (same triple shape, or -1 if
 # the nearest loop is not reset-safe) — `break`/`continue` restore it so every path back to the
 # loop head or out of it reclaims the iteration's residue, matching the back-edge rewind.
-data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs, [RecDecl] recs, [UnionDecl] unions, Iarch cur_loop, Iarch cur_slot, Str cur_ret, Iarch reset_mark, Bool fn_ptr, Iarch loop_mark, Bool alloc_stack, Bool in_loop, Iarch stack_used, [RSets] routes, [FnSum] fsums, Iarch cur_fn, Str alloc_node, Str carve_node, Iarch sur_mark, Iarch loop_sur_mark }
+data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs, [RecDecl] recs, [UnionDecl] unions, Iarch cur_loop, Iarch cur_slot, Str cur_ret, Iarch reset_mark, Bool fn_ptr, Iarch loop_mark, Bool alloc_stack, Bool in_loop, Iarch stack_used, [RSets] routes, [FnSum] fsums, Iarch cur_fn, Str alloc_node, Str carve_node, Iarch sur_mark, Iarch loop_sur_mark, [Bool] nodesig }
 
 # A local/parameter in scope: its interned name, `slot`, its `rec_type` (a record/union
 # type name, `"$dyn"`, `"$ptr"`, or `"Str"` — `""` for a word), and `elem` (a dynamic
@@ -2585,7 +2586,7 @@ const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env)
 	# thread the ambient node into arg 0 (geometry_lowering §4): the enclosing function's `%node_0`
 	# by default, or the node bound by an `in <geometry>` clause (its handle loaded from `geom`'s
 	# binding). An asm intrinsic (syscall wrapper) is below the algebra — no node.
-	const Bool node_first = !ctx.funcs[fidx].is_asm
+	const Bool node_first = !ctx.funcs[fidx].is_asm && ctx.nodesig[fidx]
 	if node_first then write_str(ctx.fd, "l ${node_op}")
 	let Iarch j = 0
 	loop {
@@ -3868,6 +3869,285 @@ const emit_block! = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 	return terminal
 }
 
+# ── node-free pruning (geometry_lowering §4) ─────────────────────────────────────────────────
+# A function's emitted signature carries the hidden `%node_0` iff it can ever NEED a node:
+#   - it is `!` (every bang frame brackets its residue subnode, deriving `%res_0` from the
+#     handle) — note bang-by-propagation frames bracket too, even when every bang callee is
+#     grafted `in b`;
+#   - its body ALLOCATES: a construction outside `$`-stack storage — including the
+#     interp/tuple/boxed-union forms that draw on the node even under a `$` literal spine —
+#     or a `Str(…)` seal, or an arena/buffer constructor intrinsic;
+#   - it makes an INDIRECT call (the target is unknown and the site passes a node uniformly);
+#   - it makes an un-grafted direct call to a function whose own signature carries a node
+#     (an `in b` call threads the geom binding instead and costs the caller nothing);
+#   - it is address-taken (an indirect site targets it with a node) or `main` (the floor
+#     enters it with the page).
+# The color algebra alone cannot decide this — a colorless constructor (`-> P({…})`) still
+# allocates, and a frame full of `$`-stack aggregates does not — so the bits are computed
+# from the bodies, closed over un-grafted calls like the `!` fixpoint itself.
+const nfp_alloc_expr! = ([UnionDecl] unions, Bool stackm, Expr e): Bool -> {
+	const Bool here = match e {
+		Expr.Record(_, _) -> !stackm,
+		Expr.ArrayLit(_, _, _, _) -> !stackm,
+		Expr.Buffer(_) -> !stackm,
+		Expr.Tuple(_) -> true,
+		Expr.Interp(_) -> true,
+		# a string LITERAL is arena-copied at runtime in this emit (bytes + header), and a
+		# BOXED union's tag-only construction (`Color.Red` on a payload-bearing union) boxes
+		Expr.StrLit(_) -> true,
+		Expr.Field(b, _) -> find_union(unions, b) >= 0 && union_is_boxed(unions, b),
+		# a string-literal MATCH materializes each pattern as a runtime Str for cf_str_eq
+		Expr.Match(_, arms) -> nfp_marms_strpat(arms),
+		Expr.UnionMk(u, _, _) -> union_is_boxed(unions, u),
+		Expr.Call(n, _, _, _) -> str_eq(n, "Str") || str_eq(n, "cf__arena_of") || str_eq(n, "cf__arena_grow") || str_eq(n, "cf__buffer_of"),
+		_ -> false
+	}
+	if here then return true
+	return match e {
+		Expr.Loop(ss) -> nfp_alloc_body!(unions, ss),
+		_ -> nfp_alloc_list!(unions, stackm, kids!(e))
+	}
+}
+const nfp_marms_strpat = ([MatchArm] arms): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		if !arms[i].is_wild && str_eq(arms[i].type_name, "$str") then return true
+		i = i + 1
+	}
+	return false
+}
+const nfp_sarms_strpat = ([StmtArm] arms): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		if !arms[i].is_wild && str_eq(arms[i].type_name, "$str") then return true
+		i = i + 1
+	}
+	return false
+}
+const nfp_alloc_list! = ([UnionDecl] unions, Bool stackm, [Expr] es): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(es.len) then break
+		if nfp_alloc_expr!(unions, stackm, es[i]) then return true
+		i = i + 1
+	}
+	return false
+}
+# A `$`-Let with a top-level literal aggregate takes the stack branch: the literal spine is
+# machine-stack storage, but interps/tuples/boxed unions inside still draw on the node
+# (mirrors alloc.cf's scan_stack_let). Any other init is ordinary node code.
+const nfp_alloc_let! = ([UnionDecl] unions, Str n, Expr init): Bool -> {
+	if is_stack_name(n) then {
+		return match init {
+			Expr.Record(_, _) -> nfp_alloc_expr!(unions, true, init),
+			Expr.ArrayLit(_, _, _, _) -> nfp_alloc_expr!(unions, true, init),
+			Expr.Buffer(_) -> nfp_alloc_expr!(unions, true, init),
+			_ -> nfp_alloc_expr!(unions, false, init)
+		}
+	}
+	return nfp_alloc_expr!(unions, false, init)
+}
+const nfp_alloc_stmt! = ([UnionDecl] unions, Stmt s): Bool -> {
+	const Bool here = match s {
+		Stmt.Let(n, _, _, init) -> nfp_alloc_let!(unions, n, init),
+		Stmt.Match(_, arms) -> nfp_sarms_strpat(arms) || nfp_alloc_list!(unions, false, stmt_exprs!(s)),
+		_ -> nfp_alloc_list!(unions, false, stmt_exprs!(s))
+	}
+	if here then return true
+	return match s {
+		Stmt.IfThen(_, b) -> nfp_alloc_stmt!(unions, b),
+		Stmt.IfElse(_, t, el) -> nfp_alloc_stmt!(unions, t) || nfp_alloc_stmt!(unions, el),
+		Stmt.Block(ss) -> nfp_alloc_body!(unions, ss),
+		Stmt.Loop(ss) -> nfp_alloc_body!(unions, ss),
+		Stmt.ForIn(_, _, ss) -> nfp_alloc_body!(unions, ss),
+		Stmt.Match(_, arms) -> nfp_alloc_arms!(unions, arms),
+		Stmt.Defer(ss) -> nfp_alloc_body!(unions, ss),
+		Stmt.Closure(_, _, _, cb) -> nfp_alloc_body!(unions, cb),
+		_ -> false
+	}
+}
+const nfp_alloc_arms! = ([UnionDecl] unions, [StmtArm] arms): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		if nfp_alloc_body!(unions, arms[i].body) then return true
+		i = i + 1
+	}
+	return false
+}
+const nfp_alloc_body! = ([UnionDecl] unions, [Stmt] ss): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		if nfp_alloc_stmt!(unions, ss[i]) then return true
+		i = i + 1
+	}
+	return false
+}
+# Does the body make an INDIRECT call (a callee name that is neither a program function nor
+# an intrinsic — a fn-value binding), or hold an unlowered DeferTap? Conservative ⇒ needs.
+const nfp_ind_expr! = ([Func] funcs, Expr e): Bool -> {
+	const Bool here = match e {
+		Expr.Call(n, _, _, _) -> find_func(funcs, n) < 0 && !is_cast_type(n) && !str_eq(n, "Str") && !str_eq(n, "cf__arena_of") && !str_eq(n, "cf__arena_grow") && !str_eq(n, "cf__buffer_of") && !str_eq(n, "cf__page"),
+		Expr.DeferTap(_, _) -> true,
+		_ -> false
+	}
+	if here then return true
+	return match e {
+		Expr.Loop(ss) -> nfp_ind_body!(funcs, ss),
+		_ -> nfp_ind_list!(funcs, kids!(e))
+	}
+}
+const nfp_ind_list! = ([Func] funcs, [Expr] es): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(es.len) then break
+		if nfp_ind_expr!(funcs, es[i]) then return true
+		i = i + 1
+	}
+	return false
+}
+const nfp_ind_stmt! = ([Func] funcs, Stmt s): Bool -> {
+	if nfp_ind_list!(funcs, stmt_exprs!(s)) then return true
+	return match s {
+		Stmt.IfThen(_, b) -> nfp_ind_stmt!(funcs, b),
+		Stmt.IfElse(_, t, el) -> nfp_ind_stmt!(funcs, t) || nfp_ind_stmt!(funcs, el),
+		Stmt.Block(ss) -> nfp_ind_body!(funcs, ss),
+		Stmt.Loop(ss) -> nfp_ind_body!(funcs, ss),
+		Stmt.ForIn(_, _, ss) -> nfp_ind_body!(funcs, ss),
+		Stmt.Match(_, arms) -> nfp_ind_arms!(funcs, arms),
+		Stmt.Defer(ss) -> nfp_ind_body!(funcs, ss),
+		Stmt.Closure(_, _, _, cb) -> nfp_ind_body!(funcs, cb),
+		_ -> false
+	}
+}
+const nfp_ind_arms! = ([Func] funcs, [StmtArm] arms): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		if nfp_ind_body!(funcs, arms[i].body) then return true
+		i = i + 1
+	}
+	return false
+}
+const nfp_ind_body! = ([Func] funcs, [Stmt] ss): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		if nfp_ind_stmt!(funcs, ss[i]) then return true
+		i = i + 1
+	}
+	return false
+}
+# An UN-GRAFTED direct call to a node-signature callee (an `in b` call threads the geom
+# binding, not the ambient, so it does not force the caller).
+const nfp_prop_expr! = ([Func] funcs, [Bool] sig, Expr e): Bool -> {
+	# a bare non-local Var / a field or index off one AUTO-CALLS a top-level value-const
+	# (emit_var!/emit_field!/the static index paths route through emit_call!), so those are
+	# call edges too — invisible as Expr.Call, caught by their base name here
+	const Bool here = match e {
+		Expr.Call(n, _, _, g) -> str_eq(g, "") && nfp_callee_sig(funcs, sig, n),
+		Expr.Var(n) -> nfp_callee_sig(funcs, sig, n),
+		Expr.Field(b, _) -> nfp_callee_sig(funcs, sig, b),
+		Expr.Index(b, _) -> nfp_callee_sig(funcs, sig, b),
+		Expr.IndexField(b, _, _) -> nfp_callee_sig(funcs, sig, b),
+		_ -> false
+	}
+	if here then return true
+	return match e {
+		Expr.Loop(ss) -> nfp_prop_body!(funcs, sig, ss),
+		_ -> nfp_prop_list!(funcs, sig, kids!(e))
+	}
+}
+const nfp_callee_sig = ([Func] funcs, [Bool] sig, Str n): Bool -> {
+	const Iarch j = find_func(funcs, n)
+	if j < 0 then return false
+	return sig[j]
+}
+const nfp_prop_list! = ([Func] funcs, [Bool] sig, [Expr] es): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(es.len) then break
+		if nfp_prop_expr!(funcs, sig, es[i]) then return true
+		i = i + 1
+	}
+	return false
+}
+const nfp_prop_stmt! = ([Func] funcs, [Bool] sig, Stmt s): Bool -> {
+	# element assignment to a `static [N Uint8]` auto-calls its value-const for the header
+	const Bool sh = match s {
+		Stmt.IndexAssign(a, _, _) -> nfp_callee_sig(funcs, sig, a),
+		_ -> false
+	}
+	if sh then return true
+	if nfp_prop_list!(funcs, sig, stmt_exprs!(s)) then return true
+	return match s {
+		Stmt.IfThen(_, b) -> nfp_prop_stmt!(funcs, sig, b),
+		Stmt.IfElse(_, t, el) -> nfp_prop_stmt!(funcs, sig, t) || nfp_prop_stmt!(funcs, sig, el),
+		Stmt.Block(ss) -> nfp_prop_body!(funcs, sig, ss),
+		Stmt.Loop(ss) -> nfp_prop_body!(funcs, sig, ss),
+		Stmt.ForIn(_, _, ss) -> nfp_prop_body!(funcs, sig, ss),
+		Stmt.Match(_, arms) -> nfp_prop_arms!(funcs, sig, arms),
+		Stmt.Defer(ss) -> nfp_prop_body!(funcs, sig, ss),
+		Stmt.Closure(_, _, _, cb) -> nfp_prop_body!(funcs, sig, cb),
+		_ -> false
+	}
+}
+const nfp_prop_arms! = ([Func] funcs, [Bool] sig, [StmtArm] arms): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		if nfp_prop_body!(funcs, sig, arms[i].body) then return true
+		i = i + 1
+	}
+	return false
+}
+const nfp_prop_body! = ([Func] funcs, [Bool] sig, [Stmt] ss): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		if nfp_prop_stmt!(funcs, sig, ss[i]) then return true
+		i = i + 1
+	}
+	return false
+}
+const compute_nodesig! = (Program prog): [Bool] -> {
+	const [Str] at = address_taken!(prog)
+	let [Bool] sig = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(prog.funcs.len) then break
+		let Bool need = false
+		if !prog.funcs[i].is_asm then {
+			if str_eq(prog.funcs[i].name, "main") then need = true
+			if !need && name_has_bang(prog.funcs[i].name) then need = true
+			if !need && has_str(at, prog.funcs[i].name) then need = true
+			if !need && nfp_alloc_body!(prog.unions, prog.funcs[i].body) then need = true
+			if !need && nfp_ind_body!(prog.funcs, prog.funcs[i].body) then need = true
+		}
+		sig = [...sig, need]
+		i = i + 1
+	}
+	loop {
+		let Bool changed = false
+		let Iarch k = 0
+		loop {
+			if k >= Iarch(prog.funcs.len) then break
+			if !sig[k] && !prog.funcs[k].is_asm then {
+				if nfp_prop_body!(prog.funcs, sig, prog.funcs[k].body) then {
+					sig[k] = true
+					changed = true
+				}
+			}
+			k = k + 1
+		}
+		if !changed then break
+	}
+	return sig
+}
+
 # Emit one function: its signature, parameter spills, and body. main is the exported
 # `$main` (the entry the floor calls); every other function `idx` is the internal
 # `$f<idx>` (positional, so a user name can never collide with `_start`/`_main`).
@@ -3889,13 +4169,19 @@ const emit_func! = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 	if is_main then write_str(ctx.fd, "export function l $main(")
 	# a float-returning helper is typed `d`/`s`; every other return (word/pointer/record) is `l`
 	if !is_main then write_str(ctx.fd, "function ${qtype_of_name(fn.ret_name)} $f${idx}(")
-	# the hidden ambient node is arg 0 (`%node_0`, geometry_lowering §4) — over-threaded onto
-	# every function for now; the node-free pruning (memory_model §5) is a later optimization.
-	write_str(ctx.fd, "l %node_0")
+	# the hidden ambient node is arg 0 (`%node_0`, geometry_lowering §4) — PRUNED from a
+	# function that can never need a node (compute_nodesig!): its emitted signature is exactly
+	# its user parameters, the ABI a node-free language would have given it.
+	let Bool sep = false
+	if ctx.nodesig[idx] then {
+		write_str(ctx.fd, "l %node_0")
+		sep = true
+	}
 	let Iarch si = 0
 	loop {
 		if si >= Iarch(fn.params.len) then break
-		write_str(ctx.fd, ", ")
+		if sep then write_str(ctx.fd, ", ")
+		sep = true
 		# a float scalar parameter is `d`/`s`; every other parameter (word/pointer/record) is `l`
 		write_str(ctx.fd, "${qtype_of_name(fn.params[si].type_name)} %p${si}")
 		si = si + 1
@@ -4873,6 +5159,8 @@ pub const emit_program! = (Program prog, RouteInfo ri, Uarch qbe_fd, Uarch asm_f
 	emit_arena_qbe!(qbe_fd, is_bare, root_size)
 	# address-taken functions (used as a value anywhere) are excluded from the flat-return reset — an
 	# indirect call site cannot claim. Computed once for the whole program (geometry_lowering §3).
+	# node-free pruning (geometry_lowering §4): which signatures carry the hidden %node_0
+	const [Bool] nsig = compute_nodesig!(prog)
 	const Bool argv_form = main_takes_argv(prog)
 	if argv_form then emit_argv_qbe(qbe_fd)
 	# STATIC storage: each `static [N Uint8] NAME` gets a zero-filled BSS data block and a
@@ -4894,7 +5182,7 @@ pub const emit_program! = (Program prog, RouteInfo ri, Uarch qbe_fd, Uarch asm_f
 		if i >= Iarch(prog.funcs.len) then break
 		# an asm function is emitted into the floor, not through QBE
 		if !prog.funcs[i].is_asm then {
-			let Emit ctx = Emit({ fd: qbe_fd, next: 0, label: 0, funcs: prog.funcs, recs: prog.recs, unions: prog.unions, cur_loop: 0 - 1, cur_slot: 0 - 1, cur_ret: "", reset_mark: 0 - 1, fn_ptr: false, loop_mark: 0 - 1, alloc_stack: false, in_loop: false, stack_used: 0, routes: ri.sets, fsums: ri.sums, cur_fn: 0 - 1, alloc_node: "%node_0", carve_node: "%node_0", sur_mark: 0 - 1, loop_sur_mark: 0 - 1 })
+			let Emit ctx = Emit({ fd: qbe_fd, next: 0, label: 0, funcs: prog.funcs, recs: prog.recs, unions: prog.unions, cur_loop: 0 - 1, cur_slot: 0 - 1, cur_ret: "", reset_mark: 0 - 1, fn_ptr: false, loop_mark: 0 - 1, alloc_stack: false, in_loop: false, stack_used: 0, routes: ri.sets, fsums: ri.sums, cur_fn: 0 - 1, alloc_node: "%node_0", carve_node: "%node_0", sur_mark: 0 - 1, loop_sur_mark: 0 - 1, nodesig: nsig })
 			emit_func!(&ctx, prog.funcs[i], i)
 		}
 		i = i + 1
