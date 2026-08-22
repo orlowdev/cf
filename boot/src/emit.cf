@@ -43,7 +43,7 @@ import "astutil" as { is_spread, spread_inner, is_skip, skip_count, is_nested, n
 # `loop_mark` is the nearest enclosing reset-safe loop's entry mark (same triple shape, or -1 if
 # the nearest loop is not reset-safe) — `break`/`continue` restore it so every path back to the
 # loop head or out of it reclaims the iteration's residue, matching the back-edge rewind.
-data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs, [RecDecl] recs, [UnionDecl] unions, Iarch cur_loop, Iarch cur_slot, Str cur_ret, Iarch reset_mark, Bool fn_ptr, Iarch loop_mark, Bool alloc_stack, Bool in_loop, Iarch stack_used, [RSets] routes, [FnSum] fsums, Iarch cur_fn, Str alloc_node, Str carve_node, Iarch sur_mark, Iarch loop_sur_mark, [Bool] nodesig }
+data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs, [RecDecl] recs, [UnionDecl] unions, Iarch cur_loop, Iarch cur_slot, Str cur_ret, Iarch reset_mark, Bool fn_ptr, Iarch loop_mark, Bool alloc_stack, Bool in_loop, Iarch stack_used, [RSets] routes, [FnSum] fsums, Iarch cur_fn, Str alloc_node, Str carve_node, Str grow_node, [Str] growok, Iarch mk_env_base, Iarch sur_mark, Iarch loop_sur_mark, [Bool] nodesig }
 
 # A local/parameter in scope: its interned name, `slot`, its `rec_type` (a record/union
 # type name, `"$dyn"`, `"$ptr"`, or `"Str"` — `""` for a word), and `elem` (a dynamic
@@ -647,6 +647,306 @@ const loop_residue_safe = (*Emit ctx, [Binding] env, Str loopvar, [Stmt] body): 
 	let [Str] locals = stmts_locals(body)
 	if !str_eq(loopvar, "") then locals = cat_names(locals, one_name(loopvar))
 	return !res_body_escapes(ctx, env, locals, body)
+}
+
+# ── the residue-carve interlock (memory_model §8) ───────────────────────────────────────────
+# A child arena carved from the frame's RESIDUE side dies with the frame or iteration bracket
+# instead of leaking until node death. The carve draws residue-side only when no reset can fire
+# between the carve — or, for an ELASTIC child, any of its later PULLS — and the handle's death;
+# every gate below fails toward SURVIVOR (a rejected carve leaks like today, never dangles).
+#   1. The carve must be the binding's DIRECT value (casts transparent). A carve buried in an
+#      argument or branch hands its handle to code the binding's classification says nothing
+#      about, so it stays survivor.
+#   2. Inside a marked loop the back-edge frees the carve, so the handle must not cross an
+#      iteration: an assign target declared OUTSIDE the loop (`mk_env_base`, the env watermark
+#      at the innermost marked loop's entry) is refused, and so is any name the body reads as a
+#      WORD anywhere in the function (`hv_*` — a word use could stash the handle past the reset;
+#      geom clauses ride the Call as a string, so `in b`-only handles pass).
+#   3. An elastic child additionally pulls chunks from the carving frame's residue lane at pull
+#      TIME — a pull inside a bracket the carve is not inside (a deeper marked loop, or a callee
+#      handed the handle) is freed while the child lives. `growok_names!` therefore admits only
+#      handles whose every use is a geom clause and whose every in-loop use follows an
+#      unconditional carve in that same loop (`gscan_*`, an ordered walk: a loop body re-enters,
+#      so a use may only trust a carve the SAME iteration already executed — a carve inside a
+#      branch or a nested loop licenses nothing outside it). A fixed child never pulls (kind
+#      0/2/4 trap at capacity), so it needs only gates 1–2.
+
+const is_grow_leaf = (Expr e): Bool -> match e {
+	Expr.Call(c, _, _, _) -> str_eq(c, "cf__arena_grow"),
+	_ -> false
+}
+const is_carve_leaf = (Expr e): Bool -> match e {
+	Expr.Call(c, _, _, _) -> str_eq(c, "cf__arena_of") || str_eq(c, "cf__arena_grow"),
+	_ -> false
+}
+# A carve as the binding's direct value — the intrinsic call itself, possibly under numeric
+# casts (`Iarch(mem.arena.of(n))`), which forward the handle unchanged.
+const cast_inner = (Expr e): Expr -> match e {
+	Expr.Call(c, _, args, _) -> if is_cast_type(c) && Iarch(args.len) == 1 then args[0] else e,
+	_ -> e
+}
+const is_direct_carve = (Expr e): Bool -> {
+	if is_carve_leaf(e) then return true
+	const Expr inner = cast_inner(e)
+	return is_carve_leaf(inner)
+}
+const is_direct_grow = (Expr e): Bool -> {
+	if is_grow_leaf(e) then return true
+	return is_grow_leaf(cast_inner(e))
+}
+
+# Does the body read `n` as a WORD anywhere (an `Expr.Var`, or its address)? Geom clauses are
+# Call-borne strings, so a handle used only as `in n` never trips this. Names are
+# function-unique (shadowing is rejected), so a whole-body scan is exact.
+const hv_expr! = (Str n, Expr e): Bool -> match e {
+	Expr.Var(m) -> str_eq(m, n),
+	Expr.Addr(m) -> str_eq(m, n),
+	Expr.Loop(ss) -> hv_body!(n, ss),
+	_ -> hv_list!(n, kids!(e))
+}
+const hv_list! = (Str n, [Expr] es): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(es.len) then break
+		if hv_expr!(n, es[i]) then return true
+		i = i + 1
+	}
+	return false
+}
+const hv_stmt! = (Str n, Stmt s): Bool -> {
+	if hv_list!(n, stmt_exprs!(s)) then return true
+	return match s {
+		Stmt.IfThen(_, b) -> hv_stmt!(n, b),
+		Stmt.IfElse(_, t, el) -> hv_stmt!(n, t) || hv_stmt!(n, el),
+		Stmt.Block(ss) -> hv_body!(n, ss),
+		Stmt.Loop(ss) -> hv_body!(n, ss),
+		Stmt.ForIn(_, _, ss) -> hv_body!(n, ss),
+		Stmt.Match(_, arms) -> hv_arms!(n, arms),
+		Stmt.Defer(ss) -> hv_body!(n, ss),
+		Stmt.Closure(_, _, _, cb) -> hv_body!(n, cb),
+		_ -> false
+	}
+}
+const hv_arms! = (Str n, [StmtArm] arms): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		if hv_body!(n, arms[i].body) then return true
+		i = i + 1
+	}
+	return false
+}
+const hv_body! = (Str n, [Stmt] ss): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		if hv_stmt!(n, ss[i]) then return true
+		i = i + 1
+	}
+	return false
+}
+
+# Gate 2 at a carve site: outside a marked loop everything is frame-scoped and the routing
+# classification alone suffices; inside one, refuse an outer assign target and any word use.
+const carve_iter_ok! = (*Emit ctx, [Binding] env, Str n, Bool is_let): Bool -> {
+	if ctx.mk_env_base < 0 then return true
+	if !is_let then { if lookup_index(env, n) < ctx.mk_env_base then return false }
+	return !hv_body!(n, ctx.funcs[ctx.cur_fn].body)
+}
+
+# ── elastic eligibility: the ordered geom-use scan ──────────────────────────────────────────
+# Threads a seen-state through the body in program order: 1 after an unconditional carve of
+# `n` on the current path, 0 before one, -1 on a violation. A geom use `in n` is legal only
+# under seen == 1. Loop bodies restart at 0 (the back-edge frees the previous iteration's
+# carve, so only a carve THIS iteration already ran licenses a use); branch and match arms
+# scan from the join state and their licensing is DISCARDED (a conditional carve licenses
+# nothing after the join); value loops are transparent (they never reset, so a carve inside
+# one stays live for the whole enclosing iteration). Defer/Closure bodies scan like loops
+# (paranoid — both are lowered away before emit). Unknown forms refuse.
+const gscan_list! = (Str n, [Expr] es, Iarch seen0): Iarch -> {
+	let Iarch seen = seen0
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(es.len) then break
+		seen = gscan_expr!(n, es[i], seen)
+		if seen < 0 then return 0 - 1
+		i = i + 1
+	}
+	return seen
+}
+const gscan_call! = (Str n, [Expr] args, Str g, Iarch seen): Iarch -> {
+	if str_eq(g, n) then { if seen != 1 then return 0 - 1 }
+	return gscan_list!(n, args, seen)
+}
+const gscan_branches! = (Str n, Expr c, Expr t, Expr el, Iarch seen): Iarch -> {
+	const Iarch rc = gscan_expr!(n, c, seen)
+	if rc < 0 then return 0 - 1
+	if gscan_expr!(n, t, rc) < 0 then return 0 - 1
+	if gscan_expr!(n, el, rc) < 0 then return 0 - 1
+	return rc
+}
+const gscan_marms! = (Str n, Expr sc, [MatchArm] arms, Iarch seen): Iarch -> {
+	const Iarch rs = gscan_expr!(n, sc, seen)
+	if rs < 0 then return 0 - 1
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		if gscan_expr!(n, arms[i].body, rs) < 0 then return 0 - 1
+		i = i + 1
+	}
+	return rs
+}
+const gscan_expr! = (Str n, Expr e, Iarch seen): Iarch -> match e {
+	Expr.Call(_, _, args, g) -> gscan_call!(n, args, g, seen),
+	Expr.Loop(ss) -> gscan_stmts!(n, ss, seen),
+	Expr.If(c, t, el) -> gscan_branches!(n, c, t, el, seen),
+	Expr.Match(sc, arms) -> gscan_marms!(n, sc, arms, seen),
+	Expr.Addr(_) -> seen,
+	Expr.DeferTap(_, args) -> gscan_list!(n, args, seen),
+	_ -> gscan_list!(n, kids!(e), seen)
+}
+const gscan_bind! = (Str n, Str m, Expr e, Iarch seen): Iarch -> {
+	const Iarch r = gscan_expr!(n, e, seen)
+	if r < 0 then return 0 - 1
+	if str_eq(m, n) then { if is_direct_grow(e) then return 1 }
+	return r
+}
+const gscan_pair! = (Str n, Expr a, Expr b2, Iarch seen): Iarch -> {
+	const Iarch r = gscan_expr!(n, a, seen)
+	if r < 0 then return 0 - 1
+	return gscan_expr!(n, b2, r)
+}
+const gscan_ifthen! = (Str n, Expr c, Stmt b2, Iarch seen): Iarch -> {
+	const Iarch rc = gscan_expr!(n, c, seen)
+	if rc < 0 then return 0 - 1
+	if gscan_stmt!(n, b2, rc) < 0 then return 0 - 1
+	return rc
+}
+const gscan_ifelse! = (Str n, Expr c, Stmt t, Stmt el, Iarch seen): Iarch -> {
+	const Iarch rc = gscan_expr!(n, c, seen)
+	if rc < 0 then return 0 - 1
+	if gscan_stmt!(n, t, rc) < 0 then return 0 - 1
+	if gscan_stmt!(n, el, rc) < 0 then return 0 - 1
+	return rc
+}
+const gscan_loop! = (Str n, [Stmt] ss, Iarch seen): Iarch -> {
+	if gscan_stmts!(n, ss, 0) < 0 then return 0 - 1
+	return seen
+}
+const gscan_smatch! = (Str n, Expr sc, [StmtArm] arms, Iarch seen): Iarch -> {
+	const Iarch rs = gscan_expr!(n, sc, seen)
+	if rs < 0 then return 0 - 1
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		if gscan_stmts!(n, arms[i].body, rs) < 0 then return 0 - 1
+		i = i + 1
+	}
+	return rs
+}
+const gscan_stmt! = (Str n, Stmt s, Iarch seen): Iarch -> match s {
+	Stmt.Let(m, _, _, e) -> gscan_bind!(n, m, e, seen),
+	Stmt.Assign(m, e) -> gscan_bind!(n, m, e, seen),
+	Stmt.FieldAssign(_, _, e) -> gscan_expr!(n, e, seen),
+	Stmt.IndexAssign(_, ix, e) -> gscan_pair!(n, ix, e, seen),
+	Stmt.DeepFieldAssign(be, _, e) -> gscan_pair!(n, be, e, seen),
+	Stmt.Return(e) -> gscan_expr!(n, e, seen),
+	Stmt.Yield(e) -> gscan_expr!(n, e, seen),
+	Stmt.Do(e) -> gscan_expr!(n, e, seen),
+	Stmt.Destructure(_, _, e) -> gscan_expr!(n, e, seen),
+	Stmt.IfThen(c, b2) -> gscan_ifthen!(n, c, b2, seen),
+	Stmt.IfElse(c, t, el) -> gscan_ifelse!(n, c, t, el, seen),
+	Stmt.Block(ss) -> gscan_stmts!(n, ss, seen),
+	Stmt.Loop(ss) -> gscan_loop!(n, ss, seen),
+	Stmt.ForIn(_, _, ss) -> gscan_loop!(n, ss, seen),
+	Stmt.Match(sc, arms) -> gscan_smatch!(n, sc, arms, seen),
+	Stmt.Defer(ss) -> gscan_loop!(n, ss, seen),
+	Stmt.Closure(_, _, _, cb) -> gscan_loop!(n, cb, seen),
+	Stmt.Break -> seen,
+	Stmt.Continue -> seen,
+	_ -> 0 - 1
+}
+const gscan_stmts! = (Str n, [Stmt] ss, Iarch seen0): Iarch -> {
+	let Iarch seen = seen0
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		seen = gscan_stmt!(n, ss[i], seen)
+		if seen < 0 then return 0 - 1
+		i = i + 1
+	}
+	return seen
+}
+
+# Collect the names bound to a DIRECT elastic carve anywhere in the body (value-loop
+# initializers included) — the candidates the eligibility scan judges.
+const gcand_einits! = (Expr e): [Str] -> match e {
+	Expr.Loop(ss) -> gcand_body!(ss),
+	_ -> gcand_list!(kids!(e))
+}
+const gcand_list! = ([Expr] es): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(es.len) then break
+		r = cat_names(r, gcand_einits!(es[i]))
+		i = i + 1
+	}
+	return r
+}
+const gcand_bind! = (Str m, Expr e): [Str] -> {
+	let [Str] r = gcand_einits!(e)
+	if is_direct_grow(e) then r = [...r, m]
+	return r
+}
+const gcand_stmt! = (Stmt s): [Str] -> match s {
+	Stmt.Let(m, _, _, e) -> gcand_bind!(m, e),
+	Stmt.Assign(m, e) -> gcand_bind!(m, e),
+	Stmt.IfThen(_, b2) -> gcand_stmt!(b2),
+	Stmt.IfElse(_, t, el) -> cat_names(gcand_stmt!(t), gcand_stmt!(el)),
+	Stmt.Block(ss) -> gcand_body!(ss),
+	Stmt.Loop(ss) -> gcand_body!(ss),
+	Stmt.ForIn(_, _, ss) -> gcand_body!(ss),
+	Stmt.Match(_, arms) -> gcand_arms!(arms),
+	Stmt.Defer(ss) -> gcand_body!(ss),
+	Stmt.Closure(_, _, _, cb) -> gcand_body!(cb),
+	_ -> no_names()
+}
+const gcand_arms! = ([StmtArm] arms): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		r = cat_names(r, gcand_body!(arms[i].body))
+		i = i + 1
+	}
+	return r
+}
+const gcand_body! = ([Stmt] ss): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		r = cat_names(r, gcand_stmt!(ss[i]))
+		i = i + 1
+	}
+	return r
+}
+const growok_names! = ([Func] funcs, Iarch fi): [Str] -> {
+	const [Str] cands = gcand_body!(funcs[fi].body)
+	let [Str] ok = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(cands.len) then break
+		const Str c = cands[i]
+		if !has_str(ok, c) then {
+			if !hv_body!(c, funcs[fi].body) then {
+				if gscan_stmts!(c, funcs[fi].body, 1) >= 0 then ok = [...ok, c]
+			}
+		}
+		i = i + 1
+	}
+	return ok
 }
 
 # The RETURN signature position of a `$fn` binding — the last telem of its whole `[args…, ret]`
@@ -2425,12 +2725,15 @@ const emit_indirect_call! = (*Emit ctx, [Binding] env, Iarch fpidx, [Expr] args)
 const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env): Str -> {
 	# `mem.arena.of(n)` — carve a fixed arena from the ambient node and yield its handle. The
 	# residue-carve tightening: when the handle binding provably never escapes (the routing
-	# classification, geom-channel rules included — memory_model §8), the carve draws from the
-	# frame's RESIDUE side instead of the survivor side, so the whole child dies with the frame
-	# or iteration bracket instead of leaking until node death. `carve_node` is set by the
-	# binding site; a fixed child never dereferences its parent field (kind 0/2 cannot pull),
-	# so pointing it at a residue subnode is inert. Elastic carves (grow) stay survivor-side —
-	# their pulls draw real storage from the parent.
+	# classification, geom-channel rules included — memory_model §8) and the interlock gates
+	# hold (the carve is the binding's direct value, and it cannot cross an iteration bracket),
+	# the carve draws from the frame's RESIDUE side instead of the survivor side, so the whole
+	# child dies with the frame or iteration bracket instead of leaking until node death.
+	# `carve_node` is set by the binding site; a fixed child never dereferences its parent field
+	# (kind 0/2/4 cannot pull), so pointing it at a residue subnode is inert. An ELASTIC carve
+	# (grow) additionally parents its PULLS at `grow_node`: residue-side only under the full
+	# eligibility scan (geom-only uses, ordered against every loop bracket — see the interlock
+	# section), else the pulls draw real storage from the survivor side as before.
 	if str_eq(callee, "cf__arena_of") then {
 		const Str nv = emit_expr!(args[0], ctx, env)
 		const Iarch tw = ctx.next
@@ -2449,7 +2752,7 @@ const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env)
 		write_str(ctx.fd, "\t%t${gw} =w copy ${gv}\n")
 		const Iarch gr = ctx.next
 		ctx.next = ctx.next + 1
-		write_str(ctx.fd, "\t%t${gr} =l call $cf_arena_grow(l %node_0, w %t${gw})\n")
+		write_str(ctx.fd, "\t%t${gr} =l call $cf_arena_grow(l ${ctx.grow_node}, w %t${gw})\n")
 		return "%t${gr}"
 	}
 	# `mem.fixed_buffer.of(buf)` — wrap a caller `[Uint8]` buffer. The arg is its `{data,len,cap}`
@@ -3422,6 +3725,7 @@ const emit_for_body! = (*Emit ctx, [Binding] env, Str lv, Str arr, [Stmt] body):
 	const Iarch saved = ctx.cur_loop
 	const Iarch saved_mark = ctx.loop_mark
 	const Iarch saved_sur = ctx.loop_sur_mark
+	const Iarch saved_mkb = ctx.mk_env_base
 	ctx.cur_loop = lid
 	const Iarch la = ctx.next
 	ctx.next = ctx.next + 1
@@ -3444,6 +3748,10 @@ const emit_for_body! = (*Emit ctx, [Binding] env, Str lv, Str arr, [Stmt] body):
 	}
 	ctx.loop_mark = lmark
 	ctx.loop_sur_mark = lsur
+	# the innermost MARKED loop's env watermark — a carve site consults it (carve_iter_ok!);
+	# an unmarked inner loop inherits the enclosing marked loop's watermark (its back-edge
+	# still frees a carve born inside)
+	if lmark >= 0 then ctx.mk_env_base = Iarch(env.len)
 	write_str(ctx.fd, "@ltop${lid}\n")
 	const Iarch iv2 = ctx.next
 	ctx.next = ctx.next + 1
@@ -3494,6 +3802,7 @@ const emit_for_body! = (*Emit ctx, [Binding] env, Str lv, Str arr, [Stmt] body):
 	ctx.cur_loop = saved
 	ctx.loop_mark = saved_mark
 	ctx.loop_sur_mark = saved_sur
+	ctx.mk_env_base = saved_mkb
 	return 0
 }
 
@@ -3508,6 +3817,7 @@ const emit_loop_body! = (*Emit ctx, [Binding] env, [Stmt] body): Iarch -> {
 	const Iarch saved = ctx.cur_loop
 	const Iarch saved_mark = ctx.loop_mark
 	const Iarch saved_sur = ctx.loop_sur_mark
+	const Iarch saved_mkb = ctx.mk_env_base
 	ctx.cur_loop = lid
 	# per-iteration reset (geometry_lowering §2): snapshot the node's triple at loop entry, rewind
 	# at every back-edge / break / continue, but only for a body whose residue can't escape the
@@ -3520,6 +3830,8 @@ const emit_loop_body! = (*Emit ctx, [Binding] env, [Stmt] body): Iarch -> {
 	}
 	ctx.loop_mark = lmark
 	ctx.loop_sur_mark = lsur
+	# see emit_for_body!: the marked-loop env watermark for the carve gates
+	if lmark >= 0 then ctx.mk_env_base = Iarch(env.len)
 	const Bool saved_inl = ctx.in_loop
 	ctx.in_loop = true
 	write_str(ctx.fd, "@ltop${lid}\n")
@@ -3532,6 +3844,7 @@ const emit_loop_body! = (*Emit ctx, [Binding] env, [Stmt] body): Iarch -> {
 	ctx.cur_loop = saved
 	ctx.loop_mark = saved_mark
 	ctx.loop_sur_mark = saved_sur
+	ctx.mk_env_base = saved_mkb
 	return 0
 }
 
@@ -3672,11 +3985,17 @@ const emit_simple_stmt! = (*Emit ctx, [Binding] env, Stmt s): Iarch -> {
 			const Iarch idx = lookup_index(env, n)
 			const Str saved_an = ctx.alloc_node
 			const Str saved_cn = ctx.carve_node
+			const Str saved_gn = ctx.grow_node
 			if binding_is_agg(env, n) then {
 				if routes_residue(ctx, n) then ctx.alloc_node = "%res_0"
 			} else {
 				if ctx.reset_mark >= 0 then ctx.alloc_node = "%res_0"
-				if routes_residue(ctx, n) then ctx.carve_node = "%res_0"
+				if is_direct_carve(e) && routes_residue(ctx, n) then {
+					if carve_iter_ok!(ctx, env, n, false) then {
+						ctx.carve_node = "%res_0"
+						if has_str(ctx.growok, n) then ctx.grow_node = "%res_0"
+					}
+				}
 			}
 			if str_eq(env[idx].rec_type, "$dyn") && is_self_spread(e, n) then {
 				const Str hdr = binding_ptr!(ctx, env, idx)
@@ -3687,6 +4006,7 @@ const emit_simple_stmt! = (*Emit ctx, [Binding] env, Stmt s): Iarch -> {
 			}
 			ctx.alloc_node = saved_an
 			ctx.carve_node = saved_cn
+			ctx.grow_node = saved_gn
 		},
 		Stmt.FieldAssign(b, f, e) -> {
 			# `base.field = value` — store the value into the record's field in place.
@@ -3811,16 +4131,25 @@ const emit_block! = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 					# a scalar init's inner constructions (an interp measured with `.len`, a value
 					# block's transient aggregates) are pure scratch — the binding copies a WORD out,
 					# so no pointer survives the statement: born residue-side in a bracketed frame.
-					# A node CARVE in the init routes by the binding's own classification (the
-					# residue-carve tightening) — the handle is a word, but the storage it names
-					# lives exactly as long as the name provably does.
+					# A DIRECT node carve routes by the binding's own classification plus the
+					# interlock gates (the residue-carve tightening) — the handle is a word, but the
+					# storage it names lives exactly as long as the name provably does. A carve
+					# buried deeper in the init stays survivor: its handle's fate is not the
+					# binding's.
 					const Str saved_an = ctx.alloc_node
 					const Str saved_cn = ctx.carve_node
+					const Str saved_gn = ctx.grow_node
 					if ctx.reset_mark >= 0 then ctx.alloc_node = "%res_0"
-					if routes_residue(ctx, n) then ctx.carve_node = "%res_0"
+					if is_direct_carve(e) && routes_residue(ctx, n) then {
+						if carve_iter_ok!(ctx, env, n, true) then {
+							ctx.carve_node = "%res_0"
+							if has_str(ctx.growok, n) then ctx.grow_node = "%res_0"
+						}
+					}
 					const Str v = emit_expr!(e, ctx, env)
 					ctx.alloc_node = saved_an
 					ctx.carve_node = saved_cn
+					ctx.grow_node = saved_gn
 					# a scalar local records its leaf type (fixed OR float, from the annotation else
 					# inferred) so later ops pick the right codegen and the cell stores/loads with its
 					# QBE type (a float uses `stored`/`loadd`, an integer `storel`/`loadl`)
@@ -4164,6 +4493,10 @@ const emit_func! = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 	# the current function's return type — supplied to a bare `({…})` record literal returned from
 	# this function (its type_name is empty; the return annotation names its record type)
 	ctx.cur_ret = fn.ret_name
+	# elastic residue-carve eligibility (the interlock section): only a bracketed frame can
+	# route a carve residue-side, so unbracketed frames skip the scan
+	if fn_brackets(fn) then ctx.growok = growok_names!(ctx.funcs, idx)
+	if !fn_brackets(fn) then ctx.growok = no_names()
 	# main always returns a word (its Int exit code); a helper returning a record
 	# returns an `l` arena pointer, else a word.
 	if is_main then write_str(ctx.fd, "export function l $main(")
@@ -5182,7 +5515,7 @@ pub const emit_program! = (Program prog, RouteInfo ri, Uarch qbe_fd, Uarch asm_f
 		if i >= Iarch(prog.funcs.len) then break
 		# an asm function is emitted into the floor, not through QBE
 		if !prog.funcs[i].is_asm then {
-			let Emit ctx = Emit({ fd: qbe_fd, next: 0, label: 0, funcs: prog.funcs, recs: prog.recs, unions: prog.unions, cur_loop: 0 - 1, cur_slot: 0 - 1, cur_ret: "", reset_mark: 0 - 1, fn_ptr: false, loop_mark: 0 - 1, alloc_stack: false, in_loop: false, stack_used: 0, routes: ri.sets, fsums: ri.sums, cur_fn: 0 - 1, alloc_node: "%node_0", carve_node: "%node_0", sur_mark: 0 - 1, loop_sur_mark: 0 - 1, nodesig: nsig })
+			let Emit ctx = Emit({ fd: qbe_fd, next: 0, label: 0, funcs: prog.funcs, recs: prog.recs, unions: prog.unions, cur_loop: 0 - 1, cur_slot: 0 - 1, cur_ret: "", reset_mark: 0 - 1, fn_ptr: false, loop_mark: 0 - 1, alloc_stack: false, in_loop: false, stack_used: 0, routes: ri.sets, fsums: ri.sums, cur_fn: 0 - 1, alloc_node: "%node_0", carve_node: "%node_0", grow_node: "%node_0", growok: no_names(), mk_env_base: 0 - 1, sur_mark: 0 - 1, loop_sur_mark: 0 - 1, nodesig: nsig })
 			emit_func!(&ctx, prog.funcs[i], i)
 		}
 		i = i + 1
