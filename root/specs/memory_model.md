@@ -357,16 +357,24 @@ never reset a child's storage — the pin of
 [geometry_lowering.md](./geometry_lowering.md) §5), so a dropped child node is
 reclaimed by the enclosing **survivor-scope mark** where one qualifies — a frame
 or loop from which nothing escapes frees the whole carve at its exit, bounded by
-that scope. Where no scope qualifies, a **fixed** child (`of(n)`) that provably dies
-in-frame is carved from the **residue side** instead — its handle never escapes
-and no `in`-call under it leaks a pointer out (the geometry-channel rules: an
+that scope. Where no scope qualifies, a child that provably dies in-frame is
+carved from the **residue side** instead — its handle never escapes and no
+`in`-call under it leaks a pointer out (the geometry-channel rules: an
 aggregate-returning or rehoming callee run `in b` pins `b`) — so the frame or
-iteration bracket reclaims the whole child regardless. Only the remaining
-unqualified cases — an escaping-pinned fixed child, and every **elastic** child
-(its pulls draw real storage from the parent) — stay until the *parent node's*
-teardown: **node-bounded, not frame-bounded**. The dropped-return loop, the
-per-call child arena, and the pointer-param carve (corpus tests 1353, 1307,
-1355; 1356 guards the pin) are the regression set.
+iteration bracket reclaims the whole child regardless. A **fixed** child
+(`of(n)`) needs two further gates (the *carve interlock*): the carve must be the
+binding's direct value, and a carve born inside a marked loop must not hand its
+handle across the back-edge (no outer assign target, no word use of the name).
+An **elastic** child (`grow(n)`) also parents its **pulls** on the residue side,
+so its chunks die with the frame or iteration too — but only under the full
+*pull-vs-bracket interlock*: every use of the handle is a geom clause, and every
+in-loop use follows an unconditional carve in that same loop, so no pull can
+land inside a bracket that resets before the child dies. Every gate fails toward
+survivor — a refused carve leaks until the *parent node's* teardown
+(**node-bounded, not frame-bounded**), never dangles. The dropped-return loop,
+the per-call child arena, and the pointer-param carve (corpus tests 1353, 1307,
+1355; 1356 guards the pin; 1359–1363 pin the interlock from both sides) are the
+regression set.
 
 For teardown to be sound the compiler promotes the **entire reachable closure**
 of the return value, not just its top: anything the return points at is promoted

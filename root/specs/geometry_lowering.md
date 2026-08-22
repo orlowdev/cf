@@ -548,7 +548,14 @@ Residue-free workloads never pay for the lane.
 
 **The pin.** Both subnodes' `parent` points at the parent node's **survivor**
 side, and headers/blocks are carved from it — a child's storage must never sit
-in a region a parent-frame bracket can reset.
+in a region a parent-frame bracket can reset. The one licensed exception is the
+**carve interlock** (memory_model §8): a child whose handle provably dies with
+the carving frame or iteration is carved from — and, for an elastic child, has
+its pulls parented on — the frame's **residue** side, precisely because the
+brackets that reset that region are the ones that outlive the child by
+construction (direct-value carve; no handle use crossing a marked loop's
+back-edge; elastic additionally geom-only uses ordered against every loop
+bracket). Every interlock gate fails toward the survivor pin.
 
 The rest of the family's hooks are uniform:
 
