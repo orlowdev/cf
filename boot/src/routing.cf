@@ -174,10 +174,24 @@ const plist_names = ([Param] ps): [Str] -> {
 # summary machinery.
 pub data FnSum = { Bool all_esc, [Bool] ret_al, [Bool] stores, Bool agg_ret, Bool rehomer }
 
+# A binding's comptime KIND, as much of the type as the routing walkers need: `shape` is one
+# of `$word` (a scalar — the ONLY exempt shape), `Str`, `$tuple`, `$rec`/`$uni` (name in
+# `name`), `$dyn`/`$ptr` (element type name in `name`), or `$agg` — the conservative unknown.
+# POLARITY: anything not provably `$word` pins like an aggregate.
+data Kind = { Str shape, Str name }
+
+# The per-function type environment: every binding name (params, lets, for-vars, match
+# payload binds) mapped to its Kind. Names never shadow (typecheck rejects it), so one flat
+# map per function is sound. Built in one forward pass before the fixpoint.
+data TEnv = { [Str] names, [Kind] kinds }
+
 # The small per-function callee table the walkers consult: the DISTINCT callee names of one
 # body, resolved once against the whole-program tables (so the fixpoint rounds never re-run
-# the global name search).
-data Sums = { [Str] names, [FnSum] tbl }
+# the global name search) — plus the function's type environment and the program's own
+# declaration tables, so a walker can judge a PROJECTION's scalarity in place (the
+# scalar-projection exemption: `s.len`, `p.v`, `xs[i]`-of-words copy a WORD out, so they
+# never pin their base).
+data Sums = { [Str] names, [FnSum] tbl, TEnv te, Program prog }
 
 const bit_at = ([Bool] bs, Iarch i): Bool -> if i >= Iarch(bs.len) then true else bs[i]
 
@@ -307,6 +321,46 @@ const sto_args = (Sums sm, Str callee, [Expr] args): [Expr] -> {
 	return r
 }
 
+# ── walk-time kind lookups (the scalar-projection exemption) ─────────────────────────────────
+
+const name_kind = (Sums sm, Str n): Kind -> tenv_kind(sm.te.names, sm.te.kinds, n)
+const name_scalar = (Sums sm, Str n): Bool -> kind_scalar(name_kind(sm, n))
+const expr_kind = (Sums sm, Expr e): Kind -> expr_kind_c(sm.prog, sm.te.names, sm.te.kinds, e)
+
+# The binds of one arm that can actually ALIAS payload storage: named (not `_`) and
+# non-scalar — a word payload is copied out, so its bind pins nothing.
+const agg_binds = (Sums sm, [Str] binds): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(binds.len) then break
+		if !str_eq(binds[i], "_") && !name_scalar(sm, binds[i]) then r = [...r, binds[i]]
+		i = i + 1
+	}
+	return r
+}
+
+const marms_agg_bind = (Sums sm, [MatchArm] arms): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		if Iarch(agg_binds(sm, arms[i].binds).len) > 0 then return true
+		i = i + 1
+	}
+	return false
+}
+
+const sarm_agg_binds = (Sums sm, [StmtArm] arms): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		r = cat_s(r, agg_binds(sm, arms[i].binds))
+		i = i + 1
+	}
+	return r
+}
+
 # ── evars: the names that escape when `e` sits in an ESCAPING position ───────────────────────
 # EXHAUSTIVE over Expr, no wildcard — a new variant fails the build until audited.
 
@@ -339,17 +393,20 @@ const evars = (Sums sm, Expr e): [Str] -> match e {
 	Expr.StrLit(_) -> no_strs(),
 	Expr.FloatLit(_) -> no_strs(),
 	Expr.Record(_, inits) -> evars_list(sm, field_values(inits)),
-	# an escaping projection pins its BASE: the read interior lives inside the base's block
-	Expr.Field(b, _) -> one_str(b),
-	Expr.FieldExpr(b, _) -> evars(sm, b),
+	# an escaping AGGREGATE projection pins its BASE (the read interior lives inside the
+	# base's block) — but a SCALAR projection (`s.len`, `p.v`, a word element) copies a WORD
+	# out, so no pointer into the base survives and nothing is pinned (the p2/p16 exemption)
+	Expr.Field(b, f) -> if kind_scalar(field_kind(sm.prog, name_kind(sm, b), f)) then no_strs() else one_str(b),
+	Expr.FieldExpr(be, f) -> if kind_scalar(field_kind(sm.prog, expr_kind(sm, be), f)) then no_strs() else evars(sm, be),
 	Expr.UnionMk(_, _, args) -> evars_list(sm, args),
-	# the arm value escapes; a payload bind aliases the scrutinee, so the scrutinee escapes too
-	Expr.Match(s, arms) -> cat_s(evars(sm, s), evars_marms(sm, arms)),
+	# the arm value escapes; a payload bind may alias the scrutinee — but only an AGGREGATE
+	# payload bind can (a word payload is copied), so a match binding only words pins nothing
+	Expr.Match(s, arms) -> cat_s(if marms_agg_bind(sm, arms) then evars(sm, s) else no_strs(), evars_marms(sm, arms)),
 	# BOTH the spread source (its element pointers are copied into the new spine) and the elements
 	Expr.ArrayLit(_, sp, elems, _) -> cat_s(evars(sm, sp), evars_list(sm, elems)),
-	Expr.Index(b, _) -> one_str(b),
-	Expr.IndexField(b, _, _) -> one_str(b),
-	Expr.IndexExpr(b, _) -> evars(sm, b),
+	Expr.Index(b, _) -> if kind_scalar(elem_kind(sm.prog, name_kind(sm, b))) then no_strs() else one_str(b),
+	Expr.IndexField(b, _, f) -> if kind_scalar(field_kind(sm.prog, elem_kind(sm.prog, name_kind(sm, b)), f)) then no_strs() else one_str(b),
+	Expr.IndexExpr(be, _) -> if kind_scalar(elem_kind(sm.prog, expr_kind(sm, be))) then no_strs() else evars(sm, be),
 	# a hole's bytes are COPIED into the string (cf_str_append) — no aliasing, no escape
 	Expr.Interp(_) -> no_strs(),
 	Expr.Tuple(elems) -> evars_list(sm, elems),
@@ -668,11 +725,11 @@ const calls_body! = ([Stmt] ss): [Str] -> {
 
 const aroots = (Sums sm, Expr e): [Str] -> match e {
 	Expr.Var(n) -> one_str(n),
-	Expr.Field(b, _) -> one_str(b),
-	Expr.FieldExpr(b, _) -> aroots(sm, b),
-	Expr.Index(b, _) -> one_str(b),
-	Expr.IndexField(b, _, _) -> one_str(b),
-	Expr.IndexExpr(b, _) -> aroots(sm, b),
+	Expr.Field(b, f) -> if kind_scalar(field_kind(sm.prog, name_kind(sm, b), f)) then no_strs() else one_str(b),
+	Expr.FieldExpr(be, f) -> if kind_scalar(field_kind(sm.prog, expr_kind(sm, be), f)) then no_strs() else aroots(sm, be),
+	Expr.Index(b, _) -> if kind_scalar(elem_kind(sm.prog, name_kind(sm, b))) then no_strs() else one_str(b),
+	Expr.IndexField(b, _, f) -> if kind_scalar(field_kind(sm.prog, elem_kind(sm.prog, name_kind(sm, b)), f)) then no_strs() else one_str(b),
+	Expr.IndexExpr(be, _) -> if kind_scalar(elem_kind(sm.prog, expr_kind(sm, be))) then no_strs() else aroots(sm, be),
 	Expr.Spread(x) -> aroots(sm, x),
 	Expr.If(_, t, el) -> cat_s(aroots(sm, t), aroots(sm, el)),
 	Expr.Match(_, arms) -> aroots_marms(sm, arms),
@@ -770,9 +827,9 @@ const rroots_stmt! = (RCtx cx, Stmt s): [Str] -> match s {
 	# a bind escaping pins the destructured source
 	Stmt.Destructure(binds, _, e) -> if any_in(cx.rset, binds) then evars(cx.sm, e) else no_strs(),
 	# the loop variable escaping pins the array (the element lives in the array's block)
-	Stmt.ForIn(v, arr, ss) -> if has_name(cx.rset, v) then cat_s(one_str(arr), rroots_body!(cx, ss)) else rroots_body!(cx, ss),
-	# a payload bind escaping pins the scrutinee
-	Stmt.Match(sc, arms) -> if any_in(cx.rset, sarm_binds(arms)) then cat_s(evars(cx.sm, sc), rroots_sarms!(cx, arms)) else rroots_sarms!(cx, arms),
+	Stmt.ForIn(v, arr, ss) -> if has_name(cx.rset, v) && !name_scalar(cx.sm, v) then cat_s(one_str(arr), rroots_body!(cx, ss)) else rroots_body!(cx, ss),
+	# an AGGREGATE payload bind escaping pins the scrutinee (a word bind copies)
+	Stmt.Match(sc, arms) -> if any_in(cx.rset, sarm_agg_binds(cx.sm, arms)) then cat_s(evars(cx.sm, sc), rroots_sarms!(cx, arms)) else rroots_sarms!(cx, arms),
 	Stmt.IfThen(_, b) -> rroots_stmt!(cx, b),
 	Stmt.IfElse(_, t, el) -> cat_s(rroots_stmt!(cx, t), rroots_stmt!(cx, el)),
 	Stmt.Block(ss) -> rroots_body!(cx, ss),
@@ -838,8 +895,8 @@ const sroots_stmt! = (RCtx cx, Stmt s): [Str] -> match s {
 	Stmt.DeepFieldAssign(be, _, val) -> if s_target(cx, deep_root(be)) then evars(cx.sm, val) else no_strs(),
 	Stmt.Let(n, _, _, init) -> if has_name(cx.sset, n) then evars(cx.sm, init) else no_strs(),
 	Stmt.Destructure(binds, _, e) -> if any_in(cx.sset, binds) then evars(cx.sm, e) else no_strs(),
-	Stmt.ForIn(v, arr, ss) -> if has_name(cx.sset, v) then cat_s(one_str(arr), sroots_body!(cx, ss)) else sroots_body!(cx, ss),
-	Stmt.Match(sc, arms) -> if any_in(cx.sset, sarm_binds(arms)) then cat_s(evars(cx.sm, sc), sroots_sarms!(cx, arms)) else sroots_sarms!(cx, arms),
+	Stmt.ForIn(v, arr, ss) -> if has_name(cx.sset, v) && !name_scalar(cx.sm, v) then cat_s(one_str(arr), sroots_body!(cx, ss)) else sroots_body!(cx, ss),
+	Stmt.Match(sc, arms) -> if any_in(cx.sset, sarm_agg_binds(cx.sm, arms)) then cat_s(evars(cx.sm, sc), sroots_sarms!(cx, arms)) else sroots_sarms!(cx, arms),
 	Stmt.IfThen(_, b) -> sroots_stmt!(cx, b),
 	Stmt.IfElse(_, t, el) -> cat_s(sroots_stmt!(cx, t), sroots_stmt!(cx, el)),
 	Stmt.Block(ss) -> sroots_body!(cx, ss),
@@ -899,8 +956,8 @@ const sroots_body! = (RCtx cx, [Stmt] ss): [Str] -> {
 const fwd_stmt! = (RCtx cx, Stmt s): [Str] -> match s {
 	Stmt.Let(n, _, _, init) -> if any_target(cx, aroots(cx.sm, init)) then one_str(n) else no_strs(),
 	Stmt.Destructure(binds, _, e) -> if any_target(cx, aroots(cx.sm, e)) then binds else no_strs(),
-	Stmt.ForIn(v, arr, ss) -> if is_target(cx, arr) then cat_s(one_str(v), fwd_body!(cx, ss)) else fwd_body!(cx, ss),
-	Stmt.Match(sc, arms) -> if any_target(cx, aroots(cx.sm, sc)) then cat_s(sarm_binds(arms), fwd_sarms!(cx, arms)) else fwd_sarms!(cx, arms),
+	Stmt.ForIn(v, arr, ss) -> if is_target(cx, arr) && !name_scalar(cx.sm, v) then cat_s(one_str(v), fwd_body!(cx, ss)) else fwd_body!(cx, ss),
+	Stmt.Match(sc, arms) -> if any_target(cx, aroots(cx.sm, sc)) then cat_s(sarm_agg_binds(cx.sm, arms), fwd_sarms!(cx, arms)) else fwd_sarms!(cx, arms),
 	Stmt.IfThen(_, b) -> fwd_stmt!(cx, b),
 	Stmt.IfElse(_, t, el) -> cat_s(fwd_stmt!(cx, t), fwd_stmt!(cx, el)),
 	Stmt.Block(ss) -> fwd_body!(cx, ss),
@@ -988,11 +1045,310 @@ const find_fn = ([Func] funcs, Str name): Iarch -> {
 	return -1
 }
 
+# ── the kind table (the scalar-projection exemption's type knowledge) ────────────────────────
+
+const kw = (): Kind -> Kind({ shape: "$word", name: "" })
+const kagg = (): Kind -> Kind({ shape: "$agg", name: "" })
+const kmk = (Str sh, Str nm): Kind -> Kind({ shape: sh, name: nm })
+const kind_scalar = (Kind k): Bool -> str_eq(k.shape, "$word")
+
+const union_boxed_r = (Program prog, Str u): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(prog.unions.len) then break
+		if str_eq(prog.unions[i].name, u) then {
+			let Iarch j = 0
+			loop {
+				if j >= Iarch(prog.unions[i].members.len) then break
+				if Iarch(prog.unions[i].members[j].payloads.len) > 0 then return true
+				j = j + 1
+			}
+			return false
+		}
+		i = i + 1
+	}
+	return false
+}
+
+const find_rec_r = (Program prog, Str n): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(prog.recs.len) then break
+		if str_eq(prog.recs[i].name, n) then return i
+		i = i + 1
+	}
+	return -1
+}
+
+# A bare TYPE NAME's kind (an annotation, a record field's ftype, a callee's ret_name).
+const kind_of_tname = (Program prog, Str tn): Kind -> {
+	if is_scalar_ret(tn) then return kw()
+	if str_eq(tn, "Str") then return kmk("Str", "")
+	if str_eq(tn, "$tuple") then return kmk("$tuple", "")
+	if find_rec_r(prog, tn) >= 0 then return kmk("$rec", tn)
+	if union_boxed_r(prog, tn) then return kmk("$uni", tn)
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(prog.unions.len) then break
+		if str_eq(prog.unions[i].name, tn) then return kw()
+		i = i + 1
+	}
+	return kagg()
+}
+
+# A FIELD/PAYLOAD type slot's kind: the `$dyn`/`$ptr` markers carry their element beside them.
+const kind_of_ftype = (Program prog, Str ft, Str felem): Kind -> {
+	if str_eq(ft, "$dyn") then return kmk("$dyn", felem)
+	if str_eq(ft, "$ptr") then return kmk("$ptr", felem)
+	return kind_of_tname(prog, ft)
+}
+
+# The kind of `base.f` given the base's kind. `.len` on a string/array/pointer is a word;
+# `.bytes` hands out a raw pointer into the backing — never exempt.
+const field_kind = (Program prog, Kind bk, Str f): Kind -> {
+	if str_eq(bk.shape, "Str") || str_eq(bk.shape, "$dyn") || str_eq(bk.shape, "$ptr") then {
+		if str_eq(f, "len") then return kw()
+		return kagg()
+	}
+	if str_eq(bk.shape, "$rec") then {
+		const Iarch ri = find_rec_r(prog, bk.name)
+		if ri < 0 then return kagg()
+		let Iarch i = 0
+		loop {
+			if i >= Iarch(prog.recs[ri].fields.len) then break
+			if str_eq(prog.recs[ri].fields[i], f) then return kind_of_ftype(prog, prog.recs[ri].ftypes[i], prog.recs[ri].felems[i])
+			i = i + 1
+		}
+		return kagg()
+	}
+	return kagg()
+}
+
+# The kind of `base[i]` given the base's kind: a byte off a string/byte-pointer is a word,
+# an array element is its element type's kind.
+const elem_kind = (Program prog, Kind bk): Kind -> {
+	if str_eq(bk.shape, "Str") then return kw()
+	if str_eq(bk.shape, "$dyn") || str_eq(bk.shape, "$ptr") then return kind_of_tname(prog, bk.name)
+	return kagg()
+}
+
+const kind_join = (Kind a, Kind b): Kind -> {
+	if str_eq(a.shape, b.shape) && str_eq(a.name, b.name) then return a
+	return kagg()
+}
+
+const tenv_kind = ([Str] tn, [Kind] tk, Str n): Kind -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(tn.len) then break
+		if str_eq(tn[i], n) then return tk[i]
+		i = i + 1
+	}
+	return kagg()
+}
+
+# The kind a CALL evaluates to (the callee's declared return; intrinsics by table).
+const call_kind = (Program prog, Str callee): Kind -> {
+	const Iarch j = find_fn(prog.funcs, callee)
+	if j >= 0 then {
+		if str_eq(prog.funcs[j].ret_name, "$dyn") then return kmk("$dyn", prog.funcs[j].ret_elem)
+		return kind_of_tname(prog, prog.funcs[j].ret_name)
+	}
+	if is_cast_name(callee) then return kw()
+	if str_eq(callee, "Str") then return kmk("Str", "")
+	if is_routing_intrinsic(callee) then return kw()
+	return kagg()
+}
+
+# The kind an EXPRESSION evaluates to — the inference core, shared by the env build (over
+# the growing arrays) and the walk-time wrapper. Conservative: unknown forms are `$agg`.
+const expr_kind_c = (Program prog, [Str] tn, [Kind] tk, Expr e): Kind -> match e {
+	Expr.Var(n) -> tenv_kind(tn, tk, n),
+	Expr.Lit(_) -> kw(),
+	Expr.BoolLit(_) -> kw(),
+	Expr.FloatLit(_) -> kw(),
+	Expr.Unit -> kw(),
+	Expr.StrLit(_) -> kmk("Str", ""),
+	Expr.Interp(_) -> kmk("Str", ""),
+	Expr.Record(tnm, _) -> if str_eq(tnm, "") then kagg() else kmk("$rec", tnm),
+	Expr.ArrayLit(_, _, _, et) -> kmk("$dyn", et),
+	Expr.Buffer(_) -> kmk("$dyn", "Uint8"),
+	Expr.Tuple(_) -> kmk("$tuple", ""),
+	Expr.UnionMk(u, _, _) -> if union_boxed_r(prog, u) then kmk("$uni", u) else kw(),
+	Expr.Field(b, f) -> field_kind(prog, tenv_kind(tn, tk, b), f),
+	Expr.FieldExpr(be, f) -> field_kind(prog, expr_kind_c(prog, tn, tk, be), f),
+	Expr.Index(b, _) -> elem_kind(prog, tenv_kind(tn, tk, b)),
+	Expr.IndexField(b, _, f) -> field_kind(prog, elem_kind(prog, tenv_kind(tn, tk, b)), f),
+	Expr.IndexExpr(be, _) -> elem_kind(prog, expr_kind_c(prog, tn, tk, be)),
+	Expr.Call(n, _, _, _) -> call_kind(prog, n),
+	Expr.If(_, t, el) -> kind_join(expr_kind_c(prog, tn, tk, t), expr_kind_c(prog, tn, tk, el)),
+	Expr.Neg(_) -> kw(),
+	Expr.Not(_) -> kw(),
+	Expr.BitNot(_) -> kw(),
+	Expr.Add(_, _) -> kw(),
+	Expr.Sub(_, _) -> kw(),
+	Expr.Mul(_, _) -> kw(),
+	Expr.Div(_, _) -> kw(),
+	Expr.Mod(_, _) -> kw(),
+	Expr.BitAnd(_, _) -> kw(),
+	Expr.BitOr(_, _) -> kw(),
+	Expr.BitXor(_, _) -> kw(),
+	Expr.Shl(_, _) -> kw(),
+	Expr.Shr(_, _) -> kw(),
+	Expr.CmpEq(_, _) -> kw(),
+	Expr.CmpNe(_, _) -> kw(),
+	Expr.CmpLt(_, _) -> kw(),
+	Expr.CmpGt(_, _) -> kw(),
+	Expr.CmpLe(_, _) -> kw(),
+	Expr.CmpGe(_, _) -> kw(),
+	Expr.And(_, _) -> kw(),
+	Expr.Or(_, _) -> kw(),
+	Expr.Spread(x) -> expr_kind_c(prog, tn, tk, x),
+	_ -> kagg()
+}
+
+# One match arm's payload binds mapped to their payload kinds (a single-member arm binds
+# positionally; `_` positions are skipped by name).
+const bind_kinds = (Program prog, Str uname, [Str] members, [Str] binds, [Str] tn0, [Kind] tk0): TEnv -> {
+	let [Str] tn = tn0
+	let [Kind] tk = tk0
+	let Iarch ui = 0
+	loop {
+		if ui >= Iarch(prog.unions.len) then break
+		if str_eq(prog.unions[ui].name, uname) then {
+			if Iarch(members.len) != 1 then return TEnv({ names: tn, kinds: tk })
+			let Iarch mi = 0
+			loop {
+				if mi >= Iarch(prog.unions[ui].members.len) then break
+				if str_eq(prog.unions[ui].members[mi].name, members[0]) then {
+					let Iarch b = 0
+					loop {
+						if b >= Iarch(binds.len) then break
+						if b < Iarch(prog.unions[ui].members[mi].payloads.len) then {
+							tn = [...tn, binds[b]]
+							tk = [...tk, kind_of_ftype(prog, prog.unions[ui].members[mi].payloads[b], prog.unions[ui].members[mi].pelems[b])]
+						}
+						b = b + 1
+					}
+					return TEnv({ names: tn, kinds: tk })
+				}
+				mi = mi + 1
+			}
+		}
+		ui = ui + 1
+	}
+	# unknown union/member: bind everything conservatively
+	let Iarch b2 = 0
+	loop {
+		if b2 >= Iarch(binds.len) then break
+		tn = [...tn, binds[b2]]
+		tk = [...tk, kagg()]
+		b2 = b2 + 1
+	}
+	return TEnv({ names: tn, kinds: tk })
+}
+
+const tenv_stmt = (Program prog, TEnv te, Stmt s): TEnv -> match s {
+	Stmt.Let(n, _, ann, init) -> tenv_add_let(prog, te, n, ann, init),
+	Stmt.ForIn(v, arr, ss) -> tenv_body(prog, tenv_add(te, v, elem_kind(prog, tenv_kind(te.names, te.kinds, arr))), ss),
+	Stmt.Destructure(binds, _, _) -> tenv_add_all(te, binds),
+	Stmt.Match(_, arms) -> tenv_sarms(prog, te, arms),
+	Stmt.IfThen(_, b) -> tenv_stmt(prog, te, b),
+	Stmt.IfElse(_, t, el) -> tenv_stmt(prog, tenv_stmt(prog, te, t), el),
+	Stmt.Block(ss) -> tenv_body(prog, te, ss),
+	Stmt.Loop(ss) -> tenv_body(prog, te, ss),
+	Stmt.Defer(ss) -> tenv_body(prog, te, ss),
+	Stmt.Closure(_, _, _, cb) -> tenv_body(prog, te, cb),
+	_ -> te
+}
+
+const tenv_add = (TEnv te, Str n, Kind k): TEnv -> {
+	const [Str] tn = [...te.names, n]
+	const [Kind] tk = [...te.kinds, k]
+	return TEnv({ names: tn, kinds: tk })
+}
+
+const tenv_add_all = (TEnv te, [Str] ns): TEnv -> {
+	let TEnv r = te
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ns.len) then break
+		r = tenv_add(r, ns[i], kagg())
+		i = i + 1
+	}
+	return r
+}
+
+# A `let`'s kind: the annotation when it names a type, else inferred from the initializer's
+# shape. Value-block initializers also declare their INNER bindings (walked for the flat map).
+const tenv_add_let = (Program prog, TEnv te, Str n, Str ann, Expr init): TEnv -> {
+	let TEnv r = te
+	r = match init {
+		Expr.Loop(ss) -> tenv_body(prog, r, ss),
+		_ -> r
+	}
+	let Kind k = expr_kind_c(prog, r.names, r.kinds, init)
+	if !str_eq(ann, "") then {
+		const Kind ka = kind_of_tname(prog, ann)
+		if !str_eq(ka.shape, "$agg") then k = ka
+	}
+	return tenv_add(r, n, k)
+}
+
+const tenv_sarms = (Program prog, TEnv te, [StmtArm] arms): TEnv -> {
+	let TEnv r = te
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		if !arms[i].is_wild && Iarch(arms[i].binds.len) > 0 then r = bind_kinds(prog, arms[i].type_name, arms[i].members, arms[i].binds, r.names, r.kinds)
+		r = tenv_body(prog, r, arms[i].body)
+		i = i + 1
+	}
+	return r
+}
+
+const tenv_body = (Program prog, TEnv te, [Stmt] ss): TEnv -> {
+	let TEnv r = te
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		r = tenv_stmt(prog, r, ss[i])
+		i = i + 1
+	}
+	return r
+}
+
+# A parameter's kind from its declaration.
+const param_kind = (Program prog, Param p): Kind -> {
+	if p.is_ptr then {
+		if str_eq(p.type_name, "$ptr") then return kmk("$ptr", p.elem)
+		return kind_of_tname(prog, p.type_name)
+	}
+	if str_eq(p.type_name, "$dyn") then return kmk("$dyn", p.elem)
+	if str_eq(p.type_name, "$tuple") then return kmk("$tuple", "")
+	if str_eq(p.type_name, "$fn") then return kw()
+	if str_eq(p.type_name, "$capref") || str_eq(p.type_name, "$capagg") then return kagg()
+	return kind_of_tname(prog, p.type_name)
+}
+
+const tenv_build! = (Program prog, Func f): TEnv -> {
+	let [Str] tn = []
+	let [Kind] tk = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(f.params.len) then break
+		tn = [...tn, f.params[i].name]
+		tk = [...tk, param_kind(prog, f.params[i])]
+		i = i + 1
+	}
+	return tenv_body(prog, TEnv({ names: tn, kinds: tk }), f.body)
+}
+
 # Resolve one body's distinct callee names into the small table the walkers consult. An
 # in-progress callee (state 1 — a recursion/SCC back-edge) resolves to ⊤ exactly like an
 # unknown one: the memo's "SCC ⇒ all-args-escape", applied at the call site. The state
 # tables ride in as `*[T]` references (read here, written by the DFS).
-const local_sums = (Program prog, *[FnSum] sums, *[Iarch] st, [Str] cns): Sums -> {
+const local_sums = (Program prog, *[FnSum] sums, *[Iarch] st, [Str] cns, TEnv te): Sums -> {
 	let [Str] ln = []
 	let [FnSum] lt = []
 	let Iarch i = 0
@@ -1011,7 +1367,7 @@ const local_sums = (Program prog, *[FnSum] sums, *[Iarch] st, [Str] cns): Sums -
 		}
 		i = i + 1
 	}
-	return Sums({ names: ln, tbl: lt })
+	return Sums({ names: ln, tbl: lt, te: te, prog: prog })
 }
 
 # A scalar return carries no pointer into the callee's ambient node; everything else might.
@@ -1079,7 +1435,8 @@ const summarize! = (Program prog, *[FnSum] sums, *[Iarch] st, *[RSets] rsets, Ia
 		}
 		i = i + 1
 	}
-	const Sums sm = local_sums(prog, sums, st, cns)
+	const TEnv te = tenv_build!(prog, prog.funcs[k])
+	const Sums sm = local_sums(prog, sums, st, cns, te)
 	const [Str] params = plist_names(prog.funcs[k].params)
 	const RSets rs = shadow_sets!(sm, params, prog.funcs[k].body)
 	sums[k] = mk_summary(prog.funcs[k], params, rs)
