@@ -389,46 +389,65 @@ const binding_is_agg = ([Binding] env, Str name): Bool -> {
 	return false
 }
 
-# Does an expression take an address (`&x`)? An `&` hands a writable pointer to a callee, which could
-# rehome an iteration-local into a caller aggregate — so its presence disqualifies the loop. Unknown
-# / value-block forms (Match, Loop, Interp, DeferTap) default to `true` (conservative — no reset).
-const exprs_have_addr = ([Expr] es): Bool -> {
+# May a DIRECT call rehome an allocation into memory that outlives the reset scope? A callee
+# with a writable pointer parameter (`*Record`/`*[T]`) can store an aggregate it allocates —
+# in OUR region, above the loop mark — into whatever the pointer roots in (the p5 dangle: the
+# back-edge reset frees records the callee rehomed into an outer table). A closure-lifted
+# callee rehomes through its hidden capture params the same way. An indirect/unknown callee is
+# opaque ⇒ unsafe. Casts and `Str` retain nothing; an asm body takes scalars and writes bytes,
+# not arena pointers. Plain `[T]`/value-aggregate params are READ-ONLY views (the write-
+# through-const rule), so only the direct callee's own signature matters — no transitivity.
+const call_may_rehome = (*Emit ctx, Str callee): Bool -> {
+	if is_cast_type(callee) || str_eq(callee, "Str") then return false
+	const Iarch fidx = find_func(ctx.funcs, callee)
+	if fidx < 0 then return true
+	if ctx.funcs[fidx].is_asm then return false
+	if any_ptr_param(ctx.funcs[fidx].params) then return true
+	if has_cap_param(ctx.funcs[fidx]) then return true
+	return false
+}
+
+# Does an expression take an address (`&x`) or make a call that may rehome (above)? An `&`
+# hands a writable pointer to a callee, which could rehome an iteration-local into a caller
+# aggregate — so its presence disqualifies the loop. Unknown / value-block forms (Match, Loop,
+# Interp, DeferTap) default to `true` (conservative — no reset).
+const exprs_have_addr = (*Emit ctx, [Expr] es): Bool -> {
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(es.len) then break
-		if expr_has_addr(es[i]) then return true
+		if expr_has_addr(ctx, es[i]) then return true
 		i = i + 1
 	}
 	return false
 }
-const finits_have_addr = ([FieldInit] fs): Bool -> {
+const finits_have_addr = (*Emit ctx, [FieldInit] fs): Bool -> {
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(fs.len) then break
-		if expr_has_addr(fs[i].value) then return true
+		if expr_has_addr(ctx, fs[i].value) then return true
 		i = i + 1
 	}
 	return false
 }
-const expr_has_addr = (Expr e): Bool -> match e {
+const expr_has_addr = (*Emit ctx, Expr e): Bool -> match e {
 	Expr.Lit(_) -> false, Expr.BoolLit(_) -> false, Expr.Var(_) -> false, Expr.StrLit(_) -> false, Expr.FloatLit(_) -> false, Expr.Unit -> false,
 	Expr.Field(_, _) -> false,
 	Expr.Addr(_) -> true,
-	Expr.FieldExpr(b, _) -> expr_has_addr(b),
-	Expr.Index(_, ix) -> expr_has_addr(ix),
-	Expr.IndexField(_, ix, _) -> expr_has_addr(ix),
-	Expr.IndexExpr(b, ix) -> expr_has_addr(b) || expr_has_addr(ix),
-	Expr.Record(_, fs) -> finits_have_addr(fs),
-	Expr.ArrayLit(_, sp, elems, _) -> expr_has_addr(sp) || exprs_have_addr(elems),
-	Expr.Tuple(es) -> exprs_have_addr(es),
-	Expr.UnionMk(_, _, args) -> exprs_have_addr(args),
-	Expr.Call(_, _, args, _) -> exprs_have_addr(args),
-	Expr.If(c, t, e2) -> expr_has_addr(c) || expr_has_addr(t) || expr_has_addr(e2),
-	Expr.Neg(x) -> expr_has_addr(x), Expr.Not(x) -> expr_has_addr(x), Expr.BitNot(x) -> expr_has_addr(x), Expr.Spread(x) -> expr_has_addr(x), Expr.Buffer(x) -> expr_has_addr(x),
-	Expr.Add(a, b) -> expr_has_addr(a) || expr_has_addr(b), Expr.Sub(a, b) -> expr_has_addr(a) || expr_has_addr(b), Expr.Mul(a, b) -> expr_has_addr(a) || expr_has_addr(b), Expr.Div(a, b) -> expr_has_addr(a) || expr_has_addr(b), Expr.Mod(a, b) -> expr_has_addr(a) || expr_has_addr(b),
-	Expr.BitAnd(a, b) -> expr_has_addr(a) || expr_has_addr(b), Expr.BitOr(a, b) -> expr_has_addr(a) || expr_has_addr(b), Expr.BitXor(a, b) -> expr_has_addr(a) || expr_has_addr(b), Expr.Shl(a, b) -> expr_has_addr(a) || expr_has_addr(b), Expr.Shr(a, b) -> expr_has_addr(a) || expr_has_addr(b),
-	Expr.CmpEq(a, b) -> expr_has_addr(a) || expr_has_addr(b), Expr.CmpNe(a, b) -> expr_has_addr(a) || expr_has_addr(b), Expr.CmpLt(a, b) -> expr_has_addr(a) || expr_has_addr(b), Expr.CmpGt(a, b) -> expr_has_addr(a) || expr_has_addr(b), Expr.CmpLe(a, b) -> expr_has_addr(a) || expr_has_addr(b), Expr.CmpGe(a, b) -> expr_has_addr(a) || expr_has_addr(b),
-	Expr.And(a, b) -> expr_has_addr(a) || expr_has_addr(b), Expr.Or(a, b) -> expr_has_addr(a) || expr_has_addr(b),
+	Expr.FieldExpr(b, _) -> expr_has_addr(ctx, b),
+	Expr.Index(_, ix) -> expr_has_addr(ctx, ix),
+	Expr.IndexField(_, ix, _) -> expr_has_addr(ctx, ix),
+	Expr.IndexExpr(b, ix) -> expr_has_addr(ctx, b) || expr_has_addr(ctx, ix),
+	Expr.Record(_, fs) -> finits_have_addr(ctx, fs),
+	Expr.ArrayLit(_, sp, elems, _) -> expr_has_addr(ctx, sp) || exprs_have_addr(ctx, elems),
+	Expr.Tuple(es) -> exprs_have_addr(ctx, es),
+	Expr.UnionMk(_, _, args) -> exprs_have_addr(ctx, args),
+	Expr.Call(n, _, args, _) -> call_may_rehome(ctx, n) || exprs_have_addr(ctx, args),
+	Expr.If(c, t, e2) -> expr_has_addr(ctx, c) || expr_has_addr(ctx, t) || expr_has_addr(ctx, e2),
+	Expr.Neg(x) -> expr_has_addr(ctx, x), Expr.Not(x) -> expr_has_addr(ctx, x), Expr.BitNot(x) -> expr_has_addr(ctx, x), Expr.Spread(x) -> expr_has_addr(ctx, x), Expr.Buffer(x) -> expr_has_addr(ctx, x),
+	Expr.Add(a, b) -> expr_has_addr(ctx, a) || expr_has_addr(ctx, b), Expr.Sub(a, b) -> expr_has_addr(ctx, a) || expr_has_addr(ctx, b), Expr.Mul(a, b) -> expr_has_addr(ctx, a) || expr_has_addr(ctx, b), Expr.Div(a, b) -> expr_has_addr(ctx, a) || expr_has_addr(ctx, b), Expr.Mod(a, b) -> expr_has_addr(ctx, a) || expr_has_addr(ctx, b),
+	Expr.BitAnd(a, b) -> expr_has_addr(ctx, a) || expr_has_addr(ctx, b), Expr.BitOr(a, b) -> expr_has_addr(ctx, a) || expr_has_addr(ctx, b), Expr.BitXor(a, b) -> expr_has_addr(ctx, a) || expr_has_addr(ctx, b), Expr.Shl(a, b) -> expr_has_addr(ctx, a) || expr_has_addr(ctx, b), Expr.Shr(a, b) -> expr_has_addr(ctx, a) || expr_has_addr(ctx, b),
+	Expr.CmpEq(a, b) -> expr_has_addr(ctx, a) || expr_has_addr(ctx, b), Expr.CmpNe(a, b) -> expr_has_addr(ctx, a) || expr_has_addr(ctx, b), Expr.CmpLt(a, b) -> expr_has_addr(ctx, a) || expr_has_addr(ctx, b), Expr.CmpGt(a, b) -> expr_has_addr(ctx, a) || expr_has_addr(ctx, b), Expr.CmpLe(a, b) -> expr_has_addr(ctx, a) || expr_has_addr(ctx, b), Expr.CmpGe(a, b) -> expr_has_addr(ctx, a) || expr_has_addr(ctx, b),
+	Expr.And(a, b) -> expr_has_addr(ctx, a) || expr_has_addr(ctx, b), Expr.Or(a, b) -> expr_has_addr(ctx, a) || expr_has_addr(ctx, b),
 	_ -> true
 }
 
@@ -492,42 +511,42 @@ const no_names = (): [Str] -> {
 
 # Does any statement let an iteration-local aggregate escape (return / yield / write to an outer
 # aggregate / rehome into an outer base / take an `&`)? Conservative: unknown forms escape.
-const body_escapes = ([Binding] env, [Str] locals, [Stmt] ss): Bool -> {
+const body_escapes = (*Emit ctx, [Binding] env, [Str] locals, [Stmt] ss): Bool -> {
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(ss.len) then break
-		if stmt_escapes(env, locals, ss[i]) then return true
+		if stmt_escapes(ctx, env, locals, ss[i]) then return true
 		i = i + 1
 	}
 	return false
 }
-const arms_escape = ([Binding] env, [Str] locals, [StmtArm] arms): Bool -> {
+const arms_escape = (*Emit ctx, [Binding] env, [Str] locals, [StmtArm] arms): Bool -> {
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(arms.len) then break
-		if body_escapes(env, locals, arms[i].body) then return true
+		if body_escapes(ctx, env, locals, arms[i].body) then return true
 		i = i + 1
 	}
 	return false
 }
-const stmt_escapes = ([Binding] env, [Str] locals, Stmt s): Bool -> match s {
+const stmt_escapes = (*Emit ctx, [Binding] env, [Str] locals, Stmt s): Bool -> match s {
 	Stmt.Return(_) -> true,
 	Stmt.Yield(_) -> true,
 	Stmt.Break -> false,
 	Stmt.Continue -> false,
-	Stmt.Let(_, _, _, init) -> expr_has_addr(init),
-	Stmt.Assign(n, val) -> (!has_str(locals, n) && binding_is_agg(env, n)) || expr_has_addr(val),
-	Stmt.FieldAssign(base, _, val) -> !has_str(locals, base) || expr_has_addr(val),
-	Stmt.IndexAssign(base, ix, val) -> !has_str(locals, base) || expr_has_addr(ix) || expr_has_addr(val),
+	Stmt.Let(_, _, _, init) -> expr_has_addr(ctx, init),
+	Stmt.Assign(n, val) -> (!has_str(locals, n) && binding_is_agg(env, n)) || expr_has_addr(ctx, val),
+	Stmt.FieldAssign(base, _, val) -> !has_str(locals, base) || expr_has_addr(ctx, val),
+	Stmt.IndexAssign(base, ix, val) -> !has_str(locals, base) || expr_has_addr(ctx, ix) || expr_has_addr(ctx, val),
 	Stmt.DeepFieldAssign(_, _, _) -> true,
-	Stmt.Do(e) -> expr_has_addr(e),
-	Stmt.IfThen(c, s2) -> expr_has_addr(c) || stmt_escapes(env, locals, s2),
-	Stmt.IfElse(c, t, el) -> expr_has_addr(c) || stmt_escapes(env, locals, t) || stmt_escapes(env, locals, el),
-	Stmt.Block(ss) -> body_escapes(env, locals, ss),
-	Stmt.Loop(ss) -> body_escapes(env, locals, ss),
-	Stmt.ForIn(_, _, ss) -> body_escapes(env, locals, ss),
-	Stmt.Match(sc, arms) -> expr_has_addr(sc) || arms_escape(env, locals, arms),
-	Stmt.Destructure(_, _, e) -> expr_has_addr(e),
+	Stmt.Do(e) -> expr_has_addr(ctx, e),
+	Stmt.IfThen(c, s2) -> expr_has_addr(ctx, c) || stmt_escapes(ctx, env, locals, s2),
+	Stmt.IfElse(c, t, el) -> expr_has_addr(ctx, c) || stmt_escapes(ctx, env, locals, t) || stmt_escapes(ctx, env, locals, el),
+	Stmt.Block(ss) -> body_escapes(ctx, env, locals, ss),
+	Stmt.Loop(ss) -> body_escapes(ctx, env, locals, ss),
+	Stmt.ForIn(_, _, ss) -> body_escapes(ctx, env, locals, ss),
+	Stmt.Match(sc, arms) -> expr_has_addr(ctx, sc) || arms_escape(ctx, env, locals, arms),
+	Stmt.Destructure(_, _, e) -> expr_has_addr(ctx, e),
 	_ -> true
 }
 
@@ -538,7 +557,7 @@ const loop_reset_safe = (*Emit ctx, [Binding] env, Str loopvar, [Stmt] body): Bo
 	if ctx.fn_ptr then return false
 	let [Str] locals = stmts_locals(body)
 	if !str_eq(loopvar, "") then locals = cat_names(locals, one_name(loopvar))
-	return !body_escapes(env, locals, body)
+	return !body_escapes(ctx, env, locals, body)
 }
 
 # The RETURN signature position of a `$fn` binding — the last telem of its whole `[args…, ret]`
