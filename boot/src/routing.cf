@@ -165,7 +165,7 @@ const plist_names = ([Param] ps): [Str] -> {
 # STORED beyond the callee's frame (`stores`). `all_esc` is ⊤ — every argument escapes — used
 # for asm bodies, indirect/unknown callees, and DFS back-edges (recursion/SCC). Out-of-range
 # bit reads default to TRUE (bit_at), so an arity surprise degrades to escape, never a miss.
-data FnSum = { Bool all_esc, [Bool] ret_al, [Bool] stores }
+pub data FnSum = { Bool all_esc, [Bool] ret_al, [Bool] stores }
 
 # The small per-function callee table the walkers consult: the DISTINCT callee names of one
 # body, resolved once against the whole-program tables (so the fixpoint rounds never re-run
@@ -1049,13 +1049,18 @@ const summarize! = (Program prog, *[FnSum] sums, *[Iarch] st, *[RSets] rsets, Ia
 # duplex router will trust, so an oracle-escaping name missing here is a compiler bug. The
 # oracle never taints a call argument (its esc_vars skips calls), so the summary refinement
 # cannot fall below it: every other oracle rule maps into an rset or sset arm.
-pub const routing_check! = (Program prog): Iarch -> routing_run!(prog, false)
+pub const routing_check! = (Program prog, RouteInfo ri): Iarch -> routing_run!(prog, ri, false)
 
-# The per-function shadow sets, aligned with prog.funcs — the CLASSIFICATION the duplex router
-# trusts (geometry_lowering §2): a name outside rset ∪ sset provably never escapes its frame, so
-# emit births its construction on the RESIDUE side; everything else stays survivor (fail-safe).
-# The always-on oracle tripwire (routing_check!) keeps this same analysis honest on every build.
-pub const routing_sets! = (Program prog): [RSets] -> {
+# Everything the duplex router consults, aligned with prog.funcs: `sets` — each function's
+# shadow escape sets (a name outside rset ∪ sset provably never escapes its frame, so emit
+# births its construction RESIDUE-side; everything else stays survivor — fail-safe); `sums` —
+# each function's summary rows (a construction passed to an argument the callee neither
+# stores beyond its frame nor aliases into its return is dead once the call returns, so emit
+# births it residue-side too). The always-on oracle tripwire (routing_check!) keeps the same
+# analysis honest on every build.
+pub data RouteInfo = { [RSets] sets, [FnSum] sums }
+
+pub const routing_tables! = (Program prog): RouteInfo -> {
 	const Iarch n = Iarch(prog.funcs.len)
 	let [FnSum] sums = []
 	let [Iarch] st = []
@@ -1074,38 +1079,22 @@ pub const routing_sets! = (Program prog): [RSets] -> {
 		summarize!(prog, sums, st, rsets, d)
 		d = d + 1
 	}
-	return rsets
+	return RouteInfo({ sets: rsets, sums: sums })
 }
 
 # Debug dump (`--dump-routing`, temporary — stripped when the duplex router lands, like
 # `--suggest-alloc` before it): each function's shadow escape set, forward aliases, and
 # summary bits (`ret:` return-may-alias, `sto:` stored-beyond-frame, per parameter).
-pub const routing_dump! = (Program prog): Iarch -> routing_run!(prog, true)
+pub const routing_dump! = (Program prog, RouteInfo ri): Iarch -> routing_run!(prog, ri, true)
 
-# The shared driver: summaries bottom-up (the recursive DFS above, writing the preallocated
-# state tables through `*[T]` references), then the per-function check or dump over the
-# RECORDED sets. An SCC member's sets were computed with its siblings at ⊤ — deliberately
-# conservative (the memo's SCC rule), leak-only. The tables are preallocated to their full
-# length before any reference is handed out and never grown after.
-const routing_run! = (Program prog, Bool dump): Iarch -> {
+# The shared driver: the per-function check or dump over the RECORDED tables (computed ONCE
+# per compile by routing_tables! and shared with emit — the analysis used to run twice, and
+# the second run's fixpoint garbage lived through the whole emit phase). An SCC member's sets
+# were computed with its siblings at ⊤ — deliberately conservative (the memo's SCC rule).
+const routing_run! = (Program prog, RouteInfo ri, Bool dump): Iarch -> {
 	const Iarch n = Iarch(prog.funcs.len)
-	let [FnSum] sums = []
-	let [Iarch] st = []
-	let [RSets] rsets = []
-	let Iarch p = 0
-	loop {
-		if p >= n then break
-		sums = [...sums, top_sum()]
-		st = [...st, 0]
-		rsets = [...rsets, empty_rsets()]
-		p = p + 1
-	}
-	let Iarch d = 0
-	loop {
-		if d >= n then break
-		summarize!(prog, sums, st, rsets, d)
-		d = d + 1
-	}
+	const [RSets] rsets = ri.sets
+	const [FnSum] sums = ri.sums
 	let Iarch i = 0
 	loop {
 		if i >= n then break

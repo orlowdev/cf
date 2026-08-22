@@ -18,7 +18,7 @@
 # not yet enforced (that is the typecheck brick).
 
 import "io" as { write_str, die }
-import "routing" as { routing_sets!, RSets }
+import "routing" as { RouteInfo, RSets, FnSum }
 import "ast" as { Expr, Stmt, Param, Func, FieldInit, RecDecl, UnionMember, UnionDecl, MatchArm, StmtArm, Seg, TupElem, Program }
 import "astutil" as { is_spread, spread_inner, is_skip, skip_count, is_nested, nested_inner!, tel_leaf, tel_nest, tel_is_nest, tel_is_fn, is_fixed_name, fixed_bits, fixed_signed, is_stack_name, is_pat_guard, is_member_guard, is_int_guard, guard_body!, guard_qual!, guard_member! }
 
@@ -42,7 +42,7 @@ import "astutil" as { is_spread, spread_inner, is_skip, skip_count, is_nested, n
 # `loop_mark` is the nearest enclosing reset-safe loop's entry mark (same triple shape, or -1 if
 # the nearest loop is not reset-safe) — `break`/`continue` restore it so every path back to the
 # loop head or out of it reclaims the iteration's residue, matching the back-edge rewind.
-data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs, [RecDecl] recs, [UnionDecl] unions, Iarch cur_loop, Iarch cur_slot, Str cur_ret, Iarch reset_mark, Bool fn_ptr, Iarch loop_mark, Bool alloc_stack, Bool in_loop, Iarch stack_used, [RSets] routes, Iarch cur_fn, Str alloc_node, Iarch sur_mark }
+data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs, [RecDecl] recs, [UnionDecl] unions, Iarch cur_loop, Iarch cur_slot, Str cur_ret, Iarch reset_mark, Bool fn_ptr, Iarch loop_mark, Bool alloc_stack, Bool in_loop, Iarch stack_used, [RSets] routes, [FnSum] fsums, Iarch cur_fn, Str alloc_node, Iarch sur_mark, Iarch loop_sur_mark }
 
 # A local/parameter in scope: its interned name, `slot`, its `rec_type` (a record/union
 # type name, `"$dyn"`, `"$ptr"`, or `"Str"` — `""` for a word), and `elem` (a dynamic
@@ -373,6 +373,35 @@ const call_may_rehome = (*Emit ctx, Str callee): Bool -> {
 	return false
 }
 
+# Is `e` a CONSTRUCTION at this node — an expression that allocates its own aggregate?
+# (Mirrors alloc.cf's is_construction; a union construction allocates iff its union is boxed.)
+const arg_is_construction = (*Emit ctx, Expr e): Bool -> match e {
+	Expr.Record(_, _) -> true,
+	Expr.ArrayLit(_, _, _, _) -> true,
+	Expr.Tuple(_) -> true,
+	Expr.Interp(_) -> true,
+	Expr.Buffer(_) -> true,
+	Expr.UnionMk(u, _, _) -> union_is_boxed(ctx.unions, u),
+	_ -> false
+}
+
+# May a CONSTRUCTION in argument position `i` of a direct call to `fidx` be born residue-side?
+# Only when the callee's summary row proves the argument is neither STORED beyond the callee's
+# frame nor ALIASED by its return — then the value is dead once the call returns, and the frame
+# or iteration bracket reclaims it (`write_str(fd, "…${x}…")` is the canonical shape: the whole
+# interp is scratch). ⊤, out-of-range, or an unbracketed frame reads as survivor.
+const arg_routes_residue = (*Emit ctx, Iarch fidx, Iarch i, Expr arg): Bool -> {
+	if ctx.reset_mark < 0 then return false
+	if !arg_is_construction(ctx, arg) then return false
+	const FnSum fs = ctx.fsums[fidx]
+	if fs.all_esc then return false
+	if i >= Iarch(fs.ret_al.len) then return false
+	if fs.ret_al[i] then return false
+	if i >= Iarch(fs.stores.len) then return false
+	if fs.stores[i] then return false
+	return true
+}
+
 # Whether name `n` provably never escapes this frame (the duplex classification, routing.cf):
 # absent from both rset (return-reachable) and sset (stored beyond the frame). A construction
 # bound to such a name is born RESIDUE-side — but only in a bracketed frame (`%res_0` exists
@@ -527,14 +556,96 @@ const stmt_escapes = (*Emit ctx, [Binding] env, [Str] locals, Stmt s): Bool -> m
 	_ -> true
 }
 
-# May a loop body reset the node cursor each iteration? Only if the enclosing function takes no
-# writable pointer (nothing to rehome an iteration-local through) and nothing in the body escapes
-# the iteration. `loopvar` is the `for`-loop element name (a loop-local), or "" for a bare `loop`.
+# May a loop body reset the SURVIVOR cursor each iteration (the strict gate)? Only when nothing
+# allocated in the iteration can outlive it on either side: no return/yield, no store to an
+# outer target, no `&`, no callee that may rehome. `loopvar` is the `for`-loop element name (a
+# loop-local), or "" for a bare `loop`. (The old blanket `fn_ptr` disqualifier dissolved: a
+# rehome through the frame's own pointer params needs a store or a rehoming call in the body,
+# and both are caught per statement.)
 const loop_reset_safe = (*Emit ctx, [Binding] env, Str loopvar, [Stmt] body): Bool -> {
-	if ctx.fn_ptr then return false
 	let [Str] locals = stmts_locals(body)
 	if !str_eq(loopvar, "") then locals = cat_names(locals, one_name(loopvar))
 	return !body_escapes(ctx, env, locals, body)
+}
+
+# May a loop body reset the RESIDUE cursor each iteration (the softened duplex gate)? The only
+# residue-side hazard is a value that OUTLIVES the iteration on the residue side: an aggregate
+# stored into an OUTER target (the frame-local accumulator shape — its values are residue-routed
+# and read by later iterations). Returns, breaks, `&` arguments and rehoming callees no longer
+# disqualify: a returned value is survivor-born, and a callee's rehome is its own sset —
+# survivor-born too. Scalar stores to outer targets carry no pointer and stay safe.
+const elem_scalar_name = (*Emit ctx, Str en): Bool -> {
+	if str_eq(en, "") then return true
+	if str_eq(en, "Str") then return false
+	if is_nested(en) then return false
+	if find_rec(ctx.recs, en) >= 0 then return false
+	if find_union(ctx.unions, en) >= 0 then return false
+	return true
+}
+const outer_elem_scalar = (*Emit ctx, [Binding] env, Str b): Bool -> {
+	const Iarch idx = lookup_index(env, b)
+	if idx < 0 then return true
+	return elem_scalar_name(ctx, env[idx].elem)
+}
+const outer_field_scalar = (*Emit ctx, [Binding] env, Str b, Str f): Bool -> {
+	const Iarch idx = lookup_index(env, b)
+	if idx < 0 then return true
+	if str_eq(env[idx].rec_type, "") then return true
+	if str_eq(env[idx].rec_type, "$dyn") || str_eq(env[idx].rec_type, "$ptr") || str_eq(env[idx].rec_type, "$tuple") then return false
+	return !field_is_ptr(ctx, env[idx].rec_type, f)
+}
+# The root NAME of a chained lvalue (`a.b.c = v` → "a"); "" when not name-rooted.
+const lroot_name = (Expr e): Str -> match e {
+	Expr.Var(n) -> n,
+	Expr.Field(b, _) -> b,
+	Expr.FieldExpr(b, _) -> lroot_name(b),
+	Expr.Index(b, _) -> b,
+	Expr.IndexField(b, _, _) -> b,
+	Expr.IndexExpr(b, _) -> lroot_name(b),
+	_ -> ""
+}
+const res_stmt_escapes = (*Emit ctx, [Binding] env, [Str] locals, Stmt s): Bool -> match s {
+	Stmt.Assign(n, val) -> !has_str(locals, n) && binding_is_agg(env, n),
+	Stmt.FieldAssign(b, f, val) -> !has_str(locals, b) && !outer_field_scalar(ctx, env, b, f),
+	Stmt.IndexAssign(b, ix, val) -> !has_str(locals, b) && !outer_elem_scalar(ctx, env, b),
+	Stmt.DeepFieldAssign(be, _, _) -> !has_str(locals, lroot_name(be)),
+	Stmt.IfThen(_, s2) -> res_stmt_escapes(ctx, env, locals, s2),
+	Stmt.IfElse(_, t, el) -> res_stmt_escapes(ctx, env, locals, t) || res_stmt_escapes(ctx, env, locals, el),
+	Stmt.Block(ss) -> res_body_escapes(ctx, env, locals, ss),
+	Stmt.Loop(ss) -> res_body_escapes(ctx, env, locals, ss),
+	Stmt.ForIn(_, _, ss) -> res_body_escapes(ctx, env, locals, ss),
+	Stmt.Match(_, arms) -> res_arms_escape(ctx, env, locals, arms),
+	Stmt.Let(_, _, _, _) -> false,
+	Stmt.Destructure(_, _, _) -> false,
+	Stmt.Do(_) -> false,
+	Stmt.Return(_) -> false,
+	Stmt.Yield(_) -> false,
+	Stmt.Break -> false,
+	Stmt.Continue -> false,
+	_ -> true
+}
+const res_arms_escape = (*Emit ctx, [Binding] env, [Str] locals, [StmtArm] arms): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		if res_body_escapes(ctx, env, locals, arms[i].body) then return true
+		i = i + 1
+	}
+	return false
+}
+const res_body_escapes = (*Emit ctx, [Binding] env, [Str] locals, [Stmt] ss): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		if res_stmt_escapes(ctx, env, locals, ss[i]) then return true
+		i = i + 1
+	}
+	return false
+}
+const loop_residue_safe = (*Emit ctx, [Binding] env, Str loopvar, [Stmt] body): Bool -> {
+	let [Str] locals = stmts_locals(body)
+	if !str_eq(loopvar, "") then locals = cat_names(locals, one_name(loopvar))
+	return !res_body_escapes(ctx, env, locals, body)
 }
 
 # The RETURN signature position of a `$fn` binding — the last telem of its whole `[args…, ret]`
@@ -2433,7 +2544,12 @@ const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env)
 			write_str(ctx.fd, "\t%t${tt} =l copy ${pv}\n")
 			aops = [...aops, ArgOp({ temp: tt, is_rec: false, qt: "l" })]
 		} else if is_agg_param(ctx.funcs[fidx].params[i], ctx.recs, ctx.unions) then {
+			# an anonymous construction the callee neither retains nor returns is statement
+			# scratch — born residue-side (see arg_routes_residue)
+			const Str saved_an = ctx.alloc_node
+			if arg_routes_residue(ctx, fidx, i, args[i]) then ctx.alloc_node = "%res_0"
 			const Str av = emit_expr!(args[i], ctx, env)
+			ctx.alloc_node = saved_an
 			const Iarch tt = copy_agg!(ctx, av)
 			aops = [...aops, ArgOp({ temp: tt, is_rec: true, qt: "l" })]
 		} else {
@@ -3297,6 +3413,7 @@ const emit_for_body! = (*Emit ctx, [Binding] env, Str lv, Str arr, [Stmt] body):
 	# current one. Saved/restored around the body so a nested `for`/`loop` targets itself.
 	const Iarch saved = ctx.cur_loop
 	const Iarch saved_mark = ctx.loop_mark
+	const Iarch saved_sur = ctx.loop_sur_mark
 	ctx.cur_loop = lid
 	const Iarch la = ctx.next
 	ctx.next = ctx.next + 1
@@ -3310,8 +3427,15 @@ const emit_for_body! = (*Emit ctx, [Binding] env, Str lv, Str arr, [Stmt] body):
 	write_str(ctx.fd, "\tstorel -1, %t${ci}\n")
 	# per-iteration reset: mark the node before the loop; rewound at the back-edge / break / continue
 	let Iarch lmark = 0 - 1
-	if ctx.reset_mark >= 0 && loop_reset_safe(ctx, env, lv, body) then lmark = emit_mark!(ctx, "%res_0")
+	let Iarch lsur = 0 - 1
+	if ctx.reset_mark >= 0 && loop_residue_safe(ctx, env, lv, body) then {
+		lmark = emit_mark!(ctx, "%res_0")
+		# nothing escapes the iteration at all — bracket the survivor triple too, freeing
+		# dropped callee returns per iteration (the probe-A economics)
+		if loop_reset_safe(ctx, env, lv, body) then lsur = emit_mark!(ctx, "%node_0")
+	}
 	ctx.loop_mark = lmark
+	ctx.loop_sur_mark = lsur
 	write_str(ctx.fd, "@ltop${lid}\n")
 	const Iarch iv2 = ctx.next
 	ctx.next = ctx.next + 1
@@ -3356,10 +3480,12 @@ const emit_for_body! = (*Emit ctx, [Binding] env, Str lv, Str arr, [Stmt] body):
 	const Iarch term = emit_block!(ctx, body, benv)
 	ctx.in_loop = saved_inl
 	if term == 0 && lmark >= 0 then emit_reset!(ctx, lmark, "%res_0")
+	if term == 0 && lsur >= 0 then emit_reset!(ctx, lsur, "%node_0")
 	if term == 0 then write_str(ctx.fd, "\tjmp @ltop${lid}\n")
 	write_str(ctx.fd, "@lend${lid}\n")
 	ctx.cur_loop = saved
 	ctx.loop_mark = saved_mark
+	ctx.loop_sur_mark = saved_sur
 	return 0
 }
 
@@ -3373,23 +3499,31 @@ const emit_loop_body! = (*Emit ctx, [Binding] env, [Stmt] body): Iarch -> {
 	ctx.label = ctx.label + 1
 	const Iarch saved = ctx.cur_loop
 	const Iarch saved_mark = ctx.loop_mark
+	const Iarch saved_sur = ctx.loop_sur_mark
 	ctx.cur_loop = lid
 	# per-iteration reset (geometry_lowering §2): snapshot the node's triple at loop entry, rewind
 	# at every back-edge / break / continue, but only for a body whose residue can't escape the
 	# iteration.
 	let Iarch lmark = 0 - 1
-	if ctx.reset_mark >= 0 && loop_reset_safe(ctx, env, "", body) then lmark = emit_mark!(ctx, "%res_0")
+	let Iarch lsur = 0 - 1
+	if ctx.reset_mark >= 0 && loop_residue_safe(ctx, env, "", body) then {
+		lmark = emit_mark!(ctx, "%res_0")
+		if loop_reset_safe(ctx, env, "", body) then lsur = emit_mark!(ctx, "%node_0")
+	}
 	ctx.loop_mark = lmark
+	ctx.loop_sur_mark = lsur
 	const Bool saved_inl = ctx.in_loop
 	ctx.in_loop = true
 	write_str(ctx.fd, "@ltop${lid}\n")
 	const Iarch term = emit_block!(ctx, body, env)
 	ctx.in_loop = saved_inl
 	if term == 0 && lmark >= 0 then emit_reset!(ctx, lmark, "%res_0")
+	if term == 0 && lsur >= 0 then emit_reset!(ctx, lsur, "%node_0")
 	if term == 0 then write_str(ctx.fd, "\tjmp @ltop${lid}\n")
 	write_str(ctx.fd, "@lend${lid}\n")
 	ctx.cur_loop = saved
 	ctx.loop_mark = saved_mark
+	ctx.loop_sur_mark = saved_sur
 	return 0
 }
 
@@ -3406,11 +3540,13 @@ const emit_loop_value! = (*Emit ctx, [Binding] env, [Stmt] body): Str -> {
 	const Iarch saved = ctx.cur_loop
 	const Iarch saved_slot = ctx.cur_slot
 	const Iarch saved_mark = ctx.loop_mark
+	const Iarch saved_sur = ctx.loop_sur_mark
 	ctx.cur_loop = lid
 	ctx.cur_slot = slot
 	# a value-yielding loop yields across its back-edge, so it is never reset-safe — clear the mark
 	# so a `break`/`continue` inside it does not rewind to an outer loop's mark.
 	ctx.loop_mark = 0 - 1
+	ctx.loop_sur_mark = 0 - 1
 	const Bool saved_inl = ctx.in_loop
 	ctx.in_loop = true
 	write_str(ctx.fd, "@ltop${lid}\n")
@@ -3421,6 +3557,7 @@ const emit_loop_value! = (*Emit ctx, [Binding] env, [Stmt] body): Str -> {
 	ctx.cur_loop = saved
 	ctx.cur_slot = saved_slot
 	ctx.loop_mark = saved_mark
+	ctx.loop_sur_mark = saved_sur
 	# the slot loads in the yielded value's QBE type (a float loop yields `d`/`s`)
 	const Str qt = qtype_of_name(loop_yield_scalar_list!(ctx, env, body))
 	const Iarch rt = ctx.next
@@ -3482,11 +3619,13 @@ const emit_simple_stmt! = (*Emit ctx, [Binding] env, Stmt s): Iarch -> {
 			# a reset-safe loop rewinds the node on the way out too — the broken iteration's residue
 			# is dead (nothing escapes a reset-safe loop), and after the loop the node sits at entry.
 			if ctx.loop_mark >= 0 then emit_reset!(ctx, ctx.loop_mark, "%res_0")
+			if ctx.loop_sur_mark >= 0 then emit_reset!(ctx, ctx.loop_sur_mark, "%node_0")
 			write_str(ctx.fd, "\tjmp @lend${ctx.cur_loop}\n")
 			term = 1
 		},
 		Stmt.Continue -> {
 			if ctx.loop_mark >= 0 then emit_reset!(ctx, ctx.loop_mark, "%res_0")
+			if ctx.loop_sur_mark >= 0 then emit_reset!(ctx, ctx.loop_sur_mark, "%node_0")
 			write_str(ctx.fd, "\tjmp @ltop${ctx.cur_loop}\n")
 			term = 1
 		},
@@ -4693,7 +4832,7 @@ const emit_asm_func! = (Uarch fd, Func fn, Iarch idx): Iarch -> {
 # `main()` the `_start` floor does nothing before `bl _main`, so those flow straight
 # through. For `main([Str] args)` it first `bl _cf_build_args` to convert `(argc, argv)`
 # into a real cf `[Str]` header (in x0), which QBE reads as `$main`'s argument.
-pub const emit_program! = (Program prog, Uarch qbe_fd, Uarch asm_fd, Str target_os, Iarch root_size): Iarch -> {
+pub const emit_program! = (Program prog, RouteInfo ri, Uarch qbe_fd, Uarch asm_fd, Str target_os, Iarch root_size): Iarch -> {
 	# a `Bare` target (bare metal / Wasm) links no OS: the root is a static BSS region (no mmap), and
 	# there is no exit syscall — the floor halts. Every other target keeps the darwin mmap/exit floor.
 	# `root_size` sizes the `Bare` root page (ignored off `Bare`, which mmaps its own reserve).
@@ -4716,15 +4855,13 @@ pub const emit_program! = (Program prog, Uarch qbe_fd, Uarch asm_fd, Str target_
 		}
 		di = di + 1
 	}
-	# the duplex classification, computed ONCE for the whole program (each function's shadow
-	# escape sets — the birth-routing table every emit ctx below consults)
-	const [RSets] routes = routing_sets!(prog)
+
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(prog.funcs.len) then break
 		# an asm function is emitted into the floor, not through QBE
 		if !prog.funcs[i].is_asm then {
-			let Emit ctx = Emit({ fd: qbe_fd, next: 0, label: 0, funcs: prog.funcs, recs: prog.recs, unions: prog.unions, cur_loop: 0 - 1, cur_slot: 0 - 1, cur_ret: "", reset_mark: 0 - 1, fn_ptr: false, loop_mark: 0 - 1, alloc_stack: false, in_loop: false, stack_used: 0, routes: routes, cur_fn: 0 - 1, alloc_node: "%node_0", sur_mark: 0 - 1 })
+			let Emit ctx = Emit({ fd: qbe_fd, next: 0, label: 0, funcs: prog.funcs, recs: prog.recs, unions: prog.unions, cur_loop: 0 - 1, cur_slot: 0 - 1, cur_ret: "", reset_mark: 0 - 1, fn_ptr: false, loop_mark: 0 - 1, alloc_stack: false, in_loop: false, stack_used: 0, routes: ri.sets, fsums: ri.sums, cur_fn: 0 - 1, alloc_node: "%node_0", sur_mark: 0 - 1, loop_sur_mark: 0 - 1 })
 			emit_func!(&ctx, prog.funcs[i], i)
 		}
 		i = i + 1
