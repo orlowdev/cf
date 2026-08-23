@@ -43,7 +43,7 @@ import "astutil" as { is_spread, spread_inner, is_skip, skip_count, is_nested, n
 # `loop_mark` is the nearest enclosing reset-safe loop's entry mark (same triple shape, or -1 if
 # the nearest loop is not reset-safe) — `break`/`continue` restore it so every path back to the
 # loop head or out of it reclaims the iteration's residue, matching the back-edge rewind.
-data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs, [RecDecl] recs, [UnionDecl] unions, Iarch cur_loop, Iarch cur_slot, Str cur_ret, Iarch reset_mark, Bool fn_ptr, Iarch loop_mark, Bool alloc_stack, Bool in_loop, Iarch stack_used, [RSets] routes, [FnSum] fsums, Iarch cur_fn, Str alloc_node, Str carve_node, Str grow_node, [Str] growok, Iarch mk_env_base, Iarch sur_mark, Iarch loop_sur_mark, [Bool] nodesig }
+data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs, [RecDecl] recs, [UnionDecl] unions, Iarch cur_loop, Iarch cur_slot, Str cur_ret, Iarch reset_mark, Bool fn_ptr, Iarch loop_mark, Bool alloc_stack, Bool in_loop, Iarch stack_used, [RSets] routes, [FnSum] fsums, Iarch cur_fn, Str alloc_node, Str carve_node, Str grow_node, [Str] growok, Iarch mk_env_base, Iarch sur_mark, Iarch loop_sur_mark, [Bool] nodesig, [Bool] fmints }
 
 # A local/parameter in scope: its interned name, `slot`, its `rec_type` (a record/union
 # type name, `"$dyn"`, `"$ptr"`, or `"Str"` — `""` for a word), and `elem` (a dynamic
@@ -326,10 +326,29 @@ const fn_brackets = (Func fn): Bool -> {
 # carved child arenas, and every survivor-routed value it births die with it. This is the old
 # fn_resettable shape reborn as an OPTIMIZATION gate: its failure means survivors leak until node
 # death, never a dangle. (Loop-scope survivor marks are the next stage.)
+# Two summary-visible channels ALSO disqualify (both found as live dangles):
+#   - the frame STORES beyond itself through a plain value param (its own summary's `stores`
+#     bits): an aliased self-append (`let a = xs; a = [...a, v]`) grows caller-reachable
+#     storage in THIS frame — value params are read-only for ELEMENT writes, but the alias
+#     append is a legal store channel the old signature-only gate could not see;
+#   - the frame may MINT a node handle (`fmints`): a carve's handle rides out as a plain
+#     WORD (a scalar return can be a handle), and the mark would free the child's storage.
+const sum_stores_any = (FnSum fs): Bool -> {
+	if fs.all_esc then return true
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(fs.stores.len) then break
+		if fs.stores[i] then return true
+		i = i + 1
+	}
+	return false
+}
 const fn_surmarks = (*Emit ctx, Func fn): Bool -> {
 	if !fn_brackets(fn) then return false
 	if any_ptr_param(fn.params) then return false
 	if has_cap_param(fn) then return false
+	if sum_stores_any(ctx.fsums[ctx.cur_fn]) then return false
+	if ctx.fmints[ctx.cur_fn] then return false
 	return !ret_is_l(fn.ret_name, ctx.recs, ctx.unions)
 }
 
@@ -362,8 +381,11 @@ const binding_is_agg = ([Binding] env, Str name): Bool -> {
 # back-edge reset frees records the callee rehomed into an outer table). A closure-lifted
 # callee rehomes through its hidden capture params the same way. An indirect/unknown callee is
 # opaque ⇒ unsafe. Casts and `Str` retain nothing; an asm body takes scalars and writes bytes,
-# not arena pointers. Plain `[T]`/value-aggregate params are READ-ONLY views (the write-
-# through-const rule), so only the direct callee's own signature matters — no transitivity.
+# not arena pointers. Plain `[T]`/value-aggregate params bind read-only for ELEMENT writes,
+# but the aliased self-append is a legal store channel through them — so the callee's SUMMARY
+# `stores` bits disqualify too (transitively, by summary construction). A callee that may MINT
+# a node handle (`fmints`) is unsafe the same way: the handle returns as a scalar WORD and the
+# reset would free the child's storage.
 const call_may_rehome = (*Emit ctx, Str callee): Bool -> {
 	if is_cast_type(callee) || str_eq(callee, "Str") then return false
 	const Iarch fidx = find_func(ctx.funcs, callee)
@@ -371,6 +393,8 @@ const call_may_rehome = (*Emit ctx, Str callee): Bool -> {
 	if ctx.funcs[fidx].is_asm then return false
 	if any_ptr_param(ctx.funcs[fidx].params) then return true
 	if has_cap_param(ctx.funcs[fidx]) then return true
+	if sum_stores_any(ctx.fsums[fidx]) then return true
+	if ctx.fmints[fidx] then return true
 	return false
 }
 
@@ -4442,8 +4466,132 @@ const nfp_prop_body! = ([Func] funcs, [Bool] sig, [Stmt] ss): Bool -> {
 	}
 	return false
 }
-const compute_nodesig! = (Program prog): [Bool] -> {
-	const [Str] at = address_taken!(prog)
+# ── the handle-mint table (the survivor-mark soundness gates) ───────────────────────────────
+# May a function MINT a node handle the caller can hold as a plain word? Seeded by an
+# UN-grafted carve intrinsic in the body (a grafted `mem.arena.of(n) in b` carves from b's
+# own interior, which lives and dies with b — ambient marks never reset a child's interior)
+# or by an indirect call / DeferTap (an unknown callee may mint), and closed over un-grafted
+# direct calls exactly like the node-signature bits (a minted handle launders through any
+# scalar return). Consulted by fn_surmarks and call_may_rehome: a survivor mark must never
+# bracket a mint, else the reset frees a child arena whose handle is still live (the
+# two-arenas-collide dangle). Over-approximation costs a leak (a skipped mark), never a
+# dangle.
+const mint_expr! = (Expr e): Bool -> {
+	const Bool here = match e {
+		Expr.Call(n, _, _, g) -> str_eq(g, "") && (str_eq(n, "cf__arena_of") || str_eq(n, "cf__arena_grow") || str_eq(n, "cf__buffer_of")),
+		_ -> false
+	}
+	if here then return true
+	return match e {
+		Expr.Loop(ss) -> mint_body!(ss),
+		_ -> mint_list!(kids!(e))
+	}
+}
+const mint_list! = ([Expr] es): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(es.len) then break
+		if mint_expr!(es[i]) then return true
+		i = i + 1
+	}
+	return false
+}
+const mint_stmt! = (Stmt s): Bool -> {
+	if mint_list!(stmt_exprs!(s)) then return true
+	return match s {
+		Stmt.IfThen(_, b) -> mint_stmt!(b),
+		Stmt.IfElse(_, t, el) -> mint_stmt!(t) || mint_stmt!(el),
+		Stmt.Block(ss) -> mint_body!(ss),
+		Stmt.Loop(ss) -> mint_body!(ss),
+		Stmt.ForIn(_, _, ss) -> mint_body!(ss),
+		Stmt.Match(_, arms) -> mint_arms!(arms),
+		Stmt.Defer(ss) -> mint_body!(ss),
+		Stmt.Closure(_, _, _, cb) -> mint_body!(cb),
+		_ -> false
+	}
+}
+const mint_arms! = ([StmtArm] arms): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		if mint_body!(arms[i].body) then return true
+		i = i + 1
+	}
+	return false
+}
+const mint_body! = ([Stmt] ss): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		if mint_stmt!(ss[i]) then return true
+		i = i + 1
+	}
+	return false
+}
+const compute_mints! = (Program prog, [Str] at): [Bool] -> {
+	let [Bool] mts = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(prog.funcs.len) then break
+		let Bool m = false
+		if !prog.funcs[i].is_asm then m = mint_body!(prog.funcs[i].body)
+		mts = [...mts, m]
+		i = i + 1
+	}
+	loop {
+		let Bool changed = false
+		let Iarch k = 0
+		loop {
+			if k >= Iarch(prog.funcs.len) then break
+			if !mts[k] && !prog.funcs[k].is_asm then {
+				if nfp_prop_body!(prog.funcs, mts, prog.funcs[k].body) then {
+					mts[k] = true
+					changed = true
+				}
+			}
+			k = k + 1
+		}
+		if !changed then break
+	}
+	# an INDIRECT callee can mint only if some ADDRESS-TAKEN function does — only then must
+	# every indirect-call-making body join the taint (blanketing all HOF walkers when no
+	# reachable fn-value ever carves would forfeit their survivor marks for nothing)
+	let Bool at_mints = false
+	let Iarch j = 0
+	loop {
+		if j >= Iarch(prog.funcs.len) then break
+		if mts[j] then { if has_str(at, prog.funcs[j].name) then at_mints = true }
+		j = j + 1
+	}
+	if at_mints then {
+		let Iarch k2 = 0
+		loop {
+			if k2 >= Iarch(prog.funcs.len) then break
+			if !mts[k2] && !prog.funcs[k2].is_asm then {
+				if nfp_ind_body!(prog.funcs, prog.funcs[k2].body) then mts[k2] = true
+			}
+			k2 = k2 + 1
+		}
+		loop {
+			let Bool changed2 = false
+			let Iarch k3 = 0
+			loop {
+				if k3 >= Iarch(prog.funcs.len) then break
+				if !mts[k3] && !prog.funcs[k3].is_asm then {
+					if nfp_prop_body!(prog.funcs, mts, prog.funcs[k3].body) then {
+						mts[k3] = true
+						changed2 = true
+					}
+				}
+				k3 = k3 + 1
+			}
+			if !changed2 then break
+		}
+	}
+	return mts
+}
+
+const compute_nodesig! = (Program prog, [Str] at): [Bool] -> {
 	let [Bool] sig = []
 	let Iarch i = 0
 	loop {
@@ -5493,7 +5641,9 @@ pub const emit_program! = (Program prog, RouteInfo ri, Uarch qbe_fd, Uarch asm_f
 	# address-taken functions (used as a value anywhere) are excluded from the flat-return reset — an
 	# indirect call site cannot claim. Computed once for the whole program (geometry_lowering §3).
 	# node-free pruning (geometry_lowering §4): which signatures carry the hidden %node_0
-	const [Bool] nsig = compute_nodesig!(prog)
+	const [Str] at = address_taken!(prog)
+	const [Bool] nsig = compute_nodesig!(prog, at)
+	const [Bool] mts = compute_mints!(prog, at)
 	const Bool argv_form = main_takes_argv(prog)
 	if argv_form then emit_argv_qbe(qbe_fd)
 	# STATIC storage: each `static [N Uint8] NAME` gets a zero-filled BSS data block and a
@@ -5515,7 +5665,7 @@ pub const emit_program! = (Program prog, RouteInfo ri, Uarch qbe_fd, Uarch asm_f
 		if i >= Iarch(prog.funcs.len) then break
 		# an asm function is emitted into the floor, not through QBE
 		if !prog.funcs[i].is_asm then {
-			let Emit ctx = Emit({ fd: qbe_fd, next: 0, label: 0, funcs: prog.funcs, recs: prog.recs, unions: prog.unions, cur_loop: 0 - 1, cur_slot: 0 - 1, cur_ret: "", reset_mark: 0 - 1, fn_ptr: false, loop_mark: 0 - 1, alloc_stack: false, in_loop: false, stack_used: 0, routes: ri.sets, fsums: ri.sums, cur_fn: 0 - 1, alloc_node: "%node_0", carve_node: "%node_0", grow_node: "%node_0", growok: no_names(), mk_env_base: 0 - 1, sur_mark: 0 - 1, loop_sur_mark: 0 - 1, nodesig: nsig })
+			let Emit ctx = Emit({ fd: qbe_fd, next: 0, label: 0, funcs: prog.funcs, recs: prog.recs, unions: prog.unions, cur_loop: 0 - 1, cur_slot: 0 - 1, cur_ret: "", reset_mark: 0 - 1, fn_ptr: false, loop_mark: 0 - 1, alloc_stack: false, in_loop: false, stack_used: 0, routes: ri.sets, fsums: ri.sums, cur_fn: 0 - 1, alloc_node: "%node_0", carve_node: "%node_0", grow_node: "%node_0", growok: no_names(), mk_env_base: 0 - 1, sur_mark: 0 - 1, loop_sur_mark: 0 - 1, nodesig: nsig, fmints: mts })
 			emit_func!(&ctx, prog.funcs[i], i)
 		}
 		i = i + 1
