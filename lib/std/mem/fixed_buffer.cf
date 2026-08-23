@@ -8,12 +8,12 @@
 #
 # This is the first geometry whose logic lives in std SOURCE instead of the compiler's QBE
 # floor. Using the geometry IS the import: the compiler auto-loads this file on any
-# `mem.fixed_buffer` use and calls the constructor by its mangled name (`of__fb`) — nothing
-# here is `pub`, because userland never calls a geometry's internals directly; the compiler
-# places every call. The remaining hooks (`on_alloc`, `on_ret`, the brackets — the nine of
-# geometry_lowering §1) land here with the Materialize stage of the geometry-modules arc,
-# which will place calls to them; until then allocation under this node keeps riding the
-# shared bump floor, coherent because both honor the same duplex node layout:
+# `mem.fixed_buffer` use and calls every function here by its mangled name (`of__fb`,
+# `on_alloc__fb`, …) — nothing here is `pub`, because userland never calls a geometry's
+# internals directly; the compiler places every call. The Materialize pass mints one copy
+# of the generic value hooks per placed aggregate type (`on_alloc__fb$Box`) and emit calls
+# them at the sites the routing classification picks; what materialize cannot prove stays
+# on the shared bump floor, coherent because both honor the same duplex node layout:
 #
 #   node+0  survivor { top, committed, limit, parent, kind, chunk }   — bumps UP
 #   node+48 residue  { top, committed, limit, parent, kind, chunk }   — bumps DOWN
@@ -45,3 +45,56 @@ const of = (Uarch node, [Uint8] buf): Uarch -> {
 	mem.raw.store(data + 88, 0)
 	return data
 }
+
+# ── the hook set (geometry_lowering §1) ──────────────────────────────────────────────────
+# The value hooks are BEHAVIOR-IDENTICAL to the floor's fixed-node branches (kind 4 up /
+# kind 2 down): each side bumps its own cursor and reads the SIBLING's cursor as its bound —
+# no limit field is ever touched, so a fixed node's limits stay exactly as minted. The
+# cursors meeting is the hard trap. `size_of` on a record is its slot count ×8, already
+# 8-aligned, so no rounding is needed here (the floor rounds byte requests; hooks place
+# whole records).
+#
+# `Mark` is geometry-private (§1): for a FIXED node the residue top ALONE is a sound mark —
+# only an elastic pull invalidates a top-only mark by relocating the block, and a fixed
+# buffer never pulls. So the fb mark is one word, and the exit restore is unconditional
+# (≡ cf_reset's same-limit path, the only one a fixed node can take).
+
+# Open a residue scope: the mark is the residue cursor now.
+const on_scope_enter = (Uarch node): Uarch -> mem.raw.load(node + 48)
+
+# Close a residue scope: everything the scope bumped down is reclaimed in bulk.
+const on_scope_exit = (Uarch node, Uarch mark): Uarch -> {
+	mem.raw.store(node + 48, mark)
+	return 0
+}
+
+# Place local residue (dies in frame): bump the residue side DOWN toward the survivor
+# cursor, trap on meet, copy the constructed value in, and hand back the placed copy
+# (the identity law — same logical value, relocated bytes).
+const on_alloc = ['T](Uarch node, 'T v): 'T -> {
+	const Uarch sz = size_of(v)
+	const Uarch dn = mem.raw.load(node + 48) - sz
+	if dn < mem.raw.load(node) then mem.raw.trap()
+	mem.raw.store(node + 48, dn)
+	return mem.raw.place(dn, v)
+}
+
+# Place an escaping value at birth (§3): bump the SURVIVOR side UP toward the residue
+# cursor — storage no residue bracket can ever reach, so whatever the frame reclaims,
+# the escape survives by construction.
+const on_ret = ['T](Uarch node, 'T v): 'T -> {
+	const Uarch p = mem.raw.load(node)
+	const Uarch nt = p + size_of(v)
+	if nt > mem.raw.load(node + 48) then mem.raw.trap()
+	mem.raw.store(node, nt)
+	return mem.raw.place(p, v)
+}
+
+# Claim a returned value (§3): the bump family's fold is the IDENTITY — the callee's
+# on_ret already placed the value on a survivor side that outlives the call, so there is
+# nothing to move. The hook stays placed by contract (a compacting geometry acts here).
+const on_alloc_ret = ['T](Uarch node, 'T v): 'T -> v
+
+# The remaining spec hooks (`on_realloc`, `on_free`, `on_rehome`, `on_store` — all
+# degenerate for the bump family) land when placement reaches their sites; no dead
+# spec-code in std until then.

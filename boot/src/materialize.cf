@@ -1,0 +1,715 @@
+# The Materialize substep of the Memory arc (order_of_compilation, Memory; geometry_lowering
+# §2): render the geometry DECISION into the program. Runs right after monomorphization —
+# the call graph is concrete, and the minted code still flows through typecheck, the defer
+# and closure lowerings, and routing like any hand-written function.
+#
+# Three jobs, all for the geometries whose logic lives in std source (today: fixed_buffer):
+#
+#   1. (fn × geometry) duplication — every function that may allocate and is reachable under
+#      a fixed_buffer ambient (an `in b` call whose binding traces to `mem.fixed_buffer.of`)
+#      is copied under the geometry's fixed mangle tag: `f` → `f__fb`. Emit lowers the copy's
+#      allocation sites to VALUE-LEVEL hook calls instead of the shared bump floor.
+#   2. Call retargeting — the `in b` seed sites and, inside the copies, every direct call to
+#      another may-allocate function are pointed at the `__fb` twins, so the whole subtree
+#      under the geometry is hook-lowered.
+#   3. Per-type hook instances — the geometry's generic value hooks (`on_alloc['T]`, …) are
+#      specialized per placed aggregate type (`on_alloc__fb$Box`) from the PRE-mono template
+#      (mono drops uninstantiated templates, so the raw program supplies them). The instances
+#      are ordinary functions from here on: typechecked, routed, emitted.
+#
+# The frontier is FAIL-SAFE: any site this pass cannot prove (an indirect call, a node handle
+# passed as a plain word, a geometry binding it cannot trace) simply stays on the legacy
+# runtime-kind-dispatch floor — correct because hook bodies and the floor honor the same
+# duplex node layout. Materialization is an optimization frontier, never a soundness one.
+
+import "io" as { die }
+import "cli" as { str_eq }
+import "ast" as { Program, Func, Param, Stmt, Expr, FieldInit, Seg, MatchArm, StmtArm, RecDecl }
+import "routing" as { kids!, stmt_exprs! }
+
+# The pass result: the rewritten program plus the names of the geometry copies — emit
+# consults the list to pick the hook lowering for exactly those bodies.
+pub data Mat = { Program prog, [Str] fbs }
+
+# A direct-call site: the owning function's index, the callee name, and the `in` binding
+# (`""` = the ambient node). Var/Field/Index bases ride along as pseudo-sites so value-const
+# AUTO-CALLS returning records are seen by the instance collection; resolution filters the
+# names that are not functions.
+data CSite = { Iarch fnidx, Str callee, Str geom }
+
+# A geometry-constructor binding: `const b = mem.fixed_buffer.of(buf)` in function `fnidx`.
+data FbBind = { Iarch fnidx, Str name }
+
+const has_str = ([Str] xs, Str n): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(xs.len) then break
+		if str_eq(xs[i], n) then return true
+		i = i + 1
+	}
+	return false
+}
+
+const find_fn = ([Func] fs, Str n): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(fs.len) then break
+		if str_eq(fs[i].name, n) then return i
+		i = i + 1
+	}
+	return 0 - 1
+}
+
+const name_has_bang = (Str n): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(n.len) then break
+		if Iarch(n[i]) == 33 then return true
+		i = i + 1
+	}
+	return false
+}
+
+# ── the direct-allocation scan (the may-allocate seed bit) ───────────────────────────────
+# Conservative on purpose: any construction counts (even under `$`-stack storage) — an
+# over-included function merely gains a harmless copy; an under-included one stays legacy,
+# which is still correct. `!` names are seeds too (bang-by-propagation frames bracket).
+
+const alloc_expr! = (Expr e): Bool -> {
+	const Bool here = match e {
+		Expr.Record(_, _) -> true,
+		Expr.ArrayLit(_, _, _, _) -> true,
+		Expr.Tuple(_) -> true,
+		Expr.Interp(_) -> true,
+		Expr.StrLit(_) -> true,
+		Expr.Buffer(_) -> true,
+		Expr.UnionMk(_, _, _) -> true,
+		Expr.Call(n, _, _, _) -> str_eq(n, "Str") || str_eq(n, "cf__arena_of") || str_eq(n, "cf__arena_grow") || str_eq(n, "cf__buffer_of"),
+		_ -> false
+	}
+	if here then return true
+	return match e {
+		Expr.Loop(ss) -> alloc_body!(ss),
+		_ -> alloc_list!(kids!(e))
+	}
+}
+const alloc_list! = ([Expr] es): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(es.len) then break
+		if alloc_expr!(es[i]) then return true
+		i = i + 1
+	}
+	return false
+}
+const alloc_stmt! = (Stmt s): Bool -> {
+	if alloc_list!(stmt_exprs!(s)) then return true
+	return match s {
+		Stmt.IfThen(_, b) -> alloc_stmt!(b),
+		Stmt.IfElse(_, t, el) -> alloc_stmt!(t) || alloc_stmt!(el),
+		Stmt.Block(ss) -> alloc_body!(ss),
+		Stmt.Loop(ss) -> alloc_body!(ss),
+		Stmt.ForIn(_, _, ss) -> alloc_body!(ss),
+		Stmt.Match(_, arms) -> alloc_arms!(arms),
+		Stmt.Defer(ss) -> alloc_body!(ss),
+		Stmt.Closure(_, _, _, cb) -> alloc_body!(cb),
+		_ -> false
+	}
+}
+const alloc_arms! = ([StmtArm] arms): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		if alloc_body!(arms[i].body) then return true
+		i = i + 1
+	}
+	return false
+}
+const alloc_body! = ([Stmt] ss): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		if alloc_stmt!(ss[i]) then return true
+		i = i + 1
+	}
+	return false
+}
+
+# ── the call-site sweep ──────────────────────────────────────────────────────────────────
+
+const cs_expr! = (Expr e, Iarch fi, [CSite] acc): [CSite] -> {
+	const [CSite] a1 = match e {
+		Expr.Call(n, _, _, g) -> [...acc, CSite({ fnidx: fi, callee: n, geom: g })],
+		Expr.DeferTap(f, _) -> [...acc, CSite({ fnidx: fi, callee: f, geom: "" })],
+		Expr.Var(n) -> [...acc, CSite({ fnidx: fi, callee: n, geom: "" })],
+		Expr.Field(b, _) -> [...acc, CSite({ fnidx: fi, callee: b, geom: "" })],
+		Expr.Index(b, _) -> [...acc, CSite({ fnidx: fi, callee: b, geom: "" })],
+		Expr.IndexField(b, _, _) -> [...acc, CSite({ fnidx: fi, callee: b, geom: "" })],
+		_ -> acc
+	}
+	return match e {
+		Expr.Loop(ss) -> cs_body!(ss, fi, a1),
+		_ -> cs_list!(kids!(e), fi, a1)
+	}
+}
+const cs_list! = ([Expr] es, Iarch fi, [CSite] acc): [CSite] -> {
+	let [CSite] out = acc
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(es.len) then break
+		out = cs_expr!(es[i], fi, out)
+		i = i + 1
+	}
+	return out
+}
+const cs_stmt! = (Stmt s, Iarch fi, [CSite] acc): [CSite] -> {
+	const [CSite] a1 = cs_list!(stmt_exprs!(s), fi, acc)
+	return match s {
+		Stmt.IfThen(_, b) -> cs_stmt!(b, fi, a1),
+		Stmt.IfElse(_, t, el) -> cs_stmt!(el, fi, cs_stmt!(t, fi, a1)),
+		Stmt.Block(ss) -> cs_body!(ss, fi, a1),
+		Stmt.Loop(ss) -> cs_body!(ss, fi, a1),
+		Stmt.ForIn(_, _, ss) -> cs_body!(ss, fi, a1),
+		Stmt.Match(_, arms) -> cs_arms!(arms, fi, a1),
+		Stmt.Defer(ss) -> cs_body!(ss, fi, a1),
+		Stmt.Closure(_, _, _, cb) -> cs_body!(cb, fi, a1),
+		_ -> a1
+	}
+}
+const cs_arms! = ([StmtArm] arms, Iarch fi, [CSite] acc): [CSite] -> {
+	let [CSite] out = acc
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		out = cs_body!(arms[i].body, fi, out)
+		i = i + 1
+	}
+	return out
+}
+const cs_body! = ([Stmt] ss, Iarch fi, [CSite] acc): [CSite] -> {
+	let [CSite] out = acc
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		out = cs_stmt!(ss[i], fi, out)
+		i = i + 1
+	}
+	return out
+}
+
+# ── the geometry-binding sweep (`in x` handles must trace to a visible constructor) ──────
+
+const is_fb_ctor = (Expr e): Bool -> match e {
+	Expr.Call(n, _, _, _) -> str_eq(n, "cf__buffer_of"),
+	_ -> false
+}
+const fbb_stmt = (Stmt s, Iarch fi, [FbBind] acc): [FbBind] -> {
+	const [FbBind] a1 = match s {
+		Stmt.Let(n, _, _, e) -> if is_fb_ctor(e) then [...acc, FbBind({ fnidx: fi, name: n })] else acc,
+		Stmt.Assign(n, e) -> if is_fb_ctor(e) then [...acc, FbBind({ fnidx: fi, name: n })] else acc,
+		_ -> acc
+	}
+	return match s {
+		Stmt.IfThen(_, b) -> fbb_stmt(b, fi, a1),
+		Stmt.IfElse(_, t, el) -> fbb_stmt(el, fi, fbb_stmt(t, fi, a1)),
+		Stmt.Block(ss) -> fbb_body(ss, fi, a1),
+		Stmt.Loop(ss) -> fbb_body(ss, fi, a1),
+		Stmt.ForIn(_, _, ss) -> fbb_body(ss, fi, a1),
+		Stmt.Match(_, arms) -> fbb_arms(arms, fi, a1),
+		Stmt.Defer(ss) -> fbb_body(ss, fi, a1),
+		Stmt.Closure(_, _, _, cb) -> fbb_body(cb, fi, a1),
+		_ -> a1
+	}
+}
+const fbb_arms = ([StmtArm] arms, Iarch fi, [FbBind] acc): [FbBind] -> {
+	let [FbBind] out = acc
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		out = fbb_body(arms[i].body, fi, out)
+		i = i + 1
+	}
+	return out
+}
+const fbb_body = ([Stmt] ss, Iarch fi, [FbBind] acc): [FbBind] -> {
+	let [FbBind] out = acc
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		out = fbb_stmt(ss[i], fi, out)
+		i = i + 1
+	}
+	return out
+}
+const fb_bind_of = ([FbBind] bs, Iarch fi, Str g): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(bs.len) then break
+		if bs[i].fnidx == fi && str_eq(bs[i].name, g) then return true
+		i = i + 1
+	}
+	return false
+}
+const binds_of = ([FbBind] bs, Iarch fi): [Str] -> {
+	let [Str] out = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(bs.len) then break
+		if bs[i].fnidx == fi then out = [...out, bs[i].name]
+		i = i + 1
+	}
+	return out
+}
+
+# ── the record-construction type sweep (which hook instances the copies need) ────────────
+
+const rty_expr! = (Expr e, [Str] acc): [Str] -> {
+	const [Str] a1 = match e {
+		Expr.Record(tn, _) -> if has_str(acc, tn) then acc else [...acc, tn],
+		_ -> acc
+	}
+	return match e {
+		Expr.Loop(ss) -> rty_body!(ss, a1),
+		_ -> rty_list!(kids!(e), a1)
+	}
+}
+const rty_list! = ([Expr] es, [Str] acc): [Str] -> {
+	let [Str] out = acc
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(es.len) then break
+		out = rty_expr!(es[i], out)
+		i = i + 1
+	}
+	return out
+}
+const rty_stmt! = (Stmt s, [Str] acc): [Str] -> {
+	const [Str] a1 = rty_list!(stmt_exprs!(s), acc)
+	return match s {
+		Stmt.IfThen(_, b) -> rty_stmt!(b, a1),
+		Stmt.IfElse(_, t, el) -> rty_stmt!(el, rty_stmt!(t, a1)),
+		Stmt.Block(ss) -> rty_body!(ss, a1),
+		Stmt.Loop(ss) -> rty_body!(ss, a1),
+		Stmt.ForIn(_, _, ss) -> rty_body!(ss, a1),
+		Stmt.Match(_, arms) -> rty_arms!(arms, a1),
+		Stmt.Defer(ss) -> rty_body!(ss, a1),
+		Stmt.Closure(_, _, _, cb) -> rty_body!(cb, a1),
+		_ -> a1
+	}
+}
+const rty_arms! = ([StmtArm] arms, [Str] acc): [Str] -> {
+	let [Str] out = acc
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		out = rty_body!(arms[i].body, out)
+		i = i + 1
+	}
+	return out
+}
+const rty_body! = ([Stmt] ss, [Str] acc): [Str] -> {
+	let [Str] out = acc
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		out = rty_stmt!(ss[i], out)
+		i = i + 1
+	}
+	return out
+}
+
+# Closure declarations whose return is a record: post-lift their call sites are direct
+# record-returning calls inside the copy, so the claim wrap needs their type too.
+const cloret_stmt = (Stmt s, [Str] acc): [Str] -> {
+	const [Str] a1 = match s {
+		Stmt.Closure(_, _, rn, _) -> if str_eq(rn, "") || has_str(acc, rn) then acc else [...acc, rn],
+		_ -> acc
+	}
+	return match s {
+		Stmt.IfThen(_, b) -> cloret_stmt(b, a1),
+		Stmt.IfElse(_, t, el) -> cloret_stmt(el, cloret_stmt(t, a1)),
+		Stmt.Block(ss) -> cloret_body(ss, a1),
+		Stmt.Loop(ss) -> cloret_body(ss, a1),
+		Stmt.ForIn(_, _, ss) -> cloret_body(ss, a1),
+		Stmt.Match(_, arms) -> cloret_arms(arms, a1),
+		Stmt.Defer(ss) -> cloret_body(ss, a1),
+		Stmt.Closure(_, _, _, cb) -> cloret_body(cb, a1),
+		_ -> a1
+	}
+}
+const cloret_arms = ([StmtArm] arms, [Str] acc): [Str] -> {
+	let [Str] out = acc
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		out = cloret_body(arms[i].body, out)
+		i = i + 1
+	}
+	return out
+}
+const cloret_body = ([Stmt] ss, [Str] acc): [Str] -> {
+	let [Str] out = acc
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		out = cloret_stmt(ss[i], out)
+		i = i + 1
+	}
+	return out
+}
+
+# ── the retarget rewrite (a copy's body points at the `__fb` twins) ──────────────────────
+# Only a `Call` callee (and a `DeferTap` target) retargets — a bare name reference feeds an
+# INDIRECT site, which stays on the legacy dispatch path by design. `infb` is true inside a
+# geometry copy (ambient calls retarget); an `in g` call retargets in ANY function when `g`
+# is one of the function's own fixed_buffer bindings.
+
+const rt_name = (Str n, Str g, [Str] fbn, [Str] binds, Bool infb): Str -> {
+	if !has_str(fbn, n) then return n
+	if str_eq(g, "") then {
+		if infb then return "${n}__fb"
+		return n
+	}
+	if has_str(binds, g) then return "${n}__fb"
+	return n
+}
+const rt_expr = (Expr e, [Str] fbn, [Str] binds, Bool infb): Expr -> match e {
+	Expr.Lit(v) -> Expr.Lit(v),
+	Expr.BoolLit(b) -> Expr.BoolLit(b),
+	Expr.Var(n) -> Expr.Var(n),
+	Expr.StrLit(bs) -> Expr.StrLit(bs),
+	Expr.FloatLit(t) -> Expr.FloatLit(t),
+	Expr.Record(n, fs) -> Expr.Record(n, rt_fields(fs, fbn, binds, infb)),
+	Expr.Field(b, f) -> Expr.Field(b, f),
+	Expr.FieldExpr(b, f) -> Expr.FieldExpr(rt_expr(b, fbn, binds, infb), f),
+	Expr.UnionMk(t, m, args) -> Expr.UnionMk(t, m, rt_exprs(args, fbn, binds, infb)),
+	Expr.Match(scrut, arms) -> Expr.Match(rt_expr(scrut, fbn, binds, infb), rt_arms(arms, fbn, binds, infb)),
+	Expr.ArrayLit(hs, sn, elems, et) -> Expr.ArrayLit(hs, rt_expr(sn, fbn, binds, infb), rt_exprs(elems, fbn, binds, infb), et),
+	Expr.Index(a, i) -> Expr.Index(a, rt_expr(i, fbn, binds, infb)),
+	Expr.IndexField(a, i, f) -> Expr.IndexField(a, rt_expr(i, fbn, binds, infb), f),
+	Expr.IndexExpr(b, i) -> Expr.IndexExpr(rt_expr(b, fbn, binds, infb), rt_expr(i, fbn, binds, infb)),
+	Expr.Tuple(elems) -> Expr.Tuple(rt_exprs(elems, fbn, binds, infb)),
+	Expr.Spread(x) -> Expr.Spread(rt_expr(x, fbn, binds, infb)),
+	Expr.Unit -> Expr.Unit,
+	Expr.Loop(body) -> Expr.Loop(rt_stmts(body, fbn, binds, infb)),
+	Expr.Interp(segs) -> Expr.Interp(rt_segs(segs, fbn, binds, infb)),
+	Expr.Buffer(sz) -> Expr.Buffer(rt_expr(sz, fbn, binds, infb)),
+	Expr.Addr(name) -> Expr.Addr(name),
+	Expr.Neg(x) -> Expr.Neg(rt_expr(x, fbn, binds, infb)),
+	Expr.Not(x) -> Expr.Not(rt_expr(x, fbn, binds, infb)),
+	Expr.BitNot(x) -> Expr.BitNot(rt_expr(x, fbn, binds, infb)),
+	Expr.Add(l, r) -> Expr.Add(rt_expr(l, fbn, binds, infb), rt_expr(r, fbn, binds, infb)),
+	Expr.Sub(l, r) -> Expr.Sub(rt_expr(l, fbn, binds, infb), rt_expr(r, fbn, binds, infb)),
+	Expr.Mul(l, r) -> Expr.Mul(rt_expr(l, fbn, binds, infb), rt_expr(r, fbn, binds, infb)),
+	Expr.Div(l, r) -> Expr.Div(rt_expr(l, fbn, binds, infb), rt_expr(r, fbn, binds, infb)),
+	Expr.Mod(l, r) -> Expr.Mod(rt_expr(l, fbn, binds, infb), rt_expr(r, fbn, binds, infb)),
+	Expr.BitAnd(l, r) -> Expr.BitAnd(rt_expr(l, fbn, binds, infb), rt_expr(r, fbn, binds, infb)),
+	Expr.BitOr(l, r) -> Expr.BitOr(rt_expr(l, fbn, binds, infb), rt_expr(r, fbn, binds, infb)),
+	Expr.BitXor(l, r) -> Expr.BitXor(rt_expr(l, fbn, binds, infb), rt_expr(r, fbn, binds, infb)),
+	Expr.Shl(l, r) -> Expr.Shl(rt_expr(l, fbn, binds, infb), rt_expr(r, fbn, binds, infb)),
+	Expr.Shr(l, r) -> Expr.Shr(rt_expr(l, fbn, binds, infb), rt_expr(r, fbn, binds, infb)),
+	Expr.CmpEq(l, r) -> Expr.CmpEq(rt_expr(l, fbn, binds, infb), rt_expr(r, fbn, binds, infb)),
+	Expr.CmpNe(l, r) -> Expr.CmpNe(rt_expr(l, fbn, binds, infb), rt_expr(r, fbn, binds, infb)),
+	Expr.CmpLt(l, r) -> Expr.CmpLt(rt_expr(l, fbn, binds, infb), rt_expr(r, fbn, binds, infb)),
+	Expr.CmpGt(l, r) -> Expr.CmpGt(rt_expr(l, fbn, binds, infb), rt_expr(r, fbn, binds, infb)),
+	Expr.CmpLe(l, r) -> Expr.CmpLe(rt_expr(l, fbn, binds, infb), rt_expr(r, fbn, binds, infb)),
+	Expr.CmpGe(l, r) -> Expr.CmpGe(rt_expr(l, fbn, binds, infb), rt_expr(r, fbn, binds, infb)),
+	Expr.And(l, r) -> Expr.And(rt_expr(l, fbn, binds, infb), rt_expr(r, fbn, binds, infb)),
+	Expr.Or(l, r) -> Expr.Or(rt_expr(l, fbn, binds, infb), rt_expr(r, fbn, binds, infb)),
+	Expr.If(c, t, e2) -> Expr.If(rt_expr(c, fbn, binds, infb), rt_expr(t, fbn, binds, infb), rt_expr(e2, fbn, binds, infb)),
+	Expr.Call(n, ta, args, g) -> Expr.Call(rt_name(n, g, fbn, binds, infb), ta, rt_exprs(args, fbn, binds, infb), g),
+	Expr.DeferTap(fn, args) -> Expr.DeferTap(rt_name(fn, "", fbn, binds, infb), rt_exprs(args, fbn, binds, infb))
+}
+const rt_exprs = ([Expr] es, [Str] fbn, [Str] binds, Bool infb): [Expr] -> {
+	let [Expr] out = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(es.len) then break
+		out = [...out, rt_expr(es[i], fbn, binds, infb)]
+		i = i + 1
+	}
+	return out
+}
+const rt_fields = ([FieldInit] fs, [Str] fbn, [Str] binds, Bool infb): [FieldInit] -> {
+	let [FieldInit] out = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(fs.len) then break
+		out = [...out, FieldInit({ field: fs[i].field, value: rt_expr(fs[i].value, fbn, binds, infb) })]
+		i = i + 1
+	}
+	return out
+}
+const rt_segs = ([Seg] segs, [Str] fbn, [Str] binds, Bool infb): [Seg] -> {
+	let [Seg] out = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(segs.len) then break
+		const Seg sg = segs[i]
+		out = [...out, Seg({ is_hole: sg.is_hole, lit: sg.lit, name: sg.name, expr: rt_expr(sg.expr, fbn, binds, infb) })]
+		i = i + 1
+	}
+	return out
+}
+const rt_arms = ([MatchArm] arms, [Str] fbn, [Str] binds, Bool infb): [MatchArm] -> {
+	let [MatchArm] out = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		const MatchArm a = arms[i]
+		out = [...out, MatchArm({ is_wild: a.is_wild, type_name: a.type_name, members: a.members, binds: a.binds, body: rt_expr(a.body, fbn, binds, infb) })]
+		i = i + 1
+	}
+	return out
+}
+const rt_stmt = (Stmt s, [Str] fbn, [Str] binds, Bool infb): Stmt -> match s {
+	Stmt.Let(n, m, ann, e) -> Stmt.Let(n, m, ann, rt_expr(e, fbn, binds, infb)),
+	Stmt.Destructure(pat, m, e) -> Stmt.Destructure(pat, m, rt_expr(e, fbn, binds, infb)),
+	Stmt.Yield(e) -> Stmt.Yield(rt_expr(e, fbn, binds, infb)),
+	Stmt.Assign(n, e) -> Stmt.Assign(n, rt_expr(e, fbn, binds, infb)),
+	Stmt.FieldAssign(b, f, e) -> Stmt.FieldAssign(b, f, rt_expr(e, fbn, binds, infb)),
+	Stmt.DeepFieldAssign(be, f, e) -> Stmt.DeepFieldAssign(rt_expr(be, fbn, binds, infb), f, rt_expr(e, fbn, binds, infb)),
+	Stmt.IndexAssign(a, i, v) -> Stmt.IndexAssign(a, rt_expr(i, fbn, binds, infb), rt_expr(v, fbn, binds, infb)),
+	Stmt.Return(e) -> Stmt.Return(rt_expr(e, fbn, binds, infb)),
+	Stmt.ForIn(v, a, body) -> Stmt.ForIn(v, a, rt_stmts(body, fbn, binds, infb)),
+	Stmt.Loop(body) -> Stmt.Loop(rt_stmts(body, fbn, binds, infb)),
+	Stmt.Break -> Stmt.Break,
+	Stmt.Continue -> Stmt.Continue,
+	Stmt.IfThen(c, st) -> Stmt.IfThen(rt_expr(c, fbn, binds, infb), rt_stmt(st, fbn, binds, infb)),
+	Stmt.IfElse(c, t, e) -> Stmt.IfElse(rt_expr(c, fbn, binds, infb), rt_stmt(t, fbn, binds, infb), rt_stmt(e, fbn, binds, infb)),
+	Stmt.Do(e) -> Stmt.Do(rt_expr(e, fbn, binds, infb)),
+	Stmt.Block(stmts) -> Stmt.Block(rt_stmts(stmts, fbn, binds, infb)),
+	Stmt.Match(scrut, arms) -> Stmt.Match(rt_expr(scrut, fbn, binds, infb), rt_stmt_arms(arms, fbn, binds, infb)),
+	Stmt.Closure(nm, params, ret, body) -> Stmt.Closure(nm, params, ret, rt_stmts(body, fbn, binds, infb)),
+	Stmt.Defer(body) -> Stmt.Defer(rt_stmts(body, fbn, binds, infb))
+}
+const rt_stmt_arms = ([StmtArm] arms, [Str] fbn, [Str] binds, Bool infb): [StmtArm] -> {
+	let [StmtArm] out = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		const StmtArm a = arms[i]
+		out = [...out, StmtArm({ is_wild: a.is_wild, type_name: a.type_name, members: a.members, binds: a.binds, body: rt_stmts(a.body, fbn, binds, infb) })]
+		i = i + 1
+	}
+	return out
+}
+const rt_stmts = ([Stmt] ss, [Str] fbn, [Str] binds, Bool infb): [Stmt] -> {
+	let [Stmt] out = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		out = [...out, rt_stmt(ss[i], fbn, binds, infb)]
+		i = i + 1
+	}
+	return out
+}
+
+# ── hook-instance minting (the trivial specialization) ───────────────────────────────────
+# The generic value hooks mention `'T` ONLY in their signature (the param and return type);
+# their bodies work through `size_of`/`mem.raw.*`, which type themselves from the value.
+# So an instance is the template with the signature substituted — no body walk needed
+# (monomorph's full machinery would be dead weight here).
+
+const hook_param = (Param p, Str t): Param -> {
+	if str_eq(p.type_name, "'T") then return Param({ name: p.name, is_ptr: p.is_ptr, type_name: t, elem: p.elem, telems: p.telems, size: p.size })
+	return p
+}
+const hook_instance = (Func tmpl, Str iname, Str t): Func -> {
+	let [Param] ps = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(tmpl.params.len) then break
+		ps = [...ps, hook_param(tmpl.params[i], t)]
+		i = i + 1
+	}
+	let Str rn = tmpl.ret_name
+	if str_eq(rn, "'T") then rn = t
+	const [Str] no_typ = []
+	return Func({ name: iname, is_pub: false, ret_name: rn, ret_elem: tmpl.ret_elem, params: ps, body: tmpl.body, is_asm: false, asm_body: tmpl.asm_body, is_value: false, ret_telems: tmpl.ret_telems, typarams: no_typ, tbounds: no_typ, ret_size: tmpl.ret_size })
+}
+
+const rec_named = ([RecDecl] recs, Str n): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(recs.len) then break
+		if str_eq(recs[i].name, n) then return true
+		i = i + 1
+	}
+	return false
+}
+
+# ── the pass ─────────────────────────────────────────────────────────────────────────────
+
+pub const materialize_program! = (Program prog, Program raw): Mat -> {
+	const [Str] no_strs = []
+	# fast path: the geometry module auto-loads on use, so a program with no `of__fb` never
+	# touched `mem.fixed_buffer` — nothing to materialize, the whole pass is one name scan.
+	if find_fn(prog.funcs, "of__fb") < 0 then return Mat({ prog: prog, fbs: no_strs })
+
+	const Iarch nf = Iarch(prog.funcs.len)
+
+	# sweep every body once: call sites, geometry bindings, the direct-allocation bit
+	let [CSite] sites = []
+	let [FbBind] fbinds = []
+	let [Bool] ma = []
+	let Iarch i = 0
+	loop {
+		if i >= nf then break
+		sites = cs_body!(prog.funcs[i].body, i, sites)
+		fbinds = fbb_body(prog.funcs[i].body, i, fbinds)
+		let Bool da = false
+		if !prog.funcs[i].is_asm then da = name_has_bang(prog.funcs[i].name) || alloc_body!(prog.funcs[i].body)
+		ma = [...ma, da]
+		i = i + 1
+	}
+
+	# resolve each site's callee to a function index once (-1 = intrinsic/local/indirect)
+	let [Iarch] cidx = []
+	let Iarch si = 0
+	loop {
+		if si >= Iarch(sites.len) then break
+		cidx = [...cidx, find_fn(prog.funcs, sites[si].callee)]
+		si = si + 1
+	}
+
+	# may-allocate closes over the direct call graph: a caller of an allocating callee
+	# allocates. (An indirect callee stays unresolved — its sites keep the legacy floor.)
+	loop {
+		let Bool changed = false
+		let Iarch k = 0
+		loop {
+			if k >= Iarch(sites.len) then break
+			const Iarch cj = cidx[k]
+			const Iarch ko = sites[k].fnidx
+			if cj >= 0 then {
+				if !ma[ko] && ma[cj] then {
+					ma[ko] = true
+					changed = true
+				}
+			}
+			k = k + 1
+		}
+		if !changed then break
+	}
+
+	# the (fn × fixed_buffer) reachability fixpoint: an `in b` call whose binding traces to
+	# the constructor SEEDS its callee; inside the set, plain ambient calls propagate it.
+	let [Bool] fbset = []
+	let Iarch z = 0
+	loop {
+		if z >= nf then break
+		fbset = [...fbset, false]
+		z = z + 1
+	}
+	loop {
+		let Bool fchanged = false
+		let Iarch q = 0
+		loop {
+			if q >= Iarch(sites.len) then break
+			const Iarch cj = cidx[q]
+			const Iarch qo = sites[q].fnidx
+			const Str qg = sites[q].geom
+			if cj >= 0 then {
+				if !fbset[cj] && ma[cj] && !prog.funcs[cj].is_asm && !prog.funcs[cj].is_value && !str_eq(prog.funcs[cj].name, "main") then {
+					let Bool joins = false
+					if !str_eq(qg, "") then joins = fb_bind_of(fbinds, qo, qg)
+					if str_eq(qg, "") then joins = fbset[qo]
+					if joins then {
+						fbset[cj] = true
+						fchanged = true
+					}
+				}
+			}
+			q = q + 1
+		}
+		if !fchanged then break
+	}
+
+	# the copy names, in function-table order (deterministic emit)
+	let [Str] fbn = []
+	let Iarch c = 0
+	loop {
+		if c >= nf then break
+		if fbset[c] then fbn = [...fbn, prog.funcs[c].name]
+		c = c + 1
+	}
+	if Iarch(fbn.len) == 0 then return Mat({ prog: prog, fbs: no_strs })
+
+	# rewrite every original (seed `in b` sites point at the twins) and mint the copies
+	let [Func] out = []
+	let Iarch fi = 0
+	loop {
+		if fi >= nf then break
+		const Func f = prog.funcs[fi]
+		if f.is_asm then out = [...out, f]
+		if !f.is_asm then {
+			const [Str] mybinds = binds_of(fbinds, fi)
+			out = [...out, Func({ name: f.name, is_pub: f.is_pub, ret_name: f.ret_name, ret_elem: f.ret_elem, params: f.params, body: rt_stmts(f.body, fbn, mybinds, false), is_asm: false, asm_body: f.asm_body, is_value: f.is_value, ret_telems: f.ret_telems, typarams: f.typarams, tbounds: f.tbounds, ret_size: f.ret_size })]
+		}
+		fi = fi + 1
+	}
+	let [Str] copies = []
+	let Iarch ci = 0
+	loop {
+		if ci >= nf then break
+		if fbset[ci] then {
+			const Func f = prog.funcs[ci]
+			const [Str] cbinds = binds_of(fbinds, ci)
+			const Str cname = "${f.name}__fb"
+			out = [...out, Func({ name: cname, is_pub: false, ret_name: f.ret_name, ret_elem: f.ret_elem, params: f.params, body: rt_stmts(f.body, fbn, cbinds, true), is_asm: false, asm_body: f.asm_body, is_value: false, ret_telems: f.ret_telems, typarams: f.typarams, tbounds: f.tbounds, ret_size: f.ret_size })]
+			copies = [...copies, cname]
+		}
+		ci = ci + 1
+	}
+
+	# the instance type set: records the copies CONSTRUCT (on_alloc/on_ret sites), plus
+	# record RETURNS of the calls they make and of their closures (on_alloc_ret claim sites)
+	let [Str] tys = []
+	let Iarch oi = nf
+	loop {
+		if oi >= Iarch(out.len) then break
+		tys = rty_body!(out[oi].body, tys)
+		tys = cloret_body(out[oi].body, tys)
+		let [CSite] csx = []
+		csx = cs_body!(out[oi].body, 0, csx)
+		let Iarch cs2 = 0
+		loop {
+			if cs2 >= Iarch(csx.len) then break
+			const Iarch tj = find_fn(out, csx[cs2].callee)
+			if tj >= 0 then {
+				const Str rn = out[tj].ret_name
+				if !has_str(tys, rn) && rec_named(prog.recs, rn) then tys = [...tys, rn]
+			}
+			cs2 = cs2 + 1
+		}
+		oi = oi + 1
+	}
+	# only record types place through value hooks in this stage; everything else stays on
+	# the legacy floor (matching emit's wrap rule), so filter the set to declared records
+	let [Str] rtys = []
+	let Iarch ti = 0
+	loop {
+		if ti >= Iarch(tys.len) then break
+		if rec_named(prog.recs, tys[ti]) then rtys = [...rtys, tys[ti]]
+		ti = ti + 1
+	}
+
+	# mint the per-type hook instances from the PRE-mono templates
+	const Iarch al_t = find_fn(raw.funcs, "on_alloc__fb")
+	const Iarch rt_t = find_fn(raw.funcs, "on_ret__fb")
+	const Iarch ar_t = find_fn(raw.funcs, "on_alloc_ret__fb")
+	if al_t < 0 || rt_t < 0 || ar_t < 0 then die("cf: materialize: the fixed_buffer geometry module is missing its value hooks (stale std source?)\n")
+	let Iarch hi = 0
+	loop {
+		if hi >= Iarch(rtys.len) then break
+		const Str t = rtys[hi]
+		out = [...out, hook_instance(raw.funcs[al_t], "on_alloc__fb$${t}", t)]
+		out = [...out, hook_instance(raw.funcs[rt_t], "on_ret__fb$${t}", t)]
+		out = [...out, hook_instance(raw.funcs[ar_t], "on_alloc_ret__fb$${t}", t)]
+		hi = hi + 1
+	}
+
+	const Program p2 = Program({ imports: prog.imports, recs: prog.recs, unions: prog.unions, funcs: out, groups: prog.groups })
+	return Mat({ prog: p2, fbs: copies })
+}
