@@ -149,7 +149,7 @@ const load_module! = (Str path, Str target_os, Str target_arch): Program -> {
 	if n < 0 then die("cf: reading an imported module failed\n")
 	if n >= Iarch(buf.len) then die("cf: an imported module exceeds the read buffer — grow it in resolve.cf\n")
 	const [Token] toks = strip_import_namespaces!(buf, strip_type_aliases!(buf, lex(buf, n)))
-	let Parser p = Parser({ toks: toks, src: buf, pos: 0, file: path, target_os: target_os, target_arch: target_arch })
+	let Parser p = Parser({ toks: toks, src: buf, pos: 0, file: path, target_os: target_os, target_arch: target_arch, saw_fb: false })
 	return parse_program!(&p)
 }
 
@@ -232,7 +232,7 @@ const in_priv = ([Str] priv, Str n): Bool -> {
 
 # The mangled form of a callee/definition name: private names gain the module tag; every
 # other name (a `pub` export, an imported name, a builtin) is unchanged.
-const mangle_name = (Str n, [Str] priv, Iarch tag): Str -> {
+const mangle_name = (Str n, [Str] priv, Str tag): Str -> {
 	if !in_priv(priv, n) then return n
 	return "${n}__${tag}"
 }
@@ -240,7 +240,7 @@ const mangle_name = (Str n, [Str] priv, Iarch tag): Str -> {
 # Rewrite every private-function reference in an expression tree. Only a `Call` callee can
 # name a function; every other node is rebuilt unchanged around its recursively rewritten
 # children.
-const mangle_expr = (Expr e, [Str] priv, Iarch tag): Expr -> match e {
+const mangle_expr = (Expr e, [Str] priv, Str tag): Expr -> match e {
 	Expr.Lit(v) -> Expr.Lit(v),
 	Expr.BoolLit(b) -> Expr.BoolLit(b),
 	# a bare name may REFERENCE a private function (passed by name to a higher-order function);
@@ -292,7 +292,7 @@ const mangle_expr = (Expr e, [Str] priv, Iarch tag): Expr -> match e {
 }
 
 # Rewrite a list of expressions / a data literal's field values / a match's arms.
-const mangle_exprs = ([Expr] es, [Str] priv, Iarch tag): [Expr] -> {
+const mangle_exprs = ([Expr] es, [Str] priv, Str tag): [Expr] -> {
 	let [Expr] out = []
 	let Iarch i = 0
 	loop {
@@ -302,7 +302,7 @@ const mangle_exprs = ([Expr] es, [Str] priv, Iarch tag): [Expr] -> {
 	}
 	return out
 }
-const mangle_fields = ([FieldInit] fs, [Str] priv, Iarch tag): [FieldInit] -> {
+const mangle_fields = ([FieldInit] fs, [Str] priv, Str tag): [FieldInit] -> {
 	let [FieldInit] out = []
 	let Iarch i = 0
 	loop {
@@ -312,7 +312,7 @@ const mangle_fields = ([FieldInit] fs, [Str] priv, Iarch tag): [FieldInit] -> {
 	}
 	return out
 }
-const mangle_segs = ([Seg] segs, [Str] priv, Iarch tag): [Seg] -> {
+const mangle_segs = ([Seg] segs, [Str] priv, Str tag): [Seg] -> {
 	let [Seg] out = []
 	let Iarch i = 0
 	loop {
@@ -323,7 +323,7 @@ const mangle_segs = ([Seg] segs, [Str] priv, Iarch tag): [Seg] -> {
 	}
 	return out
 }
-const mangle_arms = ([MatchArm] arms, [Str] priv, Iarch tag): [MatchArm] -> {
+const mangle_arms = ([MatchArm] arms, [Str] priv, Str tag): [MatchArm] -> {
 	let [MatchArm] out = []
 	let Iarch i = 0
 	loop {
@@ -336,7 +336,7 @@ const mangle_arms = ([MatchArm] arms, [Str] priv, Iarch tag): [MatchArm] -> {
 }
 
 # Rewrite every private-function reference in a statement (recursing into nested blocks).
-const mangle_stmt = (Stmt s, [Str] priv, Iarch tag): Stmt -> match s {
+const mangle_stmt = (Stmt s, [Str] priv, Str tag): Stmt -> match s {
 	Stmt.Let(n, m, ann, e) -> Stmt.Let(n, m, ann, mangle_expr(e, priv, tag)),
 	Stmt.Destructure(pat, m, e) -> Stmt.Destructure(pat, m, mangle_expr(e, priv, tag)),
 	Stmt.Yield(e) -> Stmt.Yield(mangle_expr(e, priv, tag)),
@@ -357,7 +357,7 @@ const mangle_stmt = (Stmt s, [Str] priv, Iarch tag): Stmt -> match s {
 	Stmt.Closure(nm, params, ret, body) -> Stmt.Closure(nm, params, ret, mangle_stmts(body, priv, tag)),
 	Stmt.Defer(body) -> Stmt.Defer(mangle_stmts(body, priv, tag))
 }
-const mangle_stmt_arms = ([StmtArm] arms, [Str] priv, Iarch tag): [StmtArm] -> {
+const mangle_stmt_arms = ([StmtArm] arms, [Str] priv, Str tag): [StmtArm] -> {
 	let [StmtArm] out = []
 	let Iarch i = 0
 	loop {
@@ -368,7 +368,7 @@ const mangle_stmt_arms = ([StmtArm] arms, [Str] priv, Iarch tag): [StmtArm] -> {
 	}
 	return out
 }
-const mangle_stmts = ([Stmt] ss, [Str] priv, Iarch tag): [Stmt] -> {
+const mangle_stmts = ([Stmt] ss, [Str] priv, Str tag): [Stmt] -> {
 	let [Stmt] out = []
 	let Iarch i = 0
 	loop {
@@ -573,7 +573,7 @@ const priv_minus = ([Str] priv, [Str] names): [Str] -> {
 
 # Mangle one module's functions with tag `tag`: rename each private definition and rewrite
 # every private-function reference in every body — but not a reference shadowed by a local.
-const mangle_funcs! = ([Func] fs, Iarch tag): [Func] -> {
+const mangle_funcs! = ([Func] fs, Str tag): [Func] -> {
 	const [Str] priv = priv_names(fs)
 	let [Func] out = []
 	let Iarch i = 0
@@ -1286,7 +1286,7 @@ pub const resolve_program! = (Str entry, Str target_os, Str target_arch): Progra
 	recs = cat_recs(recs, root.recs)
 	unions = cat_unions(unions, root.unions)
 	groups = cat_recs(groups, root.groups) # grouped-parameter `type` decls (splatted below)
-	funcs = cat_funcs(funcs, mangle_funcs!(root.funcs, 0)) # the entry is module tag 0
+	funcs = cat_funcs(funcs, mangle_funcs!(root.funcs, "0")) # the entry is module tag 0
 	let [Str] loaded = []
 	let [Import] work = []
 	work = cat_imports(work, root.imports)
@@ -1303,11 +1303,18 @@ pub const resolve_program! = (Str entry, Str target_os, Str target_arch): Progra
 		if !seen(loaded, mpath) then {
 			loaded = [...loaded, mpath]
 			tag = tag + 1 # a distinct tag per loaded module, so private names cannot collide
+			# a std GEOMETRY module gets a FIXED tag instead of the load-order ordinal: the
+			# compiler references its (private) hooks by mangled name — `of__fb` — from emit,
+			# so the name cannot depend on what else a program happens to import.
+			# (keyed on the IMPORT path: `mpath` carries build_path!'s trailing NUL for the
+			# open() syscall, so it never string-equals a clean literal)
+			let Str mtag = "${tag}"
+			if str_eq(im.path, "std/mem/fixed_buffer") then mtag = "fb"
 			const Program m = load_module!(mpath, target_os, target_arch)
 			recs = cat_recs(recs, m.recs)
 			unions = cat_unions(unions, m.unions)
 			groups = cat_recs(groups, m.groups)
-			funcs = cat_funcs(funcs, mangle_funcs!(m.funcs, tag))
+			funcs = cat_funcs(funcs, mangle_funcs!(m.funcs, mtag))
 			work = cat_imports(work, m.imports)
 		}
 		wi = wi + 1

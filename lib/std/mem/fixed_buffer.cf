@@ -1,0 +1,47 @@
+# std/mem/fixed_buffer — the zero-dependency bounded geometry (geometry_lowering §5):
+# `mem.fixed_buffer.of(buf)` wraps a CALLER-PROVIDED `[Uint8]` buffer (`$`-stack, `static`,
+# or heap) as a duplex bump node. Creating it allocates nothing: the 96-byte duplex header
+# lays over the buffer's own front and the remainder is one two-ended block — survivors bump
+# up from the header's end, residue bumps down from the tail, and the two cursors meeting is
+# a hard trap. Survivors live in the buffer itself, so a static-backed escape stays valid for
+# the buffer's whole life.
+#
+# This is the first geometry whose logic lives in std SOURCE instead of the compiler's QBE
+# floor. Using the geometry IS the import: the compiler auto-loads this file on any
+# `mem.fixed_buffer` use and calls the constructor by its mangled name (`of__fb`) — nothing
+# here is `pub`, because userland never calls a geometry's internals directly; the compiler
+# places every call. The remaining hooks (`on_alloc`, `on_ret`, the brackets — the nine of
+# geometry_lowering §1) land here with the Materialize stage of the geometry-modules arc,
+# which will place calls to them; until then allocation under this node keeps riding the
+# shared bump floor, coherent because both honor the same duplex node layout:
+#
+#   node+0  survivor { top, committed, limit, parent, kind, chunk }   — bumps UP
+#   node+48 residue  { top, committed, limit, parent, kind, chunk }   — bumps DOWN
+#
+# Kinds: 4 = up/shared-fixed (the survivor side, bounded by the residue cursor),
+#        2 = down/fixed (the residue side, bounded by the survivor cursor).
+
+# Lay the duplex header over the buffer's front and hand back the node (its base address).
+# `buf` arrives as its `{data,len,cap}` header; the node is the buffer's data pointer, the
+# usable block is `[data+96, data+len)`, and both subnodes parent to the AMBIENT node so
+# wall dissolution has somewhere to go (today: inert — a fixed node never pulls).
+const of = (Uarch node, [Uint8] buf): Uarch -> {
+	const Uarch hdr = mem.raw.addr(buf)
+	const Uarch data = mem.raw.load(hdr)
+	const Uarch len = mem.raw.load(hdr + 8)
+	const Uarch blk = data + 96
+	const Uarch end = data + len
+	mem.raw.store(data, blk)
+	mem.raw.store(data + 8, end)
+	mem.raw.store(data + 16, end)
+	mem.raw.store(data + 24, node)
+	mem.raw.store(data + 32, 4)
+	mem.raw.store(data + 40, 0)
+	mem.raw.store(data + 48, end)
+	mem.raw.store(data + 56, end)
+	mem.raw.store(data + 64, 0)
+	mem.raw.store(data + 72, node)
+	mem.raw.store(data + 80, 2)
+	mem.raw.store(data + 88, 0)
+	return data
+}

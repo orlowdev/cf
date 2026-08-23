@@ -15,7 +15,7 @@ import "ast" as { Expr, Stmt, Param, Func, Ty, FieldInit, RecDecl, UnionMember, 
 import "astutil" as { tel_leaf, tel_nest, tel_fn, tel_is_fn }
 
 # The parse cursor: the token stream, the source (for keyword text), a position.
-pub data Parser = { [Token] toks, *[Uint8] src, Iarch pos, Str file, Str target_os, Str target_arch }
+pub data Parser = { [Token] toks, *[Uint8] src, Iarch pos, Str file, Str target_os, Str target_arch, Bool saw_fb }
 
 # The current token's kind.
 const peek = (*Parser p): TokKind -> p.toks[p.pos].kind
@@ -148,7 +148,7 @@ const parse_hole! = (*[Uint8] src, Iarch hstart, Iarch hlen): Expr -> {
 		i = i + 1
 	}
 	const [Token] toks = lex(hbuf, hlen)
-	let Parser hp = Parser({ toks: toks, src: hbuf, pos: 0, file: "", target_os: "Darwin", target_arch: "Arm64" })
+	let Parser hp = Parser({ toks: toks, src: hbuf, pos: 0, file: "", target_os: "Darwin", target_arch: "Arm64", saw_fb: false })
 	const Expr e = parse_expr!(&hp)
 	if !is_eof(peek(&hp)) then die("cf: parse: an interpolation hole must be a single expression\n")
 	return e
@@ -971,6 +971,9 @@ const parse_primary! = (*Parser p): Expr -> {
 				# array) as a bounded bump geometry — carves nothing (§5); no `.grow` (the buffer is fixed).
 				if str_eq(geom, "fixed_buffer") then {
 					if is_grow then die("cf: parse: `fixed_buffer` wraps a fixed caller buffer and has no `.grow`\n")
+					# using the geometry IS the import: mark the module so parse_program! appends a
+					# synthetic `import "std/mem/fixed_buffer"` and the std source auto-loads
+					p.saw_fb = true
 					return Expr.Call("cf__buffer_of", mem_noty, margs, "")
 				}
 				if is_grow then return Expr.Call("cf__arena_grow", mem_noty, margs, "")
@@ -2829,6 +2832,18 @@ pub const parse_program! = (*Parser p): Program -> {
 	loop {
 		if is_eof(peek(p)) then break
 		acc = prog_cat(acc, parse_item!(p))
+	}
+	# auto-load on use (the geometry-modules arc): a module that touched `mem.fixed_buffer`
+	# gains a synthetic import of the std geometry source — the ordinary import machinery
+	# (path resolution, dedup, transitive closure) does the rest. No names bind: userland
+	# never calls hooks directly; the compiler references them by their mangled names.
+	if p.saw_fb then {
+		const [Str] no_names = []
+		const [Import] fb_im = [Import({ path: "std/mem/fixed_buffer", names: no_names })]
+		const [RecDecl] no_recs = []
+		const [UnionDecl] no_unions = []
+		const [Func] no_funcs = []
+		acc = prog_cat(acc, Program({ imports: fb_im, recs: no_recs, unions: no_unions, funcs: no_funcs, groups: no_recs }))
 	}
 	return acc
 }
