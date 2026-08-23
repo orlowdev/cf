@@ -178,20 +178,27 @@ pub data FnSum = { Bool all_esc, [Bool] ret_al, [Bool] stores, Bool agg_ret, Boo
 # every (shape, name) pair the walkers can ever ask about lives in a per-program pool built
 # once (ktab_build), and a kind everywhere else is a bare Iarch id into it, so the queries
 # inside the fixpoint compare words and read prebuilt arrays, allocating nothing. `shapes`
-# holds `$word` (a scalar — the ONLY exempt shape), `Str`, `$tuple`, `$rec`/`$uni` (type
-# name in `knames`), `$dyn`/`$ptr` (element type name in `knames`), or `$agg` — the
-# conservative unknown. `eids` is the entry's precomputed EDGE: a `$dyn`/`$ptr` entry's
-# element kind id, a `$rec` entry's index into `prog.recs`. The trailing arrays are the
+# holds `$word` (a scalar — the ONLY exempt shape), `Str`, `$tuple`, `$rec`/`$uni`,
+# `$dyn`/`$ptr`, or `$agg` — the conservative unknown. `eids` is the entry's precomputed
+# EDGE: a `$dyn`/`$ptr` entry's element kind id, a `$rec` entry's index into
+# `prog.recs`. The trailing arrays are the
 # type-name map: `tn[i]` resolves to base kind `tid[i]`, and `[tn[i]]`/`*[tn[i]]` to the
 # interned `dtid[i]`/`ptid[i]`. Fixed ids: 0 `$word`, 1 `$agg`, 2 `Str`, 3 `$tuple`,
 # 4/5 `$dyn`/`$ptr` with an unknown element. POLARITY: anything not provably id 0 pins
 # like an aggregate — a name missing from the map reads as `$agg`, sound the same way.
-data KTab = { [Str] shapes, [Str] knames, [Iarch] eids, [Str] tn, [Iarch] tid, [Iarch] dtid, [Iarch] ptid }
+data KTab = { [Str] shapes, [Iarch] eids, [Str] tn, [Iarch] tid, [Iarch] dtid, [Iarch] ptid }
+
+# One type-environment entry: a binding name and its kind id.
+data KEnt = { Str name, Iarch kid }
 
 # The per-function type environment: every binding name (params, lets, for-vars, match
 # payload binds) mapped to its kind id. Names never shadow (typecheck rejects it), so one
-# flat map per function is sound. Built in one forward pass before the fixpoint.
-data TEnv = { [Str] names, [Iarch] kinds }
+# flat map per function is sound. Built in one forward pass before the fixpoint, into a
+# single driver-owned scratch array sized up front (tenv_count) and REUSED across every
+# function — `ents` is a borrowed view of that scratch, only the first `n` entries belong
+# to this function, and the build writes one entry per binding instead of spread-copying
+# the growing map per binding.
+data TEnv = { [KEnt] ents, Iarch n }
 
 # The small per-function callee table the walkers consult: the DISTINCT callee names of one
 # body, resolved once against the whole-program tables (so the fixpoint rounds never re-run
@@ -331,9 +338,9 @@ const sto_args = (Sums sm, Str callee, [Expr] args): [Expr] -> {
 
 # ── walk-time kind lookups (the scalar-projection exemption) ─────────────────────────────────
 
-const name_kind = (Sums sm, Str n): Iarch -> tenv_kind(sm.te.names, sm.te.kinds, n)
+const name_kind = (Sums sm, Str n): Iarch -> tenv_kind(sm.te.ents, sm.te.n, n)
 const name_scalar = (Sums sm, Str n): Bool -> kind_scalar(name_kind(sm, n))
-const expr_kind = (Sums sm, Expr e): Iarch -> expr_kind_c(sm.prog, sm.kt, sm.te.names, sm.te.kinds, e)
+const expr_kind = (Sums sm, Expr e): Iarch -> expr_kind_c(sm.prog, sm.kt, sm.te.ents, sm.te.n, e)
 
 # The binds of one arm that can actually ALIAS payload storage: named (not `_`) and
 # non-scalar — a word payload is copied out, so its bind pins nothing.
@@ -1076,30 +1083,29 @@ const union_boxed_r = (Program prog, Str u): Bool -> {
 }
 
 # Append one pool entry (the arrays escape into the returned table).
-const ktab_ent = (KTab t, Str shape, Str name, Iarch eid): KTab -> {
+const ktab_ent = (KTab t, Str shape, Iarch eid): KTab -> {
 	const [Str] sh = [...t.shapes, shape]
-	const [Str] kn = [...t.knames, name]
 	const [Iarch] ei = [...t.eids, eid]
-	return KTab({ shapes: sh, knames: kn, eids: ei, tn: t.tn, tid: t.tid, dtid: t.dtid, ptid: t.ptid })
+	return KTab({ shapes: sh, eids: ei, tn: t.tn, tid: t.tid, dtid: t.dtid, ptid: t.ptid })
 }
 
 # One type-name map row: `name` resolves to base kind `b`, with `[name]` and `*[name]`
 # interned beside it (their precomputed element kind is `b`).
 const ktab_row = (KTab t0, Str name, Iarch b): KTab -> {
 	const Iarch di = Iarch(t0.shapes.len)
-	const KTab t = ktab_ent(ktab_ent(t0, "$dyn", name, b), "$ptr", name, b)
+	const KTab t = ktab_ent(ktab_ent(t0, "$dyn", b), "$ptr", b)
 	const [Str] tn2 = [...t.tn, name]
 	const [Iarch] ti = [...t.tid, b]
 	const [Iarch] dt = [...t.dtid, di]
 	const [Iarch] pt = [...t.ptid, di + 1]
-	return KTab({ shapes: t.shapes, knames: t.knames, eids: t.eids, tn: tn2, tid: ti, dtid: dt, ptid: pt })
+	return KTab({ shapes: t.shapes, eids: t.eids, tn: tn2, tid: ti, dtid: dt, ptid: pt })
 }
 
 # A named base kind (`$rec`/`$uni`) interned ahead of its row; `aux` rides in `eids` (a
 # record's index into `prog.recs`, so field queries need no name search).
 const ktab_type = (KTab t, Str shape, Str name, Iarch aux): KTab -> {
 	const Iarch b = Iarch(t.shapes.len)
-	return ktab_row(ktab_ent(t, shape, name, aux), name, b)
+	return ktab_row(ktab_ent(t, shape, aux), name, b)
 }
 
 # The scalar type names seeded into the map, so `[Uint8]`-style element kinds resolve.
@@ -1109,13 +1115,12 @@ const ktab_scalars = (): [Str] -> ["Iarch", "Int", "Uarch", "Bool", "Unit", "Flo
 # `Str`, then a row per record and union (a boxed union is `$uni`, an unboxed one a word).
 const ktab_build = (Program prog): KTab -> {
 	const [Str] sh0 = ["$word", "$agg", "Str", "$tuple", "$dyn", "$ptr"]
-	const [Str] kn0 = ["", "", "", "", "", ""]
 	const [Iarch] ei0 = [-1, -1, -1, -1, 1, 1]
 	const [Str] tn0 = []
 	const [Iarch] ti0 = []
 	const [Iarch] dt0 = []
 	const [Iarch] pt0 = []
-	let KTab t = KTab({ shapes: sh0, knames: kn0, eids: ei0, tn: tn0, tid: ti0, dtid: dt0, ptid: pt0 })
+	let KTab t = KTab({ shapes: sh0, eids: ei0, tn: tn0, tid: ti0, dtid: dt0, ptid: pt0 })
 	const [Str] sc = ktab_scalars()
 	let Iarch i = 0
 	loop {
@@ -1217,11 +1222,11 @@ const elem_kind = (KTab t, Iarch bk): Iarch -> {
 
 const kind_join = (Iarch a, Iarch b): Iarch -> if a == b then a else 1
 
-const tenv_kind = ([Str] tn, [Iarch] tk, Str n): Iarch -> {
+const tenv_kind = ([KEnt] ev, Iarch en, Str nm): Iarch -> {
 	let Iarch i = 0
 	loop {
-		if i >= Iarch(tn.len) then break
-		if str_eq(tn[i], n) then return tk[i]
+		if i >= en then break
+		if str_eq(ev[i].name, nm) then return ev[i].kid
 		i = i + 1
 	}
 	return 1
@@ -1242,8 +1247,8 @@ const call_kind = (Program prog, KTab t, Str callee): Iarch -> {
 
 # The kind an EXPRESSION evaluates to — the inference core, shared by the env build (over
 # the growing arrays) and the walk-time wrapper. Conservative: unknown forms are `$agg`.
-const expr_kind_c = (Program prog, KTab kt, [Str] tn, [Iarch] tk, Expr e): Iarch -> match e {
-	Expr.Var(n) -> tenv_kind(tn, tk, n),
+const expr_kind_c = (Program prog, KTab kt, [KEnt] ev, Iarch en, Expr e): Iarch -> match e {
+	Expr.Var(n) -> tenv_kind(ev, en, n),
 	Expr.Lit(_) -> 0,
 	Expr.BoolLit(_) -> 0,
 	Expr.FloatLit(_) -> 0,
@@ -1255,13 +1260,13 @@ const expr_kind_c = (Program prog, KTab kt, [Str] tn, [Iarch] tk, Expr e): Iarch
 	Expr.Buffer(_) -> kt_dyn(kt, "Uint8"),
 	Expr.Tuple(_) -> 3,
 	Expr.UnionMk(u, _, _) -> kt_tid(kt, u),
-	Expr.Field(b, f) -> field_kind(prog, kt, tenv_kind(tn, tk, b), f),
-	Expr.FieldExpr(be, f) -> field_kind(prog, kt, expr_kind_c(prog, kt, tn, tk, be), f),
-	Expr.Index(b, _) -> elem_kind(kt, tenv_kind(tn, tk, b)),
-	Expr.IndexField(b, _, f) -> field_kind(prog, kt, elem_kind(kt, tenv_kind(tn, tk, b)), f),
-	Expr.IndexExpr(be, _) -> elem_kind(kt, expr_kind_c(prog, kt, tn, tk, be)),
+	Expr.Field(b, f) -> field_kind(prog, kt, tenv_kind(ev, en, b), f),
+	Expr.FieldExpr(be, f) -> field_kind(prog, kt, expr_kind_c(prog, kt, ev, en, be), f),
+	Expr.Index(b, _) -> elem_kind(kt, tenv_kind(ev, en, b)),
+	Expr.IndexField(b, _, f) -> field_kind(prog, kt, elem_kind(kt, tenv_kind(ev, en, b)), f),
+	Expr.IndexExpr(be, _) -> elem_kind(kt, expr_kind_c(prog, kt, ev, en, be)),
 	Expr.Call(n, _, _, _) -> call_kind(prog, kt, n),
-	Expr.If(_, t, el) -> kind_join(expr_kind_c(prog, kt, tn, tk, t), expr_kind_c(prog, kt, tn, tk, el)),
+	Expr.If(_, t, el) -> kind_join(expr_kind_c(prog, kt, ev, en, t), expr_kind_c(prog, kt, ev, en, el)),
 	Expr.Neg(_) -> 0,
 	Expr.Not(_) -> 0,
 	Expr.BitNot(_) -> 0,
@@ -1283,20 +1288,38 @@ const expr_kind_c = (Program prog, KTab kt, [Str] tn, [Iarch] tk, Expr e): Iarch
 	Expr.CmpGe(_, _) -> 0,
 	Expr.And(_, _) -> 0,
 	Expr.Or(_, _) -> 0,
-	Expr.Spread(x) -> expr_kind_c(prog, kt, tn, tk, x),
+	Expr.Spread(x) -> expr_kind_c(prog, kt, ev, en, x),
 	_ -> 1
+}
+
+# Write one entry at the cursor. The scratch is sized by tenv_count so the guard is a belt
+# only — a dropped entry reads back as `$agg` via the tenv_kind miss, sound by polarity.
+const tenv_put = (*[KEnt] tsc, Iarch cap, Iarch n, Str nm, Iarch k): Iarch -> {
+	if n >= cap then return n
+	tsc[n] = KEnt({ name: nm, kid: k })
+	return n + 1
+}
+
+const tenv_puts = (*[KEnt] tsc, Iarch cap, Iarch n0, [Str] ns): Iarch -> {
+	let Iarch n = n0
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ns.len) then break
+		n = tenv_put(tsc, cap, n, ns[i], 1)
+		i = i + 1
+	}
+	return n
 }
 
 # One match arm's payload binds mapped to their payload kinds (a single-member arm binds
 # positionally; `_` positions are skipped by name).
-const bind_kinds = (Program prog, KTab kt, Str uname, [Str] members, [Str] binds, [Str] tn0, [Iarch] tk0): TEnv -> {
-	let [Str] tn = tn0
-	let [Iarch] tk = tk0
+const tenv_binds = (Program prog, KTab kt, *[KEnt] tsc, Iarch cap, Iarch n0, Str uname, [Str] members, [Str] binds): Iarch -> {
+	let Iarch n = n0
 	let Iarch ui = 0
 	loop {
 		if ui >= Iarch(prog.unions.len) then break
 		if str_eq(prog.unions[ui].name, uname) then {
-			if Iarch(members.len) != 1 then return TEnv({ names: tn, kinds: tk })
+			if Iarch(members.len) != 1 then return n
 			let Iarch mi = 0
 			loop {
 				if mi >= Iarch(prog.unions[ui].members.len) then break
@@ -1305,12 +1328,11 @@ const bind_kinds = (Program prog, KTab kt, Str uname, [Str] members, [Str] binds
 					loop {
 						if b >= Iarch(binds.len) then break
 						if b < Iarch(prog.unions[ui].members[mi].payloads.len) then {
-							tn = [...tn, binds[b]]
-							tk = [...tk, kind_of_ftype(kt, prog.unions[ui].members[mi].payloads[b], prog.unions[ui].members[mi].pelems[b])]
+							n = tenv_put(tsc, cap, n, binds[b], kind_of_ftype(kt, prog.unions[ui].members[mi].payloads[b], prog.unions[ui].members[mi].pelems[b]))
 						}
 						b = b + 1
 					}
-					return TEnv({ names: tn, kinds: tk })
+					return n
 				}
 				mi = mi + 1
 			}
@@ -1318,84 +1340,60 @@ const bind_kinds = (Program prog, KTab kt, Str uname, [Str] members, [Str] binds
 		ui = ui + 1
 	}
 	# unknown union/member: bind everything conservatively
-	let Iarch b2 = 0
-	loop {
-		if b2 >= Iarch(binds.len) then break
-		tn = [...tn, binds[b2]]
-		tk = [...tk, 1]
-		b2 = b2 + 1
-	}
-	return TEnv({ names: tn, kinds: tk })
+	return tenv_puts(tsc, cap, n, binds)
 }
 
-const tenv_stmt = (Program prog, KTab kt, TEnv te, Stmt s): TEnv -> match s {
-	Stmt.Let(n, _, ann, init) -> tenv_add_let(prog, kt, te, n, ann, init),
-	Stmt.ForIn(v, arr, ss) -> tenv_body(prog, kt, tenv_add(te, v, elem_kind(kt, tenv_kind(te.names, te.kinds, arr))), ss),
-	Stmt.Destructure(binds, _, _) -> tenv_add_all(te, binds),
-	Stmt.Match(_, arms) -> tenv_sarms(prog, kt, te, arms),
-	Stmt.IfThen(_, b) -> tenv_stmt(prog, kt, te, b),
-	Stmt.IfElse(_, t, el) -> tenv_stmt(prog, kt, tenv_stmt(prog, kt, te, t), el),
-	Stmt.Block(ss) -> tenv_body(prog, kt, te, ss),
-	Stmt.Loop(ss) -> tenv_body(prog, kt, te, ss),
-	Stmt.Defer(ss) -> tenv_body(prog, kt, te, ss),
-	Stmt.Closure(_, _, _, cb) -> tenv_body(prog, kt, te, cb),
-	_ -> te
-}
-
-const tenv_add = (TEnv te, Str n, Iarch k): TEnv -> {
-	const [Str] tn = [...te.names, n]
-	const [Iarch] tk = [...te.kinds, k]
-	return TEnv({ names: tn, kinds: tk })
-}
-
-const tenv_add_all = (TEnv te, [Str] ns): TEnv -> {
-	let TEnv r = te
-	let Iarch i = 0
-	loop {
-		if i >= Iarch(ns.len) then break
-		r = tenv_add(r, ns[i], 1)
-		i = i + 1
-	}
-	return r
+const tenv_stmt = (Program prog, KTab kt, *[KEnt] tsc, [KEnt] ev, Iarch cap, Iarch n, Stmt s): Iarch -> match s {
+	Stmt.Let(nm, _, ann, init) -> tenv_let(prog, kt, tsc, ev, cap, n, nm, ann, init),
+	Stmt.ForIn(v, arr, ss) -> tenv_body(prog, kt, tsc, ev, cap, tenv_put(tsc, cap, n, v, elem_kind(kt, tenv_kind(ev, n, arr))), ss),
+	Stmt.Destructure(binds, _, _) -> tenv_puts(tsc, cap, n, binds),
+	Stmt.Match(_, arms) -> tenv_sarms(prog, kt, tsc, ev, cap, n, arms),
+	Stmt.IfThen(_, b) -> tenv_stmt(prog, kt, tsc, ev, cap, n, b),
+	Stmt.IfElse(_, t, el) -> tenv_stmt(prog, kt, tsc, ev, cap, tenv_stmt(prog, kt, tsc, ev, cap, n, t), el),
+	Stmt.Block(ss) -> tenv_body(prog, kt, tsc, ev, cap, n, ss),
+	Stmt.Loop(ss) -> tenv_body(prog, kt, tsc, ev, cap, n, ss),
+	Stmt.Defer(ss) -> tenv_body(prog, kt, tsc, ev, cap, n, ss),
+	Stmt.Closure(_, _, _, cb) -> tenv_body(prog, kt, tsc, ev, cap, n, cb),
+	_ -> n
 }
 
 # A `let`'s kind: the annotation when it names a type, else inferred from the initializer's
 # shape. Value-block initializers also declare their INNER bindings (walked for the flat map).
-const tenv_add_let = (Program prog, KTab kt, TEnv te, Str n, Str ann, Expr init): TEnv -> {
-	let TEnv r = te
-	r = match init {
-		Expr.Loop(ss) -> tenv_body(prog, kt, r, ss),
-		_ -> r
+const tenv_let = (Program prog, KTab kt, *[KEnt] tsc, [KEnt] ev, Iarch cap, Iarch n0, Str nm, Str ann, Expr init): Iarch -> {
+	let Iarch n = n0
+	n = match init {
+		Expr.Loop(ss) -> tenv_body(prog, kt, tsc, ev, cap, n, ss),
+		_ -> n
 	}
-	let Iarch k = expr_kind_c(prog, kt, r.names, r.kinds, init)
+	let Iarch k = expr_kind_c(prog, kt, ev, n, init)
 	if !str_eq(ann, "") then {
 		const Iarch ka = kt_tid(kt, ann)
 		if ka != 1 then k = ka
 	}
-	return tenv_add(r, n, k)
+	return tenv_put(tsc, cap, n, nm, k)
 }
 
-const tenv_sarms = (Program prog, KTab kt, TEnv te, [StmtArm] arms): TEnv -> {
-	let TEnv r = te
+const tenv_sarms = (Program prog, KTab kt, *[KEnt] tsc, [KEnt] ev, Iarch cap, Iarch n0, [StmtArm] arms): Iarch -> {
+	let Iarch n = n0
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(arms.len) then break
-		if !arms[i].is_wild && Iarch(arms[i].binds.len) > 0 then r = bind_kinds(prog, kt, arms[i].type_name, arms[i].members, arms[i].binds, r.names, r.kinds)
-		r = tenv_body(prog, kt, r, arms[i].body)
+		if !arms[i].is_wild && Iarch(arms[i].binds.len) > 0 then n = tenv_binds(prog, kt, tsc, cap, n, arms[i].type_name, arms[i].members, arms[i].binds)
+		n = tenv_body(prog, kt, tsc, ev, cap, n, arms[i].body)
 		i = i + 1
 	}
-	return r
+	return n
 }
 
-const tenv_body = (Program prog, KTab kt, TEnv te, [Stmt] ss): TEnv -> {
-	let TEnv r = te
+const tenv_body = (Program prog, KTab kt, *[KEnt] tsc, [KEnt] ev, Iarch cap, Iarch n0, [Stmt] ss): Iarch -> {
+	let Iarch n = n0
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(ss.len) then break
-		r = tenv_stmt(prog, kt, r, ss[i])
+		n = tenv_stmt(prog, kt, tsc, ev, cap, n, ss[i])
 		i = i + 1
 	}
-	return r
+	return n
 }
 
 # A parameter's kind from its declaration.
@@ -1411,18 +1409,64 @@ const param_kind = (KTab kt, Param p): Iarch -> {
 	return kt_tid(kt, p.type_name)
 }
 
-const tenv_build! = (Program prog, KTab kt, Func f): TEnv -> {
-	let [Str] tn = []
-	let [Iarch] tk = []
+# Fill the scratch for one function; returns the entry count. `tsc` and `ev` are the WRITE
+# and READ views of the same driver-owned array (the `*[T]` reference for element stores,
+# the value borrow for lookups over the growing prefix).
+const tenv_build = (Program prog, KTab kt, *[KEnt] tsc, [KEnt] ev, Iarch cap, Func f): Iarch -> {
+	let Iarch n = 0
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(f.params.len) then break
-		tn = [...tn, f.params[i].name]
-		tk = [...tk, param_kind(kt, f.params[i])]
+		n = tenv_put(tsc, cap, n, f.params[i].name, param_kind(kt, f.params[i]))
 		i = i + 1
 	}
-	return tenv_body(prog, kt, TEnv({ names: tn, kinds: tk }), f.body)
+	return tenv_body(prog, kt, tsc, ev, cap, n, f.body)
 }
+
+# An upper bound on one function's entry count — mirrors the build walk, so the scratch
+# sized to the largest function never overflows.
+const tec_expr = (Expr e): Iarch -> match e {
+	Expr.Loop(ss) -> tec_body(ss),
+	_ -> 0
+}
+
+const tec_sarms = ([StmtArm] arms): Iarch -> {
+	let Iarch c = 0
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		c = c + Iarch(arms[i].binds.len) + tec_body(arms[i].body)
+		i = i + 1
+	}
+	return c
+}
+
+const tec_stmt = (Stmt s): Iarch -> match s {
+	Stmt.Let(_, _, _, init) -> 1 + tec_expr(init),
+	Stmt.ForIn(_, _, ss) -> 1 + tec_body(ss),
+	Stmt.Destructure(binds, _, _) -> Iarch(binds.len),
+	Stmt.Match(_, arms) -> tec_sarms(arms),
+	Stmt.IfThen(_, b) -> tec_stmt(b),
+	Stmt.IfElse(_, t, el) -> tec_stmt(t) + tec_stmt(el),
+	Stmt.Block(ss) -> tec_body(ss),
+	Stmt.Loop(ss) -> tec_body(ss),
+	Stmt.Defer(ss) -> tec_body(ss),
+	Stmt.Closure(_, _, _, cb) -> tec_body(cb),
+	_ -> 0
+}
+
+const tec_body = ([Stmt] ss): Iarch -> {
+	let Iarch c = 0
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		c = c + tec_stmt(ss[i])
+		i = i + 1
+	}
+	return c
+}
+
+const tenv_count = (Func f): Iarch -> Iarch(f.params.len) + tec_body(f.body)
 
 # Resolve one body's distinct callee names into the small table the walkers consult. An
 # in-progress callee (state 1 — a recursion/SCC back-edge) resolves to ⊤ exactly like an
@@ -1497,7 +1541,7 @@ const empty_rsets = (): RSets -> {
 # arrays, written in place through the `*[T]` references (they are never grown after the
 # handoff, so the decayed data pointers stay valid). A callee still on the DFS stack at
 # analysis time reads as ⊤ (local_sums), the memo's "SCC ⇒ all-args-escape".
-const summarize! = (Program prog, KTab kt, *[FnSum] sums, *[Iarch] st, *[RSets] rsets, Iarch k): Iarch -> {
+const summarize! = (Program prog, KTab kt, *[KEnt] tsc, [KEnt] tscv, Iarch cap, *[FnSum] sums, *[Iarch] st, *[RSets] rsets, Iarch k): Iarch -> {
 	if st[k] != 0 then return 0
 	st[k] = 1
 	if prog.funcs[k].is_asm || prog.funcs[k].is_value then {
@@ -1511,11 +1555,11 @@ const summarize! = (Program prog, KTab kt, *[FnSum] sums, *[Iarch] st, *[RSets] 
 		if i >= Iarch(cns.len) then break
 		const Iarch j = find_fn(prog.funcs, cns[i])
 		if j >= 0 then {
-			if st[j] == 0 then summarize!(prog, kt, sums, st, rsets, j)
+			if st[j] == 0 then summarize!(prog, kt, tsc, tscv, cap, sums, st, rsets, j)
 		}
 		i = i + 1
 	}
-	const TEnv te = tenv_build!(prog, kt, prog.funcs[k])
+	const TEnv te = TEnv({ ents: tscv, n: tenv_build(prog, kt, tsc, tscv, cap, prog.funcs[k]) })
 	const Sums sm = local_sums(prog, kt, sums, st, cns, te)
 	const [Str] params = plist_names(prog.funcs[k].params)
 	const RSets rs = shadow_sets!(sm, params, prog.funcs[k].body)
@@ -1557,10 +1601,28 @@ pub const routing_tables! = (Program prog): RouteInfo -> {
 		rsets = [...rsets, empty_rsets()]
 		p = p + 1
 	}
+	# the shared tenv scratch, sized once to the largest function and reused by every DFS
+	# visit (never grown after the handoff — the decayed data pointer must stay valid)
+	let Iarch cap = 0
+	let Iarch q = 0
+	loop {
+		if q >= n then break
+		const Iarch c = tenv_count(prog.funcs[q])
+		if c > cap then cap = c
+		q = q + 1
+	}
+	let [KEnt] tsc = []
+	const KEnt ke = KEnt({ name: "", kid: 1 })
+	let Iarch w = 0
+	loop {
+		if w >= cap then break
+		tsc = [...tsc, ke]
+		w = w + 1
+	}
 	let Iarch d = 0
 	loop {
 		if d >= n then break
-		summarize!(prog, kt, sums, st, rsets, d)
+		summarize!(prog, kt, tsc, tsc, cap, sums, st, rsets, d)
 		d = d + 1
 	}
 	return RouteInfo({ sets: rsets, sums: sums })
