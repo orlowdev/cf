@@ -174,24 +174,32 @@ const plist_names = ([Param] ps): [Str] -> {
 # summary machinery.
 pub data FnSum = { Bool all_esc, [Bool] ret_al, [Bool] stores, Bool agg_ret, Bool rehomer }
 
-# A binding's comptime KIND, as much of the type as the routing walkers need: `shape` is one
-# of `$word` (a scalar — the ONLY exempt shape), `Str`, `$tuple`, `$rec`/`$uni` (name in
-# `name`), `$dyn`/`$ptr` (element type name in `name`), or `$agg` — the conservative unknown.
-# POLARITY: anything not provably `$word` pins like an aggregate.
-data Kind = { Str shape, Str name }
+# A binding's comptime KIND, as much of the type as the routing walkers need — INTERNED:
+# every (shape, name) pair the walkers can ever ask about lives in a per-program pool built
+# once (ktab_build), and a kind everywhere else is a bare Iarch id into it, so the queries
+# inside the fixpoint compare words and read prebuilt arrays, allocating nothing. `shapes`
+# holds `$word` (a scalar — the ONLY exempt shape), `Str`, `$tuple`, `$rec`/`$uni` (type
+# name in `knames`), `$dyn`/`$ptr` (element type name in `knames`), or `$agg` — the
+# conservative unknown. `eids` is the entry's precomputed EDGE: a `$dyn`/`$ptr` entry's
+# element kind id, a `$rec` entry's index into `prog.recs`. The trailing arrays are the
+# type-name map: `tn[i]` resolves to base kind `tid[i]`, and `[tn[i]]`/`*[tn[i]]` to the
+# interned `dtid[i]`/`ptid[i]`. Fixed ids: 0 `$word`, 1 `$agg`, 2 `Str`, 3 `$tuple`,
+# 4/5 `$dyn`/`$ptr` with an unknown element. POLARITY: anything not provably id 0 pins
+# like an aggregate — a name missing from the map reads as `$agg`, sound the same way.
+data KTab = { [Str] shapes, [Str] knames, [Iarch] eids, [Str] tn, [Iarch] tid, [Iarch] dtid, [Iarch] ptid }
 
 # The per-function type environment: every binding name (params, lets, for-vars, match
-# payload binds) mapped to its Kind. Names never shadow (typecheck rejects it), so one flat
-# map per function is sound. Built in one forward pass before the fixpoint.
-data TEnv = { [Str] names, [Kind] kinds }
+# payload binds) mapped to its kind id. Names never shadow (typecheck rejects it), so one
+# flat map per function is sound. Built in one forward pass before the fixpoint.
+data TEnv = { [Str] names, [Iarch] kinds }
 
 # The small per-function callee table the walkers consult: the DISTINCT callee names of one
 # body, resolved once against the whole-program tables (so the fixpoint rounds never re-run
-# the global name search) — plus the function's type environment and the program's own
-# declaration tables, so a walker can judge a PROJECTION's scalarity in place (the
-# scalar-projection exemption: `s.len`, `p.v`, `xs[i]`-of-words copy a WORD out, so they
-# never pin their base).
-data Sums = { [Str] names, [FnSum] tbl, TEnv te, Program prog }
+# the global name search) — plus the function's type environment, the program's own
+# declaration tables, and the interned kind pool, so a walker can judge a PROJECTION's
+# scalarity in place (the scalar-projection exemption: `s.len`, `p.v`, `xs[i]`-of-words
+# copy a WORD out, so they never pin their base).
+data Sums = { [Str] names, [FnSum] tbl, TEnv te, Program prog, KTab kt }
 
 const bit_at = ([Bool] bs, Iarch i): Bool -> if i >= Iarch(bs.len) then true else bs[i]
 
@@ -323,9 +331,9 @@ const sto_args = (Sums sm, Str callee, [Expr] args): [Expr] -> {
 
 # ── walk-time kind lookups (the scalar-projection exemption) ─────────────────────────────────
 
-const name_kind = (Sums sm, Str n): Kind -> tenv_kind(sm.te.names, sm.te.kinds, n)
+const name_kind = (Sums sm, Str n): Iarch -> tenv_kind(sm.te.names, sm.te.kinds, n)
 const name_scalar = (Sums sm, Str n): Bool -> kind_scalar(name_kind(sm, n))
-const expr_kind = (Sums sm, Expr e): Kind -> expr_kind_c(sm.prog, sm.te.names, sm.te.kinds, e)
+const expr_kind = (Sums sm, Expr e): Iarch -> expr_kind_c(sm.prog, sm.kt, sm.te.names, sm.te.kinds, e)
 
 # The binds of one arm that can actually ALIAS payload storage: named (not `_`) and
 # non-scalar — a word payload is copied out, so its bind pins nothing.
@@ -396,17 +404,17 @@ const evars = (Sums sm, Expr e): [Str] -> match e {
 	# an escaping AGGREGATE projection pins its BASE (the read interior lives inside the
 	# base's block) — but a SCALAR projection (`s.len`, `p.v`, a word element) copies a WORD
 	# out, so no pointer into the base survives and nothing is pinned (the p2/p16 exemption)
-	Expr.Field(b, f) -> if kind_scalar(field_kind(sm.prog, name_kind(sm, b), f)) then no_strs() else one_str(b),
-	Expr.FieldExpr(be, f) -> if kind_scalar(field_kind(sm.prog, expr_kind(sm, be), f)) then no_strs() else evars(sm, be),
+	Expr.Field(b, f) -> if kind_scalar(field_kind(sm.prog, sm.kt, name_kind(sm, b), f)) then no_strs() else one_str(b),
+	Expr.FieldExpr(be, f) -> if kind_scalar(field_kind(sm.prog, sm.kt, expr_kind(sm, be), f)) then no_strs() else evars(sm, be),
 	Expr.UnionMk(_, _, args) -> evars_list(sm, args),
 	# the arm value escapes; a payload bind may alias the scrutinee — but only an AGGREGATE
 	# payload bind can (a word payload is copied), so a match binding only words pins nothing
 	Expr.Match(s, arms) -> cat_s(if marms_agg_bind(sm, arms) then evars(sm, s) else no_strs(), evars_marms(sm, arms)),
 	# BOTH the spread source (its element pointers are copied into the new spine) and the elements
 	Expr.ArrayLit(_, sp, elems, _) -> cat_s(evars(sm, sp), evars_list(sm, elems)),
-	Expr.Index(b, _) -> if kind_scalar(elem_kind(sm.prog, name_kind(sm, b))) then no_strs() else one_str(b),
-	Expr.IndexField(b, _, f) -> if kind_scalar(field_kind(sm.prog, elem_kind(sm.prog, name_kind(sm, b)), f)) then no_strs() else one_str(b),
-	Expr.IndexExpr(be, _) -> if kind_scalar(elem_kind(sm.prog, expr_kind(sm, be))) then no_strs() else evars(sm, be),
+	Expr.Index(b, _) -> if kind_scalar(elem_kind(sm.kt, name_kind(sm, b))) then no_strs() else one_str(b),
+	Expr.IndexField(b, _, f) -> if kind_scalar(field_kind(sm.prog, sm.kt, elem_kind(sm.kt, name_kind(sm, b)), f)) then no_strs() else one_str(b),
+	Expr.IndexExpr(be, _) -> if kind_scalar(elem_kind(sm.kt, expr_kind(sm, be))) then no_strs() else evars(sm, be),
 	# a hole's bytes are COPIED into the string (cf_str_append) — no aliasing, no escape
 	Expr.Interp(_) -> no_strs(),
 	Expr.Tuple(elems) -> evars_list(sm, elems),
@@ -725,11 +733,11 @@ const calls_body! = ([Stmt] ss): [Str] -> {
 
 const aroots = (Sums sm, Expr e): [Str] -> match e {
 	Expr.Var(n) -> one_str(n),
-	Expr.Field(b, f) -> if kind_scalar(field_kind(sm.prog, name_kind(sm, b), f)) then no_strs() else one_str(b),
-	Expr.FieldExpr(be, f) -> if kind_scalar(field_kind(sm.prog, expr_kind(sm, be), f)) then no_strs() else aroots(sm, be),
-	Expr.Index(b, _) -> if kind_scalar(elem_kind(sm.prog, name_kind(sm, b))) then no_strs() else one_str(b),
-	Expr.IndexField(b, _, f) -> if kind_scalar(field_kind(sm.prog, elem_kind(sm.prog, name_kind(sm, b)), f)) then no_strs() else one_str(b),
-	Expr.IndexExpr(be, _) -> if kind_scalar(elem_kind(sm.prog, expr_kind(sm, be))) then no_strs() else aroots(sm, be),
+	Expr.Field(b, f) -> if kind_scalar(field_kind(sm.prog, sm.kt, name_kind(sm, b), f)) then no_strs() else one_str(b),
+	Expr.FieldExpr(be, f) -> if kind_scalar(field_kind(sm.prog, sm.kt, expr_kind(sm, be), f)) then no_strs() else aroots(sm, be),
+	Expr.Index(b, _) -> if kind_scalar(elem_kind(sm.kt, name_kind(sm, b))) then no_strs() else one_str(b),
+	Expr.IndexField(b, _, f) -> if kind_scalar(field_kind(sm.prog, sm.kt, elem_kind(sm.kt, name_kind(sm, b)), f)) then no_strs() else one_str(b),
+	Expr.IndexExpr(be, _) -> if kind_scalar(elem_kind(sm.kt, expr_kind(sm, be))) then no_strs() else aroots(sm, be),
 	Expr.Spread(x) -> aroots(sm, x),
 	Expr.If(_, t, el) -> cat_s(aroots(sm, t), aroots(sm, el)),
 	Expr.Match(_, arms) -> aroots_marms(sm, arms),
@@ -1047,10 +1055,7 @@ const find_fn = ([Func] funcs, Str name): Iarch -> {
 
 # ── the kind table (the scalar-projection exemption's type knowledge) ────────────────────────
 
-const kw = (): Kind -> Kind({ shape: "$word", name: "" })
-const kagg = (): Kind -> Kind({ shape: "$agg", name: "" })
-const kmk = (Str sh, Str nm): Kind -> Kind({ shape: sh, name: nm })
-const kind_scalar = (Kind k): Bool -> str_eq(k.shape, "$word")
+const kind_scalar = (Iarch k): Bool -> k == 0
 
 const union_boxed_r = (Program prog, Str u): Bool -> {
 	let Iarch i = 0
@@ -1070,148 +1075,223 @@ const union_boxed_r = (Program prog, Str u): Bool -> {
 	return false
 }
 
-const find_rec_r = (Program prog, Str n): Iarch -> {
-	let Iarch i = 0
-	loop {
-		if i >= Iarch(prog.recs.len) then break
-		if str_eq(prog.recs[i].name, n) then return i
-		i = i + 1
-	}
-	return -1
+# Append one pool entry (the arrays escape into the returned table).
+const ktab_ent = (KTab t, Str shape, Str name, Iarch eid): KTab -> {
+	const [Str] sh = [...t.shapes, shape]
+	const [Str] kn = [...t.knames, name]
+	const [Iarch] ei = [...t.eids, eid]
+	return KTab({ shapes: sh, knames: kn, eids: ei, tn: t.tn, tid: t.tid, dtid: t.dtid, ptid: t.ptid })
 }
 
-# A bare TYPE NAME's kind (an annotation, a record field's ftype, a callee's ret_name).
-const kind_of_tname = (Program prog, Str tn): Kind -> {
-	if is_scalar_ret(tn) then return kw()
-	if str_eq(tn, "Str") then return kmk("Str", "")
-	if str_eq(tn, "$tuple") then return kmk("$tuple", "")
-	if find_rec_r(prog, tn) >= 0 then return kmk("$rec", tn)
-	if union_boxed_r(prog, tn) then return kmk("$uni", tn)
+# One type-name map row: `name` resolves to base kind `b`, with `[name]` and `*[name]`
+# interned beside it (their precomputed element kind is `b`).
+const ktab_row = (KTab t0, Str name, Iarch b): KTab -> {
+	const Iarch di = Iarch(t0.shapes.len)
+	const KTab t = ktab_ent(ktab_ent(t0, "$dyn", name, b), "$ptr", name, b)
+	const [Str] tn2 = [...t.tn, name]
+	const [Iarch] ti = [...t.tid, b]
+	const [Iarch] dt = [...t.dtid, di]
+	const [Iarch] pt = [...t.ptid, di + 1]
+	return KTab({ shapes: t.shapes, knames: t.knames, eids: t.eids, tn: tn2, tid: ti, dtid: dt, ptid: pt })
+}
+
+# A named base kind (`$rec`/`$uni`) interned ahead of its row; `aux` rides in `eids` (a
+# record's index into `prog.recs`, so field queries need no name search).
+const ktab_type = (KTab t, Str shape, Str name, Iarch aux): KTab -> {
+	const Iarch b = Iarch(t.shapes.len)
+	return ktab_row(ktab_ent(t, shape, name, aux), name, b)
+}
+
+# The scalar type names seeded into the map, so `[Uint8]`-style element kinds resolve.
+const ktab_scalars = (): [Str] -> ["Iarch", "Int", "Uarch", "Bool", "Unit", "Float32", "Float64", "Int8", "Int16", "Int32", "Int64", "Uint8", "Uint16", "Uint32", "Uint64"]
+
+# Built once per program before the DFS: the six fixed entries, a row per scalar name and
+# `Str`, then a row per record and union (a boxed union is `$uni`, an unboxed one a word).
+const ktab_build = (Program prog): KTab -> {
+	const [Str] sh0 = ["$word", "$agg", "Str", "$tuple", "$dyn", "$ptr"]
+	const [Str] kn0 = ["", "", "", "", "", ""]
+	const [Iarch] ei0 = [-1, -1, -1, -1, 1, 1]
+	const [Str] tn0 = []
+	const [Iarch] ti0 = []
+	const [Iarch] dt0 = []
+	const [Iarch] pt0 = []
+	let KTab t = KTab({ shapes: sh0, knames: kn0, eids: ei0, tn: tn0, tid: ti0, dtid: dt0, ptid: pt0 })
+	const [Str] sc = ktab_scalars()
 	let Iarch i = 0
 	loop {
-		if i >= Iarch(prog.unions.len) then break
-		if str_eq(prog.unions[i].name, tn) then return kw()
+		if i >= Iarch(sc.len) then break
+		t = ktab_row(t, sc[i], 0)
 		i = i + 1
 	}
-	return kagg()
+	t = ktab_row(t, "Str", 2)
+	let Iarch r = 0
+	loop {
+		if r >= Iarch(prog.recs.len) then break
+		t = ktab_type(t, "$rec", prog.recs[r].name, r)
+		r = r + 1
+	}
+	let Iarch u = 0
+	loop {
+		if u >= Iarch(prog.unions.len) then break
+		if union_boxed_r(prog, prog.unions[u].name) then {
+			t = ktab_type(t, "$uni", prog.unions[u].name, -1)
+		} else {
+			t = ktab_row(t, prog.unions[u].name, 0)
+		}
+		u = u + 1
+	}
+	return t
+}
+
+# A bare TYPE NAME's kind id (an annotation, a record field's ftype, a callee's ret_name).
+const kt_tid = (KTab t, Str name): Iarch -> {
+	if is_scalar_ret(name) then return 0
+	if str_eq(name, "Str") then return 2
+	if str_eq(name, "$tuple") then return 3
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(t.tn.len) then break
+		if str_eq(t.tn[i], name) then return t.tid[i]
+		i = i + 1
+	}
+	return 1
+}
+
+# The interned `[el]` / `*[el]` kind ids (an unknown element reads as ids 4/5).
+const kt_dyn = (KTab t, Str el): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(t.tn.len) then break
+		if str_eq(t.tn[i], el) then return t.dtid[i]
+		i = i + 1
+	}
+	return 4
+}
+
+const kt_ptr = (KTab t, Str el): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(t.tn.len) then break
+		if str_eq(t.tn[i], el) then return t.ptid[i]
+		i = i + 1
+	}
+	return 5
 }
 
 # A FIELD/PAYLOAD type slot's kind: the `$dyn`/`$ptr` markers carry their element beside them.
-const kind_of_ftype = (Program prog, Str ft, Str felem): Kind -> {
-	if str_eq(ft, "$dyn") then return kmk("$dyn", felem)
-	if str_eq(ft, "$ptr") then return kmk("$ptr", felem)
-	return kind_of_tname(prog, ft)
+const kind_of_ftype = (KTab t, Str ft, Str felem): Iarch -> {
+	if str_eq(ft, "$dyn") then return kt_dyn(t, felem)
+	if str_eq(ft, "$ptr") then return kt_ptr(t, felem)
+	return kt_tid(t, ft)
 }
 
 # The kind of `base.f` given the base's kind. `.len` on a string/array/pointer is a word;
-# `.bytes` hands out a raw pointer into the backing — never exempt.
-const field_kind = (Program prog, Kind bk, Str f): Kind -> {
-	if str_eq(bk.shape, "Str") || str_eq(bk.shape, "$dyn") || str_eq(bk.shape, "$ptr") then {
-		if str_eq(f, "len") then return kw()
-		return kagg()
+# `.bytes` hands out a raw pointer into the backing — never exempt. A `$rec` entry's `eids`
+# is its record-table index, so the field scan needs no name search.
+const field_kind = (Program prog, KTab t, Iarch bk, Str f): Iarch -> {
+	const Str sh = t.shapes[bk]
+	if str_eq(sh, "Str") || str_eq(sh, "$dyn") || str_eq(sh, "$ptr") then {
+		if str_eq(f, "len") then return 0
+		return 1
 	}
-	if str_eq(bk.shape, "$rec") then {
-		const Iarch ri = find_rec_r(prog, bk.name)
-		if ri < 0 then return kagg()
+	if str_eq(sh, "$rec") then {
+		const Iarch ri = t.eids[bk]
 		let Iarch i = 0
 		loop {
 			if i >= Iarch(prog.recs[ri].fields.len) then break
-			if str_eq(prog.recs[ri].fields[i], f) then return kind_of_ftype(prog, prog.recs[ri].ftypes[i], prog.recs[ri].felems[i])
+			if str_eq(prog.recs[ri].fields[i], f) then return kind_of_ftype(t, prog.recs[ri].ftypes[i], prog.recs[ri].felems[i])
 			i = i + 1
 		}
-		return kagg()
+		return 1
 	}
-	return kagg()
+	return 1
 }
 
-# The kind of `base[i]` given the base's kind: a byte off a string/byte-pointer is a word,
-# an array element is its element type's kind.
-const elem_kind = (Program prog, Kind bk): Kind -> {
-	if str_eq(bk.shape, "Str") then return kw()
-	if str_eq(bk.shape, "$dyn") || str_eq(bk.shape, "$ptr") then return kind_of_tname(prog, bk.name)
-	return kagg()
+# The kind of `base[i]` given the base's kind: a byte off a string is a word, an array or
+# pointer element is its entry's precomputed element kind.
+const elem_kind = (KTab t, Iarch bk): Iarch -> {
+	if str_eq(t.shapes[bk], "Str") then return 0
+	if str_eq(t.shapes[bk], "$dyn") || str_eq(t.shapes[bk], "$ptr") then return t.eids[bk]
+	return 1
 }
 
-const kind_join = (Kind a, Kind b): Kind -> {
-	if str_eq(a.shape, b.shape) && str_eq(a.name, b.name) then return a
-	return kagg()
-}
+const kind_join = (Iarch a, Iarch b): Iarch -> if a == b then a else 1
 
-const tenv_kind = ([Str] tn, [Kind] tk, Str n): Kind -> {
+const tenv_kind = ([Str] tn, [Iarch] tk, Str n): Iarch -> {
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(tn.len) then break
 		if str_eq(tn[i], n) then return tk[i]
 		i = i + 1
 	}
-	return kagg()
+	return 1
 }
 
 # The kind a CALL evaluates to (the callee's declared return; intrinsics by table).
-const call_kind = (Program prog, Str callee): Kind -> {
+const call_kind = (Program prog, KTab t, Str callee): Iarch -> {
 	const Iarch j = find_fn(prog.funcs, callee)
 	if j >= 0 then {
-		if str_eq(prog.funcs[j].ret_name, "$dyn") then return kmk("$dyn", prog.funcs[j].ret_elem)
-		return kind_of_tname(prog, prog.funcs[j].ret_name)
+		if str_eq(prog.funcs[j].ret_name, "$dyn") then return kt_dyn(t, prog.funcs[j].ret_elem)
+		return kt_tid(t, prog.funcs[j].ret_name)
 	}
-	if is_cast_name(callee) then return kw()
-	if str_eq(callee, "Str") then return kmk("Str", "")
-	if is_routing_intrinsic(callee) then return kw()
-	return kagg()
+	if is_cast_name(callee) then return 0
+	if str_eq(callee, "Str") then return 2
+	if is_routing_intrinsic(callee) then return 0
+	return 1
 }
 
 # The kind an EXPRESSION evaluates to — the inference core, shared by the env build (over
 # the growing arrays) and the walk-time wrapper. Conservative: unknown forms are `$agg`.
-const expr_kind_c = (Program prog, [Str] tn, [Kind] tk, Expr e): Kind -> match e {
+const expr_kind_c = (Program prog, KTab kt, [Str] tn, [Iarch] tk, Expr e): Iarch -> match e {
 	Expr.Var(n) -> tenv_kind(tn, tk, n),
-	Expr.Lit(_) -> kw(),
-	Expr.BoolLit(_) -> kw(),
-	Expr.FloatLit(_) -> kw(),
-	Expr.Unit -> kw(),
-	Expr.StrLit(_) -> kmk("Str", ""),
-	Expr.Interp(_) -> kmk("Str", ""),
-	Expr.Record(tnm, _) -> if str_eq(tnm, "") then kagg() else kmk("$rec", tnm),
-	Expr.ArrayLit(_, _, _, et) -> kmk("$dyn", et),
-	Expr.Buffer(_) -> kmk("$dyn", "Uint8"),
-	Expr.Tuple(_) -> kmk("$tuple", ""),
-	Expr.UnionMk(u, _, _) -> if union_boxed_r(prog, u) then kmk("$uni", u) else kw(),
-	Expr.Field(b, f) -> field_kind(prog, tenv_kind(tn, tk, b), f),
-	Expr.FieldExpr(be, f) -> field_kind(prog, expr_kind_c(prog, tn, tk, be), f),
-	Expr.Index(b, _) -> elem_kind(prog, tenv_kind(tn, tk, b)),
-	Expr.IndexField(b, _, f) -> field_kind(prog, elem_kind(prog, tenv_kind(tn, tk, b)), f),
-	Expr.IndexExpr(be, _) -> elem_kind(prog, expr_kind_c(prog, tn, tk, be)),
-	Expr.Call(n, _, _, _) -> call_kind(prog, n),
-	Expr.If(_, t, el) -> kind_join(expr_kind_c(prog, tn, tk, t), expr_kind_c(prog, tn, tk, el)),
-	Expr.Neg(_) -> kw(),
-	Expr.Not(_) -> kw(),
-	Expr.BitNot(_) -> kw(),
-	Expr.Add(_, _) -> kw(),
-	Expr.Sub(_, _) -> kw(),
-	Expr.Mul(_, _) -> kw(),
-	Expr.Div(_, _) -> kw(),
-	Expr.Mod(_, _) -> kw(),
-	Expr.BitAnd(_, _) -> kw(),
-	Expr.BitOr(_, _) -> kw(),
-	Expr.BitXor(_, _) -> kw(),
-	Expr.Shl(_, _) -> kw(),
-	Expr.Shr(_, _) -> kw(),
-	Expr.CmpEq(_, _) -> kw(),
-	Expr.CmpNe(_, _) -> kw(),
-	Expr.CmpLt(_, _) -> kw(),
-	Expr.CmpGt(_, _) -> kw(),
-	Expr.CmpLe(_, _) -> kw(),
-	Expr.CmpGe(_, _) -> kw(),
-	Expr.And(_, _) -> kw(),
-	Expr.Or(_, _) -> kw(),
-	Expr.Spread(x) -> expr_kind_c(prog, tn, tk, x),
-	_ -> kagg()
+	Expr.Lit(_) -> 0,
+	Expr.BoolLit(_) -> 0,
+	Expr.FloatLit(_) -> 0,
+	Expr.Unit -> 0,
+	Expr.StrLit(_) -> 2,
+	Expr.Interp(_) -> 2,
+	Expr.Record(tnm, _) -> if str_eq(tnm, "") then 1 else kt_tid(kt, tnm),
+	Expr.ArrayLit(_, _, _, et) -> kt_dyn(kt, et),
+	Expr.Buffer(_) -> kt_dyn(kt, "Uint8"),
+	Expr.Tuple(_) -> 3,
+	Expr.UnionMk(u, _, _) -> kt_tid(kt, u),
+	Expr.Field(b, f) -> field_kind(prog, kt, tenv_kind(tn, tk, b), f),
+	Expr.FieldExpr(be, f) -> field_kind(prog, kt, expr_kind_c(prog, kt, tn, tk, be), f),
+	Expr.Index(b, _) -> elem_kind(kt, tenv_kind(tn, tk, b)),
+	Expr.IndexField(b, _, f) -> field_kind(prog, kt, elem_kind(kt, tenv_kind(tn, tk, b)), f),
+	Expr.IndexExpr(be, _) -> elem_kind(kt, expr_kind_c(prog, kt, tn, tk, be)),
+	Expr.Call(n, _, _, _) -> call_kind(prog, kt, n),
+	Expr.If(_, t, el) -> kind_join(expr_kind_c(prog, kt, tn, tk, t), expr_kind_c(prog, kt, tn, tk, el)),
+	Expr.Neg(_) -> 0,
+	Expr.Not(_) -> 0,
+	Expr.BitNot(_) -> 0,
+	Expr.Add(_, _) -> 0,
+	Expr.Sub(_, _) -> 0,
+	Expr.Mul(_, _) -> 0,
+	Expr.Div(_, _) -> 0,
+	Expr.Mod(_, _) -> 0,
+	Expr.BitAnd(_, _) -> 0,
+	Expr.BitOr(_, _) -> 0,
+	Expr.BitXor(_, _) -> 0,
+	Expr.Shl(_, _) -> 0,
+	Expr.Shr(_, _) -> 0,
+	Expr.CmpEq(_, _) -> 0,
+	Expr.CmpNe(_, _) -> 0,
+	Expr.CmpLt(_, _) -> 0,
+	Expr.CmpGt(_, _) -> 0,
+	Expr.CmpLe(_, _) -> 0,
+	Expr.CmpGe(_, _) -> 0,
+	Expr.And(_, _) -> 0,
+	Expr.Or(_, _) -> 0,
+	Expr.Spread(x) -> expr_kind_c(prog, kt, tn, tk, x),
+	_ -> 1
 }
 
 # One match arm's payload binds mapped to their payload kinds (a single-member arm binds
 # positionally; `_` positions are skipped by name).
-const bind_kinds = (Program prog, Str uname, [Str] members, [Str] binds, [Str] tn0, [Kind] tk0): TEnv -> {
+const bind_kinds = (Program prog, KTab kt, Str uname, [Str] members, [Str] binds, [Str] tn0, [Iarch] tk0): TEnv -> {
 	let [Str] tn = tn0
-	let [Kind] tk = tk0
+	let [Iarch] tk = tk0
 	let Iarch ui = 0
 	loop {
 		if ui >= Iarch(prog.unions.len) then break
@@ -1226,7 +1306,7 @@ const bind_kinds = (Program prog, Str uname, [Str] members, [Str] binds, [Str] t
 						if b >= Iarch(binds.len) then break
 						if b < Iarch(prog.unions[ui].members[mi].payloads.len) then {
 							tn = [...tn, binds[b]]
-							tk = [...tk, kind_of_ftype(prog, prog.unions[ui].members[mi].payloads[b], prog.unions[ui].members[mi].pelems[b])]
+							tk = [...tk, kind_of_ftype(kt, prog.unions[ui].members[mi].payloads[b], prog.unions[ui].members[mi].pelems[b])]
 						}
 						b = b + 1
 					}
@@ -1242,29 +1322,29 @@ const bind_kinds = (Program prog, Str uname, [Str] members, [Str] binds, [Str] t
 	loop {
 		if b2 >= Iarch(binds.len) then break
 		tn = [...tn, binds[b2]]
-		tk = [...tk, kagg()]
+		tk = [...tk, 1]
 		b2 = b2 + 1
 	}
 	return TEnv({ names: tn, kinds: tk })
 }
 
-const tenv_stmt = (Program prog, TEnv te, Stmt s): TEnv -> match s {
-	Stmt.Let(n, _, ann, init) -> tenv_add_let(prog, te, n, ann, init),
-	Stmt.ForIn(v, arr, ss) -> tenv_body(prog, tenv_add(te, v, elem_kind(prog, tenv_kind(te.names, te.kinds, arr))), ss),
+const tenv_stmt = (Program prog, KTab kt, TEnv te, Stmt s): TEnv -> match s {
+	Stmt.Let(n, _, ann, init) -> tenv_add_let(prog, kt, te, n, ann, init),
+	Stmt.ForIn(v, arr, ss) -> tenv_body(prog, kt, tenv_add(te, v, elem_kind(kt, tenv_kind(te.names, te.kinds, arr))), ss),
 	Stmt.Destructure(binds, _, _) -> tenv_add_all(te, binds),
-	Stmt.Match(_, arms) -> tenv_sarms(prog, te, arms),
-	Stmt.IfThen(_, b) -> tenv_stmt(prog, te, b),
-	Stmt.IfElse(_, t, el) -> tenv_stmt(prog, tenv_stmt(prog, te, t), el),
-	Stmt.Block(ss) -> tenv_body(prog, te, ss),
-	Stmt.Loop(ss) -> tenv_body(prog, te, ss),
-	Stmt.Defer(ss) -> tenv_body(prog, te, ss),
-	Stmt.Closure(_, _, _, cb) -> tenv_body(prog, te, cb),
+	Stmt.Match(_, arms) -> tenv_sarms(prog, kt, te, arms),
+	Stmt.IfThen(_, b) -> tenv_stmt(prog, kt, te, b),
+	Stmt.IfElse(_, t, el) -> tenv_stmt(prog, kt, tenv_stmt(prog, kt, te, t), el),
+	Stmt.Block(ss) -> tenv_body(prog, kt, te, ss),
+	Stmt.Loop(ss) -> tenv_body(prog, kt, te, ss),
+	Stmt.Defer(ss) -> tenv_body(prog, kt, te, ss),
+	Stmt.Closure(_, _, _, cb) -> tenv_body(prog, kt, te, cb),
 	_ -> te
 }
 
-const tenv_add = (TEnv te, Str n, Kind k): TEnv -> {
+const tenv_add = (TEnv te, Str n, Iarch k): TEnv -> {
 	const [Str] tn = [...te.names, n]
-	const [Kind] tk = [...te.kinds, k]
+	const [Iarch] tk = [...te.kinds, k]
 	return TEnv({ names: tn, kinds: tk })
 }
 
@@ -1273,7 +1353,7 @@ const tenv_add_all = (TEnv te, [Str] ns): TEnv -> {
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(ns.len) then break
-		r = tenv_add(r, ns[i], kagg())
+		r = tenv_add(r, ns[i], 1)
 		i = i + 1
 	}
 	return r
@@ -1281,74 +1361,74 @@ const tenv_add_all = (TEnv te, [Str] ns): TEnv -> {
 
 # A `let`'s kind: the annotation when it names a type, else inferred from the initializer's
 # shape. Value-block initializers also declare their INNER bindings (walked for the flat map).
-const tenv_add_let = (Program prog, TEnv te, Str n, Str ann, Expr init): TEnv -> {
+const tenv_add_let = (Program prog, KTab kt, TEnv te, Str n, Str ann, Expr init): TEnv -> {
 	let TEnv r = te
 	r = match init {
-		Expr.Loop(ss) -> tenv_body(prog, r, ss),
+		Expr.Loop(ss) -> tenv_body(prog, kt, r, ss),
 		_ -> r
 	}
-	let Kind k = expr_kind_c(prog, r.names, r.kinds, init)
+	let Iarch k = expr_kind_c(prog, kt, r.names, r.kinds, init)
 	if !str_eq(ann, "") then {
-		const Kind ka = kind_of_tname(prog, ann)
-		if !str_eq(ka.shape, "$agg") then k = ka
+		const Iarch ka = kt_tid(kt, ann)
+		if ka != 1 then k = ka
 	}
 	return tenv_add(r, n, k)
 }
 
-const tenv_sarms = (Program prog, TEnv te, [StmtArm] arms): TEnv -> {
+const tenv_sarms = (Program prog, KTab kt, TEnv te, [StmtArm] arms): TEnv -> {
 	let TEnv r = te
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(arms.len) then break
-		if !arms[i].is_wild && Iarch(arms[i].binds.len) > 0 then r = bind_kinds(prog, arms[i].type_name, arms[i].members, arms[i].binds, r.names, r.kinds)
-		r = tenv_body(prog, r, arms[i].body)
+		if !arms[i].is_wild && Iarch(arms[i].binds.len) > 0 then r = bind_kinds(prog, kt, arms[i].type_name, arms[i].members, arms[i].binds, r.names, r.kinds)
+		r = tenv_body(prog, kt, r, arms[i].body)
 		i = i + 1
 	}
 	return r
 }
 
-const tenv_body = (Program prog, TEnv te, [Stmt] ss): TEnv -> {
+const tenv_body = (Program prog, KTab kt, TEnv te, [Stmt] ss): TEnv -> {
 	let TEnv r = te
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(ss.len) then break
-		r = tenv_stmt(prog, r, ss[i])
+		r = tenv_stmt(prog, kt, r, ss[i])
 		i = i + 1
 	}
 	return r
 }
 
 # A parameter's kind from its declaration.
-const param_kind = (Program prog, Param p): Kind -> {
+const param_kind = (KTab kt, Param p): Iarch -> {
 	if p.is_ptr then {
-		if str_eq(p.type_name, "$ptr") then return kmk("$ptr", p.elem)
-		return kind_of_tname(prog, p.type_name)
+		if str_eq(p.type_name, "$ptr") then return kt_ptr(kt, p.elem)
+		return kt_tid(kt, p.type_name)
 	}
-	if str_eq(p.type_name, "$dyn") then return kmk("$dyn", p.elem)
-	if str_eq(p.type_name, "$tuple") then return kmk("$tuple", "")
-	if str_eq(p.type_name, "$fn") then return kw()
-	if str_eq(p.type_name, "$capref") || str_eq(p.type_name, "$capagg") then return kagg()
-	return kind_of_tname(prog, p.type_name)
+	if str_eq(p.type_name, "$dyn") then return kt_dyn(kt, p.elem)
+	if str_eq(p.type_name, "$tuple") then return 3
+	if str_eq(p.type_name, "$fn") then return 0
+	if str_eq(p.type_name, "$capref") || str_eq(p.type_name, "$capagg") then return 1
+	return kt_tid(kt, p.type_name)
 }
 
-const tenv_build! = (Program prog, Func f): TEnv -> {
+const tenv_build! = (Program prog, KTab kt, Func f): TEnv -> {
 	let [Str] tn = []
-	let [Kind] tk = []
+	let [Iarch] tk = []
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(f.params.len) then break
 		tn = [...tn, f.params[i].name]
-		tk = [...tk, param_kind(prog, f.params[i])]
+		tk = [...tk, param_kind(kt, f.params[i])]
 		i = i + 1
 	}
-	return tenv_body(prog, TEnv({ names: tn, kinds: tk }), f.body)
+	return tenv_body(prog, kt, TEnv({ names: tn, kinds: tk }), f.body)
 }
 
 # Resolve one body's distinct callee names into the small table the walkers consult. An
 # in-progress callee (state 1 — a recursion/SCC back-edge) resolves to ⊤ exactly like an
 # unknown one: the memo's "SCC ⇒ all-args-escape", applied at the call site. The state
 # tables ride in as `*[T]` references (read here, written by the DFS).
-const local_sums = (Program prog, *[FnSum] sums, *[Iarch] st, [Str] cns, TEnv te): Sums -> {
+const local_sums = (Program prog, KTab kt, *[FnSum] sums, *[Iarch] st, [Str] cns, TEnv te): Sums -> {
 	let [Str] ln = []
 	let [FnSum] lt = []
 	let Iarch i = 0
@@ -1367,7 +1447,7 @@ const local_sums = (Program prog, *[FnSum] sums, *[Iarch] st, [Str] cns, TEnv te
 		}
 		i = i + 1
 	}
-	return Sums({ names: ln, tbl: lt, te: te, prog: prog })
+	return Sums({ names: ln, tbl: lt, te: te, prog: prog, kt: kt })
 }
 
 # A scalar return carries no pointer into the callee's ambient node; everything else might.
@@ -1417,7 +1497,7 @@ const empty_rsets = (): RSets -> {
 # arrays, written in place through the `*[T]` references (they are never grown after the
 # handoff, so the decayed data pointers stay valid). A callee still on the DFS stack at
 # analysis time reads as ⊤ (local_sums), the memo's "SCC ⇒ all-args-escape".
-const summarize! = (Program prog, *[FnSum] sums, *[Iarch] st, *[RSets] rsets, Iarch k): Iarch -> {
+const summarize! = (Program prog, KTab kt, *[FnSum] sums, *[Iarch] st, *[RSets] rsets, Iarch k): Iarch -> {
 	if st[k] != 0 then return 0
 	st[k] = 1
 	if prog.funcs[k].is_asm || prog.funcs[k].is_value then {
@@ -1431,12 +1511,12 @@ const summarize! = (Program prog, *[FnSum] sums, *[Iarch] st, *[RSets] rsets, Ia
 		if i >= Iarch(cns.len) then break
 		const Iarch j = find_fn(prog.funcs, cns[i])
 		if j >= 0 then {
-			if st[j] == 0 then summarize!(prog, sums, st, rsets, j)
+			if st[j] == 0 then summarize!(prog, kt, sums, st, rsets, j)
 		}
 		i = i + 1
 	}
-	const TEnv te = tenv_build!(prog, prog.funcs[k])
-	const Sums sm = local_sums(prog, sums, st, cns, te)
+	const TEnv te = tenv_build!(prog, kt, prog.funcs[k])
+	const Sums sm = local_sums(prog, kt, sums, st, cns, te)
 	const [Str] params = plist_names(prog.funcs[k].params)
 	const RSets rs = shadow_sets!(sm, params, prog.funcs[k].body)
 	sums[k] = mk_summary(prog.funcs[k], params, rs)
@@ -1464,6 +1544,7 @@ pub const routing_check! = (Program prog, RouteInfo ri): Iarch -> routing_run!(p
 pub data RouteInfo = { [RSets] sets, [FnSum] sums }
 
 pub const routing_tables! = (Program prog): RouteInfo -> {
+	const KTab kt = ktab_build(prog)
 	const Iarch n = Iarch(prog.funcs.len)
 	let [FnSum] sums = []
 	let [Iarch] st = []
@@ -1479,7 +1560,7 @@ pub const routing_tables! = (Program prog): RouteInfo -> {
 	let Iarch d = 0
 	loop {
 		if d >= n then break
-		summarize!(prog, sums, st, rsets, d)
+		summarize!(prog, kt, sums, st, rsets, d)
 		d = d + 1
 	}
 	return RouteInfo({ sets: rsets, sums: sums })
