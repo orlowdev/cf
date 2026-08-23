@@ -2431,7 +2431,9 @@ const init_agg_type! = (*Emit ctx, [Binding] env, Expr e): Str -> match e {
 	Expr.Record(tn, inits) -> tn,
 	Expr.UnionMk(tn, mem, args) -> tn,
 	Expr.Field(base, f) -> field_agg_type(ctx, env, base, f),
-	Expr.Call(callee, tyargs, args, _) -> call_agg_type(ctx, env, callee),
+	# `mem.raw.place(a, v)` yields v's own type at the destination (the identity law), so a
+	# bound place result carries its record type; every other call reads its declared return.
+	Expr.Call(callee, tyargs, args, _) -> if str_eq(callee, "cf__raw_place") then init_agg_type!(ctx, env, args[1]) else call_agg_type(ctx, env, callee),
 	Expr.ArrayLit(hs, sn, elems, et) -> "$dyn",
 	Expr.StrLit(bytes) -> "Str",
 	Expr.Interp(id) -> "Str",
@@ -2775,6 +2777,22 @@ const emit_indirect_call! = (*Emit ctx, [Binding] env, Iarch fpidx, [Expr] args)
 	return "%t${rt}"
 }
 
+# The raw-memory intrinsic callees (`mem.raw.*` / `size_of`, parser-gated to `std/mem/…`).
+# They allocate nothing and touch no node, so the walkers treat them like casts, not user calls.
+const is_raw_intrinsic = (Str n): Bool -> str_eq(n, "cf__raw_addr") || str_eq(n, "cf__raw_load") || str_eq(n, "cf__raw_store") || str_eq(n, "cf__raw_place") || str_eq(n, "cf__size_of")
+
+# The comptime byte size of a value's representation — the raw-intrinsic sizing rule:
+# a record is `fields.len * 8` (emit_record_lit!'s layout), a scalar is one register word.
+# Everything else (dyn arrays, Str, tuples, boxed unions) is deferred to the value-level
+# hook stage of the geometry-modules arc.
+const raw_obj_size! = (*Emit ctx, [Binding] env, Expr e): Iarch -> {
+	const Str at = init_agg_type!(ctx, env, e)
+	if str_eq(at, "") then return 8
+	const Iarch ri = find_rec(ctx.recs, at)
+	if ri < 0 then die("cf: emit: size_of/mem.raw.place covers flat records and scalar words for now — dynamic layouts arrive with the value-level hook stage\n")
+	return Iarch(ctx.recs[ri].fields.len) * 8
+}
+
 const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env): Str -> {
 	# `mem.arena.of(n)` — carve a fixed arena from the ambient node and yield its handle. The
 	# residue-carve tightening: when the handle binding provably never escapes (the routing
@@ -2823,6 +2841,38 @@ const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env)
 		ctx.next = ctx.next + 1
 		write_str(ctx.fd, "\t%t${tp} =l copy $cf_page\n")
 		return "%t${tp}"
+	}
+	# the raw-memory intrinsics (`mem.raw.*` / `size_of`) — the substrate the std geometry
+	# modules are written in (parser-gated to `std/mem/…`). An aggregate's emitted value IS
+	# its base/header address, so `addr` forwards it; `load`/`store` move one register word;
+	# `place` copies a record's representation to the destination and yields the copy.
+	if str_eq(callee, "cf__raw_addr") then return emit_expr!(args[0], ctx, env)
+	if str_eq(callee, "cf__raw_load") then {
+		const Str la = emit_expr!(args[0], ctx, env)
+		const Iarch tl = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${tl} =l loadl ${la}\n")
+		return "%t${tl}"
+	}
+	if str_eq(callee, "cf__raw_store") then {
+		const Str sa = emit_expr!(args[0], ctx, env)
+		const Str sv = emit_expr!(args[1], ctx, env)
+		write_str(ctx.fd, "\tstorel ${sv}, ${sa}\n")
+		return ""
+	}
+	# `size_of(v)` — the value's byte size. A record is its slot count (8 bytes/field, the
+	# layout emit_record_lit! builds); scalars are one register word. Dynamic layouts (`$dyn`,
+	# `Str`, tuples, boxed unions) arrive with the value-level hook stage of the
+	# geometry-modules arc — until then they are a loud error here, not a wrong size.
+	if str_eq(callee, "cf__size_of") then {
+		return "${raw_obj_size!(ctx, env, args[0])}"
+	}
+	if str_eq(callee, "cf__raw_place") then {
+		const Str pa = emit_expr!(args[0], ctx, env)
+		const Str pv = emit_expr!(args[1], ctx, env)
+		const Iarch psz = raw_obj_size!(ctx, env, args[1])
+		write_str(ctx.fd, "\tblit ${pv}, ${pa}, ${psz}\n")
+		return pa
 	}
 	# `Int8(x)`… narrows to the fixed width (canonicalizing); `Iarch`/`Int`/`Uarch` are identity
 	if is_cast_type(callee) then {
@@ -4372,7 +4422,7 @@ const nfp_alloc_body! = ([UnionDecl] unions, [Stmt] ss): Bool -> {
 # an intrinsic — a fn-value binding), or hold an unlowered DeferTap? Conservative ⇒ needs.
 const nfp_ind_expr! = ([Func] funcs, Expr e): Bool -> {
 	const Bool here = match e {
-		Expr.Call(n, _, _, _) -> find_func(funcs, n) < 0 && !is_cast_type(n) && !str_eq(n, "Str") && !str_eq(n, "cf__arena_of") && !str_eq(n, "cf__arena_grow") && !str_eq(n, "cf__buffer_of") && !str_eq(n, "cf__page"),
+		Expr.Call(n, _, _, _) -> find_func(funcs, n) < 0 && !is_cast_type(n) && !str_eq(n, "Str") && !str_eq(n, "cf__arena_of") && !str_eq(n, "cf__arena_grow") && !str_eq(n, "cf__buffer_of") && !str_eq(n, "cf__page") && !is_raw_intrinsic(n),
 		Expr.DeferTap(_, _) -> true,
 		_ -> false
 	}
