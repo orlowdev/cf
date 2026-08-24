@@ -1863,29 +1863,33 @@ const emit_agg_alloc! = (*Emit ctx, Iarch size): Iarch -> {
 	if !ctx.alloc_stack then write_str(ctx.fd, "\t%t${t} =l call $cf_alloc(l ${ctx.alloc_node}, w ${size})\n")
 	return t
 }
-# Value-level hook placement (geometry_lowering §2, the Materialize stage): in a materialized
-# fixed_buffer body, a completed record construction is handed to the geometry's per-type hook
-# instance, which performs the CLASSIFIED placement itself — `on_alloc` (residue side) when the
-# routing classification proved the binding never escapes (the same `%res_0` flip the legacy
-# path uses), `on_ret` (survivor side, birth placement) otherwise. The pre-hook construction is
-# the "constructed value" of the value-level ABI, built on the SAME side the hook places to, so
-# nested constructions (each hook-placed in turn) always point at storage of the final
-# lifetime; the hook's copy is the accepted value-level tax until the fold arc fuses it.
-const emit_fb_place! = (*Emit ctx, Str type_name, Iarch base): Iarch -> {
-	let Str hn = "on_ret__fb$${type_name}"
-	if str_eq(ctx.alloc_node, "%res_0") then hn = "on_alloc__fb$${type_name}"
+# Fold-lite hook placement (geometry_lowering §2, the Materialize stage): in a materialized
+# fixed_buffer body, a record construction reserves its bytes through the geometry's own
+# `reserve_*` — `reserve_alloc` (residue side) when the routing classification proved the
+# binding never escapes (the same `%res_0` flip the legacy path uses), `reserve_ret`
+# (survivor side, birth placement) otherwise — and the fields are then built DIRECTLY in the
+# reservation. This is `on_alloc`/`on_ret` fused by the identity law: no scratch
+# construction, no relocating copy — the value-level tax is gone. The reserves are the
+# factored bump halves of those hooks, so cursor behavior is placement-identical; a
+# geometry whose hooks are not pure placement (rc, gc) must keep the unfused value calls.
+const emit_fb_reserve! = (*Emit ctx, Iarch size): Iarch -> {
+	let Str hn = "reserve_ret__fb"
+	if str_eq(ctx.alloc_node, "%res_0") then hn = "reserve_alloc__fb"
 	const Iarch hi = find_func(ctx.funcs, hn)
-	if hi < 0 then die("cf: emit: a materialized fixed_buffer body constructs `${type_name}` but its hook instance is missing — materialize and emit disagree on the placed types\n")
+	if hi < 0 then die("cf: emit: the fixed_buffer geometry module is missing `${hn}` — stale std source?\n")
 	const Iarch t = ctx.next
 	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${t} =l call $f${hi}(l %node_0, l %t${base})\n")
+	write_str(ctx.fd, "\t%t${t} =l call $f${hi}(l %node_0, l ${size})\n")
 	return t
 }
 const emit_record_lit! = (*Emit ctx, Str type_name, [FieldInit] inits, [Binding] env): Iarch -> {
 	const Iarch ri = find_rec(ctx.recs, type_name)
 	const Iarch nfld = Iarch(ctx.recs[ri].fields.len)
 	const Iarch size = nfld * 8
-	const Iarch base = emit_agg_alloc!(ctx, size)
+	const Bool fused = ctx.mat_fb && !ctx.alloc_stack
+	let Iarch base = 0 - 1
+	if fused then base = emit_fb_reserve!(ctx, size)
+	if !fused then base = emit_agg_alloc!(ctx, size)
 	# a VALUE spread `{ ...src, … }`: fill each field in declaration order — from its override if
 	# present, else COPY the source's word at that offset (typecheck guarantees copied fields are
 	# words, never aliasing pointers). The source's base pointer is the spread value.
@@ -1913,7 +1917,6 @@ const emit_record_lit! = (*Emit ctx, Str type_name, [FieldInit] inits, [Binding]
 			}
 			f = f + 1
 		}
-		if ctx.mat_fb && !ctx.alloc_stack then return emit_fb_place!(ctx, type_name, base)
 		return base
 	}
 	let Iarch a = 0
@@ -1928,7 +1931,6 @@ const emit_record_lit! = (*Emit ctx, Str type_name, [FieldInit] inits, [Binding]
 		write_str(ctx.fd, "\t${store_op(field_scalar(ctx, type_name, inits[a].field))} ${v}, %t${addr}\n")
 		a = a + 1
 	}
-	if ctx.mat_fb && !ctx.alloc_stack then return emit_fb_place!(ctx, type_name, base)
 	return base
 }
 

@@ -8,14 +8,16 @@
 #   1. (fn × geometry) duplication — every function that may allocate and is reachable under
 #      a fixed_buffer ambient (an `in b` call whose binding traces to `mem.fixed_buffer.of`)
 #      is copied under the geometry's fixed mangle tag: `f` → `f__fb`. Emit lowers the copy's
-#      allocation sites to VALUE-LEVEL hook calls instead of the shared bump floor.
+#      allocation sites to the geometry's own hooks instead of the shared bump floor — in
+#      FOLD-LITE form: a construction reserves through `reserve_alloc`/`reserve_ret` and is
+#      built directly in the reservation (the fused `on_alloc`/`on_ret`, identity-law-equal).
 #   2. Call retargeting — the `in b` seed sites and, inside the copies, every direct call to
 #      another may-allocate function are pointed at the `__fb` twins, so the whole subtree
 #      under the geometry is hook-lowered.
-#   3. Per-type hook instances — the geometry's generic value hooks (`on_alloc['T]`, …) are
-#      specialized per placed aggregate type (`on_alloc__fb$Box`) from the PRE-mono template
-#      (mono drops uninstantiated templates, so the raw program supplies them). The instances
-#      are ordinary functions from here on: typechecked, routed, emitted.
+#   3. Per-type claim instances — the geometry's generic `on_alloc_ret['T]` is specialized
+#      per claimed record type (`on_alloc_ret__fb$Box`) from the PRE-mono template (mono
+#      drops uninstantiated templates, so the raw program supplies them). The instances are
+#      ordinary functions from here on: typechecked, routed, emitted.
 #
 # The frontier is FAIL-SAFE: any site this pass cannot prove (an indirect call, a node handle
 # passed as a plain word, a geometry binding it cannot trace) simply stays on the legacy
@@ -256,63 +258,6 @@ const binds_of = ([FbBind] bs, Iarch fi): [Str] -> {
 	loop {
 		if i >= Iarch(bs.len) then break
 		if bs[i].fnidx == fi then out = [...out, bs[i].name]
-		i = i + 1
-	}
-	return out
-}
-
-# ── the record-construction type sweep (which hook instances the copies need) ────────────
-
-const rty_expr! = (Expr e, [Str] acc): [Str] -> {
-	const [Str] a1 = match e {
-		Expr.Record(tn, _) -> if has_str(acc, tn) then acc else [...acc, tn],
-		_ -> acc
-	}
-	return match e {
-		Expr.Loop(ss) -> rty_body!(ss, a1),
-		_ -> rty_list!(kids!(e), a1)
-	}
-}
-const rty_list! = ([Expr] es, [Str] acc): [Str] -> {
-	let [Str] out = acc
-	let Iarch i = 0
-	loop {
-		if i >= Iarch(es.len) then break
-		out = rty_expr!(es[i], out)
-		i = i + 1
-	}
-	return out
-}
-const rty_stmt! = (Stmt s, [Str] acc): [Str] -> {
-	const [Str] a1 = rty_list!(stmt_exprs!(s), acc)
-	return match s {
-		Stmt.IfThen(_, b) -> rty_stmt!(b, a1),
-		Stmt.IfElse(_, t, el) -> rty_stmt!(el, rty_stmt!(t, a1)),
-		Stmt.Block(ss) -> rty_body!(ss, a1),
-		Stmt.Loop(ss) -> rty_body!(ss, a1),
-		Stmt.ForIn(_, _, ss) -> rty_body!(ss, a1),
-		Stmt.Match(_, arms) -> rty_arms!(arms, a1),
-		Stmt.Defer(ss) -> rty_body!(ss, a1),
-		Stmt.Closure(_, _, _, cb) -> rty_body!(cb, a1),
-		_ -> a1
-	}
-}
-const rty_arms! = ([StmtArm] arms, [Str] acc): [Str] -> {
-	let [Str] out = acc
-	let Iarch i = 0
-	loop {
-		if i >= Iarch(arms.len) then break
-		out = rty_body!(arms[i].body, out)
-		i = i + 1
-	}
-	return out
-}
-const rty_body! = ([Stmt] ss, [Str] acc): [Str] -> {
-	let [Str] out = acc
-	let Iarch i = 0
-	loop {
-		if i >= Iarch(ss.len) then break
-		out = rty_stmt!(ss[i], out)
 		i = i + 1
 	}
 	return out
@@ -663,13 +608,13 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 		ci = ci + 1
 	}
 
-	# the instance type set: records the copies CONSTRUCT (on_alloc/on_ret sites), plus
-	# record RETURNS of the calls they make and of their closures (on_alloc_ret claim sites)
+	# the instance type set: record RETURNS of the calls the copies make and of their
+	# closures — the on_alloc_ret claim sites. Constructions need no instances: emit's
+	# fold-lite builds them directly in a `reserve_*` reservation (per-geometry, not per-T).
 	let [Str] tys = []
 	let Iarch oi = nf
 	loop {
 		if oi >= Iarch(out.len) then break
-		tys = rty_body!(out[oi].body, tys)
 		tys = cloret_body(out[oi].body, tys)
 		let [CSite] csx = []
 		csx = cs_body!(out[oi].body, 0, csx)
@@ -695,7 +640,9 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 		ti = ti + 1
 	}
 
-	# mint the per-type hook instances from the PRE-mono templates
+	# mint the per-type claim instances from the PRE-mono templates. The other value hooks
+	# must still be present (the contract is the full set) but mint no instances: fold-lite
+	# renders their placements as fused reserve + build-in-place.
 	const Iarch al_t = find_fn(raw.funcs, "on_alloc__fb")
 	const Iarch rt_t = find_fn(raw.funcs, "on_ret__fb")
 	const Iarch ar_t = find_fn(raw.funcs, "on_alloc_ret__fb")
@@ -704,8 +651,6 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 	loop {
 		if hi >= Iarch(rtys.len) then break
 		const Str t = rtys[hi]
-		out = [...out, hook_instance(raw.funcs[al_t], "on_alloc__fb$${t}", t)]
-		out = [...out, hook_instance(raw.funcs[rt_t], "on_ret__fb$${t}", t)]
 		out = [...out, hook_instance(raw.funcs[ar_t], "on_alloc_ret__fb$${t}", t)]
 		hi = hi + 1
 	}

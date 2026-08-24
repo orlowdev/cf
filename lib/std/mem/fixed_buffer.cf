@@ -10,10 +10,13 @@
 # floor. Using the geometry IS the import: the compiler auto-loads this file on any
 # `mem.fixed_buffer` use and calls every function here by its mangled name (`of__fb`,
 # `on_alloc__fb`, …) — nothing here is `pub`, because userland never calls a geometry's
-# internals directly; the compiler places every call. The Materialize pass mints one copy
-# of the generic value hooks per placed aggregate type (`on_alloc__fb$Box`) and emit calls
-# them at the sites the routing classification picks; what materialize cannot prove stays
-# on the shared bump floor, coherent because both honor the same duplex node layout:
+# internals directly; the compiler places every call. Emit lowers a record construction in
+# a materialized body to FOLD-LITE form (geometry_lowering §2 + the identity law): it calls
+# the geometry's `reserve_*` for the bytes and builds the record directly in them — the
+# fused equivalent of `on_alloc`/`on_ret`, whose generic bodies below remain the value-level
+# contract those reserves were factored from. Only the claim hook (`on_alloc_ret`) is still
+# minted per placed type; what materialize cannot prove stays on the shared bump floor,
+# coherent because both honor the same duplex node layout:
 #
 #   node+0  survivor { top, committed, limit, parent, kind, chunk }   — bumps UP
 #   node+48 residue  { top, committed, limit, parent, kind, chunk }   — bumps DOWN
@@ -59,6 +62,26 @@ const of = (Uarch node, [Uint8] buf): Uarch -> {
 # buffer never pulls. So the fb mark is one word, and the exit restore is unconditional
 # (≡ cf_reset's same-limit path, the only one a fixed node can take).
 
+# Reserve `sz` bytes on the SURVIVOR side (bump up toward the residue cursor, trap on
+# meet) and hand back the placement address. This is `on_ret` minus the copy — emit's
+# fold-lite constructs the escaping record directly in the reservation.
+const reserve_ret = (Uarch node, Uarch sz): Uarch -> {
+	const Uarch p = mem.raw.load(node)
+	const Uarch nt = p + sz
+	if nt > mem.raw.load(node + 48) then mem.raw.trap()
+	mem.raw.store(node, nt)
+	return p
+}
+
+# Reserve `sz` bytes on the RESIDUE side (bump down toward the survivor cursor, trap on
+# meet): `on_alloc` minus the copy, for frame-local records built in place.
+const reserve_alloc = (Uarch node, Uarch sz): Uarch -> {
+	const Uarch dn = mem.raw.load(node + 48) - sz
+	if dn < mem.raw.load(node) then mem.raw.trap()
+	mem.raw.store(node + 48, dn)
+	return dn
+}
+
 # Open a residue scope: the mark is the residue cursor now.
 const on_scope_enter = (Uarch node): Uarch -> mem.raw.load(node + 48)
 
@@ -68,27 +91,16 @@ const on_scope_exit = (Uarch node, Uarch mark): Uarch -> {
 	return 0
 }
 
-# Place local residue (dies in frame): bump the residue side DOWN toward the survivor
-# cursor, trap on meet, copy the constructed value in, and hand back the placed copy
-# (the identity law — same logical value, relocated bytes).
-const on_alloc = ['T](Uarch node, 'T v): 'T -> {
-	const Uarch sz = size_of(v)
-	const Uarch dn = mem.raw.load(node + 48) - sz
-	if dn < mem.raw.load(node) then mem.raw.trap()
-	mem.raw.store(node + 48, dn)
-	return mem.raw.place(dn, v)
-}
+# Place local residue (dies in frame): reserve on the residue side, copy the constructed
+# value in, and hand back the placed copy (the identity law — same logical value,
+# relocated bytes). Fold-lite renders this hook as `reserve_alloc` + build-in-place, so
+# the copy only happens where a pre-constructed value must genuinely relocate.
+const on_alloc = ['T](Uarch node, 'T v): 'T -> mem.raw.place(reserve_alloc(node, size_of(v)), v)
 
-# Place an escaping value at birth (§3): bump the SURVIVOR side UP toward the residue
-# cursor — storage no residue bracket can ever reach, so whatever the frame reclaims,
-# the escape survives by construction.
-const on_ret = ['T](Uarch node, 'T v): 'T -> {
-	const Uarch p = mem.raw.load(node)
-	const Uarch nt = p + size_of(v)
-	if nt > mem.raw.load(node + 48) then mem.raw.trap()
-	mem.raw.store(node, nt)
-	return mem.raw.place(p, v)
-}
+# Place an escaping value at birth (§3): reserve on the SURVIVOR side — storage no residue
+# bracket can ever reach, so whatever the frame reclaims, the escape survives by
+# construction. Fold-lite renders it as `reserve_ret` + build-in-place.
+const on_ret = ['T](Uarch node, 'T v): 'T -> mem.raw.place(reserve_ret(node, size_of(v)), v)
 
 # Claim a returned value (§3): the bump family's fold is the IDENTITY — the callee's
 # on_ret already placed the value on a survivor side that outlives the call, so there is
