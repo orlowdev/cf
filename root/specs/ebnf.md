@@ -1014,6 +1014,8 @@ intrinsic fence        = () -> Unit                           (* module-private 
 pub intrinsic type Uint8 = (Number value) -> Uint8          (* a width type carrying its cast constructor *)
 pub intrinsic type Infinity                                 (* nullary compiler singleton — no constructor *)
 
+pub intrinsic target: Os                                    (* a bodyless comptime VALUE — no params: read `target`, not `target()` *)
+
 pub intrinsic bad      = (Uarch x)                           (* invalid — return type required (needs `-> T`) *)
 pub intrinsic worse    = (Uarch x) -> Uarch -> x            (* invalid — the trailing `-> x` is a body; intrinsics take none *)
 ```

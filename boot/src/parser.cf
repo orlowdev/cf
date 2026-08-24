@@ -2144,6 +2144,17 @@ const parse_func! = (*Parser p): Func -> {
 	if !is_ident(peek(p)) then die("cf: parse: expected a function name\n")
 	const Str name = cur_name!(p)
 	p.pos = p.pos + 1
+	# `[pub] intrinsic name: Type` — a bodyless compiler-supplied VALUE (no `=`, no params, no `()`),
+	# for a comptime-known member like `std::comptime::os::target : Os`. Read as a value (`os::target`,
+	# not `os::target()`); modeled as a nullary value whose body the compiler supplies.
+	if is_intrin && is_colon(peek(p)) then {
+		const RetSig vrs = parse_ret_name!(p)
+		const [Param] vnoparams = []
+		const [Stmt] vibody = []
+		const [Seg] vinoasm = []
+		const [Str] vintp = []
+		return Func({ name: name, is_pub: is_pub, ret_name: vrs.name, ret_elem: vrs.elem, params: vnoparams, body: vibody, is_asm: false, asm_body: vinoasm, is_value: true, ret_telems: vrs.telems, typarams: vintp, tbounds: vintp, ret_size: vrs.size, is_intrinsic: true })
+	}
 	if !is_eq(peek(p)) then die("cf: parse: expected `=`\n")
 	p.pos = p.pos + 1
 	# `= ['T](…)` / `= [Color 'T](…)` — a generic function's (optionally bounded) type parameters
@@ -2680,22 +2691,60 @@ const expect_cond_dot = (*Parser p): Bool -> {
 	return true
 }
 
-# Evaluate a comptime condition at PARSE TIME against the fixed darwin/arm64 target
-# (module_system): `comptime.<ns>.<member> <op> <Enum>.<Variant>`, where `<ns>` is `os` or
-# `arch`, `<member>` is `target` or `current` (equal on a non-cross build), `<op>` is `==` or
-# `!=`, and `<Enum>` must match the namespace (`os`→`Os`, `arch`→`Arch`). The fixed values are
-# os = Darwin, arch = Arm64. A malformed condition is a parse error.
+# Is `t[start..]` exactly `s`? (a suffix comparison without allocating a substring.)
+const str_tail_eq = (Str t, Iarch start, Str s): Bool -> {
+	if Iarch(t.len) - start != Iarch(s.len) then return false
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(s.len) then break
+		if t[start + i] != s[i] then return false
+		i = i + 1
+	}
+	return true
+}
+# Does a strip-minted comptime token `t` read `<nsprefix>\x01target` or `<nsprefix>\x01current`?
+# (`os::target` is joined to `std_comptime_os\x01target` before parse; a `comptime_if` condition
+# folds at parse, so the parser matches that resolved token rather than the bare words.)
+const comptime_tok_is = (Str t, Str nsprefix): Bool -> {
+	const Iarch n = Iarch(nsprefix.len)
+	if Iarch(t.len) <= n then return false
+	let Iarch i = 0
+	loop {
+		if i >= n then break
+		if t[i] != nsprefix[i] then return false
+		i = i + 1
+	}
+	if Iarch(t[n]) != 1 then return false # the ns-sep (0x01)
+	return str_tail_eq(t, n + 1, "target") || str_tail_eq(t, n + 1, "current")
+}
+
+# Evaluate a comptime condition at PARSE TIME against the build target (module_system §6/§7):
+# `<os|arch>::<member> <op> <Enum>.<Variant>` — `member` is `target`/`current` (equal on a
+# non-cross build), `op` is `==`/`!=`, and `Enum` matches the namespace (`os`→`Os`, `arch`→`Arch`).
+# The `os::member` access is joined by the strip pass into one `std_comptime_os\x01member` token;
+# the legacy `comptime.os.member` spelling (three tokens) is still accepted during the migration.
+# A malformed condition is a parse error.
 const parse_cond! = (*Parser p): Bool -> {
-	const Str head = expect_ident!(p, "cf: parse: expected `comptime` in a comptime condition\n")
-	if !str_eq(head, "comptime") then die("cf: parse: a comptime condition must start with `comptime`\n")
-	expect_cond_dot(p)
-	const Str ns = expect_ident!(p, "cf: parse: expected `os` or `arch` after `comptime.`\n")
-	const Bool is_os = str_eq(ns, "os")
-	const Bool is_arch = str_eq(ns, "arch")
-	if !is_os && !is_arch then die("cf: parse: a comptime namespace must be `os` or `arch`\n")
-	expect_cond_dot(p)
-	const Str member = expect_ident!(p, "cf: parse: expected `target` or `current` after the comptime namespace\n")
-	if !str_eq(member, "target") && !str_eq(member, "current") then die("cf: parse: a comptime member must be `target` or `current`\n")
+	const Str head = expect_ident!(p, "cf: parse: expected a comptime target (`os::target`) in a comptime condition\n")
+	let Bool is_os = false
+	let Bool is_arch = false
+	if comptime_tok_is(head, "std_comptime_os") then {
+		is_os = true
+	} else if comptime_tok_is(head, "std_comptime_arch") then {
+		is_arch = true
+	} else if str_eq(head, "comptime") then {
+		# legacy `comptime.<ns>.<member>` (three tokens)
+		expect_cond_dot(p)
+		const Str ns = expect_ident!(p, "cf: parse: expected `os` or `arch` after `comptime.`\n")
+		is_os = str_eq(ns, "os")
+		is_arch = str_eq(ns, "arch")
+		if !is_os && !is_arch then die("cf: parse: a comptime namespace must be `os` or `arch`\n")
+		expect_cond_dot(p)
+		const Str member = expect_ident!(p, "cf: parse: expected `target` or `current` after the comptime namespace\n")
+		if !str_eq(member, "target") && !str_eq(member, "current") then die("cf: parse: a comptime member must be `target` or `current`\n")
+	} else {
+		die("cf: parse: a comptime condition reads `os::target`/`arch::target` (import `std::comptime`)\n")
+	}
 	let Bool is_eq = false
 	if is_eqeq(peek(p)) then {
 		is_eq = true
