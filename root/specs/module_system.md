@@ -30,7 +30,8 @@ Per [[order_of_compilation.md]] §Resolve the module system owns, and this spec 
   names another module; the toolchain maps path → file.
 - **visibility** (§3) — `pub` exports a declaration; everything else is file-private.
 - **imports, namespaces, and paths** (§4) — full `::` paths reach any member; `import`
-  binds an optional abbreviation (a last-segment namespace or destructured names).
+  binds an optional abbreviation (a last-segment or `as`-renamed namespace, or
+  destructured names).
 - **barrels / reexport** (§5) — `pub import` reexports what it brings in, and barrels
   chain transitively.
 - **comptime conditional compilation** (§6) — the module-level `if … then … else`
@@ -119,8 +120,8 @@ runtime namespace object**).
 const t = std::comptime::os::target        (* no import needed — the full path resolves *)
 ```
 
-An import (`[ "pub" ] "import" <module_path> [ "::" "{" … "}" ]`, [[ebnf.md]] § Imports) has
-two forms, and **neither carries `as`** — the binding is fixed by the path:
+An import (`[ "pub" ] "import" <module_path> ( [ "::" "{" … "}" ] | [ "as" <name> ] )`,
+[[ebnf.md]] § Imports) has three forms:
 
 - **A bare path** `import a::b::c` binds the path's **last segment** `c` as a namespace over
   module `a::b::c`'s **whole** exported surface. A use `c::member` expands to
@@ -128,15 +129,26 @@ two forms, and **neither carries `as`** — the binding is fixed by the path:
   (a type) are both reached through `import std::mem`, told apart by the **member's** own
   casing, not the binding's. (This is the deliberate simplification over the older
   value-vs-type namespace split: a single `::` path reaches any member.)
+- **A renamed path** `import a::b::c as n` binds `n` — not the last segment `c` — as the
+  namespace over the same **whole** surface, so `n::member` expands to `a::b::c::member`. The
+  rename applies to the namespace binding only (never to `::{ … }` destructuring). It resolves
+  a last-segment collision, and — paired with **`pub import`** and a `comptime_if` (§6) — lets
+  a barrel expose every platform's implementation under one shared name:
+
+  ```
+  if os::target == Os.Darwin
+    if arch::target == Arch.Arm64
+      pub import std::io::console::darwin::arm64 as console
+  ```
 - **A destructured path** `import a::b::c::{ x, Y }` pulls **named members straight into
   scope**: `x` means `a::b::c::x`, `Y` means `a::b::c::Y`, written bare. A destructured
   member's own casing says which plane it is (`var_name` → value, `type_name` → type), and it
   must name a member the module exports.
 
 So an import is **pure sugar**: resolution can be understood as first *expanding* every
-abbreviation back to a full path (`c::member` → `a::b::c::member`, bare `x` → `a::b::c::x`),
-then resolving full paths against the module graph. Two programs — one with `import std::mem`
-+ `mem::alloc`, one writing `std::mem::alloc` inline — flatten identically.
+abbreviation back to a full path (`c::member` / `n::member` → `a::b::c::member`, bare `x` →
+`a::b::c::x`), then resolving full paths against the module graph. Two programs — one with
+`import std::mem` + `mem::alloc`, one writing `std::mem::alloc` inline — flatten identically.
 
 `::` is the **namespace/module traversal** operator and is resolved at compile time. It is
 distinct from `.`, which is the runtime member operator — a record `field_access`
@@ -146,8 +158,8 @@ namespaces by their parents (§5); each hop is a compile-time step through an ex
 and the terminal segment is the value or type reached.
 
 **Name collisions.** Destructuring two different members to the same name, or a destructured
-name (or an import's last-segment binding) colliding with a local declaration, is an error
-(§9) — resolved by using a full `::` path, which is always available. A member and a
+name (or an import's last-segment/`as`-renamed binding) colliding with a local declaration, is
+an error (§9) — resolved by an `as` rename or a full `::` path, both always available. A member and a
 same-named member reached through *different* paths do not collide (they are distinct `::`
 paths).
 
@@ -318,8 +330,9 @@ import graph into one import-free `.cf`:
    survives; the scaffolding and losing branches dissolve. Only surviving imports/paths are
    resolved further.
 2. **Expand abbreviations to full paths** (§4). Each `import` binds an abbreviation (a
-   last-segment namespace or destructured names); every use of one is rewritten to the full
-   `::` path it stands for, so the rest of resolution works on full paths alone. A path
+   last-segment or `as`-renamed namespace, or destructured names); every use of one is
+   rewritten to the full `::` path it stands for, so the rest of resolution works on full
+   paths alone. A path
    written out inline needs no expansion — it is already canonical.
 3. **Resolve module paths** (§2) — the module prefix of each full path → a file — and
    **load transitively**, following each loaded module's own paths. The set of modules loaded
@@ -378,10 +391,10 @@ carry the intent, so both fall out cleanly, and the value-vs-type namespace spli
 needed (a single `::` path reaches any member). This surface is now **fully implemented** in the
 self-hosted compiler `cf`; the legacy `.`/string-import surface has been migrated and dropped:
 
-- **Path & import surface** — DONE: `import a::b::c` (binds the last segment) and
-  `import a::b::c::{ x, Y }` (destructure), no string path and no `as`. The whole corpus and
-  `cf`'s own source were migrated `.`→`::`, and the parser/strip legacy paths (string imports,
-  `.`-namespace mangling) are removed.
+- **Path & import surface** — DONE: `import a::b::c` (binds the last segment), `import a::b::c
+  as n` (renames the namespace binding), and `import a::b::c::{ x, Y }` (destructure). No string
+  path. The whole corpus and `cf`'s own source were migrated `.`→`::`, and the parser/strip
+  legacy paths (string imports, `.`-namespace mangling) are removed.
 - **Full-path access / imports optional** — DONE: any `pub` member is reachable by full `::`
   path with no import (`std::comptime::os::target`). The strip pass mangles a full path flat
   (`::`→`_`) to its path-prefix-mangled definition and records the module as a synthetic import

@@ -105,7 +105,8 @@ const alias_prefix = ([Str] aliases, [Str] prefixes, Str n): Str -> {
 }
 
 # A pre-parse token pass for namespace imports (module_system §4/§5). A namespace import
-# `import "m" as ns` binds a local alias `ns`, and a use `ns.member` means module `m`'s `member`.
+# `import a::b::ns` binds a local alias `ns` (the last segment, or a `as <name>` rename), and a use
+# `ns::member` means module `a::b::ns`'s `member`.
 # Since the mangle later renames `m`'s value members to `<prefix>_<name>`, a value access
 # `ns.member` cannot survive as a bare `member` — it is JOINED here into one synthesized token
 # `<prefix>\x01member` (the sep flags a namespace access; the mangle resolves it through `m`'s
@@ -120,8 +121,9 @@ const alias_prefix = ([Str] aliases, [Str] prefixes, Str n): Str -> {
 # namespace) — destructure the value first. A TYPE terminal `ns.…segs….T` (PascalCase) is reached
 # THROUGH the namespaces: the whole `ns.…seg.` prefix is dropped and the bare `T` kept (types are
 # never mangled), so `T.M` stays intact. Pass 1 collects each alias and the sanitized prefix of its
-# import path (the non-`{` form; `pub import` too); the declaration's own `as ns` is left untouched
-# (its `ns` is not followed by a `.`).
+# import path (the non-`{` form; `pub import` too); an optional `as <name>` on the declaration
+# renames the alias (`import a::b::os as os2` → alias `os2`, prefix unchanged), and pass 2 emits the
+# `as <name>` clause verbatim.
 # Append `_seg` to a sanitized prefix (`std_mem` + `raw` → `std_mem_raw`).
 const us_join! = (Str base, Str seg): Str -> {
 	let [Uint8] v = []
@@ -203,6 +205,15 @@ const strip_import_namespaces! = (*[Uint8] src, [Token] toks): StripResult -> {
 					m = m + 1
 				}
 				if !destructured then {
+					# optional `as <name>` renames the alias (`import a::b::os as os2` binds `os2`); the
+					# module prefix `pre` is unchanged — only the local namespace name changes.
+					if m < Iarch(toks.len) && is_ident(toks[m].kind) && str_eq(tok_text!(src, toks[m]), "as") then {
+						m = m + 1
+						if m < Iarch(toks.len) && is_ident(toks[m].kind) then {
+							last = tok_text!(src, toks[m])
+							m = m + 1
+						}
+					}
 					paliases = [...paliases, last]
 					pprefixes = [...pprefixes, pre]
 				}
@@ -248,6 +259,12 @@ const strip_import_namespaces! = (*[Uint8] src, [Token] toks): StripResult -> {
 				if !(k < Iarch(toks.len) && is_ident(toks[k].kind)) then break
 				out = [...out, toks[k]]
 				k = k + 1
+			}
+			# emit an optional `as <name>` clause verbatim (a rename binding, not a use to mangle).
+			if k + 1 < Iarch(toks.len) && is_ident(toks[k].kind) && str_eq(tok_text!(src, toks[k]), "as") && is_ident(toks[k + 1].kind) then {
+				out = [...out, toks[k]] # `as`
+				out = [...out, toks[k + 1]] # name
+				k = k + 2
 			}
 			continue
 		}

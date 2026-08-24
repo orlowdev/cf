@@ -1399,14 +1399,14 @@ must be a named tuple is a semantic check; the grammar admits the pattern on any
 ## Imports
 
 An import names a module by a `::`-separated **path** and binds an abbreviation for
-it. There is no path string and no `as`: the segments _are_ the module's location,
-and the binding is the path's **last segment** (or the destructured names). Every
-name an import binds can equally be written as a full `::` path with no import at all
-— an import is pure sugar for omitting a namespace prefix (see Modules;
+it. There is no path string: the segments _are_ the module's location, and the binding
+is the path's **last segment** — or an explicit `as` rename, or the destructured names.
+Every name an import binds can equally be written as a full `::` path with no import at
+all — an import is pure sugar for omitting a namespace prefix (see Modules;
 [[module_system.md]] §4).
 
 ```ebnf
-import_decl  = [ "pub" ] , "import" , module_path , [ "::" , import_list ] ;   (* pub import = reexport *)
+import_decl  = [ "pub" ] , "import" , module_path , ( [ "::" , import_list ] | [ "as" , var_name ] ) ;   (* pub import = reexport *)
 module_path  = path_seg , { "::" , path_seg } ;
 path_seg     = var_name | type_name ;
 import_list  = "{" , import_name , { "," , import_name } , [ "," ] , "}" ;
@@ -1418,16 +1418,23 @@ Examples:
 ```
 import std::mem                       (* binds `mem` — mem::alloc, mem::Arena, … *)
 import std::mem::{ alloc, Arena }      (* destructures alloc (value) and Arena (type) *)
+import std::comptime::os as comptime_os  (* binds `comptime_os` — comptime_os::target *)
 pub import std::mem::{ arena }         (* reexport: arena is importable from this module too *)
 ```
 
-Two forms:
+Three forms:
 
 - **A bare path** `import a::b::c` binds the **last segment** `c` as an abbreviation
   for the whole path: a use `c::member` means `a::b::c::member`. `c` is a namespace
   over the module's entire exported surface — **values and types alike**, told apart
   by the member's own casing (`mem::alloc`, `mem::Arena`). (There is no casing-keyed
   value/type split on the binding: a single `::` path reaches any member.)
+- **A renamed path** `import a::b::c as n` binds `n` instead of the last segment `c`
+  as the namespace abbreviation, so `n::member` means `a::b::c::member`. The rename is
+  namespace-only (it never applies to `::{ … }`); it disambiguates a segment name that
+  would collide, and — paired with `pub import` and a `comptime_if` — lets a barrel
+  give every platform's implementation a single shared name (`pub import
+  …::darwin::arm64 as console`).
 - **A destructured path** `import a::b::c::{ x, Y }` pulls the named members straight
   into scope, so `x` means `a::b::c::x` and `Y` means `a::b::c::Y`. It mirrors a
   `record_pattern` but also admits a `type_name`, since a member may itself be a type.
