@@ -16,9 +16,9 @@ one file, mangles module-qualified names, and prunes what no longer applies — 
 tree of `.cf` files into a single import-free `.cf` for the typecheck gate ([[type_system.md]])
 to run on.
 
-Status: **ratified surface, `::` revision**. The module surface is `::` paths with imports as
-optional sugar (§4); this document leads the self-hosted `cf`, which still carries the older
-`.`/string-import surface, and § Reconciliation collects the migration. The target surface (§7)
+Status: **ratified and implemented, `::` revision**. The module surface is `::` paths with
+imports as optional sugar (§4), fully implemented in the self-hosted `cf` (the legacy
+`.`/string-import surface is migrated and removed); § Reconciliation records the arc. The target surface (§7)
 is coordinated with [[cf_cli.md]] §5 (the `--target` os-arch pair): `wasm` sets the `Arch`
 only, since Wasm is not an OS.
 
@@ -375,27 +375,24 @@ traversal and value/field access, so `a.b.c` could not be told apart from a name
 field, and a namespaced call collided with union-variant construction. A distinct `::` for
 module/namespace paths — with `.` left to runtime fields and union variants — lets the surface
 carry the intent, so both fall out cleanly, and the value-vs-type namespace split is no longer
-needed (a single `::` path reaches any member). This spec now **leads the implementation** (the
-self-hosted compiler `cf`), which still carries the older `.`/string-import surface; the
-migration is a keeper arc:
+needed (a single `::` path reaches any member). This surface is now **fully implemented** in the
+self-hosted compiler `cf`; the legacy `.`/string-import surface has been migrated and dropped:
 
-- **Path & import surface** — `import "std/mem" as mem` + `mem.alloc` becomes `import std::mem`
-  + `mem::alloc`; `as { … }` becomes `::{ … }`; the `as`-alias and the string path are gone.
-  Every namespace access migrates `.`→`::` across the corpus and `cf`'s own source (a
-  transitional reseed, since it is self-affecting).
-- **Full-path access / imports optional** — any `pub` member is reachable by full `::` path
-  with no import (`std::comptime::os::target`); an import only abbreviates. IMPLEMENTED: the
-  strip pass mangles a full path flat (`::`→`_`) to its path-prefix-mangled definition and
-  records the module as a synthetic import so the loader pulls it in (dedup by path).
-- **Namespace reexport → nested namespace** — `pub import ext::blah` reexported and traversed
-  `blah_barrel::blah::open` (§5). (The precursor nested-`.`-reexport already landed; corpus
-  `807_import_namespace_reexport` covers the shape.)
-- **`std::comptime`** — a real std path (§7), not a special-cased pseudo-module; `os`/`arch`
-  are compiler-supplied comptime intrinsics reached by `::`. `cf` today special-cases the bare
-  `comptime` path and reads the condition's `os`/`arch` as literal words. Migrating it is the
-  originating goal of this arc.
+- **Path & import surface** — DONE: `import a::b::c` (binds the last segment) and
+  `import a::b::c::{ x, Y }` (destructure), no string path and no `as`. The whole corpus and
+  `cf`'s own source were migrated `.`→`::`, and the parser/strip legacy paths (string imports,
+  `.`-namespace mangling) are removed.
+- **Full-path access / imports optional** — DONE: any `pub` member is reachable by full `::`
+  path with no import (`std::comptime::os::target`). The strip pass mangles a full path flat
+  (`::`→`_`) to its path-prefix-mangled definition and records the module as a synthetic import
+  so the loader pulls it in (dedup by path).
+- **Namespace reexport → nested namespace** — DONE: `pub import ext::blah` reexported and
+  traversed `blah_barrel::blah::open` (§5); corpus covers deep chains and types-through-namespaces.
+- **`std::comptime`** — DONE: a real std path (§7), not a pseudo-module. `os`/`arch` are
+  compiler-supplied comptime intrinsics reached by `::` (`os::target` a bodyless value intrinsic);
+  `comptime_if` folds the resolved token. Only `runtime` remains a reserved pseudo-namespace.
 - **Closed variant sets & `current`** — the `Os`/`Arch` variant sets (§7.1) and `arch::current`
-  (§7.2) are keeper semantics; the genesis tooling validated neither.
+  (§7.2) are keeper semantics.
 
 The one cross-spec coordination stands: [[cf_cli.md]] §5's `wasm` sets the `Arch` only (not the
 `Os`), so `os::target ∈ {darwin, linux}` matches §7.1 — Wasm is not an OS.
