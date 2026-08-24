@@ -14,7 +14,7 @@
 # imports.
 
 import io::{ open, read, close, die, o_rdonly }
-import token::{ Token, is_ident, is_strlit, is_lbrace, is_rbrace, is_dot, is_pathsep }
+import token::{ Token, is_ident, is_lbrace, is_rbrace, is_pathsep }
 import ast::{ Expr, Stmt, MatchArm, StmtArm, Seg, FieldInit, RecDecl, UnionDecl, UnionMember, TupElem, Param, Func, Import, Program, with_geom }
 import lexer::{ lex }
 import typealias::{ strip_type_aliases! }
@@ -163,12 +163,9 @@ const segs_join! = ([Str] segs, Iarch nseg, Iarch sep): Str -> {
 	return Str(v)
 }
 const strip_import_namespaces! = (*[Uint8] src, [Token] toks): StripResult -> {
-	# --- pass 1: collect namespace aliases, keeping the two import forms SEPARATE so a `.` use is
-	# only mangled against a legacy string-import alias and a `::` use only against a `::`-import
-	# alias (a new file's `rec.field` is never captured by a `::`-form alias, and vice versa). ---
-	let [Str] daliases = []   # legacy `import "p" as ns` — enable `ns.member` (`.`) mangling
-	let [Str] dprefixes = []
-	let [Str] paliases = []   # `import a::b::ns`         — enable `ns::member` (`::`) mangling
+	# --- pass 1: collect the `::`-import namespace aliases (`import a::b::ns` → `ns`), so a
+	# `ns::member` use can be joined against the alias's module prefix. ---
+	let [Str] paliases = []
 	let [Str] pprefixes = []
 	# `saw_ps` counts a `::` only in a USE position — an import DECLARATION is walked past whole, so a
 	# file with only `::` imports (no alias/full-path uses) still early-returns, keeping pass 2 (which
@@ -179,27 +176,6 @@ const strip_import_namespaces! = (*[Uint8] src, [Token] toks): StripResult -> {
 		if i >= Iarch(toks.len) then break
 		if is_ident(toks[i].kind) && str_eq(tok_text!(src, toks[i]), "import") then {
 			let Iarch m = i + 1
-			if m < Iarch(toks.len) && is_strlit(toks[m].kind) then {
-				const Str spath = tok_text!(src, toks[m])
-				m = m + 1
-				if m < Iarch(toks.len) && is_ident(toks[m].kind) && str_eq(tok_text!(src, toks[m]), "as") then m = m + 1
-				if m < Iarch(toks.len) && is_lbrace(toks[m].kind) then {
-					loop {
-						if m >= Iarch(toks.len) then break
-						if is_rbrace(toks[m].kind) then {
-							m = m + 1
-							break
-						}
-						m = m + 1
-					}
-				} else if m < Iarch(toks.len) && is_ident(toks[m].kind) then {
-					daliases = [...daliases, tok_text!(src, toks[m])]
-					dprefixes = [...dprefixes, sanitize_prefix!(spath)]
-					m = m + 1
-				}
-				i = m
-				continue
-			}
 			if m < Iarch(toks.len) && is_ident(toks[m].kind) then {
 				# `::`-path import: walk segments; the last (if not `::{ … }` destructure) is the alias.
 				let Str pre = tok_text!(src, toks[m])
@@ -238,7 +214,7 @@ const strip_import_namespaces! = (*[Uint8] src, [Token] toks): StripResult -> {
 		i = i + 1
 	}
 	let [Str] nodeps = []
-	if Iarch(daliases.len) == 0 && Iarch(paliases.len) == 0 && !saw_ps then return StripResult({ toks: toks, deps: nodeps })
+	if Iarch(paliases.len) == 0 && !saw_ps then return StripResult({ toks: toks, deps: nodeps })
 	# --- pass 2: rewrite uses; leave import declarations untouched ---
 	let [Str] deps = []
 	let [Token] out = []
@@ -246,16 +222,17 @@ const strip_import_namespaces! = (*[Uint8] src, [Token] toks): StripResult -> {
 	loop {
 		if k >= Iarch(toks.len) then break
 		if is_ident(toks[k].kind) && str_eq(tok_text!(src, toks[k]), "import") then {
-			# emit the import DECLARATION verbatim — its path segments are not uses to mangle.
+			# emit the import DECLARATION verbatim (`import a::b::c [::{ … }]`) — not a use to mangle.
 			out = [...out, toks[k]]
 			k = k + 1
-			if k < Iarch(toks.len) && is_strlit(toks[k].kind) then {
-				out = [...out, toks[k]] # legacy path string
+			if k < Iarch(toks.len) && is_ident(toks[k].kind) then {
+				out = [...out, toks[k]] # first `::` segment
 				k = k + 1
-				if k < Iarch(toks.len) && is_ident(toks[k].kind) && str_eq(tok_text!(src, toks[k]), "as") then {
-					out = [...out, toks[k]]
-					k = k + 1
-				}
+			}
+			loop {
+				if !(k < Iarch(toks.len) && is_pathsep(toks[k].kind)) then break
+				out = [...out, toks[k]] # `::`
+				k = k + 1
 				if k < Iarch(toks.len) && is_lbrace(toks[k].kind) then {
 					loop {
 						if k >= Iarch(toks.len) then break
@@ -266,69 +243,19 @@ const strip_import_namespaces! = (*[Uint8] src, [Token] toks): StripResult -> {
 						}
 						k = k + 1
 					}
-				} else if k < Iarch(toks.len) then {
-					out = [...out, toks[k]] # the `as ns` alias
-					k = k + 1
+					break
 				}
-			} else {
-				if k < Iarch(toks.len) && is_ident(toks[k].kind) then {
-					out = [...out, toks[k]] # first `::` segment
-					k = k + 1
-				}
-				loop {
-					if !(k < Iarch(toks.len) && is_pathsep(toks[k].kind)) then break
-					out = [...out, toks[k]] # `::`
-					k = k + 1
-					if k < Iarch(toks.len) && is_lbrace(toks[k].kind) then {
-						loop {
-							if k >= Iarch(toks.len) then break
-							out = [...out, toks[k]]
-							if is_rbrace(toks[k].kind) then {
-								k = k + 1
-								break
-							}
-							k = k + 1
-						}
-						break
-					}
-					if !(k < Iarch(toks.len) && is_ident(toks[k].kind)) then break
-					out = [...out, toks[k]]
-					k = k + 1
-				}
+				if !(k < Iarch(toks.len) && is_ident(toks[k].kind)) then break
+				out = [...out, toks[k]]
+				k = k + 1
 			}
 			continue
 		}
-		let Str apre = ""
-		if is_ident(toks[k].kind) && k + 1 < Iarch(toks.len) && is_dot(toks[k + 1].kind) then apre = alias_prefix(daliases, dprefixes, tok_text!(src, toks[k]))
-		# a `::` use resolves against the SAME `\x01`-join + export-surface machinery, but its leading
-		# segment must be a `::`-import alias; a full path with no import is not yet supported here.
+		# a `::` use is joined against its `::`-import alias's module prefix (the same `\x01`-join +
+		# export-surface machinery, chasing barrels) — its leading segment must be a `::`-import alias.
 		let Str ppre = ""
 		if is_ident(toks[k].kind) && k + 1 < Iarch(toks.len) && is_pathsep(toks[k + 1].kind) then ppre = alias_prefix(paliases, pprefixes, tok_text!(src, toks[k]))
-		if Iarch(apre.len) > 0 && k + 2 < Iarch(toks.len) && is_ident(toks[k + 2].kind) && is_lower_initial(tok_text!(src, toks[k + 2])) then {
-			# `ns.seg1[.seg2…].member` — greedily join the run of lowercase segments into one token
-			let Str joined = join_ns!(apre, tok_text!(src, toks[k + 2]))
-			let Iarch j = k + 2 # position of the last-consumed lowercase segment
-			loop {
-				if j + 2 < Iarch(toks.len) && is_dot(toks[j + 1].kind) && is_ident(toks[j + 2].kind) && is_lower_initial(tok_text!(src, toks[j + 2])) then {
-					joined = join_ns!(joined, tok_text!(src, toks[j + 2]))
-					j = j + 2
-				} else {
-					break
-				}
-			}
-			if j + 2 < Iarch(toks.len) && is_dot(toks[j + 1].kind) && is_ident(toks[j + 2].kind) && !is_lower_initial(tok_text!(src, toks[j + 2])) then {
-				# `…seg.Type` — the type is reached THROUGH the namespaces: drop the whole `ns.…seg.`
-				# prefix and keep the bare `Type` (emitted normally on the next iteration).
-				k = j + 2
-			} else {
-				# value terminal — emit the joined path as one token (reuse the terminal token's pos)
-				out = [...out, Token({ kind: toks[j].kind, ival: toks[j].ival, start: toks[j].start, len: toks[j].len, text: joined })]
-				k = j + 1
-			}
-		} else if Iarch(apre.len) > 0 then {
-			# `ns.Type` (or a non-ident after the dot) → drop the leading `ns.`, keep the rest
-			k = k + 2
-		} else if Iarch(ppre.len) > 0 && k + 2 < Iarch(toks.len) && is_ident(toks[k + 2].kind) && is_lower_initial(tok_text!(src, toks[k + 2])) then {
+		if Iarch(ppre.len) > 0 && k + 2 < Iarch(toks.len) && is_ident(toks[k + 2].kind) && is_lower_initial(tok_text!(src, toks[k + 2])) then {
 			# `ns::seg1[::seg2…]::member` — same join, but `::`-separated (a `::` use is unambiguous:
 			# every segment is a namespace hop, so no value/field terminal to guess at)
 			let Str joined = join_ns!(ppre, tok_text!(src, toks[k + 2]))
