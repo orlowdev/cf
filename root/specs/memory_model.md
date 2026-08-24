@@ -27,7 +27,7 @@ Memory is a **tree** of nodes called the manifold.
   is user land. The user **cannot** allocate in the root — a program must graft
   at least one geometry node before it has usable memory.
 - Every non-root node is minted by **instantiating a geometry at runtime** —
-  the `mem.arena.of(4096)` call itself creates the node (see
+  the `fixed_arena::of(4096)` call itself creates the node (see
   §4). A child node **pulls its space from
   its parent node** — it is physically _inside_ the parent.
 - A node lives exactly as long as the binding that names it, and bindings nest
@@ -100,15 +100,19 @@ identity — a hook that grows a foreign aggregate (see `on_realloc` under
 A geometry is attached to a program **only at a call site**, with an `in` clause:
 
 ```
-const arena = mem.arena.of(4096)
+import std::mem::arena::fixed_arena
+
+const arena = fixed_arena::of(4096)
 
 my_allocating_function!() in arena
 ```
 
-(The `mem.arena.of(...)` part is modules, specified elsewhere.)
+(The constructor is a geometry module's `of` intrinsic imported by `::` path —
+`fixed_arena::of(...)`, `growing_arena::of(...)` — the module system, specified
+elsewhere. Which module the `of` came through fixes the geometry at comptime.)
 
 - **Instantiation creates the node.** The geometry-creating call
-  (`mem.arena.of(4096)`) is **comptime-shaped, runtime-materialized**: the
+  (`fixed_arena::of(4096)`) is **comptime-shaped, runtime-materialized**: the
   node's capacity, hook set, and identity are fixed and validated at comptime;
   the call's runtime step merely grabs the buffer (carves pages, or space from
   the parent) for that already-settled shape. The binding names the node. Every
@@ -345,7 +349,7 @@ things, and both are copy-free:
 
 So residue is reclaimed where it was born; only the cloaked return leaves the
 frame. One case does move a *block* upward, and only bookkeeping-deep: a value
-escaping an **explicitly-carved sub-node** (`const a = mem.arena.of(n); … return
+escaping an **explicitly-carved sub-node** (`const a = fixed_arena::of(n); … return
 x` with `x` in `a`). `a`'s binding dies while `x` must survive; because `a` is
 physically carved from its parent, its **walls dissolve** and `x`'s storage is
 **re-attributed to the parent, in place** — same address, returned pointer stays

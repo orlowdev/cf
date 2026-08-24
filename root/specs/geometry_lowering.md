@@ -404,7 +404,7 @@ hook bodies (in the emitted code, a bracketing frame's single
 code may learn the offsets; a `gc`/`rc` node is free to have a completely
 different interior.
 
-Locally minted nodes (`node_1`, `node_2` from a nested `mem.arena.of`) are
+Locally minted nodes (`node_1`, `node_2` from a nested `fixed_arena::of`) are
 ordinary local handles. A call fills the callee's slot 0 with whichever node
 identity the decide substep assigned it — the ambient node by default, or the
 *target's* node for a `!` call that grows or rehomes into a foreign aggregate
@@ -473,8 +473,9 @@ there). The `%node`/`%ret` convention is entirely internal to C!-to-C! calls.
 
 A geometry is a module exposing the nine hooks plus a constructor. These sit at
 the **floor of the allocation algebra**: a hook body takes the `MemoryNode` state
-by pointer and works in raw memory (`mem.raw.*` — page mapping, pointer bumps,
-byte copies), so a hook is itself **neither `!`-colored nor node-threaded**.
+by pointer and works in raw memory (`raw::*`, the privileged `std::mem::raw`
+intrinsics — page growth, pointer bumps, byte copies), so a hook is itself
+**neither `!`-colored nor node-threaded**.
 Otherwise `on_alloc` would need a geometry to allocate, and the regress never
 bottoms out. Each geometry reads the opaque `MemoryNode` as its own private state
 layout.
@@ -484,7 +485,7 @@ each hook, not a line-complete allocator. The collection *algorithms* inside `rc
 and `gc` (mark-sweep vs copying vs generational) are their own subject; the hooks
 only expose the trigger points.
 
-### The bump family: `page`, `arena`, `fixed_buffer`
+### The bump family: `page`, `fixed_arena`, `growing_arena`, `fixed_buffer`
 
 One shared core: the node is a **duplex** — two bump subnodes in one 96-byte
 header. The **survivor** subnode is the handle itself (offset 0, the pre-duplex
@@ -512,8 +513,8 @@ const on_scope_exit  = (MemoryNode node, Mark mark) -> {
 }
 
 const on_alloc = ['T] (MemoryNode node, 'T v) -> {         # residue side shown; the
-  let p = bump(side_of(v), size_of(v))                     # survivor side is the same
-  mem.raw.place(p, v)                                      # bump on `node.survivor`
+  let p = bump(side_of(v), raw::size_of(v))                # survivor side is the same
+  raw::place(p, v)                                         # bump on `node.survivor`
   return p                                                 # same 'T (identity law)
 }
 ```
@@ -530,8 +531,8 @@ outer target disqualifies it (such a value is residue that outlives the
 iteration); returns, `&` arguments and rehoming callees are survivor-side
 matters and no longer block per-iteration reclamation.
 
-**Two-ended fixed blocks.** A bounded node (`arena.of(n)`, `fixed_buffer`, the
-bare root) lays both subnodes over **one block**: survivors bump up from the
+**Two-ended fixed blocks.** A bounded node (`fixed_arena::of(n)`, `fixed_buffer::of(buf)`,
+the bare root) lays both subnodes over **one block**: survivors bump up from the
 base, residue bumps down from the tail, and the cursors meeting is the
 capacity trap — `of(n)` still means `n` bytes **total**. The residue side
 maintains the survivor side's `limit` (= the residue cursor) on each
@@ -572,19 +573,25 @@ The three members differ only in **where the buffer comes from** and **what
 "full" means**:
 
 - **`page`** — the root-adjacent geometry `main` runs under. Backed directly by OS
-  pages; `on_alloc` maps more pages (`mem.raw.map`) when the cursor meets the
-  limit, so it is the one **unbounded** bump. `on_scope_exit` at program scope
+  pages; `on_alloc` commits more pages (`raw::grow`) when the cursor meets the
+  limit, so it is the one **unbounded** bump. It has no constructor — the root node
+  is provided to `main` as argument zero (§4). `on_scope_exit` at program scope
   unmaps.
-- **`arena`** — `of(n)` pulls one `n`-byte block from the parent node
-  (`parent.on_alloc`), so it is **bounded** by `n`; frames rewind within it and
-  the whole node dissolves into its parent at teardown (memory_model, Zero-cost
-  return).
+- **`fixed_arena`** — `of(n)` pulls one `n`-byte block from the parent node
+  (`parent.on_alloc`), so it is **bounded** by `n` and laid two-ended (above);
+  frames rewind within it and the whole node dissolves into its parent at teardown
+  (memory_model, Zero-cost return).
+- **`growing_arena`** — `of(n)` starts from one `n`-byte block but its survivor
+  **pulls fresh chunks** from the parent on overflow (the elastic lane above), so
+  it grows within its parent; same scope-rewind and teardown. Splitting the fixed
+  and growing shapes into two modules is what keeps each geometry's reserves
+  monomorphic — neither tests a runtime fixed-vs-elastic kind at an allocation.
 - **`fixed_buffer`** — `of(buf)` wraps a **caller-provided** array (stack or
   static); creating the node allocates nothing at all — the duplex header lays
   over the buffer's own front and the remainder is one two-ended block, so
   survivors live **in the buffer itself** (a static-backed escape stays valid
   for the buffer's whole life). Bounded by the buffer; the two-ended meet is a
-  hard trap. The zero-dependency embedded allocator — it differs from `arena`
+  hard trap. The zero-dependency embedded allocator — it differs from `fixed_arena`
   only in the buffer's provenance.
 
 ### The free-list family is subsumed
@@ -631,13 +638,13 @@ and `on_store` is where the real work lives:
 const on_store = ['T, 'U] (MemoryNode node, *'U dst, 'T new) -> {
   inc(new)                                                     # retain the incoming referent
   let old = deref(dst)                                         # dst still holds old
-  raw_store(dst, new)
+  raw::store(raw::addr(dst), new)
   dec(old)                                                     # release the outgoing one
 }
 const on_free = ['T] (MemoryNode node, 'T v) -> {
   if dec(v) == 0 then {                                        # last reference
     drop_referents(v)                                          # recursively dec what v points at
-    free_list_push(node, addr_of(v), size_of(v))
+    free_list_push(node, raw::addr(v), raw::size_of(v))
   }
 }
 ```
@@ -663,13 +670,13 @@ const on_scope_exit  = (MemoryNode node, Mark mark) -> shadow_pop(node, mark)
 
 const on_alloc = ['T] (MemoryNode node, 'T v) -> {
   if heap_pressure(node) then collect(node)                    # scan roots via shadow frames; no safepoint
-  let p = gc_bump(node, size_of(v))
-  mem.raw.place(p, v)
+  let p = gc_bump(node, raw::size_of(v))
+  raw::place(p, v)
   return p
 }
 const on_store = ['T, 'U] (MemoryNode node, *'U dst, 'T new) -> {
   remember(node, dst)                                          # card-mark / SATB before the write
-  raw_store(dst, new)
+  raw::store(raw::addr(dst), new)
 }
 ```
 
@@ -747,14 +754,18 @@ geometries that make adoption and cross-geometry duplication real. Which phases
 [[seed_subset.md]].
 
 **The geometry-modules arc: the degeneracy relocates from the floor to std source.**
-The three bump geometries now live as **user-visible std source** — `lib/std/mem/{page,
-arena, fixed_buffer}.cf` — exporting the §1 hooks over the `mem.raw.*` substrate, rather
-than as hardcoded folds in the QBE floor. The Materialize substep mints per-`(fn ×
-geometry)` copies under a **fixed mangle tag** (`__pg`/`__ar`/`__fb`) for the functions
-reachable under each ambient, and emit places the geometry's own `reserve_*`/claim/scope
-calls (fold-lite: a record literal builds directly in a `reserve_ret`/`reserve_alloc`
-reservation, the identity-law-fused `on_alloc`/`on_ret`). The compiler self-hosts through
-its own `arena` hooks (it grafts one elastic arena in `main`). The **`page`** geometry is
+The bump geometries now live as **user-visible std source** — `lib/std/mem/page.cf`,
+`lib/std/mem/fixed_buffer.cf`, and the two arena shapes `lib/std/mem/arena/{fixed_arena,
+growing_arena}.cf` — exporting the §1 hooks over the `raw::*` substrate (`std::mem::raw`),
+rather than as hardcoded folds in the QBE floor. Each geometry's constructor is a bodyless
+`pub intrinsic of` the user imports and calls (`fixed_arena::of(n)`, `fixed_buffer::of(buf)`);
+`page` has no constructor (its node is argument zero). The Materialize substep mints
+per-`(fn × geometry)` copies under a **fixed mangle tag** (`__pg`/`__fx`/`__el`/`__fb`) for
+the functions reachable under each ambient, and emit places the geometry's own
+`reserve_*`/claim/scope calls (fold-lite: a record literal builds directly in a
+`reserve_ret`/`reserve_alloc` reservation, the identity-law-fused `on_alloc`/`on_ret`). The
+compiler self-hosts through its own `growing_arena` hooks (it grafts one growing arena in
+`main`). The **`page`** geometry is
 materialized for a program whose `main` genuinely allocates on the root ambient — a
 colorless (non-`!`) frame building a record, plus its bare-reachable colorless allocator
 subtree (`build__pg`), which the root check permits on the page; a `!` frame is never `pg`

@@ -736,17 +736,17 @@ resolves to something callable is a semantic rule.
 It is a prefix on a `postfix` (a `unary`), so it composes anywhere a value does:
 
 ```
-const arena = defer mem.arena.destroy(mem.arena.of(256))
+const fd = defer close(open(path))
 ```
 
-`arena` binds the arena (`mem.arena.of(256)`, the tapped argument) while
-`mem.arena.destroy(arena)` is queued for scope exit. Written on its own line
-(`defer mem.arena.destroy(arena)`) it is just an expression-statement whose value
-is discarded. As a **pipe target** it needs no full call — the pipe partially
-applies the function and the tapped value completes it, so
+`fd` binds the handle (`open(path)`, the tapped argument) while `close(fd)` is
+queued for scope exit. Written on its own line (`defer close(fd)`) it is just an
+expression-statement whose value is discarded. As a **pipe target** it needs no
+full call — the pipe partially applies the function and the tapped value completes
+it, so
 
 ```
-const arena = mem.arena.of(256) |> defer mem.arena.destroy
+const fd = open(path) |> defer close
 ```
 
 is the same thing: `x |> defer f` ≡ `defer f(x)`. `defer` itself does not care
@@ -971,32 +971,35 @@ low-binding operator; only the lambda and its body are defined here.
 
 ## Intrinsics
 
-An **intrinsic** is a function the **compiler** supplies the body for — `sizeof`,
-`popcount`, `mem.copy`, atomics, and the like. Because the standard library is
-written in C!, these primitives must bottom out _somewhere_; an `intrinsic`
-declaration is that floor. Users **see** them: they are ordinary top-level
-bindings that read like any function, minus the body.
+An **intrinsic** is a function the **compiler** supplies the body for — `size_of`,
+`popcount`, the `std::mem::raw` ops, atomics, and the like. Because the standard
+library is written in C!, these primitives must bottom out _somewhere_; an
+`intrinsic` declaration is that floor. Users **see** them: they are ordinary
+top-level bindings that read like any function, minus the body.
 
 The shape reuses the binding skeleton one-for-one — swap `const` for
-`intrinsic` and give a **function-type signature** (`(params) -> return`) with no
-`-> body` after it. The compiler supplies the body.
+`intrinsic` and give the **`:`-return signature** (`(params): return`) with no
+`-> body` after it (the same `:` return a lambda uses, stopping where its `->`
+body would begin). The compiler supplies the body.
 
 ```ebnf
 intrinsic_decl  = "intrinsic" , var_name , "=" , intrinsic_sig                  (* value intrinsic *)
+               | "intrinsic" , var_name , ":" , type                            (* bodyless comptime VALUE — no params *)
                | "intrinsic" , "type" , type_name , [ "=" , constructor_sig ] ;  (* type-valued intrinsic + its constructor; nullary form omits "=" *)
-intrinsic_sig   = [ generic_params ] , param_list , "->" , type ;   (* a function-type signature, no body — the compiler supplies it *)
-constructor_sig = param_list , "->" , type ;                        (* a type's constructor: (Number value) -> Uint8 *)
+intrinsic_sig   = [ generic_params ] , param_list , ":" , type ;   (* the lambda's ":" return, no "->" body — the compiler supplies it *)
+constructor_sig = param_list , ":" , type ;                        (* a type's constructor: (Number value): Uint8 *)
 ```
 
 An `intrinsic` also names a **type the compiler supplies** — an `intrinsic type`
 whose optional `= constructor_sig` gives the type its cast/construction signature
-(`pub intrinsic type Uint8 = (Number value) -> Uint8`), and whose nullary form
+(`pub intrinsic type Uint8 = (Number value): Uint8`), and whose nullary form
 (no `=`) is a bare compiler singleton (`pub intrinsic type Infinity`). The name is
-PascalCase (a `type_name`); the constructor RHS is an ordinary function-type
-signature (`(Number value) -> Uint8`), just like a value intrinsic's.
+PascalCase (a `type_name`); the constructor RHS is an ordinary `:`-return
+signature (`(Number value): Uint8`), just like a value intrinsic's.
 
 The **return type is mandatory** — there is no body to infer from, and nothing
-is implied. A unit-returning intrinsic states it (`Unit`); the type is never omitted.
+is implied. A unit-returning intrinsic states it (`()`, or its alias `Unit`); the
+type is never omitted.
 Everything else mirrors a lambda: optional `generic_params`, a `param_list`
 whose params carry their types, and the `!` allocation marker rides the name
 (`copy!`) when the intrinsic allocates. `pub` exports it like any declaration,
@@ -1006,18 +1009,18 @@ An intrinsic is a **top-level** form only — it appears in `declaration`, never
 `statement`; there are no local intrinsics.
 
 ```
-pub intrinsic sizeof   = ['T]() -> Uarch                      (* generic, returns a count *)
-pub intrinsic popcount = (Uarch x) -> Uarch
-pub intrinsic copy!    = ['T](*'T dst, *'T src, Uarch n) -> Unit (* allocates; return stated *)
-intrinsic fence        = () -> Unit                           (* module-private *)
+pub intrinsic size_of  = ['T]('T v): Uarch                    (* generic, returns a byte count *)
+pub intrinsic popcount = (Uarch x): Uarch
+pub intrinsic copy!    = ['T](*'T dst, *'T src, Uarch n): ()  (* allocates; return stated *)
+intrinsic fence        = (): ()                               (* module-private *)
 
-pub intrinsic type Uint8 = (Number value) -> Uint8          (* a width type carrying its cast constructor *)
+pub intrinsic type Uint8 = (Number value): Uint8            (* a width type carrying its cast constructor *)
 pub intrinsic type Infinity                                 (* nullary compiler singleton — no constructor *)
 
 pub intrinsic target: Os                                    (* a bodyless comptime VALUE — no params: read `target`, not `target()` *)
 
-pub intrinsic bad      = (Uarch x)                           (* invalid — return type required (needs `-> T`) *)
-pub intrinsic worse    = (Uarch x) -> Uarch -> x            (* invalid — the trailing `-> x` is a body; intrinsics take none *)
+pub intrinsic bad      = (Uarch x)                           (* invalid — return type required (needs `: T`) *)
+pub intrinsic worse    = (Uarch x): Uarch -> x              (* invalid — the trailing `-> x` is a body; intrinsics take none *)
 ```
 
 ## Assembly
