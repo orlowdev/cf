@@ -2829,7 +2829,7 @@ const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env)
 	# section), else the pulls draw real storage from the survivor side as before.
 	# The constructor is CF SOURCE now: `of` in lib/std/mem/arena.cf (auto-loaded on use,
 	# mangled `of__ar`), like fixed_buffer's. The old `$cf_arena_of`/`$cf_arena_grow` floor
-	# text stays emitted (dead) until the legacy sweep.
+	# text has been swept (Stage 4) — every `mem.arena.of`/`.grow` site retargets here.
 	if str_eq(callee, "cf__arena_of") then {
 		const Str nv = emit_expr!(args[0], ctx, env)
 		const Iarch ofa = find_func(ctx.funcs, "of__ar")
@@ -2853,8 +2853,8 @@ const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env)
 	# header; `of` reads data/len and lays a fixed node over the buffer's own bytes (no carve).
 	# The constructor is CF SOURCE: `of` in lib/std/mem/fixed_buffer.cf (auto-loaded on use,
 	# mangled `of__fb`) — the first geometry living in std rather than the QBE floor. The old
-	# `$cf_buffer_of` floor text stays emitted (dead) until the legacy sweep, so non-fb
-	# programs' bytes are untouched.
+	# `$cf_buffer_of` floor text has been swept (Stage 4) — every `mem.fixed_buffer.of` site
+	# retargets here.
 	if str_eq(callee, "cf__buffer_of") then {
 		const Str bv = emit_expr!(args[0], ctx, env)
 		const Iarch ofi = find_func(ctx.funcs, "of__fb")
@@ -5197,124 +5197,6 @@ const emit_arena_qbe! = (Uarch fd, Bool is_bare, Iarch root_size): Iarch -> {
 	write_str(fd, "\t%elimp =l add %node, 16\n")
 	write_str(fd, "\tstorel %end, %elimp\n")
 	write_str(fd, "\tret\n")
-	write_str(fd, "}\n")
-	# `mem.arena.of(n)` — carve a FIXED arena from the parent: pull a 96-byte DUPLEX header and
-	# an n-byte block from `%node` (the parent's SURVIVOR — headers must outlive frames, so the
-	# carve itself is the MUST-PIN), then lay the two subnodes over the ONE two-ended block:
-	# survivor { top=blk, committed=end, limit=end, parent=node, kind=0 } bumping up, residue
-	# { top=end, committed=end, limit=0, parent=node, kind=2 } bumping down. The cursors meet
-	# at cf_oom, so `of(n)` still means n bytes TOTAL. The block leaks into the parent at
-	# teardown (geometry_lowering §5). Returns the header (= the survivor subnode).
-	write_str(fd, "function l $cf_arena_of(l %node, w %n) {\n")
-	write_str(fd, "@start\n")
-	write_str(fd, "\t%r7 =w add %n, 7\n")
-	write_str(fd, "\t%ra =w and %r7, -8\n")
-	write_str(fd, "\t%sz =l extuw %ra\n")
-	write_str(fd, "\t%hdr =l call $cf_alloc(l %node, w 96)\n")
-	write_str(fd, "\t%blk =l call $cf_alloc(l %node, w %n)\n")
-	write_str(fd, "\tstorel %blk, %hdr\n")
-	write_str(fd, "\t%end =l add %blk, %sz\n")
-	write_str(fd, "\t%c8 =l add %hdr, 8\n")
-	write_str(fd, "\tstorel %end, %c8\n")
-	write_str(fd, "\t%c16 =l add %hdr, 16\n")
-	write_str(fd, "\tstorel %end, %c16\n")
-	write_str(fd, "\t%c24 =l add %hdr, 24\n")
-	write_str(fd, "\tstorel %node, %c24\n")
-	write_str(fd, "\t%c32 =l add %hdr, 32\n")
-	write_str(fd, "\tstorel 4, %c32\n")
-	write_str(fd, "\t%c40 =l add %hdr, 40\n")
-	write_str(fd, "\tstorel 0, %c40\n")
-	write_str(fd, "\t%c48 =l add %hdr, 48\n")
-	write_str(fd, "\tstorel %end, %c48\n")
-	write_str(fd, "\t%c56 =l add %hdr, 56\n")
-	write_str(fd, "\tstorel %end, %c56\n")
-	write_str(fd, "\t%c64 =l add %hdr, 64\n")
-	write_str(fd, "\tstorel 0, %c64\n")
-	write_str(fd, "\t%c72 =l add %hdr, 72\n")
-	write_str(fd, "\tstorel %node, %c72\n")
-	write_str(fd, "\t%c80 =l add %hdr, 80\n")
-	write_str(fd, "\tstorel 2, %c80\n")
-	write_str(fd, "\t%c88 =l add %hdr, 88\n")
-	write_str(fd, "\tstorel 0, %c88\n")
-	write_str(fd, "\tret %hdr\n")
-	write_str(fd, "}\n")
-	# `mem.arena.grow(n)` — carve an ELASTIC arena: the survivor is kind=1 / chunk=n over the
-	# whole initial block (a limit overflow pulls another n-sized block from the parent). The
-	# residue side is a LAZY private chain: kind=1 with an empty triple, so its first allocation
-	# pulls an own n-sized chunk — an elastic arena has NO shared two-ended block (the shared
-	# boundary link is only sound where the survivor can never leave the block; an elastic
-	# survivor pulls away and a still-linked residue would clobber its limit with old-block
-	# addresses — the churn that burned the whole page reservation). Residue-free arenas pay
-	# nothing for the lane.
-	write_str(fd, "function l $cf_arena_grow(l %node, w %n) {\n")
-	write_str(fd, "@start\n")
-	write_str(fd, "\t%r7 =w add %n, 7\n")
-	write_str(fd, "\t%ra =w and %r7, -8\n")
-	write_str(fd, "\t%sz =l extuw %ra\n")
-	write_str(fd, "\t%hdr =l call $cf_alloc(l %node, w 96)\n")
-	write_str(fd, "\t%blk =l call $cf_alloc(l %node, w %n)\n")
-	write_str(fd, "\tstorel %blk, %hdr\n")
-	write_str(fd, "\t%end =l add %blk, %sz\n")
-	write_str(fd, "\t%g8 =l add %hdr, 8\n")
-	write_str(fd, "\tstorel %end, %g8\n")
-	write_str(fd, "\t%g16 =l add %hdr, 16\n")
-	write_str(fd, "\tstorel %end, %g16\n")
-	write_str(fd, "\t%g24 =l add %hdr, 24\n")
-	write_str(fd, "\tstorel %node, %g24\n")
-	write_str(fd, "\t%g32 =l add %hdr, 32\n")
-	write_str(fd, "\tstorel 1, %g32\n")
-	write_str(fd, "\t%g40 =l add %hdr, 40\n")
-	write_str(fd, "\tstorel %sz, %g40\n")
-	write_str(fd, "\t%g48 =l add %hdr, 48\n")
-	write_str(fd, "\tstorel 0, %g48\n")
-	write_str(fd, "\t%g56 =l add %hdr, 56\n")
-	write_str(fd, "\tstorel 0, %g56\n")
-	write_str(fd, "\t%g64 =l add %hdr, 64\n")
-	write_str(fd, "\tstorel 0, %g64\n")
-	write_str(fd, "\t%g72 =l add %hdr, 72\n")
-	write_str(fd, "\tstorel %node, %g72\n")
-	write_str(fd, "\t%g80 =l add %hdr, 80\n")
-	write_str(fd, "\tstorel 1, %g80\n")
-	write_str(fd, "\t%g88 =l add %hdr, 88\n")
-	write_str(fd, "\tstorel %sz, %g88\n")
-	write_str(fd, "\tret %hdr\n")
-	write_str(fd, "}\n")
-	# `mem.fixed_buffer.of(buf)` — wrap a caller `[Uint8]` buffer. `%buf` is its `{data,len,cap}` header;
-	# read data/len and lay a 96-byte DUPLEX node over the FRONT of the buffer's own bytes — carves
-	# nothing from the parent (§5): the remainder is ONE two-ended block (survivor up from data+96,
-	# residue down from data+len, meet traps). Saves the static-backed escape (test 1334): survivors
-	# live in the buffer itself. The buffer carries its length, so no size is passed.
-	write_str(fd, "function l $cf_buffer_of(l %node, l %buf) {\n")
-	write_str(fd, "@start\n")
-	write_str(fd, "\t%data =l loadl %buf\n")
-	write_str(fd, "\t%lenp =l add %buf, 8\n")
-	write_str(fd, "\t%len =l loadl %lenp\n")
-	write_str(fd, "\t%blk =l add %data, 96\n")
-	write_str(fd, "\t%end =l add %data, %len\n")
-	write_str(fd, "\tstorel %blk, %data\n")
-	write_str(fd, "\t%b8 =l add %data, 8\n")
-	write_str(fd, "\tstorel %end, %b8\n")
-	write_str(fd, "\t%b16 =l add %data, 16\n")
-	write_str(fd, "\tstorel %end, %b16\n")
-	write_str(fd, "\t%b24 =l add %data, 24\n")
-	write_str(fd, "\tstorel %node, %b24\n")
-	write_str(fd, "\t%b32 =l add %data, 32\n")
-	write_str(fd, "\tstorel 4, %b32\n")
-	write_str(fd, "\t%b40 =l add %data, 40\n")
-	write_str(fd, "\tstorel 0, %b40\n")
-	write_str(fd, "\t%b48 =l add %data, 48\n")
-	write_str(fd, "\tstorel %end, %b48\n")
-	write_str(fd, "\t%b56 =l add %data, 56\n")
-	write_str(fd, "\tstorel %end, %b56\n")
-	write_str(fd, "\t%b64 =l add %data, 64\n")
-	write_str(fd, "\tstorel 0, %b64\n")
-	write_str(fd, "\t%b72 =l add %data, 72\n")
-	write_str(fd, "\tstorel %node, %b72\n")
-	write_str(fd, "\t%b80 =l add %data, 80\n")
-	write_str(fd, "\tstorel 2, %b80\n")
-	write_str(fd, "\t%b88 =l add %data, 88\n")
-	write_str(fd, "\tstorel 0, %b88\n")
-	write_str(fd, "\tret %data\n")
 	write_str(fd, "}\n")
 	# `[T]` grow-in-place append: given the 24-byte header {data@0, len@8, cap@16} and
 	# the element stride, ensure room for one more (amortized doubling: cap 0→4 else
