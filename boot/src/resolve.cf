@@ -140,7 +140,29 @@ const us_join! = (Str base, Str seg): Str -> {
 	}
 	return Str(v)
 }
-const strip_import_namespaces! = (*[Uint8] src, [Token] toks): [Token] -> {
+# The pre-parse strip's result: the rewritten tokens, plus the module PATHS a full `::` path used
+# WITHOUT an import (`std::comptime::os::target`) refers to — the loader turns each into a synthetic
+# namespace import so the module is loaded (module_system §4: imports are optional).
+data StripResult = { [Token] toks, [Str] deps }
+# The first `nseg` segments of `segs` joined by `sep` (a byte): a full `::` path's module prefix is
+# all-but-the-last segment joined `/` (a load path), and its flat mangled name is all segments `_`.
+const segs_join! = ([Str] segs, Iarch nseg, Iarch sep): Str -> {
+	let [Uint8] v = []
+	let Iarch i = 0
+	loop {
+		if i >= nseg then break
+		if i > 0 then v = [...v, sep]
+		let Iarch j = 0
+		loop {
+			if j >= Iarch(segs[i].len) then break
+			v = [...v, segs[i][j]]
+			j = j + 1
+		}
+		i = i + 1
+	}
+	return Str(v)
+}
+const strip_import_namespaces! = (*[Uint8] src, [Token] toks): StripResult -> {
 	# --- pass 1: collect namespace aliases, keeping the two import forms SEPARATE so a `.` use is
 	# only mangled against a legacy string-import alias and a `::` use only against a `::`-import
 	# alias (a new file's `rec.field` is never captured by a `::`-form alias, and vice versa). ---
@@ -148,9 +170,11 @@ const strip_import_namespaces! = (*[Uint8] src, [Token] toks): [Token] -> {
 	let [Str] dprefixes = []
 	let [Str] paliases = []   # `import a::b::ns`         — enable `ns::member` (`::`) mangling
 	let [Str] pprefixes = []
+	let Bool saw_ps = false   # any `::` at all (full-path uses need pass 2 even with no imports)
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(toks.len) then break
+		if is_pathsep(toks[i].kind) then saw_ps = true
 		if is_ident(toks[i].kind) && str_eq(tok_text!(src, toks[i]), "import") then {
 			if i + 3 < Iarch(toks.len) && is_strlit(toks[i + 1].kind) && is_ident(toks[i + 2].kind) && str_eq(tok_text!(src, toks[i + 2]), "as") && is_ident(toks[i + 3].kind) then {
 				daliases = [...daliases, tok_text!(src, toks[i + 3])]
@@ -180,8 +204,10 @@ const strip_import_namespaces! = (*[Uint8] src, [Token] toks): [Token] -> {
 		}
 		i = i + 1
 	}
-	if Iarch(daliases.len) == 0 && Iarch(paliases.len) == 0 then return toks
+	let [Str] nodeps = []
+	if Iarch(daliases.len) == 0 && Iarch(paliases.len) == 0 && !saw_ps then return StripResult({ toks: toks, deps: nodeps })
 	# --- pass 2: rewrite uses; leave import declarations untouched ---
+	let [Str] deps = []
 	let [Token] out = []
 	let Iarch k = 0
 	loop {
@@ -292,12 +318,38 @@ const strip_import_namespaces! = (*[Uint8] src, [Token] toks): [Token] -> {
 		} else if Iarch(ppre.len) > 0 then {
 			# `ns::Type` → drop the leading `ns::`, keep the bare `Type`
 			k = k + 2
+		} else if is_ident(toks[k].kind) && k + 1 < Iarch(toks.len) && is_pathsep(toks[k + 1].kind) then {
+			# a FULL `::` path with NO import alias (`std::comptime::os::target`): collect all segments,
+			# mangle flat `::`→`_` to the member's path-prefix-mangled definition name, and record the
+			# module (all but the last segment) as a dependency — the loader turns it into a synthetic
+			# import so the module loads (imports are optional, module_system §4).
+			let [Str] segs = [tok_text!(src, toks[k])]
+			let Iarch j = k
+			loop {
+				if j + 2 < Iarch(toks.len) && is_pathsep(toks[j + 1].kind) && is_ident(toks[j + 2].kind) then {
+					segs = [...segs, tok_text!(src, toks[j + 2])]
+					j = j + 2
+				} else {
+					break
+				}
+			}
+			const Iarch ns = Iarch(segs.len)
+			const Str modpath = segs_join!(segs, ns - 1, 47) # all-but-last, `/`-joined — the load path
+			if !in_priv(deps, modpath) then deps = [...deps, modpath]
+			if is_lower_initial(segs[ns - 1]) then {
+				# value member — flat name matches the module's path-prefix-mangled definition
+				out = [...out, Token({ kind: toks[j].kind, ival: toks[j].ival, start: toks[j].start, len: toks[j].len, text: segs_join!(segs, ns, 95) })]
+			} else {
+				# type terminal — types are never mangled; keep the bare `Type` (the last token as-is)
+				out = [...out, toks[j]]
+			}
+			k = j + 1
 		} else {
 			out = [...out, toks[k]]
 			k = k + 1
 		}
 	}
-	return out
+	return StripResult({ toks: out, deps: deps })
 }
 # Join a namespace prefix and a value member into one identifier `<prefix>\x01member`.
 const join_ns! = (Str prefix, Str member): Str -> {
@@ -353,9 +405,22 @@ const load_module! = (Str path, Str target_os, Str target_arch): Program -> {
 	close(Uarch(fd))
 	if n < 0 then die("cf: reading an imported module failed\n")
 	if n >= Iarch(buf.len) then die("cf: an imported module exceeds the read buffer — grow it in resolve.cf\n")
-	const [Token] toks = strip_import_namespaces!(buf, strip_type_aliases!(buf, lex(buf, n)))
-	let Parser p = Parser({ toks: toks, src: buf, pos: 0, file: path, target_os: target_os, target_arch: target_arch, saw_fb: false, saw_fx: false, saw_el: false })
-	return parse_program!(&p)
+	const StripResult sr = strip_import_namespaces!(buf, strip_type_aliases!(buf, lex(buf, n)))
+	let Parser p = Parser({ toks: sr.toks, src: buf, pos: 0, file: path, target_os: target_os, target_arch: target_arch, saw_fb: false, saw_fx: false, saw_el: false })
+	const Program prog = parse_program!(&p)
+	# imports are optional (module_system §4): a full `::` path used without an import contributed its
+	# module PATH to `sr.deps` — turn each into a synthetic namespace import so the module is loaded
+	# (the flat use already resolves to its path-prefix-mangled definition; the loader dedups by path).
+	if Iarch(sr.deps.len) == 0 then return prog
+	let [Import] imps = prog.imports
+	let Iarch di = 0
+	loop {
+		if di >= Iarch(sr.deps.len) then break
+		const [Str] no_names = []
+		imps = [...imps, Import({ path: sr.deps[di], names: no_names, alias: "" })]
+		di = di + 1
+	}
+	return Program({ imports: imps, recs: prog.recs, unions: prog.unions, funcs: prog.funcs, groups: prog.groups })
 }
 
 

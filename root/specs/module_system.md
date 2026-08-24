@@ -384,8 +384,9 @@ migration is a keeper arc:
   Every namespace access migrates `.`→`::` across the corpus and `cf`'s own source (a
   transitional reseed, since it is self-affecting).
 - **Full-path access / imports optional** — any `pub` member is reachable by full `::` path
-  with no import (`std::comptime::os::target`); an import only abbreviates. `cf` today requires
-  an import (and binds a `.`-namespace); reaching a member by full path with no import is new.
+  with no import (`std::comptime::os::target`); an import only abbreviates. IMPLEMENTED: the
+  strip pass mangles a full path flat (`::`→`_`) to its path-prefix-mangled definition and
+  records the module as a synthetic import so the loader pulls it in (dedup by path).
 - **Namespace reexport → nested namespace** — `pub import ext::blah` reexported and traversed
   `blah_barrel::blah::open` (§5). (The precursor nested-`.`-reexport already landed; corpus
   `807_import_namespace_reexport` covers the shape.)
