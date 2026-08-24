@@ -1406,7 +1406,7 @@ all — an import is pure sugar for omitting a namespace prefix (see Modules;
 [[module_system.md]] §4).
 
 ```ebnf
-import_decl  = [ "pub" ] , "import" , module_path , ( [ "::" , import_list ] | [ "as" , var_name ] ) ;   (* pub import = reexport *)
+import_decl  = [ "pub" ] , "import" , module_path , ( [ "::" , import_list ] | [ "as" , ( var_name | "*" ) ] ) ;   (* pub import = reexport *)
 module_path  = path_seg , { "::" , path_seg } ;
 path_seg     = var_name | type_name ;
 import_list  = "{" , import_name , { "," , import_name } , [ "," ] , "}" ;
@@ -1420,9 +1420,10 @@ import std::mem                       (* binds `mem` — mem::alloc, mem::Arena,
 import std::mem::{ alloc, Arena }      (* destructures alloc (value) and Arena (type) *)
 import std::comptime::os as comptime_os  (* binds `comptime_os` — comptime_os::target *)
 pub import std::mem::{ arena }         (* reexport: arena is importable from this module too *)
+pub import std::io::console::arm64::darwin as *  (* reexport the WHOLE surface flat *)
 ```
 
-Three forms:
+Four forms:
 
 - **A bare path** `import a::b::c` binds the **last segment** `c` as an abbreviation
   for the whole path: a use `c::member` means `a::b::c::member`. `c` is a namespace
@@ -1438,6 +1439,13 @@ Three forms:
 - **A destructured path** `import a::b::c::{ x, Y }` pulls the named members straight
   into scope, so `x` means `a::b::c::x` and `Y` means `a::b::c::Y`. It mirrors a
   `record_pattern` but also admits a `type_name`, since a member may itself be a type.
+- **A wildcard** `import a::b::c as *` splices `a::b::c`'s **whole exported surface**
+  into the current module **flat** — every member at its own name, no nesting and no
+  enumeration — so a `pub import … as *` **reexport** forwards the lot without re-listing
+  them (and can never fall out of sync when the target gains a member). The natural
+  barrel form: `pub import std::io::console::arm64::darwin as *` makes each of the
+  platform module's members reachable through the barrel directly (`console::print`),
+  not under an implementation-named nesting.
 
 A **`pub import`** is a **reexport**: the names it brings in join this module's own
 exported surface, so a module that imports _this_ one may reach them through it. It

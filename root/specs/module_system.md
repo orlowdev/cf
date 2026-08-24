@@ -30,8 +30,8 @@ Per [[order_of_compilation.md]] §Resolve the module system owns, and this spec 
   names another module; the toolchain maps path → file.
 - **visibility** (§3) — `pub` exports a declaration; everything else is file-private.
 - **imports, namespaces, and paths** (§4) — full `::` paths reach any member; `import`
-  binds an optional abbreviation (a last-segment or `as`-renamed namespace, or
-  destructured names).
+  binds an optional abbreviation (a last-segment or `as`-renamed namespace, destructured
+  names, or an `as *` wildcard that splices the whole surface flat).
 - **barrels / reexport** (§5) — `pub import` reexports what it brings in, and barrels
   chain transitively.
 - **comptime conditional compilation** (§6) — the module-level `if … then … else`
@@ -120,8 +120,8 @@ runtime namespace object**).
 const t = std::comptime::os::target        (* no import needed — the full path resolves *)
 ```
 
-An import (`[ "pub" ] "import" <module_path> ( [ "::" "{" … "}" ] | [ "as" <name> ] )`,
-[[ebnf.md]] § Imports) has three forms:
+An import (`[ "pub" ] "import" <module_path> ( [ "::" "{" … "}" ] | [ "as" ( <name> | "*" ) ] )`,
+[[ebnf.md]] § Imports) has four forms:
 
 - **A bare path** `import a::b::c` binds the path's **last segment** `c` as a namespace over
   module `a::b::c`'s **whole** exported surface. A use `c::member` expands to
@@ -144,11 +144,22 @@ An import (`[ "pub" ] "import" <module_path> ( [ "::" "{" … "}" ] | [ "as" <na
   scope**: `x` means `a::b::c::x`, `Y` means `a::b::c::Y`, written bare. A destructured
   member's own casing says which plane it is (`var_name` → value, `type_name` → type), and it
   must name a member the module exports.
+- **A wildcard** `import a::b::c as *` splices `a::b::c`'s **whole exported surface** into the
+  current module **flat** — every member at its own name, no nesting prefix and no enumeration.
+  As a **`pub import … as *`** it reexports the entire surface without re-listing it, so a
+  barrel stays in sync automatically when the target gains a member (the enumeration a
+  destructured `::{ … }` reexport would otherwise have to spell out and keep updated). This is
+  the barrel form for platform dispatch — `pub import …::arm64::darwin as *` makes each of the
+  chosen implementation's members reachable through the barrel directly (`console::print`), not
+  under an implementation-named nesting. (A wildcard forwards the value plane through the rename
+  table; types, which are never mangled, come into scope simply because the target module is
+  loaded.)
 
 So an import is **pure sugar**: resolution can be understood as first *expanding* every
 abbreviation back to a full path (`c::member` / `n::member` → `a::b::c::member`, bare `x` →
-`a::b::c::x`), then resolving full paths against the module graph. Two programs — one with
-`import std::mem` + `mem::alloc`, one writing `std::mem::alloc` inline — flatten identically.
+`a::b::c::x`; a wildcard splices `a::b::c`'s members in flat), then resolving full paths against
+the module graph. Two programs — one with `import std::mem` + `mem::alloc`, one writing
+`std::mem::alloc` inline — flatten identically.
 
 `::` is the **namespace/module traversal** operator and is resolved at compile time. It is
 distinct from `.`, which is the runtime member operator — a record `field_access`
@@ -176,6 +187,10 @@ barrel's surface with the same shape the import gave it:
 
 - A **destructured** reexport contributes **flat members** — `pub import impl::{ x }`
   adds `x` to the surface directly.
+- A **wildcard** reexport contributes **every flat member at once** — `pub import impl as *`
+  adds all of `impl`'s exported members to the surface directly, exactly as a destructured
+  reexport that enumerated them would, but without the enumeration (so a new member in `impl`
+  joins the barrel automatically).
 - A **bare-path** reexport contributes a **nested namespace** — `pub import impl::io`
   adds `io` to the surface as a namespace, whose own members are reached through it (`io::…`).
 
@@ -194,6 +209,11 @@ reexported namespace is reached and traversed `M::io::open`. Two barrel shapes:
 (* file "blah_barrel.cf" *)  pub import ext::blah      (* blah joins the surface, nested *)
 (* file "consumer.cf"    *)  import blah_barrel
                              … blah_barrel::blah::open …   (* traversed through the nesting *)
+
+(* --- wildcard reexport → all flat members --- *)
+(* file "barrel.cf"   *)  pub import impl as *          (* every impl member joins barrel's surface *)
+(* file "consumer.cf" *)  import barrel
+                          … barrel::x … barrel::y …      (* each flat member, no re-listing in barrel *)
 ```
 
 Barrels **chain transitively** with no depth limit; the resolver "jumps through barrels"
@@ -202,9 +222,10 @@ nicer name, followed to the original declaration during flatten — and a reexpo
 resolved by the flatten like any other cycle (§8). A reexport that is itself `pub` extends
 the chain onward.
 
-The two barrel forms are the bare-path reexport (`pub import ext::blah` → nested namespace)
-and the destructured reexport (`pub import impl::{ x }` → flat member). Both are settled
-semantics the keeper implements (§ Reconciliation).
+The barrel forms are the bare-path reexport (`pub import ext::blah` → nested namespace), the
+destructured reexport (`pub import impl::{ x }` → flat member), and the wildcard reexport
+(`pub import impl as *` → all members flat). All are settled semantics the keeper implements
+(§ Reconciliation).
 
 A **non-`pub` import** binds names for use inside the module only and adds nothing to its
 exported surface — an importer of this module cannot reach them. (A full `::` path can still
@@ -330,9 +351,9 @@ import graph into one import-free `.cf`:
    survives; the scaffolding and losing branches dissolve. Only surviving imports/paths are
    resolved further.
 2. **Expand abbreviations to full paths** (§4). Each `import` binds an abbreviation (a
-   last-segment or `as`-renamed namespace, or destructured names); every use of one is
-   rewritten to the full `::` path it stands for, so the rest of resolution works on full
-   paths alone. A path
+   last-segment or `as`-renamed namespace, destructured names, or an `as *` wildcard that
+   splices the target's whole surface flat); every use of one is rewritten to the full `::`
+   path it stands for, so the rest of resolution works on full paths alone. A path
    written out inline needs no expansion — it is already canonical.
 3. **Resolve module paths** (§2) — the module prefix of each full path → a file — and
    **load transitively**, following each loaded module's own paths. The set of modules loaded
@@ -392,9 +413,10 @@ needed (a single `::` path reaches any member). This surface is now **fully impl
 self-hosted compiler `cf`; the legacy `.`/string-import surface has been migrated and dropped:
 
 - **Path & import surface** — DONE: `import a::b::c` (binds the last segment), `import a::b::c
-  as n` (renames the namespace binding), and `import a::b::c::{ x, Y }` (destructure). No string
-  path. The whole corpus and `cf`'s own source were migrated `.`→`::`, and the parser/strip
-  legacy paths (string imports, `.`-namespace mangling) are removed.
+  as n` (renames the namespace binding), `import a::b::c as *` (wildcard — splices the whole
+  surface flat), and `import a::b::c::{ x, Y }` (destructure). No string path. The whole corpus
+  and `cf`'s own source were migrated `.`→`::`, and the parser/strip legacy paths (string
+  imports, `.`-namespace mangling) are removed.
 - **Full-path access / imports optional** — DONE: any `pub` member is reachable by full `::`
   path with no import (`std::comptime::os::target`). The strip pass mangles a full path flat
   (`::`→`_`) to its path-prefix-mangled definition and records the module as a synthetic import

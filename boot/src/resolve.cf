@@ -14,7 +14,7 @@
 # imports.
 
 import io::{ open, read, close, die, o_rdonly }
-import token::{ Token, is_ident, is_lbrace, is_rbrace, is_pathsep }
+import token::{ Token, is_ident, is_lbrace, is_rbrace, is_pathsep, is_star }
 import ast::{ Expr, Stmt, MatchArm, StmtArm, Seg, FieldInit, RecDecl, UnionDecl, UnionMember, TupElem, Param, Func, Import, Program, with_geom }
 import lexer::{ lex }
 import typealias::{ strip_type_aliases! }
@@ -206,16 +206,23 @@ const strip_import_namespaces! = (*[Uint8] src, [Token] toks): StripResult -> {
 				}
 				if !destructured then {
 					# optional `as <name>` renames the alias (`import a::b::os as os2` binds `os2`); the
-					# module prefix `pre` is unchanged — only the local namespace name changes.
+					# module prefix `pre` is unchanged — only the local namespace name changes. `as *`
+					# (wildcard) registers NO alias — the whole surface is spliced flat by the resolver.
+					let Bool wildcard = false
 					if m < Iarch(toks.len) && is_ident(toks[m].kind) && str_eq(tok_text!(src, toks[m]), "as") then {
 						m = m + 1
-						if m < Iarch(toks.len) && is_ident(toks[m].kind) then {
+						if m < Iarch(toks.len) && is_star(toks[m].kind) then {
+							wildcard = true
+							m = m + 1
+						} else if m < Iarch(toks.len) && is_ident(toks[m].kind) then {
 							last = tok_text!(src, toks[m])
 							m = m + 1
 						}
 					}
-					paliases = [...paliases, last]
-					pprefixes = [...pprefixes, pre]
+					if !wildcard then {
+						paliases = [...paliases, last]
+						pprefixes = [...pprefixes, pre]
+					}
 				}
 				i = m
 				continue
@@ -260,10 +267,10 @@ const strip_import_namespaces! = (*[Uint8] src, [Token] toks): StripResult -> {
 				out = [...out, toks[k]]
 				k = k + 1
 			}
-			# emit an optional `as <name>` clause verbatim (a rename binding, not a use to mangle).
-			if k + 1 < Iarch(toks.len) && is_ident(toks[k].kind) && str_eq(tok_text!(src, toks[k]), "as") && is_ident(toks[k + 1].kind) then {
+			# emit an optional `as <name>`/`as *` clause verbatim (a binding, not a use to mangle).
+			if k + 1 < Iarch(toks.len) && is_ident(toks[k].kind) && str_eq(tok_text!(src, toks[k]), "as") && (is_ident(toks[k + 1].kind) || is_star(toks[k + 1].kind)) then {
 				out = [...out, toks[k]] # `as`
-				out = [...out, toks[k + 1]] # name
+				out = [...out, toks[k + 1]] # name or `*`
 				k = k + 2
 			}
 			continue
@@ -394,7 +401,7 @@ const load_module! = (Str path, Str target_os, Str target_arch): Program -> {
 	loop {
 		if di >= Iarch(sr.deps.len) then break
 		const [Str] no_names = []
-		imps = [...imps, Import({ path: sr.deps[di], names: no_names, alias: "" })]
+		imps = [...imps, Import({ path: sr.deps[di], names: no_names, alias: "", wildcard: false })]
 		di = di + 1
 	}
 	return Program({ imports: imps, recs: prog.recs, unions: prog.unions, funcs: prog.funcs, groups: prog.groups })
@@ -587,9 +594,13 @@ const resolve_export! = (Rctx rc, Iarch idx, Str name, Iarch depth): Str -> {
 	let Iarch ii = 0
 	loop {
 		if ii >= Iarch(m.prog.imports.len) then break
+		const Iarch tidx = rc.itargets[idx][ii]
+		# a destructured reexport forwards its named members; a wildcard reexport forwards ANY
+		# member the target exports (module_system §5) — both chase the barrel to the definition.
 		if in_priv(m.prog.imports[ii].names, name) then {
-			const Iarch tidx = rc.itargets[idx][ii]
 			if tidx >= 0 then return resolve_export!(rc, tidx, name, depth + 1)
+		} else if m.prog.imports[ii].wildcard && tidx >= 0 && in_priv(export_names!(rc, tidx, 0), name) then {
+			return resolve_export!(rc, tidx, name, depth + 1)
 		}
 		ii = ii + 1
 	}
@@ -954,6 +965,19 @@ const export_names! = (Rctx rc, Iarch idx, Iarch depth): [Str] -> {
 				if is_lower_initial(m.prog.imports[ii].names[k]) then out = [...out, m.prog.imports[ii].names[k]]
 				k = k + 1
 			}
+		} else if m.prog.imports[ii].wildcard then {
+			# wildcard reexport (`pub import m as *`) → splice the target's WHOLE surface in flat,
+			# same member paths, no nesting prefix (module_system §5).
+			const Iarch tidx = rc.itargets[idx][ii]
+			if tidx >= 0 then {
+				const [Str] sub = export_names!(rc, tidx, depth + 1)
+				let Iarch s = 0
+				loop {
+					if s >= Iarch(sub.len) then break
+					out = [...out, sub[s]]
+					s = s + 1
+				}
+			}
 		} else if Iarch(m.prog.imports[ii].alias.len) > 0 && is_lower_initial(m.prog.imports[ii].alias) then {
 			# namespace reexport → nested members under `<alias>\x01…`
 			const Iarch tidx = rc.itargets[idx][ii]
@@ -994,6 +1018,16 @@ const build_tbl! = (Iarch idx, Rctx rc): [Bind] -> {
 					const Str nm = m.prog.imports[ii].names[k]
 					if is_lower_initial(nm) then tbl = [...tbl, Bind({ from: nm, to: resolve_export!(rc, tidx, nm, 0) })]
 					k = k + 1
+				}
+			} else if m.prog.imports[ii].wildcard then {
+				# wildcard: bind every member of the target surface BARE (flat splice, no prefix) —
+				# a use of the bare member name in this module resolves through to the definition.
+				const [Str] ws = export_names!(rc, tidx, 0)
+				let Iarch w = 0
+				loop {
+					if w >= Iarch(ws.len) then break
+					tbl = [...tbl, Bind({ from: ws[w], to: resolve_export!(rc, tidx, ws[w], 0) })]
+					w = w + 1
 				}
 			} else {
 				# namespace: spread the whole surface under joined keys
