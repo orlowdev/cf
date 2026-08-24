@@ -38,7 +38,8 @@ const kw_at = (*Parser p, Iarch off, Str word): Bool -> {
 # surface so that a variable coincidentally named `mem` (`mem.name`, `mem.payloads`) still
 # parses as an ordinary field access — only `mem.<known-geometry>` is the reserved namespace.
 
-# Is this file privileged to use the raw-memory surface (`mem.raw.*`, `size_of`)? Raw ops are
+# Is this file privileged to use the raw-memory surface (`size_of`; the `std/mem/raw` intrinsic
+# module has its own resolve-level import gate)? Raw ops are
 # legal ONLY inside the std geometry modules (`std/mem/…`): hooks work in raw memory
 # (geometry_lowering §1), while userland keeps the no-raw-pointer discipline. The check is a
 # substring scan because std imports resolve to `lib/std/mem/<geom>.cf` paths.
@@ -912,36 +913,8 @@ const parse_primary! = (*Parser p): Expr -> {
 	if is_ident(peek(p)) then {
 		const Str name = cur_name!(p)
 		p.pos = p.pos + 1
-		# `mem.raw.<op>(args)` — the privileged raw-memory surface (geometry_lowering §1: hooks
-		# work in raw memory). Legal ONLY inside the std geometry modules (`std/mem/…`); everywhere
-		# else it is a LOUD error, not a fallback, so userland can never quietly grow raw pointers.
-		if str_eq(name, "mem") && is_dot(peek(p)) && kw_at(p, 1, "raw") then {
-			if !in_std_mem(p.file) then die("cf: parse: `mem.raw` is privileged to the geometry modules under `std/mem/`\n")
-			p.pos = p.pos + 2
-			if !is_dot(peek(p)) then die("cf: parse: expected `.<op>` after `mem.raw`\n")
-			p.pos = p.pos + 1
-			const Str rop = cur_name!(p)
-			p.pos = p.pos + 1
-			if !is_lparen(peek(p)) then die("cf: parse: expected `(` after `mem.raw.<op>`\n")
-			const [Expr] rargs = parse_args!(p)
-			const [Str] raw_noty = []
-			if str_eq(rop, "addr") then return Expr.Call("cf__raw_addr", raw_noty, rargs, "")
-			if str_eq(rop, "load") then return Expr.Call("cf__raw_load", raw_noty, rargs, "")
-			if str_eq(rop, "store") then return Expr.Call("cf__raw_store", raw_noty, rargs, "")
-			if str_eq(rop, "place") then return Expr.Call("cf__raw_place", raw_noty, rargs, "")
-			if str_eq(rop, "trap") then return Expr.Call("cf__raw_trap", raw_noty, rargs, "")
-			# `mem.raw.alloc(node, sz)` — the floor's runtime-dispatch bump (`$cf_alloc`): the one
-			# raw op that touches a node, for the slow paths whose target node's geometry is
-			# dynamic (an elastic pull allocates from the PARENT node, whoever that is).
-			if str_eq(rop, "alloc") then return Expr.Call("cf__raw_alloc", raw_noty, rargs, "")
-			# `mem.raw.grow(node, target)` — commit more backing pages up to `target` on a kind-0
-			# lane (`$cf_grow`), for the page geometry's commit-growth watermark. The reservation
-			# bound is the caller's to check first; this only advances the committed frontier.
-			if str_eq(rop, "grow") then return Expr.Call("cf__raw_grow", raw_noty, rargs, "")
-			die("cf: parse: unknown `mem.raw` op — one of `addr`, `load`, `store`, `place`, `alloc`, `grow`, `trap`\n")
-		}
 		# `size_of(v)` — the layout intrinsic (an object's byte size, comptime for fixed layouts,
-		# runtime for `$dyn`). Privileged like `mem.raw`: hook bodies bump by object size; userland
+		# runtime for `$dyn`). Privileged like the raw module: hook bodies bump by object size; userland
 		# has no layout introspection, so outside `std/mem/` the name stays an ordinary function.
 		if str_eq(name, "size_of") && is_lparen(peek(p)) && in_std_mem(p.file) then {
 			const [Str] so_noty = []
@@ -1494,12 +1467,6 @@ const parse_stmt! = (*Parser p): Stmt -> {
 	# (`name.field = expr`), an element write (`name[i] = expr`), or a whole-name
 	# reassignment (`name = expr`, a `let` local).
 	if is_ident(peek(p)) then {
-		# `mem.raw.store(…)` for effect — the raw-memory statement (parse_primary gates the
-		# privilege). Recognized here so the field-assignment path below doesn't claim `mem.`.
-		if kw_at(p, 0, "mem") && is_dot(p.toks[p.pos + 1].kind) && kw_at(p, 2, "raw") then {
-			const Expr re = parse_expr!(p)
-			return Stmt.Do(re)
-		}
 		# `name(...)` / `name[T](...)` — a call (possibly generic) evaluated for its effect,
 		# optionally with a trailing `in <geometry>` clause.
 		if is_lparen(p.toks[p.pos + 1].kind) then {

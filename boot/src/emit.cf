@@ -2453,9 +2453,9 @@ const init_agg_type! = (*Emit ctx, [Binding] env, Expr e): Str -> match e {
 	Expr.Record(tn, inits) -> tn,
 	Expr.UnionMk(tn, mem, args) -> tn,
 	Expr.Field(base, f) -> field_agg_type(ctx, env, base, f),
-	# `mem.raw.place(a, v)` yields v's own type at the destination (the identity law), so a
+	# `raw.place(a, v)` yields v's own type at the destination (the identity law), so a
 	# bound place result carries its record type; every other call reads its declared return.
-	Expr.Call(callee, tyargs, args, _) -> if str_eq(callee, "cf__raw_place") || str_eq(callee, "std_mem_raw_place") then init_agg_type!(ctx, env, args[1]) else call_agg_type(ctx, env, callee),
+	Expr.Call(callee, tyargs, args, _) -> if str_eq(callee, "std_mem_raw_place") then init_agg_type!(ctx, env, args[1]) else call_agg_type(ctx, env, callee),
 	Expr.ArrayLit(hs, sn, elems, et) -> "$dyn",
 	Expr.StrLit(bytes) -> "Str",
 	Expr.Interp(id) -> "Str",
@@ -2799,9 +2799,9 @@ const emit_indirect_call! = (*Emit ctx, [Binding] env, Iarch fpidx, [Expr] args)
 	return "%t${rt}"
 }
 
-# The raw-memory intrinsic callees (`mem.raw.*` / `size_of`, parser-gated to `std/mem/…`).
+# The raw-memory intrinsic callees (`raw.*` / `size_of`, parser-gated to `std/mem/…`).
 # They allocate nothing and touch no node, so the walkers treat them like casts, not user calls.
-const is_raw_intrinsic = (Str n): Bool -> str_eq(n, "cf__raw_addr") || str_eq(n, "cf__raw_load") || str_eq(n, "cf__raw_store") || str_eq(n, "cf__raw_place") || str_eq(n, "cf__raw_trap") || str_eq(n, "cf__raw_alloc") || str_eq(n, "cf__raw_grow") || str_eq(n, "cf__size_of") || str_eq(n, "std_mem_raw_addr") || str_eq(n, "std_mem_raw_load") || str_eq(n, "std_mem_raw_store") || str_eq(n, "std_mem_raw_place") || str_eq(n, "std_mem_raw_trap") || str_eq(n, "std_mem_raw_alloc") || str_eq(n, "std_mem_raw_grow")
+const is_raw_intrinsic = (Str n): Bool -> str_eq(n, "cf__size_of") || str_eq(n, "std_mem_raw_addr") || str_eq(n, "std_mem_raw_load") || str_eq(n, "std_mem_raw_store") || str_eq(n, "std_mem_raw_place") || str_eq(n, "std_mem_raw_trap") || str_eq(n, "std_mem_raw_alloc") || str_eq(n, "std_mem_raw_grow")
 
 # The comptime byte size of a value's representation — the raw-intrinsic sizing rule:
 # a record is `fields.len * 8` (emit_record_lit!'s layout), a scalar is one register word.
@@ -2811,7 +2811,7 @@ const raw_obj_size! = (*Emit ctx, [Binding] env, Expr e): Iarch -> {
 	const Str at = init_agg_type!(ctx, env, e)
 	if str_eq(at, "") then return 8
 	const Iarch ri = find_rec(ctx.recs, at)
-	if ri < 0 then die("cf: emit: size_of/mem.raw.place covers flat records and scalar words for now — dynamic layouts arrive with the value-level hook stage\n")
+	if ri < 0 then die("cf: emit: size_of/raw.place covers flat records and scalar words for now — dynamic layouts arrive with the value-level hook stage\n")
 	return Iarch(ctx.recs[ri].fields.len) * 8
 }
 
@@ -2862,18 +2862,6 @@ const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env)
 		write_str(ctx.fd, "\t%t${bfr} =l call $f${cfb}(l %node_0, l ${bfv})\n")
 		return "%t${bfr}"
 	}
-	# the raw-memory intrinsic TOKENS (`std/mem/raw`, honest-intrinsics Stage B): a call
-	# resolving to a declared raw intrinsic canonicalizes onto the phantom-keyed lowering
-	# below — identical QBE; the phantom spellings die when the `mem.raw` sugar does.
-	if callee_is_intrinsic(ctx, callee) then {
-		if str_eq(callee, "std_mem_raw_addr") then return emit_call!(ctx, "cf__raw_addr", args, geom, env)
-		if str_eq(callee, "std_mem_raw_load") then return emit_call!(ctx, "cf__raw_load", args, geom, env)
-		if str_eq(callee, "std_mem_raw_store") then return emit_call!(ctx, "cf__raw_store", args, geom, env)
-		if str_eq(callee, "std_mem_raw_place") then return emit_call!(ctx, "cf__raw_place", args, geom, env)
-		if str_eq(callee, "std_mem_raw_trap") then return emit_call!(ctx, "cf__raw_trap", args, geom, env)
-		if str_eq(callee, "std_mem_raw_alloc") then return emit_call!(ctx, "cf__raw_alloc", args, geom, env)
-		if str_eq(callee, "std_mem_raw_grow") then return emit_call!(ctx, "cf__raw_grow", args, geom, env)
-	}
 	# `mem.page` — the root page node handle (the address of the $cf_page struct)
 	if str_eq(callee, "cf__page") then {
 		const Iarch tp = ctx.next
@@ -2881,32 +2869,32 @@ const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env)
 		write_str(ctx.fd, "\t%t${tp} =l copy $cf_page\n")
 		return "%t${tp}"
 	}
-	# the raw-memory intrinsics (`mem.raw.*` / `size_of`) — the substrate the std geometry
+	# the raw-memory intrinsics (`raw.*` / `size_of`) — the substrate the std geometry
 	# modules are written in (parser-gated to `std/mem/…`). An aggregate's emitted value IS
 	# its base/header address, so `addr` forwards it; `load`/`store` move one register word;
 	# `place` copies a record's representation to the destination and yields the copy.
-	if str_eq(callee, "cf__raw_addr") then return emit_expr!(args[0], ctx, env)
-	if str_eq(callee, "cf__raw_load") then {
+	if str_eq(callee, "std_mem_raw_addr") && callee_is_intrinsic(ctx, callee) then return emit_expr!(args[0], ctx, env)
+	if str_eq(callee, "std_mem_raw_load") && callee_is_intrinsic(ctx, callee) then {
 		const Str la = emit_expr!(args[0], ctx, env)
 		const Iarch tl = ctx.next
 		ctx.next = ctx.next + 1
 		write_str(ctx.fd, "\t%t${tl} =l loadl ${la}\n")
 		return "%t${tl}"
 	}
-	if str_eq(callee, "cf__raw_store") then {
+	if str_eq(callee, "std_mem_raw_store") && callee_is_intrinsic(ctx, callee) then {
 		const Str sa = emit_expr!(args[0], ctx, env)
 		const Str sv = emit_expr!(args[1], ctx, env)
 		write_str(ctx.fd, "\tstorel ${sv}, ${sa}\n")
 		return ""
 	}
-	# `mem.raw.trap()` — a hook's out-of-space exit: the same floor trap the inline bump takes
-	if str_eq(callee, "cf__raw_trap") then {
+	# `raw.trap()` — a hook's out-of-space exit: the same floor trap the inline bump takes
+	if str_eq(callee, "std_mem_raw_trap") && callee_is_intrinsic(ctx, callee) then {
 		write_str(ctx.fd, "\tcall $cf_oom()\n")
 		return ""
 	}
-	# `mem.raw.alloc(node, sz)` — the floor's runtime-dispatch bump, for the slow paths whose
+	# `raw.alloc(node, sz)` — the floor's runtime-dispatch bump, for the slow paths whose
 	# target node's geometry is dynamic (an elastic pull draws from the PARENT node)
-	if str_eq(callee, "cf__raw_alloc") then {
+	if str_eq(callee, "std_mem_raw_alloc") && callee_is_intrinsic(ctx, callee) then {
 		const Str an = emit_expr!(args[0], ctx, env)
 		const Str av = emit_expr!(args[1], ctx, env)
 		const Iarch aw = ctx.next
@@ -2917,9 +2905,9 @@ const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env)
 		write_str(ctx.fd, "\t%t${at} =l call $cf_alloc(l ${an}, w %t${aw})\n")
 		return "%t${at}"
 	}
-	# `mem.raw.grow(node, target)` — commit more backing pages up to `target` (`$cf_grow`), the
+	# `raw.grow(node, target)` — commit more backing pages up to `target` (`$cf_grow`), the
 	# page geometry's kind-0 commit-growth step. The caller checked the reservation bound first.
-	if str_eq(callee, "cf__raw_grow") then {
+	if str_eq(callee, "std_mem_raw_grow") && callee_is_intrinsic(ctx, callee) then {
 		const Str gn = emit_expr!(args[0], ctx, env)
 		const Str gt = emit_expr!(args[1], ctx, env)
 		write_str(ctx.fd, "\tcall $cf_grow(l ${gn}, l ${gt})\n")
@@ -2932,7 +2920,7 @@ const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env)
 	if str_eq(callee, "cf__size_of") then {
 		return "${raw_obj_size!(ctx, env, args[0])}"
 	}
-	if str_eq(callee, "cf__raw_place") then {
+	if str_eq(callee, "std_mem_raw_place") && callee_is_intrinsic(ctx, callee) then {
 		const Str pa = emit_expr!(args[0], ctx, env)
 		const Str pv = emit_expr!(args[1], ctx, env)
 		const Iarch psz = raw_obj_size!(ctx, env, args[1])
