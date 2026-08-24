@@ -15,7 +15,7 @@ import "ast" as { Expr, Stmt, Param, Func, Ty, FieldInit, RecDecl, UnionMember, 
 import "astutil" as { tel_leaf, tel_nest, tel_fn, tel_is_fn }
 
 # The parse cursor: the token stream, the source (for keyword text), a position.
-pub data Parser = { [Token] toks, *[Uint8] src, Iarch pos, Str file, Str target_os, Str target_arch, Bool saw_fb }
+pub data Parser = { [Token] toks, *[Uint8] src, Iarch pos, Str file, Str target_os, Str target_arch, Bool saw_fb, Bool saw_ar }
 
 # The current token's kind.
 const peek = (*Parser p): TokKind -> p.toks[p.pos].kind
@@ -148,7 +148,7 @@ const parse_hole! = (*[Uint8] src, Iarch hstart, Iarch hlen): Expr -> {
 		i = i + 1
 	}
 	const [Token] toks = lex(hbuf, hlen)
-	let Parser hp = Parser({ toks: toks, src: hbuf, pos: 0, file: "", target_os: "Darwin", target_arch: "Arm64", saw_fb: false })
+	let Parser hp = Parser({ toks: toks, src: hbuf, pos: 0, file: "", target_os: "Darwin", target_arch: "Arm64", saw_fb: false, saw_ar: false })
 	const Expr e = parse_expr!(&hp)
 	if !is_eof(peek(&hp)) then die("cf: parse: an interpolation hole must be a single expression\n")
 	return e
@@ -940,7 +940,11 @@ const parse_primary! = (*Parser p): Expr -> {
 			if str_eq(rop, "store") then return Expr.Call("cf__raw_store", raw_noty, rargs, "")
 			if str_eq(rop, "place") then return Expr.Call("cf__raw_place", raw_noty, rargs, "")
 			if str_eq(rop, "trap") then return Expr.Call("cf__raw_trap", raw_noty, rargs, "")
-			die("cf: parse: unknown `mem.raw` op — one of `addr`, `load`, `store`, `place`, `trap`\n")
+			# `mem.raw.alloc(node, sz)` — the floor's runtime-dispatch bump (`$cf_alloc`): the one
+			# raw op that touches a node, for the slow paths whose target node's geometry is
+			# dynamic (an elastic pull allocates from the PARENT node, whoever that is).
+			if str_eq(rop, "alloc") then return Expr.Call("cf__raw_alloc", raw_noty, rargs, "")
+			die("cf: parse: unknown `mem.raw` op — one of `addr`, `load`, `store`, `place`, `alloc`, `trap`\n")
 		}
 		# `size_of(v)` — the layout intrinsic (an object's byte size, comptime for fixed layouts,
 		# runtime for `$dyn`). Privileged like `mem.raw`: hook bodies bump by object size; userland
@@ -977,6 +981,10 @@ const parse_primary! = (*Parser p): Expr -> {
 					p.saw_fb = true
 					return Expr.Call("cf__buffer_of", mem_noty, margs, "")
 				}
+				# using the arena IS the import (like fixed_buffer): parse_program! appends a
+				# synthetic `import "std/mem/arena"` and the constructors resolve to `of__ar`/
+				# `grow__ar` in std source instead of the floor text
+				p.saw_ar = true
 				if is_grow then return Expr.Call("cf__arena_grow", mem_noty, margs, "")
 				return Expr.Call("cf__arena_of", mem_noty, margs, "")
 			}
@@ -2845,6 +2853,14 @@ pub const parse_program! = (*Parser p): Program -> {
 		const [UnionDecl] no_unions = []
 		const [Func] no_funcs = []
 		acc = prog_cat(acc, Program({ imports: fb_im, recs: no_recs, unions: no_unions, funcs: no_funcs, groups: no_recs }))
+	}
+	if p.saw_ar then {
+		const [Str] no_ar_names = []
+		const [Import] ar_im = [Import({ path: "std/mem/arena", names: no_ar_names })]
+		const [RecDecl] no_ar_recs = []
+		const [UnionDecl] no_ar_unions = []
+		const [Func] no_ar_funcs = []
+		acc = prog_cat(acc, Program({ imports: ar_im, recs: no_ar_recs, unions: no_ar_unions, funcs: no_ar_funcs, groups: no_ar_recs }))
 	}
 	return acc
 }

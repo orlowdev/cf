@@ -127,6 +127,22 @@ const check_template_bounds = (*MonoCtx m): Iarch -> {
 	}
 	return 0
 }
+# Does `n` end with `suf`? (No stdlib string helpers below the compiler yet.)
+const ends_with = (Str n, Str suf): Bool -> {
+	if Iarch(n.len) < Iarch(suf.len) then return false
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(suf.len) then break
+		if Iarch(n[Iarch(n.len) - Iarch(suf.len) + i]) != Iarch(suf[i]) then return false
+		i = i + 1
+	}
+	return true
+}
+# A std geometry module's private name (resolve's FIXED mangle tags "fb"/"ar"): generic fns
+# under these tags are the value-hook templates the Materialize pass owns — see the template
+# split in mono_program!.
+const geom_hook_tmpl = (Str n): Bool -> ends_with(n, "__fb") || ends_with(n, "__ar")
+
 # The member NAMES of a union named `uname` (concrete, or a generic template). Members are the
 # post-spread set (resolve.cf's `expand_unions` runs before this pass, so `...Other` is already
 # flattened in). Empty if the name is not a union.
@@ -950,7 +966,11 @@ const mono_func! = (*MonoCtx m, Func f, Str newname, [Str] tvars, [Str] tvals): 
 		let Iarch pi = 0
 		loop {
 			if pi >= Iarch(ps.len) then break
-			venv = [...venv, VarTy({ name: ps[pi].name, ty: param_ty!(ps[pi], all_recs(m), all_unions(m)), mutable: false, esc: false, outer: false, fixed: false, is_ref: false, fsize: 0, elem: ps[pi].elem })]
+			# mirror typecheck's own param env: a `*T` param is a reference (is_ref/outer), so a
+			# type_of! walk over the body accepts forwarded pointers exactly as check_func! does —
+			# with is_ref stuck false, the first program mixing generics (which seed this env) and
+			# `*Record` forwarding dies in the §700 bare-value check during instantiation
+			venv = [...venv, VarTy({ name: ps[pi].name, ty: param_ty!(ps[pi], all_recs(m), all_unions(m)), mutable: false, esc: false, outer: ps[pi].is_ptr, fixed: false, is_ref: ps[pi].is_ptr, fsize: 0, elem: ps[pi].elem })]
 			pi = pi + 1
 		}
 	}
@@ -1355,8 +1375,16 @@ pub const mono_program! = (Program prog): Program -> {
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(prog.funcs.len) then break
-		if Iarch(prog.funcs[i].typarams.len) > 0 then templates = [...templates, prog.funcs[i]]
-		else concrete = [...concrete, prog.funcs[i]]
+		const Bool gen = Iarch(prog.funcs[i].typarams.len) > 0
+		# a std geometry module's generic value hooks (`on_alloc__fb`, `on_ret__ar`, … —
+		# resolve gives those modules FIXED mangle tags, so the suffix identifies them) are
+		# NOT mono templates: nothing in the AST ever calls them (the Materialize pass
+		# instantiates them from the RAW program per placed type), and letting the dormant
+		# trio into `templates` flips `has_gen` — switching every arena-using compile into
+		# the full inference regime (+164MB RSS on a self-compile, measured). They are
+		# dropped here exactly like an uninstantiated template after the pass.
+		if gen && !geom_hook_tmpl(prog.funcs[i].name) then templates = [...templates, prog.funcs[i]]
+		if !gen then concrete = [...concrete, prog.funcs[i]]
 		i = i + 1
 	}
 	let [Str] unames = []

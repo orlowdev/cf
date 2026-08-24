@@ -43,7 +43,7 @@ import "astutil" as { is_spread, spread_inner, is_skip, skip_count, is_nested, n
 # `loop_mark` is the nearest enclosing reset-safe loop's entry mark (same triple shape, or -1 if
 # the nearest loop is not reset-safe) — `break`/`continue` restore it so every path back to the
 # loop head or out of it reclaims the iteration's residue, matching the back-edge rewind.
-data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs, [RecDecl] recs, [UnionDecl] unions, Iarch cur_loop, Iarch cur_slot, Str cur_ret, Iarch reset_mark, Bool fn_ptr, Iarch loop_mark, Bool alloc_stack, Bool in_loop, Iarch stack_used, [RSets] routes, [FnSum] fsums, Iarch cur_fn, Str alloc_node, Str carve_node, Str grow_node, [Str] growok, Iarch mk_env_base, Iarch sur_mark, Iarch loop_sur_mark, [Bool] nodesig, [Bool] fmints, [Str] slits, Bool mat_fb }
+data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs, [RecDecl] recs, [UnionDecl] unions, Iarch cur_loop, Iarch cur_slot, Str cur_ret, Iarch reset_mark, Bool fn_ptr, Iarch loop_mark, Bool alloc_stack, Bool in_loop, Iarch stack_used, [RSets] routes, [FnSum] fsums, Iarch cur_fn, Str alloc_node, Str carve_node, Str grow_node, [Str] growok, Iarch mk_env_base, Iarch sur_mark, Iarch loop_sur_mark, [Bool] nodesig, [Bool] fmints, [Str] slits, Str mat_geom }
 
 # A local/parameter in scope: its interned name, `slot`, its `rec_type` (a record/union
 # type name, `"$dyn"`, `"$ptr"`, or `"Str"` — `""` for a word), and `elem` (a dynamic
@@ -1864,7 +1864,7 @@ const emit_agg_alloc! = (*Emit ctx, Iarch size): Iarch -> {
 	return t
 }
 # Fold-lite hook placement (geometry_lowering §2, the Materialize stage): in a materialized
-# fixed_buffer body, a record construction reserves its bytes through the geometry's own
+# geometry body, a record construction reserves its bytes through the geometry's own
 # `reserve_*` — `reserve_alloc` (residue side) when the routing classification proved the
 # binding never escapes (the same `%res_0` flip the legacy path uses), `reserve_ret`
 # (survivor side, birth placement) otherwise — and the fields are then built DIRECTLY in the
@@ -1872,11 +1872,11 @@ const emit_agg_alloc! = (*Emit ctx, Iarch size): Iarch -> {
 # construction, no relocating copy — the value-level tax is gone. The reserves are the
 # factored bump halves of those hooks, so cursor behavior is placement-identical; a
 # geometry whose hooks are not pure placement (rc, gc) must keep the unfused value calls.
-const emit_fb_reserve! = (*Emit ctx, Iarch size): Iarch -> {
-	let Str hn = "reserve_ret__fb"
-	if str_eq(ctx.alloc_node, "%res_0") then hn = "reserve_alloc__fb"
+const emit_geom_reserve! = (*Emit ctx, Iarch size): Iarch -> {
+	let Str hn = "reserve_ret__${ctx.mat_geom}"
+	if str_eq(ctx.alloc_node, "%res_0") then hn = "reserve_alloc__${ctx.mat_geom}"
 	const Iarch hi = find_func(ctx.funcs, hn)
-	if hi < 0 then die("cf: emit: the fixed_buffer geometry module is missing `${hn}` — stale std source?\n")
+	if hi < 0 then die("cf: emit: the `${ctx.mat_geom}` geometry module is missing `${hn}` — stale std source?\n")
 	const Iarch t = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${t} =l call $f${hi}(l %node_0, l ${size})\n")
@@ -1886,9 +1886,9 @@ const emit_record_lit! = (*Emit ctx, Str type_name, [FieldInit] inits, [Binding]
 	const Iarch ri = find_rec(ctx.recs, type_name)
 	const Iarch nfld = Iarch(ctx.recs[ri].fields.len)
 	const Iarch size = nfld * 8
-	const Bool fused = ctx.mat_fb && !ctx.alloc_stack
+	const Bool fused = !str_eq(ctx.mat_geom, "") && !ctx.alloc_stack
 	let Iarch base = 0 - 1
-	if fused then base = emit_fb_reserve!(ctx, size)
+	if fused then base = emit_geom_reserve!(ctx, size)
 	if !fused then base = emit_agg_alloc!(ctx, size)
 	# a VALUE spread `{ ...src, … }`: fill each field in declaration order — from its override if
 	# present, else COPY the source's word at that offset (typecheck guarantees copied fields are
@@ -2801,7 +2801,7 @@ const emit_indirect_call! = (*Emit ctx, [Binding] env, Iarch fpidx, [Expr] args)
 
 # The raw-memory intrinsic callees (`mem.raw.*` / `size_of`, parser-gated to `std/mem/…`).
 # They allocate nothing and touch no node, so the walkers treat them like casts, not user calls.
-const is_raw_intrinsic = (Str n): Bool -> str_eq(n, "cf__raw_addr") || str_eq(n, "cf__raw_load") || str_eq(n, "cf__raw_store") || str_eq(n, "cf__raw_place") || str_eq(n, "cf__raw_trap") || str_eq(n, "cf__size_of")
+const is_raw_intrinsic = (Str n): Bool -> str_eq(n, "cf__raw_addr") || str_eq(n, "cf__raw_load") || str_eq(n, "cf__raw_store") || str_eq(n, "cf__raw_place") || str_eq(n, "cf__raw_trap") || str_eq(n, "cf__raw_alloc") || str_eq(n, "cf__size_of")
 
 # The comptime byte size of a value's representation — the raw-intrinsic sizing rule:
 # a record is `fields.len * 8` (emit_record_lit!'s layout), a scalar is one register word.
@@ -2827,25 +2827,26 @@ const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env)
 	# (grow) additionally parents its PULLS at `grow_node`: residue-side only under the full
 	# eligibility scan (geom-only uses, ordered against every loop bracket — see the interlock
 	# section), else the pulls draw real storage from the survivor side as before.
+	# The constructor is CF SOURCE now: `of` in lib/std/mem/arena.cf (auto-loaded on use,
+	# mangled `of__ar`), like fixed_buffer's. The old `$cf_arena_of`/`$cf_arena_grow` floor
+	# text stays emitted (dead) until the legacy sweep.
 	if str_eq(callee, "cf__arena_of") then {
 		const Str nv = emit_expr!(args[0], ctx, env)
-		const Iarch tw = ctx.next
-		ctx.next = ctx.next + 1
-		write_str(ctx.fd, "\t%t${tw} =w copy ${nv}\n")
+		const Iarch ofa = find_func(ctx.funcs, "of__ar")
+		if ofa < 0 then die("cf: emit: the arena geometry module did not load — `of__ar` is missing from the program\n")
 		const Iarch tr = ctx.next
 		ctx.next = ctx.next + 1
-		write_str(ctx.fd, "\t%t${tr} =l call $cf_arena_of(l ${ctx.carve_node}, w %t${tw})\n")
+		write_str(ctx.fd, "\t%t${tr} =l call $f${ofa}(l ${ctx.carve_node}, l ${nv})\n")
 		return "%t${tr}"
 	}
 	# `mem.arena.grow(n)` — carve an ELASTIC arena from the ambient node (grows on overflow).
 	if str_eq(callee, "cf__arena_grow") then {
 		const Str gv = emit_expr!(args[0], ctx, env)
-		const Iarch gw = ctx.next
-		ctx.next = ctx.next + 1
-		write_str(ctx.fd, "\t%t${gw} =w copy ${gv}\n")
+		const Iarch gfa = find_func(ctx.funcs, "grow__ar")
+		if gfa < 0 then die("cf: emit: the arena geometry module did not load — `grow__ar` is missing from the program\n")
 		const Iarch gr = ctx.next
 		ctx.next = ctx.next + 1
-		write_str(ctx.fd, "\t%t${gr} =l call $cf_arena_grow(l ${ctx.grow_node}, w %t${gw})\n")
+		write_str(ctx.fd, "\t%t${gr} =l call $f${gfa}(l ${ctx.grow_node}, l ${gv})\n")
 		return "%t${gr}"
 	}
 	# `mem.fixed_buffer.of(buf)` — wrap a caller `[Uint8]` buffer. The arg is its `{data,len,cap}`
@@ -2892,6 +2893,19 @@ const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env)
 	if str_eq(callee, "cf__raw_trap") then {
 		write_str(ctx.fd, "\tcall $cf_oom()\n")
 		return ""
+	}
+	# `mem.raw.alloc(node, sz)` — the floor's runtime-dispatch bump, for the slow paths whose
+	# target node's geometry is dynamic (an elastic pull draws from the PARENT node)
+	if str_eq(callee, "cf__raw_alloc") then {
+		const Str an = emit_expr!(args[0], ctx, env)
+		const Str av = emit_expr!(args[1], ctx, env)
+		const Iarch aw = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${aw} =w copy ${av}\n")
+		const Iarch at = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${at} =l call $cf_alloc(l ${an}, w %t${aw})\n")
+		return "%t${at}"
 	}
 	# `size_of(v)` — the value's byte size. A record is its slot count (8 bytes/field, the
 	# layout emit_record_lit! builds); scalars are one register word. Dynamic layouts (`$dyn`,
@@ -3039,14 +3053,14 @@ const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env)
 	# on_alloc_ret (geometry_lowering §3) is a NO-OP under the duplex node: a returned aggregate
 	# was born on the callee's SURVIVOR side and simply survives — nothing to claim. The hook
 	# stays PLACED here by contract (a gc geometry compacts-on-claim at this exact site); the
-	# bump family's fold is the identity, swept — except in a MATERIALIZED fixed_buffer body,
+	# bump family's fold is the identity, swept — except in a MATERIALIZED geometry body,
 	# where the claim is a real call to the geometry's own instance (whose body is that
 	# identity): the return protocol's caller half, exercised end-to-end.
-	if ctx.mat_fb then {
+	if !str_eq(ctx.mat_geom, "") then {
 		const Str crn = ctx.funcs[fidx].ret_name
 		if find_rec(ctx.recs, crn) >= 0 then {
-			const Iarch ari = find_func(ctx.funcs, "on_alloc_ret__fb$${crn}")
-			if ari < 0 then die("cf: emit: a materialized fixed_buffer body claims a returned `${crn}` but its hook instance is missing — materialize and emit disagree on the claimed types\n")
+			const Iarch ari = find_func(ctx.funcs, "on_alloc_ret__${ctx.mat_geom}$${crn}")
+			if ari < 0 then die("cf: emit: a materialized `${ctx.mat_geom}` body claims a returned `${crn}` but its hook instance is missing — materialize and emit disagree on the claimed types\n")
 			const Iarch rt2 = ctx.next
 			ctx.next = ctx.next + 1
 			write_str(ctx.fd, "\t%t${rt2} =l call $f${ari}(l %node_0, l %t${rt})\n")
@@ -3825,13 +3839,18 @@ const defertap_survived = (): Str -> {
 const emit_mark! = (*Emit ctx, Str nodeop): Iarch -> {
 	# a materialized fixed_buffer body brackets its RESIDUE side through the geometry's own
 	# hooks (geometry_lowering §2): the mark is whatever `on_scope_enter` returns — ONE opaque
-	# word (for a fixed node the residue top alone is sound; only an elastic pull invalidates a
-	# top-only mark, and a fixed buffer never pulls). Survivor-side marks (`%node_0`) stay on
-	# the inline triple — they are the bump family's emit-internal optimization gate, not a
-	# hook of the contract.
-	if ctx.mat_fb && str_eq(nodeop, "%res_0") then {
-		const Iarch ei = find_func(ctx.funcs, "on_scope_enter__fb")
-		if ei < 0 then die("cf: emit: the fixed_buffer geometry module is missing `on_scope_enter` — stale std source?\n")
+	# word (a fixed node's residue top; only an elastic pull invalidates a top-only mark, and
+	# a fixed buffer never pulls). The ARENA keeps the floor triple + cf_reset — its brackets
+	# must serve fixed AND elastic nodes, and a one-word elastic mark that neither leaks per
+	# bracket nor dangles across pulls needs more than a cursor snapshot (a 16-byte mark
+	# record on the chain leaks per `!` CALL in loops without own residue — measured at ~+180MB
+	# on a self-compile). cf_reset IS the bump family's scope fold (§6 degeneracy), so the
+	# contract hooks stay in the module, unplaced until a leak-free mark design lands.
+	# Survivor-side marks (`%node_0`) stay on the inline triple — they are the bump family's
+	# emit-internal optimization gate, not a hook of the contract.
+	if str_eq(ctx.mat_geom, "fb") && str_eq(nodeop, "%res_0") then {
+		const Iarch ei = find_func(ctx.funcs, "on_scope_enter__${ctx.mat_geom}")
+		if ei < 0 then die("cf: emit: the `${ctx.mat_geom}` geometry module is missing `on_scope_enter` — stale std source?\n")
 		const Iarch hk = ctx.next
 		ctx.next = ctx.next + 1
 		write_str(ctx.fd, "\t%t${hk} =l call $f${ei}(l %node_0)\n")
@@ -3859,9 +3878,9 @@ const emit_mark! = (*Emit ctx, Str nodeop): Iarch -> {
 const emit_reset! = (*Emit ctx, Iarch mk, Str nodeop): Iarch -> {
 	# the dual of emit_mark!'s hook branch: a materialized fixed_buffer body closes its
 	# residue scope through `on_scope_exit(node, mark)` — the geometry interprets its own mark
-	if ctx.mat_fb && str_eq(nodeop, "%res_0") then {
-		const Iarch xi = find_func(ctx.funcs, "on_scope_exit__fb")
-		if xi < 0 then die("cf: emit: the fixed_buffer geometry module is missing `on_scope_exit` — stale std source?\n")
+	if str_eq(ctx.mat_geom, "fb") && str_eq(nodeop, "%res_0") then {
+		const Iarch xi = find_func(ctx.funcs, "on_scope_exit__${ctx.mat_geom}")
+		if xi < 0 then die("cf: emit: the `${ctx.mat_geom}` geometry module is missing `on_scope_exit` — stale std source?\n")
 		const Iarch hr = ctx.next
 		ctx.next = ctx.next + 1
 		write_str(ctx.fd, "\t%t${hr} =l call $f${xi}(l %node_0, l %t${mk})\n")
@@ -5878,6 +5897,18 @@ const emit_asm_func! = (Uarch fd, Func fn, Iarch idx): Iarch -> {
 	return 0
 }
 
+# The geometry tag of a materialized copy ("" for everything else): materialize hands emit
+# the copy names and their tags as parallel lists; the tag keys every hook lookup.
+const mat_geom_of = ([Str] names, [Str] geoms, Str n): Str -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(names.len) then break
+		if str_eq(names[i], n) then return geoms[i]
+		i = i + 1
+	}
+	return ""
+}
+
 # Emit the whole program: the arena runtime, every NON-asm function (main exported, the
 # rest internal, each with a fresh temp/label counter), then the freestanding entry floor
 # plus the arena's asm side, and finally the asm-bodied functions naked beside the floor.
@@ -5887,7 +5918,7 @@ const emit_asm_func! = (Uarch fd, Func fn, Iarch idx): Iarch -> {
 # `main()` the `_start` floor does nothing before `bl _main`, so those flow straight
 # through. For `main([Str] args)` it first `bl _cf_build_args` to convert `(argc, argv)`
 # into a real cf `[Str]` header (in x0), which QBE reads as `$main`'s argument.
-pub const emit_program! = (Program prog, RouteInfo ri, [Str] fbs, Uarch qbe_fd, Uarch asm_fd, Str target_os, Iarch root_size): Iarch -> {
+pub const emit_program! = (Program prog, RouteInfo ri, [Str] mat_names, [Str] mat_geoms, Uarch qbe_fd, Uarch asm_fd, Str target_os, Iarch root_size): Iarch -> {
 	# a `Bare` target (bare metal / Wasm) links no OS: the root is a static BSS region (no mmap), and
 	# there is no exit syscall — the floor halts. Every other target keeps the darwin mmap/exit floor.
 	# `root_size` sizes the `Bare` root page (ignored off `Bare`, which mmaps its own reserve).
@@ -5923,7 +5954,7 @@ pub const emit_program! = (Program prog, RouteInfo ri, [Str] fbs, Uarch qbe_fd, 
 		if i >= Iarch(prog.funcs.len) then break
 		# an asm function is emitted into the floor, not through QBE
 		if !prog.funcs[i].is_asm then {
-			let Emit ctx = Emit({ fd: qbe_fd, next: 0, label: 0, funcs: prog.funcs, recs: prog.recs, unions: prog.unions, cur_loop: 0 - 1, cur_slot: 0 - 1, cur_ret: "", reset_mark: 0 - 1, fn_ptr: false, loop_mark: 0 - 1, alloc_stack: false, in_loop: false, stack_used: 0, routes: ri.sets, fsums: ri.sums, cur_fn: 0 - 1, alloc_node: "%node_0", carve_node: "%node_0", grow_node: "%node_0", growok: no_names(), mk_env_base: 0 - 1, sur_mark: 0 - 1, loop_sur_mark: 0 - 1, nodesig: nsig, fmints: mts, slits: slt, mat_fb: has_str(fbs, prog.funcs[i].name) })
+			let Emit ctx = Emit({ fd: qbe_fd, next: 0, label: 0, funcs: prog.funcs, recs: prog.recs, unions: prog.unions, cur_loop: 0 - 1, cur_slot: 0 - 1, cur_ret: "", reset_mark: 0 - 1, fn_ptr: false, loop_mark: 0 - 1, alloc_stack: false, in_loop: false, stack_used: 0, routes: ri.sets, fsums: ri.sums, cur_fn: 0 - 1, alloc_node: "%node_0", carve_node: "%node_0", grow_node: "%node_0", growok: no_names(), mk_env_base: 0 - 1, sur_mark: 0 - 1, loop_sur_mark: 0 - 1, nodesig: nsig, fmints: mts, slits: slt, mat_geom: mat_geom_of(mat_names, mat_geoms, prog.funcs[i].name) })
 			emit_func!(&ctx, prog.funcs[i], i)
 		}
 		i = i + 1

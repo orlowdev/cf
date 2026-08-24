@@ -105,9 +105,9 @@ _f1:
 	svc #0x80
 	ret
 
-.globl _f15
+.globl _f14
 .p2align 2
-_f15:
+_f14:
 	mov x0, x0
 	mov x16, #1
 	svc #0x80
