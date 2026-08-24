@@ -1,0 +1,82 @@
+# std/mem/fixed_arena — the FIXED carved bump geometry (geometry_lowering §5): the `fx` half
+# of the old two-shape `arena`. `mem.arena.of(n)` carves a fixed n-byte arena from the ambient
+# node — one two-ended block whose survivor (kind 4) bumps up and residue (kind 2) bumps down,
+# the cursors meeting at the hard trap. `of(n)` means n bytes TOTAL. Splitting fixed from
+# elastic makes every reserve MONOMORPHIC: the constructor picks the shape at comptime, so the
+# reserves never test `node+32`/`node+80` — the intra-geometry kind branch the merged `arena`
+# module carried is gone. (The node still STORES its kind fields: the shared floor `cf_alloc`
+# and any un-specialized residue still read them; only the fx reserves stop reading them.)
+#
+# Duplex header (96 bytes, shared with the whole bump family):
+#   node+0  survivor { top, committed, limit, parent, kind, chunk }
+#   node+48 residue  { top, committed, limit, parent, kind, chunk }
+#
+# Auto-loaded on any `mem.arena.of` use; everything is called by mangled name (`of__fx`,
+# `reserve_ret__fx`, …); nothing is `pub`. Emit lowers a record construction in a `__fx` body
+# to fold-lite form (reserve + build-in-place, the fused `on_alloc`/`on_ret`). What
+# materialize cannot prove stays on the shared bump floor, coherent via the same duplex layout.
+
+# `mem.arena.of(n)` — carve a FIXED arena from the parent: pull a 96-byte duplex header and an
+# n-byte block from `node` (the parent's survivor — the carve is the must-pin), then lay both
+# subnodes over the one two-ended block. survivor { blk, end, end, node, 4, 0 } bumps up,
+# residue { end, end, 0, node, 2, 0 } bumps down. The block leaks into the parent at teardown.
+const of = (Uarch node, Uarch n): Uarch -> {
+	const Uarch r = (n + 7) % 8
+	const Uarch sz = n + 7 - r
+	const Uarch hdr = mem.raw.alloc(node, 96)
+	const Uarch blk = mem.raw.alloc(node, sz)
+	const Uarch end = blk + sz
+	mem.raw.store(hdr, blk)
+	mem.raw.store(hdr + 8, end)
+	mem.raw.store(hdr + 16, end)
+	mem.raw.store(hdr + 24, node)
+	mem.raw.store(hdr + 32, 4)
+	mem.raw.store(hdr + 40, 0)
+	mem.raw.store(hdr + 48, end)
+	mem.raw.store(hdr + 56, end)
+	mem.raw.store(hdr + 64, 0)
+	mem.raw.store(hdr + 72, node)
+	mem.raw.store(hdr + 80, 2)
+	mem.raw.store(hdr + 88, 0)
+	return hdr
+}
+
+# Reserve `sz` on the SURVIVOR side — `on_ret` minus the copy. A fixed survivor (kind 4) bumps
+# up toward the residue cursor (node+48) and traps on meet. Monomorphic: no kind test.
+const reserve_ret = (Uarch node, Uarch sz): Uarch -> {
+	const Uarch p = mem.raw.load(node)
+	const Uarch nt = p + sz
+	if nt > mem.raw.load(node + 48) then mem.raw.trap()
+	mem.raw.store(node, nt)
+	return p
+}
+
+# Reserve `sz` on the RESIDUE side — `on_alloc` minus the copy. A fixed residue (kind 2) bumps
+# down toward the survivor cursor (node) and traps on meet. Monomorphic: no kind test.
+const reserve_alloc = (Uarch node, Uarch sz): Uarch -> {
+	const Uarch dn = mem.raw.load(node + 48) - sz
+	if dn < mem.raw.load(node) then mem.raw.trap()
+	mem.raw.store(node + 48, dn)
+	return dn
+}
+
+# ── the scope bracket (geometry_lowering §2) ─────────────────────────────────────────────
+# A fixed residue never pulls, so the top alone is a sound mark — save it on enter, restore
+# it on exit. (Emit brackets a `!` frame's residue on the floor triple + cf_reset for now,
+# the §6 scope fold; these bodies are the placed contract for when it moves onto the hook.)
+const on_scope_enter = (Uarch node): Uarch -> mem.raw.load(node + 48)
+
+const on_scope_exit = (Uarch node, Uarch mark): Uarch -> {
+	mem.raw.store(node + 48, mark)
+	return 0
+}
+
+# ── the value hooks (geometry_lowering §1) ───────────────────────────────────────────────
+# Fold-lite fuses these into reserve + build-in-place; the bodies serve the sites a
+# pre-constructed value must genuinely relocate through. on_alloc_ret is the identity — the
+# callee's survivor side outlives the call (the bump family's claim fold).
+const on_alloc = ['T](Uarch node, 'T v): 'T -> mem.raw.place(reserve_alloc(node, size_of(v)), v)
+
+const on_ret = ['T](Uarch node, 'T v): 'T -> mem.raw.place(reserve_ret(node, size_of(v)), v)
+
+const on_alloc_ret = ['T](Uarch node, 'T v): 'T -> v

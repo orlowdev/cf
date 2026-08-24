@@ -7,7 +7,7 @@
 #
 #   1. (fn × geometry) duplication — every function that may allocate and is reachable under
 #      a geometry ambient (an `in b` call whose binding traces to that geometry's
-#      constructor) is copied under the geometry's fixed mangle tag: `f` → `f__fb`/`f__ar`.
+#      constructor) is copied under the geometry's fixed mangle tag: `f` → `f__fb`/`f__fx`/`f__el`.
 #      Emit lowers the copy's allocation sites to the geometry's own hooks instead of the
 #      shared bump floor — in FOLD-LITE form: a construction reserves through
 #      `reserve_alloc`/`reserve_ret` and is built directly in the reservation (the fused
@@ -39,7 +39,7 @@ import "ast" as { Program, Func, Param, Stmt, Expr, FieldInit, Seg, MatchArm, St
 import "routing" as { kids!, stmt_exprs! }
 
 # The pass result: the rewritten program plus the geometry copies — `names[i]` is a copy's
-# function name and `geoms[i]` its tag ("fb"/"ar"); emit consults the pair to pick the hook
+# function name and `geoms[i]` its tag ("fb"/"fx"/"el"/"pg"); emit consults the pair to pick the hook
 # lowering for exactly those bodies.
 pub data Mat = { Program prog, [Str] names, [Str] geoms }
 
@@ -50,13 +50,14 @@ pub data Mat = { Program prog, [Str] names, [Str] geoms }
 data CSite = { Iarch fnidx, Str callee, Str geom, Bool direct }
 
 # A geometry-constructor binding: `const b = mem.arena.grow(n)` in function `fnidx`, with
-# the geometry tag its constructor names ("fb" for `cf__buffer_of`, "ar" for the arenas).
+# the geometry tag its constructor names ("fb" for `cf__buffer_of`, "fx" for `cf__arena_of`,
+# "el" for `cf__arena_grow`).
 data GBind = { Iarch fnidx, Str name, Str geom }
 
 # The rewrite context threaded through the retarget walkers: the per-tag copy-name sets,
 # the owning function's constructor bindings (parallel name/geom arrays), and the tag of
 # the variant being built ("" for an original that holds seed sites).
-data Rt = { [Str] fbn, [Str] arn, [Str] pgn, [Str] bnames, [Str] bgeoms, Str tag }
+data Rt = { [Str] fbn, [Str] fxn, [Str] eln, [Str] pgn, [Str] bnames, [Str] bgeoms, Str tag }
 
 const has_str = ([Str] xs, Str n): Bool -> {
 	let Iarch i = 0
@@ -243,7 +244,7 @@ const cs_body! = ([Stmt] ss, Iarch fi, [CSite] acc): [CSite] -> {
 # ── the geometry-binding sweep (`in x` handles must trace to a visible constructor) ──────
 
 const ctor_geom = (Expr e): Str -> match e {
-	Expr.Call(n, _, _, _) -> if str_eq(n, "cf__buffer_of") then "fb" else if str_eq(n, "cf__arena_of") then "ar" else if str_eq(n, "cf__arena_grow") then "ar" else "",
+	Expr.Call(n, _, _, _) -> if str_eq(n, "cf__buffer_of") then "fb" else if str_eq(n, "cf__arena_of") then "fx" else if str_eq(n, "cf__arena_grow") then "el" else "",
 	_ -> ""
 }
 const gb_stmt = (Stmt s, Iarch fi, [GBind] acc): [GBind] -> {
@@ -362,7 +363,8 @@ const cloret_body = ([Stmt] ss, [Str] acc): [Str] -> {
 
 const tag_has = (Rt rc, Str t, Str n): Bool -> {
 	if str_eq(t, "fb") then return has_str(rc.fbn, n)
-	if str_eq(t, "ar") then return has_str(rc.arn, n)
+	if str_eq(t, "fx") then return has_str(rc.fxn, n)
+	if str_eq(t, "el") then return has_str(rc.eln, n)
 	if str_eq(t, "pg") then return has_str(rc.pgn, n)
 	return false
 }
@@ -572,11 +574,13 @@ const claim_tys! = (Func f, [Func] all, [RecDecl] recs, [Str] acc): [Str] -> {
 	return tys
 }
 
-# The tag axis: index 0 = the legacy original, 1 = "fb", 2 = "ar", 3 = "pg" (the page ambient).
+# The tag axis: index 0 = the legacy original, 1 = "fb", 2 = "fx" (fixed arena), 3 = "el"
+# (elastic arena), 4 = "pg" (the page ambient).
 const tag_idx = (Str t): Iarch -> {
 	if str_eq(t, "fb") then return 1
-	if str_eq(t, "ar") then return 2
-	if str_eq(t, "pg") then return 3
+	if str_eq(t, "fx") then return 2
+	if str_eq(t, "el") then return 3
+	if str_eq(t, "pg") then return 4
 	return 0
 }
 
@@ -642,7 +646,7 @@ const rec_body! = ([Stmt] ss): Bool -> {
 
 pub const materialize_program! = (Program prog, Program raw): Mat -> {
 	const [Str] no_strs = []
-	# fast path: fixed_buffer/arena auto-load on USE (`of__fb`/`of__ar` present), but the PAGE
+	# fast path: fixed_buffer/arena auto-load on USE (`of__fb`/`of__fx`/`grow__el` present), but the PAGE
 	# module is auto-imported into every module (its ambient has no surface keyword), so a
 	# std-source geometry is always in the table. Materialize is worth running only when one is
 	# actually EXERCISED — fb/ar by use, or the page by a record built on main's own ambient
@@ -650,9 +654,10 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 	# the pre-import table byte-for-byte) and pass through with one extra name scan.
 	const Iarch mi = find_fn(prog.funcs, "main")
 	const Bool has_fb = find_fn(prog.funcs, "of__fb") >= 0
-	const Bool has_ar = find_fn(prog.funcs, "of__ar") >= 0
+	const Bool has_fx = find_fn(prog.funcs, "of__fx") >= 0
+	const Bool has_el = find_fn(prog.funcs, "grow__el") >= 0
 	const Bool main_recs = mi >= 0 && rec_body!(prog.funcs[mi].body)
-	if !has_fb && !has_ar && !main_recs then return Mat({ prog: strip_pg(prog), names: no_strs, geoms: no_strs })
+	if !has_fb && !has_fx && !has_el && !main_recs then return Mat({ prog: strip_pg(prog), names: no_strs, geoms: no_strs })
 	if mi < 0 then return Mat({ prog: strip_pg(prog), names: no_strs, geoms: no_strs })
 
 	const Iarch nf = Iarch(prog.funcs.len)
@@ -708,10 +713,10 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 		if !changed then break
 	}
 
-	# the (fn × tag) reachability walk, flattened as `reach[fn*4 + tag]` (tag 0 legacy, 1 fb,
-	# 2 ar, 3 pg). Roots: `main` seeded under the PAGE tag — its own ambient IS the root page,
-	# so its records place through page hooks and its bare allocating calls flow to `__pg`
-	# twins (its `in a` calls still flow to the arena twins by their binding). Plus the fb/ar
+	# the (fn × tag) reachability walk, flattened as `reach[fn*5 + tag]` (tag 0 legacy, 1 fb,
+	# 2 fx, 3 el, 4 pg). Roots: `main` seeded under the PAGE tag — its own ambient IS the root
+	# page, so its records place through page hooks and its bare allocating calls flow to `__pg`
+	# twins (its `in a` calls still flow to the arena twins by their binding). Plus the fb/fx/el
 	# module functions emit references by NAME (constructors, fold-lite reserves, scope hooks),
 	# rooted legacy so their internal calls flow. A site inside a reachable variant flows its
 	# callee to the tag the retarget rewrite will use: ambient direct calls inherit the
@@ -720,20 +725,20 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 	let [Bool] reach = []
 	let Iarch z = 0
 	loop {
-		if z >= nf * 4 then break
+		if z >= nf * 5 then break
 		reach = [...reach, false]
 		z = z + 1
 	}
-	reach[mi * 4 + 3] = true
-	# (the arena's scope hooks are NOT roots: its brackets stay on the floor's cf_reset —
+	reach[mi * 5 + 4] = true
+	# (the arena scope hooks are NOT roots: their brackets stay on the floor's cf_reset —
 	# the §6 scope fold — until a leak-free one-word elastic mark design lands. The page's
 	# reserve_ret is appended by name only when the page is active, below — not an emit root.)
-	const [Str] emit_roots = ["of__fb", "reserve_ret__fb", "reserve_alloc__fb", "on_scope_enter__fb", "on_scope_exit__fb", "of__ar", "grow__ar", "reserve_ret__ar", "reserve_alloc__ar"]
+	const [Str] emit_roots = ["of__fb", "reserve_ret__fb", "reserve_alloc__fb", "on_scope_enter__fb", "on_scope_exit__fb", "of__fx", "reserve_ret__fx", "reserve_alloc__fx", "grow__el", "reserve_ret__el", "reserve_alloc__el"]
 	let Iarch er = 0
 	loop {
 		if er >= Iarch(emit_roots.len) then break
 		const Iarch ei = find_fn(prog.funcs, emit_roots[er])
-		if ei >= 0 then reach[ei * 4] = true
+		if ei >= 0 then reach[ei * 5] = true
 		er = er + 1
 	}
 	let Iarch q = 0
@@ -756,15 +761,15 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 				if sites[q].direct && !str_eq(sites[q].geom, "") then rbt = tag_idx(bind_geom(gbinds, rqo, sites[q].geom))
 				rtg = 0
 				loop {
-					if rtg >= 4 then break
-					if reach[rqo * 4 + rtg] then {
+					if rtg >= 5 then break
+					if reach[rqo * 5 + rtg] then {
 						ru = 0
 						if sites[q].direct && rel then {
 							ru = rtg
 							if !str_eq(sites[q].geom, "") then ru = rbt
 						}
-						if !reach[rcj * 4 + ru] then {
-							reach[rcj * 4 + ru] = true
+						if !reach[rcj * 5 + ru] then {
+							reach[rcj * 5 + ru] = true
 							fchanged = true
 						}
 					}
@@ -780,14 +785,16 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 	# excluded from the pg set — it is emitted in place (the entry symbol must stay `main`),
 	# never a `__pg` copy.
 	let [Str] fbn = []
-	let [Str] arn = []
+	let [Str] fxn = []
+	let [Str] eln = []
 	let [Str] pgn = []
 	let Iarch c = 0
 	loop {
 		if c >= nf then break
-		if reach[c * 4 + 1] then fbn = [...fbn, prog.funcs[c].name]
-		if reach[c * 4 + 2] then arn = [...arn, prog.funcs[c].name]
-		if reach[c * 4 + 3] && c != mi then pgn = [...pgn, prog.funcs[c].name]
+		if reach[c * 5 + 1] then fbn = [...fbn, prog.funcs[c].name]
+		if reach[c * 5 + 2] then fxn = [...fxn, prog.funcs[c].name]
+		if reach[c * 5 + 3] then eln = [...eln, prog.funcs[c].name]
+		if reach[c * 5 + 4] && c != mi then pgn = [...pgn, prog.funcs[c].name]
 		c = c + 1
 	}
 	# the page geometry is ACTIVE when main truly allocates on its own ambient — a bare-reachable
@@ -795,12 +802,12 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 	# compiler, and every arena-grafting program whose main places nothing on the page), main
 	# stays legacy and the dormant page module is stripped, keeping such programs byte-identical.
 	const Bool page_active = Iarch(pgn.len) > 0 || main_recs
-	if Iarch(fbn.len) + Iarch(arn.len) + Iarch(pgn.len) == 0 && !page_active then return Mat({ prog: strip_pg(prog), names: no_strs, geoms: no_strs })
+	if Iarch(fbn.len) + Iarch(fxn.len) + Iarch(eln.len) + Iarch(pgn.len) == 0 && !page_active then return Mat({ prog: strip_pg(prog), names: no_strs, geoms: no_strs })
 
 	# rebuild the table as the reachable variants: legacy originals in table order (bodies with
 	# seed `in b` sites are rewritten so they point at the twins; everything else is SHARED,
 	# not copied), with `main` emitted in place at its own slot (pg when active, else legacy),
-	# then the fb copies, the ar copies, and the pg copies.
+	# then the fb copies, the fx copies, the el copies, and the pg copies.
 	let [Func] out = []
 	let [Str] cnames = []
 	let [Str] cgeoms = []
@@ -811,19 +818,19 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 			const Func fm = prog.funcs[mi]
 			let Str mtag = ""
 			if page_active then mtag = "pg"
-			const Rt rcm = Rt({ fbn: fbn, arn: arn, pgn: pgn, bnames: bind_names_of(gbinds, mi), bgeoms: bind_geoms_of(gbinds, mi), tag: mtag })
+			const Rt rcm = Rt({ fbn: fbn, fxn: fxn, eln: eln, pgn: pgn, bnames: bind_names_of(gbinds, mi), bgeoms: bind_geoms_of(gbinds, mi), tag: mtag })
 			out = [...out, Func({ name: "main", is_pub: fm.is_pub, ret_name: fm.ret_name, ret_elem: fm.ret_elem, params: fm.params, body: rt_stmts(fm.body, rcm), is_asm: false, asm_body: fm.asm_body, is_value: fm.is_value, ret_telems: fm.ret_telems, typarams: fm.typarams, tbounds: fm.tbounds, ret_size: fm.ret_size })]
 			if page_active then {
 				cnames = [...cnames, "main"]
 				cgeoms = [...cgeoms, "pg"]
 			}
 		}
-		if fi != mi && reach[fi * 4] then {
+		if fi != mi && reach[fi * 5] then {
 			const Func f = prog.funcs[fi]
 			const [Str] bn = bind_names_of(gbinds, fi)
 			if f.is_asm || Iarch(bn.len) == 0 then out = [...out, f]
 			if !f.is_asm && Iarch(bn.len) > 0 then {
-				const Rt rc0 = Rt({ fbn: fbn, arn: arn, pgn: pgn, bnames: bn, bgeoms: bind_geoms_of(gbinds, fi), tag: "" })
+				const Rt rc0 = Rt({ fbn: fbn, fxn: fxn, eln: eln, pgn: pgn, bnames: bn, bgeoms: bind_geoms_of(gbinds, fi), tag: "" })
 				out = [...out, Func({ name: f.name, is_pub: f.is_pub, ret_name: f.ret_name, ret_elem: f.ret_elem, params: f.params, body: rt_stmts(f.body, rc0), is_asm: false, asm_body: f.asm_body, is_value: f.is_value, ret_telems: f.ret_telems, typarams: f.typarams, tbounds: f.tbounds, ret_size: f.ret_size })]
 			}
 		}
@@ -832,9 +839,9 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 	let Iarch cf = 0
 	loop {
 		if cf >= nf then break
-		if reach[cf * 4 + 1] then {
+		if reach[cf * 5 + 1] then {
 			const Func f = prog.funcs[cf]
-			const Rt rcf = Rt({ fbn: fbn, arn: arn, pgn: pgn, bnames: bind_names_of(gbinds, cf), bgeoms: bind_geoms_of(gbinds, cf), tag: "fb" })
+			const Rt rcf = Rt({ fbn: fbn, fxn: fxn, eln: eln, pgn: pgn, bnames: bind_names_of(gbinds, cf), bgeoms: bind_geoms_of(gbinds, cf), tag: "fb" })
 			const Str cnf = "${f.name}__fb"
 			out = [...out, Func({ name: cnf, is_pub: false, ret_name: f.ret_name, ret_elem: f.ret_elem, params: f.params, body: rt_stmts(f.body, rcf), is_asm: false, asm_body: f.asm_body, is_value: false, ret_telems: f.ret_telems, typarams: f.typarams, tbounds: f.tbounds, ret_size: f.ret_size })]
 			cnames = [...cnames, cnf]
@@ -842,25 +849,38 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 		}
 		cf = cf + 1
 	}
-	let Iarch ca = 0
+	let Iarch cx = 0
 	loop {
-		if ca >= nf then break
-		if reach[ca * 4 + 2] then {
-			const Func f = prog.funcs[ca]
-			const Rt rca = Rt({ fbn: fbn, arn: arn, pgn: pgn, bnames: bind_names_of(gbinds, ca), bgeoms: bind_geoms_of(gbinds, ca), tag: "ar" })
-			const Str cna = "${f.name}__ar"
-			out = [...out, Func({ name: cna, is_pub: false, ret_name: f.ret_name, ret_elem: f.ret_elem, params: f.params, body: rt_stmts(f.body, rca), is_asm: false, asm_body: f.asm_body, is_value: false, ret_telems: f.ret_telems, typarams: f.typarams, tbounds: f.tbounds, ret_size: f.ret_size })]
-			cnames = [...cnames, cna]
-			cgeoms = [...cgeoms, "ar"]
+		if cx >= nf then break
+		if reach[cx * 5 + 2] then {
+			const Func f = prog.funcs[cx]
+			const Rt rcx = Rt({ fbn: fbn, fxn: fxn, eln: eln, pgn: pgn, bnames: bind_names_of(gbinds, cx), bgeoms: bind_geoms_of(gbinds, cx), tag: "fx" })
+			const Str cnx = "${f.name}__fx"
+			out = [...out, Func({ name: cnx, is_pub: false, ret_name: f.ret_name, ret_elem: f.ret_elem, params: f.params, body: rt_stmts(f.body, rcx), is_asm: false, asm_body: f.asm_body, is_value: false, ret_telems: f.ret_telems, typarams: f.typarams, tbounds: f.tbounds, ret_size: f.ret_size })]
+			cnames = [...cnames, cnx]
+			cgeoms = [...cgeoms, "fx"]
 		}
-		ca = ca + 1
+		cx = cx + 1
+	}
+	let Iarch ce = 0
+	loop {
+		if ce >= nf then break
+		if reach[ce * 5 + 3] then {
+			const Func f = prog.funcs[ce]
+			const Rt rce = Rt({ fbn: fbn, fxn: fxn, eln: eln, pgn: pgn, bnames: bind_names_of(gbinds, ce), bgeoms: bind_geoms_of(gbinds, ce), tag: "el" })
+			const Str cne = "${f.name}__el"
+			out = [...out, Func({ name: cne, is_pub: false, ret_name: f.ret_name, ret_elem: f.ret_elem, params: f.params, body: rt_stmts(f.body, rce), is_asm: false, asm_body: f.asm_body, is_value: false, ret_telems: f.ret_telems, typarams: f.typarams, tbounds: f.tbounds, ret_size: f.ret_size })]
+			cnames = [...cnames, cne]
+			cgeoms = [...cgeoms, "el"]
+		}
+		ce = ce + 1
 	}
 	let Iarch cp = 0
 	loop {
 		if cp >= nf then break
-		if cp != mi && reach[cp * 4 + 3] then {
+		if cp != mi && reach[cp * 5 + 4] then {
 			const Func f = prog.funcs[cp]
-			const Rt rcp = Rt({ fbn: fbn, arn: arn, pgn: pgn, bnames: bind_names_of(gbinds, cp), bgeoms: bind_geoms_of(gbinds, cp), tag: "pg" })
+			const Rt rcp = Rt({ fbn: fbn, fxn: fxn, eln: eln, pgn: pgn, bnames: bind_names_of(gbinds, cp), bgeoms: bind_geoms_of(gbinds, cp), tag: "pg" })
 			const Str cnp = "${f.name}__pg"
 			out = [...out, Func({ name: cnp, is_pub: false, ret_name: f.ret_name, ret_elem: f.ret_elem, params: f.params, body: rt_stmts(f.body, rcp), is_asm: false, asm_body: f.asm_body, is_value: false, ret_telems: f.ret_telems, typarams: f.typarams, tbounds: f.tbounds, ret_size: f.ret_size })]
 			cnames = [...cnames, cnp]
@@ -879,7 +899,8 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 
 	# the per-geometry claim-type sets, swept from the minted copies (and pg-main) by name
 	let [Str] tys_fb = []
-	let [Str] tys_ar = []
+	let [Str] tys_fx = []
+	let [Str] tys_el = []
 	let [Str] tys_pg = []
 	let Iarch ci = 0
 	loop {
@@ -887,7 +908,8 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 		const Iarch oj = find_fn(out, cnames[ci])
 		if oj >= 0 then {
 			if str_eq(cgeoms[ci], "fb") then tys_fb = claim_tys!(out[oj], out, prog.recs, tys_fb)
-			if str_eq(cgeoms[ci], "ar") then tys_ar = claim_tys!(out[oj], out, prog.recs, tys_ar)
+			if str_eq(cgeoms[ci], "fx") then tys_fx = claim_tys!(out[oj], out, prog.recs, tys_fx)
+			if str_eq(cgeoms[ci], "el") then tys_el = claim_tys!(out[oj], out, prog.recs, tys_el)
 			if str_eq(cgeoms[ci], "pg") then tys_pg = claim_tys!(out[oj], out, prog.recs, tys_pg)
 		}
 		ci = ci + 1
@@ -901,12 +923,19 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 		if rec_named(prog.recs, tys_fb[tf]) then rty_fb = [...rty_fb, tys_fb[tf]]
 		tf = tf + 1
 	}
-	let [Str] rty_ar = []
-	let Iarch ta = 0
+	let [Str] rty_fx = []
+	let Iarch tx = 0
 	loop {
-		if ta >= Iarch(tys_ar.len) then break
-		if rec_named(prog.recs, tys_ar[ta]) then rty_ar = [...rty_ar, tys_ar[ta]]
-		ta = ta + 1
+		if tx >= Iarch(tys_fx.len) then break
+		if rec_named(prog.recs, tys_fx[tx]) then rty_fx = [...rty_fx, tys_fx[tx]]
+		tx = tx + 1
+	}
+	let [Str] rty_el = []
+	let Iarch te = 0
+	loop {
+		if te >= Iarch(tys_el.len) then break
+		if rec_named(prog.recs, tys_el[te]) then rty_el = [...rty_el, tys_el[te]]
+		te = te + 1
 	}
 	let [Str] rty_pg = []
 	let Iarch tp = 0
@@ -919,10 +948,12 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 	# mint the per-type claim instances from the PRE-mono templates (the other value hooks
 	# stay uninstantiated: fold-lite renders their placements as fused reserve + build)
 	const Iarch arf = find_fn(raw.funcs, "on_alloc_ret__fb")
-	const Iarch ara = find_fn(raw.funcs, "on_alloc_ret__ar")
+	const Iarch arx = find_fn(raw.funcs, "on_alloc_ret__fx")
+	const Iarch are = find_fn(raw.funcs, "on_alloc_ret__el")
 	const Iarch arp = find_fn(raw.funcs, "on_alloc_ret__pg")
 	if Iarch(rty_fb.len) > 0 && arf < 0 then die("cf: materialize: the fixed_buffer geometry module is missing its value hooks (stale std source?)\n")
-	if Iarch(rty_ar.len) > 0 && ara < 0 then die("cf: materialize: the arena geometry module is missing its value hooks (stale std source?)\n")
+	if Iarch(rty_fx.len) > 0 && arx < 0 then die("cf: materialize: the fixed_arena geometry module is missing its value hooks (stale std source?)\n")
+	if Iarch(rty_el.len) > 0 && are < 0 then die("cf: materialize: the elastic_arena geometry module is missing its value hooks (stale std source?)\n")
 	if Iarch(rty_pg.len) > 0 && arp < 0 then die("cf: materialize: the page geometry module is missing its value hooks (stale std source?)\n")
 	let Iarch hf = 0
 	loop {
@@ -930,11 +961,17 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 		out = [...out, hook_instance(raw.funcs[arf], "on_alloc_ret__fb$${rty_fb[hf]}", rty_fb[hf])]
 		hf = hf + 1
 	}
-	let Iarch ha = 0
+	let Iarch hx = 0
 	loop {
-		if ha >= Iarch(rty_ar.len) then break
-		out = [...out, hook_instance(raw.funcs[ara], "on_alloc_ret__ar$${rty_ar[ha]}", rty_ar[ha])]
-		ha = ha + 1
+		if hx >= Iarch(rty_fx.len) then break
+		out = [...out, hook_instance(raw.funcs[arx], "on_alloc_ret__fx$${rty_fx[hx]}", rty_fx[hx])]
+		hx = hx + 1
+	}
+	let Iarch he = 0
+	loop {
+		if he >= Iarch(rty_el.len) then break
+		out = [...out, hook_instance(raw.funcs[are], "on_alloc_ret__el$${rty_el[he]}", rty_el[he])]
+		he = he + 1
 	}
 	let Iarch hp = 0
 	loop {

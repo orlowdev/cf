@@ -15,7 +15,7 @@ import "ast" as { Expr, Stmt, Param, Func, Ty, FieldInit, RecDecl, UnionMember, 
 import "astutil" as { tel_leaf, tel_nest, tel_fn, tel_is_fn }
 
 # The parse cursor: the token stream, the source (for keyword text), a position.
-pub data Parser = { [Token] toks, *[Uint8] src, Iarch pos, Str file, Str target_os, Str target_arch, Bool saw_fb, Bool saw_ar }
+pub data Parser = { [Token] toks, *[Uint8] src, Iarch pos, Str file, Str target_os, Str target_arch, Bool saw_fb, Bool saw_fx, Bool saw_el }
 
 # The current token's kind.
 const peek = (*Parser p): TokKind -> p.toks[p.pos].kind
@@ -148,7 +148,7 @@ const parse_hole! = (*[Uint8] src, Iarch hstart, Iarch hlen): Expr -> {
 		i = i + 1
 	}
 	const [Token] toks = lex(hbuf, hlen)
-	let Parser hp = Parser({ toks: toks, src: hbuf, pos: 0, file: "", target_os: "Darwin", target_arch: "Arm64", saw_fb: false, saw_ar: false })
+	let Parser hp = Parser({ toks: toks, src: hbuf, pos: 0, file: "", target_os: "Darwin", target_arch: "Arm64", saw_fb: false, saw_fx: false, saw_el: false })
 	const Expr e = parse_expr!(&hp)
 	if !is_eof(peek(&hp)) then die("cf: parse: an interpolation hole must be a single expression\n")
 	return e
@@ -985,11 +985,15 @@ const parse_primary! = (*Parser p): Expr -> {
 					p.saw_fb = true
 					return Expr.Call("cf__buffer_of", mem_noty, margs, "")
 				}
-				# using the arena IS the import (like fixed_buffer): parse_program! appends a
-				# synthetic `import "std/mem/arena"` and the constructors resolve to `of__ar`/
-				# `grow__ar` in std source instead of the floor text
-				p.saw_ar = true
-				if is_grow then return Expr.Call("cf__arena_grow", mem_noty, margs, "")
+				# using the arena IS the import (like fixed_buffer): the FIXED shape (`.of`) and the
+				# ELASTIC shape (`.grow`) are now two monomorphic geometry modules — parse_program!
+				# appends a synthetic `import "std/mem/fixed_arena"` / `import "std/mem/elastic_arena"`
+				# per shape used, and the constructors resolve to `of__fx` / `grow__el` in std source.
+				if is_grow then {
+					p.saw_el = true
+					return Expr.Call("cf__arena_grow", mem_noty, margs, "")
+				}
+				p.saw_fx = true
 				return Expr.Call("cf__arena_of", mem_noty, margs, "")
 			}
 			const [Expr] mem_noargs = []
@@ -2858,13 +2862,21 @@ pub const parse_program! = (*Parser p): Program -> {
 		const [Func] no_funcs = []
 		acc = prog_cat(acc, Program({ imports: fb_im, recs: no_recs, unions: no_unions, funcs: no_funcs, groups: no_recs }))
 	}
-	if p.saw_ar then {
-		const [Str] no_ar_names = []
-		const [Import] ar_im = [Import({ path: "std/mem/arena", names: no_ar_names })]
-		const [RecDecl] no_ar_recs = []
-		const [UnionDecl] no_ar_unions = []
-		const [Func] no_ar_funcs = []
-		acc = prog_cat(acc, Program({ imports: ar_im, recs: no_ar_recs, unions: no_ar_unions, funcs: no_ar_funcs, groups: no_ar_recs }))
+	if p.saw_fx then {
+		const [Str] no_fx_names = []
+		const [Import] fx_im = [Import({ path: "std/mem/fixed_arena", names: no_fx_names })]
+		const [RecDecl] no_fx_recs = []
+		const [UnionDecl] no_fx_unions = []
+		const [Func] no_fx_funcs = []
+		acc = prog_cat(acc, Program({ imports: fx_im, recs: no_fx_recs, unions: no_fx_unions, funcs: no_fx_funcs, groups: no_fx_recs }))
+	}
+	if p.saw_el then {
+		const [Str] no_el_names = []
+		const [Import] el_im = [Import({ path: "std/mem/elastic_arena", names: no_el_names })]
+		const [RecDecl] no_el_recs = []
+		const [UnionDecl] no_el_unions = []
+		const [Func] no_el_funcs = []
+		acc = prog_cat(acc, Program({ imports: el_im, recs: no_el_recs, unions: no_el_unions, funcs: no_el_funcs, groups: no_el_recs }))
 	}
 	# The PAGE geometry is the ambient `main` runs under — implicit, with no surface keyword to
 	# trigger the load (unlike fixed_buffer/arena, which announce themselves by use). So every
