@@ -2221,8 +2221,17 @@ const parse_func! = (*Parser p): Func -> {
 		is_pub = true
 		p.pos = p.pos + 1
 	}
-	if !kw(p, "const") then die("cf: parse: expected `const`\n")
-	p.pos = p.pos + 1
+	# `intrinsic` opens the same signature grammar as `const` but declares ONLY the signature —
+	# the compiler supplies the body (ebnf § Intrinsics). It is the honest form for a compiler
+	# primitive: a real, resolvable declaration rather than a fabricated `cf__*` callee.
+	let Bool is_intrin = false
+	if kw(p, "intrinsic") then {
+		is_intrin = true
+		p.pos = p.pos + 1
+	} else {
+		if !kw(p, "const") then die("cf: parse: expected `const` or `intrinsic`\n")
+		p.pos = p.pos + 1
+	}
 	if !is_ident(peek(p)) then die("cf: parse: expected a function name\n")
 	const Str name = cur_name!(p)
 	p.pos = p.pos + 1
@@ -2243,6 +2252,7 @@ const parse_func! = (*Parser p): Func -> {
 	# a string (`Str`) or a Bool (`Bool`) keeps its type, anything else defaults to the `Int`
 	# word (`ret_name` "") — cf's value consts are literals (flags, sizes, greetings).
 	if !is_lparen(peek(p)) then {
+		if is_intrin then die("cf: parse: an `intrinsic` needs a parameter list — `intrinsic name = (args): Ret`\n")
 		if Iarch(typarams.len) > 0 then die("cf: parse: a top-level value const cannot be generic\n")
 		# a value name is lowercase-initial (uppercase-initial is a TYPE) — ebnf § Identifiers
 		if Iarch(name[0]) >= 65 && Iarch(name[0]) <= 90 then die("cf: parse: a value name must be lowercase — an uppercase-initial name is a type\n")
@@ -2256,13 +2266,20 @@ const parse_func! = (*Parser p): Func -> {
 		}
 		const [Stmt] vbody = [...vempty, Stmt.Return(vexpr)]
 		const [Seg] vnoasm = []
-		return Func({ name: name, is_pub: is_pub, ret_name: vret, ret_elem: "", params: noparams, body: vbody, is_asm: false, asm_body: vnoasm, is_value: true, ret_telems: [], typarams: no_tp, tbounds: no_tp, ret_size: 0 })
+		return Func({ name: name, is_pub: is_pub, ret_name: vret, ret_elem: "", params: noparams, body: vbody, is_asm: false, asm_body: vnoasm, is_value: true, ret_telems: [], typarams: no_tp, tbounds: no_tp, ret_size: 0, is_intrinsic: false })
 	}
 	p.pos = p.pos + 1
 	const [Param] params = parse_params!(p)
 	if !is_rparen(peek(p)) then die("cf: parse: expected `)`\n")
 	p.pos = p.pos + 1
 	const RetSig rs = parse_ret_name!(p)
+	# an `intrinsic` stops at its signature — no `->`, no body; the compiler supplies it.
+	if is_intrin then {
+		if is_arrow(peek(p)) then die("cf: parse: an `intrinsic` declares only a signature and takes no `-> body`\n")
+		const [Stmt] ibody = []
+		const [Seg] inoasm = []
+		return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: ibody, is_asm: false, asm_body: inoasm, is_value: false, ret_telems: rs.telems, typarams: typarams, tbounds: tbounds, ret_size: rs.size, is_intrinsic: true })
+	}
 	if !is_arrow(peek(p)) then die("cf: parse: expected `->`\n")
 	p.pos = p.pos + 1
 	const [Stmt] nobody = []
@@ -2274,15 +2291,15 @@ const parse_func! = (*Parser p): Func -> {
 		if !is_strlit(peek(p)) then die("cf: parse: expected a string after `asm`\n")
 		const [Seg] segs = scan_asm_segs!(p.src, p.toks[p.pos].start, p.toks[p.pos].len)
 		p.pos = p.pos + 1
-		return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: nobody, is_asm: true, asm_body: segs, is_value: false, ret_telems: rs.telems, typarams: typarams, tbounds: tbounds, ret_size: rs.size })
+		return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: nobody, is_asm: true, asm_body: segs, is_value: false, ret_telems: rs.telems, typarams: typarams, tbounds: tbounds, ret_size: rs.size, is_intrinsic: false })
 	}
 	if is_lbrace(peek(p)) then {
 		p.pos = p.pos + 1
 		const [Stmt] body = parse_block!(p)
-		return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: body, is_asm: false, asm_body: noasm, is_value: false, ret_telems: rs.telems, typarams: typarams, tbounds: tbounds, ret_size: rs.size })
+		return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: body, is_asm: false, asm_body: noasm, is_value: false, ret_telems: rs.telems, typarams: typarams, tbounds: tbounds, ret_size: rs.size, is_intrinsic: false })
 	}
 	const [Stmt] one = [...nobody, Stmt.Return(parse_expr!(p))]
-	return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: one, is_asm: false, asm_body: noasm, is_value: false, ret_telems: rs.telems, typarams: typarams, tbounds: tbounds, ret_size: rs.size })
+	return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: one, is_asm: false, asm_body: noasm, is_value: false, ret_telems: rs.telems, typarams: typarams, tbounds: tbounds, ret_size: rs.size, is_intrinsic: false })
 }
 
 # `data Name = { Iarch a, Iarch b }` — a record declaration (Iarch fields only, at
@@ -2841,7 +2858,7 @@ const parse_static! = (*Parser p): Func -> {
 	const [Stmt] body = [Stmt.Return(Expr.Buffer(Expr.Lit(n)))]
 	const [Seg] noasm = []
 	const [Str] no_tp = []
-	return Func({ name: name, is_pub: is_pub, ret_name: "$dyn", ret_elem: "Uint8", params: noparams, body: body, is_asm: false, asm_body: noasm, is_value: true, ret_telems: [], typarams: no_tp, tbounds: no_tp, ret_size: n })
+	return Func({ name: name, is_pub: is_pub, ret_name: "$dyn", ret_elem: "Uint8", params: noparams, body: body, is_asm: false, asm_body: noasm, is_value: true, ret_telems: [], typarams: no_tp, tbounds: no_tp, ret_size: n, is_intrinsic: false })
 }
 
 pub const parse_program! = (*Parser p): Program -> {
