@@ -13,12 +13,12 @@
 # no module declares); no `std/` root, no namespace aliases, no comptime conditional
 # imports.
 
-import "io" as { open, read, close, die, o_rdonly }
-import "token" as { Token, is_ident, is_strlit, is_lbrace, is_rbrace, is_dot, is_pathsep }
-import "ast" as { Expr, Stmt, MatchArm, StmtArm, Seg, FieldInit, RecDecl, UnionDecl, UnionMember, TupElem, Param, Func, Import, Program, with_geom }
-import "lexer" as { lex }
-import "typealias" as { strip_type_aliases! }
-import "parser" as { Parser, parse_program! }
+import io::{ open, read, close, die, o_rdonly }
+import token::{ Token, is_ident, is_strlit, is_lbrace, is_rbrace, is_dot, is_pathsep }
+import ast::{ Expr, Stmt, MatchArm, StmtArm, Seg, FieldInit, RecDecl, UnionDecl, UnionMember, TupElem, Param, Func, Import, Program, with_geom }
+import lexer::{ lex }
+import typealias::{ strip_type_aliases! }
+import parser::{ Parser, parse_program! }
 
 # Byte-wise Str equality (used to dedup already-loaded module paths).
 const str_eq = (Str a, Str b): Bool -> {
@@ -170,38 +170,71 @@ const strip_import_namespaces! = (*[Uint8] src, [Token] toks): StripResult -> {
 	let [Str] dprefixes = []
 	let [Str] paliases = []   # `import a::b::ns`         — enable `ns::member` (`::`) mangling
 	let [Str] pprefixes = []
-	let Bool saw_ps = false   # any `::` at all (full-path uses need pass 2 even with no imports)
+	# `saw_ps` counts a `::` only in a USE position — an import DECLARATION is walked past whole, so a
+	# file with only `::` imports (no alias/full-path uses) still early-returns, keeping pass 2 (which
+	# rebuilds the token stream, O(n²)) off the huge alias-free compiler files.
+	let Bool saw_ps = false
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(toks.len) then break
-		if is_pathsep(toks[i].kind) then saw_ps = true
 		if is_ident(toks[i].kind) && str_eq(tok_text!(src, toks[i]), "import") then {
-			if i + 3 < Iarch(toks.len) && is_strlit(toks[i + 1].kind) && is_ident(toks[i + 2].kind) && str_eq(tok_text!(src, toks[i + 2]), "as") && is_ident(toks[i + 3].kind) then {
-				daliases = [...daliases, tok_text!(src, toks[i + 3])]
-				dprefixes = [...dprefixes, sanitize_prefix!(tok_text!(src, toks[i + 1]))]
-			} else if i + 1 < Iarch(toks.len) && is_ident(toks[i + 1].kind) then {
+			let Iarch m = i + 1
+			if m < Iarch(toks.len) && is_strlit(toks[m].kind) then {
+				const Str spath = tok_text!(src, toks[m])
+				m = m + 1
+				if m < Iarch(toks.len) && is_ident(toks[m].kind) && str_eq(tok_text!(src, toks[m]), "as") then m = m + 1
+				if m < Iarch(toks.len) && is_lbrace(toks[m].kind) then {
+					loop {
+						if m >= Iarch(toks.len) then break
+						if is_rbrace(toks[m].kind) then {
+							m = m + 1
+							break
+						}
+						m = m + 1
+					}
+				} else if m < Iarch(toks.len) && is_ident(toks[m].kind) then {
+					daliases = [...daliases, tok_text!(src, toks[m])]
+					dprefixes = [...dprefixes, sanitize_prefix!(spath)]
+					m = m + 1
+				}
+				i = m
+				continue
+			}
+			if m < Iarch(toks.len) && is_ident(toks[m].kind) then {
 				# `::`-path import: walk segments; the last (if not `::{ … }` destructure) is the alias.
-				let Str pre = tok_text!(src, toks[i + 1])
-				let Str last = tok_text!(src, toks[i + 1])
-				let Iarch j = i + 1
+				let Str pre = tok_text!(src, toks[m])
+				let Str last = tok_text!(src, toks[m])
+				m = m + 1
 				let Bool destructured = false
 				loop {
-					if !(j + 1 < Iarch(toks.len) && is_pathsep(toks[j + 1].kind)) then break
-					if j + 2 < Iarch(toks.len) && is_lbrace(toks[j + 2].kind) then {
+					if !(m < Iarch(toks.len) && is_pathsep(toks[m].kind)) then break
+					m = m + 1 # `::`
+					if m < Iarch(toks.len) && is_lbrace(toks[m].kind) then {
 						destructured = true
+						loop {
+						if m >= Iarch(toks.len) then break
+						if is_rbrace(toks[m].kind) then {
+							m = m + 1
+							break
+						}
+						m = m + 1
+					}
 						break
 					}
-					if !(j + 2 < Iarch(toks.len) && is_ident(toks[j + 2].kind)) then break
-					pre = us_join!(pre, tok_text!(src, toks[j + 2]))
-					last = tok_text!(src, toks[j + 2])
-					j = j + 2
+					if !(m < Iarch(toks.len) && is_ident(toks[m].kind)) then break
+					pre = us_join!(pre, tok_text!(src, toks[m]))
+					last = tok_text!(src, toks[m])
+					m = m + 1
 				}
 				if !destructured then {
 					paliases = [...paliases, last]
 					pprefixes = [...pprefixes, pre]
 				}
+				i = m
+				continue
 			}
 		}
+		if is_pathsep(toks[i].kind) then saw_ps = true
 		i = i + 1
 	}
 	let [Str] nodeps = []
