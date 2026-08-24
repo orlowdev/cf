@@ -9,7 +9,7 @@
 # (`acc = Expr.Add(acc, rhs)`) — one function per precedence level.
 
 import "io" as { die }
-import "token" as { Token, TokKind, is_eof, is_ident, is_intlit, is_strlit, is_lparen, is_rparen, is_lbrace, is_rbrace, is_lbracket, is_rbracket, is_comma, is_colon, is_dot, is_ellipsis, is_eq, is_arrow, is_minus, is_plus, is_star, is_slash, is_percent, is_amp, is_pipe, is_caret, is_tilde, is_bang, is_shl, is_shr, is_eqeq, is_ne, is_lt, is_gt, is_le, is_ge, is_logand, is_logor, is_yield, is_floatlit, is_pipearrow }
+import "token" as { Token, TokKind, is_eof, is_ident, is_intlit, is_strlit, is_lparen, is_rparen, is_lbrace, is_rbrace, is_lbracket, is_rbracket, is_comma, is_colon, is_pathsep, is_dot, is_ellipsis, is_eq, is_arrow, is_minus, is_plus, is_star, is_slash, is_percent, is_amp, is_pipe, is_caret, is_tilde, is_bang, is_shl, is_shr, is_eqeq, is_ne, is_lt, is_gt, is_le, is_ge, is_logand, is_logor, is_yield, is_floatlit, is_pipearrow }
 import "lexer" as { lex }
 import "ast" as { Expr, Stmt, Param, Func, Ty, FieldInit, RecDecl, UnionMember, UnionDecl, MatchArm, StmtArm, Seg, RetSig, TupElem, Import, Program, with_geom }
 import "astutil" as { tel_leaf, tel_nest, tel_fn, tel_is_fn }
@@ -2482,13 +2482,69 @@ const parse_union! = (*Parser p): UnionDecl -> {
 # string literal; the members are a brace-enclosed, comma-separated list of names (value
 # or type). Brick 1 accepts the destructured form only — a namespace alias (`as ns`) is
 # rejected. The path's raw content is interned (module paths carry no escapes).
+# Build a `/`-joined path string from `::`-separated segments (`[std, mem]` → `std/mem`), so a
+# `::`-form import reuses the same internal path representation as the legacy string form.
+const join_segs_slash! = ([Str] segs): Str -> {
+	let [Uint8] v = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(segs.len) then break
+		if i > 0 then v = [...v, 47] # `/`
+		let Iarch j = 0
+		loop {
+			if j >= Iarch(segs[i].len) then break
+			v = [...v, segs[i][j]]
+			j = j + 1
+		}
+		i = i + 1
+	}
+	return Str(v)
+}
+
+# Parse a `::`-path import (module_system §4): `import a::b::c` binds the last segment `c` as a
+# namespace over module `a::b::c`; `import a::b::c::{ x, Y }` destructures. The current ident is
+# the first segment. `::`→`/` for the internal path; no `as`, no string.
+const parse_import_path! = (*Parser p): Import -> {
+	let [Str] segs = [cur_name!(p)]
+	p.pos = p.pos + 1
+	let [Str] names = []
+	let Bool destructured = false
+	loop {
+		if !is_pathsep(peek(p)) then break
+		p.pos = p.pos + 1 # `::`
+		if is_lbrace(peek(p)) then {
+			p.pos = p.pos + 1 # `{`
+			loop {
+				if is_rbrace(peek(p)) then break
+				if !is_ident(peek(p)) then die("cf: parse: expected an imported member name\n")
+				names = [...names, cur_name!(p)]
+				p.pos = p.pos + 1
+				if is_comma(peek(p)) then p.pos = p.pos + 1
+			}
+			p.pos = p.pos + 1 # `}`
+			destructured = true
+			break
+		}
+		if !is_ident(peek(p)) then die("cf: parse: expected a path segment or `{` after `::`\n")
+		segs = [...segs, cur_name!(p)]
+		p.pos = p.pos + 1
+	}
+	const Str path = join_segs_slash!(segs)
+	if destructured then return Import({ path: path, names: names, alias: "" })
+	let [Str] none = []
+	return Import({ path: path, names: none, alias: segs[Iarch(segs.len) - 1] })
+}
+
 const parse_import! = (*Parser p): Import -> {
 	# `pub import` is a reexport (module_system §8): in cf's flat resolver every imported public
 	# decl is already whole-program visible, so a reexport loads and merges exactly like `import`;
 	# the `pub` marks a barrel module's intent to forward the named members to its own importers.
 	if kw(p, "pub") then p.pos = p.pos + 1 # `pub`
 	p.pos = p.pos + 1 # `import`
-	if !is_strlit(peek(p)) then die("cf: parse: expected a module path string after `import`\n")
+	# NEW `::`-path form (module_system §4): `import a::b::c [::{ … }]` — no string, no `as`.
+	if is_ident(peek(p)) then return parse_import_path!(p)
+	# LEGACY string form: `import "path" as ns | { names }` (kept during the `::` migration).
+	if !is_strlit(peek(p)) then die("cf: parse: expected a module path after `import`\n")
 	const Str path = cur_name!(p)
 	p.pos = p.pos + 1
 	if !kw(p, "as") then die("cf: parse: expected `as` after the import path\n")
