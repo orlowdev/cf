@@ -103,16 +103,17 @@ Turns a set of files into **one flat program**:
 
 - **Evaluate comptime conditional imports.** The module-level `if … then … else`
   (see [[ebnf.md]], Modules) is run here, at comptime, against the target triple
-  exposed by the compiler-supplied `"comptime"` module. Exactly one branch's
+  exposed by the compiler-supplied `std::comptime` module. Exactly one branch's
   items survive; the scaffolding dissolves, so a name like `read_file` resolves to
   a single backing.
-- **Resolve module paths** (`"std/mem"` → a file) and **jump through barrels** —
-  a `pub import` reexport is an ordinary import wearing a nicer name, so it is
-  followed to its ultimate target.
+- **Expand import abbreviations to full `::` paths** and **resolve module paths**
+  (`std::mem` → a file), then **traverse namespaces / jump through barrels** — an
+  `import` only abbreviates a path, and a `pub import` reexport is followed to its
+  ultimate target ([[module_system.md]] §4/§5).
 - **Cycles are legal** and resolved by the flatten itself.
 - **Flatten** every module into one file and **mangle module-qualified names**
   path-relative to the main file, so two modules' private `helper`s become
-  distinct, collision-free top-level names (`std/mem/arena` → `std_mem_arena_*`).
+  distinct, collision-free top-level names (`std::mem::arena` → `std_mem_arena_*`).
   Names stay valid `var_name`/`type_name`s and thus readable.
 - **Prune** unused imports and the dissolved conditional-import branches.
 

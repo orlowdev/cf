@@ -585,7 +585,8 @@ call           = [ type_args ] , "(" , [ argument , { "," , argument } ] , ")" ;
 type_args      = "[" , type_arg , { "," , type_arg } , "]" ;                        (* explicit generics: [Int32], [8, Int32] *)
 type_arg       = type | expression ;                                                (* Int32 (type)  |  8 (comptime value) *)
 argument       = expression ;
-primary        = var_name | type_name | member_access | value | block ;   (* type_name/member_access = a construction callee (Point, Maybe.Just); a block is a value too; a grouped/tuple ( … ) is the `tuple` value *)
+qualified_path = path_seg , "::" , path_seg , { "::" , path_seg } ;   (* a ::-path to a module member: std::comptime::os::target — resolved through the module graph, module_system §4 *)
+primary        = qualified_path | var_name | type_name | member_access | value | block ;   (* qualified_path = a namespace-qualified reference (mem::alloc, std::io::print); type_name/member_access = a construction callee (Point, Maybe.Just); a block is a value too; a grouped/tuple ( … ) is the `tuple` value *)
 ```
 
 Each tier binds tighter than the one above and is left-associative, so
@@ -1395,15 +1396,17 @@ must be a named tuple is a semantic check; the grammar admits the pattern on any
 
 ## Imports
 
-An import names a module by a path string and binds what it brings in. The `as`
-target sets both the binding and — by its casing — _what_ is pulled from the
-module:
+An import names a module by a `::`-separated **path** and binds an abbreviation for
+it. There is no path string and no `as`: the segments _are_ the module's location,
+and the binding is the path's **last segment** (or the destructured names). Every
+name an import binds can equally be written as a full `::` path with no import at all
+— an import is pure sugar for omitting a namespace prefix (see Modules;
+[[module_system.md]] §4).
 
 ```ebnf
-import_decl  = [ "pub" ] , "import" , string , "as" , import_alias ;   (* pub import = reexport *)
-import_alias = var_name          (* lowercase namespace: values only — mem.alloc *)
-             | type_name         (* PascalCase namespace: types/data only — Math.Vec *)
-             | import_list ;     (* destructured: named members, values and types *)
+import_decl  = [ "pub" ] , "import" , module_path , [ "::" , import_list ] ;   (* pub import = reexport *)
+module_path  = path_seg , { "::" , path_seg } ;
+path_seg     = var_name | type_name ;
 import_list  = "{" , import_name , { "," , import_name } , [ "," ] , "}" ;
 import_name  = var_name | type_name ;
 ```
@@ -1411,32 +1414,33 @@ import_name  = var_name | type_name ;
 Examples:
 
 ```
-import "std/mem" as mem                    (* mem.* — values only *)
-import "std/math" as Math                   (* Math.* — types/data only *)
-import "std/functor" as { map, Functor }    (* map (value) and Functor (type), direct *)
-pub import "std/mem" as { arena }           (* reexport: arena is importable from this module too *)
+import std::mem                       (* binds `mem` — mem::alloc, mem::Arena, … *)
+import std::mem::{ alloc, Arena }      (* destructures alloc (value) and Arena (type) *)
+pub import std::mem::{ arena }         (* reexport: arena is importable from this module too *)
 ```
 
-Three `as` targets:
+Two forms:
 
-- **`var_name`** (lowercase) binds a namespace exposing the module's **values**
-  only, reached as `mem.alloc`.
-- **`type_name`** (PascalCase) binds a namespace exposing its **types and data**
-  only, reached as `Math.Vec`.
-- **`import_list`** destructures named members straight into scope. It mirrors a
-  `record_pattern` but also admits a `type_name` (`Functor`), since a module
-  member may itself be a type — so it is the one form that pulls in **both**
-  kinds at once.
+- **A bare path** `import a::b::c` binds the **last segment** `c` as an abbreviation
+  for the whole path: a use `c::member` means `a::b::c::member`. `c` is a namespace
+  over the module's entire exported surface — **values and types alike**, told apart
+  by the member's own casing (`mem::alloc`, `mem::Arena`). (There is no casing-keyed
+  value/type split on the binding: a single `::` path reaches any member.)
+- **A destructured path** `import a::b::c::{ x, Y }` pulls the named members straight
+  into scope, so `x` means `a::b::c::x` and `Y` means `a::b::c::Y`. It mirrors a
+  `record_pattern` but also admits a `type_name`, since a member may itself be a type.
 
-A **`pub import`** is a **reexport**: the names it brings in become part of this
-module's own exported surface, so a module that imports _this_ one may import them
-from here. It reads the same as `pub` on a declaration (see Visibility) — the
-imported binding is simply exported onward.
+A **`pub import`** is a **reexport**: the names it brings in join this module's own
+exported surface, so a module that imports _this_ one may reach them through it. It
+reads the same as `pub` on a declaration (see Visibility).
 
-Which names a module actually exports, and the values-vs-types split keyed on the
-alias's case, are semantic rules; the grammar fixes only the surface. The path is
-an ordinary `string`. How imports and declarations compose into a file is the
-`module` rule (see Modules).
+Because an import only abbreviates, it is **never required**: a full path
+`a::b::c::member` resolves the same whether or not `a::b::c` was imported (§ Modules;
+[[module_system.md]] §4). `std::` is the standard-library root; any other leading
+segment is relative to the importing file (§2). `::` is the **namespace/module path**
+separator — distinct from `.`, which stays the runtime `field_access` and the
+union-variant qualifier (`rec.field`, `Maybe.Just`, `Os.Darwin`). Which names a module
+exports is a semantic rule; the grammar fixes only the surface.
 
 ## Visibility
 
@@ -1489,30 +1493,32 @@ A **`comptime_if`** brings **build-time conditional compilation** to the top
 level. It reuses `if … then … else` — position tells it from the value-level
 `if_expr`, since a module item is never an expression — but it is evaluated at
 **comptime**, during import resolution, against comptime-known values, chiefly the
-compiler-supplied `"comptime"` module (`os`, `arch`, and the target). Exactly one
+compiler-supplied `std::comptime` module (`os`, `arch`, and the target). Exactly one
 branch's items survive into the module; the losing branch and the `if` scaffolding
 itself dissolve. It **surrounds** items — imports never branch internally — so it
 is how a single name resolves to a different backing per target:
 
 ```
-import "comptime" as { os, arch, Os, Arch }
+import std::comptime::{ os, arch, Os, Arch }
 
-if os.target == Os.Darwin then
-  if arch.target == Arch.Arm64 then import "sys/darwin/arm64" as { read_file }
-  else import "sys/darwin/amd64" as { read_file }
-else import "sys/linux" as { read_file }
+if os::target == Os.Darwin then
+  if arch::target == Arch.Arm64 then import sys::darwin::arm64::{ read_file }
+  else import sys::darwin::amd64::{ read_file }
+else import sys::linux::{ read_file }
 ```
 
 Exactly one `read_file` reaches the rest of the module and the selection leaves no
 trace. `else if` chains for free (a `module_branch` may itself be a `comptime_if`),
 and a branch may brace a group of items. That the condition must be
-comptime-evaluable, and the `"comptime"` module's full surface, are semantic
+comptime-evaluable, and the `std::comptime` module's full surface, are semantic
 concerns — the latter its own deferred spec; the grammar only admits the form.
+(`os::target` reaches the value member through the `::` namespace path; `Os.Darwin`
+is a union-variant qualifier and stays on `.`.)
 
-Another module is named by a **path string with no `.cf` extension**
-(`"std/mem"`), resolved to a file by the toolchain — a semantic concern. A
-module's exported surface is its `pub` declarations plus its `pub import`
-reexports; everything else is private to the file.
+Another module is named by a **`::`-path with no `.cf` extension** (`std::mem`),
+resolved to a file by the toolchain — a semantic concern. A module's exported surface
+is its `pub` declarations plus its `pub import` reexports; everything else is private
+to the file.
 
 ## Entry Point
 
