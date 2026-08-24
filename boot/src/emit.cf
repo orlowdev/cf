@@ -696,11 +696,11 @@ const loop_residue_safe = (*Emit ctx, [Binding] env, Str loopvar, [Stmt] body): 
 #      0/2/4 trap at capacity), so it needs only gates 1–2.
 
 const is_grow_leaf = (Expr e): Bool -> match e {
-	Expr.Call(c, _, _, _) -> str_eq(c, "cf__arena_grow"),
+	Expr.Call(c, _, _, _) -> str_eq(c, "cf__arena_grow") || str_eq(c, "of__el"),
 	_ -> false
 }
 const is_carve_leaf = (Expr e): Bool -> match e {
-	Expr.Call(c, _, _, _) -> str_eq(c, "cf__arena_of") || str_eq(c, "cf__arena_grow"),
+	Expr.Call(c, _, _, _) -> str_eq(c, "cf__arena_of") || str_eq(c, "cf__arena_grow") || str_eq(c, "of__fx") || str_eq(c, "of__el"),
 	_ -> false
 }
 # A carve as the binding's direct value — the intrinsic call itself, possibly under numeric
@@ -2815,6 +2815,15 @@ const raw_obj_size! = (*Emit ctx, [Binding] env, Expr e): Iarch -> {
 	return Iarch(ctx.recs[ri].fields.len) * 8
 }
 
+# Does this callee resolve to a declared `intrinsic` (a bodyless token whose behavior the
+# compiler supplies at the call site)? Gates the geometry-constructor lowerings above the
+# ordinary dispatch — a same-named real function is never intercepted.
+const callee_is_intrinsic = (*Emit ctx, Str n): Bool -> {
+	const Iarch i = find_func(ctx.funcs, n)
+	if i < 0 then return false
+	return ctx.funcs[i].is_intrinsic
+}
+
 const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env): Str -> {
 	# `mem.arena.of(n)` — carve a fixed arena from the ambient node and yield its handle. The
 	# residue-carve tightening: when the handle binding provably never escapes (the routing
@@ -2865,6 +2874,43 @@ const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env)
 		ctx.next = ctx.next + 1
 		write_str(ctx.fd, "\t%t${br} =l call $f${ofi}(l %node_0, l ${bv})\n")
 		return "%t${br}"
+	}
+	# The geometry constructor INTRINSICS (honest-intrinsics Stage C): each geometry module
+	# declares `pub intrinsic of = (<user args>): Uarch` — a bodyless token, not a function. The
+	# user imports the module and calls `of(n)` with only the args THEY provide; the compiler
+	# supplies the whole behavior here at the call site, spending the ambient node it already
+	# holds (the same node it threads into every node-carrying call as hidden arg 0) on the
+	# module's private placed carve. Nothing is ever emitted for `of` itself. Which node: a
+	# fixed carve draws from `carve_node` (the residue-carve tightening applies), a growing
+	# carve parents its pulls at `grow_node`, and a buffer wrap carves nothing (`%node_0`).
+	# Guarded on `is_intrinsic` so a same-named REAL function (the pre-flip module shape) is
+	# never intercepted — the case is dormant until the std modules declare the intrinsics.
+	if str_eq(callee, "of__fx") && callee_is_intrinsic(ctx, callee) then {
+		const Str nv = emit_expr!(args[0], ctx, env)
+		const Iarch cfx = find_func(ctx.funcs, "carve__fx")
+		if cfx < 0 then die("cf: emit: the fixed_arena geometry module is missing its placed carve `carve__fx` — stale std source?\n")
+		const Iarch tr = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${tr} =l call $f${cfx}(l ${ctx.carve_node}, l ${nv})\n")
+		return "%t${tr}"
+	}
+	if str_eq(callee, "of__el") && callee_is_intrinsic(ctx, callee) then {
+		const Str gv = emit_expr!(args[0], ctx, env)
+		const Iarch cel = find_func(ctx.funcs, "carve__el")
+		if cel < 0 then die("cf: emit: the growing_arena geometry module is missing its placed carve `carve__el` — stale std source?\n")
+		const Iarch gr = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${gr} =l call $f${cel}(l ${ctx.grow_node}, l ${gv})\n")
+		return "%t${gr}"
+	}
+	if str_eq(callee, "of__fb") && callee_is_intrinsic(ctx, callee) then {
+		const Str bfv = emit_expr!(args[0], ctx, env)
+		const Iarch cfb = find_func(ctx.funcs, "carve__fb")
+		if cfb < 0 then die("cf: emit: the fixed_buffer geometry module is missing its placed carve `carve__fb` — stale std source?\n")
+		const Iarch bfr = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${bfr} =l call $f${cfb}(l %node_0, l ${bfv})\n")
+		return "%t${bfr}"
 	}
 	# `mem.page` — the root page node handle (the address of the $cf_page struct)
 	if str_eq(callee, "cf__page") then {
@@ -4430,7 +4476,7 @@ const nfp_alloc_expr! = ([UnionDecl] unions, Bool stackm, Expr e): Bool -> {
 		# a string-literal MATCH materializes each pattern as a runtime Str for cf_str_eq
 		Expr.Match(_, arms) -> nfp_marms_strpat(arms),
 		Expr.UnionMk(u, _, _) -> union_is_boxed(unions, u),
-		Expr.Call(n, _, _, _) -> str_eq(n, "Str") || str_eq(n, "cf__arena_of") || str_eq(n, "cf__arena_grow") || str_eq(n, "cf__buffer_of"),
+		Expr.Call(n, _, _, _) -> str_eq(n, "Str") || str_eq(n, "cf__arena_of") || str_eq(n, "cf__arena_grow") || str_eq(n, "cf__buffer_of") || str_eq(n, "of__fx") || str_eq(n, "of__el") || str_eq(n, "of__fb"),
 		_ -> false
 	}
 	if here then return true
@@ -4762,7 +4808,7 @@ const emit_slits! = (Uarch fd, [Str] tbl): Iarch -> {
 # dangle.
 const mint_expr! = (Expr e): Bool -> {
 	const Bool here = match e {
-		Expr.Call(n, _, _, g) -> str_eq(g, "") && (str_eq(n, "cf__arena_of") || str_eq(n, "cf__arena_grow") || str_eq(n, "cf__buffer_of")),
+		Expr.Call(n, _, _, g) -> str_eq(g, "") && (str_eq(n, "cf__arena_of") || str_eq(n, "cf__arena_grow") || str_eq(n, "cf__buffer_of") || str_eq(n, "of__fx") || str_eq(n, "of__el") || str_eq(n, "of__fb")),
 		_ -> false
 	}
 	if here then return true
