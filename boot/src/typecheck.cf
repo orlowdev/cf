@@ -1081,18 +1081,26 @@ const arm_stmts_write_name = ([StmtArm] arms, Str pn): Bool -> {
 	return false
 }
 const func_writes_ptr_param = (Func fn, Iarch pidx): Bool -> stmts_write_name(fn.body, fn.params[pidx].name)
+# Does this callee resolve to a declared `intrinsic`? The geometry-constructor typing below is
+# gated on it so an ordinary function that happens to share the mangled name is never intercepted.
+const callee_is_intrinsic_tc = (Ctx ctx, Str n): Bool -> {
+	const Iarch i = find_func(ctx.funcs, n)
+	if i < 0 then return false
+	return ctx.funcs[i].is_intrinsic
+}
 const call_type! = (Str callee, [Str] tyargs, [Expr] args, [VarTy] env, Ctx ctx): Ty -> {
-	# the geometry intrinsics (`mem.arena.of(n)`, `mem.page`) yield an opaque node HANDLE — a
-	# pointer-sized value the compiler threads but never inspects; typed as the register word.
-	if str_eq(callee, "cf__arena_of") then return Ty.TInt
-	if str_eq(callee, "cf__arena_grow") then return Ty.TInt
+	# the geometry constructor intrinsics (`fixed_arena.of(n)` / `growing_arena.of(n)`, and the
+	# `mem.page` handle) yield an opaque node HANDLE — a pointer-sized value the compiler threads
+	# but never inspects; typed as the register word.
+	if str_eq(callee, "of__fx") && callee_is_intrinsic_tc(ctx, callee) then return Ty.TInt
+	if str_eq(callee, "of__el") && callee_is_intrinsic_tc(ctx, callee) then return Ty.TInt
 	if str_eq(callee, "cf__page") then return Ty.TInt
-	# `mem.fixed_buffer.of(buf)` wraps a `[Uint8]` buffer (which carries its own `{data,len,cap}`) as a
+	# `fixed_buffer.of(buf)` wraps a `[Uint8]` buffer (which carries its own `{data,len,cap}`) as a
 	# bounded geometry — yields an opaque node handle like the arenas. The buffer supplies the storage
 	# byte-for-byte, so its element must be `Uint8`.
-	if str_eq(callee, "cf__buffer_of") then {
-		if Iarch(args.len) != 1 then die("cf: type: mem.fixed_buffer.of expects one `[Uint8]` buffer argument\n")
-		if !str_eq(dyn_of(type_of!(args[0], env, ctx)), "Uint8") then die("cf: type: mem.fixed_buffer.of expects a `[Uint8]` buffer\n")
+	if str_eq(callee, "of__fb") && callee_is_intrinsic_tc(ctx, callee) then {
+		if Iarch(args.len) != 1 then die("cf: type: fixed_buffer.of expects one `[Uint8]` buffer argument\n")
+		if !str_eq(dyn_of(type_of!(args[0], env, ctx)), "Uint8") then die("cf: type: fixed_buffer.of expects a `[Uint8]` buffer\n")
 		return Ty.TInt
 	}
 	# the raw-memory intrinsics (`mem.raw.*`, `size_of`) — parser-gated to the std geometry
@@ -2443,7 +2451,7 @@ const ret_resides = (Str callee, Ctx ctx): Bool -> {
 # frame-local buffer and dangles once the frame pops. A SCALAR return from `f() in fb` copies out by
 # value and is safe (so `span!(n) in fb` returning an `Iarch` is fine).
 const call_carries_local = (Str callee, [Expr] args, Str g, [VarTy] env, Ctx ctx): Bool -> {
-	if (str_eq(callee, "cf__buffer_of") || str_eq(callee, "of__fb")) && exprs_carry_local(args, env, ctx) then return true
+	if str_eq(callee, "of__fb") && exprs_carry_local(args, env, ctx) then return true
 	if !str_eq(g, "") && name_esc(env, g) && ret_resides(callee, ctx) then return true
 	return false
 }

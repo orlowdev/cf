@@ -696,11 +696,11 @@ const loop_residue_safe = (*Emit ctx, [Binding] env, Str loopvar, [Stmt] body): 
 #      0/2/4 trap at capacity), so it needs only gates 1–2.
 
 const is_grow_leaf = (Expr e): Bool -> match e {
-	Expr.Call(c, _, _, _) -> str_eq(c, "cf__arena_grow") || str_eq(c, "of__el"),
+	Expr.Call(c, _, _, _) -> str_eq(c, "of__el"),
 	_ -> false
 }
 const is_carve_leaf = (Expr e): Bool -> match e {
-	Expr.Call(c, _, _, _) -> str_eq(c, "cf__arena_of") || str_eq(c, "cf__arena_grow") || str_eq(c, "of__fx") || str_eq(c, "of__el"),
+	Expr.Call(c, _, _, _) -> str_eq(c, "of__fx") || str_eq(c, "of__el"),
 	_ -> false
 }
 # A carve as the binding's direct value — the intrinsic call itself, possibly under numeric
@@ -2825,56 +2825,6 @@ const callee_is_intrinsic = (*Emit ctx, Str n): Bool -> {
 }
 
 const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env): Str -> {
-	# `mem.arena.of(n)` — carve a fixed arena from the ambient node and yield its handle. The
-	# residue-carve tightening: when the handle binding provably never escapes (the routing
-	# classification, geom-channel rules included — memory_model §8) and the interlock gates
-	# hold (the carve is the binding's direct value, and it cannot cross an iteration bracket),
-	# the carve draws from the frame's RESIDUE side instead of the survivor side, so the whole
-	# child dies with the frame or iteration bracket instead of leaking until node death.
-	# `carve_node` is set by the binding site; a fixed child never dereferences its parent field
-	# (kind 0/2/4 cannot pull), so pointing it at a residue subnode is inert. An ELASTIC carve
-	# (grow) additionally parents its PULLS at `grow_node`: residue-side only under the full
-	# eligibility scan (geom-only uses, ordered against every loop bracket — see the interlock
-	# section), else the pulls draw real storage from the survivor side as before.
-	# The constructors are CF SOURCE now, split by shape into two monomorphic geometry modules
-	# under lib/std/mem/arena/ — each names its constructor `of`: `of__fx` (fixed_arena.cf, the
-	# `.of` surface) and `of__el` (elastic_arena.cf, the `.grow` surface), auto-loaded on use.
-	# The old `$cf_arena_of`/`$cf_arena_grow` floor text was swept (Stage 4) — every
-	# `mem.arena.of`/`.grow` site retargets here.
-	if str_eq(callee, "cf__arena_of") then {
-		const Str nv = emit_expr!(args[0], ctx, env)
-		const Iarch ofa = find_func(ctx.funcs, "of__fx")
-		if ofa < 0 then die("cf: emit: the fixed_arena geometry module did not load — `of__fx` is missing from the program\n")
-		const Iarch tr = ctx.next
-		ctx.next = ctx.next + 1
-		write_str(ctx.fd, "\t%t${tr} =l call $f${ofa}(l ${ctx.carve_node}, l ${nv})\n")
-		return "%t${tr}"
-	}
-	# `mem.arena.grow(n)` — carve an ELASTIC arena from the ambient node (grows on overflow).
-	if str_eq(callee, "cf__arena_grow") then {
-		const Str gv = emit_expr!(args[0], ctx, env)
-		const Iarch gfa = find_func(ctx.funcs, "of__el")
-		if gfa < 0 then die("cf: emit: the elastic_arena geometry module did not load — `of__el` is missing from the program\n")
-		const Iarch gr = ctx.next
-		ctx.next = ctx.next + 1
-		write_str(ctx.fd, "\t%t${gr} =l call $f${gfa}(l ${ctx.grow_node}, l ${gv})\n")
-		return "%t${gr}"
-	}
-	# `mem.fixed_buffer.of(buf)` — wrap a caller `[Uint8]` buffer. The arg is its `{data,len,cap}`
-	# header; `of` reads data/len and lays a fixed node over the buffer's own bytes (no carve).
-	# The constructor is CF SOURCE: `of` in lib/std/mem/fixed_buffer.cf (auto-loaded on use,
-	# mangled `of__fb`) — the first geometry living in std rather than the QBE floor. The old
-	# `$cf_buffer_of` floor text has been swept (Stage 4) — every `mem.fixed_buffer.of` site
-	# retargets here.
-	if str_eq(callee, "cf__buffer_of") then {
-		const Str bv = emit_expr!(args[0], ctx, env)
-		const Iarch ofi = find_func(ctx.funcs, "of__fb")
-		if ofi < 0 then die("cf: emit: the fixed_buffer geometry module did not load — `of__fb` is missing from the program\n")
-		const Iarch br = ctx.next
-		ctx.next = ctx.next + 1
-		write_str(ctx.fd, "\t%t${br} =l call $f${ofi}(l %node_0, l ${bv})\n")
-		return "%t${br}"
-	}
 	# The geometry constructor INTRINSICS (honest-intrinsics Stage C): each geometry module
 	# declares `pub intrinsic of = (<user args>): Uarch` — a bodyless token, not a function. The
 	# user imports the module and calls `of(n)` with only the args THEY provide; the compiler
@@ -4476,7 +4426,7 @@ const nfp_alloc_expr! = ([UnionDecl] unions, Bool stackm, Expr e): Bool -> {
 		# a string-literal MATCH materializes each pattern as a runtime Str for cf_str_eq
 		Expr.Match(_, arms) -> nfp_marms_strpat(arms),
 		Expr.UnionMk(u, _, _) -> union_is_boxed(unions, u),
-		Expr.Call(n, _, _, _) -> str_eq(n, "Str") || str_eq(n, "cf__arena_of") || str_eq(n, "cf__arena_grow") || str_eq(n, "cf__buffer_of") || str_eq(n, "of__fx") || str_eq(n, "of__el") || str_eq(n, "of__fb"),
+		Expr.Call(n, _, _, _) -> str_eq(n, "Str") || str_eq(n, "of__fx") || str_eq(n, "of__el") || str_eq(n, "of__fb"),
 		_ -> false
 	}
 	if here then return true
@@ -4567,7 +4517,7 @@ const nfp_alloc_body! = ([UnionDecl] unions, [Stmt] ss): Bool -> {
 # an intrinsic — a fn-value binding), or hold an unlowered DeferTap? Conservative ⇒ needs.
 const nfp_ind_expr! = ([Func] funcs, Expr e): Bool -> {
 	const Bool here = match e {
-		Expr.Call(n, _, _, _) -> find_func(funcs, n) < 0 && !is_cast_type(n) && !str_eq(n, "Str") && !str_eq(n, "cf__arena_of") && !str_eq(n, "cf__arena_grow") && !str_eq(n, "cf__buffer_of") && !str_eq(n, "cf__page") && !is_raw_intrinsic(n),
+		Expr.Call(n, _, _, _) -> find_func(funcs, n) < 0 && !is_cast_type(n) && !str_eq(n, "Str") && !str_eq(n, "cf__page") && !is_raw_intrinsic(n),
 		Expr.DeferTap(_, _) -> true,
 		_ -> false
 	}
@@ -4808,7 +4758,7 @@ const emit_slits! = (Uarch fd, [Str] tbl): Iarch -> {
 # dangle.
 const mint_expr! = (Expr e): Bool -> {
 	const Bool here = match e {
-		Expr.Call(n, _, _, g) -> str_eq(g, "") && (str_eq(n, "cf__arena_of") || str_eq(n, "cf__arena_grow") || str_eq(n, "cf__buffer_of") || str_eq(n, "of__fx") || str_eq(n, "of__el") || str_eq(n, "of__fb")),
+		Expr.Call(n, _, _, g) -> str_eq(g, "") && (str_eq(n, "of__fx") || str_eq(n, "of__el") || str_eq(n, "of__fb")),
 		_ -> false
 	}
 	if here then return true

@@ -37,20 +37,6 @@ const kw_at = (*Parser p, Iarch off, Str word): Bool -> {
 # Is the token `off` ahead one of the standard geometry names? Guards the `mem.<geometry>`
 # surface so that a variable coincidentally named `mem` (`mem.name`, `mem.payloads`) still
 # parses as an ordinary field access — only `mem.<known-geometry>` is the reserved namespace.
-const is_geometry_kw_at = (*Parser p, Iarch off): Bool -> {
-	if kw_at(p, off, "page") then return true
-	if kw_at(p, off, "arena") then return true
-	if kw_at(p, off, "heap") then return true
-	if kw_at(p, off, "pool") then return true
-	if kw_at(p, off, "slab") then return true
-	if kw_at(p, off, "gc") then return true
-	if kw_at(p, off, "rc") then return true
-	if kw_at(p, off, "fixed_buffer") then return true
-	if kw_at(p, off, "ring") then return true
-	if kw_at(p, off, "buddy") then return true
-	if kw_at(p, off, "tlsf") then return true
-	return false
-}
 
 # Is this file privileged to use the raw-memory surface (`mem.raw.*`, `size_of`)? Raw ops are
 # legal ONLY inside the std geometry modules (`std/mem/…`): hooks work in raw memory
@@ -962,44 +948,15 @@ const parse_primary! = (*Parser p): Expr -> {
 			const [Expr] so_args = parse_args!(p)
 			return Expr.Call("cf__size_of", so_noty, so_args, "")
 		}
-		# `mem.<geometry>.of(args)` / `mem.<geometry>` — the geometry surface (memory_model §4).
-		# Recognized ONLY when the name after the dot is a known geometry, so an ordinary variable
-		# named `mem` is untouched. `.of(n)` lowers to the `cf__arena_of` intrinsic (carve a node
-		# from the ambient one); a bare `mem.<geometry>` (e.g. `mem.page`) to the `cf__page` handle.
-		if str_eq(name, "mem") && is_dot(peek(p)) && is_geometry_kw_at(p, 1) then {
-			p.pos = p.pos + 1
-			const Str geom = cur_name!(p)
-			p.pos = p.pos + 1
+		# `mem.page` — the root page node handle (memory_model §4). The bare ambient-page marker stays
+		# sugar (its "constructor" is a bare handle, not a carve). The arena and fixed_buffer
+		# constructors are now REAL intrinsics imported by standard path — `import ".../fixed_arena" as
+		# fixed_arena` then `fixed_arena.of(n)` (fixed), `growing_arena.of(n)` (growing),
+		# `fixed_buffer.of(buf)` — no `mem.arena`/`mem.fixed_buffer` sugar, no auto-inject.
+		if str_eq(name, "mem") && is_dot(peek(p)) && kw_at(p, 1, "page") then {
+			p.pos = p.pos + 1  # `.`
+			p.pos = p.pos + 1  # `page`
 			const [Str] mem_noty = []
-			if is_dot(peek(p)) then {
-				p.pos = p.pos + 1
-				# `.of(n)` → a FIXED arena (traps at n); `.grow(n)` → an ELASTIC arena (grows from parent)
-				const Bool is_of = kw(p, "of")
-				const Bool is_grow = kw(p, "grow")
-				if !is_of && !is_grow then die("cf: parse: expected `.of` or `.grow` after `mem.<geometry>`\n")
-				p.pos = p.pos + 1
-				if !is_lparen(peek(p)) then die("cf: parse: expected `(` after `mem.<geometry>.of`\n")
-				const [Expr] margs = parse_args!(p)
-				# `mem.fixed_buffer.of(buf)` wraps a caller `[Uint8]` buffer (a `$buf`, a `static pool`, or an
-				# array) as a bounded bump geometry — carves nothing (§5); no `.grow` (the buffer is fixed).
-				if str_eq(geom, "fixed_buffer") then {
-					if is_grow then die("cf: parse: `fixed_buffer` wraps a fixed caller buffer and has no `.grow`\n")
-					# using the geometry IS the import: mark the module so parse_program! appends a
-					# synthetic `import "std/mem/fixed_buffer"` and the std source auto-loads
-					p.saw_fb = true
-					return Expr.Call("cf__buffer_of", mem_noty, margs, "")
-				}
-				# using the arena IS the import (like fixed_buffer): the FIXED shape (`.of`) and the
-				# ELASTIC shape (`.grow`) are now two monomorphic geometry modules — parse_program!
-				# appends a synthetic `import "std/mem/arena/fixed_arena"` / `".../elastic_arena"`
-				# per shape used, and the constructors resolve to `of__fx` / `of__el` in std source.
-				if is_grow then {
-					p.saw_el = true
-					return Expr.Call("cf__arena_grow", mem_noty, margs, "")
-				}
-				p.saw_fx = true
-				return Expr.Call("cf__arena_of", mem_noty, margs, "")
-			}
 			const [Expr] mem_noargs = []
 			return Expr.Call("cf__page", mem_noty, mem_noargs, "")
 		}
@@ -2870,34 +2827,6 @@ pub const parse_program! = (*Parser p): Program -> {
 	loop {
 		if is_eof(peek(p)) then break
 		acc = prog_cat(acc, parse_item!(p))
-	}
-	# auto-load on use (the geometry-modules arc): a module that touched `mem.fixed_buffer`
-	# gains a synthetic import of the std geometry source — the ordinary import machinery
-	# (path resolution, dedup, transitive closure) does the rest. No names bind: userland
-	# never calls hooks directly; the compiler references them by their mangled names.
-	if p.saw_fb then {
-		const [Str] no_names = []
-		const [Import] fb_im = [Import({ path: "std/mem/fixed_buffer", names: no_names })]
-		const [RecDecl] no_recs = []
-		const [UnionDecl] no_unions = []
-		const [Func] no_funcs = []
-		acc = prog_cat(acc, Program({ imports: fb_im, recs: no_recs, unions: no_unions, funcs: no_funcs, groups: no_recs }))
-	}
-	if p.saw_fx then {
-		const [Str] no_fx_names = []
-		const [Import] fx_im = [Import({ path: "std/mem/arena/fixed_arena", names: no_fx_names })]
-		const [RecDecl] no_fx_recs = []
-		const [UnionDecl] no_fx_unions = []
-		const [Func] no_fx_funcs = []
-		acc = prog_cat(acc, Program({ imports: fx_im, recs: no_fx_recs, unions: no_fx_unions, funcs: no_fx_funcs, groups: no_fx_recs }))
-	}
-	if p.saw_el then {
-		const [Str] no_el_names = []
-		const [Import] el_im = [Import({ path: "std/mem/arena/elastic_arena", names: no_el_names })]
-		const [RecDecl] no_el_recs = []
-		const [UnionDecl] no_el_unions = []
-		const [Func] no_el_funcs = []
-		acc = prog_cat(acc, Program({ imports: el_im, recs: no_el_recs, unions: no_el_unions, funcs: no_el_funcs, groups: no_el_recs }))
 	}
 	# The PAGE geometry is the ambient `main` runs under — implicit, with no surface keyword to
 	# trigger the load (unlike fixed_buffer/arena, which announce themselves by use). So every
