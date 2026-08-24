@@ -104,16 +104,24 @@ const alias_prefix = ([Str] aliases, [Str] prefixes, Str n): Str -> {
 	return ""
 }
 
-# A pre-parse token pass for namespace imports (module_system §4). A namespace import
+# A pre-parse token pass for namespace imports (module_system §4/§5). A namespace import
 # `import "m" as ns` binds a local alias `ns`, and a use `ns.member` means module `m`'s `member`.
 # Since the mangle later renames `m`'s value members to `<prefix>_<name>`, a value access
 # `ns.member` cannot survive as a bare `member` — it is JOINED here into one synthesized token
 # `<prefix>\x01member` (the sep flags a namespace access; the mangle resolves it through `m`'s
-# export surface, which chases barrels). A TYPE access `ns.T` (PascalCase) keeps its bare `T`
-# (types are never mangled), so only the leading `ns.` is dropped — after it, `T` is not an alias
-# and `T.M` stays intact. Pass 1 collects each alias and the sanitized prefix of its import path
-# (the non-`{` form; `pub import` too — the `pub` sits before `import`); the import declaration's
-# own `as ns` is left untouched (its `ns` is not followed by a `.`).
+# export surface, which chases barrels).
+#
+# NESTED namespaces (§5): a `pub import` can reexport a module AS a namespace, so a path may have
+# more than one namespace hop — `foo.io.member`, where `foo` windows over a barrel whose `io` is a
+# reexported namespace. We GREEDILY consume the run of lowercase segments after an alias and join
+# ALL of them, `<prefix>\x01seg\x01…\x01member` — the mangle walks the run through the module graph.
+# Greedy consumption means a field access on a namespaced VALUE (`ns.value.field`) is not supported
+# (the run would swallow `field` as a hop, and the mangle then errors that `value` is not a
+# namespace) — destructure the value first. A TYPE terminal `ns.…segs….T` (PascalCase) is reached
+# THROUGH the namespaces: the whole `ns.…seg.` prefix is dropped and the bare `T` kept (types are
+# never mangled), so `T.M` stays intact. Pass 1 collects each alias and the sanitized prefix of its
+# import path (the non-`{` form; `pub import` too); the declaration's own `as ns` is left untouched
+# (its `ns` is not followed by a `.`).
 const strip_import_namespaces! = (*[Uint8] src, [Token] toks): [Token] -> {
 	let [Str] aliases = []
 	let [Str] prefixes = []
@@ -134,10 +142,26 @@ const strip_import_namespaces! = (*[Uint8] src, [Token] toks): [Token] -> {
 		let Str apre = ""
 		if is_ident(toks[k].kind) && k + 1 < Iarch(toks.len) && is_dot(toks[k + 1].kind) then apre = alias_prefix(aliases, prefixes, tok_text!(src, toks[k]))
 		if Iarch(apre.len) > 0 && k + 2 < Iarch(toks.len) && is_ident(toks[k + 2].kind) && is_lower_initial(tok_text!(src, toks[k + 2])) then {
-			# `ns.member` (value) → one joined token `<prefix>\x01member`
-			const Str joined = join_ns!(apre, tok_text!(src, toks[k + 2]))
-			out = [...out, Token({ kind: toks[k + 2].kind, ival: toks[k + 2].ival, start: toks[k + 2].start, len: toks[k + 2].len, text: joined })]
-			k = k + 3
+			# `ns.seg1[.seg2…].member` — greedily join the run of lowercase segments into one token
+			let Str joined = join_ns!(apre, tok_text!(src, toks[k + 2]))
+			let Iarch j = k + 2 # position of the last-consumed lowercase segment
+			loop {
+				if j + 2 < Iarch(toks.len) && is_dot(toks[j + 1].kind) && is_ident(toks[j + 2].kind) && is_lower_initial(tok_text!(src, toks[j + 2])) then {
+					joined = join_ns!(joined, tok_text!(src, toks[j + 2]))
+					j = j + 2
+				} else {
+					break
+				}
+			}
+			if j + 2 < Iarch(toks.len) && is_dot(toks[j + 1].kind) && is_ident(toks[j + 2].kind) && !is_lower_initial(tok_text!(src, toks[j + 2])) then {
+				# `…seg.Type` — the type is reached THROUGH the namespaces: drop the whole `ns.…seg.`
+				# prefix and keep the bare `Type` (emitted normally on the next iteration).
+				k = j + 2
+			} else {
+				# value terminal — emit the joined path as one token (reuse the terminal token's pos)
+				out = [...out, Token({ kind: toks[j].kind, ival: toks[j].ival, start: toks[j].start, len: toks[j].len, text: joined })]
+				k = j + 1
+			}
 		} else if Iarch(apre.len) > 0 then {
 			# `ns.Type` (or a non-ident after the dot) → drop the leading `ns.`, keep the rest
 			k = k + 2
@@ -163,6 +187,28 @@ const join_ns! = (Str prefix, Str member): Str -> {
 		if j >= Iarch(member.len) then break
 		v = [...v, member[j]]
 		j = j + 1
+	}
+	return Str(v)
+}
+# Index of the first ns_sep (0x01) in `s`, or -1 — splits a joined namespace path into its first
+# hop and the rest. A single-member key has none (a flat value); a nested path `seg\x01rest` has one.
+const ns_sep_index = (Str s): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(s.len) then break
+		if Iarch(s[i]) == 1 then return i
+		i = i + 1
+	}
+	return 0 - 1
+}
+# The substring `s[a..b)`.
+const str_range! = (Str s, Iarch a, Iarch b): Str -> {
+	let [Uint8] v = []
+	let Iarch i = a
+	loop {
+		if i >= b then break
+		v = [...v, s[i]]
+		i = i + 1
 	}
 	return Str(v)
 }
@@ -342,20 +388,39 @@ const has_pub_func = (Program p, Str name): Bool -> {
 	}
 	return false
 }
-# The flat top-level name that member `name`, reached through module `idx`, resolves to. A pub
-# function of the module mangles directly; otherwise the module's imports are chased through the
-# precomputed targets (a barrel reexport forwards to the original definition). Falls back to the
-# module's own prefixed name. Allocation-free (interpolation aside) — never re-opens a path.
-const resolve_export = (Rctx rc, Iarch idx, Str name, Iarch depth): Str -> {
+# The flat top-level name that member `name`, reached through module `idx`, resolves to. `name`
+# may be a NESTED namespace path `seg\x01rest` (module_system §5): the first hop `seg` names a
+# reexported namespace of the module (an import aliased `seg`), through which the rest is resolved
+# recursively. A single-member name is a pub function of the module (mangles directly) or is chased
+# through the module's destructured imports (a barrel reexport forwards to the original definition).
+# Falls back to the module's own prefixed name; a nested hop that names no reexported namespace is a
+# hard error (module_system §9). Never re-opens a path.
+const resolve_export! = (Rctx rc, Iarch idx, Str name, Iarch depth): Str -> {
 	if depth > 64 then die("cf: resolve: an import reexport cycle\n")
 	const Modu m = rc.mods[idx]
+	const Iarch sp = ns_sep_index(name)
+	if sp >= 0 then {
+		# `seg\x01rest` — descend through the reexported namespace aliased `seg`, resolve the rest there
+		const Str seg = str_range!(name, 0, sp)
+		const Str rest = str_range!(name, sp + 1, Iarch(name.len))
+		let Iarch ni = 0
+		loop {
+			if ni >= Iarch(m.prog.imports.len) then break
+			if str_eq(m.prog.imports[ni].alias, seg) then {
+				const Iarch tidx = rc.itargets[idx][ni]
+				if tidx >= 0 then return resolve_export!(rc, tidx, rest, depth + 1)
+			}
+			ni = ni + 1
+		}
+		die("cf: resolve: a namespace path segment names no reexported namespace here\n")
+	}
 	if has_pub_func(m.prog, name) then return mod_mangled(name, m)
 	let Iarch ii = 0
 	loop {
 		if ii >= Iarch(m.prog.imports.len) then break
 		if in_priv(m.prog.imports[ii].names, name) then {
 			const Iarch tidx = rc.itargets[idx][ii]
-			if tidx >= 0 then return resolve_export(rc, tidx, name, depth + 1)
+			if tidx >= 0 then return resolve_export!(rc, tidx, name, depth + 1)
 		}
 		ii = ii + 1
 	}
@@ -689,10 +754,13 @@ const tbl_minus = ([Bind] tbl, [Str] names): [Bind] -> {
 	return out
 }
 
-# The exported VALUE names of module `idx` — its own pub functions plus every value name its
-# imports bring in (a barrel reexports them; the pub/non-pub distinction is not tracked, a
-# deferred §9 privacy check). Used to spread a namespace import's whole surface into rename keys.
-const export_names = (Rctx rc, Iarch idx, Iarch depth): [Str] -> {
+# The exported VALUE member paths of module `idx` — its own pub functions, every value name its
+# DESTRUCTURED imports bring in (a barrel reexports them flat), and — for a NAMESPACE reexport
+# (`pub import "m" as io`, module_system §5) — the target's members each under the nested path
+# `io\x01<member>`, so the reexported namespace joins the surface and is reachable/traversable.
+# (The pub/non-pub distinction is not tracked, a deferred §9 privacy check.) Used to spread a
+# namespace import's whole surface into rename keys.
+const export_names! = (Rctx rc, Iarch idx, Iarch depth): [Str] -> {
 	if depth > 64 then die("cf: resolve: an import reexport cycle\n")
 	const Modu m = rc.mods[idx]
 	let [Str] out = []
@@ -705,11 +773,26 @@ const export_names = (Rctx rc, Iarch idx, Iarch depth): [Str] -> {
 	let Iarch ii = 0
 	loop {
 		if ii >= Iarch(m.prog.imports.len) then break
-		let Iarch k = 0
-		loop {
-			if k >= Iarch(m.prog.imports[ii].names.len) then break
-			if is_lower_initial(m.prog.imports[ii].names[k]) then out = [...out, m.prog.imports[ii].names[k]]
-			k = k + 1
+		if Iarch(m.prog.imports[ii].names.len) > 0 then {
+			# destructured reexport → flat value members
+			let Iarch k = 0
+			loop {
+				if k >= Iarch(m.prog.imports[ii].names.len) then break
+				if is_lower_initial(m.prog.imports[ii].names[k]) then out = [...out, m.prog.imports[ii].names[k]]
+				k = k + 1
+			}
+		} else if Iarch(m.prog.imports[ii].alias.len) > 0 && is_lower_initial(m.prog.imports[ii].alias) then {
+			# namespace reexport → nested members under `<alias>\x01…`
+			const Iarch tidx = rc.itargets[idx][ii]
+			if tidx >= 0 then {
+				const [Str] sub = export_names!(rc, tidx, depth + 1)
+				let Iarch s = 0
+				loop {
+					if s >= Iarch(sub.len) then break
+					out = [...out, join_ns!(m.prog.imports[ii].alias, sub[s])]
+					s = s + 1
+				}
+			}
 		}
 		ii = ii + 1
 	}
@@ -736,16 +819,16 @@ const build_tbl! = (Iarch idx, Rctx rc): [Bind] -> {
 				loop {
 					if k >= Iarch(m.prog.imports[ii].names.len) then break
 					const Str nm = m.prog.imports[ii].names[k]
-					if is_lower_initial(nm) then tbl = [...tbl, Bind({ from: nm, to: resolve_export(rc, tidx, nm, 0) })]
+					if is_lower_initial(nm) then tbl = [...tbl, Bind({ from: nm, to: resolve_export!(rc, tidx, nm, 0) })]
 					k = k + 1
 				}
 			} else {
 				# namespace: spread the whole surface under joined keys
-				const [Str] xs = export_names(rc, tidx, 0)
+				const [Str] xs = export_names!(rc, tidx, 0)
 				let Iarch x = 0
 				loop {
 					if x >= Iarch(xs.len) then break
-					tbl = [...tbl, Bind({ from: join_ns!(rc.mods[tidx].prefix, xs[x]), to: resolve_export(rc, tidx, xs[x], 0) })]
+					tbl = [...tbl, Bind({ from: join_ns!(rc.mods[tidx].prefix, xs[x]), to: resolve_export!(rc, tidx, xs[x], 0) })]
 					x = x + 1
 				}
 			}
