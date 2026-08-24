@@ -944,7 +944,11 @@ const parse_primary! = (*Parser p): Expr -> {
 			# raw op that touches a node, for the slow paths whose target node's geometry is
 			# dynamic (an elastic pull allocates from the PARENT node, whoever that is).
 			if str_eq(rop, "alloc") then return Expr.Call("cf__raw_alloc", raw_noty, rargs, "")
-			die("cf: parse: unknown `mem.raw` op — one of `addr`, `load`, `store`, `place`, `alloc`, `trap`\n")
+			# `mem.raw.grow(node, target)` — commit more backing pages up to `target` on a kind-0
+			# lane (`$cf_grow`), for the page geometry's commit-growth watermark. The reservation
+			# bound is the caller's to check first; this only advances the committed frontier.
+			if str_eq(rop, "grow") then return Expr.Call("cf__raw_grow", raw_noty, rargs, "")
+			die("cf: parse: unknown `mem.raw` op — one of `addr`, `load`, `store`, `place`, `alloc`, `grow`, `trap`\n")
 		}
 		# `size_of(v)` — the layout intrinsic (an object's byte size, comptime for fixed layouts,
 		# runtime for `$dyn`). Privileged like `mem.raw`: hook bodies bump by object size; userland
@@ -2861,6 +2865,21 @@ pub const parse_program! = (*Parser p): Program -> {
 		const [UnionDecl] no_ar_unions = []
 		const [Func] no_ar_funcs = []
 		acc = prog_cat(acc, Program({ imports: ar_im, recs: no_ar_recs, unions: no_ar_unions, funcs: no_ar_funcs, groups: no_ar_recs }))
+	}
+	# The PAGE geometry is the ambient `main` runs under — implicit, with no surface keyword to
+	# trigger the load (unlike fixed_buffer/arena, which announce themselves by use). So every
+	# NON-std/mem module gains a synthetic import of `std/mem/page`; the ordinary import machinery
+	# dedups it, and when a program has no page-ambient allocation the Materialize pass's
+	# reachable-variants rebuild prunes the module back out (leaving non-page programs byte-
+	# identical). The `!in_std_mem` guard keeps the geometry modules from importing each other
+	# (page.cf itself, and the fixed_buffer/arena cycle).
+	if !in_std_mem(p.file) then {
+		const [Str] no_pg_names = []
+		const [Import] pg_im = [Import({ path: "std/mem/page", names: no_pg_names })]
+		const [RecDecl] no_pg_recs = []
+		const [UnionDecl] no_pg_unions = []
+		const [Func] no_pg_funcs = []
+		acc = prog_cat(acc, Program({ imports: pg_im, recs: no_pg_recs, unions: no_pg_unions, funcs: no_pg_funcs, groups: no_pg_recs }))
 	}
 	return acc
 }

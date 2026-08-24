@@ -745,3 +745,25 @@ This is what makes the bootstrap tractable: `cf0` implements `page` + `arena`, a
 geometries that make adoption and cross-geometry duplication real. Which phases
 `cf0` runs in full and which it runs degenerately — this section among them — is
 [[seed_subset.md]].
+
+**The geometry-modules arc: the degeneracy relocates from the floor to std source.**
+The three bump geometries now live as **user-visible std source** — `lib/std/mem/{page,
+arena, fixed_buffer}.cf` — exporting the §1 hooks over the `mem.raw.*` substrate, rather
+than as hardcoded folds in the QBE floor. The Materialize substep mints per-`(fn ×
+geometry)` copies under a **fixed mangle tag** (`__pg`/`__ar`/`__fb`) for the functions
+reachable under each ambient, and emit places the geometry's own `reserve_*`/claim/scope
+calls (fold-lite: a record literal builds directly in a `reserve_ret`/`reserve_alloc`
+reservation, the identity-law-fused `on_alloc`/`on_ret`). The compiler self-hosts through
+its own `arena` hooks (it grafts one elastic arena in `main`). The **`page`** geometry is
+materialized for a program whose `main` genuinely allocates on the root ambient — a
+colorless (non-`!`) frame building a record, plus its bare-reachable colorless allocator
+subtree (`build__pg`), which the root check permits on the page; a `!` frame is never `pg`
+(it must run under a graft), so `page` only ever reserves survivor-side and never brackets.
+An arena-grafting `main` that places nothing on the page (the compiler, and every program
+whose allocating work runs `in` a graft) stays legacy and the auto-imported `page` module
+is stripped back out, leaving such programs byte-identical. What Materialize cannot prove
+(indirect calls, dynamic node handles, non-record aggregates) degrades to the shared bump
+**floor** (`cf_alloc`/`cf_reset`), coherent because hooks and floor honor the one 96-byte
+duplex node layout — so the floor narrows to the residue Materialize leaves it, never to
+unsoundness. Retiring the dead floor paths where every ambient is specialized is the arc's
+cleanup stage.
