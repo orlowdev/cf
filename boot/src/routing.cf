@@ -1786,3 +1786,185 @@ pub const check_destroy! = (Program prog, RouteInfo ri): Iarch -> {
 	}
 	return 0
 }
+
+# ── geometry-handle escape (geometry_lowering §1) ────────────────────────────────────────
+# A geometry is a comptime ambient spent IN PLACE, not a first-class value: the node handle
+# `<geom>::of(n)` mints must be bound where it is used and never handed out of its constructing
+# frame. A callee that returns (or passes on) its handle would let a caller `... in h` under a
+# geometry the compiler cannot see the constructor for — the exact minted-handle gap that forced
+# a runtime-dispatch `cf_alloc` fallback. Forbidding the escape keeps every handle statically
+# traceable to its constructor, so materialize always resolves the ambient.
+#
+# The rule is SYNTACTIC and precise: a handle escapes only when its name appears as an ordinary
+# VALUE — an `Expr.Var` in a RETURN or as a non-`destroy` call ARGUMENT. Crucially, the `... in b`
+# ambient is the `Call.geom` STRING field, never an `Expr.Var` and never a `kids!` child, so using
+# a handle purely as an ambient (or returning an aggregate ALLOCATED in it, `return f() in b`) is
+# invisible here — exactly right: that is the intended arena channel, the handle itself never
+# leaves. `destroy(b)` consumes the handle in place and is exempt.
+const is_geom_ctor = (Str n): Bool -> str_eq(n, "of__fx") || str_eq(n, "of__el") || str_eq(n, "of__fb")
+const ge_is_ctor = (Expr e): Bool -> match e {
+	Expr.Call(n, _, _, _) -> is_geom_ctor(n),
+	_ -> false
+}
+# the ctor-bound handle names of one function body: a `const/let b = <geom>::of(...)` binding,
+# plus a plain alias `let x = b` of an existing handle (one relinking level, closed to a fixpoint
+# by the caller re-running until stable).
+const ge_alias_of = (Expr e, [Str] hs): Bool -> match e {
+	Expr.Var(n) -> has_name(hs, n),
+	_ -> false
+}
+const ge_handles_arms = ([StmtArm] arms, [Str] hs): [Str] -> {
+	let [Str] r = no_strs()
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		r = cat_s(r, ge_handles(arms[i].body, hs))
+		i = i + 1
+	}
+	return r
+}
+const ge_handles_stmt = (Stmt s, [Str] hs): [Str] -> match s {
+	Stmt.Let(n, _, _, init) -> if ge_is_ctor(init) || ge_alias_of(init, hs) then one_str(n) else no_strs(),
+	Stmt.Assign(n, init) -> if ge_is_ctor(init) || ge_alias_of(init, hs) then one_str(n) else no_strs(),
+	Stmt.IfThen(_, b) -> ge_handles_stmt(b, hs),
+	Stmt.IfElse(_, t, e) -> cat_s(ge_handles_stmt(t, hs), ge_handles_stmt(e, hs)),
+	Stmt.Block(bs) -> ge_handles(bs, hs),
+	Stmt.Loop(bs) -> ge_handles(bs, hs),
+	Stmt.ForIn(_, _, bs) -> ge_handles(bs, hs),
+	Stmt.Match(_, arms) -> ge_handles_arms(arms, hs),
+	Stmt.Defer(bs) -> ge_handles(bs, hs),
+	Stmt.Closure(_, _, _, cb) -> ge_handles(cb, hs),
+	_ -> no_strs()
+}
+const ge_handles = ([Stmt] ss, [Str] hs): [Str] -> {
+	let [Str] r = no_strs()
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		r = cat_s(r, ge_handles_stmt(ss[i], hs))
+		i = i + 1
+	}
+	return r
+}
+# fixpoint the handle set so a chained alias (`let y = x` after `let x = b`) is captured too.
+const ge_handle_set = ([Stmt] body): [Str] -> {
+	let [Str] hs = no_strs()
+	loop {
+		const [Str] nx = ge_handles(body, hs)
+		if Iarch(nx.len) <= Iarch(hs.len) then break
+		hs = nx
+	}
+	return hs
+}
+# does a handle name (in hs) appear as a VALUE (an `Expr.Var`) anywhere in `e`? `kids!` walks
+# child EXPRs only, so the `Call.geom` ambient string is never reached — ambient uses stay invisible.
+const ge_uses! = (Expr e, [Str] hs): Bool -> {
+	const Bool here = match e {
+		Expr.Var(n) -> has_name(hs, n),
+		_ -> false
+	}
+	if here then return true
+	const [Expr] ks = kids!(e)
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ks.len) then break
+		if ge_uses!(ks[i], hs) then return true
+		i = i + 1
+	}
+	return false
+}
+# the specific handle name (in hs) that `e` hands out — the first `Expr.Var` in hs it mentions.
+const ge_named! = (Expr e, [Str] hs): Str -> {
+	const Str here = match e {
+		Expr.Var(n) -> if has_name(hs, n) then n else "",
+		_ -> ""
+	}
+	if !str_eq(here, "") then return here
+	const [Expr] ks = kids!(e)
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ks.len) then break
+		const Str r = ge_named!(ks[i], hs)
+		if !str_eq(r, "") then return r
+		i = i + 1
+	}
+	return ""
+}
+const ge_die! = (Str h, Str sink): Iarch -> die("cf: a geometry handle may not escape its constructing function: the `<geom>::of(...)` arena `${h}` is ${sink}. A geometry is a comptime ambient spent in place — run work `... in ${h}` and reclaim with `defer destroy(${h})`; do not return or forward the handle itself.\n")
+# scan an expression for a handle passed as a non-`destroy` call ARGUMENT (the ambient in `Call.geom`
+# is not an argument, so `f() in b` never trips this).
+const ge_scan_args! = (Expr e, [Str] hs): Iarch -> {
+	const Iarch hit = match e {
+		Expr.Call(callee, _, args, _) -> if is_destroy_callee(callee) then 0 else ge_scan_arglist!(args, hs, callee),
+		_ -> 0
+	}
+	const [Expr] ks = kids!(e)
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ks.len) then break
+		ge_scan_args!(ks[i], hs)
+		i = i + 1
+	}
+	return 0
+}
+const ge_scan_arglist! = ([Expr] args, [Str] hs, Str callee): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(args.len) then break
+		if ge_uses!(args[i], hs) then ge_die!(ge_named!(args[i], hs), "passed as a value argument to `${callee}`")
+		i = i + 1
+	}
+	return 0
+}
+const ge_scan_stmt! = (Stmt s, [Str] hs): Iarch -> {
+	const [Expr] es = stmt_exprs!(s)
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(es.len) then break
+		ge_scan_args!(es[i], hs)
+		i = i + 1
+	}
+	const Iarch r = match s {
+		Stmt.Return(e) -> if ge_uses!(e, hs) then ge_die!(ge_named!(e, hs), "returned out of this frame") else 0,
+		Stmt.IfThen(_, b) -> ge_scan_stmt!(b, hs),
+		Stmt.IfElse(_, t, e) -> ge_scan_stmt!(t, hs) + ge_scan_stmt!(e, hs),
+		Stmt.Block(bs) -> ge_scan_stmts!(bs, hs),
+		Stmt.Loop(bs) -> ge_scan_stmts!(bs, hs),
+		Stmt.ForIn(_, _, bs) -> ge_scan_stmts!(bs, hs),
+		Stmt.Match(_, arms) -> ge_scan_arms!(arms, hs),
+		Stmt.Defer(bs) -> ge_scan_stmts!(bs, hs),
+		Stmt.Closure(_, _, _, cb) -> ge_scan_stmts!(cb, hs),
+		_ -> 0
+	}
+	return r
+}
+const ge_scan_stmts! = ([Stmt] ss, [Str] hs): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		ge_scan_stmt!(ss[i], hs)
+		i = i + 1
+	}
+	return 0
+}
+const ge_scan_arms! = ([StmtArm] arms, [Str] hs): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		ge_scan_stmts!(arms[i].body, hs)
+		i = i + 1
+	}
+	return 0
+}
+pub const check_geom_escape! = (Program prog): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(prog.funcs.len) then break
+		if !prog.funcs[i].is_asm then {
+			const [Str] hs = ge_handle_set(prog.funcs[i].body)
+			if Iarch(hs.len) > 0 then ge_scan_stmts!(prog.funcs[i].body, hs)
+		}
+		i = i + 1
+	}
+	return 0
+}
