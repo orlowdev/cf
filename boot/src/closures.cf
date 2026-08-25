@@ -723,9 +723,27 @@ const compute_captures! = ([RecDecl] recs, [Stmt] body, [Param] params, [ScopeVa
 	}
 	return caps
 }
+# The geometry tag a materialized function name ends in (`run!__el` → "el"), or "" for a legacy
+# body. A closure lifted out of a materialized body inherits this — it runs under the same ambient
+# (the enclosing body threads it the node), so its own allocations must lower through that
+# geometry's reserve, not the `cf_alloc` floor. Emit reads the tag back off the lifted name.
+const enclosing_tag = (Str n): Str -> {
+	const Iarch l = Iarch(n.len)
+	if l < 4 then return ""
+	if Iarch(n[l - 4]) != 95 || Iarch(n[l - 3]) != 95 then return ""
+	const Iarch a = Iarch(n[l - 2])
+	const Iarch b = Iarch(n[l - 1])
+	if a == 101 && b == 108 then return "el"
+	if a == 102 && b == 120 then return "fx"
+	if a == 102 && b == 98 then return "fb"
+	if a == 112 && b == 103 then return "pg"
+	return ""
+}
+
 # One lifted function name per closure — unique across the program via the enclosing function
-# index and the closure's ordinal within it.
-const lifted_name = (Iarch fi, Iarch ci): Str -> "__clo_${fi}_${ci}"
+# index and the closure's ordinal within it. A closure lifted from a materialized body carries
+# the enclosing geometry tag (`__clo_7_0__el`) so emit lowers its allocations through that reserve.
+const lifted_name = (Iarch fi, Iarch ci, Str tag): Str -> if str_eq(tag, "") then "__clo_${fi}_${ci}" else "__clo_${fi}_${ci}__${tag}"
 
 # Result of lifting one function's body: the rewritten body (closures removed, calls redirected)
 # and the list of lifted top-level functions it produced.
@@ -758,7 +776,7 @@ const lift_func! = (Func fn, Iarch fi, [RecDecl] recs, [Func] fns): Lifted -> {
 					capargs = [...capargs, cap_arg_expr(caps[c])]
 					c = c + 1
 				}
-				const Str ln = lifted_name(fi, ci)
+				const Str ln = lifted_name(fi, ci, enclosing_tag(fn.name))
 				# the closure's calls (later in this body) are redirected before its own body is
 				# rewritten, so a captured closure that itself calls another already-lifted closure
 				# still resolves
