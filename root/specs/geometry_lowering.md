@@ -545,24 +545,33 @@ layout unchanged — fail-safe polarity: an unrouted allocation lands here and
 merely leaks). The **residue** subnode sits behind it; frames and loops bracket
 it. Allocation is a pointer bump on the classified side; reclamation is a
 bracket reset of the residue side; `Mark` is the residue subnode's saved
-**triple** `{top, committed, limit}` — a top-only mark cannot survive an elastic
-pull, which relocates all three fields.
+`{top, limit}` — a top-only mark cannot survive an elastic pull, which relocates
+the block (moving the limit too), so the limit rides along to detect it.
+(`committed` is not part of the mark — the reset never needs it.)
 
 ```
 type BumpSub  = { top: RawPtr, committed: RawPtr, limit: RawPtr,
                   parent: MemoryNode, kind: Iarch, chunk: Iarch }
 type BumpNode = { survivor: BumpSub, residue: BumpSub }   # the handle points at `survivor`
 
-const on_scope_enter = (MemoryNode node) -> triple_of(node.residue)   # Mark = the triple now
-const on_scope_exit  = (MemoryNode node, Mark mark) -> {
+# on_scope_enter is FOLDED by emit: it snapshots {top, limit} into temps at scope
+# entry (a pure read of the residue subnode — a bump-family layout invariant), so no
+# hook is called on entry. on_scope_exit is the placed reclamation contract (a
+# compacting or `rc` geometry overrides it), replacing the retired floor cf_reset.
+const on_scope_exit = (MemoryNode node, RawPtr top, RawPtr lim) -> {
   # limit unchanged since the mark → restore top alone (the common case; committed
   # stays advanced so the page never re-commits). Limit MOVED → an elastic pull
   # relocated the subnode's block since the mark: the reset is a NO-OP — restoring
   # into the old block would park the cursor at its wall and re-pull a fresh chunk
   # on every subsequent frame (pull churn). Skipping leaks the marked interval
   # once per pull, reclaimed at node teardown; it can never dangle.
-  if node.residue.limit == mark.limit then node.residue.top = mark.top
+  if node.residue.limit == lim then node.residue.top = top
 }
+
+# The mark rides in emit temps, so nothing is stored per bracket (an in-arena mark record
+# would leak per `!` call in a loop). The survivor-scope mark (a frame from which nothing
+# escapes brackets the survivor triple too) is an emit-internal optimization gate, not a
+# contract hook, so emit rewinds it INLINE with the same fold, not through on_scope_exit.
 
 const on_alloc = ['T] (MemoryNode node, 'T v) -> {         # residue side shown; the
   let p = bump(side_of(v), raw::size_of(v))                # survivor side is the same
@@ -824,9 +833,11 @@ subtree (`build__pg`), which the root check permits on the page; a `!` frame is 
 (it must run under a graft), so `page` only ever reserves survivor-side and never brackets.
 An arena-grafting `main` that places nothing on the page (the compiler, and every program
 whose allocating work runs `in` a graft) stays legacy and the auto-imported `page` module
-is stripped back out, leaving such programs byte-identical. What Materialize cannot prove
-(indirect calls, dynamic node handles, non-record aggregates) degrades to the shared bump
-**floor** (`cf_alloc`/`cf_reset`), coherent because hooks and floor honor the one 96-byte
-duplex node layout — so the floor narrows to the residue Materialize leaves it, never to
-unsoundness. Retiring the dead floor paths where every ambient is specialized is the arc's
-cleanup stage.
+is stripped back out, leaving such programs byte-identical. The runtime-dispatch floor is
+now retired: allocation draws through each node's PUBLISHED reserve entry (`parent+32`, an
+open per-node pointer — the closed `cf_alloc` kind-switch is gone) and every residue bracket
+rewinds through the geometry's own `on_scope_exit` hook (the former `cf_reset` scope-fold is
+gone). Both were artifacts of incomplete specialization, not runtime necessities: a geometry
+is a comptime fact at every use site, so nothing needs a runtime kind read. What remains of
+the floor is the shared dynamic-collection helpers (which take the reserve as a function
+pointer) and the syscall stubs — all honoring the one 96-byte duplex node layout.

@@ -65,10 +65,12 @@ const carve = (Uarch node, [Uint8] buf): Uarch -> {
 # 8-aligned, so no rounding is needed here (the floor rounds byte requests; hooks place
 # whole records).
 #
-# `Mark` is geometry-private (§1): for a FIXED node the residue top ALONE is a sound mark —
-# only an elastic pull invalidates a top-only mark by relocating the block, and a fixed
-# buffer never pulls. So the fb mark is one word, and the exit restore is unconditional
-# (≡ cf_reset's same-limit path, the only one a fixed node can take).
+# `Mark` is geometry-private (§1): the residue subnode's saved `{top, limit}` (the spec's
+# triple minus the unused `committed`). Emit snapshots it into temps at scope entry — the
+# folded `on_scope_enter` (a pure read of the residue subnode, a bump-family layout invariant)
+# — and places THIS hook at scope exit. For a FIXED node the top alone would suffice (a fixed
+# buffer never pulls, so its limit never moves), but the exit keeps the uniform limit-compare
+# so one bump-family body serves fixed and elastic alike.
 
 # Reserve `sz` bytes on the SURVIVOR side (bump up toward the residue cursor, trap on
 # meet) and hand back the placement address. This is `on_ret` minus the copy — emit's
@@ -90,12 +92,13 @@ const reserve_alloc = (Uarch node, Uarch sz): Uarch -> {
 	return dn
 }
 
-# Open a residue scope: the mark is the residue cursor now.
-const on_scope_enter = (Uarch node): Uarch -> raw::load(node + 48)
-
-# Close a residue scope: everything the scope bumped down is reclaimed in bulk.
-const on_scope_exit = (Uarch node, Uarch mark): Uarch -> {
-	raw::store(node + 48, mark)
+# Close a residue scope (geometry_lowering §2): rewind the residue side to the saved mark,
+# reclaiming in bulk everything it bumped down. `top`/`lim` are the residue subnode's saved
+# cursor and limit; restore the top only when the limit is unchanged since the mark (no pull —
+# always the case for a fixed buffer). This is the bump family's scope fold, formerly the floor
+# `cf_reset`; a compacting or `rc` geometry overrides it.
+const on_scope_exit = (Uarch node, Uarch top, Uarch lim): Uarch -> {
+	if raw::load(node + 64) == lim then raw::store(node + 48, top)
 	return 0
 }
 

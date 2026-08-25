@@ -32,17 +32,19 @@ import astutil::{ is_spread, spread_inner, is_skip, skip_count, is_nested, neste
 # `cur_slot` is the merge-slot temp of the nearest value-yielding `loop` (or -1) — a `<- v`
 # stores into it and jumps to `@lend${cur_loop}`, and the `loop` expression loads it afterward.
 # `reset_mark` carries the current function's RESIDUE bracket (geometry_lowering §2, duplex): the
-# index of the FIRST of three consecutive temps holding the residue subnode's `{top, committed,
-# limit}` at entry (see `emit_mark!`; `%res_0` is derived once in the prologue), restored via
-# `cf_reset` before each `ret` to reclaim the frame's trapped scratch. It is -1 for a frame that
-# does not bracket (a colorless function, `main`, an asm floor — see `fn_brackets`). The mark is a
-# TRIPLE because an elastic pull relocates all three fields: restoring top alone would leave top
-# in the old block with the new block's limit — an inconsistent subnode that bumps over foreign
-# memory. `fn_ptr` records whether the enclosing function takes a writable `*T` parameter — it
-# still gates per-loop-iteration reset (softened at the routing flip).
-# `loop_mark` is the nearest enclosing reset-safe loop's entry mark (same triple shape, or -1 if
-# the nearest loop is not reset-safe) — `break`/`continue` restore it so every path back to the
-# loop head or out of it reclaims the iteration's residue, matching the back-edge rewind.
+# index of the FIRST of two consecutive temps holding the residue subnode's `{top, limit}` at
+# entry (see `emit_mark!`; `%res_0` is derived once in the prologue), rewound at each `ret` — by
+# the geometry's `on_scope_exit` hook (the pluggable reclamation contract) — to reclaim the
+# frame's trapped scratch. It is -1 for a frame that does not bracket (a colorless function,
+# `main`, an asm floor — see `fn_brackets`). The mark keeps the LIMIT beside the top because an
+# elastic pull relocates the block: restoring top alone would leave top in the old block with
+# the new block's limit — an inconsistent subnode that bumps over foreign memory; the exit
+# compares the limit and skips the restore when a pull moved it. `fn_ptr` records whether the
+# enclosing function takes a writable `*T` parameter — it still gates per-loop-iteration reset
+# (softened at the routing flip).
+# `loop_mark` is the nearest enclosing reset-safe loop's entry mark (same `{top, limit}` shape, or
+# -1 if the nearest loop is not reset-safe) — `break`/`continue` restore it so every path back to
+# the loop head or out of it reclaims the iteration's residue, matching the back-edge rewind.
 data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs, [RecDecl] recs, [UnionDecl] unions, Iarch cur_loop, Iarch cur_slot, Str cur_ret, Iarch reset_mark, Bool fn_ptr, Iarch loop_mark, Bool alloc_stack, Bool in_loop, Iarch stack_used, [RSets] routes, [FnSum] fsums, Iarch cur_fn, Str alloc_node, Str carve_node, Str grow_node, [Str] growok, Iarch mk_env_base, Iarch sur_mark, Iarch loop_sur_mark, [Bool] nodesig, [Bool] fmints, [Str] slits, Str mat_geom }
 
 # A local/parameter in scope: its interned name, `slot`, its `rec_type` (a record/union
@@ -3924,65 +3926,59 @@ const defertap_survived = (): Str -> {
 # A `Stmt` is dispatched directly by a statement-position `match` in `emit_block`, whose
 # block arms bind each variant's payload and run for effect (no extractor helpers needed).
 
-# Snapshot the ambient node's RESIDUE subnode `{top, committed, limit}` into three consecutive
-# temps (`mk`, `mk+1`, `mk+2`; two scratch temps follow for the field addresses). Returns `mk`,
-# the mark handed to `emit_reset!`. `%res_0` (= the handle's residue side, emitted in the
-# bracketing prologue) is the ONLY place outside the floor that derives the subnode. The mark
-# is the full triple, not top alone, because an elastic pull relocates all three fields to a
-# fresh block — a top-only restore after a pull leaves the subnode inconsistent (§2).
+# Snapshot the ambient subnode's `{top, limit}` into two consecutive temps (`mk`, `mk+1`; one
+# scratch temp follows for the limit-field address). Returns `mk`, the mark handed to
+# `emit_reset!`. `%res_0` (= the handle's residue side, derived in the bracketing prologue) or
+# `%node_0` (the survivor side, for a survivor-scope mark) is the subnode. The mark is the
+# `{top, limit}` pair — the spec's residue triple minus the unused `committed` — held in TEMPS,
+# not stored anywhere, so it can never leak (an elastic pull relocates the block and moves the
+# limit; the exit compares the limit to detect that). This is the folded `on_scope_enter` (§2):
+# a pure read of the residue subnode, a bump-family layout invariant, so emit reads it inline
+# rather than calling a hook.
 const emit_mark! = (*Emit ctx, Str nodeop): Iarch -> {
-	# a materialized fixed_buffer body brackets its RESIDUE side through the geometry's own
-	# hooks (geometry_lowering §2): the mark is whatever `on_scope_enter` returns — ONE opaque
-	# word (a fixed node's residue top; only an elastic pull invalidates a top-only mark, and
-	# a fixed buffer never pulls). The ARENA keeps the floor triple + cf_reset — its brackets
-	# must serve fixed AND elastic nodes, and a one-word elastic mark that neither leaks per
-	# bracket nor dangles across pulls needs more than a cursor snapshot (a 16-byte mark
-	# record on the chain leaks per `!` CALL in loops without own residue — measured at ~+180MB
-	# on a self-compile). cf_reset IS the bump family's scope fold (§6 degeneracy), so the
-	# contract hooks stay in the module, unplaced until a leak-free mark design lands.
-	# Survivor-side marks (`%node_0`) stay on the inline triple — they are the bump family's
-	# emit-internal optimization gate, not a hook of the contract.
-	if str_eq(ctx.mat_geom, "fb") && str_eq(nodeop, "%res_0") then {
-		const Iarch ei = find_func(ctx.funcs, "on_scope_enter__${ctx.mat_geom}")
-		if ei < 0 then die("cf: emit: the `${ctx.mat_geom}` geometry module is missing `on_scope_enter` — stale std source?\n")
-		const Iarch hk = ctx.next
-		ctx.next = ctx.next + 1
-		write_str(ctx.fd, "\t%t${hk} =l call $f${ei}(l %node_0)\n")
-		return hk
-	}
 	const Iarch mk = ctx.next
-	ctx.next = ctx.next + 5
-	const Iarch m1 = mk + 1
-	const Iarch m2 = mk + 2
-	const Iarch a1 = mk + 3
-	const Iarch a2 = mk + 4
+	ctx.next = ctx.next + 3
+	const Iarch lm = mk + 1
+	const Iarch a1 = mk + 2
 	write_str(ctx.fd, "\t%t${mk} =l loadl ${nodeop}\n")
-	write_str(ctx.fd, "\t%t${a1} =l add ${nodeop}, 8\n")
-	write_str(ctx.fd, "\t%t${m1} =l loadl %t${a1}\n")
-	write_str(ctx.fd, "\t%t${a2} =l add ${nodeop}, 16\n")
-	write_str(ctx.fd, "\t%t${m2} =l loadl %t${a2}\n")
+	write_str(ctx.fd, "\t%t${a1} =l add ${nodeop}, 16\n")
+	write_str(ctx.fd, "\t%t${lm} =l loadl %t${a1}\n")
 	return mk
 }
 
-# Rewind the ambient node to a saved mark: a `cf_reset` call. The floor helper restores top
-# alone when the node's limit is unchanged since the mark (no pull — the page/fixed common
-# case, and committed stays advanced so the page never re-commits), else the full triple
-# (an elastic pull relocated the node's block; the blocks pulled after the mark leak into
-# the parent, per the pull-leak precedent).
+# Rewind the ambient subnode to a saved `{top, limit}` mark, reclaiming the scope's scratch in
+# bulk (geometry_lowering §2). The RESIDUE bracket (`%res_0`) is the geometry CONTRACT: place
+# the geometry's own `on_scope_exit(node, top, limit)` — the pluggable reclamation hook (a
+# compacting or `rc` geometry acts differently here), replacing the retired floor `cf_reset`.
+# The SURVIVOR-scope mark (`%node_0`) is an emit-internal optimization gate, not a contract
+# hook (a frame from which nothing escapes frees its survivors too), so it is rewound INLINE.
+# Both do the same bump-family fold: restore the top only when the subnode's limit is unchanged
+# since the mark (no elastic pull relocated its block), else skip — leaking the marked interval
+# once, reclaimed at the node's own teardown, never dangling.
 const emit_reset! = (*Emit ctx, Iarch mk, Str nodeop): Iarch -> {
-	# the dual of emit_mark!'s hook branch: a materialized fixed_buffer body closes its
-	# residue scope through `on_scope_exit(node, mark)` — the geometry interprets its own mark
-	if str_eq(ctx.mat_geom, "fb") && str_eq(nodeop, "%res_0") then {
+	if str_eq(nodeop, "%res_0") && !str_eq(ctx.mat_geom, "") then {
 		const Iarch xi = find_func(ctx.funcs, "on_scope_exit__${ctx.mat_geom}")
 		if xi < 0 then die("cf: emit: the `${ctx.mat_geom}` geometry module is missing `on_scope_exit` — stale std source?\n")
 		const Iarch hr = ctx.next
 		ctx.next = ctx.next + 1
-		write_str(ctx.fd, "\t%t${hr} =l call $f${xi}(l %node_0, l %t${mk})\n")
+		write_str(ctx.fd, "\t%t${hr} =l call $f${xi}(l %node_0, l %t${mk}, l %t${mk + 1})\n")
 		return 0
 	}
-	const Iarch m1 = mk + 1
-	const Iarch m2 = mk + 2
-	write_str(ctx.fd, "\tcall $cf_reset(l ${nodeop}, l %t${mk}, l %t${m1}, l %t${m2})\n")
+	# inline the bump-family rewind (the survivor mark, or a residue mark with no geometry tag)
+	const Iarch lid = ctx.label
+	ctx.label = ctx.label + 1
+	const Iarch a1 = ctx.next
+	ctx.next = ctx.next + 3
+	const Iarch cur = a1 + 1
+	const Iarch same = a1 + 2
+	write_str(ctx.fd, "\t%t${a1} =l add ${nodeop}, 16\n")
+	write_str(ctx.fd, "\t%t${cur} =l loadl %t${a1}\n")
+	write_str(ctx.fd, "\t%t${same} =w ceql %t${cur}, %t${mk + 1}\n")
+	write_str(ctx.fd, "\tjnz %t${same}, @rst${lid}, @rsk${lid}\n")
+	write_str(ctx.fd, "@rst${lid}\n")
+	write_str(ctx.fd, "\tstorel %t${mk}, ${nodeop}\n")
+	write_str(ctx.fd, "\tjmp @rsk${lid}\n")
+	write_str(ctx.fd, "@rsk${lid}\n")
 	return 0
 }
 
@@ -5477,28 +5473,9 @@ const emit_arena_qbe! = (Uarch fd, Bool is_bare, Iarch root_size, Bool dyn_g, Ia
 	# address of `$reserve_ret__pg` — so a child grafted from the page follows `parent+32` like any
 	# other parent. Statically relocated by the linker. `l 0` when nothing drafts from the page (pgidx<0).
 	if pgidx >= 0 then write_str(fd, "export data $cf_page = { l 0, l 0, l 0, l 0, l $f${pgidx}, l 0, l 0, l 0, l 0, l 0, l 0, l 0 }\n") else write_str(fd, "export data $cf_page = { l 0, l 0, l 0, l 0, l 0, l 0, l 0, l 0, l 0, l 0, l 0, l 0 }\n")
-	# cf_reset(node, top, comm, lim) — rewind a subnode to a saved mark (geometry_lowering §2).
-	# When the subnode's limit is unchanged since the mark (no elastic pull — the overwhelmingly
-	# common case), restoring top alone suffices: page/fixed nodes never move their limit, and
-	# leaving committed advanced spares a re-commit. When the limit MOVED, a pull relocated the
-	# subnode's active block since the mark — the reset becomes a NO-OP: the bracket is an
-	# optimization, and with brackets on every `!` frame a full-triple restore would hover the
-	# cursor at the old block's wall and re-pull a fresh chunk EVERY call (pull churn — leaking
-	# a chunk per frame to OOM). Skipping the restore leaks at most the marked interval once per
-	# pull, reclaimed at the node's own teardown; it can never dangle. (`comm` rides unused in
-	# this regime; the triple mark stays — the same-limit test needs `lim`.)
-	write_str(fd, "function $cf_reset(l %node, l %top, l %comm, l %lim) {\n")
-	write_str(fd, "@start\n")
-	write_str(fd, "\t%limp =l add %node, 16\n")
-	write_str(fd, "\t%cur =l loadl %limp\n")
-	write_str(fd, "\t%same =w ceql %cur, %lim\n")
-	write_str(fd, "\tjnz %same, @toponly, @skip\n")
-	write_str(fd, "@toponly\n")
-	write_str(fd, "\tstorel %top, %node\n")
-	write_str(fd, "\tret\n")
-	write_str(fd, "@skip\n")
-	write_str(fd, "\tret\n")
-	write_str(fd, "}\n")
+	# (the floor `cf_reset` scope-fold helper is RETIRED — a `!` frame's residue bracket now rewinds
+	# through the geometry's own `on_scope_exit` hook, placed by `emit_reset!`; the survivor-scope
+	# mark rewinds inline. See geometry_lowering §2.)
 	if dyn_g then emit_dyn_helpers!(fd, true)
 	# cf_str_eq(a, b) — Str value equality (used by string `match`): compare the low word of the
 	# `len@8` slot (LE, matching `cf_str_append`), then the `bytes@0` run byte-for-byte; returns
