@@ -3,7 +3,7 @@
 _start:
 	mov x19, x0
 	mov x20, x1
-	bl _cf_arena_init
+	bl _cf_root_page_init
 	adrp x0, _cf_page@PAGE
 	add x0, x0, _cf_page@PAGEOFF
 	mov x1, x19
@@ -15,11 +15,11 @@ _start:
 	bl _main
 	mov x16, #1
 	svc #0x80
-.globl _cf_arena_init
-.globl _cf_grow
+.globl _cf_root_page_init
+.globl _cf_root_page_grow
 .globl _cf_oom
 .p2align 2
-_cf_arena_init:
+_cf_root_page_init:
 	mov x0, #0
 	mov x1, #0x100000000
 	mov x2, #0
@@ -69,7 +69,7 @@ _cf_arena_init:
 	add x11, x12, x1
 	str x11, [x9, #64]
 	ret
-_cf_grow:
+_cf_root_page_grow:
 	add x9, x0, #8
 	ldr x10, [x9]
 	mov x11, #0x10000000
