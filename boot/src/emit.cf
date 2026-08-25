@@ -1918,28 +1918,23 @@ const emit_agg_alloc! = (*Emit ctx, Iarch size): Iarch -> {
 		write_str(ctx.fd, "\t%t${t} =l alloc8 ${size}\n")
 		return t
 	}
-	# fold-lite: in a materialized geometry body a fixed-layout aggregate reserves through the
-	# geometry's own bump half instead of the shared floor `cf_alloc` (aggregate coverage — the
-	# same fusion records already take), so arrays, buffers and every other aggregate built here
-	# leaves `cf_alloc` behind. Off a geometry (`mat_geom == ""`) this is byte-identical to the
-	# old inline `cf_alloc`, so cf's own non-materialized source emits unchanged.
+	# fold-lite: a fixed-layout aggregate reserves through the geometry's own bump half (aggregate
+	# coverage — the same fusion records take). Every allocating body is materialized under a geometry
+	# now (page included, the full-geometry arc), so there is no off-geometry path: `cf_alloc` is
+	# RETIRED. A bare `mat_geom` reaching here would be an allocation with no ambient — an internal
+	# error (`check_root` should have rejected it), not a silent floor fallback.
 	if !str_eq(ctx.mat_geom, "") then return emit_geom_reserve!(ctx, size)
-	const Iarch t = ctx.next
-	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${t} =l call $cf_alloc(l ${ctx.alloc_node}, w ${size})\n")
-	return t
+	die("cf: emit: internal — a fixed-layout aggregate allocation reached the retired cf_alloc floor with no geometry ambient\n")
+	return 0
 }
 # The same fold-lite fork for a fixed-size aggregate site that has NO `$`-stack form of its own
 # (a tuple, a boxed union, a fallback string literal): reserve through the geometry hook in a
-# materialized body that is not building a `$` binding, else the shared floor `cf_alloc`. Under
-# `alloc_stack` (a nested aggregate inside a `$` binding) it stays on `cf_alloc` exactly as the
-# old direct sites did, so non-materialized output is byte-identical.
+# materialized body that is not building a `$` binding. `cf_alloc` is retired, so a bare `mat_geom`
+# (or a `$`-stack nesting off a geometry) reaching here is an internal error, not a floor fallback.
 const emit_agg_node! = (*Emit ctx, Iarch size): Iarch -> {
 	if !str_eq(ctx.mat_geom, "") && !ctx.alloc_stack then return emit_geom_reserve!(ctx, size)
-	const Iarch t = ctx.next
-	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${t} =l call $cf_alloc(l ${ctx.alloc_node}, w ${size})\n")
-	return t
+	die("cf: emit: internal — a fixed-size aggregate allocation reached the retired cf_alloc floor (no geometry ambient, or a `$`-stack nesting off a geometry)\n")
+	return 0
 }
 # Fold-lite hook placement (geometry_lowering §2, the Materialize stage): in a materialized
 # geometry body, a record construction reserves its bytes through the geometry's own
@@ -5484,80 +5479,6 @@ const emit_arena_qbe! = (Uarch fd, Bool is_bare, Iarch root_size, Bool dyn_g, Ia
 	# address of `$reserve_ret__pg` — so a child grafted from the page follows `parent+32` like any
 	# other parent. Statically relocated by the linker. `l 0` when nothing drafts from the page (pgidx<0).
 	if pgidx >= 0 then write_str(fd, "export data $cf_page = { l 0, l 0, l 0, l 0, l $f${pgidx}, l 0, l 0, l 0, l 0, l 0, l 0, l 0 }\n") else write_str(fd, "export data $cf_page = { l 0, l 0, l 0, l 0, l 0, l 0, l 0, l 0, l 0, l 0, l 0, l 0 }\n")
-	write_str(fd, "function l $cf_alloc(l %node, w %n) {\n")
-	write_str(fd, "@start\n")
-	write_str(fd, "\t%r7 =w add %n, 7\n")
-	write_str(fd, "\t%ra =w and %r7, -8\n")
-	write_str(fd, "\t%sz =l extuw %ra\n")
-	write_str(fd, "\t%kp =l add %node, 32\n")
-	write_str(fd, "\t%kind =l loadl %kp\n")
-	write_str(fd, "\t%isplain =w cultl %kind, 2\n")
-	write_str(fd, "\tjnz %isplain, @up, @ext\n")
-	write_str(fd, "@ext\n")
-	write_str(fd, "\t%isup4 =w ceql %kind, 4\n")
-	write_str(fd, "\tjnz %isup4, @up4, @down\n")
-	# a SHARED-block survivor (kind 4 — a fixed node's up side): the bound is the sibling
-	# RESIDUE cursor at node+48, read directly — the limit FIELD is never mutated after mint,
-	# so a bracket's limit-compare (cf_reset) cannot confuse two-ended boundary drift with an
-	# elastic pull. The sibling header shares the node's cache lines; the load is ~free.
-	write_str(fd, "@up4\n")
-	write_str(fd, "\t%p4 =l loadl %node\n")
-	write_str(fd, "\t%nt4 =l add %p4, %sz\n")
-	write_str(fd, "\t%sib4 =l add %node, 48\n")
-	write_str(fd, "\t%rtop =l loadl %sib4\n")
-	write_str(fd, "\t%ok4 =w culel %nt4, %rtop\n")
-	write_str(fd, "\tjnz %ok4, @up4ok, @oom\n")
-	write_str(fd, "@up4ok\n")
-	write_str(fd, "\tstorel %nt4, %node\n")
-	write_str(fd, "\tret %p4\n")
-	write_str(fd, "@up\n")
-	write_str(fd, "\t%p =l loadl %node\n")
-	write_str(fd, "\t%nt =l add %p, %sz\n")
-	write_str(fd, "\t%limp =l add %node, 16\n")
-	write_str(fd, "\t%lim =l loadl %limp\n")
-	write_str(fd, "\t%ok =w culel %nt, %lim\n")
-	write_str(fd, "\tjnz %ok, @inbounds, @over\n")
-	# a DOWN subnode (kind 2 — a FIXED node's residue side): bump from the tail toward the
-	# shared boundary — the sibling SURVIVOR's cursor at node-48. Each side reads the OTHER's
-	# cursor for its bound and neither ever touches a limit field, so every subnode's limit
-	# stays exactly as minted and the brackets' pulled-since-mark test stays truthful. sz is
-	# 8-rounded and the tail 8-aligned, so the down cursor stays aligned. A two-ended meet
-	# traps: of(n)'s capacity still means n bytes total.
-	write_str(fd, "@down\n")
-	write_str(fd, "\t%dt =l loadl %node\n")
-	write_str(fd, "\t%dn =l sub %dt, %sz\n")
-	write_str(fd, "\t%sib =l sub %node, 48\n")
-	write_str(fd, "\t%stop =l loadl %sib\n")
-	write_str(fd, "\t%dok =w cugel %dn, %stop\n")
-	write_str(fd, "\tjnz %dok, @downok, @oom\n")
-	write_str(fd, "@downok\n")
-	write_str(fd, "\tstorel %dn, %node\n")
-	write_str(fd, "\tret %dn\n")
-	# overflow: an elastic arena (kind 1) pulls a fresh block and allocates from it; else trap
-	write_str(fd, "@over\n")
-	write_str(fd, "\t%elastic =w cnel %kind, 0\n")
-	write_str(fd, "\tjnz %elastic, @pull, @oom\n")
-	write_str(fd, "@pull\n")
-	write_str(fd, "\tcall $cf_arena_pull(l %node, l %sz)\n")
-	write_str(fd, "\t%p2 =l loadl %node\n")
-	write_str(fd, "\t%nt2 =l add %p2, %sz\n")
-	write_str(fd, "\tstorel %nt2, %node\n")
-	write_str(fd, "\tret %p2\n")
-	write_str(fd, "@oom\n")
-	write_str(fd, "\tcall $cf_oom()\n")
-	write_str(fd, "\tret 0\n")
-	write_str(fd, "@inbounds\n")
-	write_str(fd, "\t%commp =l add %node, 8\n")
-	write_str(fd, "\t%comm =l loadl %commp\n")
-	write_str(fd, "\t%need =w cugtl %nt, %comm\n")
-	write_str(fd, "\tjnz %need, @grow, @store\n")
-	write_str(fd, "@grow\n")
-	write_str(fd, "\tcall $cf_grow(l %node, l %nt)\n")
-	write_str(fd, "\tjmp @store\n")
-	write_str(fd, "@store\n")
-	write_str(fd, "\tstorel %nt, %node\n")
-	write_str(fd, "\tret %p\n")
-	write_str(fd, "}\n")
 	# cf_reset(node, top, comm, lim) — rewind a subnode to a saved mark (geometry_lowering §2).
 	# When the subnode's limit is unchanged since the mark (no elastic pull — the overwhelmingly
 	# common case), restoring top alone suffices: page/fixed nodes never move their limit, and
@@ -5580,40 +5501,6 @@ const emit_arena_qbe! = (Uarch fd, Bool is_bare, Iarch root_size, Bool dyn_g, Ia
 	write_str(fd, "@skip\n")
 	write_str(fd, "\tret\n")
 	write_str(fd, "}\n")
-	# cf_arena_pull(node, sz) — an elastic arena's grow step: pull a fresh block (the larger of the
-	# node's `chunk` and the request `sz`) from the parent node and reset {top, committed, limit} to
-	# it. The old block leaks into the parent (no per-object free yet); returned pointers stay valid.
-	write_str(fd, "function $cf_arena_pull(l %node, l %sz) {\n")
-	write_str(fd, "@start\n")
-	write_str(fd, "\t%chunkp =l add %node, 40\n")
-	write_str(fd, "\t%chunk =l loadl %chunkp\n")
-	write_str(fd, "\t%usec =w culel %sz, %chunk\n")
-	write_str(fd, "\tjnz %usec, @c, @s\n")
-	write_str(fd, "@c\n")
-	write_str(fd, "\t%bc =l copy %chunk\n")
-	write_str(fd, "\tjmp @al\n")
-	write_str(fd, "@s\n")
-	write_str(fd, "\t%bs =l copy %sz\n")
-	write_str(fd, "\tjmp @al\n")
-	write_str(fd, "@al\n")
-	write_str(fd, "\t%blksz =l phi @c %bc, @s %bs\n")
-	write_str(fd, "\t%parentp =l add %node, 24\n")
-	write_str(fd, "\t%parent =l loadl %parentp\n")
-	write_str(fd, "\t%bw =w copy %blksz\n")
-	write_str(fd, "\t%block =l call $cf_alloc(l %parent, w %bw)\n")
-	write_str(fd, "\tstorel %block, %node\n")
-	write_str(fd, "\t%end =l add %block, %blksz\n")
-	write_str(fd, "\t%ecommp =l add %node, 8\n")
-	write_str(fd, "\tstorel %end, %ecommp\n")
-	write_str(fd, "\t%elimp =l add %node, 16\n")
-	write_str(fd, "\tstorel %end, %elimp\n")
-	write_str(fd, "\tret\n")
-	write_str(fd, "}\n")
-	# `[T]` grow-in-place append: given the 24-byte header {data@0, len@8, cap@16} and
-	# the element stride, ensure room for one more (amortized doubling: cap 0→4 else
-	# ×2, with a byte-copy of the live elements to a fresh cf_alloc block), then RETURN
-	# the new (len-th) slot address and bump len. The caller stores the element there.
-	emit_dyn_helpers!(fd, false)
 	if dyn_g then emit_dyn_helpers!(fd, true)
 	# cf_str_eq(a, b) — Str value equality (used by string `match`): compare the low word of the
 	# `len@8` slot (LE, matching `cf_str_append`), then the `bytes@0` run byte-for-byte; returns
