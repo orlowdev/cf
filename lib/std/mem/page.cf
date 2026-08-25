@@ -25,43 +25,49 @@
 # (`reserve_ret__pg`, `on_alloc_ret__pg$T`, …).
 
 # Reserve `sz` bytes on the SURVIVOR side (node+0) and hand back the placement address —
-# `on_ret` minus the copy. Kind 4 (a bare two-ended root) bumps up toward the residue cursor
-# and traps on meet; kind 0 (a darwin root lane) bumps toward `limit`, committing more pages
-# through `raw::grow` when it crosses the committed watermark, and traps at reservation end.
+# `on_ret` minus the copy. The root's lane shape is a COMPTIME fact of the target, not a runtime
+# kind read: a Bare root is a two-ended block (survivor bumps up toward the residue cursor, traps
+# on meet); a Darwin root lane bumps toward `limit`, committing more pages through `raw::grow` when
+# it crosses the committed watermark, and traps at reservation end. `comptime_if os::target` folds
+# the winning body at parse, so neither reserve reads `node+32`/`node+80` — those kind slots are
+# free to repurpose as the published reserve entry (the parent draw follows a pointer, not a kind).
 import std::mem::raw
+import std::comptime::os
+import std::sys::{ Os }
 
-const reserve_ret = (Uarch node, Uarch sz): Uarch -> {
-	const Uarch p = raw::load(node)
-	const Uarch nt = p + sz
-	if raw::load(node + 32) == 4 then {
+if os::target == Os.Bare then {
+	const reserve_ret = (Uarch node, Uarch sz): Uarch -> {
+		const Uarch p = raw::load(node)
+		const Uarch nt = p + sz
 		if nt > raw::load(node + 48) then raw::trap()
 		raw::store(node, nt)
 		return p
 	}
-	if nt > raw::load(node + 16) then raw::trap()
-	if nt > raw::load(node + 8) then raw::grow(node, nt)
-	raw::store(node, nt)
-	return p
-}
-
-# Reserve `sz` bytes on the RESIDUE side (node+48) — `on_alloc` minus the copy, for the rare
-# frame-local record on the root. Kind 2 (a bare two-ended root) bumps DOWN toward the
-# survivor cursor and traps on meet; kind 0 (a darwin residue lane) bumps up its own
-# reservation, committing through `raw::grow` and trapping at its own reservation end.
-const reserve_alloc = (Uarch node, Uarch sz): Uarch -> {
-	const Uarch r = node + 48
-	if raw::load(r + 32) == 2 then {
+	const reserve_alloc = (Uarch node, Uarch sz): Uarch -> {
+		const Uarch r = node + 48
 		const Uarch dn = raw::load(r) - sz
 		if dn < raw::load(node) then raw::trap()
 		raw::store(r, dn)
 		return dn
 	}
-	const Uarch p = raw::load(r)
-	const Uarch nt = p + sz
-	if nt > raw::load(r + 16) then raw::trap()
-	if nt > raw::load(r + 8) then raw::grow(r, nt)
-	raw::store(r, nt)
-	return p
+} else {
+	const reserve_ret = (Uarch node, Uarch sz): Uarch -> {
+		const Uarch p = raw::load(node)
+		const Uarch nt = p + sz
+		if nt > raw::load(node + 16) then raw::trap()
+		if nt > raw::load(node + 8) then raw::grow(node, nt)
+		raw::store(node, nt)
+		return p
+	}
+	const reserve_alloc = (Uarch node, Uarch sz): Uarch -> {
+		const Uarch r = node + 48
+		const Uarch p = raw::load(r)
+		const Uarch nt = p + sz
+		if nt > raw::load(r + 16) then raw::trap()
+		if nt > raw::load(r + 8) then raw::grow(r, nt)
+		raw::store(r, nt)
+		return p
+	}
 }
 
 # ── the scope bracket (geometry_lowering §2) ─────────────────────────────────────────────
