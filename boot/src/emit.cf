@@ -2938,13 +2938,13 @@ const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env)
 	# `<geom>::destroy(b)` — the wall-dissolution teardown (geometry_lowering §3): a carved child is
 	# reclaimed by a SURVIVOR REWIND — the child was carved at the parent's survivor cursor, so its
 	# base IS the carve mark; setting the parent's survivor top (`parent+0`, where `parent` is the
-	# child's survivor parent link at `b+24`) back to `b` reclaims the child and everything bumped
+	# child's survivor parent link at `b+16`) back to `b` reclaims the child and everything bumped
 	# after it. Uniform for the bump family (fx/el); user-placed via `defer`.
 	if (str_eq(callee, "destroy__fx") || str_eq(callee, "destroy__el")) && callee_is_intrinsic(ctx, callee) then {
 		const Str bn = emit_expr!(args[0], ctx, env)
 		const Iarch pp = ctx.next
 		ctx.next = ctx.next + 1
-		write_str(ctx.fd, "\t%t${pp} =l add ${bn}, 24\n")
+		write_str(ctx.fd, "\t%t${pp} =l add ${bn}, 16\n")
 		const Iarch par = ctx.next
 		ctx.next = ctx.next + 1
 		write_str(ctx.fd, "\t%t${par} =l loadl %t${pp}\n")
@@ -3941,7 +3941,7 @@ const emit_mark! = (*Emit ctx, Str nodeop): Iarch -> {
 	const Iarch lm = mk + 1
 	const Iarch a1 = mk + 2
 	write_str(ctx.fd, "\t%t${mk} =l loadl ${nodeop}\n")
-	write_str(ctx.fd, "\t%t${a1} =l add ${nodeop}, 16\n")
+	write_str(ctx.fd, "\t%t${a1} =l add ${nodeop}, 8\n")
 	write_str(ctx.fd, "\t%t${lm} =l loadl %t${a1}\n")
 	return mk
 }
@@ -3971,7 +3971,7 @@ const emit_reset! = (*Emit ctx, Iarch mk, Str nodeop): Iarch -> {
 	ctx.next = ctx.next + 3
 	const Iarch cur = a1 + 1
 	const Iarch same = a1 + 2
-	write_str(ctx.fd, "\t%t${a1} =l add ${nodeop}, 16\n")
+	write_str(ctx.fd, "\t%t${a1} =l add ${nodeop}, 8\n")
 	write_str(ctx.fd, "\t%t${cur} =l loadl %t${a1}\n")
 	write_str(ctx.fd, "\t%t${same} =w ceql %t${cur}, %t${mk + 1}\n")
 	write_str(ctx.fd, "\tjnz %t${same}, @rst${lid}, @rsk${lid}\n")
@@ -5053,7 +5053,7 @@ const emit_func! = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 	ctx.reset_mark = 0 - 1
 	ctx.sur_mark = 0 - 1
 	if fn_brackets(fn) then {
-		write_str(ctx.fd, "\t%res_0 =l add %node_0, 48\n")
+		write_str(ctx.fd, "\t%res_0 =l add %node_0, 40\n")
 		if !str_eq(ctx.mat_geom, "") then {
 			const Iarch afi = find_func(ctx.funcs, "reserve_alloc__${ctx.mat_geom}")
 			if afi < 0 then die("cf: emit: the `${ctx.mat_geom}` geometry module is missing `reserve_alloc__${ctx.mat_geom}` — stale std source?\n")
@@ -5446,31 +5446,29 @@ const emit_dyn_helpers! = (Uarch fd): Iarch -> {
 
 const emit_arena_qbe! = (Uarch fd, Bool is_bare, Iarch root_size, Bool dyn_g, Iarch pgidx): Iarch -> {
 	# a `Bare` target's root is a fixed `root_size`-byte BSS block (`$cf_root`, default 1 MiB) — no
-	# mmap. cf_root_page_init seeds $cf_page over it with committed==limit, so the page reserve bumps within it and
+	# mmap. cf_root_page_init seeds $cf_page over it as a two-ended block (survivor limit == residue top == base+root_size), so the page reserve bumps within it and
 	# traps (cf_oom) at the end. In zero-root mode (root_size 0) the usable region is empty (the floor
 	# sets limit==base), so any allocation traps — but the check rejects page use at compile time first;
 	# the block still needs a non-zero size for a valid `data` symbol, so clamp the reservation to 16.
 	const Iarch dsz = if root_size < 16 then 16 else root_size
 	if is_bare then write_str(fd, "export data $cf_root = { z ${dsz} }\n")
-	# A MemoryNode is now DUPLEX (geometry_lowering §5, the duplex arc): a 96-byte pair of
-	# subnodes, each `{ top@0, committed@8, limit@16, parent@24, kind@32, chunk@40 }`. The
-	# SURVIVOR subnode sits at offset 0 — the bare handle KEEPS its old meaning, so every
-	# allocation path that predates the split lands survivor-side (fail-safe polarity: a site
-	# emit forgets to reroute leaks until node death, never dangles). The RESIDUE subnode sits
-	# at +48 and bumps DOWN from the block's tail; frame/loop brackets reset it. In a SHARED
-	# two-ended block the boundary is the other side's cursor: a residue allocation MAINTAINS
-	# the survivor's `limit` (= the new residue top), so the survivor's hot path stays the
-	# plain load-and-compare. `kind`: 0 = up, fixed bound (the page lanes; committed<limit
-	# grows via cf_root_page_grow), 1 = up, elastic (pull a chunk from the parent), 2 = down, fixed
-	# (two-ended meet traps), 3 = down, elastic (meet pulls an OWN chunk from the parent and
-	# the subnode continues as kind 1 — a private chunk needs no direction). cf_alloc is
-	# NODE-RELATIVE — it bumps whichever subnode it is handed. `$cf_page` is the root's duplex
-	# node (survivor lane + residue lane, two darwin reservations); carved arenas get 96-byte
-	# headers whose subnodes share one two-ended block.
-	# the survivor `kind` slot (5th long, offset 32) holds the page's PUBLISHED reserve entry — the
-	# address of `$reserve_ret__pg` — so a child grafted from the page follows `parent+32` like any
-	# other parent. Statically relocated by the linker. `l 0` when nothing drafts from the page (pgidx<0).
-	if pgidx >= 0 then write_str(fd, "export data $cf_page = { l 0, l 0, l 0, l 0, l $f${pgidx}, l 0, l 0, l 0, l 0, l 0, l 0, l 0 }\n") else write_str(fd, "export data $cf_page = { l 0, l 0, l 0, l 0, l 0, l 0, l 0, l 0, l 0, l 0, l 0, l 0 }\n")
+	# A MemoryNode is DUPLEX (geometry_lowering §5, the duplex arc): a 72-byte pair of subnodes —
+	# survivor `{ top@0, limit@8, parent@16, aux@24, reserve@32 }` (40 bytes) at offset 0, residue
+	# `{ top@40, limit@48, parent@56, aux@64 }` (32 bytes) at +40. The SURVIVOR subnode sits at
+	# offset 0 — the bare handle KEEPS its old meaning, so every allocation path that predates the
+	# split lands survivor-side (fail-safe polarity: a site emit forgets to reroute leaks until node
+	# death, never dangles). The residue bumps toward the block's other end; frame/loop brackets
+	# reset it. `aux` is the one geometry-specific cursor: the page reads it as its COMMITTED
+	# watermark, the elastic arena as its pull CHUNK (never both live — they share the slot); fixed
+	# geometries leave it unused. `reserve` (survivor only, offset 32) holds the node's PUBLISHED
+	# reserve entry — the address of its own `reserve_ret__<geom>` — so a child grafted from this
+	# node as a parent reads `parent+32` and follows the pointer, never inspecting a kind (the closed
+	# `cf_alloc` kind-switch is gone). `$cf_page` is the root's duplex node (survivor lane + residue
+	# lane, two darwin reservations); carved arenas get 72-byte headers.
+	# In the `$cf_page` data below, offset 32 (5th long) is statically relocated to `$f${pgidx}` =
+	# `$reserve_ret__pg` so an arena grafted from the page follows the pointer like any other parent;
+	# `l 0` when nothing drafts from the page (pgidx<0).
+	if pgidx >= 0 then write_str(fd, "export data $cf_page = { l 0, l 0, l 0, l 0, l $f${pgidx}, l 0, l 0, l 0, l 0 }\n") else write_str(fd, "export data $cf_page = { l 0, l 0, l 0, l 0, l 0, l 0, l 0, l 0, l 0 }\n")
 	# (the floor `cf_reset` scope-fold helper is RETIRED — a `!` frame's residue bracket now rewinds
 	# through the geometry's own `on_scope_exit` hook, placed by `emit_reset!`; the survivor-scope
 	# mark rewinds inline. See geometry_lowering §2.)
@@ -5606,7 +5604,7 @@ const emit_argv_qbe! = (Uarch fd, Iarch pgr): Iarch -> {
 const emit_arena_floor! = (Uarch fd, Bool is_bare, Iarch root_size): Iarch -> {
 	# BARE floor (ELF, no OS): `qbe -t arm64` emits SysV symbols with no leading `_`, and ELF uses
 	# `:lo12:` page-offset relocations (vs Mach-O `@PAGE`/`@PAGEOFF`). cf_root_page_init seeds $cf_page over
-	# the static 1 MiB $cf_root (committed==limit ⇒ the page reserve bumps within it and traps at the end);
+	# the static 1 MiB $cf_root (survivor limit == residue top == base+root_size ⇒ the reserve bumps within it and traps at the end);
 	# cf_root_page_grow is a never-reached no-op (a fixed bare root never crosses its committed watermark,
 # but raw::grow still lowers to it); cf_oom halts (no kernel).
 	if is_bare then {
@@ -5620,21 +5618,16 @@ const emit_arena_floor! = (Uarch fd, Bool is_bare, Iarch root_size): Iarch -> {
 		write_str(fd, "\tadrp x12, cf_root\n")
 		write_str(fd, "\tadd x12, x12, :lo12:cf_root\n")
 		write_str(fd, "\tstr x12, [x9]\n")
-		# committed == limit == base + root_size ⇒ a FIXED root (cf_alloc bumps and traps at the end).
-		# `mov` accepts any 64-bit immediate (the assembler expands to movz/movk). root_size 0 ⇒ 0 usable.
+		# survivor limit == residue top == base + root_size ⇒ a FIXED two-ended root (the bumps
+		# meet and trap at the end). `mov` accepts any 64-bit immediate; root_size 0 ⇒ 0 usable.
 		write_str(fd, "\tmov x1, #${root_size}\n")
 		write_str(fd, "\tadd x13, x12, x1\n")
 		write_str(fd, "\tstr x13, [x9, #8]\n")
-		write_str(fd, "\tstr x13, [x9, #16]\n")
-		# the residue lane (duplex, cf_page+48): the SAME BSS block, two-ended — bump DOWN from
-		# base+root_size (kind 2; a meet with the survivor cursor traps). root_size still means
-		# N bytes total; zero-root leaves both lanes empty.
-		write_str(fd, "\tstr x13, [x9, #48]\n")
-		write_str(fd, "\tstr x13, [x9, #56]\n")
-		write_str(fd, "\tmov x14, #2\n")
-		write_str(fd, "\tstr x14, [x9, #80]\n")
-		write_str(fd, "\tmov x14, #4\n")
-		write_str(fd, "\tstr x14, [x9, #32]\n")
+		# the residue lane (duplex, cf_page+40): the SAME BSS block, two-ended — bump DOWN from
+		# base+root_size toward the survivor cursor (a meet traps). root_size still means N bytes
+		# total; zero-root leaves both lanes empty. The reserve slot (+32) keeps its static reloc;
+		# no kind is written (geometry is comptime — the reserves never read one).
+		write_str(fd, "\tstr x13, [x9, #40]\n")
 		write_str(fd, "\tret\n")
 		write_str(fd, "cf_root_page_grow:\n")
 		write_str(fd, "\tret\n")
@@ -5666,18 +5659,18 @@ const emit_arena_floor! = (Uarch fd, Bool is_bare, Iarch root_size): Iarch -> {
 	write_str(fd, "\tmov x16, #74\n")
 	write_str(fd, "\tsvc #0x80\n")
 	write_str(fd, "\tb.cs _cf_mmap_fail\n")
-	# $cf_page.top = base; .committed = base + 256 MiB; .limit = base + 4 GiB
+	# $cf_page.top = base; .limit(+8) = base + 4 GiB; .aux/committed(+24) = base + 256 MiB
 	write_str(fd, "\tadrp x9, _cf_page@PAGE\n")
 	write_str(fd, "\tadd x9, x9, _cf_page@PAGEOFF\n")
 	write_str(fd, "\tstr x12, [x9]\n")
-	write_str(fd, "\tmov x1, #0x10000000\n")
-	write_str(fd, "\tadd x13, x12, x1\n")
-	write_str(fd, "\tstr x13, [x9, #8]\n")
 	write_str(fd, "\tmov x1, #0x100000000\n")
 	write_str(fd, "\tadd x11, x12, x1\n")
-	write_str(fd, "\tstr x11, [x9, #16]\n")
-	# the root RESIDUE lane (duplex, cf_page+48): its own small reservation — 1 GiB PROT_NONE,
-	# 16 MiB committed — an up-bumping kind-0 lane with its own cf_root_page_grow watermark (the root
+	write_str(fd, "\tstr x11, [x9, #8]\n")
+	write_str(fd, "\tmov x1, #0x10000000\n")
+	write_str(fd, "\tadd x13, x12, x1\n")
+	write_str(fd, "\tstr x13, [x9, #24]\n")
+	# the root RESIDUE lane (duplex, cf_page+40): its own small reservation — 1 GiB PROT_NONE,
+	# 16 MiB committed — an up-bumping lane with its own cf_root_page_grow watermark in `aux` (the root
 	# check keeps user residue off the page, so the lane serves only colorless-frame scraps).
 	write_str(fd, "\tmov x0, #0\n")
 	write_str(fd, "\tmov x1, #0x40000000\n")
@@ -5695,18 +5688,18 @@ const emit_arena_floor! = (Uarch fd, Bool is_bare, Iarch root_size): Iarch -> {
 	write_str(fd, "\tmov x16, #74\n")
 	write_str(fd, "\tsvc #0x80\n")
 	write_str(fd, "\tb.cs _cf_mmap_fail\n")
-	write_str(fd, "\tstr x12, [x9, #48]\n")
-	write_str(fd, "\tmov x1, #0x1000000\n")
-	write_str(fd, "\tadd x13, x12, x1\n")
-	write_str(fd, "\tstr x13, [x9, #56]\n")
+	write_str(fd, "\tstr x12, [x9, #40]\n")
 	write_str(fd, "\tmov x1, #0x40000000\n")
 	write_str(fd, "\tadd x11, x12, x1\n")
-	write_str(fd, "\tstr x11, [x9, #64]\n")
+	write_str(fd, "\tstr x11, [x9, #48]\n")
+	write_str(fd, "\tmov x1, #0x1000000\n")
+	write_str(fd, "\tadd x13, x12, x1\n")
+	write_str(fd, "\tstr x13, [x9, #64]\n")
 	write_str(fd, "\tret\n")
 	# cf_root_page_grow(x0 = node, x1 = target): commit up to round_up(target, 256 MiB) via mprotect from the
-	# node's committed watermark; the reservation bound was already checked by the caller.
+	# node's committed watermark (in `aux`, node+24); the reservation bound was already checked by the caller.
 	write_str(fd, "_cf_root_page_grow:\n")
-	write_str(fd, "\tadd x9, x0, #8\n")
+	write_str(fd, "\tadd x9, x0, #24\n")
 	write_str(fd, "\tldr x10, [x9]\n")
 	write_str(fd, "\tmov x11, #0x10000000\n")
 	write_str(fd, "\tsub x12, x11, #1\n")

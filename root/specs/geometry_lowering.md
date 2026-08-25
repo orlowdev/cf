@@ -28,7 +28,7 @@ enacted at the ALLOCATION site — **classification at birth**: a value that
 escapes its frame (returned, yielded, or rehomed into caller-visible memory) is
 born a **survivor**; provably-trapped scratch is born **residue**. The
 separation is spatial, not bookkept. The bump family realizes it as a **duplex
-node** (§5): two subnodes in one 96-byte header, survivors on the handle side,
+node** (§5): two subnodes in one 72-byte header, survivors on the handle side,
 residue on a bracketed side that frames and loops reset — no reclamation path
 can reach a survivor even in principle. The polarity is fail-safe — an unknown
 or unprovable site defaults to survivor, so a classification miss leaks until
@@ -449,9 +449,9 @@ node (see [[memory_model.md]], The `in` clause). To the calling convention the
 handle is **opaque** — only the inlined hooks know the state's layout; the ABI
 just moves a word. In particular the duplex split is **hook-private**: the
 handle IS the survivor subnode (offset 0 keeps its pre-duplex meaning), and the
-residue subnode's `+48` derivation appears only inside floor helpers and folded
+residue subnode's `+40` derivation appears only inside floor helpers and folded
 hook bodies (in the emitted code, a bracketing frame's single
-`%res_0 = %node_0 + 48` prologue line — a folded `on_scope_enter`). No other
+`%res_0 = %node_0 + 40` prologue line — a folded `on_scope_enter`). No other
 code may learn the offsets; a `gc`/`rc` node is free to have a completely
 different interior.
 
@@ -539,7 +539,7 @@ only expose the trigger points.
 
 ### The bump family: `page`, `fixed_arena`, `growing_arena`, `fixed_buffer`
 
-One shared core: the node is a **duplex** — two bump subnodes in one 96-byte
+One shared core: the node is a **duplex** — two bump subnodes in one 72-byte
 header. The **survivor** subnode is the handle itself (offset 0, the pre-duplex
 layout unchanged — fail-safe polarity: an unrouted allocation lands here and
 merely leaks). The **residue** subnode sits behind it; frames and loops bracket
@@ -550,9 +550,16 @@ the block (moving the limit too), so the limit rides along to detect it.
 (`committed` is not part of the mark — the reset never needs it.)
 
 ```
-type BumpSub  = { top: RawPtr, committed: RawPtr, limit: RawPtr,
-                  parent: MemoryNode, kind: Iarch, chunk: Iarch }
-type BumpNode = { survivor: BumpSub, residue: BumpSub }   # the handle points at `survivor`
+type BumpSub  = { top: RawPtr, limit: RawPtr, parent: MemoryNode, aux: Iarch }
+                # aux is the one geometry-specific cursor: the page reads it as its
+                # COMMITTED watermark, the elastic arena as its pull CHUNK (never both
+                # live — they share the slot); fixed geometries leave it unused.
+type BumpNode = { survivor: BumpSub + reserve: RawPtr, residue: BumpSub }
+                # 72 bytes: survivor 40 (its 4 cursors + the published `reserve` entry
+                # at +32), residue 32. The handle points at `survivor` (offset 0).
+                # `reserve` holds the address of this node's own `reserve_ret__<geom>`,
+                # published at construction, so a child drawing from it as a parent
+                # follows `parent+32` (the open parent axis) instead of a kind switch.
 
 # on_scope_enter is FOLDED by emit: it snapshots {top, limit} into temps at scope
 # entry (a pure read of the residue subnode — a bump-family layout invariant), so no
@@ -840,4 +847,4 @@ rewinds through the geometry's own `on_scope_exit` hook (the former `cf_reset` s
 gone). Both were artifacts of incomplete specialization, not runtime necessities: a geometry
 is a comptime fact at every use site, so nothing needs a runtime kind read. What remains of
 the floor is the shared dynamic-collection helpers (which take the reserve as a function
-pointer) and the syscall stubs — all honoring the one 96-byte duplex node layout.
+pointer) and the syscall stubs — all honoring the one 72-byte duplex node layout.

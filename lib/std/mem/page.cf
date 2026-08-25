@@ -5,32 +5,28 @@
 # names it; it simply runs under it. The module is only the value/scope hooks a page-ambient
 # (non-`!`, root-reachable) frame places when the Materialize pass tags it `pg`.
 #
-# The root node is the SAME 96-byte duplex header the whole bump family shares:
+# The root node is the SAME 72-byte duplex header the whole bump family shares:
 #
-#   node+0  survivor { top, committed, limit, parent, kind, chunk }
-#   node+48 residue  { top, committed, limit, parent, kind, chunk }
+#   node+0  survivor { top@0, limit@8, parent@16, aux@24, reserve@32 }   (40 bytes)
+#   node+40 residue  { top@0, limit@8, parent@16, aux@24 }               (32 bytes)
 #
-# but its lanes are seeded per TARGET (the floor's `cf_arena_init`):
-#   - Darwin: both lanes are kind 0 — up-bumping over their OWN mmap reservation, bounded by
-#     `limit`, committing more backing pages via `cf_grow` (→ `raw::grow`) when the cursor
-#     crosses the `committed` watermark. This is the kind the page geometry contributes over
-#     the arena's carved kinds, and the reason `raw::grow` exists.
-#   - Bare: one two-ended BSS block — survivor kind 4 (up, bounded by the residue cursor),
-#     residue kind 2 (down, bounded by the survivor cursor); no growth (fixed root).
+# `aux` is the one geometry-specific cursor: the page reads it as its COMMITTED watermark
+# (the elastic arena reads it as its pull CHUNK — the two are never both live, so they share
+# the slot). `reserve` (survivor only, node+32) holds the node's PUBLISHED reserve entry.
+# Its lanes are seeded per TARGET (the floor's `cf_root_page_init`):
+#   - Darwin: both lanes up-bump over their OWN mmap reservation, bounded by `limit`,
+#     committing more backing pages via `cf_root_page_grow` (→ `raw::grow`) when the cursor
+#     crosses the `aux` (committed) watermark. This is the shape the page geometry contributes
+#     over the arena's carved shapes, and the reason `raw::grow` exists.
+#   - Bare: one two-ended BSS block — survivor up (bounded by the residue cursor), residue
+#     down (bounded by the survivor cursor); no growth (fixed root), no watermark read.
 #
-# The reserves therefore branch on kind, exactly as the `cf_alloc` floor does, so one page
-# body is correct on both targets. What Materialize cannot prove stays on that floor,
-# coherent because both honor this identical layout. Like the other geometries this logic
-# lives in std SOURCE; nothing is `pub` — the compiler places every call by mangled name
-# (`reserve_ret__pg`, `on_alloc_ret__pg$T`, …).
-
-# Reserve `sz` bytes on the SURVIVOR side (node+0) and hand back the placement address —
-# `on_ret` minus the copy. The root's lane shape is a COMPTIME fact of the target, not a runtime
-# kind read: a Bare root is a two-ended block (survivor bumps up toward the residue cursor, traps
-# on meet); a Darwin root lane bumps toward `limit`, committing more pages through `raw::grow` when
-# it crosses the committed watermark, and traps at reservation end. `comptime_if os::target` folds
-# the winning body at parse, so neither reserve reads `node+32`/`node+80` — those kind slots are
-# free to repurpose as the published reserve entry (the parent draw follows a pointer, not a kind).
+# The two lane shapes are a COMPTIME fact of the target, not a runtime kind read: `comptime_if
+# os::target` folds the winning bodies at parse, so neither reserve inspects the node to decide
+# its shape. What Materialize cannot prove stays on the shared bump floor, coherent because
+# both honor this identical layout. Like the other geometries this logic lives in std SOURCE;
+# nothing is `pub` — the compiler places every call by mangled name (`reserve_ret__pg`,
+# `on_alloc_ret__pg$T`, …).
 import std::mem::raw
 import std::comptime::os
 import std::sys::{ Os }
@@ -39,12 +35,12 @@ if os::target == Os.Bare then {
 	const reserve_ret = (Uarch node, Uarch sz): Uarch -> {
 		const Uarch p = raw::load(node)
 		const Uarch nt = p + sz
-		if nt > raw::load(node + 48) then raw::trap()
+		if nt > raw::load(node + 40) then raw::trap()
 		raw::store(node, nt)
 		return p
 	}
 	const reserve_alloc = (Uarch node, Uarch sz): Uarch -> {
-		const Uarch r = node + 48
+		const Uarch r = node + 40
 		const Uarch dn = raw::load(r) - sz
 		if dn < raw::load(node) then raw::trap()
 		raw::store(r, dn)
@@ -54,17 +50,17 @@ if os::target == Os.Bare then {
 	const reserve_ret = (Uarch node, Uarch sz): Uarch -> {
 		const Uarch p = raw::load(node)
 		const Uarch nt = p + sz
-		if nt > raw::load(node + 16) then raw::trap()
-		if nt > raw::load(node + 8) then raw::grow(node, nt)
+		if nt > raw::load(node + 8) then raw::trap()
+		if nt > raw::load(node + 24) then raw::grow(node, nt)
 		raw::store(node, nt)
 		return p
 	}
 	const reserve_alloc = (Uarch node, Uarch sz): Uarch -> {
-		const Uarch r = node + 48
+		const Uarch r = node + 40
 		const Uarch p = raw::load(r)
 		const Uarch nt = p + sz
-		if nt > raw::load(r + 16) then raw::trap()
-		if nt > raw::load(r + 8) then raw::grow(r, nt)
+		if nt > raw::load(r + 8) then raw::trap()
+		if nt > raw::load(r + 24) then raw::grow(r, nt)
 		raw::store(r, nt)
 		return p
 	}
@@ -72,12 +68,13 @@ if os::target == Os.Bare then {
 
 # ── the scope bracket (geometry_lowering §2) ─────────────────────────────────────────────
 # Close a residue scope: rewind the residue side to the saved `{top, limit}` mark (emit
-# snapshots it at entry — the folded `on_scope_enter`). Neither root lane ever pulls — a
-# kind-2 down lane and a kind-0 up lane each only bump their top, so the limit is unchanged and
-# the top is always restored (a kind-0 lane leaves `committed` advanced, so the restore never
-# re-commits). The uniform limit-compare keeps one bump-family body — formerly the floor `cf_reset`.
+# snapshots it at entry — the folded `on_scope_enter`). Neither root lane ever pulls — a bare
+# down lane and a darwin up lane each only bump their top, so the limit is unchanged and the
+# top is always restored (a darwin lane leaves `aux`/committed advanced, so the restore never
+# re-commits). The uniform limit-compare keeps one bump-family body — formerly the floor
+# `cf_reset`. `node+40` is the residue top; `node+48` its limit.
 const on_scope_exit = (Uarch node, Uarch top, Uarch lim): Uarch -> {
-	if raw::load(node + 64) == lim then raw::store(node + 48, top)
+	if raw::load(node + 48) == lim then raw::store(node + 40, top)
 	return 0
 }
 

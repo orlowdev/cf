@@ -39,12 +39,12 @@ _cf_root_page_init:
 	adrp x9, _cf_page@PAGE
 	add x9, x9, _cf_page@PAGEOFF
 	str x12, [x9]
-	mov x1, #0x10000000
-	add x13, x12, x1
-	str x13, [x9, #8]
 	mov x1, #0x100000000
 	add x11, x12, x1
-	str x11, [x9, #16]
+	str x11, [x9, #8]
+	mov x1, #0x10000000
+	add x13, x12, x1
+	str x13, [x9, #24]
 	mov x0, #0
 	mov x1, #0x40000000
 	mov x2, #0
@@ -61,16 +61,16 @@ _cf_root_page_init:
 	mov x16, #74
 	svc #0x80
 	b.cs _cf_mmap_fail
-	str x12, [x9, #48]
-	mov x1, #0x1000000
-	add x13, x12, x1
-	str x13, [x9, #56]
+	str x12, [x9, #40]
 	mov x1, #0x40000000
 	add x11, x12, x1
-	str x11, [x9, #64]
+	str x11, [x9, #48]
+	mov x1, #0x1000000
+	add x13, x12, x1
+	str x13, [x9, #64]
 	ret
 _cf_root_page_grow:
-	add x9, x0, #8
+	add x9, x0, #24
 	ldr x10, [x9]
 	mov x11, #0x10000000
 	sub x12, x11, #1
