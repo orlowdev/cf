@@ -41,38 +41,16 @@ import routing::{ kids!, stmt_exprs! }
 # The pass result: the rewritten program plus the geometry copies — `names[i]` is a copy's
 # function name and `geoms[i]` its tag ("fb"/"fx"/"el"/"pg"); emit consults the pair to pick the hook
 # lowering for exactly those bodies.
-# `fx_parent`/`el_parent` = the PARENT geometry every fixed / elastic arena is carved from, when it
-# is the SAME across the whole program (the arena's parent is a comptime fact of its construction
-# ambient, and every child now carves from the parent's survivor — the `destroy` arc). When set,
-# emit lowers that geometry's `carve`/`pull` `raw::alloc(parent, sz)` to the parent's OWN static
-# `reserve_ret__<parent>` — no `cf_alloc`, no runtime kind dispatch. "" = the geometry is unused OR
-# carved from two different ambients in one program (rare); then those draws stay on `cf_alloc`.
-pub data Mat = { Program prog, [Str] names, [Str] geoms, Str fx_parent, Str el_parent }
+pub data Mat = { Program prog, [Str] names, [Str] geoms }
 
 # The ambient a reach tag names, as a parent geometry: the legacy/root (0) and page (4) tags are
-# both the page root; fb/fx/el are themselves.
+# both the page root; fb/fx/el are themselves. Used only to tell whether an arena is carved from the
+# page ambient (so `reserve_ret__pg` — the page's published entry — must be kept).
 const tag_ambient_name = (Iarch tg): Str -> {
 	if tg == 1 then return "fb"
 	if tg == 2 then return "fx"
 	if tg == 3 then return "el"
 	return "pg"
-}
-
-# Clone the shared carve body `base` (e.g. `carve__fx`) once per immediate parent `P`, naming each
-# `base__P` (`carve__fx__pg`). The clone is byte-identical but for the name; emit reads `P` off the
-# name and lowers the copy's parent draw to `reserve_ret__P`. Absent carve body (geometry unused): skip.
-const mint_carves = ([Func] out, Program prog, Str base, [Str] parents): [Func] -> {
-	const Iarch bi = find_fn(prog.funcs, base)
-	if bi < 0 then return out
-	const Func f = prog.funcs[bi]
-	let [Func] r = out
-	let Iarch i = 0
-	loop {
-		if i >= Iarch(parents.len) then break
-		r = [...r, Func({ name: "${base}__${parents[i]}", is_pub: false, ret_name: f.ret_name, ret_elem: f.ret_elem, params: f.params, body: f.body, is_asm: f.is_asm, asm_body: f.asm_body, is_value: f.is_value, ret_telems: f.ret_telems, typarams: f.typarams, tbounds: f.tbounds, ret_size: f.ret_size, is_intrinsic: f.is_intrinsic })]
-		i = i + 1
-	}
-	return r
 }
 
 # A reference site: the owning function's index, the callee name, the `in` binding (`""` =
@@ -762,7 +740,7 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 	# the LATE bail (byte-identical to the pre-import table) — that decision is deferred to there now,
 	# so the walk always runs (cheap for a non-allocating program).
 	const Iarch mi = find_fn(prog.funcs, "main")
-	if mi < 0 then return Mat({ prog: strip_pg(prog), names: no_strs, geoms: no_strs, fx_parent: "", el_parent: "" })
+	if mi < 0 then return Mat({ prog: strip_pg(prog), names: no_strs, geoms: no_strs })
 	const Bool main_allocs = alloc_body!(prog.funcs[mi].body, prog.unions)
 	# `main([Str] args)` — the pre-main argv bridge builds the `[Str]` on the root page through
 	# `reserve_ret__pg`, so that hook must survive even when the program otherwise materializes
@@ -843,11 +821,10 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 	# the §6 scope fold — until a leak-free one-word elastic mark design lands. The page's
 	# reserve_ret is appended by name only when the page is active, below — not an emit root.)
 	# (`carve__*` are the placed constructor bodies behind the geometry `of` INTRINSICS — the
-	# post-flip module shape; absent names are skipped, so both shapes root cleanly.)
-	# `carve__fx`/`carve__el` are NOT roots — they are minted per immediate parent below
-	# (`carve__fx__pg`, …) so each draws from its own parent's reserve; only the buffer carve
-	# (which draws from no parent) stays a single shared root.
-	const [Str] emit_roots = ["of__fb", "reserve_ret__fb", "reserve_alloc__fb", "on_scope_enter__fb", "on_scope_exit__fb", "of__fx", "reserve_ret__fx", "reserve_alloc__fx", "of__el", "reserve_ret__el", "reserve_alloc__el", "carve__fb"]
+	# post-flip module shape; absent names are skipped, so both shapes root cleanly.) Each carve is a
+	# SINGLE shared root now: its `raw::alloc(parent, sz)` draws follow the parent's PUBLISHED reserve
+	# entry at runtime (parent+32), so no per-parent copy is needed — the parent axis is a pointer.
+	const [Str] emit_roots = ["of__fb", "reserve_ret__fb", "reserve_alloc__fb", "on_scope_enter__fb", "on_scope_exit__fb", "of__fx", "reserve_ret__fx", "reserve_alloc__fx", "carve__fx", "of__el", "reserve_ret__el", "reserve_alloc__el", "carve__el", "carve__fb"]
 	let Iarch er = 0
 	loop {
 		if er >= Iarch(emit_roots.len) then break
@@ -918,19 +895,16 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 	const Bool page_active = Iarch(pgn.len) > 0 || main_allocs
 	# nothing materialized and the page is dormant: strip it back out (byte-identical passthrough).
 	# EXCEPT a `main([Str] args)` program keeps `reserve_ret__pg` alive for the pre-main argv bridge.
-	if Iarch(fbn.len) + Iarch(fxn.len) + Iarch(eln.len) + Iarch(pgn.len) == 0 && !page_active && main_argv then return Mat({ prog: strip_pg_keep_reserve(prog), names: no_strs, geoms: no_strs, fx_parent: "", el_parent: "" })
-	if Iarch(fbn.len) + Iarch(fxn.len) + Iarch(eln.len) + Iarch(pgn.len) == 0 && !page_active then return Mat({ prog: strip_pg(prog), names: no_strs, geoms: no_strs, fx_parent: "", el_parent: "" })
+	if Iarch(fbn.len) + Iarch(fxn.len) + Iarch(eln.len) + Iarch(pgn.len) == 0 && !page_active && main_argv then return Mat({ prog: strip_pg_keep_reserve(prog), names: no_strs, geoms: no_strs })
+	if Iarch(fbn.len) + Iarch(fxn.len) + Iarch(eln.len) + Iarch(pgn.len) == 0 && !page_active then return Mat({ prog: strip_pg(prog), names: no_strs, geoms: no_strs })
 
 	# parent-axis: an arena's parent is a comptime fact of its CONSTRUCTION AMBIENT — the tag the
-	# function holding `of__fx`/`of__el` runs under. Each carve draws only from its IMMEDIATE parent
-	# (the parent's own reserve handles ITS overflow, recursing up the manifold), so we collect, per
-	# constructor, the SET of ambients it is carved from and mint one `carve__<geom>__<parent>` per
-	# pair — each drawing from `reserve_ret__<parent>` (emit reads the parent off the copy's name).
-	# The elastic PULL stays shared (`pull__el`), so it needs a SINGLE parent: `el_parent` is the sole
-	# elastic ambient, or "" when ≥2 (then pulls degrade to `cf_alloc`; the carves are still
-	# specialized). (Loop vars hoisted — runs over every reference site × tag.)
-	let [Str] fx_parents = []
-	let [Str] el_parents = []
+	# function holding `of__fx`/`of__el` runs under. Each carve draws from its IMMEDIATE parent through
+	# the parent's PUBLISHED reserve entry (parent+32, followed as a pointer at runtime), so no
+	# per-parent carve copy is minted anymore. The one thing still needed here: whether any arena is
+	# carved from the PAGE ambient — then `reserve_ret__pg` (the page's published entry) must be kept.
+	# (Loop vars hoisted — runs over every construction site × tag.)
+	let Bool needs_pg_reserve = false
 	let Iarch aps = 0
 	let Iarch apo = 0
 	let Iarch apt = 0
@@ -941,19 +915,12 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 			apt = 0
 			loop {
 				if apt >= 5 then break
-				if reach[apo * 5 + apt] then {
-					if str_eq(sites[aps].callee, "of__fx") && !has_str(fx_parents, tag_ambient_name(apt)) then fx_parents = [...fx_parents, tag_ambient_name(apt)]
-					if str_eq(sites[aps].callee, "of__el") && !has_str(el_parents, tag_ambient_name(apt)) then el_parents = [...el_parents, tag_ambient_name(apt)]
-				}
+				if reach[apo * 5 + apt] && str_eq(tag_ambient_name(apt), "pg") then needs_pg_reserve = true
 				apt = apt + 1
 			}
 		}
 		aps = aps + 1
 	}
-	let Str el_parent = ""
-	if Iarch(el_parents.len) == 1 then el_parent = el_parents[0]
-	# reserve_ret__pg must be kept when ANY carve or the pull draws from the page root.
-	const Bool needs_pg_reserve = has_str(fx_parents, "pg") || has_str(el_parents, "pg")
 
 	# rebuild the table as the reachable variants: legacy originals in table order (bodies with
 	# seed `in b` sites are rewritten so they point at the twins; everything else is SHARED,
@@ -1055,14 +1022,6 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 		if rap < 0 then die("cf: materialize: the page geometry module is missing `reserve_alloc__pg` (stale std source?)\n")
 		out = [...out, prog.funcs[rap]]
 	}
-	# mint one carve copy per immediate parent — `carve__fx__<P>` / `carve__el__<P>` — cloned from the
-	# shared carve body; emit reads the parent `<P>` off the name and lowers the copy's `raw::alloc`
-	# to `reserve_ret__<P>`. of__fx/of__el at a call site pick the copy matching the constructing
-	# ambient. (The clone is byte-identical to the original but for its name — the parent lives only
-	# in the name, so no body surgery.)
-	out = mint_carves(out, prog, "carve__fx", fx_parents)
-	out = mint_carves(out, prog, "carve__el", el_parents)
-
 	# the per-geometry claim-type sets, swept from the minted copies (and pg-main) by name
 	let [Str] tys_fb = []
 	let [Str] tys_fx = []
@@ -1147,7 +1106,5 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 	}
 
 	const Program p2 = Program({ imports: prog.imports, recs: prog.recs, unions: prog.unions, funcs: out, groups: prog.groups })
-	# fx carve is per-immediate-parent (`carve__fx__<P>`), so no whole-program fx_parent is needed;
-	# el_parent remains for the shared `pull__el`.
-	return Mat({ prog: p2, names: cnames, geoms: cgeoms, fx_parent: "", el_parent: el_parent })
+	return Mat({ prog: p2, names: cnames, geoms: cgeoms })
 }

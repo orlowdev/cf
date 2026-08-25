@@ -43,7 +43,7 @@ import astutil::{ is_spread, spread_inner, is_skip, skip_count, is_nested, neste
 # `loop_mark` is the nearest enclosing reset-safe loop's entry mark (same triple shape, or -1 if
 # the nearest loop is not reset-safe) — `break`/`continue` restore it so every path back to the
 # loop head or out of it reclaims the iteration's residue, matching the back-edge rewind.
-data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs, [RecDecl] recs, [UnionDecl] unions, Iarch cur_loop, Iarch cur_slot, Str cur_ret, Iarch reset_mark, Bool fn_ptr, Iarch loop_mark, Bool alloc_stack, Bool in_loop, Iarch stack_used, [RSets] routes, [FnSum] fsums, Iarch cur_fn, Str alloc_node, Str carve_node, Str grow_node, [Str] growok, Iarch mk_env_base, Iarch sur_mark, Iarch loop_sur_mark, [Bool] nodesig, [Bool] fmints, [Str] slits, Str mat_geom, Str fx_parent, Str el_parent }
+data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs, [RecDecl] recs, [UnionDecl] unions, Iarch cur_loop, Iarch cur_slot, Str cur_ret, Iarch reset_mark, Bool fn_ptr, Iarch loop_mark, Bool alloc_stack, Bool in_loop, Iarch stack_used, [RSets] routes, [FnSum] fsums, Iarch cur_fn, Str alloc_node, Str carve_node, Str grow_node, [Str] growok, Iarch mk_env_base, Iarch sur_mark, Iarch loop_sur_mark, [Bool] nodesig, [Bool] fmints, [Str] slits, Str mat_geom }
 
 # A local/parameter in scope: its interned name, `slot`, its `rec_type` (a record/union
 # type name, `"$dyn"`, `"$ptr"`, or `"Str"` — `""` for a word), and `elem` (a dynamic
@@ -2905,9 +2905,8 @@ const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env)
 	# own materialized tag (`""` legacy/root ≡ the page).
 	if str_eq(callee, "of__fx") && callee_is_intrinsic(ctx, callee) then {
 		const Str nv = emit_expr!(args[0], ctx, env)
-		const Str par = if str_eq(ctx.mat_geom, "") then "pg" else ctx.mat_geom
-		const Iarch cfx = find_func(ctx.funcs, "carve__fx__${par}")
-		if cfx < 0 then die("cf: emit: the fixed_arena carve for parent `${par}` (`carve__fx__${par}`) is missing — materialize and emit disagree on the construction ambient\n")
+		const Iarch cfx = find_func(ctx.funcs, "carve__fx")
+		if cfx < 0 then die("cf: emit: the fixed_arena geometry module is missing its placed carve `carve__fx` — stale std source?\n")
 		const Iarch tr = ctx.next
 		ctx.next = ctx.next + 1
 		write_str(ctx.fd, "\t%t${tr} =l call $f${cfx}(l ${ctx.carve_node}, l ${nv})\n")
@@ -2916,9 +2915,8 @@ const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env)
 	}
 	if str_eq(callee, "of__el") && callee_is_intrinsic(ctx, callee) then {
 		const Str gv = emit_expr!(args[0], ctx, env)
-		const Str par = if str_eq(ctx.mat_geom, "") then "pg" else ctx.mat_geom
-		const Iarch cel = find_func(ctx.funcs, "carve__el__${par}")
-		if cel < 0 then die("cf: emit: the growing_arena carve for parent `${par}` (`carve__el__${par}`) is missing — materialize and emit disagree on the construction ambient\n")
+		const Iarch cel = find_func(ctx.funcs, "carve__el")
+		if cel < 0 then die("cf: emit: the growing_arena geometry module is missing its placed carve `carve__el` — stale std source?\n")
 		const Iarch gr = ctx.next
 		ctx.next = ctx.next + 1
 		write_str(ctx.fd, "\t%t${gr} =l call $f${cel}(l ${ctx.grow_node}, l ${gv})\n")
@@ -5835,7 +5833,7 @@ const clo_geom_tag = (Str n): Str -> {
 # `main()` the `_start` floor does nothing before `bl _main`, so those flow straight
 # through. For `main([Str] args)` it first `bl _cf_build_args` to convert `(argc, argv)`
 # into a real cf `[Str]` header (in x0), which QBE reads as `$main`'s argument.
-pub const emit_program! = (Program prog, RouteInfo ri, [Str] mat_names, [Str] mat_geoms, Str fx_parent, Str el_parent, Uarch qbe_fd, Uarch asm_fd, Str target_os, Iarch root_size): Iarch -> {
+pub const emit_program! = (Program prog, RouteInfo ri, [Str] mat_names, [Str] mat_geoms, Uarch qbe_fd, Uarch asm_fd, Str target_os, Iarch root_size): Iarch -> {
 	# a `Bare` target (bare metal / Wasm) links no OS: the root is a static BSS region (no mmap), and
 	# there is no exit syscall — the floor halts. Every other target keeps the darwin mmap/exit floor.
 	# `root_size` sizes the `Bare` root page (ignored off `Bare`, which mmaps its own reserve).
@@ -5886,7 +5884,7 @@ pub const emit_program! = (Program prog, RouteInfo ri, [Str] mat_names, [Str] ma
 		# an asm function is emitted into the floor, not through QBE; an intrinsic has no body at
 		# all — the compiler supplies its behavior at each call site, so it emits no function.
 		if !prog.funcs[i].is_asm && !prog.funcs[i].is_intrinsic then {
-			let Emit ctx = Emit({ fd: qbe_fd, next: 0, label: 0, funcs: prog.funcs, recs: prog.recs, unions: prog.unions, cur_loop: 0 - 1, cur_slot: 0 - 1, cur_ret: "", reset_mark: 0 - 1, fn_ptr: false, loop_mark: 0 - 1, alloc_stack: false, in_loop: false, stack_used: 0, routes: ri.sets, fsums: ri.sums, cur_fn: 0 - 1, alloc_node: "%node_0", carve_node: "%node_0", grow_node: "%node_0", growok: no_names(), mk_env_base: 0 - 1, sur_mark: 0 - 1, loop_sur_mark: 0 - 1, nodesig: nsig, fmints: mts, slits: slt, mat_geom: mat_geom_of(mat_names, mat_geoms, prog.funcs[i].name), fx_parent: fx_parent, el_parent: el_parent })
+			let Emit ctx = Emit({ fd: qbe_fd, next: 0, label: 0, funcs: prog.funcs, recs: prog.recs, unions: prog.unions, cur_loop: 0 - 1, cur_slot: 0 - 1, cur_ret: "", reset_mark: 0 - 1, fn_ptr: false, loop_mark: 0 - 1, alloc_stack: false, in_loop: false, stack_used: 0, routes: ri.sets, fsums: ri.sums, cur_fn: 0 - 1, alloc_node: "%node_0", carve_node: "%node_0", grow_node: "%node_0", growok: no_names(), mk_env_base: 0 - 1, sur_mark: 0 - 1, loop_sur_mark: 0 - 1, nodesig: nsig, fmints: mts, slits: slt, mat_geom: mat_geom_of(mat_names, mat_geoms, prog.funcs[i].name) })
 			emit_func!(&ctx, prog.funcs[i], i)
 		}
 		i = i + 1
