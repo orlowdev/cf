@@ -1456,6 +1456,58 @@ const emit_field_expr! = (*Emit ctx, [Binding] env, Expr base, Str field): Str -
 	return load_field_at!(ctx, b, field_offset(ctx.recs, bt, field), field_scalar(ctx, bt, field))
 }
 
+# ── geometry-aware dynamic growth (aggregate coverage, dynamic half) ──────────────────────
+# The growing collections (`[T]` push, string/interp building) realloc-grow their backing block
+# through the floor `cf_dyn_push`, which allocates the bigger block with `cf_alloc`. In a
+# materialized body that block must come from the geometry's OWN bump half instead — but the grow
+# lives inside a shared floor helper. Rather than mint per-geometry copies, the `_g` floor
+# variants take the geometry's reserve as a FUNCTION POINTER and call it for the grow; emit passes
+# `reserve_ret__<g>` (survivor) or `reserve_alloc__<g>` (residue, when routing flipped alloc_node)
+# and the base node `%node_0` (the reserve computes its own side). Off a geometry every call stays
+# on the shared floor `cf_dyn_push`/`cf_*_append`, byte-identical.
+
+# The reserve function's ADDRESS for the current materialized geometry + side: the per-body
+# prologue temp (`emit_geom_prologue!` below copies the reserve symbols into `%rfsur_0`/`%rfres_0`
+# once at `@start`, so they dominate every push and cost one copy per body, not one per site). The
+# residue temp exists only in a bracketed frame, which is the only place `alloc_node` is flipped to
+# the residue node — so the side selection and the temp's existence agree. Only valid when
+# `ctx.mat_geom != ""`.
+const emit_reserve_fnval = (*Emit ctx): Str -> {
+	if str_eq(ctx.alloc_node, "%res_0") then return "%rfres_0"
+	return "%rfsur_0"
+}
+
+# A grow-in-place push of one `esz`-stride slot onto the `[T]`/`[Uint8]` vector `hdr`, returning
+# the slot address. On a geometry the grow reserves through the geometry's bump half
+# (`cf_dyn_push_g` + the reserve pointer, base node `%node_0`); off it the shared floor `cf_dyn_push`.
+const emit_dyn_push_call! = (*Emit ctx, Str hdr, Iarch esz): Str -> {
+	if str_eq(ctx.mat_geom, "") then {
+		const Iarch slot = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${slot} =l call $cf_dyn_push(l ${ctx.alloc_node}, l ${hdr}, w ${esz})\n")
+		return "%t${slot}"
+	}
+	const Str rf = emit_reserve_fnval(ctx)
+	const Iarch slot = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${slot} =l call $cf_dyn_push_g(l %node_0, l ${hdr}, w ${esz}, l ${rf})\n")
+	return "%t${slot}"
+}
+
+# Append a value's text to interpolation vector `hdr` through floor helper `fn` (`cf_str_append` /
+# `cf_bool_append` / `cf_uint_append` / `cf_int_append` with `vqt`="l", `cf_float_append` with
+# `vqt`="d"). On a geometry the `_g` variant threads the reserve pointer so its internal grows
+# reserve through the geometry too.
+const emit_append_call! = (*Emit ctx, Str fn, Str hdr, Str valop, Str vqt): Iarch -> {
+	if str_eq(ctx.mat_geom, "") then {
+		write_str(ctx.fd, "\tcall $${fn}(l ${ctx.alloc_node}, l ${hdr}, ${vqt} ${valop})\n")
+		return 0
+	}
+	const Str rf = emit_reserve_fnval(ctx)
+	write_str(ctx.fd, "\tcall $${fn}_g(l %node_0, l ${hdr}, ${vqt} ${valop}, l ${rf})\n")
+	return 0
+}
+
 # Push a compile-time byte run (a `Str`'s bytes) onto an interpolation vector `vh` — each byte via
 # `cf_dyn_push` (stride 1). Renders the structural punctuation of a stringified aggregate ("(",
 # ", ", "({ ", "})", ".", …) as well as its type/field/member names.
@@ -1464,10 +1516,8 @@ const emit_lit_str! = (*Emit ctx, Str vh, Str s): Iarch -> {
 	loop {
 		if j >= Iarch(s.len) then break
 		const Iarch b = Iarch(s[j])
-		const Iarch slot = ctx.next
-		ctx.next = ctx.next + 1
-		write_str(ctx.fd, "\t%t${slot} =l call $cf_dyn_push(l ${ctx.alloc_node}, l ${vh}, w 1)\n")
-		write_str(ctx.fd, "\tstoreb ${b}, %t${slot}\n")
+		const Str slot = emit_dyn_push_call!(ctx, vh, 1)
+		write_str(ctx.fd, "\tstoreb ${b}, ${slot}\n")
 		j = j + 1
 	}
 	return 0
@@ -1490,19 +1540,19 @@ const emit_float_append! = (*Emit ctx, Str vh, Str name, Str op): Iarch -> {
 		write_str(ctx.fd, "\t%t${fd} =d exts ${op}\n")
 		dv = "%t${fd}"
 	}
-	write_str(ctx.fd, "\tcall $cf_float_append(l ${ctx.alloc_node}, l ${vh}, d ${dv})\n")
+	emit_append_call!(ctx, "cf_float_append", vh, dv, "d")
 	return 0
 }
 const emit_stringify! = (*Emit ctx, [Binding] env, Str vh, Str name, [TupElem] telems, Str op): Iarch -> {
 	if str_eq(name, "Str") then {
-		write_str(ctx.fd, "\tcall $cf_str_append(l ${ctx.alloc_node}, l ${vh}, l ${op})\n")
+		emit_append_call!(ctx, "cf_str_append", vh, op, "l")
 		return 0
 	}
 	if str_eq(name, "Bool") then {
 		const Iarch bext = ctx.next
 		ctx.next = ctx.next + 1
 		write_str(ctx.fd, "\t%t${bext} =l extsw ${op}\n")
-		write_str(ctx.fd, "\tcall $cf_bool_append(l ${ctx.alloc_node}, l ${vh}, l %t${bext})\n")
+		emit_append_call!(ctx, "cf_bool_append", vh, "%t${bext}", "l")
 		return 0
 	}
 	if str_eq(name, "$tuple") then return emit_stringify_tuple!(ctx, env, vh, telems, op)
@@ -1517,13 +1567,13 @@ const emit_stringify! = (*Emit ctx, [Binding] env, Str vh, Str name, [TupElem] t
 	# an integer leaf: an unsigned fixed prints its magnitude (no sign extension), everything else
 	# (a signed fixed or a plain word) sign-extends then itoa's
 	if is_fixed_name(name) && !fixed_signed(name) then {
-		write_str(ctx.fd, "\tcall $cf_uint_append(l ${ctx.alloc_node}, l ${vh}, l ${op})\n")
+		emit_append_call!(ctx, "cf_uint_append", vh, op, "l")
 		return 0
 	}
 	const Iarch ext = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${ext} =l extsw ${op}\n")
-	write_str(ctx.fd, "\tcall $cf_int_append(l ${ctx.alloc_node}, l ${vh}, l %t${ext})\n")
+	emit_append_call!(ctx, "cf_int_append", vh, "%t${ext}", "l")
 	return 0
 }
 
@@ -1697,9 +1747,7 @@ const emit_stringify_array! = (*Emit ctx, [Binding] env, Str vh, Str elem, Str b
 # (an integer, sign-extended then itoa) — then seal a `{bytes@0, len@8}` Str header
 # borrowing the vector's backing. Returns the header pointer.
 const emit_interp! = (*Emit ctx, [Seg] segs, [Binding] env): Str -> {
-	const Iarch vh = ctx.next
-	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${vh} =l call $cf_alloc(l ${ctx.alloc_node}, w 24)\n")
+	const Iarch vh = emit_agg_node!(ctx, 24)
 	write_str(ctx.fd, "\tstorel 0, %t${vh}\n")
 	const Iarch v8 = ctx.next
 	ctx.next = ctx.next + 1
@@ -1722,12 +1770,12 @@ const emit_interp! = (*Emit ctx, [Seg] segs, [Binding] env): Str -> {
 			const Str hsc = scalar_of!(ctx, env, sg.expr)
 			let [TupElem] notel = []
 			if str_eq(aggt, "Str") then {
-				write_str(ctx.fd, "\tcall $cf_str_append(l ${ctx.alloc_node}, l %t${vh}, l ${hv})\n")
+				emit_append_call!(ctx, "cf_str_append", "%t${vh}", hv, "l")
 			} else if str_eq(hsc, "Bool") then {
 				const Iarch bext = ctx.next
 				ctx.next = ctx.next + 1
 				write_str(ctx.fd, "\t%t${bext} =l extsw ${hv}\n")
-				write_str(ctx.fd, "\tcall $cf_bool_append(l ${ctx.alloc_node}, l %t${vh}, l %t${bext})\n")
+				emit_append_call!(ctx, "cf_bool_append", "%t${vh}", "%t${bext}", "l")
 			} else if str_eq(aggt, "$dyn") then {
 				emit_stringify_array!(ctx, env, "%t${vh}", hole_elem!(ctx, env, sg.expr), hv)
 			} else if str_eq(aggt, "$tuple") || find_rec(ctx.recs, aggt) >= 0 || (find_union(ctx.unions, aggt) >= 0 && union_is_boxed(ctx.unions, aggt)) then {
@@ -1740,17 +1788,15 @@ const emit_interp! = (*Emit ctx, [Seg] segs, [Binding] env): Str -> {
 				const Iarch ext = ctx.next
 				ctx.next = ctx.next + 1
 				write_str(ctx.fd, "\t%t${ext} =l extsw ${hv}\n")
-				write_str(ctx.fd, "\tcall $cf_int_append(l ${ctx.alloc_node}, l %t${vh}, l %t${ext})\n")
+				emit_append_call!(ctx, "cf_int_append", "%t${vh}", "%t${ext}", "l")
 			}
 		} else {
 			let Iarch bj = 0
 			loop {
 				if bj >= Iarch(sg.lit.len) then break
 				const Iarch b = Iarch(sg.lit[bj])
-				const Iarch slot = ctx.next
-				ctx.next = ctx.next + 1
-				write_str(ctx.fd, "\t%t${slot} =l call $cf_dyn_push(l ${ctx.alloc_node}, l %t${vh}, w 1)\n")
-				write_str(ctx.fd, "\tstoreb ${b}, %t${slot}\n")
+				const Str slot = emit_dyn_push_call!(ctx, "%t${vh}", 1)
+				write_str(ctx.fd, "\tstoreb ${b}, ${slot}\n")
 				bj = bj + 1
 			}
 		}
@@ -1767,9 +1813,7 @@ const emit_interp! = (*Emit ctx, [Seg] segs, [Binding] env): Str -> {
 # the `Str(buf, n)` two-argument form (a byte buffer / `[Uint8]` data pointer + a runtime length),
 # the file-read → Str path. Unlike `emit_str_seal` there is no vector header to read len from.
 const emit_str_from_buf! = (*Emit ctx, Str ptr, Str len): Str -> {
-	const Iarch hdr = ctx.next
-	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${hdr} =l call $cf_alloc(l ${ctx.alloc_node}, w 16)\n")
+	const Iarch hdr = emit_agg_node!(ctx, 16)
 	write_str(ctx.fd, "\tstorel ${ptr}, %t${hdr}\n")
 	const Iarch hl = ctx.next
 	ctx.next = ctx.next + 1
@@ -1787,9 +1831,7 @@ const emit_str_seal! = (*Emit ctx, Str vec): Str -> {
 	const Iarch ll = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${ll} =l loadl %t${lp}\n")
-	const Iarch hdr = ctx.next
-	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${hdr} =l call $cf_alloc(l ${ctx.alloc_node}, w 16)\n")
+	const Iarch hdr = emit_agg_node!(ctx, 16)
 	write_str(ctx.fd, "\tstorel %t${data}, %t${hdr}\n")
 	const Iarch hl = ctx.next
 	ctx.next = ctx.next + 1
@@ -3445,9 +3487,7 @@ const emit_array_lit! = (*Emit ctx, [Expr] elems, Str elem_type, [Binding] env):
 # one). Element stride follows `elem_type` (a `[Uint8]` is byte-packed).
 const emit_arraylit_spread! = (*Emit ctx, Expr src, [Expr] elems, Str elem_type, [Binding] env): Str -> {
 	const Iarch esz = elem_bytes(elem_type)
-	const Iarch hdr = ctx.next
-	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${hdr} =l call $cf_alloc(l ${ctx.alloc_node}, w 24)\n")
+	const Iarch hdr = emit_agg_node!(ctx, 24)
 	write_str(ctx.fd, "\tstorel 0, %t${hdr}\n")
 	const Iarch h8 = ctx.next
 	ctx.next = ctx.next + 1
@@ -3494,11 +3534,9 @@ const emit_arraylit_spread! = (*Emit ctx, Expr src, [Expr] elems, Str elem_type,
 	ctx.next = ctx.next + 1
 	if esz == 1 then write_str(ctx.fd, "\t%t${sval} =l loadub %t${saddr}\n")
 	if esz != 1 then write_str(ctx.fd, "\t%t${sval} =l loadl %t${saddr}\n")
-	const Iarch slot = ctx.next
-	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${slot} =l call $cf_dyn_push(l ${ctx.alloc_node}, l %t${hdr}, w ${esz})\n")
-	if esz == 1 then write_str(ctx.fd, "\tstoreb %t${sval}, %t${slot}\n")
-	if esz != 1 then write_str(ctx.fd, "\tstorel %t${sval}, %t${slot}\n")
+	const Str slot = emit_dyn_push_call!(ctx, "%t${hdr}", esz)
+	if esz == 1 then write_str(ctx.fd, "\tstoreb %t${sval}, ${slot}\n")
+	if esz != 1 then write_str(ctx.fd, "\tstorel %t${sval}, ${slot}\n")
 	const Iarch iv2 = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${iv2} =l loadl %t${ci}\n")
@@ -3756,12 +3794,10 @@ const emit_append! = (*Emit ctx, [Binding] env, Str hdr, [Expr] elems, Str elem)
 	loop {
 		if i >= Iarch(elems.len) then break
 		const Str v = emit_expr!(elems[i], ctx, env)
-		const Iarch slot = ctx.next
-		ctx.next = ctx.next + 1
-		write_str(ctx.fd, "\t%t${slot} =l call $cf_dyn_push(l ${ctx.alloc_node}, l ${hdr}, w ${esz})\n")
+		const Str slot = emit_dyn_push_call!(ctx, hdr, esz)
 		# a `[Uint8]` element is one byte (`storeb`); every other rides in an 8-byte slot (`storel`)
-		if esz == 1 then write_str(ctx.fd, "\tstoreb ${v}, %t${slot}\n")
-		if esz != 1 then write_str(ctx.fd, "\tstorel ${v}, %t${slot}\n")
+		if esz == 1 then write_str(ctx.fd, "\tstoreb ${v}, ${slot}\n")
+		if esz != 1 then write_str(ctx.fd, "\tstorel ${v}, ${slot}\n")
 		i = i + 1
 	}
 	return 0
@@ -4961,6 +4997,17 @@ const emit_func! = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 		return 0
 	}
 	write_str(ctx.fd, "@start\n")
+	# a materialized body's dynamic-growth pushes (`cf_dyn_push_g` / `cf_*_append_g`) reserve
+	# through the geometry's bump half via a FUNCTION POINTER; copy the survivor reserve symbol into
+	# `%rfsur_0` once here (it dominates every site, one copy per body). The residue reserve pointer
+	# `%rfres_0` is emitted only for a bracketed frame below — the only frame whose allocations flip
+	# to the residue side, and (crucially) `reserve_alloc__pg` is never kept, but a pg frame never
+	# brackets, so the residue pointer is emitted exactly where its symbol exists.
+	if !str_eq(ctx.mat_geom, "") then {
+		const Iarch sfi = find_func(ctx.funcs, "reserve_ret__${ctx.mat_geom}")
+		if sfi < 0 then die("cf: emit: the `${ctx.mat_geom}` geometry module is missing `reserve_ret__${ctx.mat_geom}` — stale std source?\n")
+		write_str(ctx.fd, "\t%rfsur_0 =l copy $f${sfi}\n")
+	}
 	# per-frame residue bracket (geometry_lowering §2, duplex): every `!` frame derives its
 	# residue subnode once, snapshots its triple at entry, and each `ret` rewinds to it —
 	# reclaiming exactly the frame's trapped scratch (survivors live on the other side).
@@ -4969,6 +5016,11 @@ const emit_func! = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 	ctx.sur_mark = 0 - 1
 	if fn_brackets(fn) then {
 		write_str(ctx.fd, "\t%res_0 =l add %node_0, 48\n")
+		if !str_eq(ctx.mat_geom, "") then {
+			const Iarch afi = find_func(ctx.funcs, "reserve_alloc__${ctx.mat_geom}")
+			if afi < 0 then die("cf: emit: the `${ctx.mat_geom}` geometry module is missing `reserve_alloc__${ctx.mat_geom}` — stale std source?\n")
+			write_str(ctx.fd, "\t%rfres_0 =l copy $f${afi}\n")
+		}
 		ctx.reset_mark = emit_mark!(ctx, "%res_0")
 		if fn_surmarks(ctx, fn) then ctx.sur_mark = emit_mark!(ctx, "%node_0")
 	}
@@ -5050,7 +5102,313 @@ const emit_func! = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 # moves, so returned pointers stay valid (memory_model §8). Records (which may escape via a
 # return) live here; scalars stay in stack slots. (Still the single ambient page — the per-node
 # `%node`/`%ret` ABI and carved arenas are the next arc.)
-const emit_arena_qbe! = (Uarch fd, Bool is_bare, Iarch root_size): Iarch -> {
+# The dynamic-collection floor helpers, in two flavors. `g`=false → the legacy set
+# (`cf_dyn_push` + `cf_*_append`, grow via the runtime-dispatch `cf_alloc`). `g`=true → the
+# `_g` set: each gains an `l %reservefn` param and its grow / internal pushes go through that
+# geometry reserve pointer (aggregate coverage, dynamic half). The two flavors share every
+# other byte, so a materialized body's string/array growth reserves through the geometry
+# while off-geometry code stays byte-identical on the legacy set.
+const emit_dyn_helpers! = (Uarch fd, Bool g): Iarch -> {
+	const Str sfx = if g then "_g" else ""
+	const Str rf = if g then ", l %reservefn" else ""
+	write_str(fd, "function l $cf_dyn_push${sfx}(l %node, l %hdr, w %esize${rf}) {\n")
+	write_str(fd, "@start\n")
+	write_str(fd, "\t%ip =l alloc8 8\n")
+	write_str(fd, "\t%es =l extuw %esize\n")
+	write_str(fd, "\t%hlen =l add %hdr, 8\n")
+	write_str(fd, "\t%hcap =l add %hdr, 16\n")
+	write_str(fd, "\t%len =l loadl %hlen\n")
+	write_str(fd, "\t%cap =l loadl %hcap\n")
+	write_str(fd, "\t%full =w ceql %len, %cap\n")
+	write_str(fd, "\tjnz %full, @grow, @store\n")
+	write_str(fd, "@grow\n")
+	write_str(fd, "\t%dbl =l mul %cap, 2\n")
+	write_str(fd, "\t%z =w ceql %cap, 0\n")
+	write_str(fd, "\t%zl =l extuw %z\n")
+	write_str(fd, "\t%z4 =l mul %zl, 4\n")
+	write_str(fd, "\t%ncap =l add %dbl, %z4\n")
+	write_str(fd, "\t%nbytes =l mul %ncap, %es\n")
+	if !g then write_str(fd, "\t%nbw =w copy %nbytes\n")
+	if !g then write_str(fd, "\t%ndata =l call $cf_alloc(l %node, w %nbw)\n")
+	if g then write_str(fd, "\t%ndata =l call %reservefn(l %node, l %nbytes)\n")
+	write_str(fd, "\t%odata =l loadl %hdr\n")
+	write_str(fd, "\t%obytes =l mul %len, %es\n")
+	write_str(fd, "\tstorel 0, %ip\n")
+	write_str(fd, "@copytop\n")
+	write_str(fd, "\t%ci =l loadl %ip\n")
+	write_str(fd, "\t%cdone =w cugel %ci, %obytes\n")
+	write_str(fd, "\tjnz %cdone, @copydone, @copybody\n")
+	write_str(fd, "@copybody\n")
+	write_str(fd, "\t%src =l add %odata, %ci\n")
+	write_str(fd, "\t%dst =l add %ndata, %ci\n")
+	write_str(fd, "\t%cb =w loadub %src\n")
+	write_str(fd, "\tstoreb %cb, %dst\n")
+	write_str(fd, "\t%ci1 =l add %ci, 1\n")
+	write_str(fd, "\tstorel %ci1, %ip\n")
+	write_str(fd, "\tjmp @copytop\n")
+	write_str(fd, "@copydone\n")
+	write_str(fd, "\tstorel %ndata, %hdr\n")
+	write_str(fd, "\tstorel %ncap, %hcap\n")
+	write_str(fd, "\tjmp @store\n")
+	write_str(fd, "@store\n")
+	write_str(fd, "\t%data =l loadl %hdr\n")
+	write_str(fd, "\t%len2 =l loadl %hlen\n")
+	write_str(fd, "\t%soff =l mul %len2, %es\n")
+	write_str(fd, "\t%slot =l add %data, %soff\n")
+	write_str(fd, "\t%len3 =l add %len2, 1\n")
+	write_str(fd, "\tstorel %len3, %hlen\n")
+	write_str(fd, "\tret %slot\n")
+	write_str(fd, "}\n")
+	# Interpolation append helpers — push a value's TEXT onto a `[Uint8]` vector (via
+	# cf_dyn_push, stride 1). cf_uint_append: unsigned itoa (two-pass extract-then-reverse
+	# over a stack digit buffer). cf_int_append: a sign, then the magnitude. cf_str_append:
+	# a Str's bytes. (Void functions — they mutate the vector and return nothing.)
+	write_str(fd, "function $cf_uint_append${sfx}(l %node, l %vhdr, l %val${rf}) {\n")
+	write_str(fd, "@start\n")
+	write_str(fd, "\t%buf =l alloc4 24\n")
+	write_str(fd, "\t%ip =l alloc8 8\n")
+	write_str(fd, "\t%vp =l alloc8 8\n")
+	write_str(fd, "\tstorel %val, %vp\n")
+	write_str(fd, "\tstorel 0, %ip\n")
+	write_str(fd, "\t%z =w ceql %val, 0\n")
+	write_str(fd, "\tjnz %z, @zero, @extract\n")
+	write_str(fd, "@zero\n")
+	write_str(fd, "\t%sz =l call $cf_dyn_push${sfx}(l %node, l %vhdr, w 1${rf})\n")
+	write_str(fd, "\tstoreb 48, %sz\n")
+	write_str(fd, "\tret\n")
+	write_str(fd, "@extract\n")
+	write_str(fd, "\t%v =l loadl %vp\n")
+	write_str(fd, "\t%done =w ceql %v, 0\n")
+	write_str(fd, "\tjnz %done, @emit, @digit\n")
+	write_str(fd, "@digit\n")
+	write_str(fd, "\t%q =l udiv %v, 10\n")
+	write_str(fd, "\t%r =l urem %v, 10\n")
+	write_str(fd, "\t%rc =w copy %r\n")
+	write_str(fd, "\t%ch =w add %rc, 48\n")
+	write_str(fd, "\t%i =l loadl %ip\n")
+	write_str(fd, "\t%da =l add %buf, %i\n")
+	write_str(fd, "\tstoreb %ch, %da\n")
+	write_str(fd, "\t%i1 =l add %i, 1\n")
+	write_str(fd, "\tstorel %i1, %ip\n")
+	write_str(fd, "\tstorel %q, %vp\n")
+	write_str(fd, "\tjmp @extract\n")
+	write_str(fd, "@emit\n")
+	write_str(fd, "\t%cnt =l loadl %ip\n")
+	write_str(fd, "\tstorel %cnt, %vp\n")
+	write_str(fd, "@eloop\n")
+	write_str(fd, "\t%k =l loadl %vp\n")
+	write_str(fd, "\t%kz =w ceql %k, 0\n")
+	write_str(fd, "\tjnz %kz, @edone, @estep\n")
+	write_str(fd, "@estep\n")
+	write_str(fd, "\t%k1 =l sub %k, 1\n")
+	write_str(fd, "\t%dap =l add %buf, %k1\n")
+	write_str(fd, "\t%dch =w loadub %dap\n")
+	write_str(fd, "\t%es =l call $cf_dyn_push${sfx}(l %node, l %vhdr, w 1${rf})\n")
+	write_str(fd, "\tstoreb %dch, %es\n")
+	write_str(fd, "\tstorel %k1, %vp\n")
+	write_str(fd, "\tjmp @eloop\n")
+	write_str(fd, "@edone\n")
+	write_str(fd, "\tret\n")
+	write_str(fd, "}\n")
+	write_str(fd, "function $cf_int_append${sfx}(l %node, l %vhdr, l %val${rf}) {\n")
+	write_str(fd, "@start\n")
+	write_str(fd, "\t%neg =w csltl %val, 0\n")
+	write_str(fd, "\tjnz %neg, @isneg, @pos\n")
+	write_str(fd, "@isneg\n")
+	write_str(fd, "\t%s =l call $cf_dyn_push${sfx}(l %node, l %vhdr, w 1${rf})\n")
+	write_str(fd, "\tstoreb 45, %s\n")
+	write_str(fd, "\t%nv =l sub 0, %val\n")
+	write_str(fd, "\tcall $cf_uint_append${sfx}(l %node, l %vhdr, l %nv${rf})\n")
+	write_str(fd, "\tret\n")
+	write_str(fd, "@pos\n")
+	write_str(fd, "\tcall $cf_uint_append${sfx}(l %node, l %vhdr, l %val${rf})\n")
+	write_str(fd, "\tret\n")
+	write_str(fd, "}\n")
+	# cf_bool_append(vhdr, val) — append the textual form of a `Bool`: a nonzero word writes
+	# `true` (4 bytes), zero writes `false` (5 bytes), each byte pushed via cf_dyn_push (stride 1).
+	write_str(fd, "function $cf_bool_append${sfx}(l %node, l %vhdr, l %val${rf}) {\n")
+	write_str(fd, "@start\n")
+	write_str(fd, "\t%nz =w cnel %val, 0\n")
+	write_str(fd, "\tjnz %nz, @true, @false\n")
+	write_str(fd, "@true\n")
+	write_str(fd, "\t%t0 =l call $cf_dyn_push${sfx}(l %node, l %vhdr, w 1${rf})\n")
+	write_str(fd, "\tstoreb 116, %t0\n")
+	write_str(fd, "\t%t1 =l call $cf_dyn_push${sfx}(l %node, l %vhdr, w 1${rf})\n")
+	write_str(fd, "\tstoreb 114, %t1\n")
+	write_str(fd, "\t%t2 =l call $cf_dyn_push${sfx}(l %node, l %vhdr, w 1${rf})\n")
+	write_str(fd, "\tstoreb 117, %t2\n")
+	write_str(fd, "\t%t3 =l call $cf_dyn_push${sfx}(l %node, l %vhdr, w 1${rf})\n")
+	write_str(fd, "\tstoreb 101, %t3\n")
+	write_str(fd, "\tret\n")
+	write_str(fd, "@false\n")
+	write_str(fd, "\t%f0 =l call $cf_dyn_push${sfx}(l %node, l %vhdr, w 1${rf})\n")
+	write_str(fd, "\tstoreb 102, %f0\n")
+	write_str(fd, "\t%f1 =l call $cf_dyn_push${sfx}(l %node, l %vhdr, w 1${rf})\n")
+	write_str(fd, "\tstoreb 97, %f1\n")
+	write_str(fd, "\t%f2 =l call $cf_dyn_push${sfx}(l %node, l %vhdr, w 1${rf})\n")
+	write_str(fd, "\tstoreb 108, %f2\n")
+	write_str(fd, "\t%f3 =l call $cf_dyn_push${sfx}(l %node, l %vhdr, w 1${rf})\n")
+	write_str(fd, "\tstoreb 115, %f3\n")
+	write_str(fd, "\t%f4 =l call $cf_dyn_push${sfx}(l %node, l %vhdr, w 1${rf})\n")
+	write_str(fd, "\tstoreb 101, %f4\n")
+	write_str(fd, "\tret\n")
+	write_str(fd, "}\n")
+	# cf_float_append(vhdr, val) — a NAIVE fixed-precision `%f` (no libc dtoa): NaN/±Inf via a bit
+	# type-pun (store double, load long; exponent all-ones), then sign, the integer part (`dtosi` +
+	# cf_uint_append), `.`, and up to 6 fractional digits pulled by multiply-by-10 — trailing zeros
+	# trimmed but always ≥1 digit (`2.0`). Truncates (no rounding) and assumes |val| < 2^63; a shortest
+	# round-trip (Ryū) is a stdlib concern, not this debug renderer.
+	write_str(fd, "function $cf_float_append${sfx}(l %node, l %vhdr, d %val${rf}) {\n")
+	write_str(fd, "@start\n")
+	write_str(fd, "\t%bslot =l alloc8 8\n")
+	write_str(fd, "\tstored %val, %bslot\n")
+	write_str(fd, "\t%bits =l loadl %bslot\n")
+	write_str(fd, "\t%exps =l shr %bits, 52\n")
+	write_str(fd, "\t%exp =l and %exps, 2047\n")
+	write_str(fd, "\t%mant =l and %bits, 4503599627370495\n")
+	write_str(fd, "\t%special =w ceql %exp, 2047\n")
+	write_str(fd, "\tjnz %special, @spec, @finite\n")
+	write_str(fd, "@spec\n")
+	write_str(fd, "\t%isnan =w cnel %mant, 0\n")
+	write_str(fd, "\tjnz %isnan, @nan, @inf\n")
+	write_str(fd, "@nan\n")
+	write_str(fd, "\t%n0 =l call $cf_dyn_push${sfx}(l %node, l %vhdr, w 1${rf})\n")
+	write_str(fd, "\tstoreb 78, %n0\n")
+	write_str(fd, "\t%n1 =l call $cf_dyn_push${sfx}(l %node, l %vhdr, w 1${rf})\n")
+	write_str(fd, "\tstoreb 97, %n1\n")
+	write_str(fd, "\t%n2 =l call $cf_dyn_push${sfx}(l %node, l %vhdr, w 1${rf})\n")
+	write_str(fd, "\tstoreb 78, %n2\n")
+	write_str(fd, "\tret\n")
+	write_str(fd, "@inf\n")
+	write_str(fd, "\t%sgn =l shr %bits, 63\n")
+	write_str(fd, "\tjnz %sgn, @neginf, @posinf\n")
+	write_str(fd, "@neginf\n")
+	write_str(fd, "\t%mm0 =l call $cf_dyn_push${sfx}(l %node, l %vhdr, w 1${rf})\n")
+	write_str(fd, "\tstoreb 45, %mm0\n")
+	write_str(fd, "\tjmp @posinf\n")
+	write_str(fd, "@posinf\n")
+	write_str(fd, "\t%i0 =l call $cf_dyn_push${sfx}(l %node, l %vhdr, w 1${rf})\n")
+	write_str(fd, "\tstoreb 73, %i0\n")
+	write_str(fd, "\t%i1 =l call $cf_dyn_push${sfx}(l %node, l %vhdr, w 1${rf})\n")
+	write_str(fd, "\tstoreb 110, %i1\n")
+	write_str(fd, "\t%i2 =l call $cf_dyn_push${sfx}(l %node, l %vhdr, w 1${rf})\n")
+	write_str(fd, "\tstoreb 102, %i2\n")
+	write_str(fd, "\tret\n")
+	write_str(fd, "@finite\n")
+	write_str(fd, "\t%vs =l alloc8 8\n")
+	write_str(fd, "\tstored %val, %vs\n")
+	write_str(fd, "\t%isneg =w cltd %val, d_0\n")
+	write_str(fd, "\tjnz %isneg, @doneg, @pos\n")
+	write_str(fd, "@doneg\n")
+	write_str(fd, "\t%s0 =l call $cf_dyn_push${sfx}(l %node, l %vhdr, w 1${rf})\n")
+	write_str(fd, "\tstoreb 45, %s0\n")
+	write_str(fd, "\t%vld =d loadd %vs\n")
+	write_str(fd, "\t%vng =d neg %vld\n")
+	write_str(fd, "\tstored %vng, %vs\n")
+	write_str(fd, "\tjmp @pos\n")
+	write_str(fd, "@pos\n")
+	write_str(fd, "\t%vv =d loadd %vs\n")
+	write_str(fd, "\t%ip =l dtosi %vv\n")
+	write_str(fd, "\tcall $cf_uint_append${sfx}(l %node, l %vhdr, l %ip${rf})\n")
+	write_str(fd, "\t%dot =l call $cf_dyn_push${sfx}(l %node, l %vhdr, w 1${rf})\n")
+	write_str(fd, "\tstoreb 46, %dot\n")
+	write_str(fd, "\t%ipf =d sltof %ip\n")
+	write_str(fd, "\t%frac =d sub %vv, %ipf\n")
+	write_str(fd, "\t%fbuf =l alloc4 8\n")
+	write_str(fd, "\t%fs =l alloc8 8\n")
+	write_str(fd, "\tstored %frac, %fs\n")
+	write_str(fd, "\t%ci =l alloc8 8\n")
+	write_str(fd, "\tstorel 0, %ci\n")
+	write_str(fd, "@floop\n")
+	write_str(fd, "\t%i =l loadl %ci\n")
+	write_str(fd, "\t%fdone =w csgel %i, 6\n")
+	write_str(fd, "\tjnz %fdone, @trim, @fstep\n")
+	write_str(fd, "@fstep\n")
+	write_str(fd, "\t%fr =d loadd %fs\n")
+	write_str(fd, "\t%fr10 =d mul %fr, d_10.0\n")
+	write_str(fd, "\t%dg =l dtosi %fr10\n")
+	write_str(fd, "\t%dgc =l add %dg, 48\n")
+	write_str(fd, "\t%faddr =l add %fbuf, %i\n")
+	write_str(fd, "\tstoreb %dgc, %faddr\n")
+	write_str(fd, "\t%dgf =d sltof %dg\n")
+	write_str(fd, "\t%rem =d sub %fr10, %dgf\n")
+	write_str(fd, "\tstored %rem, %fs\n")
+	write_str(fd, "\t%i1f =l add %i, 1\n")
+	write_str(fd, "\tstorel %i1f, %ci\n")
+	write_str(fd, "\tjmp @floop\n")
+	write_str(fd, "@trim\n")
+	write_str(fd, "\t%last =l alloc8 8\n")
+	write_str(fd, "\tstorel -1, %last\n")
+	write_str(fd, "\t%tj =l alloc8 8\n")
+	write_str(fd, "\tstorel 0, %tj\n")
+	write_str(fd, "@tloop\n")
+	write_str(fd, "\t%j =l loadl %tj\n")
+	write_str(fd, "\t%tdone =w csgel %j, 6\n")
+	write_str(fd, "\tjnz %tdone, @emit, @tstep\n")
+	write_str(fd, "@tstep\n")
+	write_str(fd, "\t%ja =l add %fbuf, %j\n")
+	write_str(fd, "\t%jc =w loadub %ja\n")
+	write_str(fd, "\t%isz =w ceqw %jc, 48\n")
+	write_str(fd, "\tjnz %isz, @tskip, @tset\n")
+	write_str(fd, "@tset\n")
+	write_str(fd, "\tstorel %j, %last\n")
+	write_str(fd, "@tskip\n")
+	write_str(fd, "\t%j1 =l add %j, 1\n")
+	write_str(fd, "\tstorel %j1, %tj\n")
+	write_str(fd, "\tjmp @tloop\n")
+	write_str(fd, "@emit\n")
+	write_str(fd, "\t%ln =l loadl %last\n")
+	write_str(fd, "\t%allz =w csltl %ln, 0\n")
+	write_str(fd, "\tjnz %allz, @zero, @digits\n")
+	write_str(fd, "@zero\n")
+	write_str(fd, "\t%z0 =l call $cf_dyn_push${sfx}(l %node, l %vhdr, w 1${rf})\n")
+	write_str(fd, "\tstoreb 48, %z0\n")
+	write_str(fd, "\tret\n")
+	write_str(fd, "@digits\n")
+	write_str(fd, "\t%ei =l alloc8 8\n")
+	write_str(fd, "\tstorel 0, %ei\n")
+	write_str(fd, "@eloop\n")
+	write_str(fd, "\t%e =l loadl %ei\n")
+	write_str(fd, "\t%eend =w csgtl %e, %ln\n")
+	write_str(fd, "\tjnz %eend, @edone, @estep\n")
+	write_str(fd, "@estep\n")
+	write_str(fd, "\t%ea =l add %fbuf, %e\n")
+	write_str(fd, "\t%ec =w loadub %ea\n")
+	write_str(fd, "\t%esl =l call $cf_dyn_push${sfx}(l %node, l %vhdr, w 1${rf})\n")
+	write_str(fd, "\tstoreb %ec, %esl\n")
+	write_str(fd, "\t%e1 =l add %e, 1\n")
+	write_str(fd, "\tstorel %e1, %ei\n")
+	write_str(fd, "\tjmp @eloop\n")
+	write_str(fd, "@edone\n")
+	write_str(fd, "\tret\n")
+	write_str(fd, "}\n")
+	write_str(fd, "function $cf_str_append${sfx}(l %node, l %vhdr, l %str${rf}) {\n")
+	write_str(fd, "@start\n")
+	write_str(fd, "\t%bytes =l loadl %str\n")
+	write_str(fd, "\t%la =l add %str, 8\n")
+	write_str(fd, "\t%lenw =w loadw %la\n")
+	write_str(fd, "\t%len =l extuw %lenw\n")
+	write_str(fd, "\t%ip =l alloc8 8\n")
+	write_str(fd, "\tstorel 0, %ip\n")
+	write_str(fd, "@sloop\n")
+	write_str(fd, "\t%i =l loadl %ip\n")
+	write_str(fd, "\t%d =w cugel %i, %len\n")
+	write_str(fd, "\tjnz %d, @sdone, @sstep\n")
+	write_str(fd, "@sstep\n")
+	write_str(fd, "\t%ba =l add %bytes, %i\n")
+	write_str(fd, "\t%b =w loadub %ba\n")
+	write_str(fd, "\t%sl =l call $cf_dyn_push${sfx}(l %node, l %vhdr, w 1${rf})\n")
+	write_str(fd, "\tstoreb %b, %sl\n")
+	write_str(fd, "\t%i1 =l add %i, 1\n")
+	write_str(fd, "\tstorel %i1, %ip\n")
+	write_str(fd, "\tjmp @sloop\n")
+	write_str(fd, "@sdone\n")
+	write_str(fd, "\tret\n")
+	write_str(fd, "}\n")
+	return 0
+}
+
+const emit_arena_qbe! = (Uarch fd, Bool is_bare, Iarch root_size, Bool dyn_g): Iarch -> {
 	# a `Bare` target's root is a fixed `root_size`-byte BSS block (`$cf_root`, default 1 MiB) — no
 	# mmap. cf_arena_init seeds $cf_page over it with committed==limit, so cf_alloc bumps within it and
 	# traps (cf_oom) at the end. In zero-root mode (root_size 0) the usable region is empty (the floor
@@ -5203,299 +5561,8 @@ const emit_arena_qbe! = (Uarch fd, Bool is_bare, Iarch root_size): Iarch -> {
 	# the element stride, ensure room for one more (amortized doubling: cap 0→4 else
 	# ×2, with a byte-copy of the live elements to a fresh cf_alloc block), then RETURN
 	# the new (len-th) slot address and bump len. The caller stores the element there.
-	write_str(fd, "function l $cf_dyn_push(l %node, l %hdr, w %esize) {\n")
-	write_str(fd, "@start\n")
-	write_str(fd, "\t%ip =l alloc8 8\n")
-	write_str(fd, "\t%es =l extuw %esize\n")
-	write_str(fd, "\t%hlen =l add %hdr, 8\n")
-	write_str(fd, "\t%hcap =l add %hdr, 16\n")
-	write_str(fd, "\t%len =l loadl %hlen\n")
-	write_str(fd, "\t%cap =l loadl %hcap\n")
-	write_str(fd, "\t%full =w ceql %len, %cap\n")
-	write_str(fd, "\tjnz %full, @grow, @store\n")
-	write_str(fd, "@grow\n")
-	write_str(fd, "\t%dbl =l mul %cap, 2\n")
-	write_str(fd, "\t%z =w ceql %cap, 0\n")
-	write_str(fd, "\t%zl =l extuw %z\n")
-	write_str(fd, "\t%z4 =l mul %zl, 4\n")
-	write_str(fd, "\t%ncap =l add %dbl, %z4\n")
-	write_str(fd, "\t%nbytes =l mul %ncap, %es\n")
-	write_str(fd, "\t%nbw =w copy %nbytes\n")
-	write_str(fd, "\t%ndata =l call $cf_alloc(l %node, w %nbw)\n")
-	write_str(fd, "\t%odata =l loadl %hdr\n")
-	write_str(fd, "\t%obytes =l mul %len, %es\n")
-	write_str(fd, "\tstorel 0, %ip\n")
-	write_str(fd, "@copytop\n")
-	write_str(fd, "\t%ci =l loadl %ip\n")
-	write_str(fd, "\t%cdone =w cugel %ci, %obytes\n")
-	write_str(fd, "\tjnz %cdone, @copydone, @copybody\n")
-	write_str(fd, "@copybody\n")
-	write_str(fd, "\t%src =l add %odata, %ci\n")
-	write_str(fd, "\t%dst =l add %ndata, %ci\n")
-	write_str(fd, "\t%cb =w loadub %src\n")
-	write_str(fd, "\tstoreb %cb, %dst\n")
-	write_str(fd, "\t%ci1 =l add %ci, 1\n")
-	write_str(fd, "\tstorel %ci1, %ip\n")
-	write_str(fd, "\tjmp @copytop\n")
-	write_str(fd, "@copydone\n")
-	write_str(fd, "\tstorel %ndata, %hdr\n")
-	write_str(fd, "\tstorel %ncap, %hcap\n")
-	write_str(fd, "\tjmp @store\n")
-	write_str(fd, "@store\n")
-	write_str(fd, "\t%data =l loadl %hdr\n")
-	write_str(fd, "\t%len2 =l loadl %hlen\n")
-	write_str(fd, "\t%soff =l mul %len2, %es\n")
-	write_str(fd, "\t%slot =l add %data, %soff\n")
-	write_str(fd, "\t%len3 =l add %len2, 1\n")
-	write_str(fd, "\tstorel %len3, %hlen\n")
-	write_str(fd, "\tret %slot\n")
-	write_str(fd, "}\n")
-	# Interpolation append helpers — push a value's TEXT onto a `[Uint8]` vector (via
-	# cf_dyn_push, stride 1). cf_uint_append: unsigned itoa (two-pass extract-then-reverse
-	# over a stack digit buffer). cf_int_append: a sign, then the magnitude. cf_str_append:
-	# a Str's bytes. (Void functions — they mutate the vector and return nothing.)
-	write_str(fd, "function $cf_uint_append(l %node, l %vhdr, l %val) {\n")
-	write_str(fd, "@start\n")
-	write_str(fd, "\t%buf =l alloc4 24\n")
-	write_str(fd, "\t%ip =l alloc8 8\n")
-	write_str(fd, "\t%vp =l alloc8 8\n")
-	write_str(fd, "\tstorel %val, %vp\n")
-	write_str(fd, "\tstorel 0, %ip\n")
-	write_str(fd, "\t%z =w ceql %val, 0\n")
-	write_str(fd, "\tjnz %z, @zero, @extract\n")
-	write_str(fd, "@zero\n")
-	write_str(fd, "\t%sz =l call $cf_dyn_push(l %node, l %vhdr, w 1)\n")
-	write_str(fd, "\tstoreb 48, %sz\n")
-	write_str(fd, "\tret\n")
-	write_str(fd, "@extract\n")
-	write_str(fd, "\t%v =l loadl %vp\n")
-	write_str(fd, "\t%done =w ceql %v, 0\n")
-	write_str(fd, "\tjnz %done, @emit, @digit\n")
-	write_str(fd, "@digit\n")
-	write_str(fd, "\t%q =l udiv %v, 10\n")
-	write_str(fd, "\t%r =l urem %v, 10\n")
-	write_str(fd, "\t%rc =w copy %r\n")
-	write_str(fd, "\t%ch =w add %rc, 48\n")
-	write_str(fd, "\t%i =l loadl %ip\n")
-	write_str(fd, "\t%da =l add %buf, %i\n")
-	write_str(fd, "\tstoreb %ch, %da\n")
-	write_str(fd, "\t%i1 =l add %i, 1\n")
-	write_str(fd, "\tstorel %i1, %ip\n")
-	write_str(fd, "\tstorel %q, %vp\n")
-	write_str(fd, "\tjmp @extract\n")
-	write_str(fd, "@emit\n")
-	write_str(fd, "\t%cnt =l loadl %ip\n")
-	write_str(fd, "\tstorel %cnt, %vp\n")
-	write_str(fd, "@eloop\n")
-	write_str(fd, "\t%k =l loadl %vp\n")
-	write_str(fd, "\t%kz =w ceql %k, 0\n")
-	write_str(fd, "\tjnz %kz, @edone, @estep\n")
-	write_str(fd, "@estep\n")
-	write_str(fd, "\t%k1 =l sub %k, 1\n")
-	write_str(fd, "\t%dap =l add %buf, %k1\n")
-	write_str(fd, "\t%dch =w loadub %dap\n")
-	write_str(fd, "\t%es =l call $cf_dyn_push(l %node, l %vhdr, w 1)\n")
-	write_str(fd, "\tstoreb %dch, %es\n")
-	write_str(fd, "\tstorel %k1, %vp\n")
-	write_str(fd, "\tjmp @eloop\n")
-	write_str(fd, "@edone\n")
-	write_str(fd, "\tret\n")
-	write_str(fd, "}\n")
-	write_str(fd, "function $cf_int_append(l %node, l %vhdr, l %val) {\n")
-	write_str(fd, "@start\n")
-	write_str(fd, "\t%neg =w csltl %val, 0\n")
-	write_str(fd, "\tjnz %neg, @isneg, @pos\n")
-	write_str(fd, "@isneg\n")
-	write_str(fd, "\t%s =l call $cf_dyn_push(l %node, l %vhdr, w 1)\n")
-	write_str(fd, "\tstoreb 45, %s\n")
-	write_str(fd, "\t%nv =l sub 0, %val\n")
-	write_str(fd, "\tcall $cf_uint_append(l %node, l %vhdr, l %nv)\n")
-	write_str(fd, "\tret\n")
-	write_str(fd, "@pos\n")
-	write_str(fd, "\tcall $cf_uint_append(l %node, l %vhdr, l %val)\n")
-	write_str(fd, "\tret\n")
-	write_str(fd, "}\n")
-	# cf_bool_append(vhdr, val) — append the textual form of a `Bool`: a nonzero word writes
-	# `true` (4 bytes), zero writes `false` (5 bytes), each byte pushed via cf_dyn_push (stride 1).
-	write_str(fd, "function $cf_bool_append(l %node, l %vhdr, l %val) {\n")
-	write_str(fd, "@start\n")
-	write_str(fd, "\t%nz =w cnel %val, 0\n")
-	write_str(fd, "\tjnz %nz, @true, @false\n")
-	write_str(fd, "@true\n")
-	write_str(fd, "\t%t0 =l call $cf_dyn_push(l %node, l %vhdr, w 1)\n")
-	write_str(fd, "\tstoreb 116, %t0\n")
-	write_str(fd, "\t%t1 =l call $cf_dyn_push(l %node, l %vhdr, w 1)\n")
-	write_str(fd, "\tstoreb 114, %t1\n")
-	write_str(fd, "\t%t2 =l call $cf_dyn_push(l %node, l %vhdr, w 1)\n")
-	write_str(fd, "\tstoreb 117, %t2\n")
-	write_str(fd, "\t%t3 =l call $cf_dyn_push(l %node, l %vhdr, w 1)\n")
-	write_str(fd, "\tstoreb 101, %t3\n")
-	write_str(fd, "\tret\n")
-	write_str(fd, "@false\n")
-	write_str(fd, "\t%f0 =l call $cf_dyn_push(l %node, l %vhdr, w 1)\n")
-	write_str(fd, "\tstoreb 102, %f0\n")
-	write_str(fd, "\t%f1 =l call $cf_dyn_push(l %node, l %vhdr, w 1)\n")
-	write_str(fd, "\tstoreb 97, %f1\n")
-	write_str(fd, "\t%f2 =l call $cf_dyn_push(l %node, l %vhdr, w 1)\n")
-	write_str(fd, "\tstoreb 108, %f2\n")
-	write_str(fd, "\t%f3 =l call $cf_dyn_push(l %node, l %vhdr, w 1)\n")
-	write_str(fd, "\tstoreb 115, %f3\n")
-	write_str(fd, "\t%f4 =l call $cf_dyn_push(l %node, l %vhdr, w 1)\n")
-	write_str(fd, "\tstoreb 101, %f4\n")
-	write_str(fd, "\tret\n")
-	write_str(fd, "}\n")
-	# cf_float_append(vhdr, val) — a NAIVE fixed-precision `%f` (no libc dtoa): NaN/±Inf via a bit
-	# type-pun (store double, load long; exponent all-ones), then sign, the integer part (`dtosi` +
-	# cf_uint_append), `.`, and up to 6 fractional digits pulled by multiply-by-10 — trailing zeros
-	# trimmed but always ≥1 digit (`2.0`). Truncates (no rounding) and assumes |val| < 2^63; a shortest
-	# round-trip (Ryū) is a stdlib concern, not this debug renderer.
-	write_str(fd, "function $cf_float_append(l %node, l %vhdr, d %val) {\n")
-	write_str(fd, "@start\n")
-	write_str(fd, "\t%bslot =l alloc8 8\n")
-	write_str(fd, "\tstored %val, %bslot\n")
-	write_str(fd, "\t%bits =l loadl %bslot\n")
-	write_str(fd, "\t%exps =l shr %bits, 52\n")
-	write_str(fd, "\t%exp =l and %exps, 2047\n")
-	write_str(fd, "\t%mant =l and %bits, 4503599627370495\n")
-	write_str(fd, "\t%special =w ceql %exp, 2047\n")
-	write_str(fd, "\tjnz %special, @spec, @finite\n")
-	write_str(fd, "@spec\n")
-	write_str(fd, "\t%isnan =w cnel %mant, 0\n")
-	write_str(fd, "\tjnz %isnan, @nan, @inf\n")
-	write_str(fd, "@nan\n")
-	write_str(fd, "\t%n0 =l call $cf_dyn_push(l %node, l %vhdr, w 1)\n")
-	write_str(fd, "\tstoreb 78, %n0\n")
-	write_str(fd, "\t%n1 =l call $cf_dyn_push(l %node, l %vhdr, w 1)\n")
-	write_str(fd, "\tstoreb 97, %n1\n")
-	write_str(fd, "\t%n2 =l call $cf_dyn_push(l %node, l %vhdr, w 1)\n")
-	write_str(fd, "\tstoreb 78, %n2\n")
-	write_str(fd, "\tret\n")
-	write_str(fd, "@inf\n")
-	write_str(fd, "\t%sgn =l shr %bits, 63\n")
-	write_str(fd, "\tjnz %sgn, @neginf, @posinf\n")
-	write_str(fd, "@neginf\n")
-	write_str(fd, "\t%mm0 =l call $cf_dyn_push(l %node, l %vhdr, w 1)\n")
-	write_str(fd, "\tstoreb 45, %mm0\n")
-	write_str(fd, "\tjmp @posinf\n")
-	write_str(fd, "@posinf\n")
-	write_str(fd, "\t%i0 =l call $cf_dyn_push(l %node, l %vhdr, w 1)\n")
-	write_str(fd, "\tstoreb 73, %i0\n")
-	write_str(fd, "\t%i1 =l call $cf_dyn_push(l %node, l %vhdr, w 1)\n")
-	write_str(fd, "\tstoreb 110, %i1\n")
-	write_str(fd, "\t%i2 =l call $cf_dyn_push(l %node, l %vhdr, w 1)\n")
-	write_str(fd, "\tstoreb 102, %i2\n")
-	write_str(fd, "\tret\n")
-	write_str(fd, "@finite\n")
-	write_str(fd, "\t%vs =l alloc8 8\n")
-	write_str(fd, "\tstored %val, %vs\n")
-	write_str(fd, "\t%isneg =w cltd %val, d_0\n")
-	write_str(fd, "\tjnz %isneg, @doneg, @pos\n")
-	write_str(fd, "@doneg\n")
-	write_str(fd, "\t%s0 =l call $cf_dyn_push(l %node, l %vhdr, w 1)\n")
-	write_str(fd, "\tstoreb 45, %s0\n")
-	write_str(fd, "\t%vld =d loadd %vs\n")
-	write_str(fd, "\t%vng =d neg %vld\n")
-	write_str(fd, "\tstored %vng, %vs\n")
-	write_str(fd, "\tjmp @pos\n")
-	write_str(fd, "@pos\n")
-	write_str(fd, "\t%vv =d loadd %vs\n")
-	write_str(fd, "\t%ip =l dtosi %vv\n")
-	write_str(fd, "\tcall $cf_uint_append(l %node, l %vhdr, l %ip)\n")
-	write_str(fd, "\t%dot =l call $cf_dyn_push(l %node, l %vhdr, w 1)\n")
-	write_str(fd, "\tstoreb 46, %dot\n")
-	write_str(fd, "\t%ipf =d sltof %ip\n")
-	write_str(fd, "\t%frac =d sub %vv, %ipf\n")
-	write_str(fd, "\t%fbuf =l alloc4 8\n")
-	write_str(fd, "\t%fs =l alloc8 8\n")
-	write_str(fd, "\tstored %frac, %fs\n")
-	write_str(fd, "\t%ci =l alloc8 8\n")
-	write_str(fd, "\tstorel 0, %ci\n")
-	write_str(fd, "@floop\n")
-	write_str(fd, "\t%i =l loadl %ci\n")
-	write_str(fd, "\t%fdone =w csgel %i, 6\n")
-	write_str(fd, "\tjnz %fdone, @trim, @fstep\n")
-	write_str(fd, "@fstep\n")
-	write_str(fd, "\t%fr =d loadd %fs\n")
-	write_str(fd, "\t%fr10 =d mul %fr, d_10.0\n")
-	write_str(fd, "\t%dg =l dtosi %fr10\n")
-	write_str(fd, "\t%dgc =l add %dg, 48\n")
-	write_str(fd, "\t%faddr =l add %fbuf, %i\n")
-	write_str(fd, "\tstoreb %dgc, %faddr\n")
-	write_str(fd, "\t%dgf =d sltof %dg\n")
-	write_str(fd, "\t%rem =d sub %fr10, %dgf\n")
-	write_str(fd, "\tstored %rem, %fs\n")
-	write_str(fd, "\t%i1f =l add %i, 1\n")
-	write_str(fd, "\tstorel %i1f, %ci\n")
-	write_str(fd, "\tjmp @floop\n")
-	write_str(fd, "@trim\n")
-	write_str(fd, "\t%last =l alloc8 8\n")
-	write_str(fd, "\tstorel -1, %last\n")
-	write_str(fd, "\t%tj =l alloc8 8\n")
-	write_str(fd, "\tstorel 0, %tj\n")
-	write_str(fd, "@tloop\n")
-	write_str(fd, "\t%j =l loadl %tj\n")
-	write_str(fd, "\t%tdone =w csgel %j, 6\n")
-	write_str(fd, "\tjnz %tdone, @emit, @tstep\n")
-	write_str(fd, "@tstep\n")
-	write_str(fd, "\t%ja =l add %fbuf, %j\n")
-	write_str(fd, "\t%jc =w loadub %ja\n")
-	write_str(fd, "\t%isz =w ceqw %jc, 48\n")
-	write_str(fd, "\tjnz %isz, @tskip, @tset\n")
-	write_str(fd, "@tset\n")
-	write_str(fd, "\tstorel %j, %last\n")
-	write_str(fd, "@tskip\n")
-	write_str(fd, "\t%j1 =l add %j, 1\n")
-	write_str(fd, "\tstorel %j1, %tj\n")
-	write_str(fd, "\tjmp @tloop\n")
-	write_str(fd, "@emit\n")
-	write_str(fd, "\t%ln =l loadl %last\n")
-	write_str(fd, "\t%allz =w csltl %ln, 0\n")
-	write_str(fd, "\tjnz %allz, @zero, @digits\n")
-	write_str(fd, "@zero\n")
-	write_str(fd, "\t%z0 =l call $cf_dyn_push(l %node, l %vhdr, w 1)\n")
-	write_str(fd, "\tstoreb 48, %z0\n")
-	write_str(fd, "\tret\n")
-	write_str(fd, "@digits\n")
-	write_str(fd, "\t%ei =l alloc8 8\n")
-	write_str(fd, "\tstorel 0, %ei\n")
-	write_str(fd, "@eloop\n")
-	write_str(fd, "\t%e =l loadl %ei\n")
-	write_str(fd, "\t%eend =w csgtl %e, %ln\n")
-	write_str(fd, "\tjnz %eend, @edone, @estep\n")
-	write_str(fd, "@estep\n")
-	write_str(fd, "\t%ea =l add %fbuf, %e\n")
-	write_str(fd, "\t%ec =w loadub %ea\n")
-	write_str(fd, "\t%esl =l call $cf_dyn_push(l %node, l %vhdr, w 1)\n")
-	write_str(fd, "\tstoreb %ec, %esl\n")
-	write_str(fd, "\t%e1 =l add %e, 1\n")
-	write_str(fd, "\tstorel %e1, %ei\n")
-	write_str(fd, "\tjmp @eloop\n")
-	write_str(fd, "@edone\n")
-	write_str(fd, "\tret\n")
-	write_str(fd, "}\n")
-	write_str(fd, "function $cf_str_append(l %node, l %vhdr, l %str) {\n")
-	write_str(fd, "@start\n")
-	write_str(fd, "\t%bytes =l loadl %str\n")
-	write_str(fd, "\t%la =l add %str, 8\n")
-	write_str(fd, "\t%lenw =w loadw %la\n")
-	write_str(fd, "\t%len =l extuw %lenw\n")
-	write_str(fd, "\t%ip =l alloc8 8\n")
-	write_str(fd, "\tstorel 0, %ip\n")
-	write_str(fd, "@sloop\n")
-	write_str(fd, "\t%i =l loadl %ip\n")
-	write_str(fd, "\t%d =w cugel %i, %len\n")
-	write_str(fd, "\tjnz %d, @sdone, @sstep\n")
-	write_str(fd, "@sstep\n")
-	write_str(fd, "\t%ba =l add %bytes, %i\n")
-	write_str(fd, "\t%b =w loadub %ba\n")
-	write_str(fd, "\t%sl =l call $cf_dyn_push(l %node, l %vhdr, w 1)\n")
-	write_str(fd, "\tstoreb %b, %sl\n")
-	write_str(fd, "\t%i1 =l add %i, 1\n")
-	write_str(fd, "\tstorel %i1, %ip\n")
-	write_str(fd, "\tjmp @sloop\n")
-	write_str(fd, "@sdone\n")
-	write_str(fd, "\tret\n")
-	write_str(fd, "}\n")
+	emit_dyn_helpers!(fd, false)
+	if dyn_g then emit_dyn_helpers!(fd, true)
 	# cf_str_eq(a, b) — Str value equality (used by string `match`): compare the low word of the
 	# `len@8` slot (LE, matching `cf_str_append`), then the `bytes@0` run byte-for-byte; returns
 	# 1 if equal, 0 otherwise. Length-driven, so an interior NUL and an empty string compare right.
@@ -5814,7 +5881,10 @@ pub const emit_program! = (Program prog, RouteInfo ri, [Str] mat_names, [Str] ma
 	# there is no exit syscall — the floor halts. Every other target keeps the darwin mmap/exit floor.
 	# `root_size` sizes the `Bare` root page (ignored off `Bare`, which mmaps its own reserve).
 	const Bool is_bare = str_eq(target_os, "Bare")
-	emit_arena_qbe!(qbe_fd, is_bare, root_size)
+	# the `_g` dynamic helpers are emitted only when the program has materialized geometry bodies
+	# (they alone reference `cf_dyn_push_g`/`cf_*_append_g`); off them the floor stays byte-identical.
+	const Bool dyn_g = Iarch(mat_names.len) > 0
+	emit_arena_qbe!(qbe_fd, is_bare, root_size, dyn_g)
 	# address-taken functions (used as a value anywhere) are excluded from the flat-return reset — an
 	# indirect call site cannot claim. Computed once for the whole program (geometry_lowering §3).
 	# node-free pruning (geometry_lowering §4): which signatures carry the hidden %node_0
