@@ -1477,6 +1477,25 @@ const emit_reserve_fnval = (*Emit ctx): Str -> {
 	return "%rfsur_0"
 }
 
+# Publish a freshly-carved node's OWN reserve entry into its `kind` slot (`hdr+32`): the address of
+# `reserve_ret__<geom>`, the "how to claim from me" function. A child that later draws from this node
+# as a parent reads `parent+32` and calls it (see the `raw::alloc` lowering) — so the parent's
+# geometry is followed as a pointer, never inspected. Replaces the kind int the carve wrote there;
+# the slot is free since page reserves stopped reading it (comptime target) and every other reserve
+# is monomorphic. `hdr` is the header address the carve returned.
+const emit_publish! = (*Emit ctx, Str hdr, Str geom): Iarch -> {
+	const Iarch ri = find_func(ctx.funcs, "reserve_ret__${geom}")
+	if ri < 0 then die("cf: emit: publishing a `${geom}` node's reserve entry needs `reserve_ret__${geom}`, absent — stale std source?\n")
+	const Iarch ep = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${ep} =l add ${hdr}, 32\n")
+	const Iarch ev = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${ev} =l copy $f${ri}\n")
+	write_str(ctx.fd, "\tstorel %t${ev}, %t${ep}\n")
+	return 0
+}
+
 # A grow-in-place push of one `esz`-stride slot onto the `[T]`/`[Uint8]` vector `hdr`, returning
 # the slot address. On a geometry the grow reserves through the geometry's bump half
 # (`cf_dyn_push_g` + the reserve pointer, base node `%node_0`); off it the shared floor `cf_dyn_push`.
@@ -2897,6 +2916,7 @@ const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env)
 		const Iarch tr = ctx.next
 		ctx.next = ctx.next + 1
 		write_str(ctx.fd, "\t%t${tr} =l call $f${cfx}(l ${ctx.carve_node}, l ${nv})\n")
+		emit_publish!(ctx, "%t${tr}", "fx")
 		return "%t${tr}"
 	}
 	if str_eq(callee, "of__el") && callee_is_intrinsic(ctx, callee) then {
@@ -2907,6 +2927,7 @@ const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env)
 		const Iarch gr = ctx.next
 		ctx.next = ctx.next + 1
 		write_str(ctx.fd, "\t%t${gr} =l call $f${cel}(l ${ctx.grow_node}, l ${gv})\n")
+		emit_publish!(ctx, "%t${gr}", "el")
 		return "%t${gr}"
 	}
 	if str_eq(callee, "of__fb") && callee_is_intrinsic(ctx, callee) then {
@@ -2916,6 +2937,7 @@ const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env)
 		const Iarch bfr = ctx.next
 		ctx.next = ctx.next + 1
 		write_str(ctx.fd, "\t%t${bfr} =l call $f${cfb}(l %node_0, l ${bfv})\n")
+		emit_publish!(ctx, "%t${bfr}", "fb")
 		return "%t${bfr}"
 	}
 	# `<geom>::destroy(b)` — the wall-dissolution teardown (geometry_lowering §3): a carved child is
@@ -2957,49 +2979,32 @@ const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env)
 		write_str(ctx.fd, "\tcall $cf_oom()\n")
 		return ""
 	}
-	# `raw::alloc(node, sz)` — a carve/pull draw from the PARENT node's SURVIVOR side (every child
-	# now carves survivor — the `destroy` arc). The parent's geometry is a comptime fact of the
-	# construction ambient; materialize passes it as the whole-program parent of `fx`/`el`
-	# (`carve__fx` draws from `fx_parent`; `carve__el`/`pull__el` from `el_parent`). When known,
-	# lower the draw to the parent's OWN static `reserve_ret__<P>` — no `cf_alloc`, no kind dispatch,
-	# for ANY parent geometry. `reserve_ret` never rounds, so 8-round `sz` to match the floor
-	# `cf_alloc` and keep the parent cursor aligned. Unknown parent ("" — carved from two ambients)
-	# stays on `cf_alloc`, correct by degrade.
+	# `raw::alloc(parent, sz)` — a carve/pull draw from the PARENT node. At its birth the parent
+	# PUBLISHED its own reserve entry into `parent+32` (`emit_publish!`), so we FOLLOW that pointer
+	# rather than inspect a kind: load `parent+32` and indirect-call it with the 8-rounded size. This
+	# is the whole parent axis — each node knows only how to draw from its immediate parent; the
+	# recursion drains up the manifold one published call at a time (page commits, elastic pulls from
+	# ITS parent, a user geometry does whatever it published), open to any geometry, no closed switch.
+	# `reserve_ret` never rounds, so 8-round `sz` here to keep the parent cursor aligned.
 	if str_eq(callee, "std_mem_raw_alloc") && callee_is_intrinsic(ctx, callee) then {
 		const Str an = emit_expr!(args[0], ctx, env)
 		const Str av = emit_expr!(args[1], ctx, env)
-		# the parent geometry this draw targets: read off a per-parent carve copy's name
-		# (`carve__fx__pg` draws from `reserve_ret__pg`), or `el_parent` for the shared elastic pull.
-		let Str par = ""
-		if ctx.cur_fn >= 0 then {
-			const Str cfn = ctx.funcs[ctx.cur_fn].name
-			if str_eq(cfn, "carve__fx__pg") || str_eq(cfn, "carve__el__pg") then par = "pg"
-			if str_eq(cfn, "carve__fx__fx") || str_eq(cfn, "carve__el__fx") then par = "fx"
-			if str_eq(cfn, "carve__fx__el") || str_eq(cfn, "carve__el__el") then par = "el"
-			if str_eq(cfn, "carve__fx__fb") || str_eq(cfn, "carve__el__fb") then par = "fb"
-			if str_eq(cfn, "pull__el") then par = ctx.el_parent
-		}
-		if !str_eq(par, "") then {
-			const Iarch r7 = ctx.next
-			ctx.next = ctx.next + 1
-			write_str(ctx.fd, "\t%t${r7} =l add ${av}, 7\n")
-			const Iarch rnd = ctx.next
-			ctx.next = ctx.next + 1
-			write_str(ctx.fd, "\t%t${rnd} =l and %t${r7}, -8\n")
-			const Iarch pgi = find_func(ctx.funcs, "reserve_ret__${par}")
-			if pgi < 0 then die("cf: emit: the parent-axis draw needs `reserve_ret__${par}` but it is absent — materialize and emit disagree on the arena parent\n")
-			const Iarch pr = ctx.next
-			ctx.next = ctx.next + 1
-			write_str(ctx.fd, "\t%t${pr} =l call $f${pgi}(l ${an}, l %t${rnd})\n")
-			return "%t${pr}"
-		}
-		const Iarch aw = ctx.next
+		const Iarch r7 = ctx.next
 		ctx.next = ctx.next + 1
-		write_str(ctx.fd, "\t%t${aw} =w copy ${av}\n")
-		const Iarch at = ctx.next
+		write_str(ctx.fd, "\t%t${r7} =l add ${av}, 7\n")
+		const Iarch rnd = ctx.next
 		ctx.next = ctx.next + 1
-		write_str(ctx.fd, "\t%t${at} =l call $cf_alloc(l ${an}, w %t${aw})\n")
-		return "%t${at}"
+		write_str(ctx.fd, "\t%t${rnd} =l and %t${r7}, -8\n")
+		const Iarch ep = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${ep} =l add ${an}, 32\n")
+		const Iarch ev = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${ev} =l loadl %t${ep}\n")
+		const Iarch pr = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${pr} =l call %t${ev}(l ${an}, l %t${rnd})\n")
+		return "%t${pr}"
 	}
 	# `raw::grow(node, target)` — commit more backing pages up to `target` (`$cf_grow`), the
 	# page geometry's kind-0 commit-growth step. The caller checked the reservation bound first.
@@ -5452,7 +5457,7 @@ const emit_dyn_helpers! = (Uarch fd, Bool g): Iarch -> {
 	return 0
 }
 
-const emit_arena_qbe! = (Uarch fd, Bool is_bare, Iarch root_size, Bool dyn_g): Iarch -> {
+const emit_arena_qbe! = (Uarch fd, Bool is_bare, Iarch root_size, Bool dyn_g, Iarch pgidx): Iarch -> {
 	# a `Bare` target's root is a fixed `root_size`-byte BSS block (`$cf_root`, default 1 MiB) — no
 	# mmap. cf_arena_init seeds $cf_page over it with committed==limit, so cf_alloc bumps within it and
 	# traps (cf_oom) at the end. In zero-root mode (root_size 0) the usable region is empty (the floor
@@ -5475,7 +5480,10 @@ const emit_arena_qbe! = (Uarch fd, Bool is_bare, Iarch root_size, Bool dyn_g): I
 	# NODE-RELATIVE — it bumps whichever subnode it is handed. `$cf_page` is the root's duplex
 	# node (survivor lane + residue lane, two darwin reservations); carved arenas get 96-byte
 	# headers whose subnodes share one two-ended block.
-	write_str(fd, "export data $cf_page = { l 0, l 0, l 0, l 0, l 0, l 0, l 0, l 0, l 0, l 0, l 0, l 0 }\n")
+	# the survivor `kind` slot (5th long, offset 32) holds the page's PUBLISHED reserve entry — the
+	# address of `$reserve_ret__pg` — so a child grafted from the page follows `parent+32` like any
+	# other parent. Statically relocated by the linker. `l 0` when nothing drafts from the page (pgidx<0).
+	if pgidx >= 0 then write_str(fd, "export data $cf_page = { l 0, l 0, l 0, l 0, l $f${pgidx}, l 0, l 0, l 0, l 0, l 0, l 0, l 0 }\n") else write_str(fd, "export data $cf_page = { l 0, l 0, l 0, l 0, l 0, l 0, l 0, l 0, l 0, l 0, l 0, l 0 }\n")
 	write_str(fd, "function l $cf_alloc(l %node, w %n) {\n")
 	write_str(fd, "@start\n")
 	write_str(fd, "\t%r7 =w add %n, 7\n")
@@ -5950,7 +5958,11 @@ pub const emit_program! = (Program prog, RouteInfo ri, [Str] mat_names, [Str] ma
 	# `[Str]` through `cf_dyn_push_g` + the page reserve); off both the floor stays byte-identical.
 	const Bool argv_form = main_takes_argv(prog)
 	const Bool dyn_g = Iarch(mat_names.len) > 0 || argv_form
-	emit_arena_qbe!(qbe_fd, is_bare, root_size, dyn_g)
+	# the root page publishes its own reserve entry (`$reserve_ret__pg`) into its `kind` slot statically
+	# in the `$cf_page` data, so an arena grafted from the page follows the pointer like any other
+	# parent. Kept by materialize whenever a child draws from the page; -1 (absent) when nothing does.
+	const Iarch pgidx = find_func(prog.funcs, "reserve_ret__pg")
+	emit_arena_qbe!(qbe_fd, is_bare, root_size, dyn_g, pgidx)
 	# address-taken functions (used as a value anywhere) are excluded from the flat-return reset — an
 	# indirect call site cannot claim. Computed once for the whole program (geometry_lowering §3).
 	# node-free pruning (geometry_lowering §4): which signatures carry the hidden %node_0
