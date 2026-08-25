@@ -1,0 +1,42 @@
+# Stage 4, aggregate coverage: a body materialized under a geometry now reserves EVERY
+# fixed-layout aggregate through the geometry's own bump half (`reserve_ret`/`reserve_alloc`),
+# not just records — arrays (their {data,len,cap} header AND their backing block), tuples, and
+# boxed unions all fold-lite through the hooks, leaving the shared floor `cf_alloc` behind. The
+# same `work!` reached under both `fixed_arena` and `growing_arena` mints a `__fx` twin (whose
+# aggregates bump the survivor toward the residue cursor, no kind test) and a `__el` twin (whose
+# aggregates bump within the block and pull on overflow) — a wrong reserve would trap or read
+# back garbage and break the sum. Both ambients compute the same value independently.
+# expect: exit 0
+import std::mem::arena::fixed_arena
+import std::mem::arena::growing_arena
+
+data Box = { Iarch a, Iarch b }
+union Shape = { Dot, Seg(Iarch, Iarch) }
+
+const work! = (Iarch n): Iarch -> {
+	const [Iarch] xs = [n, n + 1, n + 2, n + 3]
+	const t = (n * 2, n * 3)
+	const Box bx = Box({ a: xs[0], b: xs[3] })
+	const Shape s = Shape.Seg(n, n + 10)
+	let Iarch acc = 0
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(xs.len) then break
+		acc = acc + xs[i]
+		i = i + 1
+	}
+	acc = acc + t[0] + t[1] + bx.a + bx.b
+	acc = acc + match s { Shape.Dot -> 0, Shape.Seg(lo, hi) -> hi - lo }
+	return acc
+}
+
+pub const main = () -> {
+	const fx = fixed_arena::of(4096)
+	const el = growing_arena::of(512)
+	const Iarch a = work!(1) in fx
+	const Iarch b = work!(1) in el
+	if a != b then return 1
+	# xs 1+2+3+4=10, t 2+3=5, bx 1+4=5, seg 10 -> 30
+	if a != 30 then return 2
+	return 0
+}

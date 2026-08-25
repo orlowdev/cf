@@ -1320,9 +1320,7 @@ const emit_field! = (*Emit ctx, [Binding] env, Str base, Str field): Str -> {
 		const Iarch tag = member_tag(ctx.unions, base, field)
 		if !union_is_boxed(ctx.unions, base) then return "${tag}"
 		# a boxed union's tag-only member is still a one-word arena box holding the tag
-		const Iarch b = ctx.next
-		ctx.next = ctx.next + 1
-		write_str(ctx.fd, "\t%t${b} =l call $cf_alloc(l ${ctx.alloc_node}, w 8)\n")
+		const Iarch b = emit_agg_node!(ctx, 8)
 		write_str(ctx.fd, "\tstorel ${tag}, %t${b}\n")
 		return "%t${b}"
 	}
@@ -1385,9 +1383,7 @@ const emit_str_lit! = (*Emit ctx, [Uint8] bytes): Str -> {
 		return "%t${st}"
 	}
 	const Iarch n = Iarch(bytes.len)
-	const Iarch buf = ctx.next
-	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${buf} =l call $cf_alloc(l ${ctx.alloc_node}, w ${n + 1})\n")
+	const Iarch buf = emit_agg_node!(ctx, n + 1)
 	let Iarch i = 0
 	loop {
 		if i >= n then break
@@ -1402,9 +1398,7 @@ const emit_str_lit! = (*Emit ctx, [Uint8] bytes): Str -> {
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${za} =l add %t${buf}, ${n}\n")
 	write_str(ctx.fd, "\tstoreb 0, %t${za}\n")
-	const Iarch hdr = ctx.next
-	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${hdr} =l call $cf_alloc(l ${ctx.alloc_node}, w 16)\n")
+	const Iarch hdr = emit_agg_node!(ctx, 16)
 	write_str(ctx.fd, "\tstorel %t${buf}, %t${hdr}\n")
 	const Iarch hl = ctx.next
 	ctx.next = ctx.next + 1
@@ -1857,10 +1851,33 @@ const emit_agg_alloc! = (*Emit ctx, Iarch size): Iarch -> {
 		ctx.stack_used = ctx.stack_used + size
 		if ctx.stack_used > 262144 then die("cf: emit: this function's `$`-stack use exceeds the 256 KiB per-frame budget — move some scratch into a geometry\n")
 	}
+	if ctx.alloc_stack then {
+		const Iarch t = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${t} =l alloc8 ${size}\n")
+		return t
+	}
+	# fold-lite: in a materialized geometry body a fixed-layout aggregate reserves through the
+	# geometry's own bump half instead of the shared floor `cf_alloc` (aggregate coverage — the
+	# same fusion records already take), so arrays, buffers and every other aggregate built here
+	# leaves `cf_alloc` behind. Off a geometry (`mat_geom == ""`) this is byte-identical to the
+	# old inline `cf_alloc`, so cf's own non-materialized source emits unchanged.
+	if !str_eq(ctx.mat_geom, "") then return emit_geom_reserve!(ctx, size)
 	const Iarch t = ctx.next
 	ctx.next = ctx.next + 1
-	if ctx.alloc_stack then write_str(ctx.fd, "\t%t${t} =l alloc8 ${size}\n")
-	if !ctx.alloc_stack then write_str(ctx.fd, "\t%t${t} =l call $cf_alloc(l ${ctx.alloc_node}, w ${size})\n")
+	write_str(ctx.fd, "\t%t${t} =l call $cf_alloc(l ${ctx.alloc_node}, w ${size})\n")
+	return t
+}
+# The same fold-lite fork for a fixed-size aggregate site that has NO `$`-stack form of its own
+# (a tuple, a boxed union, a fallback string literal): reserve through the geometry hook in a
+# materialized body that is not building a `$` binding, else the shared floor `cf_alloc`. Under
+# `alloc_stack` (a nested aggregate inside a `$` binding) it stays on `cf_alloc` exactly as the
+# old direct sites did, so non-materialized output is byte-identical.
+const emit_agg_node! = (*Emit ctx, Iarch size): Iarch -> {
+	if !str_eq(ctx.mat_geom, "") && !ctx.alloc_stack then return emit_geom_reserve!(ctx, size)
+	const Iarch t = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${t} =l call $cf_alloc(l ${ctx.alloc_node}, w ${size})\n")
 	return t
 }
 # Fold-lite hook placement (geometry_lowering §2, the Materialize stage): in a materialized
@@ -1886,10 +1903,7 @@ const emit_record_lit! = (*Emit ctx, Str type_name, [FieldInit] inits, [Binding]
 	const Iarch ri = find_rec(ctx.recs, type_name)
 	const Iarch nfld = Iarch(ctx.recs[ri].fields.len)
 	const Iarch size = nfld * 8
-	const Bool fused = !str_eq(ctx.mat_geom, "") && !ctx.alloc_stack
-	let Iarch base = 0 - 1
-	if fused then base = emit_geom_reserve!(ctx, size)
-	if !fused then base = emit_agg_alloc!(ctx, size)
+	const Iarch base = emit_agg_alloc!(ctx, size)
 	# a VALUE spread `{ ...src, … }`: fill each field in declaration order — from its override if
 	# present, else COPY the source's word at that offset (typecheck guarantees copied fields are
 	# words, never aliasing pointers). The source's base pointer is the spread value.
@@ -1955,9 +1969,7 @@ const emit_tuple! = (*Emit ctx, [Expr] elems, [Binding] env): Str -> {
 		i = i + 1
 	}
 	const Iarch size = total * 8
-	const Iarch base = ctx.next
-	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${base} =l call $cf_alloc(l ${ctx.alloc_node}, w ${size})\n")
+	const Iarch base = emit_agg_node!(ctx, size)
 	let Iarch pos = 0
 	let Iarch k = 0
 	loop {
@@ -2310,9 +2322,7 @@ const emit_union_mk! = (*Emit ctx, Str type_name, Str member, [Expr] args, [Bind
 	const Iarch tag = member_tag(ctx.unions, type_name, member)
 	const Iarch na = Iarch(args.len)
 	const Iarch size = 8 + na * 8
-	const Iarch b = ctx.next
-	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${b} =l call $cf_alloc(l ${ctx.alloc_node}, w ${size})\n")
+	const Iarch b = emit_agg_node!(ctx, size)
 	write_str(ctx.fd, "\tstorel ${tag}, %t${b}\n")
 	let Iarch i = 0
 	loop {
