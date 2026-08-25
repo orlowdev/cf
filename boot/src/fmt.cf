@@ -11,26 +11,130 @@
 # breaks and canonicalises only indentation, spacing, blank-line runs, comment width, group
 # layout, trailing commas, and top-level ordering.
 #
-# Phase A: an IDENTITY core (reproduce the bytes) plus the read / write-in-place / `--check`
-# plumbing. The real reflow arrives in later phases; the core stays a pure `[Uint8] -> [Uint8]`
-# so the CLI command and the pipeline canonicaliser share one implementation.
+# Phase A: read / write-in-place / `--check` plumbing. Phase B (here): indentation + blank-line
+# runs. The core stays a pure `[Uint8] -> [Uint8]` so the CLI command and the pipeline
+# canonicaliser share one implementation.
 
 import io::{ open, read, write, close, die, eprint, o_rdonly, o_wronly_creat_trunc, mode_644 }
-import token::{ Token, TokKind }
+import token::{ Token, TokKind, is_eof, is_strlit, is_comment, is_lparen, is_rparen, is_lbrace, is_rbrace, is_lbracket, is_rbracket }
 import lexer::{ lex_fmt }
 
-# The formatted bytes of `src[0..n]`. Phase A: a faithful copy. The output is a growing
-# `[Uint8]` so `--check` can compare it against the original in memory without writing. Not
-# `!`: the built vector RIDES OUT to the caller (a survivor), so this frame holds no residue —
-# the residue is the caller's (`format_file!`), which owns the arena.
+# --- token geometry ----------------------------------------------------------
+
+const is_opener = (TokKind k): Bool -> is_lparen(k) || is_lbracket(k) || is_lbrace(k)
+const is_closer = (TokKind k): Bool -> is_rparen(k) || is_rbracket(k) || is_rbrace(k)
+
+# A token's span in the SOURCE buffer. A `StrLit`'s stored (start, len) is the CONTENT between
+# the quotes, so its source span also covers the two quote bytes; every other kind's (start, len)
+# already covers its full source text.
+const src_lo = (Token t): Iarch -> if is_strlit(t.kind) then t.start - 1 else t.start
+const src_hi = (Token t): Iarch -> if is_strlit(t.kind) then t.start + t.len + 1 else t.start + t.len
+
+# Count newline bytes in `src[from..to]`.
+const count_nl = (*[Uint8] src, Iarch from, Iarch to): Iarch -> {
+	let Iarch c = 0
+	let Iarch k = from
+	loop {
+		if k >= to then break
+		if Iarch(src[k]) == 10 then c = c + 1
+		k = k + 1
+	}
+	return c
+}
+
+# The formatted bytes of `src[0..n]`. The whole output vector rides out to the caller (a
+# survivor), so this frame is residue-free and non-`!` — it allocates under the caller's ambient
+# arena (`format_file!`'s), where the returned bytes then live.
+#
+# Phase B (line formatting): reproduce the token stream, but rewrite every line START to `depth`
+# hard tabs (nesting depth over `(){}[]`) and collapse each run of blank lines to a single one.
+# Inter-token spacing WITHIN a line is preserved verbatim — cf's newlines are statement
+# separators, so the user's line breaks stand; only leading indentation and blank runs are
+# canonicalised (both invisible to the lexer, so the output always re-lexes to the same tokens).
+#
+# Every byte append is INLINED on the single `out` local: a `[Uint8]` grows byte-packed only
+# while tracked as element `Uint8`, which a parameter loses (a `[Uint8]` arg stores 8-wide in
+# the callee) — so there are no `([Uint8] out) -> [Uint8]` builder helpers here.
 pub const format_source = (*[Uint8] src, Iarch n): [Uint8] -> {
+	const [Token] toks = lex_fmt(src, n)
 	let [Uint8] out = []
+	let Iarch depth = 0
+	let Bool first = true
 	let Iarch i = 0
 	loop {
-		if i >= n then break
-		out = [...out, src[i]]
+		if i >= Iarch(toks.len) then break
+		const Token t = toks[i]
+		if is_eof(t.kind) then break
+		# whitespace before this token: verbatim within a line, canonical indent across a break
+		if first then first = false
+		else {
+			const Token p = toks[i - 1]
+			const Iarch gfrom = src_hi(p)
+			const Iarch gto = src_lo(t)
+			const Iarch nl = count_nl(src, gfrom, gto)
+			if nl == 0 then {
+				let Iarch k = gfrom
+				loop {
+					if k >= gto then break
+					out = [...out, src[k]]
+					k = k + 1
+				}
+			} else {
+				out = [...out, Uint8(10)]
+				if nl >= 2 then out = [...out, Uint8(10)]
+				let Iarch ind = depth
+				if is_closer(t.kind) then ind = depth - 1
+				if ind < 0 then ind = 0
+				let Iarch ti = 0
+				loop {
+					if ti >= ind then break
+					out = [...out, Uint8(9)]
+					ti = ti + 1
+				}
+			}
+		}
+		# the token's own text — a `StrLit` re-wrapped in its quotes, a `Comment` right-trimmed,
+		# everything else its verbatim source slice (multi-line `asm`/interp strings ride through
+		# untouched: their inner newlines and indentation are string content, never reflowed)
+		if is_strlit(t.kind) then {
+			out = [...out, Uint8(34)]
+			let Iarch k = t.start
+			const Iarch se = t.start + t.len
+			loop {
+				if k >= se then break
+				out = [...out, src[k]]
+				k = k + 1
+			}
+			out = [...out, Uint8(34)]
+		} else if is_comment(t.kind) then {
+			let Iarch e = t.start + t.len
+			loop {
+				if e <= t.start then break
+				const Iarch cb = Iarch(src[e - 1])
+				if cb == 32 || cb == 9 then e = e - 1 else break
+			}
+			let Iarch k = t.start
+			loop {
+				if k >= e then break
+				out = [...out, src[k]]
+				k = k + 1
+			}
+		} else {
+			let Iarch k = t.start
+			const Iarch te = t.start + t.len
+			loop {
+				if k >= te then break
+				out = [...out, src[k]]
+				k = k + 1
+			}
+		}
+		if is_opener(t.kind) then depth = depth + 1
+		if is_closer(t.kind) then depth = depth - 1
 		i = i + 1
 	}
+	# trailing newline. NB: this is a STATEMENT append, not `return [...out, Uint8(10)]` — a
+	# spread in RETURN position corrupts (drops the last byte of) a large survivor array.
+	out = [...out, Uint8(10)]
 	return out
 }
 
