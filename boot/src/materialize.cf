@@ -35,7 +35,7 @@
 
 import io::{ die }
 import cli::{ str_eq }
-import ast::{ Program, Func, Param, Stmt, Expr, FieldInit, Seg, MatchArm, StmtArm, RecDecl }
+import ast::{ Program, Func, Param, Stmt, Expr, FieldInit, Seg, MatchArm, StmtArm, RecDecl, UnionDecl, UnionMember }
 import routing::{ kids!, stmt_exprs! }
 
 # The pass result: the rewritten program plus the geometry copies — `names[i]` is a copy's
@@ -145,7 +145,29 @@ const strip_pg = (Program prog): Program -> {
 # over-included function merely gains a harmless copy; an under-included one stays legacy,
 # which is still correct. `!` names are seeds too (bang-by-propagation frames bracket).
 
-const alloc_expr! = (Expr e): Bool -> {
+# A boxed union (any member carries a payload) — a value of it is a heap pointer, so even a
+# TAG-ONLY member `U.Member` is a one-word box (emit_field! reserves 8 bytes for the tag).
+# A tag-only union rides as a bare word tag and allocates nothing. (Mirrors alloc.cf's
+# `union_boxed`; a non-union base — a record field read — finds no union and counts as false.)
+const union_boxed = ([UnionDecl] unions, Str name): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(unions.len) then break
+		if str_eq(unions[i].name, name) then {
+			let Iarch j = 0
+			loop {
+				if j >= Iarch(unions[i].members.len) then break
+				if Iarch(unions[i].members[j].payloads.len) > 0 then return true
+				j = j + 1
+			}
+			return false
+		}
+		i = i + 1
+	}
+	return false
+}
+
+const alloc_expr! = (Expr e, [UnionDecl] uns): Bool -> {
 	const Bool here = match e {
 		Expr.Record(_, _) -> true,
 		Expr.ArrayLit(_, _, _, _) -> true,
@@ -154,52 +176,56 @@ const alloc_expr! = (Expr e): Bool -> {
 		Expr.StrLit(_) -> true,
 		Expr.Buffer(_) -> true,
 		Expr.UnionMk(_, _, _) -> true,
+		# `U.Member` on a boxed union is a tag-only box (emit_field! reserves 8 bytes) — a
+		# heap construction the syntactic scan would otherwise miss (it reads as a Field, not
+		# a UnionMk), leaving the boxing function unmaterialized and stuck on the `cf_alloc` floor.
+		Expr.Field(b, _) -> union_boxed(uns, b),
 		Expr.Call(n, _, _, _) -> str_eq(n, "Str") || str_eq(n, "of__fx") || str_eq(n, "of__el") || str_eq(n, "of__fb"),
 		_ -> false
 	}
 	if here then return true
 	return match e {
-		Expr.Loop(ss) -> alloc_body!(ss),
-		_ -> alloc_list!(kids!(e))
+		Expr.Loop(ss) -> alloc_body!(ss, uns),
+		_ -> alloc_list!(kids!(e), uns)
 	}
 }
-const alloc_list! = ([Expr] es): Bool -> {
+const alloc_list! = ([Expr] es, [UnionDecl] uns): Bool -> {
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(es.len) then break
-		if alloc_expr!(es[i]) then return true
+		if alloc_expr!(es[i], uns) then return true
 		i = i + 1
 	}
 	return false
 }
-const alloc_stmt! = (Stmt s): Bool -> {
-	if alloc_list!(stmt_exprs!(s)) then return true
+const alloc_stmt! = (Stmt s, [UnionDecl] uns): Bool -> {
+	if alloc_list!(stmt_exprs!(s), uns) then return true
 	return match s {
-		Stmt.IfThen(_, b) -> alloc_stmt!(b),
-		Stmt.IfElse(_, t, el) -> alloc_stmt!(t) || alloc_stmt!(el),
-		Stmt.Block(ss) -> alloc_body!(ss),
-		Stmt.Loop(ss) -> alloc_body!(ss),
-		Stmt.ForIn(_, _, ss) -> alloc_body!(ss),
-		Stmt.Match(_, arms) -> alloc_arms!(arms),
-		Stmt.Defer(ss) -> alloc_body!(ss),
-		Stmt.Closure(_, _, _, cb) -> alloc_body!(cb),
+		Stmt.IfThen(_, b) -> alloc_stmt!(b, uns),
+		Stmt.IfElse(_, t, el) -> alloc_stmt!(t, uns) || alloc_stmt!(el, uns),
+		Stmt.Block(ss) -> alloc_body!(ss, uns),
+		Stmt.Loop(ss) -> alloc_body!(ss, uns),
+		Stmt.ForIn(_, _, ss) -> alloc_body!(ss, uns),
+		Stmt.Match(_, arms) -> alloc_arms!(arms, uns),
+		Stmt.Defer(ss) -> alloc_body!(ss, uns),
+		Stmt.Closure(_, _, _, cb) -> alloc_body!(cb, uns),
 		_ -> false
 	}
 }
-const alloc_arms! = ([StmtArm] arms): Bool -> {
+const alloc_arms! = ([StmtArm] arms, [UnionDecl] uns): Bool -> {
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(arms.len) then break
-		if alloc_body!(arms[i].body) then return true
+		if alloc_body!(arms[i].body, uns) then return true
 		i = i + 1
 	}
 	return false
 }
-const alloc_body! = ([Stmt] ss): Bool -> {
+const alloc_body! = ([Stmt] ss, [UnionDecl] uns): Bool -> {
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(ss.len) then break
-		if alloc_stmt!(ss[i]) then return true
+		if alloc_stmt!(ss[i], uns) then return true
 		i = i + 1
 	}
 	return false
@@ -705,7 +731,7 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 		sites = cs_body!(prog.funcs[i].body, i, sites)
 		gbinds = gb_body(prog.funcs[i].body, i, gbinds)
 		let Bool da = false
-		if !prog.funcs[i].is_asm then da = name_has_bang(prog.funcs[i].name) || alloc_body!(prog.funcs[i].body)
+		if !prog.funcs[i].is_asm then da = name_has_bang(prog.funcs[i].name) || alloc_body!(prog.funcs[i].body, prog.unions)
 		ma = [...ma, da]
 		i = i + 1
 	}
