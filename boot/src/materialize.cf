@@ -263,10 +263,29 @@ const cs_expr! = (Expr e, Iarch fi, [CSite] acc): [CSite] -> {
 		Expr.IndexField(b, _, _) -> { a1 = [...a1, CSite({ fnidx: fi, callee: b, geom: "", direct: false })] },
 		_ -> { }
 	}
+	# A Call's arguments: a bare fn-NAME argument (`apply(sq!, x)`) is a fn-value that the HOF
+	# invokes under the CALL's ambient — so it flows like the callee to the call's geom (`g`),
+	# minting the geometry copy the retarget will point it at. (A non-fn Var arg resolves to no
+	# function and is skipped in the reach walk; other args recurse normally.) This is what closes
+	# the indirect-allocation gap: the callback allocates through the geometry, not the `cf_alloc` floor.
 	return match e {
+		Expr.Call(_, _, cargs, g) -> cs_call_args!(cargs, fi, g, a1),
 		Expr.Loop(ss) -> cs_body!(ss, fi, a1),
 		_ -> cs_list!(kids!(e), fi, a1)
 	}
+}
+const cs_call_args! = ([Expr] args, Iarch fi, Str g, [CSite] acc): [CSite] -> {
+	let [CSite] out = acc
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(args.len) then break
+		match args[i] {
+			Expr.Var(vn) -> { out = [...out, CSite({ fnidx: fi, callee: vn, geom: g, direct: true })] },
+			_ -> { out = cs_expr!(args[i], fi, out) }
+		}
+		i = i + 1
+	}
+	return out
 }
 const cs_list! = ([Expr] es, Iarch fi, [CSite] acc): [CSite] -> {
 	let [CSite] out = acc
@@ -504,8 +523,24 @@ const rt_expr = (Expr e, Rt rc): Expr -> match e {
 	Expr.And(l, r) -> Expr.And(rt_expr(l, rc), rt_expr(r, rc)),
 	Expr.Or(l, r) -> Expr.Or(rt_expr(l, rc), rt_expr(r, rc)),
 	Expr.If(c, t, e2) -> Expr.If(rt_expr(c, rc), rt_expr(t, rc), rt_expr(e2, rc)),
-	Expr.Call(n, ta, args, g) -> Expr.Call(rt_name(n, g, rc), ta, rt_exprs(args, rc), g),
+	Expr.Call(n, ta, args, g) -> Expr.Call(rt_name(n, g, rc), ta, rt_call_args(args, g, rc), g),
 	Expr.DeferTap(fn, args) -> Expr.DeferTap(rt_name(fn, "", rc), rt_exprs(args, rc))
+}
+# Retarget a Call's arguments: a bare fn-NAME argument becomes the copy for the CALL's ambient
+# (`apply(sq!, x) in g` → `apply(sq!__el, x)`), so the HOF invokes the geometry-lowered callback;
+# a non-fn Var passes through `rt_name` unchanged (not in any copy set). Other args recurse normally.
+const rt_call_args = ([Expr] args, Str g, Rt rc): [Expr] -> {
+	let [Expr] out = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(args.len) then break
+		out = [...out, match args[i] {
+			Expr.Var(vn) -> Expr.Var(rt_name(vn, g, rc)),
+			_ -> rt_expr(args[i], rc)
+		}]
+		i = i + 1
+	}
+	return out
 }
 const rt_exprs = ([Expr] es, Rt rc): [Expr] -> {
 	let [Expr] out = []
@@ -1006,15 +1041,19 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 		}
 		cp = cp + 1
 	}
-	# keep the page's `reserve_ret` (the only page hook emit places for a pg body — a page
-	# frame is never `!`, so no residue reserve or scope bracket is ever emitted). It calls
-	# only `mem::raw::*`, so it is a leaf with no further reachability to walk. Also kept when
-	# `main([Str] args)` takes argv (`main_argv`): the pre-main argv bridge (`cf_build_args`) builds
-	# the `[Str]` on the root page and now draws from `reserve_ret__pg` too (emit finds it by name).
+	# keep the page's reserves. `reserve_ret__pg` (survivor) covers a colorless pg frame's records
+	# and the argv bridge; `reserve_alloc__pg` (residue) covers a `!` pg frame — a `!` function
+	# reached under the ROOT page (e.g. a `!` fn-value handed to a bare-from-main HOF, whose residue
+	# the retarget lowers to the page's own residue side, reclaimed by the floor `cf_reset` like an
+	# arena). Both are leaves (only `mem::raw::*`). Also kept when `main([Str] args)` takes argv
+	# (`main_argv`): the pre-main bridge (`cf_build_args`) builds its `[Str]` through `reserve_ret__pg`.
 	if page_active || needs_pg_reserve || main_argv then {
 		const Iarch rrp = find_fn(prog.funcs, "reserve_ret__pg")
 		if rrp < 0 then die("cf: materialize: the page geometry module is missing `reserve_ret__pg` (stale std source?)\n")
 		out = [...out, prog.funcs[rrp]]
+		const Iarch rap = find_fn(prog.funcs, "reserve_alloc__pg")
+		if rap < 0 then die("cf: materialize: the page geometry module is missing `reserve_alloc__pg` (stale std source?)\n")
+		out = [...out, prog.funcs[rap]]
 	}
 	# mint one carve copy per immediate parent — `carve__fx__<P>` / `carve__el__<P>` — cloned from the
 	# shared carve body; emit reads the parent `<P>` off the name and lowers the copy's `raw::alloc`
