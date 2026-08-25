@@ -3500,9 +3500,16 @@ const emit_array_lit! = (*Emit ctx, [Expr] elems, Str elem_type, [Binding] env):
 		write_str(ctx.fd, "\t%t${ca} =l add %t${hdr}, 16\n")
 		write_str(ctx.fd, "\tstorel 0, %t${ca}\n")
 	} else {
+		# The element type: the `[Elem]` annotation when present, else DERIVED from the data — the
+		# first element's scalar type. A return/argument/reassign position leaves `elem_type` "",
+		# and `elem_bytes("")` would silently default the stride to a word (8), mislaying a byte (or
+		# float) array; `scalar_of!` recovers `Uint8`/`Float64` from the element itself. The
+		# annotation still wins when set (a `let [Uint8] x = [65, 66]` whose bare int literals do
+		# not reveal `Uint8` on their own).
 		# a `[Uint8]` element is one byte (`storeb`, stride 1); every other element rides in an
 		# 8-byte slot (`storel`) — a record/Str/[T]/union pointer, or a word in the low half.
-		const Iarch esz = elem_bytes(elem_type)
+		const Str el = if str_eq(elem_type, "") then scalar_of!(ctx, env, elems[0]) else elem_type
+		const Iarch esz = elem_bytes(el)
 		const Iarch bytes = n * esz
 		const Iarch data = emit_agg_alloc!(ctx, bytes)
 		let Iarch i = 0
@@ -3515,7 +3522,7 @@ const emit_array_lit! = (*Emit ctx, [Expr] elems, Str elem_type, [Binding] env):
 			write_str(ctx.fd, "\t%t${addr} =l add %t${data}, ${off}\n")
 			# a `[Uint8]` byte element uses `storeb`; a float element `stored`/`stores`; else `storel`
 			if esz == 1 then write_str(ctx.fd, "\tstoreb ${v}, %t${addr}\n")
-			if esz != 1 then write_str(ctx.fd, "\t${store_op(scalar_only(elem_type))} ${v}, %t${addr}\n")
+			if esz != 1 then write_str(ctx.fd, "\t${store_op(scalar_only(el))} ${v}, %t${addr}\n")
 			i = i + 1
 		}
 		write_str(ctx.fd, "\tstorel %t${data}, %t${hdr}\n")
@@ -3532,12 +3539,23 @@ const emit_array_lit! = (*Emit ctx, [Expr] elems, Str elem_type, [Binding] env):
 }
 
 # Emit `[...src, e…]` into a FRESH binding (NOT a self-append): a new {data,len,cap} header
+# The element type of a spread SOURCE — a local var's binding `elem` (what the self-spread path
+# uses), else the general element-type inference. Used when the arraylit carries no `[Elem]`
+# annotation, so a spread in return/argument position doesn't fall to the corrupting word default.
+const spread_src_elem! = (*Emit ctx, [Binding] env, Expr src): Str -> match src {
+	Expr.Var(n) -> if lookup_index(env, n) >= 0 then env[lookup_index(env, n)].elem else init_elem!(ctx, env, src),
+	_ -> init_elem!(ctx, env, src)
+}
+
 # that COPIES all of `src`'s current elements at runtime, then appends the listed `elems`.
 # A self-append `xs = [...xs, e]` grows in place via the Assign path; this is the GENERAL
 # spread (e.g. `check_for_body`'s `[...env, VarTy(...)]` — extend a borrowed env into a new
-# one). Element stride follows `elem_type` (a `[Uint8]` is byte-packed).
+# one). Element stride follows the element type: the `[Elem]` annotation when set, else DERIVED
+# from the spread source (the result IS `[source-elem]`) — a return/argument-position spread
+# leaves `elem_type` "", and `elem_bytes("")` would silently default a byte array to stride 8.
 const emit_arraylit_spread! = (*Emit ctx, Expr src, [Expr] elems, Str elem_type, [Binding] env): Str -> {
-	const Iarch esz = elem_bytes(elem_type)
+	const Str el = if str_eq(elem_type, "") then spread_src_elem!(ctx, env, src) else elem_type
+	const Iarch esz = elem_bytes(el)
 	const Iarch hdr = emit_agg_node!(ctx, 24)
 	write_str(ctx.fd, "\tstorel 0, %t${hdr}\n")
 	const Iarch h8 = ctx.next
@@ -3598,7 +3616,7 @@ const emit_arraylit_spread! = (*Emit ctx, Expr src, [Expr] elems, Str elem_type,
 	write_str(ctx.fd, "\tjmp @cptop${lid}\n")
 	write_str(ctx.fd, "@cpend${lid}\n")
 	# append the listed elements after the copied ones
-	emit_append!(ctx, env, "%t${hdr}", elems, elem_type)
+	emit_append!(ctx, env, "%t${hdr}", elems, el)
 	return "%t${hdr}"
 }
 
