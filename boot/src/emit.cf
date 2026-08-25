@@ -43,7 +43,7 @@ import astutil::{ is_spread, spread_inner, is_skip, skip_count, is_nested, neste
 # `loop_mark` is the nearest enclosing reset-safe loop's entry mark (same triple shape, or -1 if
 # the nearest loop is not reset-safe) — `break`/`continue` restore it so every path back to the
 # loop head or out of it reclaims the iteration's residue, matching the back-edge rewind.
-data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs, [RecDecl] recs, [UnionDecl] unions, Iarch cur_loop, Iarch cur_slot, Str cur_ret, Iarch reset_mark, Bool fn_ptr, Iarch loop_mark, Bool alloc_stack, Bool in_loop, Iarch stack_used, [RSets] routes, [FnSum] fsums, Iarch cur_fn, Str alloc_node, Str carve_node, Str grow_node, [Str] growok, Iarch mk_env_base, Iarch sur_mark, Iarch loop_sur_mark, [Bool] nodesig, [Bool] fmints, [Str] slits, Str mat_geom }
+data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs, [RecDecl] recs, [UnionDecl] unions, Iarch cur_loop, Iarch cur_slot, Str cur_ret, Iarch reset_mark, Bool fn_ptr, Iarch loop_mark, Bool alloc_stack, Bool in_loop, Iarch stack_used, [RSets] routes, [FnSum] fsums, Iarch cur_fn, Str alloc_node, Str carve_node, Str grow_node, [Str] growok, Iarch mk_env_base, Iarch sur_mark, Iarch loop_sur_mark, [Bool] nodesig, [Bool] fmints, [Str] slits, Str mat_geom, Str fx_parent, Str el_parent }
 
 # A local/parameter in scope: its interned name, `slot`, its `rec_type` (a record/union
 # type name, `"$dyn"`, `"$ptr"`, or `"Str"` — `""` for a word), and `elem` (a dynamic
@@ -2953,11 +2953,37 @@ const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env)
 		write_str(ctx.fd, "\tcall $cf_oom()\n")
 		return ""
 	}
-	# `raw::alloc(node, sz)` — the floor's runtime-dispatch bump, for the slow paths whose
-	# target node's geometry is dynamic (an elastic pull draws from the PARENT node)
+	# `raw::alloc(node, sz)` — a carve/pull draw from the PARENT node's SURVIVOR side (every child
+	# now carves survivor — the `destroy` arc). The parent's geometry is a comptime fact of the
+	# construction ambient; materialize passes it as the whole-program parent of `fx`/`el`
+	# (`carve__fx` draws from `fx_parent`; `carve__el`/`pull__el` from `el_parent`). When known,
+	# lower the draw to the parent's OWN static `reserve_ret__<P>` — no `cf_alloc`, no kind dispatch,
+	# for ANY parent geometry. `reserve_ret` never rounds, so 8-round `sz` to match the floor
+	# `cf_alloc` and keep the parent cursor aligned. Unknown parent ("" — carved from two ambients)
+	# stays on `cf_alloc`, correct by degrade.
 	if str_eq(callee, "std_mem_raw_alloc") && callee_is_intrinsic(ctx, callee) then {
 		const Str an = emit_expr!(args[0], ctx, env)
 		const Str av = emit_expr!(args[1], ctx, env)
+		let Str par = ""
+		if ctx.cur_fn >= 0 then {
+			const Str cfn = ctx.funcs[ctx.cur_fn].name
+			if str_eq(cfn, "carve__fx") then par = ctx.fx_parent
+			if str_eq(cfn, "carve__el") || str_eq(cfn, "pull__el") then par = ctx.el_parent
+		}
+		if !str_eq(par, "") then {
+			const Iarch r7 = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${r7} =l add ${av}, 7\n")
+			const Iarch rnd = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${rnd} =l and %t${r7}, -8\n")
+			const Iarch pgi = find_func(ctx.funcs, "reserve_ret__${par}")
+			if pgi < 0 then die("cf: emit: the parent-axis draw needs `reserve_ret__${par}` but it is absent — materialize and emit disagree on the arena parent\n")
+			const Iarch pr = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${pr} =l call $f${pgi}(l ${an}, l %t${rnd})\n")
+			return "%t${pr}"
+		}
 		const Iarch aw = ctx.next
 		ctx.next = ctx.next + 1
 		write_str(ctx.fd, "\t%t${aw} =w copy ${av}\n")
@@ -5885,7 +5911,7 @@ const mat_geom_of = ([Str] names, [Str] geoms, Str n): Str -> {
 # `main()` the `_start` floor does nothing before `bl _main`, so those flow straight
 # through. For `main([Str] args)` it first `bl _cf_build_args` to convert `(argc, argv)`
 # into a real cf `[Str]` header (in x0), which QBE reads as `$main`'s argument.
-pub const emit_program! = (Program prog, RouteInfo ri, [Str] mat_names, [Str] mat_geoms, Uarch qbe_fd, Uarch asm_fd, Str target_os, Iarch root_size): Iarch -> {
+pub const emit_program! = (Program prog, RouteInfo ri, [Str] mat_names, [Str] mat_geoms, Str fx_parent, Str el_parent, Uarch qbe_fd, Uarch asm_fd, Str target_os, Iarch root_size): Iarch -> {
 	# a `Bare` target (bare metal / Wasm) links no OS: the root is a static BSS region (no mmap), and
 	# there is no exit syscall — the floor halts. Every other target keeps the darwin mmap/exit floor.
 	# `root_size` sizes the `Bare` root page (ignored off `Bare`, which mmaps its own reserve).
@@ -5925,7 +5951,7 @@ pub const emit_program! = (Program prog, RouteInfo ri, [Str] mat_names, [Str] ma
 		# an asm function is emitted into the floor, not through QBE; an intrinsic has no body at
 		# all — the compiler supplies its behavior at each call site, so it emits no function.
 		if !prog.funcs[i].is_asm && !prog.funcs[i].is_intrinsic then {
-			let Emit ctx = Emit({ fd: qbe_fd, next: 0, label: 0, funcs: prog.funcs, recs: prog.recs, unions: prog.unions, cur_loop: 0 - 1, cur_slot: 0 - 1, cur_ret: "", reset_mark: 0 - 1, fn_ptr: false, loop_mark: 0 - 1, alloc_stack: false, in_loop: false, stack_used: 0, routes: ri.sets, fsums: ri.sums, cur_fn: 0 - 1, alloc_node: "%node_0", carve_node: "%node_0", grow_node: "%node_0", growok: no_names(), mk_env_base: 0 - 1, sur_mark: 0 - 1, loop_sur_mark: 0 - 1, nodesig: nsig, fmints: mts, slits: slt, mat_geom: mat_geom_of(mat_names, mat_geoms, prog.funcs[i].name) })
+			let Emit ctx = Emit({ fd: qbe_fd, next: 0, label: 0, funcs: prog.funcs, recs: prog.recs, unions: prog.unions, cur_loop: 0 - 1, cur_slot: 0 - 1, cur_ret: "", reset_mark: 0 - 1, fn_ptr: false, loop_mark: 0 - 1, alloc_stack: false, in_loop: false, stack_used: 0, routes: ri.sets, fsums: ri.sums, cur_fn: 0 - 1, alloc_node: "%node_0", carve_node: "%node_0", grow_node: "%node_0", growok: no_names(), mk_env_base: 0 - 1, sur_mark: 0 - 1, loop_sur_mark: 0 - 1, nodesig: nsig, fmints: mts, slits: slt, mat_geom: mat_geom_of(mat_names, mat_geoms, prog.funcs[i].name), fx_parent: fx_parent, el_parent: el_parent })
 			emit_func!(&ctx, prog.funcs[i], i)
 		}
 		i = i + 1

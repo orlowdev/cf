@@ -41,7 +41,22 @@ import routing::{ kids!, stmt_exprs! }
 # The pass result: the rewritten program plus the geometry copies — `names[i]` is a copy's
 # function name and `geoms[i]` its tag ("fb"/"fx"/"el"/"pg"); emit consults the pair to pick the hook
 # lowering for exactly those bodies.
-pub data Mat = { Program prog, [Str] names, [Str] geoms }
+# `fx_parent`/`el_parent` = the PARENT geometry every fixed / elastic arena is carved from, when it
+# is the SAME across the whole program (the arena's parent is a comptime fact of its construction
+# ambient, and every child now carves from the parent's survivor — the `destroy` arc). When set,
+# emit lowers that geometry's `carve`/`pull` `raw::alloc(parent, sz)` to the parent's OWN static
+# `reserve_ret__<parent>` — no `cf_alloc`, no runtime kind dispatch. "" = the geometry is unused OR
+# carved from two different ambients in one program (rare); then those draws stay on `cf_alloc`.
+pub data Mat = { Program prog, [Str] names, [Str] geoms, Str fx_parent, Str el_parent }
+
+# The ambient a reach tag names, as a parent geometry: the legacy/root (0) and page (4) tags are
+# both the page root; fb/fx/el are themselves.
+const tag_ambient_name = (Iarch tg): Str -> {
+	if tg == 1 then return "fb"
+	if tg == 2 then return "fx"
+	if tg == 3 then return "el"
+	return "pg"
+}
 
 # A reference site: the owning function's index, the callee name, the `in` binding (`""` =
 # the ambient node), and whether the reference is DIRECT (a call / defer-tap — retargetable)
@@ -657,8 +672,8 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 	const Bool has_fx = find_fn(prog.funcs, "of__fx") >= 0
 	const Bool has_el = find_fn(prog.funcs, "of__el") >= 0
 	const Bool main_recs = mi >= 0 && rec_body!(prog.funcs[mi].body)
-	if !has_fb && !has_fx && !has_el && !main_recs then return Mat({ prog: strip_pg(prog), names: no_strs, geoms: no_strs })
-	if mi < 0 then return Mat({ prog: strip_pg(prog), names: no_strs, geoms: no_strs })
+	if !has_fb && !has_fx && !has_el && !main_recs then return Mat({ prog: strip_pg(prog), names: no_strs, geoms: no_strs, fx_parent: "", el_parent: "" })
+	if mi < 0 then return Mat({ prog: strip_pg(prog), names: no_strs, geoms: no_strs, fx_parent: "", el_parent: "" })
 
 	const Iarch nf = Iarch(prog.funcs.len)
 
@@ -804,7 +819,45 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 	# compiler, and every arena-grafting program whose main places nothing on the page), main
 	# stays legacy and the dormant page module is stripped, keeping such programs byte-identical.
 	const Bool page_active = Iarch(pgn.len) > 0 || main_recs
-	if Iarch(fbn.len) + Iarch(fxn.len) + Iarch(eln.len) + Iarch(pgn.len) == 0 && !page_active then return Mat({ prog: strip_pg(prog), names: no_strs, geoms: no_strs })
+	if Iarch(fbn.len) + Iarch(fxn.len) + Iarch(eln.len) + Iarch(pgn.len) == 0 && !page_active then return Mat({ prog: strip_pg(prog), names: no_strs, geoms: no_strs, fx_parent: "", el_parent: "" })
+
+	# parent-axis: an arena's parent is a comptime fact of its CONSTRUCTION AMBIENT — the tag the
+	# function holding `of__fx`/`of__el` runs under. Collect, per geometry, the set of ambients it is
+	# carved from; when that set is a SINGLETON the parent is statically one geometry, so emit lowers
+	# `carve`/`pull`'s survivor draw to that parent's own static `reserve_ret__<parent>`. Two different
+	# ambients leaves it "" → `cf_alloc`, correct by degrade. (Loop vars hoisted — runs over every
+	# reference site × tag.)
+	let Str fx_parent = ""
+	let Str el_parent = ""
+	let Bool fx_multi = false
+	let Bool el_multi = false
+	let Iarch aps = 0
+	let Iarch apo = 0
+	let Iarch apt = 0
+	loop {
+		if aps >= Iarch(sites.len) then break
+		if str_eq(sites[aps].callee, "of__fx") || str_eq(sites[aps].callee, "of__el") then {
+			apo = sites[aps].fnidx
+			apt = 0
+			loop {
+				if apt >= 5 then break
+				if reach[apo * 5 + apt] then {
+					if str_eq(sites[aps].callee, "of__fx") then {
+						if str_eq(fx_parent, "") then fx_parent = tag_ambient_name(apt)
+						else if !str_eq(fx_parent, tag_ambient_name(apt)) then fx_multi = true
+					}
+					if str_eq(sites[aps].callee, "of__el") then {
+						if str_eq(el_parent, "") then el_parent = tag_ambient_name(apt)
+						else if !str_eq(el_parent, tag_ambient_name(apt)) then el_multi = true
+					}
+				}
+				apt = apt + 1
+			}
+		}
+		aps = aps + 1
+	}
+	if fx_multi then fx_parent = ""
+	if el_multi then el_parent = ""
 
 	# rebuild the table as the reachable variants: legacy originals in table order (bodies with
 	# seed `in b` sites are rewritten so they point at the twins; everything else is SHARED,
@@ -895,7 +948,7 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 	# keep the page's `reserve_ret` (the only page hook emit places for a pg body — a page
 	# frame is never `!`, so no residue reserve or scope bracket is ever emitted). It calls
 	# only `mem::raw::*`, so it is a leaf with no further reachability to walk.
-	if page_active then {
+	if page_active || str_eq(fx_parent, "pg") || str_eq(el_parent, "pg") then {
 		const Iarch rrp = find_fn(prog.funcs, "reserve_ret__pg")
 		if rrp < 0 then die("cf: materialize: the page geometry module is missing `reserve_ret__pg` (stale std source?)\n")
 		out = [...out, prog.funcs[rrp]]
@@ -985,5 +1038,5 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 	}
 
 	const Program p2 = Program({ imports: prog.imports, recs: prog.recs, unions: prog.unions, funcs: out, groups: prog.groups })
-	return Mat({ prog: p2, names: cnames, geoms: cgeoms })
+	return Mat({ prog: p2, names: cnames, geoms: cgeoms, fx_parent: fx_parent, el_parent: el_parent })
 }
