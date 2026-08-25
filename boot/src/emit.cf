@@ -5140,15 +5140,15 @@ const emit_func! = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 # moves, so returned pointers stay valid (memory_model §8). Records (which may escape via a
 # return) live here; scalars stay in stack slots. (Still the single ambient page — the per-node
 # `%node`/`%ret` ABI and carved arenas are the next arc.)
-# The dynamic-collection floor helpers, in two flavors. `g`=false → the legacy set
-# (`cf_dyn_push` + `cf_*_append`, grow via the runtime-dispatch `cf_alloc`). `g`=true → the
-# `_g` set: each gains an `l %reservefn` param and its grow / internal pushes go through that
-# geometry reserve pointer (aggregate coverage, dynamic half). The two flavors share every
-# other byte, so a materialized body's string/array growth reserves through the geometry
-# while off-geometry code stays byte-identical on the legacy set.
-const emit_dyn_helpers! = (Uarch fd, Bool g): Iarch -> {
-	const Str sfx = if g then "_g" else ""
-	const Str rf = if g then ", l %reservefn" else ""
+# The dynamic-collection floor helpers (`cf_dyn_push_g` + `cf_*_append_g`): a `[T]`/`[Uint8]`
+# grow-in-place and the interpolation itoa/append routines. Each takes the current geometry's
+# reserve as an `l %reservefn` FUNCTION POINTER and grows the backing block through it — geometry
+# is carried by the pointer, so one shared floor helper serves every geometry (no per-geometry
+# copy, no runtime kind-dispatch). The `_g` suffix is historical: the legacy non-`_g` set that
+# grew via the now-deleted `cf_alloc` kind-switch is gone (every allocation is materialized).
+const emit_dyn_helpers! = (Uarch fd): Iarch -> {
+	const Str sfx = "_g"
+	const Str rf = ", l %reservefn"
 	write_str(fd, "function l $cf_dyn_push${sfx}(l %node, l %hdr, w %esize${rf}) {\n")
 	write_str(fd, "@start\n")
 	write_str(fd, "\t%ip =l alloc8 8\n")
@@ -5166,9 +5166,7 @@ const emit_dyn_helpers! = (Uarch fd, Bool g): Iarch -> {
 	write_str(fd, "\t%z4 =l mul %zl, 4\n")
 	write_str(fd, "\t%ncap =l add %dbl, %z4\n")
 	write_str(fd, "\t%nbytes =l mul %ncap, %es\n")
-	if !g then write_str(fd, "\t%nbw =w copy %nbytes\n")
-	if !g then write_str(fd, "\t%ndata =l call $cf_alloc(l %node, w %nbw)\n")
-	if g then write_str(fd, "\t%ndata =l call %reservefn(l %node, l %nbytes)\n")
+	write_str(fd, "\t%ndata =l call %reservefn(l %node, l %nbytes)\n")
 	write_str(fd, "\t%odata =l loadl %hdr\n")
 	write_str(fd, "\t%obytes =l mul %len, %es\n")
 	write_str(fd, "\tstorel 0, %ip\n")
@@ -5476,7 +5474,7 @@ const emit_arena_qbe! = (Uarch fd, Bool is_bare, Iarch root_size, Bool dyn_g, Ia
 	# (the floor `cf_reset` scope-fold helper is RETIRED — a `!` frame's residue bracket now rewinds
 	# through the geometry's own `on_scope_exit` hook, placed by `emit_reset!`; the survivor-scope
 	# mark rewinds inline. See geometry_lowering §2.)
-	if dyn_g then emit_dyn_helpers!(fd, true)
+	if dyn_g then emit_dyn_helpers!(fd)
 	# cf_str_eq(a, b) — Str value equality (used by string `match`): compare the low word of the
 	# `len@8` slot (LE, matching `cf_str_append`), then the `bytes@0` run byte-for-byte; returns
 	# 1 if equal, 0 otherwise. Length-driven, so an interior NUL and an empty string compare right.
