@@ -704,19 +704,17 @@ const rec_body! = ([Stmt] ss): Bool -> {
 
 pub const materialize_program! = (Program prog, Program raw): Mat -> {
 	const [Str] no_strs = []
-	# fast path: fixed_buffer/arena auto-load on USE (`of__fb`/`of__fx`/`of__el` present), but the PAGE
-	# module is auto-imported into every module (its ambient has no surface keyword), so a
-	# std-source geometry is always in the table. Materialize is worth running only when one is
-	# actually EXERCISED — fb/ar by use, or the page by a record built on main's own ambient
-	# (rec_body! over main). When none hold, strip the dormant page module back out (restoring
-	# the pre-import table byte-for-byte) and pass through with one extra name scan.
+	# The PAGE geometry is a first-class ambient: `main` runs under the root page, and any allocation
+	# in its root subtree (its own body, or a bare-called helper — an `in <arena>` graft leaves the
+	# subtree) draws from the page's OWN reserve like every other geometry, not a runtime-dispatch
+	# floor. `main` is always seeded `pg`, so the reach walk flows root allocators to `__pg` copies;
+	# `page_active` below is set from that (or `main`'s own direct allocation). A program that
+	# allocates NOTHING on the page and grafts no arena strips the dormant page module back out at
+	# the LATE bail (byte-identical to the pre-import table) — that decision is deferred to there now,
+	# so the walk always runs (cheap for a non-allocating program).
 	const Iarch mi = find_fn(prog.funcs, "main")
-	const Bool has_fb = find_fn(prog.funcs, "of__fb") >= 0
-	const Bool has_fx = find_fn(prog.funcs, "of__fx") >= 0
-	const Bool has_el = find_fn(prog.funcs, "of__el") >= 0
-	const Bool main_recs = mi >= 0 && rec_body!(prog.funcs[mi].body)
-	if !has_fb && !has_fx && !has_el && !main_recs then return Mat({ prog: strip_pg(prog), names: no_strs, geoms: no_strs, fx_parent: "", el_parent: "" })
 	if mi < 0 then return Mat({ prog: strip_pg(prog), names: no_strs, geoms: no_strs, fx_parent: "", el_parent: "" })
+	const Bool main_allocs = alloc_body!(prog.funcs[mi].body, prog.unions)
 
 	const Iarch nf = Iarch(prog.funcs.len)
 
@@ -864,7 +862,7 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 	# allocator became a `__pg` copy, or main itself builds a record. When it is INACTIVE (the
 	# compiler, and every arena-grafting program whose main places nothing on the page), main
 	# stays legacy and the dormant page module is stripped, keeping such programs byte-identical.
-	const Bool page_active = Iarch(pgn.len) > 0 || main_recs
+	const Bool page_active = Iarch(pgn.len) > 0 || main_allocs
 	if Iarch(fbn.len) + Iarch(fxn.len) + Iarch(eln.len) + Iarch(pgn.len) == 0 && !page_active then return Mat({ prog: strip_pg(prog), names: no_strs, geoms: no_strs, fx_parent: "", el_parent: "" })
 
 	# parent-axis: an arena's parent is a comptime fact of its CONSTRUCTION AMBIENT — the tag the
