@@ -47,12 +47,22 @@ everything after is one-way.
 ## 1. The hook contract
 
 A **geometry is a module** — there is no `geometry` keyword. It is any module
-that exposes the closed hook set below plus a constructor (`of`, `with_capacity`,
-…) that mints a node (see [[memory_model.md]], The `in` clause). Selection is
-structural: `in arena` names the module, and the Memory arc splices its hooks
-into every governed body. Because the contract is duck-typed, a user geometry and
-a standard one are indistinguishable to the compiler — the same placement runs
-over both.
+that exposes the closed hook set below plus the **node-lifecycle pair** that
+brackets it: a constructor (`of`, `with_capacity`, …) that carves a child node,
+and **`destroy`** that dissolves it back into its parent (§3, Wall dissolution).
+The constructor and `destroy` are the node's birth and teardown; the nine hooks
+below place and reclaim the *values* that live between them. `destroy` is
+**user-placed** — the programmer bounds a child's lifetime with
+`<arena> |> defer destroy` (or `defer <geom>::destroy(b)` on its own line), exactly
+like any other `defer`. The compiler does not guess where teardown goes; it only
+**verifies** the `destroy` is sound — that nothing the child holds escapes the scope
+being closed (the same escape analysis behind `!`) — and rejects one that would
+strand an escaping value. An un-`destroy`ed child simply lives until its parent
+node's own teardown (node-bounded, never dangling). See [[memory_model.md]], The
+`in` clause. Selection is structural:
+`in arena` names the module, and the Memory arc splices its hooks into every
+governed body. Because the contract is duck-typed, a user geometry and a standard
+one are indistinguishable to the compiler — the same placement runs over both.
 
 ### The two intrinsic types
 
@@ -327,6 +337,47 @@ acts:
 So `.cf` reads `on_alloc_ret(node_0, f(...))` uniformly, and each geometry folds
 it to its own claim — a bump adjust, a compaction, an RC adopt.
 
+### Wall dissolution: `destroy`
+
+The dual of construction, and event 2 above. A carved child `b = <geom>::of(n)`
+opens a wall inside the parent it is carved from; **`<geom>::destroy(b)`** dissolves
+that wall — the explicit child-node teardown named in the arena surface
+(`fixed_arena::destroy`, `growing_arena::destroy`). It is the node-level counterpart
+of `on_scope_exit`: where `on_scope_exit` rewinds a *frame's* residue mark, `destroy`
+rewinds the *child's whole extent* back out of the parent — header, blocks, and for an
+elastic child every pulled chunk — reclaiming the subtree in one operation.
+
+`destroy` **preserves the escaping closure while reclaiming the dead block** — that is
+its whole responsibility, discharged by each geometry in its own coin. For the **bump
+family** the escaping closure was born survivor-side (`on_ret` at birth), physically
+above the reclaimed region, so preservation is free and `destroy` is a single cursor
+rewind to the carve mark; a compacting geometry relocates or adjusts counts as its
+policy requires. Either way the boundary stays copy-free for what survives — the same
+guarantee wall dissolution has always carried, now named and placed.
+
+`destroy` is **user-placed**, an explicit teardown the programmer writes — the Memory arc
+does *not* infer it. `const b = <geom>::of(n) |> defer destroy` carves the child and
+schedules its dissolution at the binding's scope exit, LIFO with the frame's other
+deferred teardowns (order_of_compilation, Backend); `defer <geom>::destroy(b)` on its own
+line is the same. What the compiler contributes is **verification, not placement**: a
+`destroy` is sound only if nothing the child holds escapes the scope it closes (rewinding
+the parent past the child would strand an escaping value), and that is exactly the
+closure law that computes `!` — so the compiler **rejects** an unsound `destroy` and
+otherwise trusts the programmer's scoping. A child left un-`destroy`ed is not reclaimed
+early; it lives until its own parent node tears down (node-bounded, never dangling) — the
+arena discipline is the programmer's to state, like `free` in C but scope-checked.
+
+Because a child is reclaimed by its *own* `destroy` at the position the programmer chose,
+never by whichever ambient bracket happens to enclose it, **children are carved uniformly
+from the parent's *survivor* side**. This is the key simplification the earlier
+residue-side carve worked around: the residue carve and its interlocks (the carve
+interlock, the pull-vs-bracket interlock) existed only to let the compiler *auto-reclaim*
+a scratch child by borrowing the ambient's *residue* bracket — and once teardown is the
+programmer's explicit `destroy`, that inference and its borrowing are unnecessary. With
+every parent draw on the survivor side, `carve`/`pull`'s draw from the parent lowers to
+the parent's own static `reserve_ret__<parent>` — the parent geometry is a comptime fact
+of the construction ambient — with no runtime kind dispatch and no `cf_alloc`.
+
 ### Rehome is return aimed at an ancestor
 
 `on_rehome(node_target, target, v)` is the same escape, claimed by `target`
@@ -471,7 +522,8 @@ there). The `%node`/`%ret` convention is entirely internal to C!-to-C! calls.
 
 ## 5. Reference geometries
 
-A geometry is a module exposing the nine hooks plus a constructor. These sit at
+A geometry is a module exposing the nine hooks plus the node-lifecycle pair
+(a constructor and `destroy`). These sit at
 the **floor of the allocation algebra**: a hook body takes the `MemoryNode` state
 by pointer and works in raw memory (`raw::*`, the privileged `std::mem::raw`
 intrinsics — page growth, pointer bumps, byte copies), so a hook is itself

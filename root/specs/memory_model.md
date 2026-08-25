@@ -355,6 +355,30 @@ physically carved from its parent, its **walls dissolve** and `x`'s storage is
 **re-attributed to the parent, in place** — same address, returned pointer stays
 valid.
 
+**Reclamation is by `destroy`, user-placed** (the ratified mechanism —
+geometry_lowering §3, Wall dissolution). A carved child is reclaimed by the explicit
+teardown the programmer writes — `const b = <geom>::of(n) |> defer destroy` — which
+rewinds the child's own extent (header, blocks, elastic pulls) out of the parent's
+**survivor** side at the binding's scope exit, preserving the escaping closure (born
+survivor-side above it) and carrying nothing dead up. The compiler does not infer the
+teardown; it **verifies** each `destroy` is sound (nothing the child holds escapes the
+closed scope — the drop-set / closure law behind `!`) and rejects one that would strand
+an escaping value. A child left un-`destroy`ed lives until its parent node's own teardown
+(node-bounded, never dangling). Because reclaim is the child's own `destroy` at a
+programmer-chosen position, **every child is carved uniformly from the parent's survivor
+side**, so the carve/pull draw from the parent lowers to the parent's static
+`reserve_ret__<parent>` (the parent-axis specialization: no runtime kind dispatch, no
+`cf_alloc`).
+
+The scope-graded scheme described in the rest of this section — a survivor-scope mark
+where one qualifies, **else** a residue-side carve gated by the *carve interlock* and the
+*pull-vs-bracket interlock* — is the pre-`destroy` mechanism it **supersedes**: those
+tiers let the compiler *auto-reclaim* a scratch child by borrowing whichever *ambient*
+bracket could reach it, and once teardown is the programmer's explicit `destroy` that
+inference retires (with it, the disqualification cases like a `&`-taken sibling, which
+forced the residue fallback, simply don't arise). It is retained here as the
+regression-set history until the implementation lands.
+
 The carve's *reclamation* is scope-graded rather than unconditional: a child
 node is carved from its parent's **survivor** side (a parent-frame bracket must
 never reset a child's storage — the pin of
