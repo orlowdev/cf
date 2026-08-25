@@ -103,16 +103,17 @@ Turns a set of files into **one flat program**:
 
 - **Evaluate comptime conditional imports.** The module-level `if … then … else`
   (see [[ebnf.md]], Modules) is run here, at comptime, against the target triple
-  exposed by the compiler-supplied `"comptime"` module. Exactly one branch's
+  exposed by the compiler-supplied `std::comptime` module. Exactly one branch's
   items survive; the scaffolding dissolves, so a name like `read_file` resolves to
   a single backing.
-- **Resolve module paths** (`"std/mem"` → a file) and **jump through barrels** —
-  a `pub import` reexport is an ordinary import wearing a nicer name, so it is
-  followed to its ultimate target.
+- **Expand import abbreviations to full `::` paths** and **resolve module paths**
+  (`std::mem` → a file), then **traverse namespaces / jump through barrels** — an
+  `import` only abbreviates a path, and a `pub import` reexport is followed to its
+  ultimate target ([[module_system.md]] §4/§5).
 - **Cycles are legal** and resolved by the flatten itself.
 - **Flatten** every module into one file and **mangle module-qualified names**
   path-relative to the main file, so two modules' private `helper`s become
-  distinct, collision-free top-level names (`std/mem/arena` → `std_mem_arena_*`).
+  distinct, collision-free top-level names (`std::mem::arena` → `std_mem_arena_*`).
   Names stay valid `var_name`/`type_name`s and thus readable.
 - **Prune** unused imports and the dissolved conditional-import branches.
 
@@ -347,8 +348,10 @@ Held back, lowered at **emit** (kept readable through every arc):
 Source:
 
 ```
+import std::mem::arena::fixed_arena
+
 pub const main = () -> {
-  const arena = mem.arena.of(4096)
+  const arena = fixed_arena::of(4096)
   const ys = make_arr!() in arena
 }
 
@@ -360,39 +363,40 @@ const make_arr! = () -> {
 }
 ```
 
-- **`resolved`** — single file already; `mem.arena.of` flattens to its mangled
-  module name (shown short below for readability).
+- **`resolved`** — the `import` binds the `fixed_arena` geometry module; its `of`
+  constructor flattens to its mangled module name (shown short below for readability).
 - **`desugared`** — the self-spreads are classified: `xs = [...xs, 4]` is
   grow-in-place, `let ys = [...xs, 5]` is a copy that also escapes via `return`.
 - **`specialized`** — no generics, so `make_arr!` is unchanged; geometry is _not_
   resolved here.
-- **`memory`** — the geometry lands. `make_arr!` is duplicated for `arena` and
-  mangled to `make_arr_b__arena`; the node is threaded; escape classes pick the
-  hooks; scopes open with `on_scope_enter` and a `defer`'d `on_scope_exit`:
+- **`memory`** — the geometry lands. `make_arr!` is duplicated for the `fixed_arena`
+  geometry and mangled to `make_arr_b__fx`; the node is threaded; escape classes pick
+  the hooks; scopes open with `on_scope_enter` and a `defer`'d `on_scope_exit`:
 
 ```
 pub const main = (node_0) -> {
   const mark_0 = page.on_scope_enter(node_0)
   defer page.on_scope_exit(node_0, mark_0)
 
-  const node_1 = page.on_alloc(node_0, mem.arena.of(node_0, 4096))
-  const ys = page.on_alloc_ret(node_0, make_arr_b__arena(node_1))
+  const node_1 = page.on_alloc(node_0, fixed_arena::of(node_0, 4096))
+  const ys = page.on_alloc_ret(node_0, make_arr_b__fx(node_1))
 }
 
-const make_arr_b__arena = (node_0) -> {
-  const mark_0 = arena.on_scope_enter(node_0)
-  defer arena.on_scope_exit(node_0, mark_0)
+const make_arr_b__fx = (node_0) -> {
+  const mark_0 = fixed_arena.on_scope_enter(node_0)
+  defer fixed_arena.on_scope_exit(node_0, mark_0)
 
-  let xs = arena.on_alloc(node_0, [1, 2, 3])
-  xs = arena.on_realloc(node_0, [...xs, 4])
-  let ys = arena.on_ret(node_0, [...xs, 5])
+  let xs = fixed_arena.on_alloc(node_0, [1, 2, 3])
+  xs = fixed_arena.on_realloc(node_0, [...xs, 4])
+  let ys = fixed_arena.on_ret(node_0, [...xs, 5])
   return ys
 }
 ```
 
-(The arena binding _is_ its node, so `const arena` becomes the handle `node_1`;
-`page`/`arena` hook names are shown short — flatten would render them as mangled
-module names.)
+(The arena binding _is_ its node, so `const arena` becomes the handle `node_1`; the
+constructor `of` spends the ambient node it is placed on, shown here as its explicit
+arg. `page`/`fixed_arena` hook names are shown short — flatten renders them as mangled
+names, `on_ret__fx` and so on.)
 
 - **`folded`** — the non-deferred hooks (`on_scope_enter`, `on_alloc`,
   `on_realloc`, `on_ret`, `on_alloc_ret`) inline to their literal bump/copy

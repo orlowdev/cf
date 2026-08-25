@@ -15,9 +15,9 @@
 # return type, so forward references and recursion type without walking the callee.
 # The emitter runs only on programs this phase accepts.
 
-import "io" as { die }
-import "ast" as { Expr, Stmt, Param, Func, Ty, FieldInit, RecDecl, UnionMember, UnionDecl, MatchArm, StmtArm, Seg, TupElem, Program }
-import "astutil" as { is_spread, spread_inner, is_skip, skip_count, is_nested, nested_inner!, tel_leaf, tel_nest, tel_is_nest, tel_fn, tel_is_fn, is_fixed_name, fixed_bits, fixed_signed, is_float_name, float_bits, is_pat_guard, is_member_guard, is_int_guard, guard_body!, guard_qual!, guard_member! }
+import io::{ die }
+import ast::{ Expr, Stmt, Param, Func, Ty, FieldInit, RecDecl, UnionMember, UnionDecl, MatchArm, StmtArm, Seg, TupElem, Program }
+import astutil::{ is_spread, spread_inner, is_skip, skip_count, is_nested, nested_inner!, tel_leaf, tel_nest, tel_is_nest, tel_fn, tel_is_fn, is_fixed_name, fixed_bits, fixed_signed, is_float_name, float_bits, is_stack_name, is_pat_guard, is_member_guard, is_int_guard, guard_body!, guard_qual!, guard_member! }
 
 # A name in scope during checking: its type and whether it is reassignable (`let`).
 # `esc` — this binding is, or (by construction) transitively contains, an explicit pointer into a
@@ -35,7 +35,7 @@ import "astutil" as { is_spread, spread_inner, is_skip, skip_count, is_nested, n
 # `&`). cf collapses `*Point`≡`Point` at the type level, so this bit is how a `*Record` argument
 # (which must be a reference — `&x` or a forwarded pointer, memory_model §6, NOT a "borrow": C! has
 # none — a `*T` is a first-class reference to a `let`-owned referent) is told apart from a bare value.
-pub data VarTy = { Str name, Ty ty, Bool mutable, Bool esc, Bool outer, Bool fixed, Bool is_ref, Iarch fsize }
+pub data VarTy = { Str name, Ty ty, Bool mutable, Bool esc, Bool outer, Bool fixed, Bool is_ref, Iarch fsize, Str elem }
 
 # The whole-program context threaded through typing: the functions (a call resolves
 # its callee here), the record declarations (a data literal / field read), and the
@@ -299,7 +299,7 @@ pub const tel_to_ty! = (TupElem te, Ctx ctx): Ty -> {
 # keeps the element to a shape the emitter classifies the same way the type gate does (an
 # `if`/`match`-valued record element is a later brick).
 const is_fresh_record = (Expr e): Bool -> match e {
-	Expr.Call(c, ta, a) -> true,
+	Expr.Call(c, ta, a, _) -> true,
 	Expr.Record(n, fs) -> true,
 	Expr.UnionMk(t, m, args) -> true,
 	_ -> false
@@ -309,12 +309,12 @@ const is_fresh_record = (Expr e): Bool -> match e {
 # binding may take (a literal `(a,b)` or a tuple-returning call `f(…)`). Aliasing a tuple
 # name or a tuple from a field/index is a later brick.
 const is_tuple_lit = (Expr e): Bool -> match e { Expr.Tuple(es) -> true, _ -> false }
-const is_call_expr = (Expr e): Bool -> match e { Expr.Call(c, ta, a) -> true, _ -> false }
+const is_call_expr = (Expr e): Bool -> match e { Expr.Call(c, ta, a, _) -> true, _ -> false }
 # The value forms a whole-tuple binding may take — every form emit resolves telems for: a
 # literal, a call result, a bound tuple name, a tuple element/field (indexed or via `.field`).
 const is_tuple_bindable = (Expr e): Bool -> match e {
 	Expr.Tuple(es) -> true,
-	Expr.Call(c, ta, a) -> true,
+	Expr.Call(c, ta, a, _) -> true,
 	Expr.Var(n) -> true,
 	Expr.Index(a, i) -> true,
 	Expr.IndexExpr(b, i) -> true,
@@ -335,7 +335,7 @@ const is_tuple_bindable = (Expr e): Bool -> match e {
 # out a bound union name / a union-typed record field read, which would put a borrowed value in the tuple.
 const is_fresh_union = (Expr e, Ctx ctx): Bool -> match e {
 	Expr.UnionMk(t, m, args) -> true,
-	Expr.Call(c, ta, a) -> true,
+	Expr.Call(c, ta, a, _) -> true,
 	Expr.Field(base, member) -> find_union(ctx.unions, base) >= 0,
 	_ -> false
 }
@@ -366,7 +366,7 @@ const element_type_name! = (Ty t, Expr e, Ctx ctx): TupElem -> {
 	# array literal or a call result), never an aliased array binding.
 	const Str aen = dyn_of(t)
 	if !str_eq(aen, "") then {
-		const Bool afresh = match e { Expr.ArrayLit(h, s, el, et) -> true, Expr.Call(c, ta, a) -> true, _ -> false }
+		const Bool afresh = match e { Expr.ArrayLit(h, s, el, et) -> true, Expr.Call(c, ta, a, _) -> true, _ -> false }
 		if !afresh then die("cf: type: an array tuple element must be a fresh array literal or a call result, not an alias\n")
 		return tel_leaf("[${aen}]")
 	}
@@ -543,13 +543,14 @@ const is_ptr_field_elem = (Str elem): Bool -> {
 	if str_eq(elem, "Iarch") || str_eq(elem, "Int") || str_eq(elem, "Uarch") then return true
 	return is_fixed_name(elem)
 }
-# A `*[T]` raw-pointer parameter with an indexable element (`*[Uint8]`, `*[Iarch]`, a fixed-width) —
-# its elements are written through it (`p[i] = v`), so it binds mutable. An opaque `*[Str]`
-# (argv/envp) has no indexable element and stays a read-only view.
+# A `*[T]` raw-pointer parameter with an indexable element — its elements are read at their
+# declared type and written through it (`p[i] = v`), so it binds mutable: a byte/word/fixed
+# scalar, a float, a `Bool`, or an AGGREGATE element (`*[P]` — the slot holds the record's
+# 8-byte arena pointer). The one opaque exception is `*[Str]` (argv/envp), a read-only view.
 const param_is_indexptr = (Param p): Bool -> {
 	if !p.is_ptr then return false
 	if !str_eq(p.type_name, "$ptr") then return false
-	return is_ptr_field_elem(p.elem)
+	return !str_eq(p.elem, "Str")
 }
 
 # A `*T` pointer may only point to an aggregate — a declared record or a PAYLOAD-BEARING union
@@ -855,9 +856,15 @@ const is_cast_type = (Str name): Bool -> {
 const cast_type! = (Str callee, [Expr] args, [VarTy] env, Ctx ctx): Ty -> {
 	if Iarch(args.len) != 1 then die("cf: type: a numeric cast takes exactly one argument\n")
 	const Ty ot = type_of!(args[0], env, ctx)
-	# the operand is any number — a word, a fixed-width int, or a float; a pointer/Bool/aggregate
-	# is rejected. Casts cross the integer/float boundary (`Float64(7)`, `Int32(f)`).
-	if !is_tint(ot) && !is_tfixed(ot) && !is_tfloat(ot) then die("cf: type: a numeric cast takes a scalar number (no pointer<->number conversion)\n")
+	# the cast's TARGET type: a fixed width, a float, else the signed register word `Iarch`/`Int`.
+	const Ty tgt = if is_fixed_name(callee) then fixed_ty(callee) else if is_float_name(callee) then Ty.TFloat(float_bits(callee)) else Ty.TInt
+	# the operand is any number — a word, a fixed-width int, or a float. A POINTER may widen to a
+	# 64-bit register word (`Uarch(p)`/`Iarch(p)`): an address is visible as a number. The dangerous
+	# direction, number→pointer, has no cast at all — no cast yields a `TPtr`. Narrowing a pointer to
+	# a sub-word width or a float is rejected (it would truncate/garble the address), as is a
+	# Bool/aggregate operand. Pointer ARITHMETIC stays unavailable — a later intrinsic, not a cast.
+	const Bool ptr_to_word = is_tptr(ot) && is_wordish(tgt)
+	if !is_tint(ot) && !is_tfixed(ot) && !is_tfloat(ot) && !ptr_to_word then die("cf: type: a numeric cast takes a number, or a pointer widened to a register word (`Uarch`/`Iarch`)\n")
 	# `Int8(x)`… yields that fixed-width type; `Float32`/`Float64` a float; `Iarch`/`Int`/`Uarch`
 	# the register word. Each is a real conversion of the operand's value.
 	if is_fixed_name(callee) then return fixed_ty(callee)
@@ -905,7 +912,7 @@ const is_ptr_arr_arg = (Expr e): Bool -> match e {
 	Expr.Index(_, _) -> true,
 	Expr.IndexExpr(_, _) -> true,
 	Expr.IndexField(_, _, _) -> true,
-	Expr.Call(_, _, _) -> true,
+	Expr.Call(_, _, _, _) -> true,
 	_ -> false
 }
 
@@ -1074,14 +1081,91 @@ const arm_stmts_write_name = ([StmtArm] arms, Str pn): Bool -> {
 	return false
 }
 const func_writes_ptr_param = (Func fn, Iarch pidx): Bool -> stmts_write_name(fn.body, fn.params[pidx].name)
+# Does this callee resolve to a declared `intrinsic`? The geometry-constructor typing below is
+# gated on it so an ordinary function that happens to share the mangled name is never intercepted.
+const callee_is_intrinsic_tc = (Ctx ctx, Str n): Bool -> {
+	const Iarch i = find_func(ctx.funcs, n)
+	if i < 0 then return false
+	return ctx.funcs[i].is_intrinsic
+}
 const call_type! = (Str callee, [Str] tyargs, [Expr] args, [VarTy] env, Ctx ctx): Ty -> {
+	# the geometry constructor intrinsics (`fixed_arena.of(n)` / `growing_arena.of(n)`) yield an
+	# opaque node HANDLE — a pointer-sized value the compiler threads but never inspects; typed
+	# as the register word. (The page has NO constructor: it is the ambient main receives.)
+	if str_eq(callee, "of__fx") && callee_is_intrinsic_tc(ctx, callee) then return Ty.TInt
+	if str_eq(callee, "of__el") && callee_is_intrinsic_tc(ctx, callee) then return Ty.TInt
+	# `fixed_buffer.of(buf)` wraps a `[Uint8]` buffer (which carries its own `{data,len,cap}`) as a
+	# bounded geometry — yields an opaque node handle like the arenas. The buffer supplies the storage
+	# byte-for-byte, so its element must be `Uint8`.
+	if str_eq(callee, "of__fb") && callee_is_intrinsic_tc(ctx, callee) then {
+		if Iarch(args.len) != 1 then die("cf: type: fixed_buffer.of expects one `[Uint8]` buffer argument\n")
+		if !str_eq(dyn_of(type_of!(args[0], env, ctx)), "Uint8") then die("cf: type: fixed_buffer.of expects a `[Uint8]` buffer\n")
+		return Ty.TInt
+	}
+	# the raw-memory intrinsics (`raw::*`, `size_of`) — parser-gated to the std geometry
+	# modules (`std/mem/…`), so userland never reaches these arms. Addresses and raw words are
+	# `Uarch`; `place` returns its value argument's own type at the destination address (the
+	# identity law, geometry_lowering §1) and `size_of` that value's byte size.
+	if str_eq(callee, "std_mem_raw_addr") && callee_is_intrinsic_tc(ctx, callee) then {
+		if Iarch(args.len) != 1 then die("cf: type: raw::addr takes one aggregate (or pointer) value\n")
+		const Ty at = type_of!(args[0], env, ctx)
+		if is_tint(at) || is_tfixed(at) || is_tfloat(at) || is_tbool(at) then die("cf: type: raw::addr takes an aggregate (or pointer) — a scalar has no address\n")
+		return fixed_ty("Uarch")
+	}
+	if str_eq(callee, "std_mem_raw_load") && callee_is_intrinsic_tc(ctx, callee) then {
+		if Iarch(args.len) != 1 then die("cf: type: raw::load takes one `Uarch` address\n")
+		if !is_wordish(type_of!(args[0], env, ctx)) then die("cf: type: raw::load takes a `Uarch` address\n")
+		return fixed_ty("Uarch")
+	}
+	if str_eq(callee, "std_mem_raw_store") && callee_is_intrinsic_tc(ctx, callee) then {
+		if Iarch(args.len) != 2 then die("cf: type: raw::store takes an address and a word\n")
+		if !is_wordish(type_of!(args[0], env, ctx)) then die("cf: type: raw::store takes a `Uarch` address\n")
+		if !is_wordish(type_of!(args[1], env, ctx)) then die("cf: type: raw::store stores a register word — aggregates go through `raw::place`\n")
+		return Ty.TUnit
+	}
+	if str_eq(callee, "std_mem_raw_size_of") && callee_is_intrinsic_tc(ctx, callee) then {
+		if Iarch(args.len) != 1 then die("cf: type: size_of takes one value\n")
+		const Ty st = type_of!(args[0], env, ctx)
+		return fixed_ty("Uarch")
+	}
+	# `raw::alloc(node, sz)` — the floor's runtime-dispatch bump (`$cf_alloc`), for the
+	# slow paths whose target node's geometry is dynamic (an elastic pull draws from the
+	# PARENT node). Yields the placement address.
+	if str_eq(callee, "std_mem_raw_alloc") && callee_is_intrinsic_tc(ctx, callee) then {
+		if Iarch(args.len) != 2 then die("cf: type: raw::alloc takes a node handle and a byte size\n")
+		if !is_wordish(type_of!(args[0], env, ctx)) then die("cf: type: raw::alloc takes a `Uarch` node handle\n")
+		if !is_wordish(type_of!(args[1], env, ctx)) then die("cf: type: raw::alloc takes a `Uarch` byte size\n")
+		return fixed_ty("Uarch")
+	}
+	# `raw::grow(node, target)` — commit more backing pages up to `target` on a kind-0 lane
+	# (`$cf_root_page_grow`); the page geometry's commit-growth step. Advances the committed watermark only.
+	if str_eq(callee, "std_mem_raw_grow") && callee_is_intrinsic_tc(ctx, callee) then {
+		if Iarch(args.len) != 2 then die("cf: type: raw::grow takes a node handle and a target address\n")
+		if !is_wordish(type_of!(args[0], env, ctx)) then die("cf: type: raw::grow takes a `Uarch` node handle\n")
+		if !is_wordish(type_of!(args[1], env, ctx)) then die("cf: type: raw::grow takes a `Uarch` target address\n")
+		return Ty.TUnit
+	}
+	# `raw::trap()` — the out-of-space trap (the floor's cf_oom): a hook whose cursors
+	# meet has nowhere to place the value; the process dies exactly as the floor's bump does.
+	if str_eq(callee, "std_mem_raw_trap") && callee_is_intrinsic_tc(ctx, callee) then {
+		if Iarch(args.len) != 0 then die("cf: type: raw::trap takes no arguments\n")
+		return Ty.TUnit
+	}
+	if str_eq(callee, "std_mem_raw_place") && callee_is_intrinsic_tc(ctx, callee) then {
+		if Iarch(args.len) != 2 then die("cf: type: raw::place takes an address and a value\n")
+		if !is_wordish(type_of!(args[0], env, ctx)) then die("cf: type: raw::place takes a `Uarch` destination address\n")
+		const Ty pt = type_of!(args[1], env, ctx)
+		if is_tint(pt) || is_tfixed(pt) || is_tfloat(pt) || is_tbool(pt) then die("cf: type: raw::place places an aggregate — a scalar word goes through `raw::store`\n")
+		if is_tptr(pt) || is_tfn(pt) then die("cf: type: raw::place places an aggregate value, not a pointer\n")
+		return pt
+	}
 	if is_cast_type(callee) then return cast_type!(callee, args, env, ctx)
 	if str_eq(callee, "Str") then return str_seal_type!(args, env, ctx)
 	# an INDIRECT call: the callee names a function-value binding (a HOF's function parameter)
 	const Iarch cei = env_index(env, callee)
 	if cei >= 0 then { if is_tfn(env[cei].ty) then return indirect_call_type!(env[cei].ty, args, env, ctx) }
 	const Iarch fidx = find_func(ctx.funcs, callee)
-	if fidx < 0 then die("cf: type: call to an undefined function\n")
+	if fidx < 0 then die("cf: type: call to an undefined function `${callee}`\n")
 	const Iarch np = Iarch(ctx.funcs[fidx].params.len)
 	const Iarch na = Iarch(args.len)
 	if np != na then die("cf: type: wrong number of call arguments\n")
@@ -1349,7 +1433,7 @@ pub const arm_bind_env = (Str type_name, [Str] members, [Str] binds, [VarTy] env
 		# a `_` skips and a sub-pattern GUARD (`=Member`/`#int`) constrains but binds no name
 		if !str_eq(binds[bi], "_") && !is_pat_guard(binds[bi]) then {
 			const Ty bt = payload_decl_ty(ui, mi, bi, ctx)
-			benv = [...benv, VarTy({ name: binds[bi], ty: bt, mutable: false, esc: false, outer: false, fixed: false, is_ref: false, fsize: 0 })]
+			benv = [...benv, VarTy({ name: binds[bi], ty: bt, mutable: false, esc: false, outer: false, fixed: false, is_ref: false, fsize: 0, elem: "" })]
 		}
 		bi = bi + 1
 	}
@@ -1744,7 +1828,7 @@ const arraylit_ret_ty! = (Expr e, Str elem, [VarTy] env, Ctx ctx): Ty -> {
 # than letting emit silently copy zero slots.)
 const is_spreadable_src = (Expr e): Bool -> match e {
 	Expr.Var(n) -> true,
-	Expr.Call(c, ta, a) -> true,
+	Expr.Call(c, ta, a, _) -> true,
 	Expr.Tuple(es) -> true,
 	_ -> false
 }
@@ -1838,7 +1922,7 @@ pub const check_destructure! = ([Str] pat, Bool mutable, Expr rhs, [VarTy] env, 
 		if mutable then {
 			if !is_tint(pty) && !is_tbool(pty) then die("cf: type: a `let` destructure position must be a scalar (a record/Str position binds `const`)\n")
 		}
-		e2 = [...e2, VarTy({ name: tok, ty: pty, mutable: mutable, esc: false, outer: false, fixed: false, is_ref: false, fsize: 0 })]
+		e2 = [...e2, VarTy({ name: tok, ty: pty, mutable: mutable, esc: false, outer: false, fixed: false, is_ref: false, fsize: 0, elem: "" })]
 		pos = pos + 1
 		pi = pi + 1
 	}
@@ -1850,7 +1934,15 @@ pub const check_destructure! = ([Str] pat, Bool mutable, Expr rhs, [VarTy] env, 
 # word, or a record for a `[Record]`).
 const index_type! = (Str arr, Expr idx, [VarTy] env, Ctx ctx): Ty -> {
 	const Iarch vi = env_index(env, arr)
-	if vi < 0 then die("cf: type: index of an undeclared name\n")
+	if vi < 0 then {
+		# a bare NON-local name — a `static [N Uint8]` (a `$dyn` value-const) is indexable like an array
+		const Iarch sfi = find_func(ctx.funcs, arr)
+		if sfi >= 0 && ctx.funcs[sfi].is_value && str_eq(ctx.funcs[sfi].ret_name, "$dyn") then {
+			if !is_tint(type_of!(idx, env, ctx)) then die("cf: type: an array index must be an integer\n")
+			return elem_ty!(ctx.funcs[sfi].ret_elem, ctx)
+		}
+		die("cf: type: index of an undeclared name\n")
+	}
 	# a tuple is comptime-indexed, each position independently typed
 	if is_ttuple(env[vi].ty) then return tuple_index_type!(tuple_elems(env[vi].ty), idx, ctx)
 	# a string index `s[i]` yields a byte (an Int)
@@ -1858,10 +1950,15 @@ const index_type! = (Str arr, Expr idx, [VarTy] env, Ctx ctx): Ty -> {
 		if !is_tint(type_of!(idx, env, ctx)) then die("cf: type: a string index must be an integer\n")
 		return Ty.TInt
 	}
-	# a byte-pointer / buffer index `p[i]` yields a byte (an Int)
+	# a pointer index `p[i]` reads at the DECLARED element type (the binding's `elem`, kept from
+	# the `*[T]` parameter): a byte pointer / opaque `*[Str]` yields a byte (an Int), a fixed
+	# width its exact type, an aggregate element its record/union/Str type — mirroring a `[T]`
 	if is_tptr(env[vi].ty) then {
 		if !is_tint(type_of!(idx, env, ctx)) then die("cf: type: a buffer index must be an integer\n")
-		return Ty.TInt
+		const Str pe = env[vi].elem
+		if str_eq(pe, "") || str_eq(pe, "Uint8") || str_eq(pe, "Str") then return Ty.TInt
+		if is_fixed_name(pe) then return fixed_ty(pe)
+		return elem_ty!(pe, ctx)
 	}
 	const Str en = dyn_of(env[vi].ty)
 	if str_eq(en, "") then die("cf: type: indexing a non-array value\n")
@@ -2095,7 +2192,7 @@ const arraylit_len = (Expr e): Iarch -> match e {
 	_ -> 0 - 1
 }
 const call_ret_size = (Expr e, Ctx ctx): Iarch -> {
-	const Str cn = match e { Expr.Call(n, ta, args) -> n, _ -> "" }
+	const Str cn = match e { Expr.Call(n, ta, args, _) -> n, _ -> "" }
 	if str_eq(cn, "") then return 0 - 1
 	const Iarch fi = find_func(ctx.funcs, cn)
 	if fi < 0 then return 0 - 1
@@ -2189,7 +2286,7 @@ const yields_of_list! = ([Stmt] ss, [VarTy] env0, Ctx ctx): [Ty] -> {
 		if i >= Iarch(ss.len) then break
 		const Stmt s = ss[i]
 		match s {
-			Stmt.Let(n, m, ann, e) -> { env = [...env, VarTy({ name: n, ty: binding_ty!(ann, e, env, ctx), mutable: m, esc: false, outer: false, fixed: false, is_ref: false, fsize: 0 })] },
+			Stmt.Let(n, m, ann, e) -> { env = [...env, VarTy({ name: n, ty: binding_ty!(ann, e, env, ctx), mutable: m, esc: false, outer: false, fixed: false, is_ref: false, fsize: 0, elem: "" })] },
 			Stmt.Destructure(pat, m, e) -> { env = check_destructure!(pat, m, e, env, ctx) },
 			_ -> { r = cat_tys(r, yields_of_stmt!(s, env, ctx)) }
 		}
@@ -2253,7 +2350,7 @@ pub const type_of! = (Expr e, [VarTy] env, Ctx ctx): Ty -> match e {
 	Expr.Unit -> Ty.TUnit,
 	Expr.Loop(body) -> loop_expr_type!(body, env, ctx),
 	Expr.Spread(x) -> spread_bad_type(),
-	Expr.Buffer(sz) -> Ty.TPtr,
+	Expr.Buffer(sz) -> Ty.TDyn("Uint8"),
 	Expr.Addr(name) -> var_type(env, name, ctx),
 	Expr.Neg(x) -> neg_unop!(x, env, ctx),
 	Expr.BitNot(x) -> bitnot_unop!(x, env, ctx),
@@ -2277,7 +2374,7 @@ pub const type_of! = (Expr e, [VarTy] env, Ctx ctx): Ty -> match e {
 	Expr.And(l, r) -> bool_binop!(l, r, env, ctx),
 	Expr.Or(l, r) -> bool_binop!(l, r, env, ctx),
 	Expr.If(c, t, e2) -> if_type!(c, t, e2, env, ctx),
-	Expr.Call(callee, tyargs, args) -> call_type!(callee, tyargs, args, env, ctx),
+	Expr.Call(callee, tyargs, args, _) -> call_type!(callee, tyargs, args, env, ctx),
 	Expr.DeferTap(fn, args) -> defertap_type!(fn, args, env, ctx)
 }
 # `defer fn(args)` in value position: the scheduled call must typecheck (arity + argument types,
@@ -2308,7 +2405,7 @@ const check_for_body! = (Str lv, Str arr, [Stmt] body, [VarTy] env, Ctx ctx): Ia
 	# element narrowed to a word — a genesis simplification; now the element type flows through.)
 	const Str fen = dyn_of(env[ai].ty)
 	const Ty lvt = elem_ty!(fen, ctx)
-	const [VarTy] benv = [...env, VarTy({ name: lv, ty: lvt, mutable: false, esc: false, outer: false, fixed: false, is_ref: false, fsize: 0 })]
+	const [VarTy] benv = [...env, VarTy({ name: lv, ty: lvt, mutable: false, esc: false, outer: false, fixed: false, is_ref: false, fsize: 0, elem: "" })]
 	return check_stmts!(body, benv, ctx, lk_for)
 }
 
@@ -2333,15 +2430,43 @@ const name_esc = ([VarTy] env, Str n): Bool -> {
 	if i < 0 then return false
 	return env[i].esc
 }
+# Does `callee` return a type that RESIDES in memory — a record, dynamic array/buffer, string,
+# tuple, or union? Classified straight from the declared `ret_name` (no `Ty` is built, so this stays
+# allocation-free — `carries_local` must remain non-`!`). Unions are treated conservatively: a
+# tag-only union is a bare word and never dangles, but a boxed one does, and over-rejecting a rare
+# tag-only return `in fb` is safe. A scalar return (`Iarch`/fixed/`Bool`/`Float`) copies out by value.
+const ret_resides = (Str callee, Ctx ctx): Bool -> {
+	const Iarch fi = find_func(ctx.funcs, callee)
+	if fi < 0 then return false
+	const Str rn = ctx.funcs[fi].ret_name
+	if str_eq(rn, "$tuple") || str_eq(rn, "$dyn") || str_eq(rn, "Str") then return true
+	if find_rec(ctx.recs, rn) >= 0 then return true
+	if find_union(ctx.unions, rn) >= 0 then return true
+	return false
+}
+# A call carries a local when it wraps a `$`-stack buffer into a `fixed_buffer` (the returned handle
+# then addresses frame-local storage — track it like a `$` value), or when it allocates an AGGREGATE
+# `in` a stack-tainted geometry (`make!() in fb`, fb over a `$buf`): the aggregate lives in that
+# frame-local buffer and dangles once the frame pops. A SCALAR return from `f() in fb` copies out by
+# value and is safe (so `span!(n) in fb` returning an `Iarch` is fine).
+const call_carries_local = (Str callee, [Expr] args, Str g, [VarTy] env, Ctx ctx): Bool -> {
+	if str_eq(callee, "of__fb") && exprs_carry_local(args, env, ctx) then return true
+	if !str_eq(g, "") && name_esc(env, g) && ret_resides(callee, ctx) then return true
+	return false
+}
 const carries_local = (Expr e, [VarTy] env, Ctx ctx): Bool -> match e {
 	Expr.Addr(n) -> true,
-	Expr.Var(n) -> name_esc(env, n),
+	Expr.Call(callee, tyargs, args, g) -> call_carries_local(callee, args, g, env, ctx),
+	# a `$`-stack aggregate IS a dying local: its storage pops with the frame, so returning/rehoming
+	# the whole value (`$p`) dangles — just like a pointer-into-a-local. A scalar field read (`$p.x`)
+	# copies a value and is fine (handled by the Field arm's `field_is_ptr` gate below).
+	Expr.Var(n) -> is_stack_name(n) || name_esc(env, n),
 	# a field READ propagates the local-escape taint iff it reads an aggregate POINTER field (`fptrs`)
 	# of a TAINTED local aggregate — `return localAgg.ptrField` hands up the `&local` stored in it, a
 	# pointer into a dying residence (memory_model §6). A scalar-field read (`p.x`) carries no pointer,
 	# and a pointer field of a PARAM (`param.p`, non-`esc`) points into the caller's region and is safe.
 	# (An index read `a[i]` and a nested `FieldExpr` base stay unpropagated — a further edge.)
-	Expr.Field(base, f) -> name_esc(env, base) && field_is_ptr(base, f, env, ctx),
+	Expr.Field(base, f) -> (is_stack_name(base) || name_esc(env, base)) && field_is_ptr(base, f, env, ctx),
 	Expr.Record(tn, inits) -> inits_carry_local(inits, env, ctx),
 	Expr.UnionMk(tn, mem, args) -> exprs_carry_local(args, env, ctx),
 	Expr.Tuple(elems) -> exprs_carry_local(elems, env, ctx),
@@ -2474,6 +2599,13 @@ const check_simple_stmt! = (Stmt s, [VarTy] env, Ctx ctx, Iarch loop_kind): Iarc
 			const Iarch idx = env_index(env, n)
 			if idx < 0 then die("cf: type: assignment to an undeclared name\n")
 			if !env[idx].mutable then die("cf: type: cannot reassign a `const` binding or a parameter\n")
+			# a `$`-stack value may not be stored into a non-`$` binding (a heap array/record that may outlive
+			# the frame): the store would dangle once the frame pops, exactly like returning it. A store into
+			# another `$` (same-frame) binding is fine — both die together.
+			# a `$`-stack AGGREGATE is a fixed frame slot — it is built once and cannot be re-pointed (growing
+			# or resetting it would need a fresh heap block, defeating the stack). Mutate its fields instead.
+			if is_stack_name(n) && (!str_eq(rec_of(env[idx].ty), "") || !str_eq(dyn_of(env[idx].ty), "")) then die("cf: type: a `$`-stack aggregate cannot be reassigned — its storage is a fixed frame slot; mutate its fields, or drop the `$` for a growable value\n")
+			if !is_stack_name(n) && carries_local(e, env, ctx) then die("cf: type: a `$`-stack value cannot escape into a heap aggregate — it dangles when the frame pops; keep it in a geometry (or a `$` binding)\n")
 			# an empty `[]` reset keeps a dynamic-array binding's type (its element is unknown,
 			# adopted from the target — `arraylit_type` would otherwise default it to `Iarch`)
 			if is_empty_arraylit(e) then {
@@ -2505,6 +2637,7 @@ const check_simple_stmt! = (Stmt s, [VarTy] env, Ctx ctx, Iarch loop_kind): Iarc
 			# OUTLIVES this call) may not store a pointer into a function-LOCAL — it would dangle once the
 			# local dies (memory_model §6). A store into a local record is same-rank and permitted.
 			if env[idx].outer && carries_local(e, env, ctx) then die("cf: type: cannot rehome a pointer into a local through a caller's aggregate — it would dangle once the call returns\n")
+			if !is_stack_name(b) && carries_local(e, env, ctx) then die("cf: type: a `$`-stack value cannot escape into a heap aggregate — it dangles when the frame pops; keep it in a geometry (or a `$` binding)\n")
 			if !ty_eq(type_of!(e, env, ctx), ft) then die("cf: type: a field value's type must match the field\n")
 		},
 		Stmt.DeepFieldAssign(be, f, e) -> {
@@ -2523,30 +2656,58 @@ const check_simple_stmt! = (Stmt s, [VarTy] env, Ctx ctx, Iarch loop_kind): Iarc
 			const Str rn = lvalue_root_name(be)
 			const Iarch rIdx = env_index(env, rn)
 			if rIdx >= 0 && env[rIdx].outer && carries_local(e, env, ctx) then die("cf: type: cannot rehome a pointer into a local through a caller's aggregate — it would dangle once the call returns\n")
+			if !is_stack_name(rn) && carries_local(e, env, ctx) then die("cf: type: a `$`-stack value cannot escape into a heap aggregate — it dangles when the frame pops; keep it in a geometry (or a `$` binding)\n")
 			if !ty_eq(type_of!(e, env, ctx), ft) then die("cf: type: a field value's type must match the field\n")
 		},
 		Stmt.IndexAssign(a, ix, val) -> {
 			const Iarch idx = env_index(env, a)
-			if idx < 0 then die("cf: type: element assignment to an undeclared name\n")
+			# a bare NON-local name — a `static [N Uint8]` (mutable BSS `$dyn` value-const) — is assignable
+			# by index; validate index/value here and skip the local-binding checks (guarded by idx>=0).
+			const Iarch sfi = if idx < 0 then find_func(ctx.funcs, a) else 0 - 1
+			const Bool is_stat = idx < 0 && sfi >= 0 && ctx.funcs[sfi].is_value && str_eq(ctx.funcs[sfi].ret_name, "$dyn")
+			if idx < 0 && !is_stat then die("cf: type: element assignment to an undeclared name\n")
+			if is_stat then {
+				if !is_tint(type_of!(ix, env, ctx)) then die("cf: type: an array index must be an integer\n")
+				if is_adoptable_lit(val) then {
+					const Iarch slv = lit_signed_val(val)
+					if slv < 0 || slv > 255 then die("cf: type: a byte-buffer element literal must be in 0..255\n")
+				}
+				const Ty svt = type_of!(val, env, ctx)
+				if !is_tint(svt) && !is_tfixed(svt) then die("cf: type: an array element must be an integer\n")
+			}
+			if idx >= 0 then {
 			if !env[idx].mutable then die("cf: type: cannot write to a `const`/borrowed array\n")
 			if str_eq(dyn_of(env[idx].ty), "") && !is_tptr(env[idx].ty) then die("cf: type: element assignment needs a dynamic array or a byte buffer\n")
 			if !is_tint(type_of!(ix, env, ctx)) then die("cf: type: an array index must be an integer\n")
-			# a byte buffer (`[N Uint8]`, a `$ptr`) holds `Uint8`: a literal element must fit 0..255.
-			# (A non-literal stays a byte word — a byte read `src[i]` types `Int`, not `Uint8`, so no
-			# implicit-narrowing gate is possible without also rejecting the legitimate byte-copy path.)
-			if is_tptr(env[idx].ty) && is_adoptable_lit(val) then {
+			if !is_stack_name(a) && carries_local(val, env, ctx) then die("cf: type: a `$`-stack value cannot escape into a heap aggregate — it dangles when the frame pops; keep it in a geometry (or a `$` binding)\n")
+			# region-outlives (memory_model §6, mirroring the field-assign rule): rehoming through a
+			# caller-provided array (a `*[T]` parameter, an `outer` binding) may not store a pointer
+			# into a local — it would dangle once this call returns
+			if env[idx].outer && carries_local(val, env, ctx) then die("cf: type: cannot rehome a pointer into a local through a caller's array — it would dangle once the call returns\n")
+			# the ELEMENT type name: a `[T]`'s from its `TDyn`, a `*[T]` pointer's from the binding's
+			# declared `elem` ("" is a raw byte buffer)
+			const Str aen = if is_tptr(env[idx].ty) then env[idx].elem else dyn_of(env[idx].ty)
+			# a byte element (`[N Uint8]` buffer, a `[Uint8]` array, or a byte pointer) holds `Uint8`:
+			# a literal element must fit 0..255. (A non-literal stays a byte word — a byte read `src[i]`
+			# types `Int`, not `Uint8`, so no implicit-narrowing gate is possible without also
+			# rejecting the legitimate byte-copy path.)
+			if (str_eq(aen, "") || str_eq(aen, "Uint8")) && is_adoptable_lit(val) then {
 				const Iarch lv = lit_signed_val(val)
 				if lv < 0 || lv > 255 then die("cf: type: a byte-buffer element literal must be in 0..255\n")
 			}
-			# a FLOAT-element array (`[Float64]`/`[Float32]`) takes a matching float value; otherwise the
-			# element value is any integer word — a plain `Iarch`/`Int` OR a fixed-width (`Int16`, `Uint8`, …)
+			# a FLOAT-element array (`[Float64]`/`[Float32]`) takes a matching float value; a `[Bool]`
+			# a Bool; an AGGREGATE element (a record/union/`Str`/nested array — the slot holds its
+			# 8-byte arena pointer) a value of exactly the element type; otherwise the element value
+			# is any integer word — a plain `Iarch`/`Int` OR a fixed-width (`Int16`, `Uint8`, …)
 			const Ty vt = type_of!(val, env, ctx)
-			const Str aen = dyn_of(env[idx].ty)
 			if is_float_name(aen) then {
 				if !ty_eq(vt, elem_ty!(aen, ctx)) then die("cf: type: a float array element needs a matching float value\n")
 			} else if str_eq(aen, "Bool") then {
 				if !is_tbool(vt) then die("cf: type: a `[Bool]` array element needs a Bool value\n")
+			} else if str_eq(aen, "Str") || is_nested(aen) || find_rec(ctx.recs, aen) >= 0 || find_union(ctx.unions, aen) >= 0 then {
+				if !ty_eq(vt, elem_ty!(aen, ctx)) then die("cf: type: an array element value must match the element type\n")
 			} else if !is_tint(vt) && !is_tfixed(vt) then die("cf: type: an array element must be an integer\n")
+			}
 		},
 		Stmt.IfThen(c, body) -> {
 			if !is_tbool(type_of!(c, env, ctx)) then die("cf: type: an `if` condition must be a Bool (no truthiness)\n")
@@ -2729,20 +2890,40 @@ const stmt_has_return = (Stmt s): Bool -> match s {
 	Stmt.Match(scrut, arms) -> stmt_arms_have_return(arms),
 	_ -> false
 }
-# A `defer` may appear ONLY as a direct statement of the function body (v1). A defer nested in
-# a loop / `if` / block / match / another defer is rejected here rather than surviving
-# unlowered to emit; a defer body may not `return`.
+# A `defer` may appear in ANY block/loop/match-arm scope (v2 — the lowering fires it at that scope's
+# exit: a loop body per back-edge, a block at its close). Two rules remain, validated over every
+# defer anywhere in the body: a defer body may not itself `defer` (no defer-in-defer) nor `return`
+# (it runs at scope exit). A defer inside a CLOSURE is not yet lowered, so it is still rejected.
+const defer_body_ok = ([Stmt] dbody): Iarch -> {
+	if stmts_have_defer(dbody) then die("cf: type: a `defer` cannot be nested in another `defer`\n")
+	if stmts_have_return(dbody) then die("cf: type: a `defer` body runs at scope exit and cannot `return`\n")
+	return 0
+}
+const validate_defer_arms = ([StmtArm] arms): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		enforce_toplevel_defer(arms[i].body)
+		i = i + 1
+	}
+	return 0
+}
+const validate_defer_stmt = (Stmt s): Iarch -> match s {
+	Stmt.Defer(dbody) -> defer_body_ok(dbody),
+	Stmt.Loop(ss) -> enforce_toplevel_defer(ss),
+	Stmt.Block(ss) -> enforce_toplevel_defer(ss),
+	Stmt.ForIn(v, a, ss) -> enforce_toplevel_defer(ss),
+	Stmt.IfThen(c, st) -> validate_defer_stmt(st),
+	Stmt.IfElse(c, t, e) -> validate_defer_stmt(t) + validate_defer_stmt(e),
+	Stmt.Match(sc, arms) -> validate_defer_arms(arms),
+	Stmt.Closure(nm, ps, rn, cb) -> if stmts_have_defer(cb) then die("cf: type: a `defer` inside a closure is not supported yet\n") else 0,
+	_ -> 0
+}
 const enforce_toplevel_defer = ([Stmt] body): Iarch -> {
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(body.len) then break
-		match body[i] {
-			Stmt.Defer(dbody) -> {
-				if stmts_have_defer(dbody) then die("cf: type: a `defer` cannot be nested in another `defer`\n")
-				if stmts_have_return(dbody) then die("cf: type: a `defer` body runs at scope exit and cannot `return`\n")
-			},
-			_ -> { if stmt_has_defer(body[i]) then die("cf: type: a `defer` must be a top-level statement of its function (v1)\n") }
-		}
+		validate_defer_stmt(body[i])
 		i = i + 1
 	}
 	return 0
@@ -2762,7 +2943,7 @@ const exprs_have_defertap = ([Expr] es): Bool -> {
 }
 const expr_has_defertap = (Expr e): Bool -> match e {
 	Expr.DeferTap(fn, args) -> true,
-	Expr.Call(n, ta, args) -> exprs_have_defertap(args),
+	Expr.Call(n, ta, args, _) -> exprs_have_defertap(args),
 	Expr.UnionMk(t, m, args) -> exprs_have_defertap(args),
 	Expr.Tuple(elems) -> exprs_have_defertap(elems),
 	Expr.ArrayLit(hs, sn, elems, et) -> expr_has_defertap(sn) || exprs_have_defertap(elems),
@@ -2848,7 +3029,7 @@ const exprs_defertap_hoistable = ([Expr] es): Bool -> {
 }
 const defertap_hoistable = (Expr e): Bool -> match e {
 	Expr.DeferTap(fn, args) -> exprs_defertap_hoistable(args),
-	Expr.Call(n, ta, args) -> exprs_defertap_hoistable(args),
+	Expr.Call(n, ta, args, _) -> exprs_defertap_hoistable(args),
 	_ -> !expr_has_defertap(e)
 }
 # A `defer`-tap value is admitted ONLY as (part of) a direct function-body binding / return / call
@@ -2925,12 +3106,12 @@ const check_closure! = (Str nm, [Param] params, Str ret, [Stmt] body, [VarTy] en
 	loop {
 		if pi >= Iarch(params.len) then break
 		check_ptr_pointee(params[pi], ctx.recs, ctx.unions)
-		cenv = [...cenv, VarTy({ name: params[pi].name, ty: param_ty!(params[pi], ctx.recs, ctx.unions), mutable: false, esc: false, outer: false, fixed: false, is_ref: false, fsize: 0 })]
+		cenv = [...cenv, VarTy({ name: params[pi].name, ty: param_ty!(params[pi], ctx.recs, ctx.unions), mutable: false, esc: false, outer: false, fixed: false, is_ref: false, fsize: 0, elem: params[pi].elem })]
 		pi = pi + 1
 	}
 	const Iarch dr = check_stmts!(body, cenv, cctx, lk_none)
 	if dr != 2 then die("cf: type: a closure body must end with `return`\n")
-	return [...env, VarTy({ name: nm, ty: closure_tfn(ret, params), mutable: false, esc: false, outer: false, fixed: false, is_ref: false, fsize: 0 })]
+	return [...env, VarTy({ name: nm, ty: closure_tfn(ret, params), mutable: false, esc: false, outer: false, fixed: false, is_ref: false, fsize: 0, elem: "" })]
 }
 
 const check_stmts! = ([Stmt] stmts, [VarTy] env0, Ctx ctx, Iarch loop_kind): Iarch -> {
@@ -2968,7 +3149,7 @@ const check_stmts! = ([Stmt] stmts, [VarTy] env0, Ctx ctx, Iarch loop_kind): Iar
 				if is_ttuple(ty) && !is_tuple_bindable(e) then die("cf: type: this expression cannot bind a tuple\n")
 				# a binding inherits the region-outlives taint of its initializer: `const *P p = &x`, or a
 				# `let q = p` that launders one, carries a local pointer that a later escape must catch.
-				env = [...env, VarTy({ name: n, ty: ty, mutable: m, esc: carries_local(e, env, ctx), outer: false, fixed: is_fix_ann(ann), is_ref: inits_ref!(e, env, ctx), fsize: fix_ann_size(ann) })]
+				env = [...env, VarTy({ name: n, ty: ty, mutable: m, esc: carries_local(e, env, ctx), outer: false, fixed: is_fix_ann(ann), is_ref: inits_ref!(e, env, ctx), fsize: fix_ann_size(ann), elem: "" })]
 			},
 			Stmt.Destructure(pat, m, e) -> { env = check_destructure!(pat, m, e, env, ctx) },
 			Stmt.Closure(nm, params, ret, body) -> { env = check_closure!(nm, params, ret, body, env, ctx) },
@@ -3161,6 +3342,13 @@ const check_func! = (Func fn, Ctx ctx): Iarch -> {
 		if str_eq(fn.ret_name, "") then die("cf: type: an asm function must declare its return type\n")
 		return 0
 	}
+	# an intrinsic declares only a signature — no body to check; the compiler supplies it. Its
+	# params/return register it for callers exactly like asm; the return type is mandatory (it
+	# may be generic, so no param-count cap and no concrete-signature check applies).
+	if fn.is_intrinsic then {
+		if str_eq(fn.ret_name, "") then die("cf: type: an intrinsic must declare its return type\n")
+		return 0
+	}
 	# a concrete function's signature may not mention a type variable (an undeclared `'T` in a
 	# non-generic function, or one the monomorph pass left unsubstituted)
 	if sig_has_typevar(fn) then die("cf: type: an undeclared type variable in a function signature\n")
@@ -3180,7 +3368,7 @@ const check_func! = (Func fn, Ctx ctx): Iarch -> {
 		const Bool pmut = param_is_recptr(fn.params[pi], ctx.recs) || param_is_indexptr(fn.params[pi])
 		# a `*T` pointer parameter is a caller-provided home that OUTLIVES this call (`outer`): the
 		# region-outlives check rejects rehoming a pointer-into-local through it (memory_model §6).
-		env = [...env, VarTy({ name: fn.params[pi].name, ty: pty, mutable: pmut, esc: false, outer: fn.params[pi].is_ptr, fixed: false, is_ref: fn.params[pi].is_ptr, fsize: 0 })]
+		env = [...env, VarTy({ name: fn.params[pi].name, ty: pty, mutable: pmut, esc: false, outer: fn.params[pi].is_ptr, fixed: false, is_ref: fn.params[pi].is_ptr, fsize: 0, elem: fn.params[pi].elem })]
 		pi = pi + 1
 	}
 	# a closure is admitted only as a direct function-body statement (v1); reject one buried in

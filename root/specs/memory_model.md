@@ -27,7 +27,7 @@ Memory is a **tree** of nodes called the manifold.
   is user land. The user **cannot** allocate in the root — a program must graft
   at least one geometry node before it has usable memory.
 - Every non-root node is minted by **instantiating a geometry at runtime** —
-  the `mem.arena.of(4096)` call itself creates the node (see
+  the `fixed_arena::of(4096)` call itself creates the node (see
   §4). A child node **pulls its space from
   its parent node** — it is physically _inside_ the parent.
 - A node lives exactly as long as the binding that names it, and bindings nest
@@ -48,7 +48,11 @@ its parent's bound, and an unbounded child (say, a GC heap) requires an
 unbounded ancestor chain up to the root. Violations — an unbounded child
 grafted into a bounded parent, or children whose total cap exceeds the
 parent's — are compile errors. This is checkable precisely because geometries
-are comptime entities and can never be assigned at runtime.
+are comptime entities and can never be assigned at runtime. A node's bound
+covers **both of its sub-regions** (the residue/survivor split of
+[geometry_lowering.md](./geometry_lowering.md) §5): the split is an interior
+layout, never a capacity boundary — `of(n)` means `n` bytes total, however the
+two sides share them.
 
 ## 3. Geometries
 
@@ -96,15 +100,19 @@ identity — a hook that grows a foreign aggregate (see `on_realloc` under
 A geometry is attached to a program **only at a call site**, with an `in` clause:
 
 ```
-const arena = mem.arena.of(4096)
+import std::mem::arena::fixed_arena
+
+const arena = fixed_arena::of(4096)
 
 my_allocating_function!() in arena
 ```
 
-(The `mem.arena.of(...)` part is modules, specified elsewhere.)
+(The constructor is a geometry module's `of` intrinsic imported by `::` path —
+`fixed_arena::of(...)`, `growing_arena::of(...)` — the module system, specified
+elsewhere. Which module the `of` came through fixes the geometry at comptime.)
 
 - **Instantiation creates the node.** The geometry-creating call
-  (`mem.arena.of(4096)`) is **comptime-shaped, runtime-materialized**: the
+  (`fixed_arena::of(4096)`) is **comptime-shaped, runtime-materialized**: the
   node's capacity, hook set, and identity are fixed and validated at comptime;
   the call's runtime step merely grabs the buffer (carves pages, or space from
   the parent) for that already-settled shape. The binding names the node. Every
@@ -324,20 +332,77 @@ Full capture rules to be specified; the direction above is ratified.
 
 ## 8. Zero-cost return
 
-Returning a value across a geometry boundary is **free** — no copy. Two
-distinct events hide behind "return", and both are copy-free:
+Returning a value across a geometry boundary is **free** — no copy — and it does
+**not** carry the frame's dead residue upward. A return does two independent
+things, and both are copy-free:
 
-1. **Scope exit inside a live node.** The function returns but its node is
-   shared and outlives the call (an `in arena` used by several calls). The
-   return value already sits in storage that outlives the call — there is
-   nothing to do at all. `on_scope_exit` only runs the drop-set for the dead
-   residue.
-2. **Node teardown.** The binding that names the node dies with its scope, and
-   a value is returned out of the dying node. Because a child node is
-   physically carved from its parent, the boundary between them is only
-   bookkeeping: the node's **walls dissolve** and the return's storage is
-   **re-attributed to the parent, in place** — same address, same bytes, and
-   any **returned pointer stays valid**.
+- **The frame reclaims its own residue, in place.** `on_scope_exit` runs the
+  frame's **drop-set** — its own residue *minus everything reachable from the
+  return*. For a bump that is one rewind to the entry mark: the dead residue is
+  freed **at the frame**, on every return, aggregate-returning frames included.
+- **The return is cloaked, and already lives on the claiming node.** `on_ret`
+  removes the return's whole reachable closure from that drop-set, so the rewind
+  cannot touch it — and because an escaping allocation is placed on the **caller's**
+  node to begin with (node-locality), the value the caller binds already sits in
+  storage the caller owns. Nothing crosses but the cloaked return, as a pointer;
+  `on_alloc_ret` has nothing to copy.
+
+So residue is reclaimed where it was born; only the cloaked return leaves the
+frame. One case does move a *block* upward, and only bookkeeping-deep: a value
+escaping an **explicitly-carved sub-node** (`const a = fixed_arena::of(n); … return
+x` with `x` in `a`). `a`'s binding dies while `x` must survive; because `a` is
+physically carved from its parent, its **walls dissolve** and `x`'s storage is
+**re-attributed to the parent, in place** — same address, returned pointer stays
+valid.
+
+**Reclamation is by `destroy`, user-placed** (the ratified mechanism —
+geometry_lowering §3, Wall dissolution). A carved child is reclaimed by the explicit
+teardown the programmer writes — `const b = <geom>::of(n) |> defer destroy` — which
+rewinds the child's own extent (header, blocks, elastic pulls) out of the parent's
+**survivor** side at the binding's scope exit, preserving the escaping closure (born
+survivor-side above it) and carrying nothing dead up. The compiler does not infer the
+teardown; it **verifies** each `destroy` is sound (nothing the child holds escapes the
+closed scope — the drop-set / closure law behind `!`) and rejects one that would strand
+an escaping value. A child left un-`destroy`ed lives until its parent node's own teardown
+(node-bounded, never dangling). Because reclaim is the child's own `destroy` at a
+programmer-chosen position, **every child is carved uniformly from the parent's survivor
+side**, so the carve/pull draw from the parent lowers to the parent's static
+`reserve_ret__<parent>` (the parent-axis specialization: no runtime kind dispatch, no
+`cf_alloc`).
+
+The scope-graded scheme described in the rest of this section — a survivor-scope mark
+where one qualifies, **else** a residue-side carve gated by the *carve interlock* and the
+*pull-vs-bracket interlock* — is the pre-`destroy` mechanism it **supersedes**: those
+tiers let the compiler *auto-reclaim* a scratch child by borrowing whichever *ambient*
+bracket could reach it, and once teardown is the programmer's explicit `destroy` that
+inference retires (with it, the disqualification cases like a `&`-taken sibling, which
+forced the residue fallback, simply don't arise). It is retained here as the
+regression-set history until the implementation lands.
+
+The carve's *reclamation* is scope-graded rather than unconditional: a child
+node is carved from its parent's **survivor** side (a parent-frame bracket must
+never reset a child's storage — the pin of
+[geometry_lowering.md](./geometry_lowering.md) §5), so a dropped child node is
+reclaimed by the enclosing **survivor-scope mark** where one qualifies — a frame
+or loop from which nothing escapes frees the whole carve at its exit, bounded by
+that scope. Where no scope qualifies, a child that provably dies in-frame is
+carved from the **residue side** instead — its handle never escapes and no
+`in`-call under it leaks a pointer out (the geometry-channel rules: an
+aggregate-returning or rehoming callee run `in b` pins `b`) — so the frame or
+iteration bracket reclaims the whole child regardless. A **fixed** child
+(`of(n)`) needs two further gates (the *carve interlock*): the carve must be the
+binding's direct value, and a carve born inside a marked loop must not hand its
+handle across the back-edge (no outer assign target, no word use of the name).
+An **elastic** child (`grow(n)`) also parents its **pulls** on the residue side,
+so its chunks die with the frame or iteration too — but only under the full
+*pull-vs-bracket interlock*: every use of the handle is a geom clause, and every
+in-loop use follows an unconditional carve in that same loop, so no pull can
+land inside a bracket that resets before the child dies. Every gate fails toward
+survivor — a refused carve leaks until the *parent node's* teardown
+(**node-bounded, not frame-bounded**), never dangles. The dropped-return loop,
+the per-call child arena, and the pointer-param carve (corpus tests 1353, 1307,
+1355; 1356 guards the pin; 1359–1363 pin the interlock from both sides) are the
+regression set.
 
 For teardown to be sound the compiler promotes the **entire reachable closure**
 of the return value, not just its top: anything the return points at is promoted
@@ -347,9 +412,13 @@ return_. This reuses the same escape analysis that computes `!`.
 Reclaiming the _dead_ residue is the geometry's own concern, orthogonal to the
 copy-free return:
 
-- **Arena** — literally free. Arenas never per-object free, so dissolving the
-  walls merges the child bump (dead residue included) into the parent, reclaimed
-  at the parent's reset.
+- **Arena** — the frame's `on_scope_exit` rewind frees its dead residue **in
+  place, at the frame**. The return closure was born on the node's survivor side
+  (`on_ret` is placement at birth — geometry_lowering §3), so the rewind cannot
+  reach it by construction — no copy, no cloaking bookkeeping, and **nothing dead
+  is carried up to the caller**. (A dropped explicitly-carved sub-node is
+  reclaimed by an enclosing survivor-scope mark where one qualifies — the
+  scope-graded case above.)
 - **RC / GC** — the return is still not copied, but dead residue runs its hooks; a
   compacting collector may relocate by its own policy.
 

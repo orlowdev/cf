@@ -8,14 +8,14 @@
 # Left-associative operators fold in a loop that reassigns an `Expr` accumulator
 # (`acc = Expr.Add(acc, rhs)`) — one function per precedence level.
 
-import "io" as { die }
-import "token" as { Token, TokKind, is_eof, is_ident, is_intlit, is_strlit, is_lparen, is_rparen, is_lbrace, is_rbrace, is_lbracket, is_rbracket, is_comma, is_colon, is_dot, is_ellipsis, is_eq, is_arrow, is_minus, is_plus, is_star, is_slash, is_percent, is_amp, is_pipe, is_caret, is_tilde, is_bang, is_shl, is_shr, is_eqeq, is_ne, is_lt, is_gt, is_le, is_ge, is_logand, is_logor, is_yield, is_floatlit, is_pipearrow }
-import "lexer" as { lex }
-import "ast" as { Expr, Stmt, Param, Func, Ty, FieldInit, RecDecl, UnionMember, UnionDecl, MatchArm, StmtArm, Seg, RetSig, TupElem, Import, Program }
-import "astutil" as { tel_leaf, tel_nest, tel_fn, tel_is_fn }
+import io::{ die }
+import token::{ Token, TokKind, is_eof, is_ident, is_intlit, is_strlit, is_lparen, is_rparen, is_lbrace, is_rbrace, is_lbracket, is_rbracket, is_comma, is_colon, is_pathsep, is_dot, is_ellipsis, is_eq, is_arrow, is_minus, is_plus, is_star, is_slash, is_percent, is_amp, is_pipe, is_caret, is_tilde, is_bang, is_shl, is_shr, is_eqeq, is_ne, is_lt, is_gt, is_le, is_ge, is_logand, is_logor, is_yield, is_floatlit, is_pipearrow }
+import lexer::{ lex }
+import ast::{ Expr, Stmt, Param, Func, Ty, FieldInit, RecDecl, UnionMember, UnionDecl, MatchArm, StmtArm, Seg, RetSig, TupElem, Import, Program, with_geom }
+import astutil::{ tel_leaf, tel_nest, tel_fn, tel_is_fn }
 
 # The parse cursor: the token stream, the source (for keyword text), a position.
-pub data Parser = { [Token] toks, *[Uint8] src, Iarch pos, Str file }
+pub data Parser = { [Token] toks, *[Uint8] src, Iarch pos, Str file, Str target_os, Str target_arch, Bool saw_fb, Bool saw_fx, Bool saw_el }
 
 # The current token's kind.
 const peek = (*Parser p): TokKind -> p.toks[p.pos].kind
@@ -24,6 +24,45 @@ const peek = (*Parser p): TokKind -> p.toks[p.pos].kind
 const kw = (*Parser p, Str word): Bool -> {
 	if !is_ident(peek(p)) then return false
 	return slice_eq(p.src, p.toks[p.pos].start, p.toks[p.pos].len, word)
+}
+
+# Is the token `off` positions ahead the identifier `word`? (A bounded lookahead — the EOF
+# token backstops the end, so an out-of-range `off` reads a non-ident and returns false.)
+const kw_at = (*Parser p, Iarch off, Str word): Bool -> {
+	const Iarch j = p.pos + off
+	if !is_ident(p.toks[j].kind) then return false
+	return slice_eq(p.src, p.toks[j].start, p.toks[j].len, word)
+}
+
+# Is the token `off` ahead one of the standard geometry names? Guards the `mem.<geometry>`
+# surface so that a variable coincidentally named `mem` (`mem.name`, `mem.payloads`) still
+# parses as an ordinary field access — only `mem.<known-geometry>` is the reserved namespace.
+
+# Is this file one of the std geometry modules under `std/mem/`? Gates the page auto-inject
+# (a geometry module must not import the ambient page module). The raw substrate itself is
+# gated at RESOLVE (importing `std/mem/raw` is privileged to these files). Raw ops are
+# legal ONLY inside the std geometry modules (`std/mem/…`): hooks work in raw memory
+# (geometry_lowering §1), while userland keeps the no-raw-pointer discipline. The check is a
+# substring scan because std imports resolve to `lib/std/mem/<geom>.cf` paths.
+const in_std_mem = (Str file): Bool -> {
+	const Str tag = "std/mem/"
+	let Iarch i = 0
+	loop {
+		if i + Iarch(tag.len) > Iarch(file.len) then break
+		let Iarch j = 0
+		let Bool hit = true
+		loop {
+			if j >= Iarch(tag.len) then break
+			if Iarch(file[i + j]) != Iarch(tag[j]) then {
+				hit = false
+				break
+			}
+			j = j + 1
+		}
+		if hit then return true
+		i = i + 1
+	}
+	return false
 }
 
 # Does the token slice at (start, len) equal the keyword `word`?
@@ -51,8 +90,12 @@ const intern! = (*[Uint8] src, Iarch start, Iarch len): Str -> {
 	return Str(v)
 }
 
-# The current token's interned text (for a binding name or a variable reference).
-const cur_name! = (*Parser p): Str -> intern!(p.src, p.toks[p.pos].start, p.toks[p.pos].len)
+# The current token's interned text (for a binding name or a variable reference). A synthesized
+# token (namespace mangling) carries its identifier in `.text`, bypassing `src`; honor it.
+const cur_name! = (*Parser p): Str -> {
+	if Iarch(p.toks[p.pos].text.len) > 0 then return p.toks[p.pos].text
+	return intern!(p.src, p.toks[p.pos].start, p.toks[p.pos].len)
+}
 
 # A float literal's text with `_` separators removed — the spelling handed to QBE as a
 # `d_…` constant (cf never evaluates the value itself).
@@ -89,7 +132,7 @@ const escape_byte = (Iarch e): Iarch -> {
 # A hole must be exactly one expression (trailing tokens are an error).
 const parse_hole! = (*[Uint8] src, Iarch hstart, Iarch hlen): Expr -> {
 	let [1024 Uint8] hbuf
-	if hlen >= 1024 then die("cf: parse: an interpolation hole is too long\n")
+	if hlen >= Iarch(hbuf.len) then die("cf: parse: an interpolation hole is too long\n")
 	let Iarch i = 0
 	loop {
 		if i >= hlen then break
@@ -97,7 +140,7 @@ const parse_hole! = (*[Uint8] src, Iarch hstart, Iarch hlen): Expr -> {
 		i = i + 1
 	}
 	const [Token] toks = lex(hbuf, hlen)
-	let Parser hp = Parser({ toks: toks, src: hbuf, pos: 0, file: "" })
+	let Parser hp = Parser({ toks: toks, src: hbuf, pos: 0, file: "", target_os: "Darwin", target_arch: "Arm64", saw_fb: false, saw_fx: false, saw_el: false })
 	const Expr e = parse_expr!(&hp)
 	if !is_eof(peek(&hp)) then die("cf: parse: an interpolation hole must be a single expression\n")
 	return e
@@ -202,7 +245,7 @@ const parse_pipe_target! = (*Parser p, Expr piped): Expr -> {
 	let [Expr] args = []
 	if is_lparen(peek(p)) then args = parse_args!(p)
 	const [Str] no_ty = []
-	return Expr.Call(name, no_ty, [...args, piped])
+	return Expr.Call(name, no_ty, [...args, piped], "")
 }
 
 const parse_or! = (*Parser p): Expr -> {
@@ -407,7 +450,7 @@ const parse_args! = (*Parser p): [Expr] -> {
 }
 const parse_call! = (*Parser p, Str name): Expr -> {
 	const [Str] no_ty = []
-	return Expr.Call(name, no_ty, parse_args!(p))
+	return Expr.Call(name, no_ty, parse_args!(p), "")
 }
 
 # `f[T1, T2](args)` — a call to a generic function with explicit type arguments. Each type
@@ -431,7 +474,7 @@ const parse_tyargs! = (*Parser p): [Str] -> {
 const parse_generic_call! = (*Parser p, Str name): Expr -> {
 	const [Str] tys = parse_tyargs!(p)
 	if !is_lparen(peek(p)) then die("cf: parse: expected `(` after type arguments\n")
-	return Expr.Call(name, tys, parse_args!(p))
+	return Expr.Call(name, tys, parse_args!(p), "")
 }
 # Scan a bracket group starting at token index `br` (a `[`) to its matching `]`, returning the
 # index of the token AFTER the `]` (or -1 if unbalanced).
@@ -1079,7 +1122,7 @@ const is_fixed_arraylit = (Expr e, Iarch n): Bool -> match e {
 	_ -> false
 }
 const is_arraylit_e = (Expr e): Bool -> match e { Expr.ArrayLit(hs, sn, elems, et) -> true, _ -> false }
-const is_call_e = (Expr e): Bool -> match e { Expr.Call(c, ta, args) -> true, _ -> false }
+const is_call_e = (Expr e): Bool -> match e { Expr.Call(c, ta, args, _) -> true, _ -> false }
 
 # Validate a destructure pattern token: a bare name binds a position; a `_`-led token is a
 # skip — `_` (one) or `_<digits>` (n) — and anything else (`_foo`) is rejected.
@@ -1320,20 +1363,54 @@ const parse_defer! = (*Parser p): Stmt -> {
 		return Stmt.Defer(body)
 	}
 	const Expr e = parse_expr!(p)
-	const Bool isc = match e { Expr.Call(cn, ct, ca) -> true, _ -> false }
+	const Bool isc = match e { Expr.Call(cn, ct, ca, _) -> true, _ -> false }
 	if !isc then die("cf: parse: `defer` schedules a call `f(…)` or a block `{ … }`\n")
 	const [Stmt] one = [Stmt.Do(e)]
 	return Stmt.Defer(one)
 }
 
+# `<call> in <geometry>` — a geometry clause on a call site (memory_model §4). The name is
+# stamped onto the governing `Expr.Call` (its `geom` field) and rides to emit, which threads
+# the named node. `for x in arr` consumes its own `in` in `parse_for`, so this only ever
+# sees the trailing clause on a binding, a `return`, or a call-for-effect statement.
+const in_clause_name! = (*Parser p): Str -> {
+	if !kw(p, "in") then return ""
+	p.pos = p.pos + 1
+	if !is_ident(peek(p)) then die("cf: parse: expected a geometry name after `in`\n")
+	const Str g = cur_name!(p)
+	p.pos = p.pos + 1
+	return g
+}
+
+# Stamp an `in <geometry>` clause onto its governed expression. A geometry attaches to a
+# program ONLY at a call site (memory_model §4): only `Expr.Call` has a geom slot, so on any
+# other expression the clause would silently fall back to the ambient node — refuse it loudly.
+const geom_stamp = (Expr e, Str g): Expr -> {
+	if str_eq(g, "") then return e
+	const Bool isc = match e { Expr.Call(_, _, _, _) -> true, _ -> false }
+	if !isc then die("cf: parse: `in <geometry>` governs a call `f(…)`; this value is not a call\n")
+	return with_geom(e, g)
+}
+
+# Apply an `in <geometry>` clause to a binding: it governs the binding's initializer call.
+const let_with_geom = (Stmt s, Str g): Stmt -> {
+	if str_eq(g, "") then return s
+	return match s {
+		Stmt.Let(n, m, t, init) -> Stmt.Let(n, m, t, geom_stamp(init, g)),
+		_ -> s
+	}
+}
+
 const parse_stmt! = (*Parser p): Stmt -> {
 	if kw(p, "const") then {
 		p.pos = p.pos + 1
-		return parse_let!(p, false)
+		const Stmt cb = parse_let!(p, false)
+		return let_with_geom(cb, in_clause_name!(p))
 	}
 	if kw(p, "let") then {
 		p.pos = p.pos + 1
-		return parse_let!(p, true)
+		const Stmt lb = parse_let!(p, true)
+		return let_with_geom(lb, in_clause_name!(p))
 	}
 	if kw(p, "for") then return parse_for!(p)
 	if kw(p, "loop") then return parse_loop!(p)
@@ -1364,17 +1441,23 @@ const parse_stmt! = (*Parser p): Stmt -> {
 		# takes the following expression — so a valueless guarded return must be braced
 		# (`if c then { return }`), never `if c then return <more…>` (that returns the value).
 		if is_rbrace(peek(p)) || is_comma(peek(p)) then return Stmt.Return(Expr.Unit)
-		return Stmt.Return(parse_expr!(p))
+		const Expr rv = parse_expr!(p)
+		return Stmt.Return(geom_stamp(rv, in_clause_name!(p)))
 	}
 	# otherwise a call-for-effect statement (`name(args)`), a field mutation
 	# (`name.field = expr`), an element write (`name[i] = expr`), or a whole-name
 	# reassignment (`name = expr`, a `let` local).
 	if is_ident(peek(p)) then {
-		# `name(...)` / `name[T](...)` — a call (possibly generic) evaluated for its effect
+		# `name(...)` / `name[T](...)` — a call (possibly generic) evaluated for its effect,
+		# optionally with a trailing `in <geometry>` clause.
 		if is_lparen(p.toks[p.pos + 1].kind) then {
-			return Stmt.Do(parse_expr!(p))
+			const Expr de = parse_expr!(p)
+			return Stmt.Do(geom_stamp(de, in_clause_name!(p)))
 		}
-		if generic_call_stmt_ahead(p) then return Stmt.Do(parse_expr!(p))
+		if generic_call_stmt_ahead(p) then {
+			const Expr ge = parse_expr!(p)
+			return Stmt.Do(geom_stamp(ge, in_clause_name!(p)))
+		}
 		const Str name = cur_name!(p)
 		p.pos = p.pos + 1
 		if is_dot(peek(p)) then {
@@ -1437,7 +1520,9 @@ const parse_stmt! = (*Parser p): Stmt -> {
 		}
 		if !is_eq(peek(p)) then die("cf: parse: expected `=` in an assignment\n")
 		p.pos = p.pos + 1
-		return Stmt.Assign(name, parse_expr!(p))
+		# `name = <call> in <geometry>` — a reassignment whose value is a governed call
+		const Expr av = parse_expr!(p)
+		return Stmt.Assign(name, geom_stamp(av, in_clause_name!(p)))
 	}
 	die("cf: parse: expected a statement\n")
 	return Stmt.Return(Expr.Lit(0))
@@ -2045,11 +2130,31 @@ const parse_func! = (*Parser p): Func -> {
 		is_pub = true
 		p.pos = p.pos + 1
 	}
-	if !kw(p, "const") then die("cf: parse: expected `const`\n")
-	p.pos = p.pos + 1
+	# `intrinsic` opens the same signature grammar as `const` but declares ONLY the signature —
+	# the compiler supplies the body (ebnf § Intrinsics). It is the honest form for a compiler
+	# primitive: a real, resolvable declaration rather than a fabricated `cf__*` callee.
+	let Bool is_intrin = false
+	if kw(p, "intrinsic") then {
+		is_intrin = true
+		p.pos = p.pos + 1
+	} else {
+		if !kw(p, "const") then die("cf: parse: expected `const` or `intrinsic`\n")
+		p.pos = p.pos + 1
+	}
 	if !is_ident(peek(p)) then die("cf: parse: expected a function name\n")
 	const Str name = cur_name!(p)
 	p.pos = p.pos + 1
+	# `[pub] intrinsic name: Type` — a bodyless compiler-supplied VALUE (no `=`, no params, no `()`),
+	# for a comptime-known member like `std::comptime::os::target : Os`. Read as a value (`os::target`,
+	# not `os::target()`); modeled as a nullary value whose body the compiler supplies.
+	if is_intrin && is_colon(peek(p)) then {
+		const RetSig vrs = parse_ret_name!(p)
+		const [Param] vnoparams = []
+		const [Stmt] vibody = []
+		const [Seg] vinoasm = []
+		const [Str] vintp = []
+		return Func({ name: name, is_pub: is_pub, ret_name: vrs.name, ret_elem: vrs.elem, params: vnoparams, body: vibody, is_asm: false, asm_body: vinoasm, is_value: true, ret_telems: vrs.telems, typarams: vintp, tbounds: vintp, ret_size: vrs.size, is_intrinsic: true })
+	}
 	if !is_eq(peek(p)) then die("cf: parse: expected `=`\n")
 	p.pos = p.pos + 1
 	# `= ['T](…)` / `= [Color 'T](…)` — a generic function's (optionally bounded) type parameters
@@ -2067,7 +2172,10 @@ const parse_func! = (*Parser p): Func -> {
 	# a string (`Str`) or a Bool (`Bool`) keeps its type, anything else defaults to the `Int`
 	# word (`ret_name` "") — cf's value consts are literals (flags, sizes, greetings).
 	if !is_lparen(peek(p)) then {
+		if is_intrin then die("cf: parse: an `intrinsic` needs a parameter list — `intrinsic name = (args): Ret`\n")
 		if Iarch(typarams.len) > 0 then die("cf: parse: a top-level value const cannot be generic\n")
+		# a value name is lowercase-initial (uppercase-initial is a TYPE) — ebnf § Identifiers
+		if Iarch(name[0]) >= 65 && Iarch(name[0]) <= 90 then die("cf: parse: a value name must be lowercase — an uppercase-initial name is a type\n")
 		const [Param] noparams = []
 		const [Stmt] vempty = []
 		const Expr vexpr = parse_expr!(p)
@@ -2078,13 +2186,20 @@ const parse_func! = (*Parser p): Func -> {
 		}
 		const [Stmt] vbody = [...vempty, Stmt.Return(vexpr)]
 		const [Seg] vnoasm = []
-		return Func({ name: name, is_pub: is_pub, ret_name: vret, ret_elem: "", params: noparams, body: vbody, is_asm: false, asm_body: vnoasm, is_value: true, ret_telems: [], typarams: no_tp, tbounds: no_tp, ret_size: 0 })
+		return Func({ name: name, is_pub: is_pub, ret_name: vret, ret_elem: "", params: noparams, body: vbody, is_asm: false, asm_body: vnoasm, is_value: true, ret_telems: [], typarams: no_tp, tbounds: no_tp, ret_size: 0, is_intrinsic: false })
 	}
 	p.pos = p.pos + 1
 	const [Param] params = parse_params!(p)
 	if !is_rparen(peek(p)) then die("cf: parse: expected `)`\n")
 	p.pos = p.pos + 1
 	const RetSig rs = parse_ret_name!(p)
+	# an `intrinsic` stops at its signature — no `->`, no body; the compiler supplies it.
+	if is_intrin then {
+		if is_arrow(peek(p)) then die("cf: parse: an `intrinsic` declares only a signature and takes no `-> body`\n")
+		const [Stmt] ibody = []
+		const [Seg] inoasm = []
+		return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: ibody, is_asm: false, asm_body: inoasm, is_value: false, ret_telems: rs.telems, typarams: typarams, tbounds: tbounds, ret_size: rs.size, is_intrinsic: true })
+	}
 	if !is_arrow(peek(p)) then die("cf: parse: expected `->`\n")
 	p.pos = p.pos + 1
 	const [Stmt] nobody = []
@@ -2096,15 +2211,15 @@ const parse_func! = (*Parser p): Func -> {
 		if !is_strlit(peek(p)) then die("cf: parse: expected a string after `asm`\n")
 		const [Seg] segs = scan_asm_segs!(p.src, p.toks[p.pos].start, p.toks[p.pos].len)
 		p.pos = p.pos + 1
-		return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: nobody, is_asm: true, asm_body: segs, is_value: false, ret_telems: rs.telems, typarams: typarams, tbounds: tbounds, ret_size: rs.size })
+		return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: nobody, is_asm: true, asm_body: segs, is_value: false, ret_telems: rs.telems, typarams: typarams, tbounds: tbounds, ret_size: rs.size, is_intrinsic: false })
 	}
 	if is_lbrace(peek(p)) then {
 		p.pos = p.pos + 1
 		const [Stmt] body = parse_block!(p)
-		return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: body, is_asm: false, asm_body: noasm, is_value: false, ret_telems: rs.telems, typarams: typarams, tbounds: tbounds, ret_size: rs.size })
+		return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: body, is_asm: false, asm_body: noasm, is_value: false, ret_telems: rs.telems, typarams: typarams, tbounds: tbounds, ret_size: rs.size, is_intrinsic: false })
 	}
 	const [Stmt] one = [...nobody, Stmt.Return(parse_expr!(p))]
-	return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: one, is_asm: false, asm_body: noasm, is_value: false, ret_telems: rs.telems, typarams: typarams, tbounds: tbounds, ret_size: rs.size })
+	return Func({ name: name, is_pub: is_pub, ret_name: rs.name, ret_elem: rs.elem, params: params, body: one, is_asm: false, asm_body: noasm, is_value: false, ret_telems: rs.telems, typarams: typarams, tbounds: tbounds, ret_size: rs.size, is_intrinsic: false })
 }
 
 # `data Name = { Iarch a, Iarch b }` — a record declaration (Iarch fields only, at
@@ -2374,42 +2489,82 @@ const parse_union! = (*Parser p): UnionDecl -> {
 	return UnionDecl({ name: name, members: members, typarams: typarams, tbounds: tbounds })
 }
 
-# A top-level import `import "path" as { a, b, … }` (module_system §4). The path is a
-# string literal; the members are a brace-enclosed, comma-separated list of names (value
-# or type). Brick 1 accepts the destructured form only — a namespace alias (`as ns`) is
-# rejected. The path's raw content is interned (module paths carry no escapes).
+# Build a `/`-joined path string from `::`-separated segments (`[std, mem]` → `std/mem`), the
+# internal path representation the loader resolves against.
+const join_segs_slash! = ([Str] segs): Str -> {
+	let [Uint8] v = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(segs.len) then break
+		if i > 0 then v = [...v, 47] # `/`
+		let Iarch j = 0
+		loop {
+			if j >= Iarch(segs[i].len) then break
+			v = [...v, segs[i][j]]
+			j = j + 1
+		}
+		i = i + 1
+	}
+	return Str(v)
+}
+
+# Parse a `::`-path import (module_system §4): `import a::b::c` binds the last segment `c` as a
+# namespace over module `a::b::c`; `import a::b::c::{ x, Y }` destructures. The current ident is
+# the first segment. `::`→`/` for the internal path; no `as`, no string.
+const parse_import_path! = (*Parser p): Import -> {
+	let [Str] segs = [cur_name!(p)]
+	p.pos = p.pos + 1
+	let [Str] names = []
+	let Bool destructured = false
+	loop {
+		if !is_pathsep(peek(p)) then break
+		p.pos = p.pos + 1 # `::`
+		if is_lbrace(peek(p)) then {
+			p.pos = p.pos + 1 # `{`
+			loop {
+				if is_rbrace(peek(p)) then break
+				if !is_ident(peek(p)) then die("cf: parse: expected an imported member name\n")
+				names = [...names, cur_name!(p)]
+				p.pos = p.pos + 1
+				if is_comma(peek(p)) then p.pos = p.pos + 1
+			}
+			p.pos = p.pos + 1 # `}`
+			destructured = true
+			break
+		}
+		if !is_ident(peek(p)) then die("cf: parse: expected a path segment or `{` after `::`\n")
+		segs = [...segs, cur_name!(p)]
+		p.pos = p.pos + 1
+	}
+	const Str path = join_segs_slash!(segs)
+	let [Str] none = []
+	if destructured then return Import({ path: path, names: names, alias: "", wildcard: false })
+	# Optional `as <name>` (module_system §4): renames the namespace binding — `import a::b::os as
+	# os2` binds `os2` (not the last segment `os`) as the namespace over module `a::b::os`. The
+	# wildcard `as *` (module_system §5) instead splices the whole target surface in flat.
+	let Str alias = segs[Iarch(segs.len) - 1]
+	if kw(p, "as") then {
+		p.pos = p.pos + 1 # `as`
+		if is_star(peek(p)) then {
+			p.pos = p.pos + 1 # `*`
+			return Import({ path: path, names: none, alias: "", wildcard: true })
+		}
+		if !is_ident(peek(p)) then die("cf: parse: expected a namespace name or `*` after `as`\n")
+		alias = cur_name!(p)
+		p.pos = p.pos + 1
+	}
+	return Import({ path: path, names: none, alias: alias, wildcard: false })
+}
+
 const parse_import! = (*Parser p): Import -> {
 	# `pub import` is a reexport (module_system §8): in cf's flat resolver every imported public
 	# decl is already whole-program visible, so a reexport loads and merges exactly like `import`;
 	# the `pub` marks a barrel module's intent to forward the named members to its own importers.
 	if kw(p, "pub") then p.pos = p.pos + 1 # `pub`
 	p.pos = p.pos + 1 # `import`
-	if !is_strlit(peek(p)) then die("cf: parse: expected a module path string after `import`\n")
-	const Str path = cur_name!(p)
-	p.pos = p.pos + 1
-	if !kw(p, "as") then die("cf: parse: expected `as` after the import path\n")
-	p.pos = p.pos + 1
-	# `as ns` / `as Ns` — a namespace alias (module_system §4). The alias and its `ns.member` uses
-	# are erased before parse by `strip_import_namespaces`, which rewrites each use to a bare
-	# `member`; the declaration's alias token survives to here. Consume it and bind no destructured
-	# names — the module's public decls flatten in whole-program regardless of the binding form.
-	if is_ident(peek(p)) then {
-		p.pos = p.pos + 1 # the alias name
-		let [Str] none = []
-		return Import({ path: path, names: none })
-	}
-	if !is_lbrace(peek(p)) then die("cf: parse: an import binds either `{ names }` or a namespace alias after `as`\n")
-	p.pos = p.pos + 1
-	let [Str] names = []
-	loop {
-		if is_rbrace(peek(p)) then break
-		if !is_ident(peek(p)) then die("cf: parse: expected an imported member name\n")
-		names = [...names, cur_name!(p)]
-		p.pos = p.pos + 1
-		if is_comma(peek(p)) then p.pos = p.pos + 1
-	}
-	p.pos = p.pos + 1 # `}`
-	return Import({ path: path, names: names })
+	# `::`-path form (module_system §4): `import a::b::c [::{ … }]` — no string; `as` is optional.
+	if !is_ident(peek(p)) then die("cf: parse: expected a module path after `import`\n")
+	return parse_import_path!(p)
 }
 
 # Does the current top-level item start a `word` declaration — bare (`data …`) or
@@ -2518,22 +2673,51 @@ const expect_cond_dot = (*Parser p): Bool -> {
 	return true
 }
 
-# Evaluate a comptime condition at PARSE TIME against the fixed darwin/arm64 target
-# (module_system): `comptime.<ns>.<member> <op> <Enum>.<Variant>`, where `<ns>` is `os` or
-# `arch`, `<member>` is `target` or `current` (equal on a non-cross build), `<op>` is `==` or
-# `!=`, and `<Enum>` must match the namespace (`os`→`Os`, `arch`→`Arch`). The fixed values are
-# os = Darwin, arch = Arm64. A malformed condition is a parse error.
+# Is `t[start..]` exactly `s`? (a suffix comparison without allocating a substring.)
+const str_tail_eq = (Str t, Iarch start, Str s): Bool -> {
+	if Iarch(t.len) - start != Iarch(s.len) then return false
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(s.len) then break
+		if t[start + i] != s[i] then return false
+		i = i + 1
+	}
+	return true
+}
+# Does a strip-minted comptime token `t` read `<nsprefix><sep>target` or `<nsprefix><sep>current`,
+# where `<sep>` is the ns-sep `\x01` (an aliased `os::target` → `std_comptime_os\x01target`) or `_`
+# (a full path `std::comptime::os::target` → the flat `std_comptime_os_target`)? A `comptime_if`
+# folds at parse, so the parser matches that resolved token rather than the bare words.
+const comptime_tok_is = (Str t, Str nsprefix): Bool -> {
+	const Iarch n = Iarch(nsprefix.len)
+	if Iarch(t.len) <= n then return false
+	let Iarch i = 0
+	loop {
+		if i >= n then break
+		if t[i] != nsprefix[i] then return false
+		i = i + 1
+	}
+	if Iarch(t[n]) != 1 && Iarch(t[n]) != 95 then return false # the ns-sep (0x01) or `_` (full path)
+	return str_tail_eq(t, n + 1, "target") || str_tail_eq(t, n + 1, "current")
+}
+
+# Evaluate a comptime condition at PARSE TIME against the build target (module_system §6/§7):
+# `<os|arch>::<member> <op> <Enum>.<Variant>` — `member` is `target`/`current` (equal on a
+# non-cross build), `op` is `==`/`!=`, and `Enum` matches the namespace (`os`→`Os`, `arch`→`Arch`).
+# The `os::member` access is joined by the strip pass into one `std_comptime_os\x01member` token (or
+# the flat `std_comptime_os_target` for a full path); the parser matches that resolved token. A
+# malformed condition is a parse error.
 const parse_cond! = (*Parser p): Bool -> {
-	const Str head = expect_ident!(p, "cf: parse: expected `comptime` in a comptime condition\n")
-	if !str_eq(head, "comptime") then die("cf: parse: a comptime condition must start with `comptime`\n")
-	expect_cond_dot(p)
-	const Str ns = expect_ident!(p, "cf: parse: expected `os` or `arch` after `comptime.`\n")
-	const Bool is_os = str_eq(ns, "os")
-	const Bool is_arch = str_eq(ns, "arch")
-	if !is_os && !is_arch then die("cf: parse: a comptime namespace must be `os` or `arch`\n")
-	expect_cond_dot(p)
-	const Str member = expect_ident!(p, "cf: parse: expected `target` or `current` after the comptime namespace\n")
-	if !str_eq(member, "target") && !str_eq(member, "current") then die("cf: parse: a comptime member must be `target` or `current`\n")
+	const Str head = expect_ident!(p, "cf: parse: expected a comptime target (`os::target`) in a comptime condition\n")
+	let Bool is_os = false
+	let Bool is_arch = false
+	if comptime_tok_is(head, "std_comptime_os") then {
+		is_os = true
+	} else if comptime_tok_is(head, "std_comptime_arch") then {
+		is_arch = true
+	} else {
+		die("cf: parse: a comptime condition reads `os::target`/`arch::target` (import `std::comptime`)\n")
+	}
 	let Bool is_eq = false
 	if is_eqeq(peek(p)) then {
 		is_eq = true
@@ -2551,10 +2735,12 @@ const parse_cond! = (*Parser p): Bool -> {
 	# The enum variant sets are closed (module_system §7.1): `Os` is `{ Darwin, Linux }` and
 	# `Arch` is `{ Arm64, Amd64, Riscv64, Wasm }`. A variant outside its enum (a typo, or a
 	# cross-enum name like `Os.Arm64`) is a parse error, not a silently-false comparison.
-	if is_os && !str_eq(variant, "Darwin") && !str_eq(variant, "Linux") then die("cf: parse: `Os` has no such variant (expected `Darwin` or `Linux`)\n")
+	if is_os && !str_eq(variant, "Darwin") && !str_eq(variant, "Linux") && !str_eq(variant, "Bare") then die("cf: parse: `Os` has no such variant (expected `Darwin`, `Linux`, or `Bare`)\n")
 	if is_arch && !str_eq(variant, "Arm64") && !str_eq(variant, "Amd64") && !str_eq(variant, "Riscv64") && !str_eq(variant, "Wasm") then die("cf: parse: `Arch` has no such variant (expected `Arm64`, `Amd64`, `Riscv64`, or `Wasm`)\n")
-	let Str fixed = "Arm64"
-	if is_os then fixed = "Darwin"
+	# the target comes from `--target` (via the CLI), defaulting to the host os/arch — threaded on the
+	# Parser. `target` and `current` coincide on a non-cross build (both are this compile's target).
+	let Str fixed = p.target_arch
+	if is_os then fixed = p.target_os
 	const Bool same = str_eq(fixed, variant)
 	if is_eq then return same
 	return !same
@@ -2617,6 +2803,9 @@ const parse_item! = (*Parser p): Program -> {
 		# only grouped-parameter `type X = { … }` decls reach here — `type` ALIASES are erased
 		# before parse (typealias.cf token pass)
 		groups = [...groups, parse_group!(p)]
+	} else if heads(p, "static") then {
+		# a module-level `static [N Uint8] NAME` — a BSS byte buffer, modeled as a value-const Func
+		funcs = [...funcs, parse_static!(p)]
 	} else {
 		funcs = [...funcs, parse_func!(p)]
 	}
@@ -2627,11 +2816,60 @@ const parse_item! = (*Parser p): Program -> {
 # (each optionally `pub`), and comptime `if` conditionals, in any order. One function must be
 # `pub const main` (checked later). Imports are resolved and flattened away before typecheck
 # (module_system §8).
+# `[pub] static [N Uint8] NAME` — a module-level STATIC byte buffer: N zero bytes in the binary's BSS,
+# program-lifetime, off every geometry node. Modeled as a nullary value-const (a bare `NAME` auto-calls
+# it), with a `$static` return that emit lowers to the persistent BSS header address. Global-lifetime,
+# so it never dangles — no escape rules, not residue.
+const parse_static! = (*Parser p): Func -> {
+	let Bool is_pub = false
+	if kw(p, "pub") then {
+		is_pub = true
+		p.pos = p.pos + 1
+	}
+	if !kw(p, "static") then die("cf: parse: expected `static`\n")
+	p.pos = p.pos + 1
+	if !is_lbracket(peek(p)) then die("cf: parse: a `static` needs a `[N Uint8]` buffer type\n")
+	if !is_intlit(p.toks[p.pos + 1].kind) then die("cf: parse: a `static` buffer needs a comptime size\n")
+	p.pos = p.pos + 1
+	const Iarch n = p.toks[p.pos].ival
+	p.pos = p.pos + 1
+	const Str felem = parse_fixed_elem!(p)
+	if !str_eq(felem, "Uint8") then die("cf: parse: a `static` buffer holds `Uint8` only\n")
+	if !is_rbracket(peek(p)) then die("cf: parse: expected `]` in a `static` type\n")
+	p.pos = p.pos + 1
+	if n <= 0 then die("cf: parse: a `static` buffer needs a positive size\n")
+	if !is_ident(peek(p)) then die("cf: parse: expected a `static` name\n")
+	const Str name = cur_name!(p)
+	# a value name is lowercase-initial (uppercase-initial is a TYPE) — ebnf § Identifiers
+	if Iarch(name[0]) >= 65 && Iarch(name[0]) <= 90 then die("cf: parse: a `static` name must be lowercase — an uppercase-initial name is a type\n")
+	p.pos = p.pos + 1
+	const [Param] noparams = []
+	const [Stmt] body = [Stmt.Return(Expr.Buffer(Expr.Lit(n)))]
+	const [Seg] noasm = []
+	const [Str] no_tp = []
+	return Func({ name: name, is_pub: is_pub, ret_name: "$dyn", ret_elem: "Uint8", params: noparams, body: body, is_asm: false, asm_body: noasm, is_value: true, ret_telems: [], typarams: no_tp, tbounds: no_tp, ret_size: n, is_intrinsic: false })
+}
+
 pub const parse_program! = (*Parser p): Program -> {
 	let Program acc = empty_program()
 	loop {
 		if is_eof(peek(p)) then break
 		acc = prog_cat(acc, parse_item!(p))
+	}
+	# The PAGE geometry is the ambient `main` runs under — implicit, with no surface keyword to
+	# trigger the load (unlike fixed_buffer/arena, which announce themselves by use). So every
+	# NON-std/mem module gains a synthetic import of `std/mem/page`; the ordinary import machinery
+	# dedups it, and when a program has no page-ambient allocation the Materialize pass's
+	# reachable-variants rebuild prunes the module back out (leaving non-page programs byte-
+	# identical). The `!in_std_mem` guard keeps the geometry modules from importing each other
+	# (page.cf itself, and the fixed_buffer/arena cycle).
+	if !in_std_mem(p.file) then {
+		const [Str] no_pg_names = []
+		const [Import] pg_im = [Import({ path: "std/mem/page", names: no_pg_names, alias: "", wildcard: false })]
+		const [RecDecl] no_pg_recs = []
+		const [UnionDecl] no_pg_unions = []
+		const [Func] no_pg_funcs = []
+		acc = prog_cat(acc, Program({ imports: pg_im, recs: no_pg_recs, unions: no_pg_unions, funcs: no_pg_funcs, groups: no_pg_recs }))
 	}
 	return acc
 }

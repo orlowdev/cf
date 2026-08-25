@@ -69,7 +69,7 @@ with four fixed widths plus a pointer-width member:
   `[Int 'T]` function is parametric over one width, monomorphized (§5.4, §8). There
   is no bare `Int` value; everyday code names a width (`Iarch`, `Int32`, …).
 - **Each width is an intrinsic type carrying its constructor** —
-  `pub intrinsic type Uint8 = (Number value) -> Uint8` — so `Uint8(x)` is the cast
+  `pub intrinsic type Uint8 = (Number value): Uint8` — so `Uint8(x)` is the cast
   (§4), and the argument bound `Number` (§8) rejects `Uint8("hi")` cleanly.
 - **`Uint8` is the byte.** A byte buffer is `*[Uint8]`; there is no `byte` type.
 - **The ten concrete integer types are distinct** — none a subtype of another;

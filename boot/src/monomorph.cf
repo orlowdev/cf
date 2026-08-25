@@ -15,14 +15,14 @@
 # variables, and union BOUNDS (`[Color 'T]`) are supported; STRUCTURAL inference (fixing `'T`
 # from INSIDE a `['T]`/tuple parameter) and a tuple-typed type variable are later bricks.
 
-import "io" as { die }
-import "ast" as { Expr, Stmt, Param, Func, MatchArm, StmtArm, Seg, FieldInit, RecDecl, UnionDecl, UnionMember, TupElem, Import, Program, Ty }
-import "astutil" as { is_fixed_name, is_float_name }
+import io::{ die }
+import ast::{ Expr, Stmt, Param, Func, MatchArm, StmtArm, Seg, FieldInit, RecDecl, UnionDecl, UnionMember, TupElem, Import, Program, Ty, with_geom }
+import astutil::{ is_fixed_name, is_float_name }
 # The monomorph pass infers a generic call's type arguments by deriving argument types with the
 # SAME `type_of` the typechecker uses (types flow, not a parallel guesser). `Ctx`/`VarTy` are the
 # shared typing vocabulary; the helpers build the pieces `type_of` needs from a binding.
-import "typecheck" as { type_of!, ty_name, Ctx, VarTy, named_ty, param_ty!, binding_ty!, arm_bind_env, check_destructure!, dyn_of, tuple_elems, elem_ty! }
-import "closures" as { Subst, subst_expr }
+import typecheck::{ type_of!, ty_name, Ctx, VarTy, named_ty, param_ty!, binding_ty!, arm_bind_env, check_destructure!, dyn_of, tuple_elems, elem_ty! }
+import closures::{ Subst, subst_expr }
 
 # The accumulating state, threaded by pointer: the generic FUNCTION templates + their instance
 # clones (with a dedup key set); the generic RECORD/UNION templates + their instance clones (with
@@ -127,6 +127,22 @@ const check_template_bounds = (*MonoCtx m): Iarch -> {
 	}
 	return 0
 }
+# Does `n` end with `suf`? (No stdlib string helpers below the compiler yet.)
+const ends_with = (Str n, Str suf): Bool -> {
+	if Iarch(n.len) < Iarch(suf.len) then return false
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(suf.len) then break
+		if Iarch(n[Iarch(n.len) - Iarch(suf.len) + i]) != Iarch(suf[i]) then return false
+		i = i + 1
+	}
+	return true
+}
+# A std geometry module's private name (resolve's FIXED mangle tags "fb"/"fx"/"el"/"pg"): generic fns
+# under these tags are the value-hook templates the Materialize pass owns — see the template
+# split in mono_program!.
+const geom_hook_tmpl = (Str n): Bool -> ends_with(n, "__fb") || ends_with(n, "__fx") || ends_with(n, "__el") || ends_with(n, "__pg")
+
 # The member NAMES of a union named `uname` (concrete, or a generic template). Members are the
 # post-spread set (resolve.cf's `expand_unions` runs before this pass, so `...Other` is already
 # flattened in). Empty if the name is not a union.
@@ -717,7 +733,7 @@ const mangle_func_sig! = (*MonoCtx m, Func f): Func -> {
 		i = i + 1
 	}
 	const [Stmt] nobody = []
-	return Func({ name: f.name, is_pub: f.is_pub, ret_name: mangle_type!(m, f.ret_name, nt, nt), ret_elem: mangle_type!(m, f.ret_elem, nt, nt), params: ps, body: nobody, is_asm: f.is_asm, asm_body: f.asm_body, is_value: f.is_value, ret_telems: f.ret_telems, typarams: f.typarams, tbounds: f.tbounds, ret_size: f.ret_size })
+	return Func({ name: f.name, is_pub: f.is_pub, ret_name: mangle_type!(m, f.ret_name, nt, nt), ret_elem: mangle_type!(m, f.ret_elem, nt, nt), params: ps, body: nobody, is_asm: f.is_asm, asm_body: f.asm_body, is_value: f.is_value, ret_telems: f.ret_telems, typarams: f.typarams, tbounds: f.tbounds, ret_size: f.ret_size, is_intrinsic: f.is_intrinsic })
 }
 const mangle_rec_sig! = (*MonoCtx m, RecDecl r): RecDecl -> {
 	const [Str] nt = []
@@ -764,7 +780,7 @@ const mangle_concrete_sigs! = (*MonoCtx m): Iarch -> {
 	return 0
 }
 
-const env_bind = (MonoEnv e, Str name, Ty ty): MonoEnv -> MonoEnv({ tvars: e.tvars, tvals: e.tvals, venv: [...e.venv, VarTy({ name: name, ty: ty, mutable: false, esc: false, outer: false, fixed: false, is_ref: false, fsize: 0 })], ret: e.ret, vpnames: e.vpnames, vpvals: e.vpvals })
+const env_bind = (MonoEnv e, Str name, Ty ty): MonoEnv -> MonoEnv({ tvars: e.tvars, tvals: e.tvals, venv: [...e.venv, VarTy({ name: name, ty: ty, mutable: false, esc: false, outer: false, fixed: false, is_ref: false, fsize: 0, elem: "" })], ret: e.ret, vpnames: e.vpnames, vpvals: e.vpvals })
 
 # The concrete type NAME an argument denotes, for inference — derived by the SAME `type_of` the
 # typechecker uses, over the threaded `[VarTy]` environment (parameters + `let`/match/`for`/
@@ -904,6 +920,10 @@ const ensure_instance! = (*MonoCtx m, Str gname, [Str] tyargs): Str -> {
 # return, local annotations, nested generic call arguments) and its generic calls rewritten to
 # instances. `newname` is the (concrete) result name.
 const mono_func! = (*MonoCtx m, Func f, Str newname, [Str] tvars, [Str] tvals): Func -> {
+	# a declared INTRINSIC passes through untouched: its body is empty (nothing to rewrite) and
+	# its signature may be generic without the template machinery — the env-seeding below would
+	# choke resolving `'T` params it has no substitution for
+	if f.is_intrinsic then return f
 	# split the parameters: a TYPE parameter (`'T`) drives type substitution; a comptime VALUE
 	# parameter (`n`, its arg an int literal) is FOLDED to its literal in the body — so the two
 	# have distinct machineries (`subst_slot` vs a `Var → Lit` fold threaded on the env).
@@ -950,14 +970,18 @@ const mono_func! = (*MonoCtx m, Func f, Str newname, [Str] tvars, [Str] tvals): 
 		let Iarch pi = 0
 		loop {
 			if pi >= Iarch(ps.len) then break
-			venv = [...venv, VarTy({ name: ps[pi].name, ty: param_ty!(ps[pi], all_recs(m), all_unions(m)), mutable: false, esc: false, outer: false, fixed: false, is_ref: false, fsize: 0 })]
+			# mirror typecheck's own param env: a `*T` param is a reference (is_ref/outer), so a
+			# type_of! walk over the body accepts forwarded pointers exactly as check_func! does —
+			# with is_ref stuck false, the first program mixing generics (which seed this env) and
+			# `*Record` forwarding dies in the §700 bare-value check during instantiation
+			venv = [...venv, VarTy({ name: ps[pi].name, ty: param_ty!(ps[pi], all_recs(m), all_unions(m)), mutable: false, esc: false, outer: ps[pi].is_ptr, fixed: false, is_ref: ps[pi].is_ptr, fsize: 0, elem: ps[pi].elem })]
 			pi = pi + 1
 		}
 	}
 	const MonoEnv env = MonoEnv({ tvars: tvars_t, tvals: tvals_t, venv: venv, ret: ret, vpnames: vpnames, vpvals: vpvals })
 	const [Stmt] body = mono_stmts!(m, f.body, env)
 	const [Str] no_tp = []
-	return Func({ name: newname, is_pub: f.is_pub, ret_name: rn, ret_elem: re, params: ps, body: body, is_asm: f.is_asm, asm_body: f.asm_body, is_value: f.is_value, ret_telems: rtel, typarams: no_tp, tbounds: no_tp, ret_size: f.ret_size })
+	return Func({ name: newname, is_pub: f.is_pub, ret_name: rn, ret_elem: re, params: ps, body: body, is_asm: f.is_asm, asm_body: f.asm_body, is_value: f.is_value, ret_telems: rtel, typarams: no_tp, tbounds: no_tp, ret_size: f.ret_size, is_intrinsic: f.is_intrinsic })
 }
 
 # Resolve a callee name to its concrete instance: a generic callee is instantiated (type args
@@ -979,7 +1003,7 @@ const mono_callee! = (*MonoCtx m, Str n, [Str] ta, [Expr] margs, MonoEnv env): S
 const mono_call! = (*MonoCtx m, Str n, [Str] ta, [Expr] args, MonoEnv env): Expr -> {
 	const [Expr] margs = mono_exprs!(m, args, env)
 	const [Str] no_ty = []
-	return Expr.Call(mono_callee!(m, n, ta, margs, env), no_ty, margs)
+	return Expr.Call(mono_callee!(m, n, ta, margs, env), no_ty, margs, "")
 }
 # Rewrite a `defer`-tap: like a call (a generic callee is instantiated), but there are no explicit
 # type args (the pipe/prefix syntax carries none), so the callee is always inferred from `margs`.
@@ -1074,7 +1098,7 @@ const mono_expr! = (*MonoCtx m, Expr e, MonoEnv env): Expr -> match e {
 	Expr.And(l, r) -> Expr.And(mono_expr!(m, l, env), mono_expr!(m, r, env)),
 	Expr.Or(l, r) -> Expr.Or(mono_expr!(m, l, env), mono_expr!(m, r, env)),
 	Expr.If(c, t, e2) -> Expr.If(mono_expr!(m, c, env), mono_expr!(m, t, env), mono_expr!(m, e2, env)),
-	Expr.Call(n, ta, args) -> mono_call!(m, n, ta, args, env),
+	Expr.Call(n, ta, args, g) -> with_geom(mono_call!(m, n, ta, args, env), g),
 	Expr.DeferTap(fn, args) -> mono_defertap!(m, fn, args, env)
 }
 
@@ -1355,8 +1379,19 @@ pub const mono_program! = (Program prog): Program -> {
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(prog.funcs.len) then break
-		if Iarch(prog.funcs[i].typarams.len) > 0 then templates = [...templates, prog.funcs[i]]
-		else concrete = [...concrete, prog.funcs[i]]
+		# a generic INTRINSIC (a declared bodyless token — raw ops like `place['T]`) is NOT a
+		# template: its behavior is compiler-supplied at the call site, so there is nothing to
+		# instantiate; it stays a concrete (skipped-body) function for the later gates to resolve.
+		const Bool gen = Iarch(prog.funcs[i].typarams.len) > 0 && !prog.funcs[i].is_intrinsic
+		# a std geometry module's generic value hooks (`on_alloc__fb`, `on_ret__el`, … —
+		# resolve gives those modules FIXED mangle tags, so the suffix identifies them) are
+		# NOT mono templates: nothing in the AST ever calls them (the Materialize pass
+		# instantiates them from the RAW program per placed type), and letting the dormant
+		# trio into `templates` flips `has_gen` — switching every arena-using compile into
+		# the full inference regime (+164MB RSS on a self-compile, measured). They are
+		# dropped here exactly like an uninstantiated template after the pass.
+		if gen && !geom_hook_tmpl(prog.funcs[i].name) then templates = [...templates, prog.funcs[i]]
+		if !gen then concrete = [...concrete, prog.funcs[i]]
 		i = i + 1
 	}
 	let [Str] unames = []

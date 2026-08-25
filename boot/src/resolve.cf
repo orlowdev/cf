@@ -1,30 +1,21 @@
 # resolve — module resolution and flattening (module_system §8), brick 1.
 #
 # Loads the entry module and, transitively, every module it imports, then flattens all
-# their declarations into one Program for the typecheck and emit phases. Each `import
-# "m"` resolves to a file `<dir>/m.cf` and its declarations join the program.
+# their declarations into one Program for the typecheck and emit phases. Each `import m`
+# resolves to a file `<dir>/m.cf` and its declarations join the program.
 #
-# Brick-1 scope (narrowings, each a later brick): destructured imports only; paths
-# resolve relative to the ENTRY file's directory — correct for a flat layout, where
-# every module sits beside the entry, as cf's own sources do (the spec resolves each
-# import relative to its own importer's directory); no name mangling, so imported
-# modules must not collide on a private top-level name; no visibility filtering, so every
-# merged declaration is visible (the typecheck phase still rejects a reference to a name
-# no module declares); no `std/` root, no namespace aliases, no comptime conditional
-# imports.
+# Scope notes: paths resolve relative to the ENTRY file's directory — correct for a flat
+# layout, where every module sits beside the entry, as cf's own sources do (the spec
+# resolves each import relative to its own importer's directory); no visibility filtering,
+# so every merged declaration is visible (the typecheck phase still rejects a reference to
+# a name no module declares).
 
-import "io" as { open, read, close, die, o_rdonly }
-import "token" as { Token, is_ident, is_strlit, is_lbrace, is_dot }
-import "ast" as { Expr, Stmt, MatchArm, StmtArm, Seg, FieldInit, RecDecl, UnionDecl, UnionMember, TupElem, Param, Func, Import, Program }
-import "lexer" as { lex }
-import "typealias" as { strip_type_aliases! }
-import "parser" as { Parser, parse_program! }
-
-# One module's read buffer size — large enough for cf's own sources (its largest module,
-# emit.cf, is ~77 KB and growing; 256 KB leaves comfortable headroom). A single `read`
-# fills it (regular files return the whole requested count); a growable read arrives when a
-# module outgrows even this.
-pub const mod_cap = 262144
+import io::{ open, read, close, die, o_rdonly }
+import token::{ Token, is_ident, is_lbrace, is_rbrace, is_pathsep, is_star }
+import ast::{ Expr, Stmt, MatchArm, StmtArm, Seg, FieldInit, RecDecl, UnionDecl, UnionMember, TupElem, Param, Func, Import, Program, with_geom }
+import lexer::{ lex }
+import typealias::{ strip_type_aliases! }
+import parser::{ Parser, parse_program! }
 
 # Byte-wise Str equality (used to dedup already-loaded module paths).
 const str_eq = (Str a, Str b): Bool -> {
@@ -39,7 +30,7 @@ const str_eq = (Str a, Str b): Bool -> {
 }
 
 # The directory prefix of a path: its bytes up to and INCLUDING the last `/` (empty when
-# the path has no `/`). `import "m"` from `dir/entry.cf` resolves against this prefix.
+# the path has no `/`). `import m` from `dir/entry.cf` resolves against this prefix.
 const dir_of! = (Str path): Str -> {
 	let Iarch last = 0 - 1
 	let Iarch i = 0
@@ -87,6 +78,8 @@ const build_path! = (Str dir, Str name): Str -> {
 # and the buffer can be discarded.
 # The decoded text of a token — the source slice it points at, as a `Str`.
 const tok_text! = (*[Uint8] src, Token t): Str -> {
+	# a synthesized token carries its identifier directly (namespace mangling), bypassing src
+	if Iarch(t.text.len) > 0 then return t.text
 	let [Uint8] out = []
 	let Iarch i = 0
 	loop {
@@ -97,72 +90,320 @@ const tok_text! = (*[Uint8] src, Token t): Str -> {
 	return Str(out)
 }
 
-# Is `n` one of the collected namespace-alias names?
-const is_alias = ([Str] aliases, Str n): Bool -> {
+# The flat prefix registered for alias `n`, or "" when `n` is not a namespace alias.
+const alias_prefix = ([Str] aliases, [Str] prefixes, Str n): Str -> {
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(aliases.len) then break
-		if str_eq(aliases[i], n) then return true
+		if str_eq(aliases[i], n) then return prefixes[i]
 		i = i + 1
 	}
-	return false
+	return ""
 }
 
-# A pre-parse token pass for namespace imports (module_system §4). A namespace import
-# `import "m" as ns` binds a local alias `ns`, and a use `ns.member` means module `m`'s `member`.
-# Because resolve flattens every module's public declarations into one whole-program namespace, a
-# namespace-qualified access is a pure syntactic prefix: pass 1 collects each alias name from an
-# `import … as <ident>` (the non-`{` form; `pub import` too — the `pub` sits before `import`), and
-# pass 2 deletes every leading `<alias> .` token pair, rewriting `ns.member` to a bare `member` and
-# `ns.T.M` to `T.M` (only the leading `ns.` is stripped — after it, `T` is not an alias). The
-# import declaration's own `as ns` is left untouched: its `ns` is not followed by a `.`.
-const strip_import_namespaces! = (*[Uint8] src, [Token] toks): [Token] -> {
-	let [Str] aliases = []
+# A pre-parse token pass for namespace imports (module_system §4/§5). A namespace import
+# `import a::b::ns` binds a local alias `ns` (the last segment, or a `as <name>` rename), and a use
+# `ns::member` means module `a::b::ns`'s `member`.
+# Since the mangle later renames `m`'s value members to `<prefix>_<name>`, a value access
+# `ns::member` cannot survive as a bare `member` — it is JOINED here into one synthesized token
+# `<prefix>\x01member` (the sep flags a namespace access; the mangle resolves it through `m`'s
+# export surface, which chases barrels).
+#
+# NESTED namespaces (§5): a `pub import` can reexport a module AS a namespace, so a path may have
+# more than one namespace hop — `foo::io::member`, where `foo` windows over a barrel whose `io` is a
+# reexported namespace. We GREEDILY consume the run of lowercase segments after an alias and join
+# ALL of them, `<prefix>\x01seg\x01…\x01member` — the mangle walks the run through the module graph.
+# Greedy consumption means a field access on a namespaced VALUE (`ns::value.field`) is not supported
+# (the run would swallow `field` as a hop, and the mangle then errors that `value` is not a
+# namespace) — destructure the value first. A TYPE terminal `ns::…segs::…::T` (PascalCase) is reached
+# THROUGH the namespaces: the whole `ns::…seg::` prefix is dropped and the bare `T` kept (types are
+# never mangled), so `T.M` stays intact. Pass 1 collects each alias and the sanitized prefix of its
+# import path (the non-`{` form; `pub import` too); an optional `as <name>` on the declaration
+# renames the alias (`import a::b::os as os2` → alias `os2`, prefix unchanged), and pass 2 emits the
+# `as <name>` clause verbatim.
+# Append `_seg` to a sanitized prefix (`std_mem` + `raw` → `std_mem_raw`).
+const us_join! = (Str base, Str seg): Str -> {
+	let [Uint8] v = []
 	let Iarch i = 0
 	loop {
-		if i >= Iarch(toks.len) then break
-		if is_ident(toks[i].kind) && str_eq(tok_text!(src, toks[i]), "import") && i + 3 < Iarch(toks.len) && is_strlit(toks[i + 1].kind) && is_ident(toks[i + 2].kind) && str_eq(tok_text!(src, toks[i + 2]), "as") && is_ident(toks[i + 3].kind) then {
-			aliases = [...aliases, tok_text!(src, toks[i + 3])]
+		if i >= Iarch(base.len) then break
+		v = [...v, base[i]]
+		i = i + 1
+	}
+	if Iarch(base.len) > 0 then v = [...v, 95] # `_`
+	let Iarch j = 0
+	loop {
+		if j >= Iarch(seg.len) then break
+		v = [...v, seg[j]]
+		j = j + 1
+	}
+	return Str(v)
+}
+# The pre-parse strip's result: the rewritten tokens, plus the module PATHS a full `::` path used
+# WITHOUT an import (`std::comptime::os::target`) refers to — the loader turns each into a synthetic
+# namespace import so the module is loaded (module_system §4: imports are optional).
+data StripResult = { [Token] toks, [Str] deps }
+# The first `nseg` segments of `segs` joined by `sep` (a byte): a full `::` path's module prefix is
+# all-but-the-last segment joined `/` (a load path), and its flat mangled name is all segments `_`.
+const segs_join! = ([Str] segs, Iarch nseg, Iarch sep): Str -> {
+	let [Uint8] v = []
+	let Iarch i = 0
+	loop {
+		if i >= nseg then break
+		if i > 0 then v = [...v, sep]
+		let Iarch j = 0
+		loop {
+			if j >= Iarch(segs[i].len) then break
+			v = [...v, segs[i][j]]
+			j = j + 1
 		}
 		i = i + 1
 	}
-	if Iarch(aliases.len) == 0 then return toks
+	return Str(v)
+}
+const strip_import_namespaces! = (*[Uint8] src, [Token] toks): StripResult -> {
+	# --- pass 1: collect the `::`-import namespace aliases (`import a::b::ns` → `ns`), so a
+	# `ns::member` use can be joined against the alias's module prefix. ---
+	let [Str] paliases = []
+	let [Str] pprefixes = []
+	# `saw_ps` counts a `::` only in a USE position — an import DECLARATION is walked past whole, so a
+	# file with only `::` imports (no alias/full-path uses) still early-returns, keeping pass 2 (which
+	# rebuilds the token stream, O(n²)) off the huge alias-free compiler files.
+	let Bool saw_ps = false
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(toks.len) then break
+		if is_ident(toks[i].kind) && str_eq(tok_text!(src, toks[i]), "import") then {
+			let Iarch m = i + 1
+			if m < Iarch(toks.len) && is_ident(toks[m].kind) then {
+				# `::`-path import: walk segments; the last (if not `::{ … }` destructure) is the alias.
+				let Str pre = tok_text!(src, toks[m])
+				let Str last = tok_text!(src, toks[m])
+				m = m + 1
+				let Bool destructured = false
+				loop {
+					if !(m < Iarch(toks.len) && is_pathsep(toks[m].kind)) then break
+					m = m + 1 # `::`
+					if m < Iarch(toks.len) && is_lbrace(toks[m].kind) then {
+						destructured = true
+						loop {
+						if m >= Iarch(toks.len) then break
+						if is_rbrace(toks[m].kind) then {
+							m = m + 1
+							break
+						}
+						m = m + 1
+					}
+						break
+					}
+					if !(m < Iarch(toks.len) && is_ident(toks[m].kind)) then break
+					pre = us_join!(pre, tok_text!(src, toks[m]))
+					last = tok_text!(src, toks[m])
+					m = m + 1
+				}
+				if !destructured then {
+					# optional `as <name>` renames the alias (`import a::b::os as os2` binds `os2`); the
+					# module prefix `pre` is unchanged — only the local namespace name changes. `as *`
+					# (wildcard) registers NO alias — the whole surface is spliced flat by the resolver.
+					let Bool wildcard = false
+					if m < Iarch(toks.len) && is_ident(toks[m].kind) && str_eq(tok_text!(src, toks[m]), "as") then {
+						m = m + 1
+						if m < Iarch(toks.len) && is_star(toks[m].kind) then {
+							wildcard = true
+							m = m + 1
+						} else if m < Iarch(toks.len) && is_ident(toks[m].kind) then {
+							last = tok_text!(src, toks[m])
+							m = m + 1
+						}
+					}
+					if !wildcard then {
+						paliases = [...paliases, last]
+						pprefixes = [...pprefixes, pre]
+					}
+				}
+				i = m
+				continue
+			}
+		}
+		if is_pathsep(toks[i].kind) then saw_ps = true
+		i = i + 1
+	}
+	let [Str] nodeps = []
+	if Iarch(paliases.len) == 0 && !saw_ps then return StripResult({ toks: toks, deps: nodeps })
+	# --- pass 2: rewrite uses; leave import declarations untouched ---
+	let [Str] deps = []
 	let [Token] out = []
 	let Iarch k = 0
 	loop {
 		if k >= Iarch(toks.len) then break
-		if is_ident(toks[k].kind) && k + 1 < Iarch(toks.len) && is_dot(toks[k + 1].kind) && is_alias(aliases, tok_text!(src, toks[k])) then {
+		if is_ident(toks[k].kind) && str_eq(tok_text!(src, toks[k]), "import") then {
+			# emit the import DECLARATION verbatim (`import a::b::c [::{ … }]`) — not a use to mangle.
+			out = [...out, toks[k]]
+			k = k + 1
+			if k < Iarch(toks.len) && is_ident(toks[k].kind) then {
+				out = [...out, toks[k]] # first `::` segment
+				k = k + 1
+			}
+			loop {
+				if !(k < Iarch(toks.len) && is_pathsep(toks[k].kind)) then break
+				out = [...out, toks[k]] # `::`
+				k = k + 1
+				if k < Iarch(toks.len) && is_lbrace(toks[k].kind) then {
+					loop {
+						if k >= Iarch(toks.len) then break
+						out = [...out, toks[k]]
+						if is_rbrace(toks[k].kind) then {
+							k = k + 1
+							break
+						}
+						k = k + 1
+					}
+					break
+				}
+				if !(k < Iarch(toks.len) && is_ident(toks[k].kind)) then break
+				out = [...out, toks[k]]
+				k = k + 1
+			}
+			# emit an optional `as <name>`/`as *` clause verbatim (a binding, not a use to mangle).
+			if k + 1 < Iarch(toks.len) && is_ident(toks[k].kind) && str_eq(tok_text!(src, toks[k]), "as") && (is_ident(toks[k + 1].kind) || is_star(toks[k + 1].kind)) then {
+				out = [...out, toks[k]] # `as`
+				out = [...out, toks[k + 1]] # name or `*`
+				k = k + 2
+			}
+			continue
+		}
+		# a `::` use is joined against its `::`-import alias's module prefix (the same `\x01`-join +
+		# export-surface machinery, chasing barrels) — its leading segment must be a `::`-import alias.
+		let Str ppre = ""
+		if is_ident(toks[k].kind) && k + 1 < Iarch(toks.len) && is_pathsep(toks[k + 1].kind) then ppre = alias_prefix(paliases, pprefixes, tok_text!(src, toks[k]))
+		if Iarch(ppre.len) > 0 && k + 2 < Iarch(toks.len) && is_ident(toks[k + 2].kind) && is_lower_initial(tok_text!(src, toks[k + 2])) then {
+			# `ns::seg1[::seg2…]::member` — same join, but `::`-separated (a `::` use is unambiguous:
+			# every segment is a namespace hop, so no value/field terminal to guess at)
+			let Str joined = join_ns!(ppre, tok_text!(src, toks[k + 2]))
+			let Iarch j = k + 2
+			loop {
+				if j + 2 < Iarch(toks.len) && is_pathsep(toks[j + 1].kind) && is_ident(toks[j + 2].kind) && is_lower_initial(tok_text!(src, toks[j + 2])) then {
+					joined = join_ns!(joined, tok_text!(src, toks[j + 2]))
+					j = j + 2
+				} else {
+					break
+				}
+			}
+			if j + 2 < Iarch(toks.len) && is_pathsep(toks[j + 1].kind) && is_ident(toks[j + 2].kind) && !is_lower_initial(tok_text!(src, toks[j + 2])) then {
+				# `…seg::Type` — a type reached through the namespaces: drop the prefix, keep bare `Type`
+				k = j + 2
+			} else {
+				out = [...out, Token({ kind: toks[j].kind, ival: toks[j].ival, start: toks[j].start, len: toks[j].len, text: joined })]
+				k = j + 1
+			}
+		} else if Iarch(ppre.len) > 0 then {
+			# `ns::Type` → drop the leading `ns::`, keep the bare `Type`
 			k = k + 2
+		} else if is_ident(toks[k].kind) && k + 1 < Iarch(toks.len) && is_pathsep(toks[k + 1].kind) then {
+			# a FULL `::` path with NO import alias (`std::comptime::os::target`): collect all segments,
+			# mangle flat `::`→`_` to the member's path-prefix-mangled definition name, and record the
+			# module (all but the last segment) as a dependency — the loader turns it into a synthetic
+			# import so the module loads (imports are optional, module_system §4).
+			let [Str] segs = [tok_text!(src, toks[k])]
+			let Iarch j = k
+			loop {
+				if j + 2 < Iarch(toks.len) && is_pathsep(toks[j + 1].kind) && is_ident(toks[j + 2].kind) then {
+					segs = [...segs, tok_text!(src, toks[j + 2])]
+					j = j + 2
+				} else {
+					break
+				}
+			}
+			const Iarch ns = Iarch(segs.len)
+			const Str modpath = segs_join!(segs, ns - 1, 47) # all-but-last, `/`-joined — the load path
+			if !in_priv(deps, modpath) then deps = [...deps, modpath]
+			if is_lower_initial(segs[ns - 1]) then {
+				# value member — flat name matches the module's path-prefix-mangled definition
+				out = [...out, Token({ kind: toks[j].kind, ival: toks[j].ival, start: toks[j].start, len: toks[j].len, text: segs_join!(segs, ns, 95) })]
+			} else {
+				# type terminal — types are never mangled; keep the bare `Type` (the last token as-is)
+				out = [...out, toks[j]]
+			}
+			k = j + 1
 		} else {
 			out = [...out, toks[k]]
 			k = k + 1
 		}
 	}
-	return out
+	return StripResult({ toks: out, deps: deps })
 }
-
-const load_module! = (Str path): Program -> {
-	let [262144 Uint8] buf
-	const Iarch fd = open(path.bytes, Uarch(o_rdonly), 0)
-	if fd < 0 then die("cf: cannot open an imported module\n")
-	const Iarch n = read(Uarch(fd), buf, Uarch(mod_cap))
-	close(Uarch(fd))
-	if n < 0 then die("cf: reading an imported module failed\n")
-	const [Token] toks = strip_import_namespaces!(buf, strip_type_aliases!(buf, lex(buf, n)))
-	let Parser p = Parser({ toks: toks, src: buf, pos: 0, file: path })
-	return parse_program!(&p)
-}
-
-# Has this module path already been loaded (dedup + cycle break)?
-const seen = ([Str] loaded, Str path): Bool -> {
+# Join a namespace prefix and a value member into one identifier `<prefix>\x01member`.
+const join_ns! = (Str prefix, Str member): Str -> {
+	let [Uint8] v = []
 	let Iarch i = 0
 	loop {
-		if i >= Iarch(loaded.len) then break
-		if str_eq(loaded[i], path) then return true
+		if i >= Iarch(prefix.len) then break
+		v = [...v, prefix[i]]
 		i = i + 1
 	}
-	return false
+	v = [...v, 1]  # ns_sep (0x01) — flags a joined namespace access
+	let Iarch j = 0
+	loop {
+		if j >= Iarch(member.len) then break
+		v = [...v, member[j]]
+		j = j + 1
+	}
+	return Str(v)
 }
+# Index of the first ns_sep (0x01) in `s`, or -1 — splits a joined namespace path into its first
+# hop and the rest. A single-member key has none (a flat value); a nested path `seg\x01rest` has one.
+const ns_sep_index = (Str s): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(s.len) then break
+		if Iarch(s[i]) == 1 then return i
+		i = i + 1
+	}
+	return 0 - 1
+}
+# The substring `s[a..b)`.
+const str_range! = (Str s, Iarch a, Iarch b): Str -> {
+	let [Uint8] v = []
+	let Iarch i = a
+	loop {
+		if i >= b then break
+		v = [...v, s[i]]
+		i = i + 1
+	}
+	return Str(v)
+}
+
+const load_module! = (Str path, Str target_os, Str target_arch): Program -> {
+	# One module's read buffer — large enough for cf's own sources (its largest module, emit.cf,
+	# crossed 256 KB; 1 MB leaves headroom). `buf.len` is the capacity handed to `read` (the
+	# buffer reports its own size now), and `read` returns the actual byte count `n`. A read that
+	# FILLS the buffer means the module was truncated — die loudly (a silent cut surfaces as a
+	# baffling parse error at the boundary).
+	let [1048576 Uint8] buf
+	const Iarch fd = open(path.bytes, Uarch(o_rdonly), 0)
+	if fd < 0 then die("cf: cannot open an imported module\n")
+	const Iarch n = read(Uarch(fd), buf, Uarch(buf.len))
+	close(Uarch(fd))
+	if n < 0 then die("cf: reading an imported module failed\n")
+	if n >= Iarch(buf.len) then die("cf: an imported module exceeds the read buffer — grow it in resolve.cf\n")
+	const StripResult sr = strip_import_namespaces!(buf, strip_type_aliases!(buf, lex(buf, n)))
+	let Parser p = Parser({ toks: sr.toks, src: buf, pos: 0, file: path, target_os: target_os, target_arch: target_arch, saw_fb: false, saw_fx: false, saw_el: false })
+	const Program prog = parse_program!(&p)
+	# imports are optional (module_system §4): a full `::` path used without an import contributed its
+	# module PATH to `sr.deps` — turn each into a synthetic namespace import so the module is loaded
+	# (the flat use already resolves to its path-prefix-mangled definition; the loader dedups by path).
+	if Iarch(sr.deps.len) == 0 then return prog
+	let [Import] imps = prog.imports
+	let Iarch di = 0
+	loop {
+		if di >= Iarch(sr.deps.len) then break
+		const [Str] no_names = []
+		imps = [...imps, Import({ path: sr.deps[di], names: no_names, alias: "", wildcard: false })]
+		di = di + 1
+	}
+	return Program({ imports: imps, recs: prog.recs, unions: prog.unions, funcs: prog.funcs, groups: prog.groups })
+}
+
 
 # Append every element of `src` onto `dst` (cf has no two-spread merge, so grow one at a
 # time). One helper per declaration list — the payload types differ.
@@ -207,191 +448,312 @@ const cat_imports = ([Import] dst, [Import] src): [Import] -> {
 	return out
 }
 
-# --- name mangling (module_system §8: flatten mangles module-private names apart) -------
+# --- name mangling (module_system §8: flatten mangles module-qualified names apart) ------
 #
-# When two modules define a top-level name privately (a `const` helper, not `pub`), the
-# flatten would double-define it. So each module's PRIVATE names are renamed with a
-# per-module tag (`str_eq` → `str_eq__2`) and every reference to one, within that module,
-# is rewritten to match. Exported (`pub`) names are left alone — they are unique across
-# modules and are how imports resolve — so an import binds the same bare name the flatten
-# keeps. Brick scope: private FUNCTIONS only (cf's collisions are all private helpers;
-# records/unions live once and are imported, never redefined). A private function is only
-# ever referenced by a `Call` (cf has no function values), so the rewrite renames each
-# private `Func` definition and every `Call` callee that names one.
+# Every module's VALUE members (functions and value-consts, pub AND private) are renamed to
+# a flat `<prefix>_<name>` keyed on the module's PATH (`std/mem/raw`'s `load` → `std_mem_raw_load`),
+# so two modules may each export a `load`/`of`/`ping` without colliding after the flatten. Types
+# (records/unions) are NOT mangled — they live once and are imported by their bare name. The
+# ENTRY module keeps its names BARE (it fixes the naming frame; `main` stays `main`); the
+# geometry std modules keep the FIXED per-shape SUFFIX tag (`of__fx`) that emit references by name.
+#
+# A reference is rewritten through a per-module rename table (`tbl`): a name defined in THIS
+# module maps to its mangled definition; a name brought in by a destructured import maps to the
+# EXPORT it resolves to (chasing barrels); a namespace access `ns::member`, joined at token level
+# into `<prefix>\x01member`, resolves through the target module's export surface. Everything else
+# (a builtin, a local, a type ctor, a phantom `cf__*`) is left bare.
 
-# Is `n` one of this module's private names?
-const in_priv = ([Str] priv, Str n): Bool -> {
+# A resolved rename: the name as written in a body, and the flat top-level name it mangles to.
+data Bind = { Str from, Str to }
+# One loaded module, kept UNMANGLED as the resolution source-of-truth. `prefix` is the sanitized
+# import path that loaded it (empty for the entry); `mpath` the resolved file path (the dedup key);
+# `is_geom`/`tag` mark a fixed-suffix geometry module. `prog` is its parsed surface.
+data Modu = { Str prefix, Str mpath, Bool is_geom, Str tag, Program prog }
+# The constant resolution context. `mods` is every loaded module; `edir` the entry directory
+# relative import paths resolve against (the brick-narrowing: all relative imports resolve against
+# the entry, matching the loader); `itargets[m][k]` is the module index that module `m`'s import
+# `k` resolves to (or -1), precomputed once so export resolution never re-opens a path.
+data Rctx = { [Modu] mods, Str edir, [[Iarch]] itargets }
+
+# A body's namespace access `ns::member` is joined to `<prefix>\x01member` (0x01 — never a source
+# byte) at token level and pre-resolved into the rename table (`build_tbl!`), so the joined name is
+# a plain table key — the mangle never re-splits it.
+# Is `n` one of the names in `xs`?
+const in_priv = ([Str] xs, Str n): Bool -> {
 	let Iarch i = 0
 	loop {
-		if i >= Iarch(priv.len) then break
-		if str_eq(priv[i], n) then return true
+		if i >= Iarch(xs.len) then break
+		if str_eq(xs[i], n) then return true
 		i = i + 1
 	}
 	return false
 }
+# Index of `n` in a rename table by `from`, or -1.
+const bind_find = ([Bind] bs, Str n): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(bs.len) then break
+		if str_eq(bs[i].from, n) then return i
+		i = i + 1
+	}
+	return 0 - 1
+}
+# Is `n`'s first byte a lowercase letter? (a value/function member, vs a PascalCase type — the
+# module_system §4 casing split, used to decide which imported names are renameable values.)
+const is_lower_initial = (Str n): Bool -> {
+	if Iarch(n.len) == 0 then return false
+	const Iarch c = Iarch(n[0])
+	if c < 97 then return false
+	if c > 122 then return false
+	return true
+}
+# The sanitized flat prefix of an import path: `/`→`_`, so `std/mem/raw` → `std_mem_raw`.
+const sanitize_prefix! = (Str path): Str -> {
+	let [Uint8] v = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(path.len) then break
+		if Iarch(path[i]) == 47 then {
+			v = [...v, 95]
+		} else {
+			v = [...v, path[i]]
+		}
+		i = i + 1
+	}
+	return Str(v)
+}
+# The resolved file path an import resolves to — `std/`-prefixed under the lib root, everything
+# else against the entry dir (the loader's rule, replayed so `find_mod` matches what was loaded).
+const mod_target_path! = (Str edir, Str impath): Str -> {
+	if has_prefix(impath, "std/") then return build_path!("lib/", impath)
+	return build_path!(edir, impath)
+}
+# Index of the module with resolved path `mpath`, or -1.
+const find_mod = ([Modu] mods, Str mpath): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(mods.len) then break
+		if str_eq(mods[i].mpath, mpath) then return i
+		i = i + 1
+	}
+	return 0 - 1
+}
+# The flat name a VALUE named `name` gets in module `m`: bare in the entry, suffix-tagged in a
+# geometry module, `<prefix>_<name>` otherwise.
+const mod_mangled = (Str name, Modu m): Str -> {
+	if Iarch(m.prefix.len) == 0 then return name
+	if m.is_geom then return "${name}__${m.tag}"
+	return "${m.prefix}_${name}"
+}
+# The mangled definition name of a function: `main` is always bare (the program entry symbol),
+# everything else follows `mod_mangled`.
+const mangle_def_name = (Func f, Modu m): Str -> {
+	if str_eq(f.name, "main") then return f.name
+	return mod_mangled(f.name, m)
+}
+# Does module `m` export a PUBLIC function named `name`? (the base case of export resolution.)
+const has_pub_func = (Program p, Str name): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(p.funcs.len) then break
+		if p.funcs[i].is_pub && str_eq(p.funcs[i].name, name) then return true
+		i = i + 1
+	}
+	return false
+}
+# The flat top-level name that member `name`, reached through module `idx`, resolves to. `name`
+# may be a NESTED namespace path `seg\x01rest` (module_system §5): the first hop `seg` names a
+# reexported namespace of the module (an import aliased `seg`), through which the rest is resolved
+# recursively. A single-member name is a pub function of the module (mangles directly) or is chased
+# through the module's destructured imports (a barrel reexport forwards to the original definition).
+# Falls back to the module's own prefixed name; a nested hop that names no reexported namespace is a
+# hard error (module_system §9). Never re-opens a path.
+const resolve_export! = (Rctx rc, Iarch idx, Str name, Iarch depth): Str -> {
+	if depth > 64 then die("cf: resolve: an import reexport cycle\n")
+	const Modu m = rc.mods[idx]
+	const Iarch sp = ns_sep_index(name)
+	if sp >= 0 then {
+		# `seg\x01rest` — descend through the reexported namespace aliased `seg`, resolve the rest there
+		const Str seg = str_range!(name, 0, sp)
+		const Str rest = str_range!(name, sp + 1, Iarch(name.len))
+		let Iarch ni = 0
+		loop {
+			if ni >= Iarch(m.prog.imports.len) then break
+			if str_eq(m.prog.imports[ni].alias, seg) then {
+				const Iarch tidx = rc.itargets[idx][ni]
+				if tidx >= 0 then return resolve_export!(rc, tidx, rest, depth + 1)
+			}
+			ni = ni + 1
+		}
+		die("cf: resolve: a namespace path segment names no reexported namespace here\n")
+	}
+	if has_pub_func(m.prog, name) then return mod_mangled(name, m)
+	let Iarch ii = 0
+	loop {
+		if ii >= Iarch(m.prog.imports.len) then break
+		const Iarch tidx = rc.itargets[idx][ii]
+		# a destructured reexport forwards its named members; a wildcard reexport forwards ANY
+		# member the target exports (module_system §5) — both chase the barrel to the definition.
+		if in_priv(m.prog.imports[ii].names, name) then {
+			if tidx >= 0 then return resolve_export!(rc, tidx, name, depth + 1)
+		} else if m.prog.imports[ii].wildcard && tidx >= 0 && in_priv(export_names!(rc, tidx, 0), name) then {
+			return resolve_export!(rc, tidx, name, depth + 1)
+		}
+		ii = ii + 1
+	}
+	return mod_mangled(name, m)
+}
 
-# The mangled form of a callee/definition name: private names gain the module tag; every
-# other name (a `pub` export, an imported name, a builtin) is unchanged.
-const mangle_name = (Str n, [Str] priv, Iarch tag): Str -> {
-	if !in_priv(priv, n) then return n
-	return "${n}__${tag}"
+# The mangled form of a callee/definition reference: a name in the rename table maps to its target
+# (a namespace access `<prefix>\x01member` is a table key like any other, pre-resolved by
+# `build_tbl!`); everything else — a builtin, a local, a type ctor, a phantom `cf__*` — is left bare.
+const mangle_name = (Str n, [Bind] tbl, Rctx rc): Str -> {
+	const Iarch bi = bind_find(tbl, n)
+	if bi >= 0 then return tbl[bi].to
+	return n
 }
 
 # Rewrite every private-function reference in an expression tree. Only a `Call` callee can
 # name a function; every other node is rebuilt unchanged around its recursively rewritten
 # children.
-const mangle_expr = (Expr e, [Str] priv, Iarch tag): Expr -> match e {
+const mangle_expr = (Expr e, [Bind] tbl, Rctx rc): Expr -> match e {
 	Expr.Lit(v) -> Expr.Lit(v),
 	Expr.BoolLit(b) -> Expr.BoolLit(b),
 	# a bare name may REFERENCE a private function (passed by name to a higher-order function);
 	# rewrite it like a `Call` callee so the reference tracks the mangled definition. A local /
 	# value-const name is not in `priv`, so it is left unchanged.
-	Expr.Var(n) -> Expr.Var(mangle_name(n, priv, tag)),
+	Expr.Var(n) -> Expr.Var(mangle_name(n, tbl, rc)),
 	Expr.StrLit(bs) -> Expr.StrLit(bs),
 	Expr.FloatLit(t) -> Expr.FloatLit(t),
-	Expr.Record(n, fs) -> Expr.Record(n, mangle_fields(fs, priv, tag)),
-	Expr.Field(b, f) -> Expr.Field(b, f),
-	Expr.FieldExpr(b, f) -> Expr.FieldExpr(mangle_expr(b, priv, tag), f),
-	Expr.UnionMk(t, m, args) -> Expr.UnionMk(t, m, mangle_exprs(args, priv, tag)),
-	Expr.Match(scrut, arms) -> Expr.Match(mangle_expr(scrut, priv, tag), mangle_arms(arms, priv, tag)),
-	Expr.ArrayLit(hs, sn, elems, et) -> Expr.ArrayLit(hs, mangle_expr(sn, priv, tag), mangle_exprs(elems, priv, tag), et),
-	Expr.Index(a, i) -> Expr.Index(a, mangle_expr(i, priv, tag)),
-	Expr.IndexField(a, i, f) -> Expr.IndexField(a, mangle_expr(i, priv, tag), f),
-	Expr.IndexExpr(b, i) -> Expr.IndexExpr(mangle_expr(b, priv, tag), mangle_expr(i, priv, tag)),
-	Expr.Tuple(elems) -> Expr.Tuple(mangle_exprs(elems, priv, tag)),
-	Expr.Spread(x) -> Expr.Spread(mangle_expr(x, priv, tag)),
+	Expr.Record(n, fs) -> Expr.Record(n, mangle_fields(fs, tbl, rc)),
+	# the base of a `base.field` read is a NAME — rewrite it through the table too, so a field read
+	# on an imported value / namespaced value (`cfg.defaults` in `cfg.defaults.width`) tracks the
+	# mangled definition; a local of the same name is absent from the (locals-filtered) table and
+	# so is left bare.
+	Expr.Field(b, f) -> Expr.Field(mangle_name(b, tbl, rc), f),
+	Expr.FieldExpr(b, f) -> Expr.FieldExpr(mangle_expr(b, tbl, rc), f),
+	Expr.UnionMk(t, m, args) -> Expr.UnionMk(t, m, mangle_exprs(args, tbl, rc)),
+	Expr.Match(scrut, arms) -> Expr.Match(mangle_expr(scrut, tbl, rc), mangle_arms(arms, tbl, rc)),
+	Expr.ArrayLit(hs, sn, elems, et) -> Expr.ArrayLit(hs, mangle_expr(sn, tbl, rc), mangle_exprs(elems, tbl, rc), et),
+	Expr.Index(a, i) -> Expr.Index(a, mangle_expr(i, tbl, rc)),
+	Expr.IndexField(a, i, f) -> Expr.IndexField(a, mangle_expr(i, tbl, rc), f),
+	Expr.IndexExpr(b, i) -> Expr.IndexExpr(mangle_expr(b, tbl, rc), mangle_expr(i, tbl, rc)),
+	Expr.Tuple(elems) -> Expr.Tuple(mangle_exprs(elems, tbl, rc)),
+	Expr.Spread(x) -> Expr.Spread(mangle_expr(x, tbl, rc)),
 	Expr.Unit -> Expr.Unit,
-	Expr.Loop(body) -> Expr.Loop(mangle_stmts(body, priv, tag)),
-	Expr.Interp(segs) -> Expr.Interp(mangle_segs(segs, priv, tag)),
-	Expr.Buffer(sz) -> Expr.Buffer(mangle_expr(sz, priv, tag)),
+	Expr.Loop(body) -> Expr.Loop(mangle_stmts(body, tbl, rc)),
+	Expr.Interp(segs) -> Expr.Interp(mangle_segs(segs, tbl, rc)),
+	Expr.Buffer(sz) -> Expr.Buffer(mangle_expr(sz, tbl, rc)),
 	Expr.Addr(name) -> Expr.Addr(name),
-	Expr.Neg(x) -> Expr.Neg(mangle_expr(x, priv, tag)),
-	Expr.Not(x) -> Expr.Not(mangle_expr(x, priv, tag)),
-	Expr.BitNot(x) -> Expr.BitNot(mangle_expr(x, priv, tag)),
-	Expr.Add(l, r) -> Expr.Add(mangle_expr(l, priv, tag), mangle_expr(r, priv, tag)),
-	Expr.Sub(l, r) -> Expr.Sub(mangle_expr(l, priv, tag), mangle_expr(r, priv, tag)),
-	Expr.Mul(l, r) -> Expr.Mul(mangle_expr(l, priv, tag), mangle_expr(r, priv, tag)),
-	Expr.Div(l, r) -> Expr.Div(mangle_expr(l, priv, tag), mangle_expr(r, priv, tag)),
-	Expr.Mod(l, r) -> Expr.Mod(mangle_expr(l, priv, tag), mangle_expr(r, priv, tag)),
-	Expr.BitAnd(l, r) -> Expr.BitAnd(mangle_expr(l, priv, tag), mangle_expr(r, priv, tag)),
-	Expr.BitOr(l, r) -> Expr.BitOr(mangle_expr(l, priv, tag), mangle_expr(r, priv, tag)),
-	Expr.BitXor(l, r) -> Expr.BitXor(mangle_expr(l, priv, tag), mangle_expr(r, priv, tag)),
-	Expr.Shl(l, r) -> Expr.Shl(mangle_expr(l, priv, tag), mangle_expr(r, priv, tag)),
-	Expr.Shr(l, r) -> Expr.Shr(mangle_expr(l, priv, tag), mangle_expr(r, priv, tag)),
-	Expr.CmpEq(l, r) -> Expr.CmpEq(mangle_expr(l, priv, tag), mangle_expr(r, priv, tag)),
-	Expr.CmpNe(l, r) -> Expr.CmpNe(mangle_expr(l, priv, tag), mangle_expr(r, priv, tag)),
-	Expr.CmpLt(l, r) -> Expr.CmpLt(mangle_expr(l, priv, tag), mangle_expr(r, priv, tag)),
-	Expr.CmpGt(l, r) -> Expr.CmpGt(mangle_expr(l, priv, tag), mangle_expr(r, priv, tag)),
-	Expr.CmpLe(l, r) -> Expr.CmpLe(mangle_expr(l, priv, tag), mangle_expr(r, priv, tag)),
-	Expr.CmpGe(l, r) -> Expr.CmpGe(mangle_expr(l, priv, tag), mangle_expr(r, priv, tag)),
-	Expr.And(l, r) -> Expr.And(mangle_expr(l, priv, tag), mangle_expr(r, priv, tag)),
-	Expr.Or(l, r) -> Expr.Or(mangle_expr(l, priv, tag), mangle_expr(r, priv, tag)),
-	Expr.If(c, t, e2) -> Expr.If(mangle_expr(c, priv, tag), mangle_expr(t, priv, tag), mangle_expr(e2, priv, tag)),
-	Expr.Call(n, ta, args) -> Expr.Call(mangle_name(n, priv, tag), ta, mangle_exprs(args, priv, tag)),
-	Expr.DeferTap(fn, args) -> Expr.DeferTap(mangle_name(fn, priv, tag), mangle_exprs(args, priv, tag))
+	Expr.Neg(x) -> Expr.Neg(mangle_expr(x, tbl, rc)),
+	Expr.Not(x) -> Expr.Not(mangle_expr(x, tbl, rc)),
+	Expr.BitNot(x) -> Expr.BitNot(mangle_expr(x, tbl, rc)),
+	Expr.Add(l, r) -> Expr.Add(mangle_expr(l, tbl, rc), mangle_expr(r, tbl, rc)),
+	Expr.Sub(l, r) -> Expr.Sub(mangle_expr(l, tbl, rc), mangle_expr(r, tbl, rc)),
+	Expr.Mul(l, r) -> Expr.Mul(mangle_expr(l, tbl, rc), mangle_expr(r, tbl, rc)),
+	Expr.Div(l, r) -> Expr.Div(mangle_expr(l, tbl, rc), mangle_expr(r, tbl, rc)),
+	Expr.Mod(l, r) -> Expr.Mod(mangle_expr(l, tbl, rc), mangle_expr(r, tbl, rc)),
+	Expr.BitAnd(l, r) -> Expr.BitAnd(mangle_expr(l, tbl, rc), mangle_expr(r, tbl, rc)),
+	Expr.BitOr(l, r) -> Expr.BitOr(mangle_expr(l, tbl, rc), mangle_expr(r, tbl, rc)),
+	Expr.BitXor(l, r) -> Expr.BitXor(mangle_expr(l, tbl, rc), mangle_expr(r, tbl, rc)),
+	Expr.Shl(l, r) -> Expr.Shl(mangle_expr(l, tbl, rc), mangle_expr(r, tbl, rc)),
+	Expr.Shr(l, r) -> Expr.Shr(mangle_expr(l, tbl, rc), mangle_expr(r, tbl, rc)),
+	Expr.CmpEq(l, r) -> Expr.CmpEq(mangle_expr(l, tbl, rc), mangle_expr(r, tbl, rc)),
+	Expr.CmpNe(l, r) -> Expr.CmpNe(mangle_expr(l, tbl, rc), mangle_expr(r, tbl, rc)),
+	Expr.CmpLt(l, r) -> Expr.CmpLt(mangle_expr(l, tbl, rc), mangle_expr(r, tbl, rc)),
+	Expr.CmpGt(l, r) -> Expr.CmpGt(mangle_expr(l, tbl, rc), mangle_expr(r, tbl, rc)),
+	Expr.CmpLe(l, r) -> Expr.CmpLe(mangle_expr(l, tbl, rc), mangle_expr(r, tbl, rc)),
+	Expr.CmpGe(l, r) -> Expr.CmpGe(mangle_expr(l, tbl, rc), mangle_expr(r, tbl, rc)),
+	Expr.And(l, r) -> Expr.And(mangle_expr(l, tbl, rc), mangle_expr(r, tbl, rc)),
+	Expr.Or(l, r) -> Expr.Or(mangle_expr(l, tbl, rc), mangle_expr(r, tbl, rc)),
+	Expr.If(c, t, e2) -> Expr.If(mangle_expr(c, tbl, rc), mangle_expr(t, tbl, rc), mangle_expr(e2, tbl, rc)),
+	Expr.Call(n, ta, args, g) -> Expr.Call(mangle_name(n, tbl, rc), ta, mangle_exprs(args, tbl, rc), g),
+	Expr.DeferTap(fn, args) -> Expr.DeferTap(mangle_name(fn, tbl, rc), mangle_exprs(args, tbl, rc))
 }
 
 # Rewrite a list of expressions / a data literal's field values / a match's arms.
-const mangle_exprs = ([Expr] es, [Str] priv, Iarch tag): [Expr] -> {
+const mangle_exprs = ([Expr] es, [Bind] tbl, Rctx rc): [Expr] -> {
 	let [Expr] out = []
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(es.len) then break
-		out = [...out, mangle_expr(es[i], priv, tag)]
+		out = [...out, mangle_expr(es[i], tbl, rc)]
 		i = i + 1
 	}
 	return out
 }
-const mangle_fields = ([FieldInit] fs, [Str] priv, Iarch tag): [FieldInit] -> {
+const mangle_fields = ([FieldInit] fs, [Bind] tbl, Rctx rc): [FieldInit] -> {
 	let [FieldInit] out = []
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(fs.len) then break
-		out = [...out, FieldInit({ field: fs[i].field, value: mangle_expr(fs[i].value, priv, tag) })]
+		out = [...out, FieldInit({ field: fs[i].field, value: mangle_expr(fs[i].value, tbl, rc) })]
 		i = i + 1
 	}
 	return out
 }
-const mangle_segs = ([Seg] segs, [Str] priv, Iarch tag): [Seg] -> {
+const mangle_segs = ([Seg] segs, [Bind] tbl, Rctx rc): [Seg] -> {
 	let [Seg] out = []
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(segs.len) then break
 		const Seg sg = segs[i]
-		out = [...out, Seg({ is_hole: sg.is_hole, lit: sg.lit, name: sg.name, expr: mangle_expr(sg.expr, priv, tag) })]
+		out = [...out, Seg({ is_hole: sg.is_hole, lit: sg.lit, name: sg.name, expr: mangle_expr(sg.expr, tbl, rc) })]
 		i = i + 1
 	}
 	return out
 }
-const mangle_arms = ([MatchArm] arms, [Str] priv, Iarch tag): [MatchArm] -> {
+const mangle_arms = ([MatchArm] arms, [Bind] tbl, Rctx rc): [MatchArm] -> {
 	let [MatchArm] out = []
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(arms.len) then break
 		const MatchArm a = arms[i]
-		out = [...out, MatchArm({ is_wild: a.is_wild, type_name: a.type_name, members: a.members, binds: a.binds, body: mangle_expr(a.body, priv, tag) })]
+		out = [...out, MatchArm({ is_wild: a.is_wild, type_name: a.type_name, members: a.members, binds: a.binds, body: mangle_expr(a.body, tbl, rc) })]
 		i = i + 1
 	}
 	return out
 }
 
 # Rewrite every private-function reference in a statement (recursing into nested blocks).
-const mangle_stmt = (Stmt s, [Str] priv, Iarch tag): Stmt -> match s {
-	Stmt.Let(n, m, ann, e) -> Stmt.Let(n, m, ann, mangle_expr(e, priv, tag)),
-	Stmt.Destructure(pat, m, e) -> Stmt.Destructure(pat, m, mangle_expr(e, priv, tag)),
-	Stmt.Yield(e) -> Stmt.Yield(mangle_expr(e, priv, tag)),
-	Stmt.Assign(n, e) -> Stmt.Assign(n, mangle_expr(e, priv, tag)),
-	Stmt.FieldAssign(b, f, e) -> Stmt.FieldAssign(b, f, mangle_expr(e, priv, tag)),
-	Stmt.DeepFieldAssign(be, f, e) -> Stmt.DeepFieldAssign(mangle_expr(be, priv, tag), f, mangle_expr(e, priv, tag)),
-	Stmt.IndexAssign(a, i, v) -> Stmt.IndexAssign(a, mangle_expr(i, priv, tag), mangle_expr(v, priv, tag)),
-	Stmt.Return(e) -> Stmt.Return(mangle_expr(e, priv, tag)),
-	Stmt.ForIn(v, a, body) -> Stmt.ForIn(v, a, mangle_stmts(body, priv, tag)),
-	Stmt.Loop(body) -> Stmt.Loop(mangle_stmts(body, priv, tag)),
+const mangle_stmt = (Stmt s, [Bind] tbl, Rctx rc): Stmt -> match s {
+	Stmt.Let(n, m, ann, e) -> Stmt.Let(n, m, ann, mangle_expr(e, tbl, rc)),
+	Stmt.Destructure(pat, m, e) -> Stmt.Destructure(pat, m, mangle_expr(e, tbl, rc)),
+	Stmt.Yield(e) -> Stmt.Yield(mangle_expr(e, tbl, rc)),
+	Stmt.Assign(n, e) -> Stmt.Assign(n, mangle_expr(e, tbl, rc)),
+	Stmt.FieldAssign(b, f, e) -> Stmt.FieldAssign(b, f, mangle_expr(e, tbl, rc)),
+	Stmt.DeepFieldAssign(be, f, e) -> Stmt.DeepFieldAssign(mangle_expr(be, tbl, rc), f, mangle_expr(e, tbl, rc)),
+	Stmt.IndexAssign(a, i, v) -> Stmt.IndexAssign(a, mangle_expr(i, tbl, rc), mangle_expr(v, tbl, rc)),
+	Stmt.Return(e) -> Stmt.Return(mangle_expr(e, tbl, rc)),
+	Stmt.ForIn(v, a, body) -> Stmt.ForIn(v, a, mangle_stmts(body, tbl, rc)),
+	Stmt.Loop(body) -> Stmt.Loop(mangle_stmts(body, tbl, rc)),
 	Stmt.Break -> Stmt.Break,
 	Stmt.Continue -> Stmt.Continue,
-	Stmt.IfThen(c, st) -> Stmt.IfThen(mangle_expr(c, priv, tag), mangle_stmt(st, priv, tag)),
-	Stmt.IfElse(c, t, e) -> Stmt.IfElse(mangle_expr(c, priv, tag), mangle_stmt(t, priv, tag), mangle_stmt(e, priv, tag)),
-	Stmt.Do(e) -> Stmt.Do(mangle_expr(e, priv, tag)),
-	Stmt.Block(stmts) -> Stmt.Block(mangle_stmts(stmts, priv, tag)),
-	Stmt.Match(scrut, arms) -> Stmt.Match(mangle_expr(scrut, priv, tag), mangle_stmt_arms(arms, priv, tag)),
-	Stmt.Closure(nm, params, ret, body) -> Stmt.Closure(nm, params, ret, mangle_stmts(body, priv, tag)),
-	Stmt.Defer(body) -> Stmt.Defer(mangle_stmts(body, priv, tag))
+	Stmt.IfThen(c, st) -> Stmt.IfThen(mangle_expr(c, tbl, rc), mangle_stmt(st, tbl, rc)),
+	Stmt.IfElse(c, t, e) -> Stmt.IfElse(mangle_expr(c, tbl, rc), mangle_stmt(t, tbl, rc), mangle_stmt(e, tbl, rc)),
+	Stmt.Do(e) -> Stmt.Do(mangle_expr(e, tbl, rc)),
+	Stmt.Block(stmts) -> Stmt.Block(mangle_stmts(stmts, tbl, rc)),
+	Stmt.Match(scrut, arms) -> Stmt.Match(mangle_expr(scrut, tbl, rc), mangle_stmt_arms(arms, tbl, rc)),
+	Stmt.Closure(nm, params, ret, body) -> Stmt.Closure(nm, params, ret, mangle_stmts(body, tbl, rc)),
+	Stmt.Defer(body) -> Stmt.Defer(mangle_stmts(body, tbl, rc))
 }
-const mangle_stmt_arms = ([StmtArm] arms, [Str] priv, Iarch tag): [StmtArm] -> {
+const mangle_stmt_arms = ([StmtArm] arms, [Bind] tbl, Rctx rc): [StmtArm] -> {
 	let [StmtArm] out = []
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(arms.len) then break
 		const StmtArm a = arms[i]
-		out = [...out, StmtArm({ is_wild: a.is_wild, type_name: a.type_name, members: a.members, binds: a.binds, body: mangle_stmts(a.body, priv, tag) })]
+		out = [...out, StmtArm({ is_wild: a.is_wild, type_name: a.type_name, members: a.members, binds: a.binds, body: mangle_stmts(a.body, tbl, rc) })]
 		i = i + 1
 	}
 	return out
 }
-const mangle_stmts = ([Stmt] ss, [Str] priv, Iarch tag): [Stmt] -> {
+const mangle_stmts = ([Stmt] ss, [Bind] tbl, Rctx rc): [Stmt] -> {
 	let [Stmt] out = []
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(ss.len) then break
-		out = [...out, mangle_stmt(ss[i], priv, tag)]
-		i = i + 1
-	}
-	return out
-}
-
-# The private (non-`pub`) function names of a module — the set to mangle. A VALUE const
-# (`is_value`) is EXCLUDED: it is referenced as a bare `Var` and auto-called, and the
-# reference-rewrite only renames `Call` callees, so mangling its definition would orphan the
-# reference. A genuine zero-arg FUNCTION is referenced by `Call` and is mangled normally.
-# cf's value consts are all `pub` anyway, so none collide across modules regardless.
-const priv_names = ([Func] fs): [Str] -> {
-	let [Str] out = []
-	let Iarch i = 0
-	loop {
-		if i >= Iarch(fs.len) then break
-		if !fs[i].is_pub then {
-			if !fs[i].is_value then out = [...out, fs[i].name]
-		}
+		out = [...out, mangle_stmt(ss[i], tbl, rc)]
 		i = i + 1
 	}
 	return out
@@ -524,7 +886,7 @@ const lnames_expr! = (Expr e): [Str] -> match e {
 	Expr.And(l, r) -> cat_names(lnames_expr!(l), lnames_expr!(r)),
 	Expr.Or(l, r) -> cat_names(lnames_expr!(l), lnames_expr!(r)),
 	Expr.If(c, t, e2) -> cat_names(cat_names(lnames_expr!(c), lnames_expr!(t)), lnames_expr!(e2)),
-	Expr.Call(n, ta, args) -> lnames_exprs!(args),
+	Expr.Call(n, ta, args, _) -> lnames_exprs!(args),
 	Expr.DeferTap(fn, args) -> lnames_exprs!(args)
 }
 const lnames_stmt! = (Stmt s): [Str] -> match s {
@@ -559,35 +921,152 @@ const param_name_list = ([Param] ps): [Str] -> {
 	}
 	return out
 }
-# `priv` minus any name shadowed by a local (`names`) — the set to rewrite in one body.
-const priv_minus = ([Str] priv, [Str] names): [Str] -> {
-	let [Str] out = []
+# A rename table minus every entry shadowed by a local binder (`names`) — the subset to rewrite
+# in one body. A local of the same name as an imported/module value hides it, so its references
+# must NOT be rewritten (module_system §8: a syntactic mangle must not capture a local).
+const tbl_minus = ([Bind] tbl, [Str] names): [Bind] -> {
+	let [Bind] out = []
 	let Iarch i = 0
 	loop {
-		if i >= Iarch(priv.len) then break
-		if !in_priv(names, priv[i]) then out = [...out, priv[i]]
+		if i >= Iarch(tbl.len) then break
+		if !in_priv(names, tbl[i].from) then out = [...out, tbl[i]]
 		i = i + 1
 	}
 	return out
 }
 
-# Mangle one module's functions with tag `tag`: rename each private definition and rewrite
-# every private-function reference in every body — but not a reference shadowed by a local.
-const mangle_funcs! = ([Func] fs, Iarch tag): [Func] -> {
-	const [Str] priv = priv_names(fs)
+# The exported VALUE member paths of module `idx` — its own pub functions, every value name its
+# DESTRUCTURED imports bring in (a barrel reexports them flat), and — for a NAMESPACE reexport
+# (`pub import m as io`, module_system §5) — the target's members each under the nested path
+# `io\x01<member>`, so the reexported namespace joins the surface and is reachable/traversable.
+# (The pub/non-pub distinction is not tracked, a deferred §9 privacy check.) Used to spread a
+# namespace import's whole surface into rename keys.
+const export_names! = (Rctx rc, Iarch idx, Iarch depth): [Str] -> {
+	if depth > 64 then die("cf: resolve: an import reexport cycle\n")
+	const Modu m = rc.mods[idx]
+	let [Str] out = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(m.prog.funcs.len) then break
+		if m.prog.funcs[i].is_pub && is_lower_initial(m.prog.funcs[i].name) then out = [...out, m.prog.funcs[i].name]
+		i = i + 1
+	}
+	let Iarch ii = 0
+	loop {
+		if ii >= Iarch(m.prog.imports.len) then break
+		if Iarch(m.prog.imports[ii].names.len) > 0 then {
+			# destructured reexport → flat value members
+			let Iarch k = 0
+			loop {
+				if k >= Iarch(m.prog.imports[ii].names.len) then break
+				if is_lower_initial(m.prog.imports[ii].names[k]) then out = [...out, m.prog.imports[ii].names[k]]
+				k = k + 1
+			}
+		} else if m.prog.imports[ii].wildcard then {
+			# wildcard reexport (`pub import m as *`) → splice the target's WHOLE surface in flat,
+			# same member paths, no nesting prefix (module_system §5).
+			const Iarch tidx = rc.itargets[idx][ii]
+			if tidx >= 0 then {
+				const [Str] sub = export_names!(rc, tidx, depth + 1)
+				let Iarch s = 0
+				loop {
+					if s >= Iarch(sub.len) then break
+					out = [...out, sub[s]]
+					s = s + 1
+				}
+			}
+		} else if Iarch(m.prog.imports[ii].alias.len) > 0 && is_lower_initial(m.prog.imports[ii].alias) then {
+			# namespace reexport → nested members under `<alias>\x01…`
+			const Iarch tidx = rc.itargets[idx][ii]
+			if tidx >= 0 then {
+				const [Str] sub = export_names!(rc, tidx, depth + 1)
+				let Iarch s = 0
+				loop {
+					if s >= Iarch(sub.len) then break
+					out = [...out, join_ns!(m.prog.imports[ii].alias, sub[s])]
+					s = s + 1
+				}
+			}
+		}
+		ii = ii + 1
+	}
+	return out
+}
+
+# The rename table for module `idx`. A DESTRUCTURED import's VALUE members bind by their bare name
+# to the export they resolve to (chasing barrels); a NAMESPACE import (no destructured names) has
+# its whole export surface spread under joined `<prefix>\x01member` keys, matching the tokens the
+# strip pass minted. Then every one of the module's own functions binds to its mangled definition
+# (laid down last, so a body's own-function reference wins over a same-named import). Type imports
+# (PascalCase) are skipped — types are never mangled.
+const build_tbl! = (Iarch idx, Rctx rc): [Bind] -> {
+	const Modu m = rc.mods[idx]
+	let [Bind] tbl = []
+	let Iarch ii = 0
+	loop {
+		if ii >= Iarch(m.prog.imports.len) then break
+		const Iarch tidx = rc.itargets[idx][ii]
+		if tidx >= 0 then {
+			if Iarch(m.prog.imports[ii].names.len) > 0 then {
+				# destructured: bind each named value member
+				let Iarch k = 0
+				loop {
+					if k >= Iarch(m.prog.imports[ii].names.len) then break
+					const Str nm = m.prog.imports[ii].names[k]
+					if is_lower_initial(nm) then tbl = [...tbl, Bind({ from: nm, to: resolve_export!(rc, tidx, nm, 0) })]
+					k = k + 1
+				}
+			} else if m.prog.imports[ii].wildcard then {
+				# wildcard: bind every member of the target surface BARE (flat splice, no prefix) —
+				# a use of the bare member name in this module resolves through to the definition.
+				const [Str] ws = export_names!(rc, tidx, 0)
+				let Iarch w = 0
+				loop {
+					if w >= Iarch(ws.len) then break
+					tbl = [...tbl, Bind({ from: ws[w], to: resolve_export!(rc, tidx, ws[w], 0) })]
+					w = w + 1
+				}
+			} else {
+				# namespace: spread the whole surface under joined keys
+				const [Str] xs = export_names!(rc, tidx, 0)
+				let Iarch x = 0
+				loop {
+					if x >= Iarch(xs.len) then break
+					tbl = [...tbl, Bind({ from: join_ns!(rc.mods[tidx].prefix, xs[x]), to: resolve_export!(rc, tidx, xs[x], 0) })]
+					x = x + 1
+				}
+			}
+		}
+		ii = ii + 1
+	}
+	let Iarch j = 0
+	loop {
+		if j >= Iarch(m.prog.funcs.len) then break
+		const Func f = m.prog.funcs[j]
+		tbl = [...tbl, Bind({ from: f.name, to: mangle_def_name(f, m) })]
+		j = j + 1
+	}
+	return tbl
+}
+
+# Mangle module `idx`: rename each function definition to its flat name and rewrite every value
+# reference in every body through the module's rename table — but not a reference shadowed by a local.
+const mangle_module_funcs! = (Iarch idx, Rctx rc): [Func] -> {
+	const Modu m = rc.mods[idx]
+	const [Bind] tbl = build_tbl!(idx, rc)
 	let [Func] out = []
 	let Iarch i = 0
 	loop {
-		if i >= Iarch(fs.len) then break
-		const Func f = fs[i]
-		const Str nm = mangle_name(f.name, priv, tag)
-		# a name bound locally in THIS function (a parameter or any body binder) shadows a private
-		# function of the same name, so it is excluded from the set this body's references rewrite
+		if i >= Iarch(m.prog.funcs.len) then break
+		const Func f = m.prog.funcs[i]
+		const Str nm = mangle_def_name(f, m)
+		# a name bound locally in THIS function (a parameter or any body binder) shadows a module
+		# value of the same name, so it is excluded from the set this body's references rewrite
 		const [Str] locals = cat_names(param_name_list(f.params), lnames_stmts!(f.body))
-		const [Str] bodypriv = priv_minus(priv, locals)
-		const [Stmt] body = mangle_stmts(f.body, bodypriv, tag)
+		const [Bind] bodytbl = tbl_minus(tbl, locals)
+		const [Stmt] body = mangle_stmts(f.body, bodytbl, rc)
 		# an asm body references only parameters, never functions — passed through unchanged
-		out = [...out, Func({ name: nm, is_pub: f.is_pub, ret_name: f.ret_name, ret_elem: f.ret_elem, params: f.params, body: body, is_asm: f.is_asm, asm_body: f.asm_body, is_value: f.is_value, ret_telems: f.ret_telems, typarams: f.typarams, tbounds: f.tbounds, ret_size: f.ret_size })]
+		out = [...out, Func({ name: nm, is_pub: f.is_pub, ret_name: f.ret_name, ret_elem: f.ret_elem, params: f.params, body: body, is_asm: f.is_asm, asm_body: f.asm_body, is_value: f.is_value, ret_telems: f.ret_telems, typarams: f.typarams, tbounds: f.tbounds, ret_size: f.ret_size, is_intrinsic: f.is_intrinsic })]
 		i = i + 1
 	}
 	return out
@@ -918,7 +1397,7 @@ const norm_mt_func! = (Func f, [RecDecl] recs, [UnionDecl] unions): Func -> {
 		ps = [...ps, Param({ name: p.name, is_ptr: p.is_ptr, type_name: collapse_member_type!(p.type_name, recs, unions), elem: p.elem, telems: p.telems, size: p.size })]
 		i = i + 1
 	}
-	return Func({ name: f.name, is_pub: f.is_pub, ret_name: collapse_member_type!(f.ret_name, recs, unions), ret_elem: f.ret_elem, params: ps, body: norm_mt_stmts!(f.body, recs, unions), is_asm: f.is_asm, asm_body: f.asm_body, is_value: f.is_value, ret_telems: f.ret_telems, typarams: f.typarams, tbounds: f.tbounds, ret_size: f.ret_size })
+	return Func({ name: f.name, is_pub: f.is_pub, ret_name: collapse_member_type!(f.ret_name, recs, unions), ret_elem: f.ret_elem, params: ps, body: norm_mt_stmts!(f.body, recs, unions), is_asm: f.is_asm, asm_body: f.asm_body, is_value: f.is_value, ret_telems: f.ret_telems, typarams: f.typarams, tbounds: f.tbounds, ret_size: f.ret_size, is_intrinsic: f.is_intrinsic })
 }
 const norm_mt_funcs! = ([Func] fs, [RecDecl] recs, [UnionDecl] unions): [Func] -> {
 	let [Func] out = []
@@ -1049,7 +1528,7 @@ const splat_call = (Str callee, [Str] ta, [Expr] args, [Func] funcs, [RecDecl] g
 	}
 	# does the callee have group parameters? (look up its ORIGINAL, pre-splat signature)
 	const Iarch fi = find_func_r(funcs, callee)
-	if fi < 0 then return Expr.Call(callee, ta, sargs)
+	if fi < 0 then return Expr.Call(callee, ta, sargs, "")
 	const [Param] ps = funcs[fi].params
 	let Bool any_group = false
 	let Iarch pg = 0
@@ -1058,7 +1537,7 @@ const splat_call = (Str callee, [Str] ta, [Expr] args, [Func] funcs, [RecDecl] g
 		if param_is_group(ps[pg], groups) then any_group = true
 		pg = pg + 1
 	}
-	if !any_group then return Expr.Call(callee, ta, sargs)
+	if !any_group then return Expr.Call(callee, ta, sargs, "")
 	# a grouped-parameter callee must be called with one argument per ORIGINAL parameter
 	if Iarch(sargs.len) != Iarch(ps.len) then die("cf: type: a grouped-parameter call needs one argument per parameter (a `{…}` for each group)\n")
 	let [Expr] out = []
@@ -1074,7 +1553,7 @@ const splat_call = (Str callee, [Str] ta, [Expr] args, [Func] funcs, [RecDecl] g
 		}
 		i = i + 1
 	}
-	return Expr.Call(callee, ta, out)
+	return Expr.Call(callee, ta, out, "")
 }
 const find_func_r = ([Func] funcs, Str name): Iarch -> {
 	let Iarch i = 0
@@ -1181,7 +1660,7 @@ const splat_expr = (Expr e, [Func] funcs, [RecDecl] groups): Expr -> match e {
 	Expr.And(l, r) -> Expr.And(splat_expr(l, funcs, groups), splat_expr(r, funcs, groups)),
 	Expr.Or(l, r) -> Expr.Or(splat_expr(l, funcs, groups), splat_expr(r, funcs, groups)),
 	Expr.If(c, t, e2) -> Expr.If(splat_expr(c, funcs, groups), splat_expr(t, funcs, groups), splat_expr(e2, funcs, groups)),
-	Expr.Call(n, ta, args) -> splat_call(n, ta, args, funcs, groups),
+	Expr.Call(n, ta, args, g) -> with_geom(splat_call(n, ta, args, funcs, groups), g),
 	Expr.DeferTap(fn, args) -> Expr.DeferTap(fn, splat_exprs(args, funcs, groups))
 }
 const splat_stmts = ([Stmt] ss, [Func] funcs, [RecDecl] groups): [Stmt] -> {
@@ -1266,51 +1745,107 @@ const splat_groups! = ([Func] funcs, [RecDecl] recs, [UnionDecl] unions, [RecDec
 		const Func f = funcs[i]
 		const [Param] nps = splat_params!(groups, f.params)
 		const [Stmt] nbody = splat_stmts(f.body, funcs, groups)
-		out = [...out, Func({ name: f.name, is_pub: f.is_pub, ret_name: f.ret_name, ret_elem: f.ret_elem, params: nps, body: nbody, is_asm: f.is_asm, asm_body: f.asm_body, is_value: f.is_value, ret_telems: f.ret_telems, typarams: f.typarams, tbounds: f.tbounds, ret_size: f.ret_size })]
+		out = [...out, Func({ name: f.name, is_pub: f.is_pub, ret_name: f.ret_name, ret_elem: f.ret_elem, params: nps, body: nbody, is_asm: f.is_asm, asm_body: f.asm_body, is_value: f.is_value, ret_telems: f.ret_telems, typarams: f.typarams, tbounds: f.tbounds, ret_size: f.ret_size, is_intrinsic: f.is_intrinsic })]
 		i = i + 1
 	}
 	return out
 }
 
-# Load the entry module and flatten its transitive import graph into one Program. The
-# work list grows as newly loaded modules contribute imports; `loaded` dedups by resolved
-# path so a diamond or a cycle loads each module once. Each module's private functions are
-# mangled with its own tag so they cannot collide after the flatten.
-pub const resolve_program! = (Str entry): Program -> {
-	const Str dir = dir_of!(entry)
-	const Program root = load_module!(entry)
-	let [RecDecl] recs = []
-	let [UnionDecl] unions = []
-	let [Func] funcs = []
-	let [RecDecl] groups = []
-	recs = cat_recs(recs, root.recs)
-	unions = cat_unions(unions, root.unions)
-	groups = cat_recs(groups, root.groups) # grouped-parameter `type` decls (splatted below)
-	funcs = cat_funcs(funcs, mangle_funcs!(root.funcs, 0)) # the entry is module tag 0
-	let [Str] loaded = []
+# Is this import path a compiler-supplied pseudo-module? `comptime` is now the real `std::comptime`
+# module (§7); only `runtime` remains a reserved pseudo-namespace (out of scope here) — it backs no
+# `.cf` file, so the loader never opens it and it contributes no module.
+const is_pseudo_module = (Str path): Bool -> {
+	if str_eq(path, "runtime") then return true
+	return false
+}
+
+# Load the entry module and flatten its transitive import graph into one Program in TWO passes.
+# Pass 1 loads every module (the work list grows as newly loaded modules contribute imports;
+# `find_mod` dedups by resolved path so a diamond or a cycle loads each once), keeping each
+# UNMANGLED with its flat prefix. Pass 2 mangles every module's value members apart —
+# `<prefix>_<name>` keyed on its path — so two modules may export the same name, resolving each
+# cross-module reference through the module's imports (module_system §8).
+pub const resolve_program! = (Str entry, Str target_os, Str target_arch): Program -> {
+	const Str edir = dir_of!(entry)
+	const Program root = load_module!(entry, target_os, target_arch)
+	# the entry is prefix-empty (its names stay bare — it fixes the naming frame)
+	let [Modu] mods = [Modu({ prefix: "", mpath: entry, is_geom: false, tag: "", prog: root })]
 	let [Import] work = []
 	work = cat_imports(work, root.imports)
-	let Iarch tag = 0
 	let Iarch wi = 0
 	loop {
 		if wi >= Iarch(work.len) then break
 		const Import im = work[wi]
-		# `std/`-prefixed imports resolve under the fixed library root, not the entry dir. The lib
-		# root is the cwd-relative literal "lib/" for the fixed-target bootstrap (a later brick may
-		# derive it from argv[0]). `build_path("lib/", "std/math")` → "lib/std/math.cf".
-		let Str mpath = build_path!(dir, im.path)
-		if has_prefix(im.path, "std/") then mpath = build_path!("lib/", im.path)
-		if !seen(loaded, mpath) then {
-			loaded = [...loaded, mpath]
-			tag = tag + 1 # a distinct tag per loaded module, so private names cannot collide
-			const Program m = load_module!(mpath)
-			recs = cat_recs(recs, m.recs)
-			unions = cat_unions(unions, m.unions)
-			groups = cat_recs(groups, m.groups)
-			funcs = cat_funcs(funcs, mangle_funcs!(m.funcs, tag))
-			work = cat_imports(work, m.imports)
+		if is_pseudo_module(im.path) then {
+			wi = wi + 1
+		} else {
+			# `std/`-prefixed imports resolve under the fixed library root, not the entry dir. The lib
+			# root is the cwd-relative literal "lib/" for the fixed-target bootstrap (a later brick may
+			# derive it from argv[0]). `build_path("lib/", "std/math")` → "lib/std/math.cf".
+			const Str mpath = mod_target_path!(edir, im.path)
+			if find_mod(mods, mpath) < 0 then {
+				# a std GEOMETRY module keeps a FIXED per-shape SUFFIX tag rather than a path prefix: the
+				# compiler references its (private) hooks by mangled name — `of__fx` — from emit, so the
+				# name cannot depend on the path. (keyed on the IMPORT path string.)
+				let Bool geom = false
+				let Str mtag = ""
+				if str_eq(im.path, "std/mem/fixed_buffer") then {
+					geom = true
+					mtag = "fb"
+				}
+				if str_eq(im.path, "std/mem/arena/fixed_arena") then {
+					geom = true
+					mtag = "fx"
+				}
+				if str_eq(im.path, "std/mem/arena/growing_arena") then {
+					geom = true
+					mtag = "el"
+				}
+				if str_eq(im.path, "std/mem/page") then {
+					geom = true
+					mtag = "pg"
+				}
+				const Program m = load_module!(mpath, target_os, target_arch)
+				mods = [...mods, Modu({ prefix: sanitize_prefix!(im.path), mpath: mpath, is_geom: geom, tag: mtag, prog: m })]
+				work = cat_imports(work, m.imports)
+			}
+			wi = wi + 1
 		}
-		wi = wi + 1
+	}
+	# precompute, for every loaded module, the target-module index of each of its imports, so
+	# export resolution never re-opens a path (keeping the mangle walkers allocation-free).
+	let [[Iarch]] itargets = []
+	let Iarch ti = 0
+	loop {
+		if ti >= Iarch(mods.len) then break
+		let [Iarch] row = []
+		let Iarch ri = 0
+		loop {
+			if ri >= Iarch(mods[ti].prog.imports.len) then break
+			# the raw-memory substrate is privileged: only the geometry modules under lib/std/mem/
+			# may import it (module_system; geometry_lowering §1 — userland never reaches raw ops)
+			if str_eq(mods[ti].prog.imports[ri].path, "std/mem/raw") && !has_prefix(mods[ti].mpath, "lib/std/mem/") then die("cf: resolve: `std/mem/raw` is privileged to the geometry modules under `std/mem/`\n")
+			let Iarch t = 0 - 1
+			if !is_pseudo_module(mods[ti].prog.imports[ri].path) then t = find_mod(mods, mod_target_path!(edir, mods[ti].prog.imports[ri].path))
+			row = [...row, t]
+			ri = ri + 1
+		}
+		itargets = [...itargets, row]
+		ti = ti + 1
+	}
+	const Rctx rc = Rctx({ mods: mods, edir: edir, itargets: itargets })
+	let [RecDecl] recs = []
+	let [UnionDecl] unions = []
+	let [Func] funcs = []
+	let [RecDecl] groups = []
+	let Iarch mi = 0
+	loop {
+		if mi >= Iarch(mods.len) then break
+		recs = cat_recs(recs, mods[mi].prog.recs)
+		unions = cat_unions(unions, mods[mi].prog.unions)
+		groups = cat_recs(groups, mods[mi].prog.groups) # grouped-parameter `type` decls (splatted below)
+		funcs = cat_funcs(funcs, mangle_module_funcs!(mi, rc))
+		mi = mi + 1
 	}
 	let [Import] none = []
 	# a user type may not redeclare a builtin (`Bool`/`Str`/`Iarch`/`Int8`/… — the names are

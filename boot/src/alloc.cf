@@ -9,10 +9,9 @@
 # the user; this pass validates it BOTH WAYS — a missing `!` on an allocator is an error, and a
 # redundant `!` on a colorless function is an error.
 #
-# GATED. cf's own 830 functions are not yet colored, so this runs only when the caller passes
-# `--check-alloc` (a corpus test opts in with `# check: alloc`); cf's normal self-build never
-# does, and compiles its unmarked source unchanged. The global mark-everything rollout is a
-# separate follow-up. Runs after monomorphization (every call is concrete) and after typecheck.
+# UNCONDITIONAL. The whole tree (compiler + lib + corpus) is colored, so this runs on every
+# compile with no flag. Runs PRE-monomorphization so the color is per SOURCE function, and the
+# companion root-page rule (check_root_program!) runs alongside it — both are mandatory.
 #
 # Escape (memory_model §5): a value escapes by RETURNING (handed to the caller) or REHOMING
 # (stored into a caller-owned aggregate — an assignment into a parameter aggregate). Allocation
@@ -22,8 +21,8 @@
 # trapped. A `defer` body is analyzed in the enclosing frame (its residence is the function's); a
 # closure body is analyzed with its OWN context and a `!` closure colors the function that holds it.
 
-import "ast" as { Expr, Stmt, MatchArm, StmtArm, Seg, FieldInit, Param, UnionDecl, UnionMember, Func, Program }
-import "io" as { die, write_str, stdout }
+import ast::{ Expr, Stmt, MatchArm, StmtArm, Seg, FieldInit, Param, UnionDecl, UnionMember, Func, Program }
+import io::{ die }
 
 const str_eq = (Str a, Str b): Bool -> {
 	if a.len != b.len then return false
@@ -49,6 +48,10 @@ const is_bang_name = (Str n): Bool -> {
 	}
 	return false
 }
+
+# A binding whose name carries the leading `$` STACK marker (byte 36): its storage is on the machine
+# stack (freed at frame exit), so — like a scalar — it is NOT residue and does not color the function.
+const is_stack_name = (Str n): Bool -> if Iarch(n.len) == 0 then false else Iarch(n[0]) == 36
 
 const has_name = ([Str] xs, Str s): Bool -> {
 	let Iarch i = 0
@@ -214,7 +217,7 @@ const expr_children! = (Expr e): [Expr] -> match e {
 	Expr.Buffer(sz) -> exl_one(sz),
 	Expr.Match(s, arms) -> cat_e(exl_one(s), arm_bodies(arms)),
 	Expr.If(c, t, el) -> exl_three!(c, t, el),
-	Expr.Call(_, _, args) -> args,
+	Expr.Call(_, _, args, _) -> args,
 	Expr.DeferTap(_, args) -> args,
 	Expr.FieldExpr(b, _) -> exl_one(b),
 	Expr.Index(_, i) -> exl_one(i),
@@ -303,8 +306,61 @@ const scan_escaping! = (ACtx cx, Expr e): Bool -> match e {
 	Expr.If(c, t, el) -> scan_trapped!(cx, c) || scan_escaping!(cx, t) || scan_escaping!(cx, el),
 	Expr.Match(s, arms) -> scan_trapped!(cx, s) || any_escaping!(cx, arm_bodies(arms)),
 	Expr.Loop(ss) -> body_traps!(cx, true, ss),
-	Expr.Call(_, _, args) -> any_trapped!(cx, args),
+	Expr.Call(_, _, args, _) -> any_trapped!(cx, args),
 	_ -> scan_trapped!(cx, e)
+}
+
+# A `$`-Let with a LITERAL aggregate initializer builds on the machine STACK: emit's `alloc_stack`
+# flag rides through the WHOLE initializer (nested literals included), so record/array/buffer
+# literals anywhere inside are stack storage, not node residue. But three forms draw on the NODE
+# even under the flag — an interpolated Str (the cf_str floor helpers), a tuple, and a boxed-union
+# construction (their emit paths never consult the flag) — and a value block's statements are
+# ordinary frame code. Scan for exactly those, descending the literal spine and call arguments
+# (which ride the flag too).
+const scan_stack_init! = (ACtx cx, Expr e): Bool -> match e {
+	Expr.Record(_, inits) -> stack_scan_list!(cx, field_values(inits)),
+	Expr.ArrayLit(_, sp, elems, _) -> scan_stack_init!(cx, sp) || stack_scan_list!(cx, elems),
+	Expr.Buffer(sz) -> scan_stack_init!(cx, sz),
+	Expr.Interp(_) -> true,
+	Expr.Tuple(_) -> true,
+	Expr.UnionMk(u, _, args) -> if union_boxed(cx.unions, u) then true else stack_scan_list!(cx, args),
+	Expr.Loop(ss) -> body_traps!(cx, false, ss),
+	_ -> stack_scan_list!(cx, expr_children!(e))
+}
+
+const stack_scan_list! = (ACtx cx, [Expr] es): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(es.len) then break
+		if scan_stack_init!(cx, es[i]) then return true
+		i = i + 1
+	}
+	return false
+}
+
+# Route a `$`-Let's initializer: a top-level literal aggregate takes emit's stack branch (the
+# `alloc_stack` flag is set for the whole init), so it scans in stack mode; any other form —
+# a scalar expression, a call, an if/match aggregate — takes emit's scalar/normal path where
+# the flag is never set, so every construction inside is ordinary node residue (this is what
+# made `const $n = "x${y}z".len` allocate invisibly — the old arm skipped the init entirely).
+const scan_stack_let! = (ACtx cx, Expr init): Bool -> match init {
+	Expr.Record(_, _) -> scan_stack_init!(cx, init),
+	Expr.ArrayLit(_, _, _, _) -> scan_stack_init!(cx, init),
+	Expr.Buffer(_) -> scan_stack_init!(cx, init),
+	_ -> scan_trapped!(cx, init)
+}
+
+# The root NAME of a chained lvalue's base (`a.b.c… = v` — the Var/name at the bottom of the
+# Field/Index chain), or "" when the base is not name-rooted (a non-name root is never a
+# parameter, so "" safely reads as non-escaping).
+const deep_root = (Expr e): Str -> match e {
+	Expr.Var(n) -> n,
+	Expr.Field(b, _) -> b,
+	Expr.FieldExpr(b, _) -> deep_root(b),
+	Expr.Index(b, _) -> b,
+	Expr.IndexField(b, _, _) -> b,
+	Expr.IndexExpr(b, _) -> deep_root(b),
+	_ -> ""
 }
 
 # Walk a statement list for trapped residue. `yesc` says whether a `<- v` yield escapes (true when
@@ -336,10 +392,10 @@ const target_escapes = (ACtx cx, Str name): Bool -> has_name(cx.params, name) ||
 const stmt_traps! = (ACtx cx, Bool yesc, Stmt s): Bool -> match s {
 	Stmt.Return(e) -> scan_escaping!(cx, e),
 	Stmt.Yield(e) -> if yesc then scan_escaping!(cx, e) else scan_trapped!(cx, e),
-	Stmt.Let(name, _, _, init) -> if has_name(cx.esc, name) then scan_escaping!(cx, init) else scan_trapped!(cx, init),
+	Stmt.Let(name, _, _, init) -> if has_name(cx.esc, name) then scan_escaping!(cx, init) else if is_stack_name(name) then scan_stack_let!(cx, init) else scan_trapped!(cx, init),
 	Stmt.Assign(name, val) -> if target_escapes(cx, name) then scan_escaping!(cx, val) else scan_trapped!(cx, val),
 	Stmt.FieldAssign(base, _, val) -> if target_escapes(cx, base) then scan_escaping!(cx, val) else scan_trapped!(cx, val),
-	Stmt.DeepFieldAssign(be, _, val) -> scan_trapped!(cx, be) || scan_trapped!(cx, val),
+	Stmt.DeepFieldAssign(be, _, val) -> if target_escapes(cx, deep_root(be)) then scan_trapped!(cx, be) || scan_escaping!(cx, val) else scan_trapped!(cx, be) || scan_trapped!(cx, val),
 	Stmt.IndexAssign(base, idx, val) -> scan_trapped!(cx, idx) || (if target_escapes(cx, base) then scan_escaping!(cx, val) else scan_trapped!(cx, val)),
 	Stmt.Do(e) -> scan_trapped!(cx, e),
 	Stmt.IfThen(c, s2) -> scan_trapped!(cx, c) || stmt_traps!(cx, yesc, s2),
@@ -360,15 +416,35 @@ const stmt_traps! = (ACtx cx, Bool yesc, Stmt s): Bool -> match s {
 # The local names that escape when `e` is in an escaping position: bare `Var`s reachable through
 # aggregate components / branches / value-block yields (NOT through call arguments or read bases,
 # which do not escape).
+# A `<- v` yield may sit inside a nested if/block/match (mirroring typecheck's stmt_yields_local)
+# — but NOT inside a nested loop, which opens its own value context. A yield buried in a branch
+# escapes exactly like a top-level one.
+const yield_vars_stmt = (Stmt s): [Str] -> match s {
+	Stmt.Yield(e) -> esc_vars(e),
+	Stmt.IfThen(_, b) -> yield_vars_stmt(b),
+	Stmt.IfElse(_, t, el) -> cat_s(yield_vars_stmt(t), yield_vars_stmt(el)),
+	Stmt.Block(ss) -> yield_vars(ss),
+	Stmt.Match(_, arms) -> yield_vars_stmtarms(arms),
+	_ -> no_strs()
+}
+
+const yield_vars_stmtarms = ([StmtArm] arms): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		r = cat_s(r, yield_vars(arms[i].body))
+		i = i + 1
+	}
+	return r
+}
+
 const yield_vars = ([Stmt] ss): [Str] -> {
 	let [Str] r = []
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(ss.len) then break
-		r = match ss[i] {
-			Stmt.Yield(e) -> cat_s(r, esc_vars(e)),
-			_ -> r
-		}
+		r = cat_s(r, yield_vars_stmt(ss[i]))
 		i = i + 1
 	}
 	return r
@@ -399,57 +475,166 @@ const vars_of = ([Expr] es): [Str] -> {
 }
 
 # One pass collecting escape roots and closing aliasing: a return/yield escapes its value's vars; a
-# rehome (assign / field / index into a parameter or escaping aggregate) escapes the stored vars; a
-# binding to an already-escaping name escapes its initializer's vars. Iterated to a fixpoint.
-const esc_roots_stmt = ([Str] params, [Str] esc, Stmt s): [Str] -> match s {
+# rehome (assign / field / deep-field / index into a parameter or escaping aggregate) escapes the
+# stored vars; a binding to an already-escaping name escapes its initializer's vars. Iterated to a
+# fixpoint. Every statement's EXPRESSIONS are also walked for embedded value blocks (`Expr.Loop`),
+# whose statement bodies share this frame's params/locals — a rehome inside one escapes exactly
+# like a top-level rehome (it was invisible before: the walk never descended into expressions).
+const esc_roots_stmt! = ([Str] params, [Str] esc, Stmt s): [Str] -> match s {
 	Stmt.Return(e) -> esc_vars(e),
 	Stmt.Yield(e) -> esc_vars(e),
 	Stmt.Assign(name, val) -> if has_name(params, name) || has_name(esc, name) then esc_vars(val) else no_strs(),
 	Stmt.FieldAssign(base, _, val) -> if has_name(params, base) || has_name(esc, base) then esc_vars(val) else no_strs(),
 	Stmt.IndexAssign(base, _, val) -> if has_name(params, base) || has_name(esc, base) then esc_vars(val) else no_strs(),
+	Stmt.DeepFieldAssign(be, _, val) -> if has_name(params, deep_root(be)) || has_name(esc, deep_root(be)) then esc_vars(val) else no_strs(),
 	Stmt.Let(name, _, _, init) -> if has_name(esc, name) then esc_vars(init) else no_strs(),
-	Stmt.IfThen(_, s2) -> esc_roots_stmt(params, esc, s2),
-	Stmt.IfElse(_, t, el) -> cat_s(esc_roots_stmt(params, esc, t), esc_roots_stmt(params, esc, el)),
-	Stmt.Block(ss) -> esc_roots_body(params, esc, ss),
-	Stmt.Loop(ss) -> esc_roots_body(params, esc, ss),
-	Stmt.ForIn(_, _, ss) -> esc_roots_body(params, esc, ss),
-	Stmt.Match(_, arms) -> esc_roots_stmtarms(params, esc, arms),
+	Stmt.IfThen(_, s2) -> esc_roots_stmt!(params, esc, s2),
+	Stmt.IfElse(_, t, el) -> cat_s(esc_roots_stmt!(params, esc, t), esc_roots_stmt!(params, esc, el)),
+	Stmt.Block(ss) -> esc_roots_body!(params, esc, ss),
+	Stmt.Loop(ss) -> esc_roots_body!(params, esc, ss),
+	Stmt.ForIn(_, _, ss) -> esc_roots_body!(params, esc, ss),
+	Stmt.Match(_, arms) -> esc_roots_stmtarms!(params, esc, arms),
 	# a `defer` body shares this frame's locals/params, so a rehome inside it escapes too
-	Stmt.Defer(ss) -> esc_roots_body(params, esc, ss),
+	Stmt.Defer(ss) -> esc_roots_body!(params, esc, ss),
 	_ -> no_strs()
 }
 
-const esc_roots_body = ([Str] params, [Str] esc, [Stmt] ss): [Str] -> {
+# The expressions a statement holds directly — walked for embedded value-block bodies.
+const stmt_exprs! = (Stmt s): [Expr] -> match s {
+	Stmt.Return(e) -> exl_one(e),
+	Stmt.Yield(e) -> exl_one(e),
+	Stmt.Let(_, _, _, init) -> exl_one(init),
+	Stmt.Assign(_, val) -> exl_one(val),
+	Stmt.FieldAssign(_, _, val) -> exl_one(val),
+	Stmt.DeepFieldAssign(be, _, val) -> exl_two!(be, val),
+	Stmt.IndexAssign(_, idx, val) -> exl_two!(idx, val),
+	Stmt.Do(e) -> exl_one(e),
+	Stmt.IfThen(c, _) -> exl_one(c),
+	Stmt.IfElse(c, _, _) -> exl_one(c),
+	Stmt.Match(sc, _) -> exl_one(sc),
+	Stmt.Destructure(_, _, e) -> exl_one(e),
+	_ -> no_exprs()
+}
+
+const esc_roots_expr! = ([Str] params, [Str] esc, Expr e): [Str] -> match e {
+	Expr.Loop(ss) -> esc_roots_body!(params, esc, ss),
+	_ -> esc_roots_elist!(params, esc, expr_children!(e))
+}
+
+const esc_roots_elist! = ([Str] params, [Str] esc, [Expr] es): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(es.len) then break
+		r = cat_s(r, esc_roots_expr!(params, esc, es[i]))
+		i = i + 1
+	}
+	return r
+}
+
+const esc_roots_body! = ([Str] params, [Str] esc, [Stmt] ss): [Str] -> {
 	let [Str] r = []
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(ss.len) then break
-		r = cat_s(r, esc_roots_stmt(params, esc, ss[i]))
+		r = cat_s(r, esc_roots_stmt!(params, esc, ss[i]))
+		r = cat_s(r, esc_roots_elist!(params, esc, stmt_exprs!(ss[i])))
 		i = i + 1
 	}
 	return r
 }
 
-const esc_roots_stmtarms = ([Str] params, [Str] esc, [StmtArm] arms): [Str] -> {
+const esc_roots_stmtarms! = ([Str] params, [Str] esc, [StmtArm] arms): [Str] -> {
 	let [Str] r = []
 	let Iarch i = 0
 	loop {
 		if i >= Iarch(arms.len) then break
-		r = cat_s(r, esc_roots_body(params, esc, arms[i].body))
+		r = cat_s(r, esc_roots_body!(params, esc, arms[i].body))
 		i = i + 1
 	}
 	return r
 }
 
-const compute_esc = ([Str] params, [Stmt] body): [Str] -> {
+pub const compute_esc! = ([Str] params, [Stmt] body): [Str] -> {
 	let [Str] esc = []
 	loop {
-		const [Str] add = esc_roots_body(params, esc, body)
+		const [Str] add = esc_roots_body!(params, esc, body)
 		const [Str] merged = union_names(esc, add)
 		if Iarch(merged.len) == Iarch(esc.len) then break
 		esc = merged
 	}
 	return esc
+}
+
+const var_refs_expr! = (Expr e): [Str] -> match e {
+	Expr.Var(n) -> exl_one_s(n),
+	Expr.Loop(ss) -> var_refs_body!(ss),
+	_ -> var_refs_list!(expr_children!(e))
+}
+const var_refs_list! = ([Expr] es): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(es.len) then break
+		r = cat_s(r, var_refs_expr!(es[i]))
+		i = i + 1
+	}
+	return r
+}
+const var_refs_arms! = ([StmtArm] arms): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		r = cat_s(r, var_refs_body!(arms[i].body))
+		i = i + 1
+	}
+	return r
+}
+const var_refs_stmt! = (Stmt s): [Str] -> match s {
+	Stmt.Return(e) -> var_refs_expr!(e),
+	Stmt.Yield(e) -> var_refs_expr!(e),
+	Stmt.Let(_, _, _, init) -> var_refs_expr!(init),
+	Stmt.Assign(_, val) -> var_refs_expr!(val),
+	Stmt.FieldAssign(_, _, val) -> var_refs_expr!(val),
+	Stmt.DeepFieldAssign(be, _, val) -> cat_s(var_refs_expr!(be), var_refs_expr!(val)),
+	Stmt.IndexAssign(_, idx, val) -> cat_s(var_refs_expr!(idx), var_refs_expr!(val)),
+	Stmt.Do(e) -> var_refs_expr!(e),
+	Stmt.IfThen(c, s2) -> cat_s(var_refs_expr!(c), var_refs_stmt!(s2)),
+	Stmt.IfElse(c, t, el) -> cat_s(var_refs_expr!(c), cat_s(var_refs_stmt!(t), var_refs_stmt!(el))),
+	Stmt.Block(ss) -> var_refs_body!(ss),
+	Stmt.Loop(ss) -> var_refs_body!(ss),
+	Stmt.ForIn(_, _, ss) -> var_refs_body!(ss),
+	Stmt.Match(sc, arms) -> cat_s(var_refs_expr!(sc), var_refs_arms!(arms)),
+	Stmt.Destructure(_, _, e) -> var_refs_expr!(e),
+	Stmt.Defer(ss) -> var_refs_body!(ss),
+	Stmt.Closure(_, _, _, cbody) -> var_refs_body!(cbody),
+	_ -> no_strs()
+}
+const var_refs_body! = ([Stmt] ss): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		r = cat_s(r, var_refs_stmt!(ss[i]))
+		i = i + 1
+	}
+	return r
+}
+# The set of names used as a VALUE (an `Expr.Var`) anywhere in the program. A direct call's callee is
+# a bare Str in the AST, not a Var, so a FUNCTION name lands here ONLY when it is taken as a value
+# (passed to a HOF, bound, returned). Emit consults it: an address-taken function is reachable by an
+# indirect call, whose site cannot claim, so such a function must NOT reset (on_ret/on_alloc_ret pairs
+# only at direct call sites in this step).
+pub const address_taken! = (Program prog): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(prog.funcs.len) then break
+		if !prog.funcs[i].is_asm then r = union_names(r, var_refs_body!(prog.funcs[i].body))
+		i = i + 1
+	}
+	return r
 }
 
 const plist_names = ([Param] ps): [Str] -> {
@@ -471,7 +656,7 @@ const param_names = (Func f): [Str] -> plist_names(f.params)
 # invokes it) is colored `!`, exactly as if it called a `!` function. Closures do not nest in v1.
 const closure_traps! = ([UnionDecl] unions, [Param] cps, [Stmt] cbody): Bool -> {
 	const [Str] cparams = plist_names(cps)
-	const [Str] cesc = compute_esc(cparams, cbody)
+	const [Str] cesc = compute_esc!(cparams, cbody)
 	const ACtx cx2 = ACtx({ unions: unions, params: cparams, esc: cesc })
 	return body_traps!(cx2, false, cbody)
 }
@@ -479,7 +664,7 @@ const closure_traps! = ([UnionDecl] unions, [Param] cps, [Stmt] cbody): Bool -> 
 # Does function `f` hold a trapped (non-escaping) aggregate residence of its own?
 const local_residue! = ([UnionDecl] unions, Func f): Bool -> {
 	const [Str] params = param_names(f)
-	const [Str] esc = compute_esc(params, f.body)
+	const [Str] esc = compute_esc!(params, f.body)
 	const ACtx cx = ACtx({ unions: unions, params: params, esc: esc })
 	return body_traps!(cx, false, f.body)
 }
@@ -538,7 +723,7 @@ const list_calls_bang! = ([Func] funcs, [Bool] bang, [Str] params, [Expr] es): B
 
 const expr_calls_bang! = ([Func] funcs, [Bool] bang, [Str] params, Expr e): Bool -> {
 	const Bool here = match e {
-		Expr.Call(name, _, args) -> call_is_effectful(funcs, bang, params, name, args),
+		Expr.Call(name, _, args, _) -> call_is_effectful(funcs, bang, params, name, args),
 		Expr.DeferTap(name, args) -> call_is_effectful(funcs, bang, params, name, args),
 		_ -> false
 	}
@@ -648,20 +833,124 @@ pub const check_alloc_program! = (Program prog) -> {
 	return 0
 }
 
-# Suggest mode (Stage C rollout tooling): print, one per line, the SOURCE name of every function the
-# analysis colors `!` but that is not yet marked — the exact set to annotate. Run PRE-monomorph so
-# names are source names and a generic that may allocate in any instantiation is reported once.
-pub const suggest_alloc_program! = (Program prog) -> {
-	const [Func] funcs = prog.funcs
-	const [Bool] bang = compute_bang!(prog)
-	let Iarch j = 0
+# ── Root-allocation check (memory_model §2) ────────────────────────────────────────────────────
+# `main` runs under the ROOT page, and the user cannot allocate there — a program must graft a
+# geometry (an `in <arena>` clause) before any residue is placed. The ambient node propagates down
+# BARE calls (no `in`); an `in`-grafted call switches its subtree to the arena. So the set of
+# functions that can run under the root is the closure of `main` over bare callees; if any of them
+# holds trapped residue, that residue would land on the root — a compile error. An `in`-grafted
+# call's ARGUMENTS still evaluate in the caller's ambient, so they keep propagating.
+const bare_calls_expr! = (Expr e): [Str] -> match e {
+	Expr.Call(n, _, args, g) -> if str_eq(g, "") then cat_s(exl_one_s(n), bare_calls_list!(args)) else bare_calls_list!(args),
+	Expr.DeferTap(_, args) -> bare_calls_list!(args),
+	Expr.Loop(ss) -> bare_calls_body!(ss),
+	_ -> bare_calls_list!(expr_children!(e))
+}
+
+const exl_one_s = (Str a): [Str] -> {
+	let [Str] r = [a]
+	return r
+}
+
+const bare_calls_list! = ([Expr] es): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
 	loop {
-		if j >= Iarch(funcs.len) then break
-		if !funcs[j].is_asm && !is_main(funcs[j]) && bang[j] && !is_bang_name(funcs[j].name) then {
-			write_str(Uarch(stdout), funcs[j].name)
-			write_str(Uarch(stdout), "\n")
+		if i >= Iarch(es.len) then break
+		r = cat_s(r, bare_calls_expr!(es[i]))
+		i = i + 1
+	}
+	return r
+}
+
+const bare_calls_arms! = ([StmtArm] arms): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		r = cat_s(r, bare_calls_body!(arms[i].body))
+		i = i + 1
+	}
+	return r
+}
+
+const bare_calls_stmt! = (Stmt s): [Str] -> match s {
+	Stmt.Return(e) -> bare_calls_expr!(e),
+	Stmt.Yield(e) -> bare_calls_expr!(e),
+	Stmt.Let(_, _, _, init) -> bare_calls_expr!(init),
+	Stmt.Assign(_, val) -> bare_calls_expr!(val),
+	Stmt.FieldAssign(_, _, val) -> bare_calls_expr!(val),
+	Stmt.DeepFieldAssign(be, _, val) -> cat_s(bare_calls_expr!(be), bare_calls_expr!(val)),
+	Stmt.IndexAssign(_, idx, val) -> cat_s(bare_calls_expr!(idx), bare_calls_expr!(val)),
+	Stmt.Do(e) -> bare_calls_expr!(e),
+	Stmt.IfThen(c, s2) -> cat_s(bare_calls_expr!(c), bare_calls_stmt!(s2)),
+	Stmt.IfElse(c, t, el) -> cat_s(bare_calls_expr!(c), cat_s(bare_calls_stmt!(t), bare_calls_stmt!(el))),
+	Stmt.Block(ss) -> bare_calls_body!(ss),
+	Stmt.Loop(ss) -> bare_calls_body!(ss),
+	Stmt.ForIn(_, _, ss) -> bare_calls_body!(ss),
+	Stmt.Match(sc, arms) -> cat_s(bare_calls_expr!(sc), bare_calls_arms!(arms)),
+	Stmt.Destructure(_, _, e) -> bare_calls_expr!(e),
+	Stmt.Defer(ss) -> bare_calls_body!(ss),
+	Stmt.Closure(_, _, _, cbody) -> bare_calls_body!(cbody),
+	_ -> no_strs()
+}
+
+const bare_calls_body! = ([Stmt] ss): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		r = cat_s(r, bare_calls_stmt!(ss[i]))
+		i = i + 1
+	}
+	return r
+}
+
+# The set of functions reachable from `main` through bare (non-`in`) calls — those that can run
+# under the root page. Grown to a fixpoint over the whole program.
+const root_ambient_set! = (Program prog): [Str] -> {
+	const [Func] funcs = prog.funcs
+	let [Str] r = exl_one_s("main")
+	loop {
+		let [Str] add = []
+		let Iarch i = 0
+		loop {
+			if i >= Iarch(r.len) then break
+			const Iarch fi = find_func(funcs, r[i])
+			if fi >= 0 && !funcs[fi].is_asm then add = cat_s(add, bare_calls_body!(funcs[fi].body))
+			i = i + 1
 		}
-		j = j + 1
+		const [Str] merged = union_names(r, add)
+		if Iarch(merged.len) == Iarch(r.len) then break
+		r = merged
+	}
+	return r
+}
+
+pub const check_root_program! = (Program prog, Bool zero_root) -> {
+	const [Func] funcs = prog.funcs
+	const [Str] root = root_ambient_set!(prog)
+	# ZERO-ROOT mode (`--root-size 0` on `Bare`): the root page has no bytes, so NO page use is legal.
+	# An arena graft carves its header from the ambient node — bare (root-ambient) it draws on the
+	# page. The root-ambient set already collects bare-called names, so a page-carving arena intrinsic
+	# reached without an `in` clause shows up here by name. Reject it up front.
+	if zero_root && (has_name(root, "of__fx") || has_name(root, "of__el")) then die("cf: zero-root: an arena grafts its header from the root page, but `--root-size 0` forbids all page use — drop the arena and allocate only in `$`-stack, `static`, or a `fixed_buffer`\n")
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(root.len) then break
+		const Iarch fi = find_func(funcs, root[i])
+		# ROOT does not propagate into `!` functions (memory_model §2): `main` (and any colorless
+		# function) may allocate on the root page freely, but a `!` function — one that HOLDS residue —
+		# must run under a geometry. So the violation is a `!` function reached from `main` by BARE
+		# calls (the root-ambient set closes over bare calls only; an `in` clause leaves the set). `main`
+		# is never `!`, so it is exempt and may open buffers/records directly on the root.
+		if fi >= 0 && !funcs[fi].is_asm && is_bang_name(funcs[fi].name) then die("cf: root: `${funcs[fi].name}` is a `!` function reached without a geometry — call it `in <arena>` (root does not propagate into `!` functions)\n")
+		# In zero-root there is no page to spill onto, so `main`'s own exemption is revoked too: ANY
+		# root-ambient function that constructs a residue aggregate on the page is rejected. Legal
+		# storage (`$`, `static`, `fixed_buffer` allocations run `in fb`) never lands here — the first
+		# two aren't residue, and a `fixed_buffer` sink is reached `in fb`, off the root-ambient set.
+		if zero_root && fi >= 0 && !funcs[fi].is_asm && local_residue!(prog.unions, funcs[fi]) then die("cf: zero-root: `${funcs[fi].name}` allocates residue on the root page, but `--root-size 0` forbids it — use `$`-stack, `static`, or a `fixed_buffer` instead\n")
+		i = i + 1
 	}
 	return 0
 }

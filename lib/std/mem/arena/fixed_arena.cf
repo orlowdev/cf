@@ -1,0 +1,93 @@
+# std/mem/arena/fixed_arena — the FIXED carved bump geometry (geometry_lowering §5): the `fx` half
+# of the old two-shape `arena`. `mem.arena.of(n)` carves a fixed n-byte arena from the ambient
+# node — one two-ended block whose survivor bumps up and residue bumps down, the cursors meeting
+# at the hard trap. `of(n)` means n bytes TOTAL. Splitting fixed from elastic makes every reserve
+# MONOMORPHIC: the constructor picks the shape at comptime, so the reserves never test a stored
+# kind — the intra-geometry branch the merged `arena` module carried is gone.
+#
+# Duplex header (72 bytes, shared with the whole bump family):
+#   node+0  survivor { top@0, limit@8, parent@16, aux@24, reserve@32 }
+#   node+40 residue  { top@0, limit@8, parent@16, aux@24 }
+#
+# A fixed arena uses neither `aux` (no commit watermark, no pull chunk) nor a hot-path `limit`
+# bound (each side reads the SIBLING's cursor as its wall). Auto-loaded on any `mem.arena.of`
+# use; everything is called by mangled name (`of__fx`, `reserve_ret__fx`, …); nothing is `pub`.
+# Emit lowers a record construction in a `__fx` body to fold-lite form (reserve + build-in-place,
+# the fused `on_alloc`/`on_ret`). What materialize cannot prove stays on the shared bump floor,
+# coherent via the same duplex layout.
+
+# `fixed_arena.of(n)` — the constructor SURFACE: a bodyless intrinsic, a token the user imports
+# and calls with only the args THEY provide. The compiler supplies the whole behavior at the
+# call site, spending the ambient node it already holds on the placed `carve` below.
+import std::mem::raw
+
+pub intrinsic of = (Uarch n): Uarch
+
+# `fixed_arena::destroy(b)` — the wall-dissolution teardown (geometry_lowering §3): dissolve a
+# carved child `b` back into the parent it was carved from, reclaiming its whole extent (header +
+# block). The user places it explicitly (`|> defer destroy`); the compiler supplies the behavior at
+# the call site. For the bump family this is a single SURVIVOR REWIND — the child was carved at the
+# parent's survivor cursor, so its base IS the carve mark; setting the parent's survivor top back to
+# it reclaims the child and everything bumped after it. The escaping closure was born survivor-side
+# ABOVE the child, so the rewind cannot reach it. `b` carries its parent node at `b+16`.
+pub intrinsic destroy = (Uarch node): ()
+
+# Carve a FIXED arena from the parent: pull a 72-byte duplex header and an n-byte block from
+# `node` (the parent's survivor — the carve is the must-pin), then lay both subnodes over the one
+# two-ended block: survivor { blk, end, node } bumps up, residue { end, 0, node } bumps down. The
+# block leaks into the parent at teardown. The `reserve` slot (+32) is not written here — emit
+# PUBLISHES this node's reserve entry there after the carve. `aux` is unused (fixed neither commits
+# nor pulls). `node` is compiler-supplied (the ambient parent) when lowering an `of(n)` call.
+const carve = (Uarch node, Uarch n): Uarch -> {
+	const Uarch r = (n + 7) % 8
+	const Uarch sz = n + 7 - r
+	const Uarch hdr = raw::alloc(node, 72)
+	const Uarch blk = raw::alloc(node, sz)
+	const Uarch end = blk + sz
+	raw::store(hdr, blk)
+	raw::store(hdr + 8, end)
+	raw::store(hdr + 16, node)
+	raw::store(hdr + 40, end)
+	raw::store(hdr + 48, 0)
+	raw::store(hdr + 56, node)
+	return hdr
+}
+
+# Reserve `sz` on the SURVIVOR side — `on_ret` minus the copy. A fixed survivor bumps up toward
+# the residue cursor (node+40) and traps on meet. Monomorphic: no kind test.
+const reserve_ret = (Uarch node, Uarch sz): Uarch -> {
+	const Uarch p = raw::load(node)
+	const Uarch nt = p + sz
+	if nt > raw::load(node + 40) then raw::trap()
+	raw::store(node, nt)
+	return p
+}
+
+# Reserve `sz` on the RESIDUE side — `on_alloc` minus the copy. A fixed residue bumps down toward
+# the survivor cursor (node) and traps on meet. Monomorphic: no kind test.
+const reserve_alloc = (Uarch node, Uarch sz): Uarch -> {
+	const Uarch dn = raw::load(node + 40) - sz
+	if dn < raw::load(node) then raw::trap()
+	raw::store(node + 40, dn)
+	return dn
+}
+
+# ── the scope bracket (geometry_lowering §2) ─────────────────────────────────────────────
+# Close a residue scope: rewind the residue side (top at node+40) to the saved `{top, limit}`
+# mark (emit snapshots it at entry — the folded `on_scope_enter`). A fixed residue never pulls,
+# so its limit (node+48) never moves and the top is always restored; the uniform limit-compare
+# keeps one bump-family body. This is the scope fold formerly done by the floor `cf_reset`.
+const on_scope_exit = (Uarch node, Uarch top, Uarch lim): Uarch -> {
+	if raw::load(node + 48) == lim then raw::store(node + 40, top)
+	return 0
+}
+
+# ── the value hooks (geometry_lowering §1) ───────────────────────────────────────────────
+# Fold-lite fuses these into reserve + build-in-place; the bodies serve the sites a
+# pre-constructed value must genuinely relocate through. on_alloc_ret is the identity — the
+# callee's survivor side outlives the call (the bump family's claim fold).
+const on_alloc = ['T](Uarch node, 'T v): 'T -> raw::place(reserve_alloc(node, raw::size_of(v)), v)
+
+const on_ret = ['T](Uarch node, 'T v): 'T -> raw::place(reserve_ret(node, raw::size_of(v)), v)
+
+const on_alloc_ret = ['T](Uarch node, 'T v): 'T -> v

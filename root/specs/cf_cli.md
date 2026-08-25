@@ -61,9 +61,9 @@ cf compile <file> [options]
 
 `compile` takes **one file** — the compilation entry. It must be a `.cf` file, and
 (unless `--lib`) must define a `pub const main` (see [[ebnf.md]], Entry Point).
-Every import is resolved relative to that file's location, **except** standard
-library paths (`"std/…"`), which the toolchain resolves. This single-entry,
-relative-import rule is the whole module-resolution story; there is no ambient
+Every path is resolved relative to that file's location, **except** standard
+library paths (`std::…`), which the toolchain resolves. This single-entry,
+relative-path rule is the whole module-resolution story; there is no ambient
 search path.
 
 ### Output and kind
@@ -157,9 +157,9 @@ just operating system and architecture, os first:
 darwin-arm64  darwin-amd64  linux-arm64  linux-amd64  linux-riscv64  wasm
 ```
 
-The pair splits into the two values the `comptime` module exposes for conditional
-imports (see [[ebnf.md]], Modules; [[module_system.md]] §7): `comptime.os.target` ∈
-`{darwin, linux}` and `comptime.arch.target` ∈ `{arm64, amd64, riscv64, wasm}`. `wasm`
+The pair splits into the two values the `std::comptime` module exposes for conditional
+imports (see [[ebnf.md]], Modules; [[module_system.md]] §7): `os::target` ∈
+`{darwin, linux}` and `arch::target` ∈ `{arm64, amd64, riscv64, wasm}`. `wasm`
 is the one token that does not split on `-`: **Wasm is not an OS**, so it sets the
 **arch** to `wasm` and leaves `os` at its default. Default is the **host** pair — the os
 and arch `cf` itself runs on (so a bare `wasm` target is the Wasm arch on the host os).

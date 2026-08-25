@@ -1,0 +1,119 @@
+# std/mem/fixed_buffer — the zero-dependency bounded geometry (geometry_lowering §5):
+# `mem.fixed_buffer.of(buf)` wraps a CALLER-PROVIDED `[Uint8]` buffer (`$`-stack, `static`,
+# or heap) as a duplex bump node. Creating it allocates nothing: the 72-byte duplex header
+# lays over the buffer's own front and the remainder is one two-ended block — survivors bump
+# up from the header's end, residue bumps down from the tail, and the two cursors meeting is
+# a hard trap. Survivors live in the buffer itself, so a static-backed escape stays valid for
+# the buffer's whole life.
+#
+# This is the first geometry whose logic lives in std SOURCE instead of the compiler's QBE
+# floor. Using the geometry IS the import: the compiler auto-loads this file on any
+# `mem.fixed_buffer` use and calls every function here by its mangled name (`of__fb`,
+# `on_alloc__fb`, …) — nothing here is `pub`, because userland never calls a geometry's
+# internals directly; the compiler places every call. Emit lowers a record construction in
+# a materialized body to FOLD-LITE form (geometry_lowering §2 + the identity law): it calls
+# the geometry's `reserve_*` for the bytes and builds the record directly in them — the
+# fused equivalent of `on_alloc`/`on_ret`, whose generic bodies below remain the value-level
+# contract those reserves were factored from. Only the claim hook (`on_alloc_ret`) is still
+# minted per placed type; what materialize cannot prove stays on the shared bump floor,
+# coherent because both honor the same 72-byte duplex node layout:
+#
+#   node+0  survivor { top@0, limit@8, parent@16, aux@24, reserve@32 }   — bumps UP
+#   node+40 residue  { top@0, limit@8, parent@16, aux@24 }               — bumps DOWN
+#
+# A fixed buffer uses neither `aux` (no commit watermark, no pull chunk) nor a `limit` bound
+# on its hot path (each side reads the SIBLING's cursor as its wall); its limits are only the
+# stable marks the scope bracket compares against. After the carve, emit PUBLISHES this node's
+# reserve entry into `reserve` (node+32) — the address of `reserve_ret__fb` — so a child
+# grafted from it follows `parent+32` like any parent; the carve therefore does not write +32.
+
+# `fixed_buffer.of(buf)` — the constructor SURFACE: a bodyless intrinsic, a token the user
+# imports and calls with only the buffer THEY provide. The compiler supplies the behavior at
+# the call site, handing the ambient node to the placed `carve` below.
+import std::mem::raw
+
+pub intrinsic of = ([Uint8] buf): Uarch
+
+# Lay the duplex header over the buffer's front and hand back the node (its base address).
+# `buf` arrives as its `{data,len,cap}` header; the node is the buffer's data pointer, the
+# usable block is `[data+72, data+len)`, and both subnodes parent to the AMBIENT node so
+# wall dissolution has somewhere to go (today: inert — a fixed node never pulls).
+# `node` is compiler-supplied (the ambient) when lowering an `of(buf)` call.
+const carve = (Uarch node, [Uint8] buf): Uarch -> {
+	const Uarch hdr = raw::addr(buf)
+	const Uarch data = raw::load(hdr)
+	const Uarch len = raw::load(hdr + 8)
+	const Uarch blk = data + 72
+	const Uarch end = data + len
+	raw::store(data, blk)
+	raw::store(data + 8, end)
+	raw::store(data + 16, node)
+	raw::store(data + 40, end)
+	raw::store(data + 48, 0)
+	raw::store(data + 56, node)
+	return data
+}
+
+# ── the hook set (geometry_lowering §1) ──────────────────────────────────────────────────
+# The value hooks are BEHAVIOR-IDENTICAL to the floor's fixed-node branches: each side bumps
+# its own cursor and reads the SIBLING's cursor as its bound — no limit field is ever touched
+# on the hot path. The cursors meeting is the hard trap. `size_of` on a record is its slot
+# count ×8, already 8-aligned, so no rounding is needed here (the floor rounds byte requests;
+# hooks place whole records).
+#
+# `Mark` is geometry-private (§1): the residue subnode's saved `{top, limit}`. Emit snapshots
+# it into temps at scope entry — the folded `on_scope_enter` (a pure read of the residue
+# subnode, a bump-family layout invariant) — and places the exit hook at scope exit. For a
+# FIXED node the top alone would suffice (a fixed buffer never pulls, so its limit never
+# moves), but the exit keeps the uniform limit-compare so one bump-family body serves fixed
+# and elastic alike.
+
+# Reserve `sz` bytes on the SURVIVOR side (bump up toward the residue cursor at node+40, trap
+# on meet) and hand back the placement address. This is `on_ret` minus the copy — emit's
+# fold-lite constructs the escaping record directly in the reservation.
+const reserve_ret = (Uarch node, Uarch sz): Uarch -> {
+	const Uarch p = raw::load(node)
+	const Uarch nt = p + sz
+	if nt > raw::load(node + 40) then raw::trap()
+	raw::store(node, nt)
+	return p
+}
+
+# Reserve `sz` bytes on the RESIDUE side (bump down toward the survivor cursor at node, trap
+# on meet): `on_alloc` minus the copy, for frame-local records built in place.
+const reserve_alloc = (Uarch node, Uarch sz): Uarch -> {
+	const Uarch dn = raw::load(node + 40) - sz
+	if dn < raw::load(node) then raw::trap()
+	raw::store(node + 40, dn)
+	return dn
+}
+
+# Close a residue scope (geometry_lowering §2): rewind the residue side to the saved mark,
+# reclaiming in bulk everything it bumped down. `top`/`lim` are the residue subnode's saved
+# cursor (node+40) and limit (node+48); restore the top only when the limit is unchanged
+# since the mark (no pull — always the case for a fixed buffer). This is the bump family's
+# scope fold, formerly the floor `cf_reset`; a compacting or `rc` geometry overrides it.
+const on_scope_exit = (Uarch node, Uarch top, Uarch lim): Uarch -> {
+	if raw::load(node + 48) == lim then raw::store(node + 40, top)
+	return 0
+}
+
+# Place local residue (dies in frame): reserve on the residue side, copy the constructed
+# value in, and hand back the placed copy (the identity law — same logical value,
+# relocated bytes). Fold-lite renders this hook as `reserve_alloc` + build-in-place, so
+# the copy only happens where a pre-constructed value must genuinely relocate.
+const on_alloc = ['T](Uarch node, 'T v): 'T -> raw::place(reserve_alloc(node, raw::size_of(v)), v)
+
+# Place an escaping value at birth (§3): reserve on the SURVIVOR side — storage no residue
+# bracket can ever reach, so whatever the frame reclaims, the escape survives by
+# construction. Fold-lite renders it as `reserve_ret` + build-in-place.
+const on_ret = ['T](Uarch node, 'T v): 'T -> raw::place(reserve_ret(node, raw::size_of(v)), v)
+
+# Claim a returned value (§3): the bump family's fold is the IDENTITY — the callee's
+# on_ret already placed the value on a survivor side that outlives the call, so there is
+# nothing to move. The hook stays placed by contract (a compacting geometry acts here).
+const on_alloc_ret = ['T](Uarch node, 'T v): 'T -> v
+
+# The remaining spec hooks (`on_realloc`, `on_free`, `on_rehome`, `on_store` — all
+# degenerate for the bump family) land when placement reaches their sites; no dead
+# spec-code in std until then.

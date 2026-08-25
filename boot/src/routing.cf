@@ -1,0 +1,1970 @@
+# routing — the SHADOW residue/survivor classification (memory_model §5, geometry_lowering §2-§3).
+#
+# The MEMORY MODEL separates every allocation at birth: a value that escapes its frame
+# (returned, yielded, or rehomed into a caller-owned aggregate) is a SURVIVOR, placed through
+# the geometry's survivor hooks; trapped residue is frame-bounded and reclaimable at scope
+# exit. The classification itself is geometry-AGNOSTIC — geometries differ only in what
+# keeping a survivor costs (a bump node keeps it until node death, gc traces it, rc counts
+# it) and in how residue is wiped. The first consumer is the DUPLEX NODE, the bump family's
+# two-sided layout: it trusts these bits blindly (a reset frees residue en masse, with no
+# per-object tracking), so routing an escaping value residue is a use-after-free THERE — the
+# analysis must be a SOUND OVER-APPROXIMATION: when in doubt, a name ESCAPES (the cost of
+# over-approximation is a leak until node death, never a dangle). A tracking geometry would
+# consume the same bits as a placement hint only.
+#
+# SHADOW MODE: this pass currently drives nothing. It runs on the LOWERED program (post
+# monomorphization / defer-tap hoist / defer lowering / closure lift — the AST emit actually
+# consumes, where a capture is an ordinary hidden parameter), computes each function's escape
+# set with the FULL arm coverage the older `!`-oracle (alloc.cf) lacks, and cross-checks:
+# every name the oracle says escapes must also escape here (`routing_check!`). A divergence is
+# a compiler bug reported at compile time, so the whole corpus plus cf itself exercise the new
+# analysis on every build long before any codegen trusts it.
+#
+# PER-FUNCTION SUMMARIES (slice B): a call argument no longer escapes unconditionally. Each
+# function gets a summary computed bottom-up over the call graph — per parameter,
+#   ret_al(i)  the return value may ALIAS argument i (identity `_ -> e` rewriters, projections
+#              of a parameter, transitive returns through callees), and
+#   stores(i)  argument i is STORED beyond the callee's own frame (rehomed into another
+#              argument's aggregate or into memory the callee's caller can reach).
+# At a call site, a `stores` argument escapes wherever the call sits (position-independent
+# sweep); a `ret_al` argument escapes exactly when the call's VALUE does (the ordinary
+# escaping-position machinery), and makes a binding of the result a forward alias of the
+# argument (`const q = f(gg.inner); q.p = v` rehomes `v` through the call). The polarity is
+# fixed: an UNRESOLVED callee — indirect (a fn-value name), recursive/SCC (still in progress
+# on the DFS stack), asm (opaque body), or plain unknown — is ⊤: every argument escapes.
+# Intrinsics get exact rows: a numeric cast and `Str(v[,n])` and `fixed_buffer.of` return
+# (an alias of) argument 0 and retain nothing; the arena constructors take only sizes. The
+# asm floor whitelists exactly `syscall6`/`exit` (the kernel copies or fills during the call
+# and retains no user pointer; exit never returns), which frees the whole write→eprint→die
+# chain — every other asm body is ⊤.
+#
+# The per-function fixpoint splits the escape set by WHY a name escapes:
+#   rset  return-reachable (returned/yielded, or flows into a returned name) → the summary's
+#         ret_al bits — conditional escape at the call site;
+#   sset  stored beyond the frame (rehomed into a parameter/forward alias, or a `stores`
+#         call argument) → the summary's stores bits — unconditional escape at the call site.
+# esc = rset ∪ sset partitions exactly the one set slice A grew, so the oracle cross-check is
+# unchanged. A store into a plain rset name stays return-conditional (the stored value rides
+# the return); a store through a forward alias goes to sset (the alias may root in caller
+# memory).
+#
+# Beyond the oracle, this pass closes the alias channels red-teamed against the duplex design:
+#   - an escaping PROJECTION pins its base (`return o.a` keeps `o` alive — the interior box
+#     lives inside the base's construction);
+#   - a match/destructure BIND aliases its scrutinee's payload;
+#   - a `for` variable aliases the array's element;
+#   - a spread copies the SOURCE array's element pointers into the new spine;
+#   - `&x` hands the address out;
+#   - FORWARD aliases: a name bound FROM a parameter/escaping aggregate (`const q = gg.inner`)
+#     becomes a store TARGET — a rehome through it escapes the stored value (now grown inside
+#     value blocks too, and through ret-aliasing call results).
+# An interpolation hole is NOT an escape: cf_str_append copies the hole's bytes.
+#
+# `evars` (the escaping-position walker) is deliberately EXHAUSTIVE with no `_` arm: adding an
+# Expr variant fails this compile until the new form is audited for escape behavior.
+
+import ast::{ Expr, Stmt, MatchArm, StmtArm, Seg, FieldInit, Param, UnionDecl, Func, Program }
+import alloc::{ compute_esc! }
+import io::{ die, eprint }
+
+const str_eq = (Str a, Str b): Bool -> {
+	if a.len != b.len then return false
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(a.len) then break
+		if Iarch(a[i]) != Iarch(b[i]) then return false
+		i = i + 1
+	}
+	return true
+}
+
+const has_name = ([Str] xs, Str s): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(xs.len) then break
+		if str_eq(xs[i], s) then return true
+		i = i + 1
+	}
+	return false
+}
+
+const no_strs = (): [Str] -> {
+	let [Str] e = []
+	return e
+}
+
+const no_exprs = (): [Expr] -> {
+	let [Expr] e = []
+	return e
+}
+
+const one_str = (Str s): [Str] -> {
+	let [Str] r = [s]
+	return r
+}
+
+const cat_s = ([Str] a, [Str] b): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(a.len) then break
+		r = [...r, a[i]]
+		i = i + 1
+	}
+	let Iarch j = 0
+	loop {
+		if j >= Iarch(b.len) then break
+		r = [...r, b[j]]
+		j = j + 1
+	}
+	return r
+}
+
+const union_names = ([Str] a, [Str] b): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(a.len) then break
+		r = [...r, a[i]]
+		i = i + 1
+	}
+	let Iarch j = 0
+	loop {
+		if j >= Iarch(b.len) then break
+		if !has_name(r, b[j]) then r = [...r, b[j]]
+		j = j + 1
+	}
+	return r
+}
+
+const field_values = ([FieldInit] fs): [Expr] -> {
+	let [Expr] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(fs.len) then break
+		r = [...r, fs[i].value]
+		i = i + 1
+	}
+	return r
+}
+
+const plist_names = ([Param] ps): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ps.len) then break
+		r = [...r, ps[i].name]
+		i = i + 1
+	}
+	return r
+}
+
+# ── per-function summaries ───────────────────────────────────────────────────────────────────
+
+# One callee's summary: per parameter, may the RETURN value alias it (`ret_al`) and is it
+# STORED beyond the callee's frame (`stores`). `all_esc` is ⊤ — every argument escapes — used
+# for asm bodies, indirect/unknown callees, and DFS back-edges (recursion/SCC). Out-of-range
+# bit reads default to TRUE (bit_at), so an arity surprise degrades to escape, never a miss.
+# The two GEOMETRY-CHANNEL bits drive the in-clause pin (the residue-carve tightening): a
+# value produced by an `in g` call lives in g's node, so leaking one must pin `g` —
+# `agg_ret` (the return is aggregate-typed: a scalar result carries no pointer into the
+# node) pins g positionally via evars; `rehomer` (the callee holds a writable `*T`/capture
+# param, or is ⊤ — value params are read-only, so these are the only rehome channels) pins g
+# unconditionally via the sweep. Both propagate through `in <param>` grafts by the ordinary
+# summary machinery.
+pub data FnSum = { Bool all_esc, [Bool] ret_al, [Bool] stores, Bool agg_ret, Bool rehomer }
+
+# A binding's comptime KIND, as much of the type as the routing walkers need — INTERNED:
+# every (shape, name) pair the walkers can ever ask about lives in a per-program pool built
+# once (ktab_build), and a kind everywhere else is a bare Iarch id into it, so the queries
+# inside the fixpoint compare words and read prebuilt arrays, allocating nothing. `shapes`
+# holds `$word` (a scalar — the ONLY exempt shape), `Str`, `$tuple`, `$rec`/`$uni`,
+# `$dyn`/`$ptr`, or `$agg` — the conservative unknown. `eids` is the entry's precomputed
+# EDGE: a `$dyn`/`$ptr` entry's element kind id, a `$rec` entry's index into
+# `prog.recs`. The trailing arrays are the
+# type-name map: `tn[i]` resolves to base kind `tid[i]`, and `[tn[i]]`/`*[tn[i]]` to the
+# interned `dtid[i]`/`ptid[i]`. Fixed ids: 0 `$word`, 1 `$agg`, 2 `Str`, 3 `$tuple`,
+# 4/5 `$dyn`/`$ptr` with an unknown element. POLARITY: anything not provably id 0 pins
+# like an aggregate — a name missing from the map reads as `$agg`, sound the same way.
+data KTab = { [Str] shapes, [Iarch] eids, [Str] tn, [Iarch] tid, [Iarch] dtid, [Iarch] ptid }
+
+# One type-environment entry: a binding name and its kind id.
+data KEnt = { Str name, Iarch kid }
+
+# The per-function type environment: every binding name (params, lets, for-vars, match
+# payload binds) mapped to its kind id. Names never shadow (typecheck rejects it), so one
+# flat map per function is sound. Built in one forward pass before the fixpoint, into a
+# single driver-owned scratch array sized up front (tenv_count) and REUSED across every
+# function — `ents` is a borrowed view of that scratch, only the first `n` entries belong
+# to this function, and the build writes one entry per binding instead of spread-copying
+# the growing map per binding.
+data TEnv = { [KEnt] ents, Iarch n }
+
+# The small per-function callee table the walkers consult: the DISTINCT callee names of one
+# body, resolved once against the whole-program tables (so the fixpoint rounds never re-run
+# the global name search) — plus the function's type environment, the program's own
+# declaration tables, and the interned kind pool, so a walker can judge a PROJECTION's
+# scalarity in place (the scalar-projection exemption: `s.len`, `p.v`, `xs[i]`-of-words
+# copy a WORD out, so they never pin their base).
+data Sums = { [Str] names, [FnSum] tbl, TEnv te, Program prog, KTab kt }
+
+const bit_at = ([Bool] bs, Iarch i): Bool -> if i >= Iarch(bs.len) then true else bs[i]
+
+const top_sum = (): FnSum -> {
+	let [Bool] ra = []
+	let [Bool] sto = []
+	return FnSum({ all_esc: true, ret_al: ra, stores: sto, agg_ret: true, rehomer: true })
+}
+
+const none_sum = (Iarch n): FnSum -> {
+	let [Bool] ra = []
+	let [Bool] sto = []
+	let Iarch i = 0
+	loop {
+		if i >= n then break
+		ra = [...ra, false]
+		sto = [...sto, false]
+		i = i + 1
+	}
+	return FnSum({ all_esc: false, ret_al: ra, stores: sto, agg_ret: false, rehomer: false })
+}
+
+# Result may alias argument 0; nothing is retained beyond the call. `Str(v[,n])` BORROWS a
+# byte buffer's backing; `fixed_buffer.of` wraps its buffer; a numeric cast is an identity on
+# the operand word (`Uarch(p)` IS the pointer). Extra arguments read as TRUE via bit_at —
+# for `Str(buf, n)` the length word "escaping" is harmless.
+const ret0_sum = (): FnSum -> {
+	let [Bool] ra = [true]
+	let [Bool] sto = [false]
+	return FnSum({ all_esc: false, ret_al: ra, stores: sto, agg_ret: true, rehomer: false })
+}
+
+# The builtin numeric cast names (typecheck's is_cast_type set).
+const is_cast_name = (Str n): Bool -> {
+	if str_eq(n, "Iarch") then return true
+	if str_eq(n, "Uarch") then return true
+	if str_eq(n, "Int") then return true
+	if str_eq(n, "Int8") then return true
+	if str_eq(n, "Int16") then return true
+	if str_eq(n, "Int32") then return true
+	if str_eq(n, "Int64") then return true
+	if str_eq(n, "Uint8") then return true
+	if str_eq(n, "Uint16") then return true
+	if str_eq(n, "Uint32") then return true
+	if str_eq(n, "Uint64") then return true
+	if str_eq(n, "Float32") then return true
+	if str_eq(n, "Float64") then return true
+	return false
+}
+
+const is_routing_intrinsic = (Str n): Bool -> {
+	if is_cast_name(n) then return true
+	if str_eq(n, "Str") then return true
+	if str_eq(n, "of__fb") then return true
+	if str_eq(n, "of__fx") then return true
+	if str_eq(n, "of__el") then return true
+	if str_eq(n, "std_mem_raw_addr") then return true
+	if str_eq(n, "std_mem_raw_load") then return true
+	if str_eq(n, "std_mem_raw_store") then return true
+	if str_eq(n, "std_mem_raw_place") then return true
+	if str_eq(n, "std_mem_raw_trap") then return true
+	if str_eq(n, "std_mem_raw_alloc") then return true
+	if str_eq(n, "std_mem_raw_grow") then return true
+	if str_eq(n, "std_mem_raw_size_of") then return true
+	return false
+}
+
+const intrinsic_sum = (Str n): FnSum -> {
+	if is_cast_name(n) || str_eq(n, "Str") || str_eq(n, "of__fb") then return ret0_sum()
+	# raw store/place — two arguments, nothing retained; `place`'s result points
+	# into raw memory the caller named by ADDRESS (a scalar word), which the alias tracking does
+	# not follow — sound today because raw ops are parser-gated to the std geometry modules,
+	# whose hooks are exempt from these analyses by contract (geometry_lowering §1). Stage 2 of
+	# the geometry-modules arc revisits this when hooks return node-resident values.
+	if str_eq(n, "std_mem_raw_store") || str_eq(n, "std_mem_raw_place") || str_eq(n, "std_mem_raw_alloc") || str_eq(n, "std_mem_raw_grow") then return none_sum(2)
+	# of__fx / of__el / one-arg raw ops — nothing retained
+	return none_sum(1)
+}
+
+# The asm floor whitelist: `syscall6` hands pointers to the KERNEL for the duration of the
+# call only (read fills, write copies, open reads the path — nothing is retained after
+# return), and `exit` never returns. Every other asm body is opaque ⇒ ⊤.
+const asm_sum = (Func f): FnSum -> {
+	if str_eq(f.name, "syscall6") || str_eq(f.name, "exit") then return none_sum(Iarch(f.params.len))
+	return top_sum()
+}
+
+const lookup_sum = (Sums sm, Str n): FnSum -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(sm.names.len) then break
+		if str_eq(sm.names[i], n) then return sm.tbl[i]
+		i = i + 1
+	}
+	return top_sum()
+}
+
+# The in-clause pin, positional side: an `in g` call whose callee returns an AGGREGATE may
+# hand out a pointer into g's node — wherever that result escapes to, `g` escapes with it.
+const geom_ret_pin = (Sums sm, Str callee, Str geom): [Str] -> {
+	if str_eq(geom, "") then return no_strs()
+	if lookup_sum(sm, callee).agg_ret then return one_str(geom)
+	return no_strs()
+}
+
+# The in-clause pin, unconditional side: a REHOMING callee (writable pointer / capture
+# params, or ⊤) can store its in-g allocations into memory that outlives the call — the
+# node must be pinned wherever the call sits.
+const geom_sweep_pin = (Sums sm, Str callee, Str geom): [Str] -> {
+	if str_eq(geom, "") then return no_strs()
+	if lookup_sum(sm, callee).rehomer then return one_str(geom)
+	return no_strs()
+}
+
+# The arguments whose values may ride OUT through the call's return value.
+const ret_args = (Sums sm, Str callee, [Expr] args): [Expr] -> {
+	const FnSum s = lookup_sum(sm, callee)
+	if s.all_esc then return args
+	let [Expr] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(args.len) then break
+		if bit_at(s.ret_al, i) then r = [...r, args[i]]
+		i = i + 1
+	}
+	return r
+}
+
+# The arguments the callee stores beyond its own frame — escaping wherever the call sits.
+const sto_args = (Sums sm, Str callee, [Expr] args): [Expr] -> {
+	const FnSum s = lookup_sum(sm, callee)
+	if s.all_esc then return args
+	let [Expr] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(args.len) then break
+		if bit_at(s.stores, i) then r = [...r, args[i]]
+		i = i + 1
+	}
+	return r
+}
+
+# ── walk-time kind lookups (the scalar-projection exemption) ─────────────────────────────────
+
+const name_kind = (Sums sm, Str n): Iarch -> tenv_kind(sm.te.ents, sm.te.n, n)
+const name_scalar = (Sums sm, Str n): Bool -> kind_scalar(name_kind(sm, n))
+const expr_kind = (Sums sm, Expr e): Iarch -> expr_kind_c(sm.prog, sm.kt, sm.te.ents, sm.te.n, e)
+
+# The binds of one arm that can actually ALIAS payload storage: named (not `_`) and
+# non-scalar — a word payload is copied out, so its bind pins nothing.
+const agg_binds = (Sums sm, [Str] binds): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(binds.len) then break
+		if !str_eq(binds[i], "_") && !name_scalar(sm, binds[i]) then r = [...r, binds[i]]
+		i = i + 1
+	}
+	return r
+}
+
+const marms_agg_bind = (Sums sm, [MatchArm] arms): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		if Iarch(agg_binds(sm, arms[i].binds).len) > 0 then return true
+		i = i + 1
+	}
+	return false
+}
+
+const sarm_agg_binds = (Sums sm, [StmtArm] arms): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		r = cat_s(r, agg_binds(sm, arms[i].binds))
+		i = i + 1
+	}
+	return r
+}
+
+# ── evars: the names that escape when `e` sits in an ESCAPING position ───────────────────────
+# EXHAUSTIVE over Expr, no wildcard — a new variant fails the build until audited.
+
+const evars_list = (Sums sm, [Expr] es): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(es.len) then break
+		r = cat_s(r, evars(sm, es[i]))
+		i = i + 1
+	}
+	return r
+}
+
+const evars_marms = (Sums sm, [MatchArm] arms): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		r = cat_s(r, evars(sm, arms[i].body))
+		i = i + 1
+	}
+	return r
+}
+
+const evars = (Sums sm, Expr e): [Str] -> match e {
+	Expr.Lit(_) -> no_strs(),
+	Expr.BoolLit(_) -> no_strs(),
+	Expr.Var(n) -> one_str(n),
+	Expr.StrLit(_) -> no_strs(),
+	Expr.FloatLit(_) -> no_strs(),
+	Expr.Record(_, inits) -> evars_list(sm, field_values(inits)),
+	# an escaping AGGREGATE projection pins its BASE (the read interior lives inside the
+	# base's block) — but a SCALAR projection (`s.len`, `p.v`, a word element) copies a WORD
+	# out, so no pointer into the base survives and nothing is pinned (the p2/p16 exemption)
+	Expr.Field(b, f) -> if kind_scalar(field_kind(sm.prog, sm.kt, name_kind(sm, b), f)) then no_strs() else one_str(b),
+	Expr.FieldExpr(be, f) -> if kind_scalar(field_kind(sm.prog, sm.kt, expr_kind(sm, be), f)) then no_strs() else evars(sm, be),
+	Expr.UnionMk(_, _, args) -> evars_list(sm, args),
+	# the arm value escapes; a payload bind may alias the scrutinee — but only an AGGREGATE
+	# payload bind can (a word payload is copied), so a match binding only words pins nothing
+	Expr.Match(s, arms) -> cat_s(if marms_agg_bind(sm, arms) then evars(sm, s) else no_strs(), evars_marms(sm, arms)),
+	# BOTH the spread source (its element pointers are copied into the new spine) and the elements
+	Expr.ArrayLit(_, sp, elems, _) -> cat_s(evars(sm, sp), evars_list(sm, elems)),
+	Expr.Index(b, _) -> if kind_scalar(elem_kind(sm.kt, name_kind(sm, b))) then no_strs() else one_str(b),
+	Expr.IndexField(b, _, f) -> if kind_scalar(field_kind(sm.prog, sm.kt, elem_kind(sm.kt, name_kind(sm, b)), f)) then no_strs() else one_str(b),
+	Expr.IndexExpr(be, _) -> if kind_scalar(elem_kind(sm.kt, expr_kind(sm, be))) then no_strs() else evars(sm, be),
+	# a hole's bytes are COPIED into the string (cf_str_append) — no aliasing, no escape
+	Expr.Interp(_) -> no_strs(),
+	Expr.Tuple(elems) -> evars_list(sm, elems),
+	Expr.Spread(x) -> evars(sm, x),
+	Expr.Unit -> no_strs(),
+	Expr.Loop(ss) -> yvars(sm, ss),
+	Expr.Buffer(_) -> no_strs(),
+	Expr.Addr(n) -> one_str(n),
+	Expr.Neg(_) -> no_strs(),
+	Expr.Not(_) -> no_strs(),
+	Expr.BitNot(_) -> no_strs(),
+	Expr.Add(_, _) -> no_strs(),
+	Expr.Sub(_, _) -> no_strs(),
+	Expr.Mul(_, _) -> no_strs(),
+	Expr.Div(_, _) -> no_strs(),
+	Expr.Mod(_, _) -> no_strs(),
+	Expr.BitAnd(_, _) -> no_strs(),
+	Expr.BitOr(_, _) -> no_strs(),
+	Expr.BitXor(_, _) -> no_strs(),
+	Expr.Shl(_, _) -> no_strs(),
+	Expr.Shr(_, _) -> no_strs(),
+	Expr.CmpEq(_, _) -> no_strs(),
+	Expr.CmpNe(_, _) -> no_strs(),
+	Expr.CmpLt(_, _) -> no_strs(),
+	Expr.CmpGt(_, _) -> no_strs(),
+	Expr.CmpLe(_, _) -> no_strs(),
+	Expr.CmpGe(_, _) -> no_strs(),
+	Expr.And(_, _) -> no_strs(),
+	Expr.Or(_, _) -> no_strs(),
+	Expr.If(_, t, el) -> cat_s(evars(sm, t), evars(sm, el)),
+	# only the arguments the callee's summary says may ride out through the RETURN value —
+	# a `stores` argument escapes via the position-independent sweep instead — plus the
+	# in-clause geometry when the (aggregate) result may point into its node
+	Expr.Call(n, _, args, g) -> cat_s(geom_ret_pin(sm, n, g), evars_list(sm, ret_args(sm, n, args))),
+	# lowered away by hoist_defertap; maximally conservative if ever seen
+	Expr.DeferTap(_, args) -> evars_list(sm, args)
+}
+
+# `<- v` yields of a value block, recursing into nested if/block/match (NOT a nested loop —
+# it opens its own value context), mirroring alloc.cf's yield_vars.
+const yvars_stmt = (Sums sm, Stmt s): [Str] -> match s {
+	Stmt.Yield(e) -> evars(sm, e),
+	Stmt.IfThen(_, b) -> yvars_stmt(sm, b),
+	Stmt.IfElse(_, t, el) -> cat_s(yvars_stmt(sm, t), yvars_stmt(sm, el)),
+	Stmt.Block(ss) -> yvars(sm, ss),
+	Stmt.Match(_, arms) -> yvars_sarms(sm, arms),
+	_ -> no_strs()
+}
+
+const yvars_sarms = (Sums sm, [StmtArm] arms): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		r = cat_s(r, yvars(sm, arms[i].body))
+		i = i + 1
+	}
+	return r
+}
+
+const yvars = (Sums sm, [Stmt] ss): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		r = cat_s(r, yvars_stmt(sm, ss[i]))
+		i = i + 1
+	}
+	return r
+}
+
+# ── generic descent helpers ──────────────────────────────────────────────────────────────────
+
+# The immediate expression children (generic recursion for the sweeps / value-block walk).
+pub const kids! = (Expr e): [Expr] -> match e {
+	Expr.Record(_, inits) -> field_values(inits),
+	Expr.ArrayLit(_, sp, elems, _) -> spread_kids(sp, elems),
+	Expr.Tuple(elems) -> elems,
+	Expr.UnionMk(_, _, args) -> args,
+	Expr.Interp(segs) -> hole_exprs(segs),
+	Expr.Buffer(sz) -> one_expr(sz),
+	Expr.Match(s, arms) -> marm_exprs(s, arms),
+	Expr.If(c, t, el) -> three_exprs!(c, t, el),
+	Expr.Call(_, _, args, _) -> args,
+	Expr.DeferTap(_, args) -> args,
+	Expr.Field(_, _) -> no_exprs(),
+	Expr.FieldExpr(b, _) -> one_expr(b),
+	Expr.Index(_, i) -> one_expr(i),
+	Expr.IndexField(_, i, _) -> one_expr(i),
+	Expr.IndexExpr(b, i) -> two_exprs!(b, i),
+	Expr.Spread(x) -> one_expr(x),
+	Expr.Neg(x) -> one_expr(x),
+	Expr.Not(x) -> one_expr(x),
+	Expr.BitNot(x) -> one_expr(x),
+	Expr.Add(a, b) -> two_exprs!(a, b),
+	Expr.Sub(a, b) -> two_exprs!(a, b),
+	Expr.Mul(a, b) -> two_exprs!(a, b),
+	Expr.Div(a, b) -> two_exprs!(a, b),
+	Expr.Mod(a, b) -> two_exprs!(a, b),
+	Expr.BitAnd(a, b) -> two_exprs!(a, b),
+	Expr.BitOr(a, b) -> two_exprs!(a, b),
+	Expr.BitXor(a, b) -> two_exprs!(a, b),
+	Expr.Shl(a, b) -> two_exprs!(a, b),
+	Expr.Shr(a, b) -> two_exprs!(a, b),
+	Expr.CmpEq(a, b) -> two_exprs!(a, b),
+	Expr.CmpNe(a, b) -> two_exprs!(a, b),
+	Expr.CmpLt(a, b) -> two_exprs!(a, b),
+	Expr.CmpGt(a, b) -> two_exprs!(a, b),
+	Expr.CmpLe(a, b) -> two_exprs!(a, b),
+	Expr.CmpGe(a, b) -> two_exprs!(a, b),
+	Expr.And(a, b) -> two_exprs!(a, b),
+	Expr.Or(a, b) -> two_exprs!(a, b),
+	_ -> no_exprs()
+}
+
+const one_expr = (Expr a): [Expr] -> {
+	let [Expr] r = [a]
+	return r
+}
+
+const spread_kids = (Expr sp, [Expr] elems): [Expr] -> {
+	let [Expr] r = [sp]
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(elems.len) then break
+		r = [...r, elems[i]]
+		i = i + 1
+	}
+	return r
+}
+
+const two_exprs! = (Expr a, Expr b): [Expr] -> {
+	let [Expr] r = [a]
+	return [...r, b]
+}
+
+const three_exprs! = (Expr a, Expr b, Expr c): [Expr] -> {
+	let [Expr] r = [a]
+	r = [...r, b]
+	return [...r, c]
+}
+
+const hole_exprs = ([Seg] segs): [Expr] -> {
+	let [Expr] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(segs.len) then break
+		if segs[i].is_hole then r = [...r, segs[i].expr]
+		i = i + 1
+	}
+	return r
+}
+
+const marm_exprs = (Expr s, [MatchArm] arms): [Expr] -> {
+	let [Expr] r = [s]
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		r = [...r, arms[i].body]
+		i = i + 1
+	}
+	return r
+}
+
+# The expressions a statement holds directly.
+pub const stmt_exprs! = (Stmt s): [Expr] -> match s {
+	Stmt.Return(e) -> one_expr(e),
+	Stmt.Yield(e) -> one_expr(e),
+	Stmt.Let(_, _, _, init) -> one_expr(init),
+	Stmt.Assign(_, val) -> one_expr(val),
+	Stmt.FieldAssign(_, _, val) -> one_expr(val),
+	Stmt.DeepFieldAssign(be, _, val) -> two_exprs!(be, val),
+	Stmt.IndexAssign(_, idx, val) -> two_exprs!(idx, val),
+	Stmt.Do(e) -> one_expr(e),
+	Stmt.IfThen(c, _) -> one_expr(c),
+	Stmt.IfElse(c, _, _) -> one_expr(c),
+	Stmt.Match(sc, _) -> one_expr(sc),
+	Stmt.Destructure(_, _, e) -> one_expr(e),
+	_ -> no_exprs()
+}
+
+# ── the store sweep ──────────────────────────────────────────────────────────────────────────
+# Arguments the callee STORES beyond its own frame escape wherever the call sits — position-
+# independent, so collected once per function, outside the fixpoint. A DeferTap (never present
+# post-lift) stays maximally conservative.
+
+const sweep_expr! = (Sums sm, Expr e): [Str] -> {
+	let [Str] r = match e {
+		Expr.Call(n, _, args, g) -> cat_s(geom_sweep_pin(sm, n, g), evars_list(sm, sto_args(sm, n, args))),
+		Expr.DeferTap(_, args) -> evars_list(sm, args),
+		Expr.Loop(ss) -> sweep_body!(sm, ss),
+		_ -> no_strs()
+	}
+	const [Expr] ks = kids!(e)
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ks.len) then break
+		r = cat_s(r, sweep_expr!(sm, ks[i]))
+		i = i + 1
+	}
+	return r
+}
+
+const sweep_stmt! = (Sums sm, Stmt s): [Str] -> {
+	let [Str] r = []
+	const [Expr] es = stmt_exprs!(s)
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(es.len) then break
+		r = cat_s(r, sweep_expr!(sm, es[i]))
+		i = i + 1
+	}
+	r = match s {
+		Stmt.IfThen(_, b) -> cat_s(r, sweep_stmt!(sm, b)),
+		Stmt.IfElse(_, t, el) -> cat_s(r, cat_s(sweep_stmt!(sm, t), sweep_stmt!(sm, el))),
+		Stmt.Block(ss) -> cat_s(r, sweep_body!(sm, ss)),
+		Stmt.Loop(ss) -> cat_s(r, sweep_body!(sm, ss)),
+		Stmt.ForIn(_, _, ss) -> cat_s(r, sweep_body!(sm, ss)),
+		Stmt.Match(_, arms) -> cat_s(r, sweep_sarms!(sm, arms)),
+		Stmt.Defer(ss) -> cat_s(r, sweep_body!(sm, ss)),
+		Stmt.Closure(_, _, _, cb) -> cat_s(r, sweep_body!(sm, cb)),
+		_ -> r
+	}
+	return r
+}
+
+const sweep_sarms! = (Sums sm, [StmtArm] arms): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		r = cat_s(r, sweep_body!(sm, arms[i].body))
+		i = i + 1
+	}
+	return r
+}
+
+const sweep_body! = (Sums sm, [Stmt] ss): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		r = cat_s(r, sweep_stmt!(sm, ss[i]))
+		i = i + 1
+	}
+	return r
+}
+
+# ── the callee-name walk (for the bottom-up DFS + the per-function table) ────────────────────
+
+const calls_expr! = (Expr e): [Str] -> {
+	let [Str] r = match e {
+		Expr.Call(n, _, _, _) -> one_str(n),
+		Expr.Loop(ss) -> calls_body!(ss),
+		_ -> no_strs()
+	}
+	const [Expr] ks = kids!(e)
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ks.len) then break
+		r = cat_s(r, calls_expr!(ks[i]))
+		i = i + 1
+	}
+	return r
+}
+
+const calls_stmt! = (Stmt s): [Str] -> {
+	let [Str] r = []
+	const [Expr] es = stmt_exprs!(s)
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(es.len) then break
+		r = cat_s(r, calls_expr!(es[i]))
+		i = i + 1
+	}
+	r = match s {
+		Stmt.IfThen(_, b) -> cat_s(r, calls_stmt!(b)),
+		Stmt.IfElse(_, t, el) -> cat_s(r, cat_s(calls_stmt!(t), calls_stmt!(el))),
+		Stmt.Block(ss) -> cat_s(r, calls_body!(ss)),
+		Stmt.Loop(ss) -> cat_s(r, calls_body!(ss)),
+		Stmt.ForIn(_, _, ss) -> cat_s(r, calls_body!(ss)),
+		Stmt.Match(_, arms) -> cat_s(r, calls_sarms!(arms)),
+		Stmt.Defer(ss) -> cat_s(r, calls_body!(ss)),
+		Stmt.Closure(_, _, _, cb) -> cat_s(r, calls_body!(cb)),
+		_ -> r
+	}
+	return r
+}
+
+const calls_sarms! = ([StmtArm] arms): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		r = cat_s(r, calls_body!(arms[i].body))
+		i = i + 1
+	}
+	return r
+}
+
+const calls_body! = ([Stmt] ss): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		r = cat_s(r, calls_stmt!(ss[i]))
+		i = i + 1
+	}
+	return r
+}
+
+# ── forward aliases ──────────────────────────────────────────────────────────────────────────
+# The root names a binding READS from: binding a projection/alias of a store target makes the
+# new name a store target too (`const q = gg.inner; q.p = v` rehomes `v` through `q`). A call
+# result aliases the arguments the callee's summary says the return may alias.
+
+const aroots = (Sums sm, Expr e): [Str] -> match e {
+	Expr.Var(n) -> one_str(n),
+	Expr.Field(b, f) -> if kind_scalar(field_kind(sm.prog, sm.kt, name_kind(sm, b), f)) then no_strs() else one_str(b),
+	Expr.FieldExpr(be, f) -> if kind_scalar(field_kind(sm.prog, sm.kt, expr_kind(sm, be), f)) then no_strs() else aroots(sm, be),
+	Expr.Index(b, _) -> if kind_scalar(elem_kind(sm.kt, name_kind(sm, b))) then no_strs() else one_str(b),
+	Expr.IndexField(b, _, f) -> if kind_scalar(field_kind(sm.prog, sm.kt, elem_kind(sm.kt, name_kind(sm, b)), f)) then no_strs() else one_str(b),
+	Expr.IndexExpr(be, _) -> if kind_scalar(elem_kind(sm.kt, expr_kind(sm, be))) then no_strs() else aroots(sm, be),
+	Expr.Spread(x) -> aroots(sm, x),
+	Expr.If(_, t, el) -> cat_s(aroots(sm, t), aroots(sm, el)),
+	Expr.Match(_, arms) -> aroots_marms(sm, arms),
+	Expr.Loop(ss) -> yvars(sm, ss),
+	Expr.Call(n, _, args, g) -> cat_s(geom_ret_pin(sm, n, g), aroots_list(sm, ret_args(sm, n, args))),
+	_ -> no_strs()
+}
+
+const aroots_list = (Sums sm, [Expr] es): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(es.len) then break
+		r = cat_s(r, aroots(sm, es[i]))
+		i = i + 1
+	}
+	return r
+}
+
+const aroots_marms = (Sums sm, [MatchArm] arms): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		r = cat_s(r, aroots(sm, arms[i].body))
+		i = i + 1
+	}
+	return r
+}
+
+# ── the per-function fixpoint ────────────────────────────────────────────────────────────────
+
+# The three grown sets: `rset` — names whose values may ride out through the RETURN value;
+# `sset` — names whose values are STORED beyond the frame; `fwd` — forward aliases of store
+# targets. esc = rset ∪ sset. A store target is a parameter, a stored-beyond name, or a
+# forward alias; a store into a plain rset name keeps the stored value return-conditional.
+pub data RSets = { [Str] rset, [Str] sset, [Str] fwd }
+
+data RCtx = { Sums sm, [Str] params, [Str] rset, [Str] sset, [Str] fwd }
+
+const is_target = (RCtx cx, Str n): Bool -> has_name(cx.params, n) || has_name(cx.rset, n) || has_name(cx.sset, n) || has_name(cx.fwd, n)
+
+const s_target = (RCtx cx, Str n): Bool -> has_name(cx.params, n) || has_name(cx.sset, n) || has_name(cx.fwd, n)
+
+const any_target = (RCtx cx, [Str] ns): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ns.len) then break
+		if is_target(cx, ns[i]) then return true
+		i = i + 1
+	}
+	return false
+}
+
+const any_in = ([Str] set, [Str] ns): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ns.len) then break
+		if has_name(set, ns[i]) then return true
+		i = i + 1
+	}
+	return false
+}
+
+const deep_root = (Expr e): Str -> match e {
+	Expr.Var(n) -> n,
+	Expr.Field(b, _) -> b,
+	Expr.FieldExpr(b, _) -> deep_root(b),
+	Expr.Index(b, _) -> b,
+	Expr.IndexField(b, _, _) -> b,
+	Expr.IndexExpr(b, _) -> deep_root(b),
+	_ -> ""
+}
+
+const sarm_binds = ([StmtArm] arms): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		r = cat_s(r, arms[i].binds)
+		i = i + 1
+	}
+	return r
+}
+
+# Return-reachable roots of one statement (position-sensitive).
+const rroots_stmt! = (RCtx cx, Stmt s): [Str] -> match s {
+	Stmt.Return(e) -> evars(cx.sm, e),
+	Stmt.Yield(e) -> evars(cx.sm, e),
+	Stmt.Assign(n, val) -> if has_name(cx.rset, n) then evars(cx.sm, val) else no_strs(),
+	Stmt.FieldAssign(b, _, val) -> if has_name(cx.rset, b) then evars(cx.sm, val) else no_strs(),
+	Stmt.IndexAssign(b, _, val) -> if has_name(cx.rset, b) then evars(cx.sm, val) else no_strs(),
+	Stmt.DeepFieldAssign(be, _, val) -> if has_name(cx.rset, deep_root(be)) then evars(cx.sm, val) else no_strs(),
+	Stmt.Let(n, _, _, init) -> if has_name(cx.rset, n) then evars(cx.sm, init) else no_strs(),
+	# a bind escaping pins the destructured source
+	Stmt.Destructure(binds, _, e) -> if any_in(cx.rset, binds) then evars(cx.sm, e) else no_strs(),
+	# the loop variable escaping pins the array (the element lives in the array's block)
+	Stmt.ForIn(v, arr, ss) -> if has_name(cx.rset, v) && !name_scalar(cx.sm, v) then cat_s(one_str(arr), rroots_body!(cx, ss)) else rroots_body!(cx, ss),
+	# an AGGREGATE payload bind escaping pins the scrutinee (a word bind copies)
+	Stmt.Match(sc, arms) -> if any_in(cx.rset, sarm_agg_binds(cx.sm, arms)) then cat_s(evars(cx.sm, sc), rroots_sarms!(cx, arms)) else rroots_sarms!(cx, arms),
+	Stmt.IfThen(_, b) -> rroots_stmt!(cx, b),
+	Stmt.IfElse(_, t, el) -> cat_s(rroots_stmt!(cx, t), rroots_stmt!(cx, el)),
+	Stmt.Block(ss) -> rroots_body!(cx, ss),
+	Stmt.Loop(ss) -> rroots_body!(cx, ss),
+	Stmt.Defer(ss) -> rroots_body!(cx, ss),
+	Stmt.Closure(_, _, _, cb) -> rroots_body!(cx, cb),
+	Stmt.Do(_) -> no_strs(),
+	Stmt.Break -> no_strs(),
+	Stmt.Continue -> no_strs()
+}
+
+const rroots_sarms! = (RCtx cx, [StmtArm] arms): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		r = cat_s(r, rroots_body!(cx, arms[i].body))
+		i = i + 1
+	}
+	return r
+}
+
+const rvb_expr! = (RCtx cx, Expr e): [Str] -> {
+	let [Str] r = match e {
+		Expr.Loop(ss) -> rroots_body!(cx, ss),
+		_ -> no_strs()
+	}
+	const [Expr] ks = kids!(e)
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ks.len) then break
+		r = cat_s(r, rvb_expr!(cx, ks[i]))
+		i = i + 1
+	}
+	return r
+}
+
+const rroots_body! = (RCtx cx, [Stmt] ss): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		r = cat_s(r, rroots_stmt!(cx, ss[i]))
+		const [Expr] es = stmt_exprs!(ss[i])
+		let Iarch j = 0
+		loop {
+			if j >= Iarch(es.len) then break
+			r = cat_s(r, rvb_expr!(cx, es[j]))
+			j = j + 1
+		}
+		i = i + 1
+	}
+	return r
+}
+
+# Stored-beyond-the-frame roots of one statement (position-sensitive).
+const sroots_stmt! = (RCtx cx, Stmt s): [Str] -> match s {
+	Stmt.Return(_) -> no_strs(),
+	Stmt.Yield(_) -> no_strs(),
+	Stmt.Assign(n, val) -> if s_target(cx, n) then evars(cx.sm, val) else no_strs(),
+	Stmt.FieldAssign(b, _, val) -> if s_target(cx, b) then evars(cx.sm, val) else no_strs(),
+	Stmt.IndexAssign(b, _, val) -> if s_target(cx, b) then evars(cx.sm, val) else no_strs(),
+	Stmt.DeepFieldAssign(be, _, val) -> if s_target(cx, deep_root(be)) then evars(cx.sm, val) else no_strs(),
+	Stmt.Let(n, _, _, init) -> if has_name(cx.sset, n) then evars(cx.sm, init) else no_strs(),
+	Stmt.Destructure(binds, _, e) -> if any_in(cx.sset, binds) then evars(cx.sm, e) else no_strs(),
+	Stmt.ForIn(v, arr, ss) -> if has_name(cx.sset, v) && !name_scalar(cx.sm, v) then cat_s(one_str(arr), sroots_body!(cx, ss)) else sroots_body!(cx, ss),
+	Stmt.Match(sc, arms) -> if any_in(cx.sset, sarm_agg_binds(cx.sm, arms)) then cat_s(evars(cx.sm, sc), sroots_sarms!(cx, arms)) else sroots_sarms!(cx, arms),
+	Stmt.IfThen(_, b) -> sroots_stmt!(cx, b),
+	Stmt.IfElse(_, t, el) -> cat_s(sroots_stmt!(cx, t), sroots_stmt!(cx, el)),
+	Stmt.Block(ss) -> sroots_body!(cx, ss),
+	Stmt.Loop(ss) -> sroots_body!(cx, ss),
+	Stmt.Defer(ss) -> sroots_body!(cx, ss),
+	Stmt.Closure(_, _, _, cb) -> sroots_body!(cx, cb),
+	Stmt.Do(_) -> no_strs(),
+	Stmt.Break -> no_strs(),
+	Stmt.Continue -> no_strs()
+}
+
+const sroots_sarms! = (RCtx cx, [StmtArm] arms): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		r = cat_s(r, sroots_body!(cx, arms[i].body))
+		i = i + 1
+	}
+	return r
+}
+
+const svb_expr! = (RCtx cx, Expr e): [Str] -> {
+	let [Str] r = match e {
+		Expr.Loop(ss) -> sroots_body!(cx, ss),
+		_ -> no_strs()
+	}
+	const [Expr] ks = kids!(e)
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ks.len) then break
+		r = cat_s(r, svb_expr!(cx, ks[i]))
+		i = i + 1
+	}
+	return r
+}
+
+const sroots_body! = (RCtx cx, [Stmt] ss): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		r = cat_s(r, sroots_stmt!(cx, ss[i]))
+		const [Expr] es = stmt_exprs!(ss[i])
+		let Iarch j = 0
+		loop {
+			if j >= Iarch(es.len) then break
+			r = cat_s(r, svb_expr!(cx, es[j]))
+			j = j + 1
+		}
+		i = i + 1
+	}
+	return r
+}
+
+# Forward-alias growth of one statement: names bound from a target join the target set.
+const fwd_stmt! = (RCtx cx, Stmt s): [Str] -> match s {
+	Stmt.Let(n, _, _, init) -> if any_target(cx, aroots(cx.sm, init)) then one_str(n) else no_strs(),
+	Stmt.Destructure(binds, _, e) -> if any_target(cx, aroots(cx.sm, e)) then binds else no_strs(),
+	Stmt.ForIn(v, arr, ss) -> if is_target(cx, arr) && !name_scalar(cx.sm, v) then cat_s(one_str(v), fwd_body!(cx, ss)) else fwd_body!(cx, ss),
+	Stmt.Match(sc, arms) -> if any_target(cx, aroots(cx.sm, sc)) then cat_s(sarm_agg_binds(cx.sm, arms), fwd_sarms!(cx, arms)) else fwd_sarms!(cx, arms),
+	Stmt.IfThen(_, b) -> fwd_stmt!(cx, b),
+	Stmt.IfElse(_, t, el) -> cat_s(fwd_stmt!(cx, t), fwd_stmt!(cx, el)),
+	Stmt.Block(ss) -> fwd_body!(cx, ss),
+	Stmt.Loop(ss) -> fwd_body!(cx, ss),
+	Stmt.Defer(ss) -> fwd_body!(cx, ss),
+	Stmt.Closure(_, _, _, cb) -> fwd_body!(cx, cb),
+	_ -> no_strs()
+}
+
+const fwd_sarms! = (RCtx cx, [StmtArm] arms): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		r = cat_s(r, fwd_body!(cx, arms[i].body))
+		i = i + 1
+	}
+	return r
+}
+
+const fvb_expr! = (RCtx cx, Expr e): [Str] -> {
+	let [Str] r = match e {
+		Expr.Loop(ss) -> fwd_body!(cx, ss),
+		_ -> no_strs()
+	}
+	const [Expr] ks = kids!(e)
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ks.len) then break
+		r = cat_s(r, fvb_expr!(cx, ks[i]))
+		i = i + 1
+	}
+	return r
+}
+
+const fwd_body! = (RCtx cx, [Stmt] ss): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		r = cat_s(r, fwd_stmt!(cx, ss[i]))
+		const [Expr] es = stmt_exprs!(ss[i])
+		let Iarch j = 0
+		loop {
+			if j >= Iarch(es.len) then break
+			r = cat_s(r, fvb_expr!(cx, es[j]))
+			j = j + 1
+		}
+		i = i + 1
+	}
+	return r
+}
+
+# Compute a function's shadow sets to a joint fixpoint. The store sweep is position-
+# independent, so it seeds `sset` once; the root and alias passes iterate.
+const shadow_sets! = (Sums sm, [Str] params, [Stmt] body): RSets -> {
+	let [Str] sset = sweep_body!(sm, body)
+	let [Str] rset = []
+	let [Str] fwd = []
+	loop {
+		const RCtx cx = RCtx({ sm: sm, params: params, rset: rset, sset: sset, fwd: fwd })
+		const [Str] radd = rroots_body!(cx, body)
+		const [Str] sadd = sroots_body!(cx, body)
+		const [Str] fadd = fwd_body!(cx, body)
+		const [Str] r2 = union_names(rset, radd)
+		const [Str] s2 = union_names(sset, sadd)
+		const [Str] f2 = union_names(fwd, fadd)
+		if Iarch(r2.len) == Iarch(rset.len) && Iarch(s2.len) == Iarch(sset.len) && Iarch(f2.len) == Iarch(fwd.len) then break
+		rset = r2
+		sset = s2
+		fwd = f2
+	}
+	return RSets({ rset: rset, sset: sset, fwd: fwd })
+}
+
+# ── the bottom-up summary computation ────────────────────────────────────────────────────────
+
+const find_fn = ([Func] funcs, Str name): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(funcs.len) then break
+		if str_eq(funcs[i].name, name) then return i
+		i = i + 1
+	}
+	return -1
+}
+
+# ── the kind table (the scalar-projection exemption's type knowledge) ────────────────────────
+
+const kind_scalar = (Iarch k): Bool -> k == 0
+
+const union_boxed_r = (Program prog, Str u): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(prog.unions.len) then break
+		if str_eq(prog.unions[i].name, u) then {
+			let Iarch j = 0
+			loop {
+				if j >= Iarch(prog.unions[i].members.len) then break
+				if Iarch(prog.unions[i].members[j].payloads.len) > 0 then return true
+				j = j + 1
+			}
+			return false
+		}
+		i = i + 1
+	}
+	return false
+}
+
+# Append one pool entry (the arrays escape into the returned table).
+const ktab_ent = (KTab t, Str shape, Iarch eid): KTab -> {
+	const [Str] sh = [...t.shapes, shape]
+	const [Iarch] ei = [...t.eids, eid]
+	return KTab({ shapes: sh, eids: ei, tn: t.tn, tid: t.tid, dtid: t.dtid, ptid: t.ptid })
+}
+
+# One type-name map row: `name` resolves to base kind `b`, with `[name]` and `*[name]`
+# interned beside it (their precomputed element kind is `b`).
+const ktab_row = (KTab t0, Str name, Iarch b): KTab -> {
+	const Iarch di = Iarch(t0.shapes.len)
+	const KTab t = ktab_ent(ktab_ent(t0, "$dyn", b), "$ptr", b)
+	const [Str] tn2 = [...t.tn, name]
+	const [Iarch] ti = [...t.tid, b]
+	const [Iarch] dt = [...t.dtid, di]
+	const [Iarch] pt = [...t.ptid, di + 1]
+	return KTab({ shapes: t.shapes, eids: t.eids, tn: tn2, tid: ti, dtid: dt, ptid: pt })
+}
+
+# A named base kind (`$rec`/`$uni`) interned ahead of its row; `aux` rides in `eids` (a
+# record's index into `prog.recs`, so field queries need no name search).
+const ktab_type = (KTab t, Str shape, Str name, Iarch aux): KTab -> {
+	const Iarch b = Iarch(t.shapes.len)
+	return ktab_row(ktab_ent(t, shape, aux), name, b)
+}
+
+# The scalar type names seeded into the map, so `[Uint8]`-style element kinds resolve.
+const ktab_scalars = (): [Str] -> ["Iarch", "Int", "Uarch", "Bool", "Unit", "Float32", "Float64", "Int8", "Int16", "Int32", "Int64", "Uint8", "Uint16", "Uint32", "Uint64"]
+
+# Built once per program before the DFS: the six fixed entries, a row per scalar name and
+# `Str`, then a row per record and union (a boxed union is `$uni`, an unboxed one a word).
+const ktab_build = (Program prog): KTab -> {
+	const [Str] sh0 = ["$word", "$agg", "Str", "$tuple", "$dyn", "$ptr"]
+	const [Iarch] ei0 = [-1, -1, -1, -1, 1, 1]
+	const [Str] tn0 = []
+	const [Iarch] ti0 = []
+	const [Iarch] dt0 = []
+	const [Iarch] pt0 = []
+	let KTab t = KTab({ shapes: sh0, eids: ei0, tn: tn0, tid: ti0, dtid: dt0, ptid: pt0 })
+	const [Str] sc = ktab_scalars()
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(sc.len) then break
+		t = ktab_row(t, sc[i], 0)
+		i = i + 1
+	}
+	t = ktab_row(t, "Str", 2)
+	let Iarch r = 0
+	loop {
+		if r >= Iarch(prog.recs.len) then break
+		t = ktab_type(t, "$rec", prog.recs[r].name, r)
+		r = r + 1
+	}
+	let Iarch u = 0
+	loop {
+		if u >= Iarch(prog.unions.len) then break
+		if union_boxed_r(prog, prog.unions[u].name) then {
+			t = ktab_type(t, "$uni", prog.unions[u].name, -1)
+		} else {
+			t = ktab_row(t, prog.unions[u].name, 0)
+		}
+		u = u + 1
+	}
+	return t
+}
+
+# A bare TYPE NAME's kind id (an annotation, a record field's ftype, a callee's ret_name).
+const kt_tid = (KTab t, Str name): Iarch -> {
+	if is_scalar_ret(name) then return 0
+	if str_eq(name, "Str") then return 2
+	if str_eq(name, "$tuple") then return 3
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(t.tn.len) then break
+		if str_eq(t.tn[i], name) then return t.tid[i]
+		i = i + 1
+	}
+	return 1
+}
+
+# The interned `[el]` / `*[el]` kind ids (an unknown element reads as ids 4/5).
+const kt_dyn = (KTab t, Str el): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(t.tn.len) then break
+		if str_eq(t.tn[i], el) then return t.dtid[i]
+		i = i + 1
+	}
+	return 4
+}
+
+const kt_ptr = (KTab t, Str el): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(t.tn.len) then break
+		if str_eq(t.tn[i], el) then return t.ptid[i]
+		i = i + 1
+	}
+	return 5
+}
+
+# A FIELD/PAYLOAD type slot's kind: the `$dyn`/`$ptr` markers carry their element beside them.
+const kind_of_ftype = (KTab t, Str ft, Str felem): Iarch -> {
+	if str_eq(ft, "$dyn") then return kt_dyn(t, felem)
+	if str_eq(ft, "$ptr") then return kt_ptr(t, felem)
+	return kt_tid(t, ft)
+}
+
+# The kind of `base.f` given the base's kind. `.len` on a string/array/pointer is a word;
+# `.bytes` hands out a raw pointer into the backing — never exempt. A `$rec` entry's `eids`
+# is its record-table index, so the field scan needs no name search.
+const field_kind = (Program prog, KTab t, Iarch bk, Str f): Iarch -> {
+	const Str sh = t.shapes[bk]
+	if str_eq(sh, "Str") || str_eq(sh, "$dyn") || str_eq(sh, "$ptr") then {
+		if str_eq(f, "len") then return 0
+		return 1
+	}
+	if str_eq(sh, "$rec") then {
+		const Iarch ri = t.eids[bk]
+		let Iarch i = 0
+		loop {
+			if i >= Iarch(prog.recs[ri].fields.len) then break
+			if str_eq(prog.recs[ri].fields[i], f) then return kind_of_ftype(t, prog.recs[ri].ftypes[i], prog.recs[ri].felems[i])
+			i = i + 1
+		}
+		return 1
+	}
+	return 1
+}
+
+# The kind of `base[i]` given the base's kind: a byte off a string is a word, an array or
+# pointer element is its entry's precomputed element kind.
+const elem_kind = (KTab t, Iarch bk): Iarch -> {
+	if str_eq(t.shapes[bk], "Str") then return 0
+	if str_eq(t.shapes[bk], "$dyn") || str_eq(t.shapes[bk], "$ptr") then return t.eids[bk]
+	return 1
+}
+
+const kind_join = (Iarch a, Iarch b): Iarch -> if a == b then a else 1
+
+const tenv_kind = ([KEnt] ev, Iarch en, Str nm): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= en then break
+		if str_eq(ev[i].name, nm) then return ev[i].kid
+		i = i + 1
+	}
+	return 1
+}
+
+# The kind a CALL evaluates to (the callee's declared return; intrinsics by table).
+const call_kind = (Program prog, KTab t, Str callee): Iarch -> {
+	const Iarch j = find_fn(prog.funcs, callee)
+	if j >= 0 then {
+		# a declared intrinsic's kind comes from its exact table row (a generic `place` declares
+		# `'T`, which the name table cannot kind) — same 0 the phantom spelling always got
+		if prog.funcs[j].is_intrinsic && is_routing_intrinsic(callee) then return 0
+		if str_eq(prog.funcs[j].ret_name, "$dyn") then return kt_dyn(t, prog.funcs[j].ret_elem)
+		return kt_tid(t, prog.funcs[j].ret_name)
+	}
+	if is_cast_name(callee) then return 0
+	if str_eq(callee, "Str") then return 2
+	if is_routing_intrinsic(callee) then return 0
+	return 1
+}
+
+# The kind an EXPRESSION evaluates to — the inference core, shared by the env build (over
+# the growing arrays) and the walk-time wrapper. Conservative: unknown forms are `$agg`.
+const expr_kind_c = (Program prog, KTab kt, [KEnt] ev, Iarch en, Expr e): Iarch -> match e {
+	Expr.Var(n) -> tenv_kind(ev, en, n),
+	Expr.Lit(_) -> 0,
+	Expr.BoolLit(_) -> 0,
+	Expr.FloatLit(_) -> 0,
+	Expr.Unit -> 0,
+	Expr.StrLit(_) -> 2,
+	Expr.Interp(_) -> 2,
+	Expr.Record(tnm, _) -> if str_eq(tnm, "") then 1 else kt_tid(kt, tnm),
+	Expr.ArrayLit(_, _, _, et) -> kt_dyn(kt, et),
+	Expr.Buffer(_) -> kt_dyn(kt, "Uint8"),
+	Expr.Tuple(_) -> 3,
+	Expr.UnionMk(u, _, _) -> kt_tid(kt, u),
+	Expr.Field(b, f) -> field_kind(prog, kt, tenv_kind(ev, en, b), f),
+	Expr.FieldExpr(be, f) -> field_kind(prog, kt, expr_kind_c(prog, kt, ev, en, be), f),
+	Expr.Index(b, _) -> elem_kind(kt, tenv_kind(ev, en, b)),
+	Expr.IndexField(b, _, f) -> field_kind(prog, kt, elem_kind(kt, tenv_kind(ev, en, b)), f),
+	Expr.IndexExpr(be, _) -> elem_kind(kt, expr_kind_c(prog, kt, ev, en, be)),
+	Expr.Call(n, _, _, _) -> call_kind(prog, kt, n),
+	Expr.If(_, t, el) -> kind_join(expr_kind_c(prog, kt, ev, en, t), expr_kind_c(prog, kt, ev, en, el)),
+	Expr.Neg(_) -> 0,
+	Expr.Not(_) -> 0,
+	Expr.BitNot(_) -> 0,
+	Expr.Add(_, _) -> 0,
+	Expr.Sub(_, _) -> 0,
+	Expr.Mul(_, _) -> 0,
+	Expr.Div(_, _) -> 0,
+	Expr.Mod(_, _) -> 0,
+	Expr.BitAnd(_, _) -> 0,
+	Expr.BitOr(_, _) -> 0,
+	Expr.BitXor(_, _) -> 0,
+	Expr.Shl(_, _) -> 0,
+	Expr.Shr(_, _) -> 0,
+	Expr.CmpEq(_, _) -> 0,
+	Expr.CmpNe(_, _) -> 0,
+	Expr.CmpLt(_, _) -> 0,
+	Expr.CmpGt(_, _) -> 0,
+	Expr.CmpLe(_, _) -> 0,
+	Expr.CmpGe(_, _) -> 0,
+	Expr.And(_, _) -> 0,
+	Expr.Or(_, _) -> 0,
+	Expr.Spread(x) -> expr_kind_c(prog, kt, ev, en, x),
+	_ -> 1
+}
+
+# Write one entry at the cursor. The scratch is sized by tenv_count so the guard is a belt
+# only — a dropped entry reads back as `$agg` via the tenv_kind miss, sound by polarity.
+const tenv_put = (*[KEnt] tsc, Iarch cap, Iarch n, Str nm, Iarch k): Iarch -> {
+	if n >= cap then return n
+	tsc[n] = KEnt({ name: nm, kid: k })
+	return n + 1
+}
+
+const tenv_puts = (*[KEnt] tsc, Iarch cap, Iarch n0, [Str] ns): Iarch -> {
+	let Iarch n = n0
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ns.len) then break
+		n = tenv_put(tsc, cap, n, ns[i], 1)
+		i = i + 1
+	}
+	return n
+}
+
+# One match arm's payload binds mapped to their payload kinds (a single-member arm binds
+# positionally; `_` positions are skipped by name).
+const tenv_binds = (Program prog, KTab kt, *[KEnt] tsc, Iarch cap, Iarch n0, Str uname, [Str] members, [Str] binds): Iarch -> {
+	let Iarch n = n0
+	let Iarch ui = 0
+	loop {
+		if ui >= Iarch(prog.unions.len) then break
+		if str_eq(prog.unions[ui].name, uname) then {
+			if Iarch(members.len) != 1 then return n
+			let Iarch mi = 0
+			loop {
+				if mi >= Iarch(prog.unions[ui].members.len) then break
+				if str_eq(prog.unions[ui].members[mi].name, members[0]) then {
+					let Iarch b = 0
+					loop {
+						if b >= Iarch(binds.len) then break
+						if b < Iarch(prog.unions[ui].members[mi].payloads.len) then {
+							n = tenv_put(tsc, cap, n, binds[b], kind_of_ftype(kt, prog.unions[ui].members[mi].payloads[b], prog.unions[ui].members[mi].pelems[b]))
+						}
+						b = b + 1
+					}
+					return n
+				}
+				mi = mi + 1
+			}
+		}
+		ui = ui + 1
+	}
+	# unknown union/member: bind everything conservatively
+	return tenv_puts(tsc, cap, n, binds)
+}
+
+const tenv_stmt = (Program prog, KTab kt, *[KEnt] tsc, [KEnt] ev, Iarch cap, Iarch n, Stmt s): Iarch -> match s {
+	Stmt.Let(nm, _, ann, init) -> tenv_let(prog, kt, tsc, ev, cap, n, nm, ann, init),
+	Stmt.ForIn(v, arr, ss) -> tenv_body(prog, kt, tsc, ev, cap, tenv_put(tsc, cap, n, v, elem_kind(kt, tenv_kind(ev, n, arr))), ss),
+	Stmt.Destructure(binds, _, _) -> tenv_puts(tsc, cap, n, binds),
+	Stmt.Match(_, arms) -> tenv_sarms(prog, kt, tsc, ev, cap, n, arms),
+	Stmt.IfThen(_, b) -> tenv_stmt(prog, kt, tsc, ev, cap, n, b),
+	Stmt.IfElse(_, t, el) -> tenv_stmt(prog, kt, tsc, ev, cap, tenv_stmt(prog, kt, tsc, ev, cap, n, t), el),
+	Stmt.Block(ss) -> tenv_body(prog, kt, tsc, ev, cap, n, ss),
+	Stmt.Loop(ss) -> tenv_body(prog, kt, tsc, ev, cap, n, ss),
+	Stmt.Defer(ss) -> tenv_body(prog, kt, tsc, ev, cap, n, ss),
+	Stmt.Closure(_, _, _, cb) -> tenv_body(prog, kt, tsc, ev, cap, n, cb),
+	_ -> n
+}
+
+# A `let`'s kind: the annotation when it names a type, else inferred from the initializer's
+# shape. Value-block initializers also declare their INNER bindings (walked for the flat map).
+const tenv_let = (Program prog, KTab kt, *[KEnt] tsc, [KEnt] ev, Iarch cap, Iarch n0, Str nm, Str ann, Expr init): Iarch -> {
+	let Iarch n = n0
+	n = match init {
+		Expr.Loop(ss) -> tenv_body(prog, kt, tsc, ev, cap, n, ss),
+		_ -> n
+	}
+	let Iarch k = expr_kind_c(prog, kt, ev, n, init)
+	if !str_eq(ann, "") then {
+		const Iarch ka = kt_tid(kt, ann)
+		if ka != 1 then k = ka
+	}
+	return tenv_put(tsc, cap, n, nm, k)
+}
+
+const tenv_sarms = (Program prog, KTab kt, *[KEnt] tsc, [KEnt] ev, Iarch cap, Iarch n0, [StmtArm] arms): Iarch -> {
+	let Iarch n = n0
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		if !arms[i].is_wild && Iarch(arms[i].binds.len) > 0 then n = tenv_binds(prog, kt, tsc, cap, n, arms[i].type_name, arms[i].members, arms[i].binds)
+		n = tenv_body(prog, kt, tsc, ev, cap, n, arms[i].body)
+		i = i + 1
+	}
+	return n
+}
+
+const tenv_body = (Program prog, KTab kt, *[KEnt] tsc, [KEnt] ev, Iarch cap, Iarch n0, [Stmt] ss): Iarch -> {
+	let Iarch n = n0
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		n = tenv_stmt(prog, kt, tsc, ev, cap, n, ss[i])
+		i = i + 1
+	}
+	return n
+}
+
+# A parameter's kind from its declaration.
+const param_kind = (KTab kt, Param p): Iarch -> {
+	if p.is_ptr then {
+		if str_eq(p.type_name, "$ptr") then return kt_ptr(kt, p.elem)
+		return kt_tid(kt, p.type_name)
+	}
+	if str_eq(p.type_name, "$dyn") then return kt_dyn(kt, p.elem)
+	if str_eq(p.type_name, "$tuple") then return 3
+	if str_eq(p.type_name, "$fn") then return 0
+	if str_eq(p.type_name, "$capref") || str_eq(p.type_name, "$capagg") then return 1
+	return kt_tid(kt, p.type_name)
+}
+
+# Fill the scratch for one function; returns the entry count. `tsc` and `ev` are the WRITE
+# and READ views of the same driver-owned array (the `*[T]` reference for element stores,
+# the value borrow for lookups over the growing prefix).
+const tenv_build = (Program prog, KTab kt, *[KEnt] tsc, [KEnt] ev, Iarch cap, Func f): Iarch -> {
+	let Iarch n = 0
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(f.params.len) then break
+		n = tenv_put(tsc, cap, n, f.params[i].name, param_kind(kt, f.params[i]))
+		i = i + 1
+	}
+	return tenv_body(prog, kt, tsc, ev, cap, n, f.body)
+}
+
+# An upper bound on one function's entry count — mirrors the build walk, so the scratch
+# sized to the largest function never overflows.
+const tec_expr = (Expr e): Iarch -> match e {
+	Expr.Loop(ss) -> tec_body(ss),
+	_ -> 0
+}
+
+const tec_sarms = ([StmtArm] arms): Iarch -> {
+	let Iarch c = 0
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		c = c + Iarch(arms[i].binds.len) + tec_body(arms[i].body)
+		i = i + 1
+	}
+	return c
+}
+
+const tec_stmt = (Stmt s): Iarch -> match s {
+	Stmt.Let(_, _, _, init) -> 1 + tec_expr(init),
+	Stmt.ForIn(_, _, ss) -> 1 + tec_body(ss),
+	Stmt.Destructure(binds, _, _) -> Iarch(binds.len),
+	Stmt.Match(_, arms) -> tec_sarms(arms),
+	Stmt.IfThen(_, b) -> tec_stmt(b),
+	Stmt.IfElse(_, t, el) -> tec_stmt(t) + tec_stmt(el),
+	Stmt.Block(ss) -> tec_body(ss),
+	Stmt.Loop(ss) -> tec_body(ss),
+	Stmt.Defer(ss) -> tec_body(ss),
+	Stmt.Closure(_, _, _, cb) -> tec_body(cb),
+	_ -> 0
+}
+
+const tec_body = ([Stmt] ss): Iarch -> {
+	let Iarch c = 0
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		c = c + tec_stmt(ss[i])
+		i = i + 1
+	}
+	return c
+}
+
+const tenv_count = (Func f): Iarch -> Iarch(f.params.len) + tec_body(f.body)
+
+# Resolve one body's distinct callee names into the small table the walkers consult. An
+# in-progress callee (state 1 — a recursion/SCC back-edge) resolves to ⊤ exactly like an
+# unknown one: the memo's "SCC ⇒ all-args-escape", applied at the call site. The state
+# tables ride in as `*[T]` references (read here, written by the DFS).
+const local_sums = (Program prog, KTab kt, *[FnSum] sums, *[Iarch] st, [Str] cns, TEnv te): Sums -> {
+	let [Str] ln = []
+	let [FnSum] lt = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(cns.len) then break
+		if !has_name(ln, cns[i]) then {
+			const Iarch j = find_fn(prog.funcs, cns[i])
+			let FnSum s = top_sum()
+			# a declared `intrinsic` is a bodyless token — its behavior is compiler-supplied, so its
+			# exact row comes from the intrinsic table, never from the (empty) body's computed sum
+			if j >= 0 && prog.funcs[j].is_intrinsic && is_routing_intrinsic(cns[i]) then {
+				s = intrinsic_sum(cns[i])
+			} else if j >= 0 then {
+				if st[j] == 2 then s = sums[j]
+			} else if is_routing_intrinsic(cns[i]) then {
+				s = intrinsic_sum(cns[i])
+			}
+			ln = [...ln, cns[i]]
+			lt = [...lt, s]
+		}
+		i = i + 1
+	}
+	return Sums({ names: ln, tbl: lt, te: te, prog: prog, kt: kt })
+}
+
+# A scalar return carries no pointer into the callee's ambient node; everything else might.
+const is_scalar_ret = (Str rn): Bool -> {
+	if str_eq(rn, "") || str_eq(rn, "Iarch") || str_eq(rn, "Int") || str_eq(rn, "Uarch") then return true
+	if str_eq(rn, "Bool") || str_eq(rn, "Unit") then return true
+	if str_eq(rn, "Float32") || str_eq(rn, "Float64") then return true
+	if str_eq(rn, "Int8") || str_eq(rn, "Int16") || str_eq(rn, "Int32") || str_eq(rn, "Int64") then return true
+	if str_eq(rn, "Uint8") || str_eq(rn, "Uint16") || str_eq(rn, "Uint32") || str_eq(rn, "Uint64") then return true
+	return false
+}
+
+const fn_rehomes = (Func f): Bool -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(f.params.len) then break
+		if f.params[i].is_ptr then return true
+		if str_eq(f.params[i].type_name, "$capref") || str_eq(f.params[i].type_name, "$capagg") then return true
+		i = i + 1
+	}
+	return false
+}
+
+const mk_summary = (Func f, [Str] params, RSets rs): FnSum -> {
+	let [Bool] ra = []
+	let [Bool] sto = []
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(params.len) then break
+		ra = [...ra, has_name(rs.rset, params[i])]
+		sto = [...sto, has_name(rs.sset, params[i])]
+		i = i + 1
+	}
+	return FnSum({ all_esc: false, ret_al: ra, stores: sto, agg_ret: !is_scalar_ret(f.ret_name), rehomer: fn_rehomes(f) })
+}
+
+const empty_rsets = (): RSets -> {
+	let [Str] r = []
+	let [Str] s = []
+	let [Str] f = []
+	return RSets({ rset: r, sset: s, fwd: f })
+}
+
+# Post-order DFS over the call graph: summarize every reachable callee first, then analyze
+# this body against the resolved table and record its summary + shadow sets. `st` is the
+# visit state (0 unvisited, 1 in progress, 2 done); the tables are the caller's preallocated
+# arrays, written in place through the `*[T]` references (they are never grown after the
+# handoff, so the decayed data pointers stay valid). A callee still on the DFS stack at
+# analysis time reads as ⊤ (local_sums), the memo's "SCC ⇒ all-args-escape".
+const summarize! = (Program prog, KTab kt, *[KEnt] tsc, [KEnt] tscv, Iarch cap, *[FnSum] sums, *[Iarch] st, *[RSets] rsets, Iarch k): Iarch -> {
+	if st[k] != 0 then return 0
+	st[k] = 1
+	if prog.funcs[k].is_asm || prog.funcs[k].is_value then {
+		if prog.funcs[k].is_asm then sums[k] = asm_sum(prog.funcs[k]) else sums[k] = none_sum(0)
+		st[k] = 2
+		return 0
+	}
+	const [Str] cns = calls_body!(prog.funcs[k].body)
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(cns.len) then break
+		const Iarch j = find_fn(prog.funcs, cns[i])
+		if j >= 0 then {
+			if st[j] == 0 then summarize!(prog, kt, tsc, tscv, cap, sums, st, rsets, j)
+		}
+		i = i + 1
+	}
+	const TEnv te = TEnv({ ents: tscv, n: tenv_build(prog, kt, tsc, tscv, cap, prog.funcs[k]) })
+	const Sums sm = local_sums(prog, kt, sums, st, cns, te)
+	const [Str] params = plist_names(prog.funcs[k].params)
+	const RSets rs = shadow_sets!(sm, params, prog.funcs[k].body)
+	sums[k] = mk_summary(prog.funcs[k], params, rs)
+	rsets[k] = rs
+	st[k] = 2
+	return 0
+}
+
+# ── entry points ─────────────────────────────────────────────────────────────────────────────
+
+# The divergence tripwire, run on every compile: every name the `!`-oracle (alloc.cf) says
+# escapes must also escape per the shadow pass — the shadow set is the sound superset the
+# duplex router will trust, so an oracle-escaping name missing here is a compiler bug. The
+# oracle never taints a call argument (its esc_vars skips calls), so the summary refinement
+# cannot fall below it: every other oracle rule maps into an rset or sset arm.
+pub const routing_check! = (Program prog, RouteInfo ri): Iarch -> routing_run!(prog, ri, false)
+
+# Everything the duplex router consults, aligned with prog.funcs: `sets` — each function's
+# shadow escape sets (a name outside rset ∪ sset provably never escapes its frame, so emit
+# births its construction RESIDUE-side; everything else stays survivor — fail-safe); `sums` —
+# each function's summary rows (a construction passed to an argument the callee neither
+# stores beyond its frame nor aliases into its return is dead once the call returns, so emit
+# births it residue-side too). The always-on oracle tripwire (routing_check!) keeps the same
+# analysis honest on every build.
+pub data RouteInfo = { [RSets] sets, [FnSum] sums }
+
+pub const routing_tables! = (Program prog): RouteInfo -> {
+	const KTab kt = ktab_build(prog)
+	const Iarch n = Iarch(prog.funcs.len)
+	let [FnSum] sums = []
+	let [Iarch] st = []
+	let [RSets] rsets = []
+	let Iarch p = 0
+	loop {
+		if p >= n then break
+		sums = [...sums, top_sum()]
+		st = [...st, 0]
+		rsets = [...rsets, empty_rsets()]
+		p = p + 1
+	}
+	# the shared tenv scratch, sized once to the largest function and reused by every DFS
+	# visit (never grown after the handoff — the decayed data pointer must stay valid)
+	let Iarch cap = 0
+	let Iarch q = 0
+	loop {
+		if q >= n then break
+		const Iarch c = tenv_count(prog.funcs[q])
+		if c > cap then cap = c
+		q = q + 1
+	}
+	let [KEnt] tsc = []
+	const KEnt ke = KEnt({ name: "", kid: 1 })
+	let Iarch w = 0
+	loop {
+		if w >= cap then break
+		tsc = [...tsc, ke]
+		w = w + 1
+	}
+	let Iarch d = 0
+	loop {
+		if d >= n then break
+		summarize!(prog, kt, tsc, tsc, cap, sums, st, rsets, d)
+		d = d + 1
+	}
+	return RouteInfo({ sets: rsets, sums: sums })
+}
+
+# Inspection hatch (`--dump-routing`, KEPT deliberately now that the router is live — the
+# classification drives codegen, so seeing it is a debugging primitive, not scaffolding):
+# each function's shadow escape set, forward aliases, and summary bits (`ret:`
+# return-may-alias, `sto:` stored-beyond-frame, per parameter).
+pub const routing_dump! = (Program prog, RouteInfo ri): Iarch -> routing_run!(prog, ri, true)
+
+# The shared driver: the per-function check or dump over the RECORDED tables (computed ONCE
+# per compile by routing_tables! and shared with emit — the analysis used to run twice, and
+# the second run's fixpoint garbage lived through the whole emit phase). An SCC member's sets
+# were computed with its siblings at ⊤ — deliberately conservative (the memo's SCC rule).
+const routing_run! = (Program prog, RouteInfo ri, Bool dump): Iarch -> {
+	const Iarch n = Iarch(prog.funcs.len)
+	const [RSets] rsets = ri.sets
+	const [FnSum] sums = ri.sums
+	let Iarch i = 0
+	loop {
+		if i >= n then break
+		if !prog.funcs[i].is_asm && !prog.funcs[i].is_value then {
+			const RSets rs = rsets[i]
+			const [Str] esc = union_names(rs.rset, rs.sset)
+			const [Str] params = plist_names(prog.funcs[i].params)
+			if dump then {
+				const FnSum fsum = sums[i]
+				eprint("routing ${prog.funcs[i].name}:")
+				let Iarch j = 0
+				loop {
+					if j >= Iarch(esc.len) then break
+					eprint(" ${esc[j]}")
+					j = j + 1
+				}
+				let Iarch k = 0
+				loop {
+					if k >= Iarch(rs.fwd.len) then break
+					eprint(" fwd:${rs.fwd[k]}")
+					k = k + 1
+				}
+				let Iarch m = 0
+				loop {
+					if m >= Iarch(params.len) then break
+					if bit_at(fsum.ret_al, m) then eprint(" ret:${params[m]}")
+					if bit_at(fsum.stores, m) then eprint(" sto:${params[m]}")
+					m = m + 1
+				}
+				eprint("\n")
+			} else {
+				const [Str] oracle = compute_esc!(params, prog.funcs[i].body)
+				let Iarch j = 0
+				loop {
+					if j >= Iarch(oracle.len) then break
+					if !has_name(esc, oracle[j]) then die("cf: routing: internal divergence in `${prog.funcs[i].name}`: `${oracle[j]}` escapes per the oracle but not per the shadow pass\n")
+					j = j + 1
+				}
+			}
+		}
+		i = i + 1
+	}
+	return 0
+}
+
+# ── `destroy` soundness (geometry_lowering §3 verification) ───────────────────────────────
+# `<geom>::destroy(b)` rewinds the parent past b, reclaiming b's whole extent — sound only when
+# nothing b holds outlives the teardown. Routing already computes exactly that: an aggregate handed
+# out through `in b` makes b a SURVIVOR (`b ∈ sset`, routing line ~311). So the check is one bit: a
+# `destroy(b)` whose b escapes its frame would dangle the escaped value. `b ∉ sset` ⟹ everything in b
+# is frame-bounded, so the rewind reclaims only dead storage. (Routing over-approximates escape, so
+# this never lets an unsound teardown through; at worst it conservatively rejects a sound one.)
+const is_destroy_callee = (Str n): Bool -> str_eq(n, "destroy__fx") || str_eq(n, "destroy__el") || str_eq(n, "destroy__fb")
+const cd_check_arg! = (Expr arg, [Str] sset): Iarch -> {
+	const Iarch r = match arg {
+		Expr.Var(bn) -> if has_name(sset, bn) then die("cf: `destroy(${bn})` reclaims `${bn}`, but a value that lives in `${bn}` escapes this scope — it would dangle. Return only scalars from work run `in ${bn}`, or drop the `defer destroy(${bn})`.\n") else 0,
+		_ -> 0
+	}
+	return r
+}
+const cd_expr! = (Expr e, [Str] sset): Iarch -> {
+	const Iarch hit = match e {
+		Expr.Call(n, _, args, _) -> if is_destroy_callee(n) && Iarch(args.len) > 0 then cd_check_arg!(args[0], sset) else 0,
+		_ -> 0
+	}
+	const [Expr] ks = kids!(e)
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ks.len) then break
+		cd_expr!(ks[i], sset)
+		i = i + 1
+	}
+	return 0
+}
+const cd_arms! = ([StmtArm] arms, [Str] sset): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		cd_stmts!(arms[i].body, sset)
+		i = i + 1
+	}
+	return 0
+}
+const cd_stmt! = (Stmt s, [Str] sset): Iarch -> {
+	const [Expr] es = stmt_exprs!(s)
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(es.len) then break
+		cd_expr!(es[i], sset)
+		i = i + 1
+	}
+	const Iarch r = match s {
+		Stmt.IfThen(_, b) -> cd_stmt!(b, sset),
+		Stmt.IfElse(_, t, e) -> cd_stmt!(t, sset) + cd_stmt!(e, sset),
+		Stmt.Block(bs) -> cd_stmts!(bs, sset),
+		Stmt.Loop(bs) -> cd_stmts!(bs, sset),
+		Stmt.ForIn(_, _, bs) -> cd_stmts!(bs, sset),
+		Stmt.Match(_, arms) -> cd_arms!(arms, sset),
+		Stmt.Defer(bs) -> cd_stmts!(bs, sset),
+		Stmt.Closure(_, _, _, cb) -> cd_stmts!(cb, sset),
+		_ -> 0
+	}
+	return r
+}
+const cd_stmts! = ([Stmt] ss, [Str] sset): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		cd_stmt!(ss[i], sset)
+		i = i + 1
+	}
+	return 0
+}
+pub const check_destroy! = (Program prog, RouteInfo ri): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(prog.funcs.len) then break
+		# the FULL escape set: a name that rides out via the RETURN lives in `rset`, one that escapes
+		# via a store/rehome in `sset` — either means the child handed something out (routing line 1670).
+		if !prog.funcs[i].is_asm then cd_stmts!(prog.funcs[i].body, union_names(ri.sets[i].rset, ri.sets[i].sset))
+		i = i + 1
+	}
+	return 0
+}
+
+# ── geometry-handle escape (geometry_lowering §1) ────────────────────────────────────────
+# A geometry is a comptime ambient spent IN PLACE, not a first-class value: the node handle
+# `<geom>::of(n)` mints must be bound where it is used and never handed out of its constructing
+# frame. A callee that returns (or passes on) its handle would let a caller `... in h` under a
+# geometry the compiler cannot see the constructor for — the exact minted-handle gap that forced
+# a runtime-dispatch `cf_alloc` fallback. Forbidding the escape keeps every handle statically
+# traceable to its constructor, so materialize always resolves the ambient.
+#
+# The rule is SYNTACTIC and precise: a handle escapes only when its name appears as an ordinary
+# VALUE — an `Expr.Var` in a RETURN or as a non-`destroy` call ARGUMENT. Crucially, the `... in b`
+# ambient is the `Call.geom` STRING field, never an `Expr.Var` and never a `kids!` child, so using
+# a handle purely as an ambient (or returning an aggregate ALLOCATED in it, `return f() in b`) is
+# invisible here — exactly right: that is the intended arena channel, the handle itself never
+# leaves. `destroy(b)` consumes the handle in place and is exempt.
+const is_geom_ctor = (Str n): Bool -> str_eq(n, "of__fx") || str_eq(n, "of__el") || str_eq(n, "of__fb")
+const ge_is_ctor = (Expr e): Bool -> match e {
+	Expr.Call(n, _, _, _) -> is_geom_ctor(n),
+	_ -> false
+}
+# the ctor-bound handle names of one function body: a `const/let b = <geom>::of(...)` binding,
+# plus a plain alias `let x = b` of an existing handle (one relinking level, closed to a fixpoint
+# by the caller re-running until stable).
+const ge_alias_of = (Expr e, [Str] hs): Bool -> match e {
+	Expr.Var(n) -> has_name(hs, n),
+	_ -> false
+}
+const ge_handles_arms = ([StmtArm] arms, [Str] hs): [Str] -> {
+	let [Str] r = no_strs()
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		r = cat_s(r, ge_handles(arms[i].body, hs))
+		i = i + 1
+	}
+	return r
+}
+const ge_handles_stmt = (Stmt s, [Str] hs): [Str] -> match s {
+	Stmt.Let(n, _, _, init) -> if ge_is_ctor(init) || ge_alias_of(init, hs) then one_str(n) else no_strs(),
+	Stmt.Assign(n, init) -> if ge_is_ctor(init) || ge_alias_of(init, hs) then one_str(n) else no_strs(),
+	Stmt.IfThen(_, b) -> ge_handles_stmt(b, hs),
+	Stmt.IfElse(_, t, e) -> cat_s(ge_handles_stmt(t, hs), ge_handles_stmt(e, hs)),
+	Stmt.Block(bs) -> ge_handles(bs, hs),
+	Stmt.Loop(bs) -> ge_handles(bs, hs),
+	Stmt.ForIn(_, _, bs) -> ge_handles(bs, hs),
+	Stmt.Match(_, arms) -> ge_handles_arms(arms, hs),
+	Stmt.Defer(bs) -> ge_handles(bs, hs),
+	Stmt.Closure(_, _, _, cb) -> ge_handles(cb, hs),
+	_ -> no_strs()
+}
+const ge_handles = ([Stmt] ss, [Str] hs): [Str] -> {
+	let [Str] r = no_strs()
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		r = cat_s(r, ge_handles_stmt(ss[i], hs))
+		i = i + 1
+	}
+	return r
+}
+# fixpoint the handle set so a chained alias (`let y = x` after `let x = b`) is captured too.
+const ge_handle_set = ([Stmt] body): [Str] -> {
+	let [Str] hs = no_strs()
+	loop {
+		const [Str] nx = ge_handles(body, hs)
+		if Iarch(nx.len) <= Iarch(hs.len) then break
+		hs = nx
+	}
+	return hs
+}
+# does a handle name (in hs) appear as a VALUE (an `Expr.Var`) anywhere in `e`? `kids!` walks
+# child EXPRs only, so the `Call.geom` ambient string is never reached — ambient uses stay invisible.
+const ge_uses! = (Expr e, [Str] hs): Bool -> {
+	const Bool here = match e {
+		Expr.Var(n) -> has_name(hs, n),
+		_ -> false
+	}
+	if here then return true
+	const [Expr] ks = kids!(e)
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ks.len) then break
+		if ge_uses!(ks[i], hs) then return true
+		i = i + 1
+	}
+	return false
+}
+# the specific handle name (in hs) that `e` hands out — the first `Expr.Var` in hs it mentions.
+const ge_named! = (Expr e, [Str] hs): Str -> {
+	const Str here = match e {
+		Expr.Var(n) -> if has_name(hs, n) then n else "",
+		_ -> ""
+	}
+	if !str_eq(here, "") then return here
+	const [Expr] ks = kids!(e)
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ks.len) then break
+		const Str r = ge_named!(ks[i], hs)
+		if !str_eq(r, "") then return r
+		i = i + 1
+	}
+	return ""
+}
+const ge_die! = (Str h, Str sink): Iarch -> die("cf: a geometry handle may not escape its constructing function: the `<geom>::of(...)` arena `${h}` is ${sink}. A geometry is a comptime ambient spent in place — run work `... in ${h}` and reclaim with `defer destroy(${h})`; do not return or forward the handle itself.\n")
+# scan an expression for a handle passed as a non-`destroy` call ARGUMENT (the ambient in `Call.geom`
+# is not an argument, so `f() in b` never trips this).
+const ge_scan_args! = (Expr e, [Str] hs): Iarch -> {
+	const Iarch hit = match e {
+		Expr.Call(callee, _, args, _) -> if is_destroy_callee(callee) then 0 else ge_scan_arglist!(args, hs, callee),
+		_ -> 0
+	}
+	const [Expr] ks = kids!(e)
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ks.len) then break
+		ge_scan_args!(ks[i], hs)
+		i = i + 1
+	}
+	return 0
+}
+const ge_scan_arglist! = ([Expr] args, [Str] hs, Str callee): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(args.len) then break
+		if ge_uses!(args[i], hs) then ge_die!(ge_named!(args[i], hs), "passed as a value argument to `${callee}`")
+		i = i + 1
+	}
+	return 0
+}
+const ge_scan_stmt! = (Stmt s, [Str] hs): Iarch -> {
+	const [Expr] es = stmt_exprs!(s)
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(es.len) then break
+		ge_scan_args!(es[i], hs)
+		i = i + 1
+	}
+	const Iarch r = match s {
+		Stmt.Return(e) -> if ge_uses!(e, hs) then ge_die!(ge_named!(e, hs), "returned out of this frame") else 0,
+		Stmt.IfThen(_, b) -> ge_scan_stmt!(b, hs),
+		Stmt.IfElse(_, t, e) -> ge_scan_stmt!(t, hs) + ge_scan_stmt!(e, hs),
+		Stmt.Block(bs) -> ge_scan_stmts!(bs, hs),
+		Stmt.Loop(bs) -> ge_scan_stmts!(bs, hs),
+		Stmt.ForIn(_, _, bs) -> ge_scan_stmts!(bs, hs),
+		Stmt.Match(_, arms) -> ge_scan_arms!(arms, hs),
+		Stmt.Defer(bs) -> ge_scan_stmts!(bs, hs),
+		Stmt.Closure(_, _, _, cb) -> ge_scan_stmts!(cb, hs),
+		_ -> 0
+	}
+	return r
+}
+const ge_scan_stmts! = ([Stmt] ss, [Str] hs): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(ss.len) then break
+		ge_scan_stmt!(ss[i], hs)
+		i = i + 1
+	}
+	return 0
+}
+const ge_scan_arms! = ([StmtArm] arms, [Str] hs): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(arms.len) then break
+		ge_scan_stmts!(arms[i].body, hs)
+		i = i + 1
+	}
+	return 0
+}
+pub const check_geom_escape! = (Program prog): Iarch -> {
+	let Iarch i = 0
+	loop {
+		if i >= Iarch(prog.funcs.len) then break
+		if !prog.funcs[i].is_asm then {
+			const [Str] hs = ge_handle_set(prog.funcs[i].body)
+			if Iarch(hs.len) > 0 then ge_scan_stmts!(prog.funcs[i].body, hs)
+		}
+		i = i + 1
+	}
+	return 0
+}

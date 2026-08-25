@@ -585,7 +585,8 @@ call           = [ type_args ] , "(" , [ argument , { "," , argument } ] , ")" ;
 type_args      = "[" , type_arg , { "," , type_arg } , "]" ;                        (* explicit generics: [Int32], [8, Int32] *)
 type_arg       = type | expression ;                                                (* Int32 (type)  |  8 (comptime value) *)
 argument       = expression ;
-primary        = var_name | type_name | member_access | value | block ;   (* type_name/member_access = a construction callee (Point, Maybe.Just); a block is a value too; a grouped/tuple ( … ) is the `tuple` value *)
+qualified_path = path_seg , "::" , path_seg , { "::" , path_seg } ;   (* a ::-path to a module member: std::comptime::os::target — resolved through the module graph, module_system §4 *)
+primary        = qualified_path | var_name | type_name | member_access | value | block ;   (* qualified_path = a namespace-qualified reference (mem::alloc, std::io::print); type_name/member_access = a construction callee (Point, Maybe.Just); a block is a value too; a grouped/tuple ( … ) is the `tuple` value *)
 ```
 
 Each tier binds tighter than the one above and is left-associative, so
@@ -735,17 +736,17 @@ resolves to something callable is a semantic rule.
 It is a prefix on a `postfix` (a `unary`), so it composes anywhere a value does:
 
 ```
-const arena = defer mem.arena.destroy(mem.arena.of(256))
+const fd = defer close(open(path))
 ```
 
-`arena` binds the arena (`mem.arena.of(256)`, the tapped argument) while
-`mem.arena.destroy(arena)` is queued for scope exit. Written on its own line
-(`defer mem.arena.destroy(arena)`) it is just an expression-statement whose value
-is discarded. As a **pipe target** it needs no full call — the pipe partially
-applies the function and the tapped value completes it, so
+`fd` binds the handle (`open(path)`, the tapped argument) while `close(fd)` is
+queued for scope exit. Written on its own line (`defer close(fd)`) it is just an
+expression-statement whose value is discarded. As a **pipe target** it needs no
+full call — the pipe partially applies the function and the tapped value completes
+it, so
 
 ```
-const arena = mem.arena.of(256) |> defer mem.arena.destroy
+const fd = open(path) |> defer close
 ```
 
 is the same thing: `x |> defer f` ≡ `defer f(x)`. `defer` itself does not care
@@ -970,32 +971,35 @@ low-binding operator; only the lambda and its body are defined here.
 
 ## Intrinsics
 
-An **intrinsic** is a function the **compiler** supplies the body for — `sizeof`,
-`popcount`, `mem.copy`, atomics, and the like. Because the standard library is
-written in C!, these primitives must bottom out _somewhere_; an `intrinsic`
-declaration is that floor. Users **see** them: they are ordinary top-level
-bindings that read like any function, minus the body.
+An **intrinsic** is a function the **compiler** supplies the body for — `size_of`,
+`popcount`, the `std::mem::raw` ops, atomics, and the like. Because the standard
+library is written in C!, these primitives must bottom out _somewhere_; an
+`intrinsic` declaration is that floor. Users **see** them: they are ordinary
+top-level bindings that read like any function, minus the body.
 
 The shape reuses the binding skeleton one-for-one — swap `const` for
-`intrinsic` and give a **function-type signature** (`(params) -> return`) with no
-`-> body` after it. The compiler supplies the body.
+`intrinsic` and give the **`:`-return signature** (`(params): return`) with no
+`-> body` after it (the same `:` return a lambda uses, stopping where its `->`
+body would begin). The compiler supplies the body.
 
 ```ebnf
 intrinsic_decl  = "intrinsic" , var_name , "=" , intrinsic_sig                  (* value intrinsic *)
+               | "intrinsic" , var_name , ":" , type                            (* bodyless comptime VALUE — no params *)
                | "intrinsic" , "type" , type_name , [ "=" , constructor_sig ] ;  (* type-valued intrinsic + its constructor; nullary form omits "=" *)
-intrinsic_sig   = [ generic_params ] , param_list , "->" , type ;   (* a function-type signature, no body — the compiler supplies it *)
-constructor_sig = param_list , "->" , type ;                        (* a type's constructor: (Number value) -> Uint8 *)
+intrinsic_sig   = [ generic_params ] , param_list , ":" , type ;   (* the lambda's ":" return, no "->" body — the compiler supplies it *)
+constructor_sig = param_list , ":" , type ;                        (* a type's constructor: (Number value): Uint8 *)
 ```
 
 An `intrinsic` also names a **type the compiler supplies** — an `intrinsic type`
 whose optional `= constructor_sig` gives the type its cast/construction signature
-(`pub intrinsic type Uint8 = (Number value) -> Uint8`), and whose nullary form
+(`pub intrinsic type Uint8 = (Number value): Uint8`), and whose nullary form
 (no `=`) is a bare compiler singleton (`pub intrinsic type Infinity`). The name is
-PascalCase (a `type_name`); the constructor RHS is an ordinary function-type
-signature (`(Number value) -> Uint8`), just like a value intrinsic's.
+PascalCase (a `type_name`); the constructor RHS is an ordinary `:`-return
+signature (`(Number value): Uint8`), just like a value intrinsic's.
 
 The **return type is mandatory** — there is no body to infer from, and nothing
-is implied. A unit-returning intrinsic states it (`Unit`); the type is never omitted.
+is implied. A unit-returning intrinsic states it (`()`, or its alias `Unit`); the
+type is never omitted.
 Everything else mirrors a lambda: optional `generic_params`, a `param_list`
 whose params carry their types, and the `!` allocation marker rides the name
 (`copy!`) when the intrinsic allocates. `pub` exports it like any declaration,
@@ -1005,16 +1009,18 @@ An intrinsic is a **top-level** form only — it appears in `declaration`, never
 `statement`; there are no local intrinsics.
 
 ```
-pub intrinsic sizeof   = ['T]() -> Uarch                      (* generic, returns a count *)
-pub intrinsic popcount = (Uarch x) -> Uarch
-pub intrinsic copy!    = ['T](*'T dst, *'T src, Uarch n) -> Unit (* allocates; return stated *)
-intrinsic fence        = () -> Unit                           (* module-private *)
+pub intrinsic size_of  = ['T]('T v): Uarch                    (* generic, returns a byte count *)
+pub intrinsic popcount = (Uarch x): Uarch
+pub intrinsic copy!    = ['T](*'T dst, *'T src, Uarch n): ()  (* allocates; return stated *)
+intrinsic fence        = (): ()                               (* module-private *)
 
-pub intrinsic type Uint8 = (Number value) -> Uint8          (* a width type carrying its cast constructor *)
+pub intrinsic type Uint8 = (Number value): Uint8            (* a width type carrying its cast constructor *)
 pub intrinsic type Infinity                                 (* nullary compiler singleton — no constructor *)
 
-pub intrinsic bad      = (Uarch x)                           (* invalid — return type required (needs `-> T`) *)
-pub intrinsic worse    = (Uarch x) -> Uarch -> x            (* invalid — the trailing `-> x` is a body; intrinsics take none *)
+pub intrinsic target: Os                                    (* a bodyless comptime VALUE — no params: read `target`, not `target()` *)
+
+pub intrinsic bad      = (Uarch x)                           (* invalid — return type required (needs `: T`) *)
+pub intrinsic worse    = (Uarch x): Uarch -> x              (* invalid — the trailing `-> x` is a body; intrinsics take none *)
 ```
 
 ## Assembly
@@ -1395,15 +1401,17 @@ must be a named tuple is a semantic check; the grammar admits the pattern on any
 
 ## Imports
 
-An import names a module by a path string and binds what it brings in. The `as`
-target sets both the binding and — by its casing — _what_ is pulled from the
-module:
+An import names a module by a `::`-separated **path** and binds an abbreviation for
+it. There is no path string: the segments _are_ the module's location, and the binding
+is the path's **last segment** — or an explicit `as` rename, or the destructured names.
+Every name an import binds can equally be written as a full `::` path with no import at
+all — an import is pure sugar for omitting a namespace prefix (see Modules;
+[[module_system.md]] §4).
 
 ```ebnf
-import_decl  = [ "pub" ] , "import" , string , "as" , import_alias ;   (* pub import = reexport *)
-import_alias = var_name          (* lowercase namespace: values only — mem.alloc *)
-             | type_name         (* PascalCase namespace: types/data only — Math.Vec *)
-             | import_list ;     (* destructured: named members, values and types *)
+import_decl  = [ "pub" ] , "import" , module_path , ( [ "::" , import_list ] | [ "as" , ( var_name | "*" ) ] ) ;   (* pub import = reexport *)
+module_path  = path_seg , { "::" , path_seg } ;
+path_seg     = var_name | type_name ;
 import_list  = "{" , import_name , { "," , import_name } , [ "," ] , "}" ;
 import_name  = var_name | type_name ;
 ```
@@ -1411,32 +1419,48 @@ import_name  = var_name | type_name ;
 Examples:
 
 ```
-import "std/mem" as mem                    (* mem.* — values only *)
-import "std/math" as Math                   (* Math.* — types/data only *)
-import "std/functor" as { map, Functor }    (* map (value) and Functor (type), direct *)
-pub import "std/mem" as { arena }           (* reexport: arena is importable from this module too *)
+import std::mem                       (* binds `mem` — mem::alloc, mem::Arena, … *)
+import std::mem::{ alloc, Arena }      (* destructures alloc (value) and Arena (type) *)
+import std::comptime::os as comptime_os  (* binds `comptime_os` — comptime_os::target *)
+pub import std::mem::{ arena }         (* reexport: arena is importable from this module too *)
+pub import std::io::console::arm64::darwin as *  (* reexport the WHOLE surface flat *)
 ```
 
-Three `as` targets:
+Four forms:
 
-- **`var_name`** (lowercase) binds a namespace exposing the module's **values**
-  only, reached as `mem.alloc`.
-- **`type_name`** (PascalCase) binds a namespace exposing its **types and data**
-  only, reached as `Math.Vec`.
-- **`import_list`** destructures named members straight into scope. It mirrors a
-  `record_pattern` but also admits a `type_name` (`Functor`), since a module
-  member may itself be a type — so it is the one form that pulls in **both**
-  kinds at once.
+- **A bare path** `import a::b::c` binds the **last segment** `c` as an abbreviation
+  for the whole path: a use `c::member` means `a::b::c::member`. `c` is a namespace
+  over the module's entire exported surface — **values and types alike**, told apart
+  by the member's own casing (`mem::alloc`, `mem::Arena`). (There is no casing-keyed
+  value/type split on the binding: a single `::` path reaches any member.)
+- **A renamed path** `import a::b::c as n` binds `n` instead of the last segment `c`
+  as the namespace abbreviation, so `n::member` means `a::b::c::member`. The rename is
+  namespace-only (it never applies to `::{ … }`); it disambiguates a segment name that
+  would collide, and — paired with `pub import` and a `comptime_if` — lets a barrel
+  give every platform's implementation a single shared name (`pub import
+  …::darwin::arm64 as console`).
+- **A destructured path** `import a::b::c::{ x, Y }` pulls the named members straight
+  into scope, so `x` means `a::b::c::x` and `Y` means `a::b::c::Y`. It mirrors a
+  `record_pattern` but also admits a `type_name`, since a member may itself be a type.
+- **A wildcard** `import a::b::c as *` splices `a::b::c`'s **whole exported surface**
+  into the current module **flat** — every member at its own name, no nesting and no
+  enumeration — so a `pub import … as *` **reexport** forwards the lot without re-listing
+  them (and can never fall out of sync when the target gains a member). The natural
+  barrel form: `pub import std::io::console::arm64::darwin as *` makes each of the
+  platform module's members reachable through the barrel directly (`console::print`),
+  not under an implementation-named nesting.
 
-A **`pub import`** is a **reexport**: the names it brings in become part of this
-module's own exported surface, so a module that imports _this_ one may import them
-from here. It reads the same as `pub` on a declaration (see Visibility) — the
-imported binding is simply exported onward.
+A **`pub import`** is a **reexport**: the names it brings in join this module's own
+exported surface, so a module that imports _this_ one may reach them through it. It
+reads the same as `pub` on a declaration (see Visibility).
 
-Which names a module actually exports, and the values-vs-types split keyed on the
-alias's case, are semantic rules; the grammar fixes only the surface. The path is
-an ordinary `string`. How imports and declarations compose into a file is the
-`module` rule (see Modules).
+Because an import only abbreviates, it is **never required**: a full path
+`a::b::c::member` resolves the same whether or not `a::b::c` was imported (§ Modules;
+[[module_system.md]] §4). `std::` is the standard-library root; any other leading
+segment is relative to the importing file (§2). `::` is the **namespace/module path**
+separator — distinct from `.`, which stays the runtime `field_access` and the
+union-variant qualifier (`rec.field`, `Maybe.Just`, `Os.Darwin`). Which names a module
+exports is a semantic rule; the grammar fixes only the surface.
 
 ## Visibility
 
@@ -1489,30 +1513,32 @@ A **`comptime_if`** brings **build-time conditional compilation** to the top
 level. It reuses `if … then … else` — position tells it from the value-level
 `if_expr`, since a module item is never an expression — but it is evaluated at
 **comptime**, during import resolution, against comptime-known values, chiefly the
-compiler-supplied `"comptime"` module (`os`, `arch`, and the target). Exactly one
+compiler-supplied `std::comptime` module (`os`, `arch`, and the target). Exactly one
 branch's items survive into the module; the losing branch and the `if` scaffolding
 itself dissolve. It **surrounds** items — imports never branch internally — so it
 is how a single name resolves to a different backing per target:
 
 ```
-import "comptime" as { os, arch, Os, Arch }
+import std::comptime::{ os, arch, Os, Arch }
 
-if os.target == Os.Darwin then
-  if arch.target == Arch.Arm64 then import "sys/darwin/arm64" as { read_file }
-  else import "sys/darwin/amd64" as { read_file }
-else import "sys/linux" as { read_file }
+if os::target == Os.Darwin then
+  if arch::target == Arch.Arm64 then import sys::darwin::arm64::{ read_file }
+  else import sys::darwin::amd64::{ read_file }
+else import sys::linux::{ read_file }
 ```
 
 Exactly one `read_file` reaches the rest of the module and the selection leaves no
 trace. `else if` chains for free (a `module_branch` may itself be a `comptime_if`),
 and a branch may brace a group of items. That the condition must be
-comptime-evaluable, and the `"comptime"` module's full surface, are semantic
+comptime-evaluable, and the `std::comptime` module's full surface, are semantic
 concerns — the latter its own deferred spec; the grammar only admits the form.
+(`os::target` reaches the value member through the `::` namespace path; `Os.Darwin`
+is a union-variant qualifier and stays on `.`.)
 
-Another module is named by a **path string with no `.cf` extension**
-(`"std/mem"`), resolved to a file by the toolchain — a semantic concern. A
-module's exported surface is its `pub` declarations plus its `pub import`
-reexports; everything else is private to the file.
+Another module is named by a **`::`-path with no `.cf` extension** (`std::mem`),
+resolved to a file by the toolchain — a semantic concern. A module's exported surface
+is its `pub` declarations plus its `pub import` reexports; everything else is private
+to the file.
 
 ## Entry Point
 

@@ -1,0 +1,90 @@
+# std/mem/page — the ROOT geometry (geometry_lowering §5, `page`): the ambient node `main`
+# runs under before any graft. Unlike `arena`/`fixed_buffer` it is never CONSTRUCTED — the
+# entry floor mints the root duplex node (`$cf_page`) and passes it as main's hidden node
+# arg-0. The page therefore has NO constructor surface at all — a program never mints or
+# names it; it simply runs under it. The module is only the value/scope hooks a page-ambient
+# (non-`!`, root-reachable) frame places when the Materialize pass tags it `pg`.
+#
+# The root node is the SAME 72-byte duplex header the whole bump family shares:
+#
+#   node+0  survivor { top@0, limit@8, parent@16, aux@24, reserve@32 }   (40 bytes)
+#   node+40 residue  { top@0, limit@8, parent@16, aux@24 }               (32 bytes)
+#
+# `aux` is the one geometry-specific cursor: the page reads it as its COMMITTED watermark
+# (the elastic arena reads it as its pull CHUNK — the two are never both live, so they share
+# the slot). `reserve` (survivor only, node+32) holds the node's PUBLISHED reserve entry.
+# Its lanes are seeded per TARGET (the floor's `cf_root_page_init`):
+#   - Darwin: both lanes up-bump over their OWN mmap reservation, bounded by `limit`,
+#     committing more backing pages via `cf_root_page_grow` (→ `raw::grow`) when the cursor
+#     crosses the `aux` (committed) watermark. This is the shape the page geometry contributes
+#     over the arena's carved shapes, and the reason `raw::grow` exists.
+#   - Bare: one two-ended BSS block — survivor up (bounded by the residue cursor), residue
+#     down (bounded by the survivor cursor); no growth (fixed root), no watermark read.
+#
+# The two lane shapes are a COMPTIME fact of the target, not a runtime kind read: `comptime_if
+# os::target` folds the winning bodies at parse, so neither reserve inspects the node to decide
+# its shape. What Materialize cannot prove stays on the shared bump floor, coherent because
+# both honor this identical layout. Like the other geometries this logic lives in std SOURCE;
+# nothing is `pub` — the compiler places every call by mangled name (`reserve_ret__pg`,
+# `on_alloc_ret__pg$T`, …).
+import std::mem::raw
+import std::comptime::os
+import std::sys::{ Os }
+
+if os::target == Os.Bare then {
+	const reserve_ret = (Uarch node, Uarch sz): Uarch -> {
+		const Uarch p = raw::load(node)
+		const Uarch nt = p + sz
+		if nt > raw::load(node + 40) then raw::trap()
+		raw::store(node, nt)
+		return p
+	}
+	const reserve_alloc = (Uarch node, Uarch sz): Uarch -> {
+		const Uarch r = node + 40
+		const Uarch dn = raw::load(r) - sz
+		if dn < raw::load(node) then raw::trap()
+		raw::store(r, dn)
+		return dn
+	}
+} else {
+	const reserve_ret = (Uarch node, Uarch sz): Uarch -> {
+		const Uarch p = raw::load(node)
+		const Uarch nt = p + sz
+		if nt > raw::load(node + 8) then raw::trap()
+		if nt > raw::load(node + 24) then raw::grow(node, nt)
+		raw::store(node, nt)
+		return p
+	}
+	const reserve_alloc = (Uarch node, Uarch sz): Uarch -> {
+		const Uarch r = node + 40
+		const Uarch p = raw::load(r)
+		const Uarch nt = p + sz
+		if nt > raw::load(r + 8) then raw::trap()
+		if nt > raw::load(r + 24) then raw::grow(r, nt)
+		raw::store(r, nt)
+		return p
+	}
+}
+
+# ── the scope bracket (geometry_lowering §2) ─────────────────────────────────────────────
+# Close a residue scope: rewind the residue side to the saved `{top, limit}` mark (emit
+# snapshots it at entry — the folded `on_scope_enter`). Neither root lane ever pulls — a bare
+# down lane and a darwin up lane each only bump their top, so the limit is unchanged and the
+# top is always restored (a darwin lane leaves `aux`/committed advanced, so the restore never
+# re-commits). The uniform limit-compare keeps one bump-family body — formerly the floor
+# `cf_reset`. `node+40` is the residue top; `node+48` its limit.
+const on_scope_exit = (Uarch node, Uarch top, Uarch lim): Uarch -> {
+	if raw::load(node + 48) == lim then raw::store(node + 40, top)
+	return 0
+}
+
+# ── the value hooks (geometry_lowering §1) ───────────────────────────────────────────────
+# Fold-lite fuses these to `reserve_*` + build-in-place (identity-law-equal); the bodies
+# stay the contract for a site that must relocate a pre-constructed value. `on_alloc_ret` is
+# the identity — a returned value was born on the callee's survivor side and outlives the call.
+
+const on_alloc = ['T](Uarch node, 'T v): 'T -> raw::place(reserve_alloc(node, raw::size_of(v)), v)
+
+const on_ret = ['T](Uarch node, 'T v): 'T -> raw::place(reserve_ret(node, raw::size_of(v)), v)
+
+const on_alloc_ret = ['T](Uarch node, 'T v): 'T -> v

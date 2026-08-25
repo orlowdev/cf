@@ -1,0 +1,121 @@
+# std/mem/arena/growing_arena — the ELASTIC carved bump geometry (geometry_lowering §5): the
+# `el` half of the old two-shape `arena`. `mem.arena.grow(n)` carves an elastic arena from the
+# ambient node — its survivor bumps within its block and PULLS a fresh n-sized block from the
+# parent on overflow; its residue is a lazy private chain that pulls its own chunks. An elastic
+# arena has NO shared two-ended block (a survivor that pulls away would let a still-linked residue
+# clobber its limit — see the merged module's history). Splitting fixed from elastic makes every
+# reserve MONOMORPHIC: the constructor picks the shape at comptime, so the reserves never test a
+# stored kind.
+#
+# Duplex header (72 bytes, shared with the whole bump family):
+#   node+0  survivor { top@0, limit@8, parent@16, aux@24, reserve@32 }
+#   node+40 residue  { top@0, limit@8, parent@16, aux@24 }
+#
+# An elastic arena reads `aux` as its pull CHUNK (the block size to re-request); `limit` is the
+# live overflow bound. Auto-loaded on any `mem.arena.grow` use; the constructor is `of` (each
+# geometry names its constructor `of` — the `.grow` surface selects THIS module), everything
+# called by mangled name (`of__el`, `reserve_ret__el`, …); nothing is `pub`. The pull slow path
+# draws from the PARENT node through `raw::alloc`, which follows the parent's published reserve
+# entry (`parent+32`) — the parent axis, open to any parent geometry.
+
+# `growing_arena.of(n)` — the constructor SURFACE: a bodyless intrinsic, a token the user imports
+# and calls with only the args THEY provide. The compiler supplies the whole behavior at the
+# call site, spending the ambient node it already holds on the placed `carve` below.
+import std::mem::raw
+
+pub intrinsic of = (Uarch n): Uarch
+
+# `growing_arena::destroy(b)` — the wall-dissolution teardown (geometry_lowering §3): dissolve a
+# carved elastic child `b` back into its parent, reclaiming its whole extent — header, initial
+# block, AND every chunk it pulled from the parent (all bumped onto the parent's survivor after the
+# child's base). A single SURVIVOR REWIND to the child's base (the carve mark) reclaims the lot; the
+# escaping closure, born survivor-side above the child, is untouched. `b` carries its parent at
+# `b+16`. User-placed (`|> defer destroy`); the compiler supplies the behavior at the call site.
+pub intrinsic destroy = (Uarch node): ()
+
+# Carve a GROWING (elastic) arena: survivor over the whole initial block (chunk = block size in
+# `aux` at +24, read by `pull` on overflow); residue the lazy private chain (empty, chunk in its
+# own `aux` at +64). The `reserve` slot (+32) is NOT written — emit publishes this node's reserve
+# entry there after the carve. `node` is compiler-supplied (the ambient parent) when lowering an
+# `of(n)` call.
+const carve = (Uarch node, Uarch n): Uarch -> {
+	const Uarch r = (n + 7) % 8
+	const Uarch sz = n + 7 - r
+	const Uarch hdr = raw::alloc(node, 72)
+	const Uarch blk = raw::alloc(node, sz)
+	const Uarch end = blk + sz
+	raw::store(hdr, blk)
+	raw::store(hdr + 8, end)
+	raw::store(hdr + 16, node)
+	raw::store(hdr + 24, sz)
+	raw::store(hdr + 40, 0)
+	raw::store(hdr + 48, 0)
+	raw::store(hdr + 56, node)
+	raw::store(hdr + 64, sz)
+	return hdr
+}
+
+# An elastic subnode's grow step (≡ the floor's cf_arena_pull): pull a fresh block — the larger
+# of the subnode's chunk (`aux` at sub+24) and the request — from the parent (at sub+16) and reset
+# the subnode's {top, limit} to it. The old block leaks into the parent (no per-object free);
+# returned pointers stay valid.
+const pull = (Uarch sub, Uarch sz): Uarch -> {
+	const Uarch chunk = raw::load(sub + 24)
+	let Uarch bs = sz
+	if chunk > sz then bs = chunk
+	const Uarch parent = raw::load(sub + 16)
+	const Uarch blk = raw::alloc(parent, bs)
+	raw::store(sub, blk)
+	raw::store(sub + 8, blk + bs)
+	return 0
+}
+
+# Reserve `sz` on the SURVIVOR side — `on_ret` minus the copy. An elastic survivor bumps within
+# its block and pulls a fresh chunk on overflow (limit at node+8). Monomorphic: no kind test.
+const reserve_ret = (Uarch node, Uarch sz): Uarch -> {
+	let Uarch p = raw::load(node)
+	if p + sz > raw::load(node + 8) then {
+		pull(node, sz)
+		p = raw::load(node)
+	}
+	raw::store(node, p + sz)
+	return p
+}
+
+# Reserve `sz` on the RESIDUE side — `on_alloc` minus the copy. An elastic residue bumps up its
+# private chain (at node+40), pulling its first/next chunk from the parent as needed (limit at
+# node+48). Monomorphic: no kind test.
+const reserve_alloc = (Uarch node, Uarch sz): Uarch -> {
+	const Uarch r = node + 40
+	let Uarch p = raw::load(r)
+	if p + sz > raw::load(r + 8) then {
+		pull(r, sz)
+		p = raw::load(r)
+	}
+	raw::store(r, p + sz)
+	return p
+}
+
+# ── the scope bracket (geometry_lowering §2) ─────────────────────────────────────────────
+# An elastic residue can pull mid-scope, so a bare top is not a sound mark: the exit must know
+# the block it landed in. The mark is the residue subnode's saved `{top, limit}` (top at node+40,
+# limit at node+48), snapshotted into emit's temps at scope entry (the folded `on_scope_enter`) —
+# NO storage in the arena, so no per-`!`-call leak (the earlier in-arena 16-byte record cost
+# hundreds of MB on a self-compile). Exit restores the top only when the saved limit is unchanged
+# (no pull happened); a pull moved the block, so restoring would park the cursor at the old wall
+# and re-pull every call (churn) — skip it, leaking the marked interval once, reclaimed at the
+# node's own teardown. This is the leak-free realisation of the floor `cf_reset` regime.
+const on_scope_exit = (Uarch node, Uarch top, Uarch lim): Uarch -> {
+	if raw::load(node + 48) == lim then raw::store(node + 40, top)
+	return 0
+}
+
+# ── the value hooks (geometry_lowering §1) ───────────────────────────────────────────────
+# Fold-lite fuses these into reserve + build-in-place; the bodies serve the sites a
+# pre-constructed value must genuinely relocate through. on_alloc_ret is the identity — the
+# callee's survivor side outlives the call (the bump family's claim fold).
+const on_alloc = ['T](Uarch node, 'T v): 'T -> raw::place(reserve_alloc(node, raw::size_of(v)), v)
+
+const on_ret = ['T](Uarch node, 'T v): 'T -> raw::place(reserve_ret(node, raw::size_of(v)), v)
+
+const on_alloc_ret = ['T](Uarch node, 'T v): 'T -> v
