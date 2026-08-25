@@ -2914,6 +2914,22 @@ const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env)
 		write_str(ctx.fd, "\t%t${bfr} =l call $f${cfb}(l %node_0, l ${bfv})\n")
 		return "%t${bfr}"
 	}
+	# `<geom>::destroy(b)` — the wall-dissolution teardown (geometry_lowering §3): a carved child is
+	# reclaimed by a SURVIVOR REWIND — the child was carved at the parent's survivor cursor, so its
+	# base IS the carve mark; setting the parent's survivor top (`parent+0`, where `parent` is the
+	# child's survivor parent link at `b+24`) back to `b` reclaims the child and everything bumped
+	# after it. Uniform for the bump family (fx/el); user-placed via `defer`.
+	if (str_eq(callee, "destroy__fx") || str_eq(callee, "destroy__el")) && callee_is_intrinsic(ctx, callee) then {
+		const Str bn = emit_expr!(args[0], ctx, env)
+		const Iarch pp = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${pp} =l add ${bn}, 24\n")
+		const Iarch par = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${par} =l loadl %t${pp}\n")
+		write_str(ctx.fd, "\tstorel ${bn}, %t${par}\n")
+		return ""
+	}
 	# the raw-memory intrinsics (`raw::*` / `size_of`) — the substrate the std geometry
 	# modules are written in (parser-gated to `std/mem/…`). An aggregate's emitted value IS
 	# its base/header address, so `addr` forwards it; `load`/`store` move one register word;
@@ -4227,12 +4243,9 @@ const emit_simple_stmt! = (*Emit ctx, [Binding] env, Stmt s): Iarch -> {
 				if routes_residue(ctx, n) then ctx.alloc_node = "%res_0"
 			} else {
 				if ctx.reset_mark >= 0 then ctx.alloc_node = "%res_0"
-				if is_direct_carve(e) && routes_residue(ctx, n) then {
-					if carve_iter_ok!(ctx, env, n, false) then {
-						ctx.carve_node = "%res_0"
-						if has_str(ctx.growok, n) then ctx.grow_node = "%res_0"
-					}
-				}
+				# child nodes carve UNIFORMLY from the parent's survivor side (the `destroy` arc): a
+				# scratch child is reclaimed by an explicit `defer <geom>::destroy`, so carve_node /
+				# grow_node stay `%node_0` — the residue-carve tightening + interlocks are retired.
 			}
 			if str_eq(env[idx].rec_type, "$dyn") && is_self_spread(e, n) then {
 				const Str hdr = binding_ptr!(ctx, env, idx)
@@ -4377,12 +4390,8 @@ const emit_block! = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 					const Str saved_cn = ctx.carve_node
 					const Str saved_gn = ctx.grow_node
 					if ctx.reset_mark >= 0 then ctx.alloc_node = "%res_0"
-					if is_direct_carve(e) && routes_residue(ctx, n) then {
-						if carve_iter_ok!(ctx, env, n, true) then {
-							ctx.carve_node = "%res_0"
-							if has_str(ctx.growok, n) then ctx.grow_node = "%res_0"
-						}
-					}
+						# child nodes carve UNIFORMLY from the parent's survivor side (the `destroy` arc)
+						# — no residue-side carve; carve_node / grow_node stay `%node_0`.
 					const Str v = emit_expr!(e, ctx, env)
 					ctx.alloc_node = saved_an
 					ctx.carve_node = saved_cn
