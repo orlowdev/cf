@@ -1,0 +1,78 @@
+# fmt — the cf source formatter.
+#
+# `cf format <file> [--check]` (alias `f`) — reformats cf source in place, or, with `--check`,
+# writes nothing and exits non-zero if the file is not already formatted (the CI gate; cf_cli
+# §7). It is the same formatter the pipeline uses to canonicalise every emitted `.cf`, exposed
+# as a command — so `cf format`'s output and an arc emit are byte-for-byte the same text.
+#
+# The formatter is COMMENT-PRESERVING: it lexes with `lex_fmt` (which keeps `#…` comments as
+# `Comment` tokens) and reflows the token stream. It deliberately does NOT run the parser —
+# cf has no `;`, so newlines are statement separators; the formatter keeps the user's line
+# breaks and canonicalises only indentation, spacing, blank-line runs, comment width, group
+# layout, trailing commas, and top-level ordering.
+#
+# Phase A: an IDENTITY core (reproduce the bytes) plus the read / write-in-place / `--check`
+# plumbing. The real reflow arrives in later phases; the core stays a pure `[Uint8] -> [Uint8]`
+# so the CLI command and the pipeline canonicaliser share one implementation.
+
+import io::{ open, read, write, close, die, eprint, o_rdonly, o_wronly_creat_trunc, mode_644 }
+import token::{ Token, TokKind }
+import lexer::{ lex_fmt }
+
+# The formatted bytes of `src[0..n]`. Phase A: a faithful copy. The output is a growing
+# `[Uint8]` so `--check` can compare it against the original in memory without writing. Not
+# `!`: the built vector RIDES OUT to the caller (a survivor), so this frame holds no residue —
+# the residue is the caller's (`format_file!`), which owns the arena.
+pub const format_source = (*[Uint8] src, Iarch n): [Uint8] -> {
+	let [Uint8] out = []
+	let Iarch i = 0
+	loop {
+		if i >= n then break
+		out = [...out, src[i]]
+		i = i + 1
+	}
+	return out
+}
+
+# Format one file. `check` selects the `--check` gate: it never writes, and returns 1 if the
+# file is not already formatted, else 0. Without `--check` it rewrites the file in place
+# (skipping the write when the file is already formatted) and returns 0.
+pub const format_file! = (Str path, Bool check): Iarch -> {
+	# One file's read buffer — sized like resolve's (cf's own largest module, emit.cf, is past
+	# 256 KB; 1 MB leaves headroom). A read that FILLS the buffer means truncation — die loudly.
+	let [1048576 Uint8] buf
+	const Iarch fd = open(path.bytes, Uarch(o_rdonly), 0)
+	if fd < 0 then die("cf: format: cannot open the input file\n")
+	const Iarch n = read(Uarch(fd), buf, Uarch(buf.len))
+	close(Uarch(fd))
+	if n < 0 then die("cf: format: reading the input file failed\n")
+	if n >= Iarch(buf.len) then die("cf: format: the input file exceeds the read buffer — grow it in fmt.cf\n")
+
+	const [Uint8] out = format_source(buf, n)
+
+	# Is the file already formatted? (out == buf[0..n], byte for byte.)
+	let Bool same = Iarch(out.len) == n
+	if same then {
+		let Iarch j = 0
+		loop {
+			if j >= n then break
+			if Iarch(buf[j]) != Iarch(out[j]) then {
+				same = false
+				break
+			}
+			j = j + 1
+		}
+	}
+
+	if check then {
+		if same then return 0
+		eprint("cf: format: file is not formatted (run `cf format` to fix)\n")
+		return 1
+	}
+	if same then return 0
+	const Iarch wfd = open(path.bytes, Uarch(o_wronly_creat_trunc), Uarch(mode_644))
+	if wfd < 0 then die("cf: format: cannot open the file for writing\n")
+	write(Uarch(wfd), out, Uarch(out.len))
+	close(Uarch(wfd))
+	return 0
+}
