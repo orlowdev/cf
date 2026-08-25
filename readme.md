@@ -118,7 +118,7 @@ pub const main = () -> 3 |> inc |> inc |> sum(10)   # sum(10) is partial → sum
 ## Hello, world
 
 ```c!
-import "std/io/console" as { print }
+import std::io::console::{ print }
 
 pub const main = () -> {
 	print("Hello, world!\n")
