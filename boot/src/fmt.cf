@@ -16,7 +16,7 @@
 # and the pipeline canonicaliser share one implementation.
 
 import io::{ open, read, write, close, die, eprint, o_rdonly, o_wronly_creat_trunc, mode_644 }
-import token::{ Token, TokKind, is_eof, is_strlit, is_comment, is_comma, is_arrow, is_lparen, is_rparen, is_lbrace, is_rbrace, is_lbracket, is_rbracket }
+import token::{ Token, TokKind, is_eof, is_strlit, is_comment, is_comma, is_arrow, is_logor, is_logand, is_lparen, is_rparen, is_lbrace, is_rbrace, is_lbracket, is_rbracket }
 import lexer::{ lex_fmt }
 
 # --- token geometry ----------------------------------------------------------
@@ -156,9 +156,10 @@ pub const format_source! = (*[Uint8] src, Iarch n): [Uint8] -> {
 				if nl >= 2 then out = [...out, Uint8(10)]
 				let Iarch ind = depth
 				if is_closer(t.kind) then ind = depth - 1
-				# a line broken right after a `->` is an arrow-body continuation — indent it one
-				# stop past its bracket depth (the `break_arrows!` pass places such breaks)
-				if is_arrow(p.kind) then ind = ind + 1
+				# a line broken right after a `->`, or one led by a `||`/`&&`, is an expression
+				# continuation — indent it one stop past its bracket depth (the `break_expr!` pass
+				# places such breaks)
+				if is_arrow(p.kind) || is_logor(t.kind) || is_logand(t.kind) then ind = ind + 1
 				if ind < 0 then ind = 0
 				let Iarch ti = 0
 				loop {
@@ -469,14 +470,14 @@ const reflow! = (*[Uint8] src, Iarch n): [Uint8] -> {
 	return out
 }
 
-# Arrow-break pass (Phase D, higher precedence than argument reflow): for each over-long line
-# that carries a top-level `->` whose expression body would fit on ONE line indented a further
-# tab, break right after the `->` and drop the body to that line. `format_source!` supplies the
-# `+1` indent (a line after a `->` is an arrow continuation). Only fires when the body fits on a
-# single line — a body that would still overflow is left for the later passes, whose nested
-# continuation indent this pass does not attempt. One break per line; only structural newlines
-# change, so a buffer already in shape returns equal.
-const break_arrows! = (*[Uint8] src, Iarch n): [Uint8] -> {
+# Expression-break pass (Phase D, higher precedence than argument reflow): for each over-long
+# line with a top-level `->` and an expression (non-block) body, either drop the body onto one
+# continuation line if it fits a further tab in, or — failing that — split it on its top-level
+# `||`/`&&` when every operand then fits on its own continuation line. `format_source!` supplies
+# the `+1` indent (a line after a `->`, or led by `||`/`&&`, is a continuation). A body that
+# still would not fit either way is left for the argument pass, whose NESTED continuation indent
+# this pass does not attempt. Only structural newlines change, so a settled buffer returns equal.
+const break_expr! = (*[Uint8] src, Iarch n): [Uint8] -> {
 	const [Token] toks = lex_fmt(src, n)
 	const Iarch nt = Iarch(toks.len)
 	let [Iarch] gapd = []
@@ -501,37 +502,76 @@ const break_arrows! = (*[Uint8] src, Iarch n): [Uint8] -> {
 				if src_lo(toks[ti]) >= le then break
 				ti = ti + 1
 			}
-			# width through the last non-comment token, capped at the visual line end
+			# width through the last non-comment token (`belast`), capped at the visual line end
 			let Iarch cend = ls
+			let Iarch belast = 0 - 1
 			let Iarch w = tstart
 			loop {
 				if w >= ti then break
-				if !is_comment(toks[w].kind) then cend = src_hi(toks[w])
+				if !is_comment(toks[w].kind) then {
+					cend = src_hi(toks[w])
+					belast = w
+				}
 				w = w + 1
 			}
 			if cend > le then cend = le
 			if cend - ls > line_limit && tstart < ti then {
 				const Iarch indent = src_lo(toks[tstart]) - ls
-				# the FIRST top-level `->` (relative depth 0) whose expression body fits at +1 tab
+				# the FIRST top-level (relative depth 0) `->` with an expression (non-block) body
 				let Iarch rel = 0
+				let Iarch arrow = 0 - 1
 				let Iarch j = tstart
 				loop {
 					if j >= ti then break
 					const TokKind jk = toks[j].kind
 					if is_opener(jk) then rel = rel + 1
 					else if is_closer(jk) then rel = rel - 1
-					else if is_arrow(jk) then {
-						if rel == 0 && j + 1 < ti then {
-							if !is_lbrace(toks[j + 1].kind) then {
-								const Iarch bodylen = indent + 1 + cend - src_lo(toks[j + 1])
-								if bodylen <= line_limit then {
-									gapd[j + 1] = gap_nl
-									break
-								}
+					else if is_arrow(jk) && rel == 0 && j + 1 < ti && !is_lbrace(toks[j + 1].kind) then {
+						arrow = j
+						break
+					}
+					j = j + 1
+				}
+				if arrow >= 0 then {
+					const Iarch bs = arrow + 1
+					const Iarch bodylen = indent + 1 + cend - src_lo(toks[bs])
+					if bodylen <= line_limit then {
+						# the body fits on one continuation line — drop it after the `->`
+						gapd[bs] = gap_nl
+					} else {
+						# else split the body on its top-level `||`/`&&`, but only if every operand
+						# then fits on its own continuation line (no nested breaking attempted)
+						let Iarch r2 = 0
+						let Bool ok = true
+						let Iarch segstart = bs
+						let Iarch m = bs
+						loop {
+							if m > belast then break
+							const TokKind mk = toks[m].kind
+							if is_opener(mk) then r2 = r2 + 1
+							else if is_closer(mk) then r2 = r2 - 1
+							else if (is_logor(mk) || is_logand(mk)) && r2 == 0 then {
+								if indent + 1 + src_hi(toks[m - 1]) - src_lo(toks[segstart]) > line_limit then ok = false
+								segstart = m
+							}
+							m = m + 1
+						}
+						if indent + 1 + src_hi(toks[belast]) - src_lo(toks[segstart]) > line_limit then ok = false
+						if ok && segstart > bs then {
+							# break after the `->` and before each top-level operator
+							gapd[bs] = gap_nl
+							let Iarch r3 = 0
+							let Iarch q = bs
+							loop {
+								if q > belast then break
+								const TokKind qk = toks[q].kind
+								if is_opener(qk) then r3 = r3 + 1
+								else if is_closer(qk) then r3 = r3 - 1
+								else if (is_logor(qk) || is_logand(qk)) && r3 == 0 then gapd[q] = gap_nl
+								q = q + 1
 							}
 						}
 					}
-					j = j + 1
 				}
 			}
 			ls = p + 1
@@ -595,7 +635,7 @@ pub const format_file! = (Str path, Bool check): Iarch -> {
 	if n < 0 then die("cf: format: reading the input file failed\n")
 	if n >= Iarch(buf.len) then die("cf: format: the input file exceeds the read buffer — grow it in fmt.cf\n")
 
-	# Format-first fit reflow (Phase D): canonicalise, then each round apply `break_arrows!`
+	# Format-first fit reflow (Phase D): canonicalise, then each round apply `break_expr!`
 	# (drop a fitting `->` body to its own line — higher precedence) and `reflow!` (collapse or
 	# explode one level of comma-groups), re-`format_source!`-ing after each, until the result
 	# stops changing. Every pass only rewrites structural newlines and the re-format is idempotent,
@@ -604,7 +644,7 @@ pub const format_file! = (Str path, Bool check): Iarch -> {
 	let Iarch guard = 0
 	loop {
 		if guard >= 100 then break
-		const [Uint8] ba = break_arrows!(out, Iarch(out.len))
+		const [Uint8] ba = break_expr!(out, Iarch(out.len))
 		const [Uint8] ab = format_source!(ba, Iarch(ba.len))
 		const [Uint8] rf = reflow!(ab, Iarch(ab.len))
 		const [Uint8] re = format_source!(rf, Iarch(rf.len))
