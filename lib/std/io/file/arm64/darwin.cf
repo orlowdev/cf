@@ -1,0 +1,58 @@
+# File IO for arm64/darwin, over the raw BSD syscalls (read 3, write 4, open 5, close 6). Every
+# fallible operation returns `Either[IoErr, T]`: darwin reports failure as a negative return (the
+# negated errno), so each wrapper tests `< 0` once and lifts the result into `Left(IoErr)` or
+# `Right(value)`. Callers `match` the outcome — no raw negative codes leak past this floor.
+#
+# The open modes are intent-named, not flag-exposed: `open_read` is O_RDONLY (0); `create` is
+# O_WRONLY|O_CREAT|O_TRUNC (darwin 1|0x200|0x400 = 1537) with mode 0644 (= 420). Those two cover the
+# compiler's whole need — reading a source, writing an output — so the flag soup stays private here.
+import std::sys::{ syscall6 }
+import std::data::{ Either }
+import std::io::fd::{ Fd, IoErr }
+
+# open() with O_RDONLY. `path.bytes` is the NUL-terminated byte pointer the kernel wants.
+pub const open_read = (Str path): Either[IoErr, Fd] -> {
+	const Iarch r = syscall6(5, path.bytes, 0, 0, 0, 0, 0)
+
+	if r < 0 then return Either[IoErr, Fd].Left(IoErr({ errno: r }))
+
+	return Either[IoErr, Fd].Right(Fd({ n: Uarch(r) }))
+}
+
+# open() a fresh output file: O_WRONLY|O_CREAT|O_TRUNC, mode 0644.
+pub const create = (Str path): Either[IoErr, Fd] -> {
+	const Iarch r = syscall6(5, path.bytes, 1537, 420, 0, 0, 0)
+
+	if r < 0 then return Either[IoErr, Fd].Left(IoErr({ errno: r }))
+
+	return Either[IoErr, Fd].Right(Fd({ n: Uarch(r) }))
+}
+
+# read() up to `n` bytes into `buf` (a `*[Uint8]` byte pointer). `Right` carries the count read
+# (0 = EOF); `Left` an error.
+pub const read = (Fd fd, *[Uint8] buf, Uarch n): Either[IoErr, Iarch] -> {
+	const Iarch r = syscall6(3, fd.n, buf, n, 0, 0, 0)
+
+	if r < 0 then return Either[IoErr, Iarch].Left(IoErr({ errno: r }))
+
+	return Either[IoErr, Iarch].Right(r)
+}
+
+# write() a whole Str to `fd`. `Right` carries the count written; `Left` an error.
+pub const write = (Fd fd, Str s): Either[IoErr, Iarch] -> {
+	const Iarch r = syscall6(4, fd.n, s.bytes, Uarch(s.len), 0, 0, 0)
+
+	if r < 0 then return Either[IoErr, Iarch].Left(IoErr({ errno: r }))
+
+	return Either[IoErr, Iarch].Right(r)
+}
+
+# close() the descriptor. `Right(0)` on success; `Left` an error. (A scalar `0` stands in for "no
+# value" — a unit payload in a generic union is avoided.)
+pub const close = (Fd fd): Either[IoErr, Iarch] -> {
+	const Iarch r = syscall6(6, fd.n, 0, 0, 0, 0, 0)
+
+	if r < 0 then return Either[IoErr, Iarch].Left(IoErr({ errno: r }))
+
+	return Either[IoErr, Iarch].Right(r)
+}
