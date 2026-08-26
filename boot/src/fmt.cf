@@ -71,6 +71,7 @@ const tok_is_then = (*[Uint8] src, Token t): Bool -> {
 	if Iarch(src[t.start + 1]) != 104 then return false
 	if Iarch(src[t.start + 2]) != 101 then return false
 	if Iarch(src[t.start + 3]) != 110 then return false
+
 	return true
 }
 
@@ -81,6 +82,7 @@ const tok_is_else = (*[Uint8] src, Token t): Bool -> {
 	if Iarch(src[t.start + 1]) != 108 then return false
 	if Iarch(src[t.start + 2]) != 115 then return false
 	if Iarch(src[t.start + 3]) != 101 then return false
+
 	return true
 }
 
@@ -91,6 +93,20 @@ const tok_is_loop = (*[Uint8] src, Token t): Bool -> {
 	if Iarch(src[t.start + 1]) != 111 then return false
 	if Iarch(src[t.start + 2]) != 111 then return false
 	if Iarch(src[t.start + 3]) != 112 then return false
+
+	return true
+}
+
+# Does token `t`'s source text equal the keyword `return` (bytes r,e,t,u,r,n)?
+const tok_is_return = (*[Uint8] src, Token t): Bool -> {
+	if Iarch(t.len) != 6 then return false
+	if Iarch(src[t.start]) != 114 then return false
+	if Iarch(src[t.start + 1]) != 101 then return false
+	if Iarch(src[t.start + 2]) != 116 then return false
+	if Iarch(src[t.start + 3]) != 117 then return false
+	if Iarch(src[t.start + 4]) != 114 then return false
+	if Iarch(src[t.start + 5]) != 110 then return false
+
 	return true
 }
 
@@ -101,6 +117,7 @@ const tok_is_loop = (*[Uint8] src, Token t): Bool -> {
 const opens_stmt_block = (*[Uint8] src, [Token] toks, Iarch o): Bool -> {
 	if o <= 0 then return false
 	const Token p = toks[o - 1]
+
 	return is_arrow(p.kind) || tok_is_then(src, p) || tok_is_else(src, p) || tok_is_loop(src, p)
 }
 
@@ -197,13 +214,15 @@ pub const format_source! = (*[Uint8] src, Iarch n): [Uint8] -> {
 		pi = pi + 1
 	}
 
-	# Blank lines around a `loop` STATEMENT (a `loop {…}` run for effect — NOT a `->`/`then`/`else`
-	# body loop nor a `= …` value loop). `blank_before[j]` forces one blank line before token j: it
-	# is set on the `loop` keyword to open a gap ABOVE (unless the loop is the block's first
-	# statement, i.e. `{` sits right before it) and on the token AFTER the loop's matching `}` to
-	# open a gap BELOW (unless that token is the block's own `}`, i.e. the loop is the block's last
-	# statement). The gap is only ever emitted where a newline already falls, so a same-line value
-	# loop is untouched.
+	# Blank lines around `loop` and `return` STATEMENTS. `blank_before[j]` forces one blank line
+	# before token j. A `loop {…}` run for effect is fenced ABOVE (unless it is the block's first
+	# statement, i.e. `{` sits right before it) and BELOW (unless the token after its matching `}` is
+	# the block's own `}`, i.e. it is the block's last statement); a `return` gets a blank ABOVE
+	# unless it is the block's first statement. EXCLUDED in both cases: a `->`/`then`/`else` body (the
+	# loop or return IS the body, not a block statement) and — for loops — a `= …` value loop. A
+	# comment glued directly above the statement (on the line right above, no blank between) is
+	# carried WITH it: the blank opens above the comment so it stays attached to what it documents.
+	# The gap is only ever emitted where a newline already falls, so a same-line value loop is untouched.
 	let [Bool] blank_before = []
 	let Iarch bz = 0
 
@@ -217,26 +236,42 @@ pub const format_source! = (*[Uint8] src, Iarch n): [Uint8] -> {
 
 	loop {
 		if li >= Iarch(toks.len) then break
-		if tok_is_loop(src, toks[li]) && li > 0 && li + 1 < Iarch(toks.len) && is_lbrace(toks[li + 1].kind) then {
-			const Token pv = toks[li - 1]
-			if !is_arrow(pv.kind) && !tok_is_then(src, pv) && !tok_is_else(src, pv) && !is_eq(pv.kind) then {
-				if !is_lbrace(pv.kind) then blank_before[li] = true
-				# find the loop's matching `}` by tracking brace/bracket depth from its opener
-				let Iarch d = 0
-				let Iarch m = li + 1
+		const Bool is_loop_stmt = tok_is_loop(src, toks[li]) && li + 1 < Iarch(toks.len) && is_lbrace(toks[li + 1].kind)
+		const Bool is_ret_stmt = tok_is_return(src, toks[li])
+		if (is_loop_stmt || is_ret_stmt) && li > 0 then {
+			# the statement's head: walk back over comment lines glued directly above it (each on the
+			# line right above, no blank line intervening), so the blank opens above the comment run
+			let Iarch head = li
 
-				loop {
-					if m >= Iarch(toks.len) then break
-					if is_opener(toks[m].kind) then d = d + 1
-						else if is_closer(toks[m].kind) then {
-						d = d - 1
-						if d == 0 then break
+			loop {
+				if head <= 0 then break
+				if !is_comment(toks[head - 1].kind) then break
+				if count_nl(src, src_hi(toks[head - 1]), src_lo(toks[head])) != 1 then break
+				head = head - 1
+			}
+
+			if head > 0 then {
+				const Token pv = toks[head - 1]
+				const Bool body = is_arrow(pv.kind) || tok_is_then(src, pv) || tok_is_else(src, pv) || is_eq(pv.kind)
+				if !body && !is_lbrace(pv.kind) then blank_before[head] = true
+				# a loop is also fenced BELOW unless it closes the block
+				if is_loop_stmt && !body then {
+					let Iarch d = 0
+					let Iarch m = li + 1
+
+					loop {
+						if m >= Iarch(toks.len) then break
+						if is_opener(toks[m].kind) then d = d + 1
+							else if is_closer(toks[m].kind) then {
+							d = d - 1
+							if d == 0 then break
+						}
+						m = m + 1
 					}
-					m = m + 1
-				}
 
-				if m + 1 < Iarch(toks.len) && !is_rbrace(toks[m + 1].kind) && !is_eof(toks[m + 1].kind)
-					then blank_before[m + 1] = true
+					if m + 1 < Iarch(toks.len) && !is_rbrace(toks[m + 1].kind) && !is_eof(toks[m + 1].kind)
+						then blank_before[m + 1] = true
+				}
 			}
 		}
 		li = li + 1
@@ -351,6 +386,7 @@ pub const format_source! = (*[Uint8] src, Iarch n): [Uint8] -> {
 	# trailing newline. NB: this is a STATEMENT append, not `return [...out, Uint8(10)]` — a
 	# spread in RETURN position corrupts (drops the last byte of) a large survivor array.
 	out = [...out, Uint8(10)]
+
 	return out
 }
 
@@ -617,6 +653,7 @@ const reflow! = (*[Uint8] src, Iarch n): [Uint8] -> {
 	}
 
 	out = [...out, Uint8(10)]
+
 	return out
 }
 
@@ -810,6 +847,7 @@ const break_expr! = (*[Uint8] src, Iarch n): [Uint8] -> {
 	}
 
 	out = [...out, Uint8(10)]
+
 	return out
 }
 
@@ -819,12 +857,14 @@ const break_expr! = (*[Uint8] src, Iarch n): [Uint8] -> {
 # fixpoint loop's live survivor set small on a large file.
 const break_and_format! = (*[Uint8] src, Iarch n): [Uint8] -> {
 	const [Uint8] ba = break_expr!(src, n)
+
 	return format_source!(ba, Iarch(ba.len))
 }
 
 # One `reflow!` + re-canonicalise step; same reclaim discipline as `break_and_format!`.
 const reflow_and_format! = (*[Uint8] src, Iarch n): [Uint8] -> {
 	const [Uint8] rf = reflow!(src, n)
+
 	return format_source!(rf, Iarch(rf.len))
 }
 
@@ -890,6 +930,7 @@ pub const format_file! = (Str path, Bool check): Iarch -> {
 	if check then {
 		if same then return 0
 		eprint("cf: format: file is not formatted (run `cf format` to fix)\n")
+
 		return 1
 	}
 	if same then return 0
@@ -897,5 +938,6 @@ pub const format_file! = (Str path, Bool check): Iarch -> {
 	if wfd < 0 then die("cf: format: cannot open the file for writing\n")
 	write(Uarch(wfd), out, Uarch(out.len))
 	close(Uarch(wfd))
+
 	return 0
 }
