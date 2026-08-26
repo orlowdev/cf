@@ -268,8 +268,10 @@ semantics; the grammar only admits `...expr` as an element.
 A data literal is a brace-delimited set of `field: value` pairs (fields are
 snake_case value names). The type name (e.g. `Point`) comes from the annotation
 or context, not the literal — the literal itself is structural. Empty `{}` is
-allowed; there is no trailing comma. It constructs an instance of a `data` type
-(see Data & Type Declarations).
+allowed, and a trailing comma is optional (as in every comma-separated list —
+data/type/union shapes, array literals, call and constructor arguments, and
+parameter lists — so a formatter may explode a long list one item per line). It
+constructs an instance of a `data` type (see Data & Type Declarations).
 
 ```ebnf
 data_literal = "{" , [ field_entry , { "," , field_entry } ] , "}" ;

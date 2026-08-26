@@ -12,8 +12,11 @@ import token::{ TokKind, Token }
 
 # Byte classes (ASCII).
 const is_space = (Iarch c): Bool -> c == 32 || c == 9 || c == 10 || c == 13
+
 const is_digit = (Iarch c): Bool -> c >= 48 && c <= 57
+
 const is_alpha = (Iarch c): Bool -> (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95
+
 const is_alnum = (Iarch c): Bool -> is_alpha(c) || is_digit(c)
 
 # The byte a char-literal escape `\<e>` decodes to. Mirrors the parser's string `escape_byte`,
@@ -26,6 +29,7 @@ const char_escape_byte = (Iarch e): Iarch -> {
 	if e == 92 then return 92   # backslash
 	if e == 39 then return 39   # \'
 	die("cf: lex: unknown char escape (allowed: \\n \\t \\r \\0 \\\\ \\')\n")
+
 	return 0
 }
 
@@ -37,6 +41,7 @@ const digit_value = (Iarch c): Iarch -> {
 	if c >= 65 && c <= 70 then return c - 65 + 10     # A-F
 	return 0 - 1
 }
+
 # The radix of a base-prefix letter following a leading `0` (`x`/`o`/`b`, case-insensitive), or 0
 # if the byte is not a base prefix (so the `0` begins an ordinary decimal literal).
 const base_radix = (Iarch c): Iarch -> {
@@ -45,16 +50,21 @@ const base_radix = (Iarch c): Iarch -> {
 	if c == 98 || c == 66 then return 2     # b / B
 	return 0
 }
+
 # Whether byte `c` is a digit valid in `radix`.
 const in_radix = (Iarch c, Iarch radix): Bool -> {
 	const Iarch dv = digit_value(c)
+
 	return dv >= 0 && dv < radix
 }
 
-# Lex the first `n` bytes of `src` into a token stream terminated by `Eof`.
-pub const lex = (*[Uint8] src, Iarch n): [Token] -> {
+# Lex the first `n` bytes of `src` into a token stream terminated by `Eof`. `keep_comments`
+# selects whether a `#…` line comment becomes a `Comment` token (the formatter's `lex_fmt`) or
+# is dropped (the compile path's `lex`, so the parser never meets a comment token).
+const lex_impl = (*[Uint8] src, Iarch n, Bool keep_comments): [Token] -> {
 	let [Token] toks = []
 	let Iarch i = 0
+
 	loop {
 		if i >= n then break
 		const Iarch c = Iarch(src[i])
@@ -62,13 +72,24 @@ pub const lex = (*[Uint8] src, Iarch n): [Token] -> {
 			i = i + 1
 			continue
 		}
-		# `#` line comment — skip to end of line (cf strips comments like cfcc).
+		# `#` line comment — the span runs from `#` to (but not including) the end of line. The
+		# compile path drops it; the formatter (`keep_comments`) keeps it as a `Comment` token so it
+		# can reflow and reposition the comment. Trailing whitespace stays in the span; the formatter
+		# trims it.
 		if c == 35 then {
+			const Iarch cstart = i
+
 			loop {
 				if i >= n then break
 				if Iarch(src[i]) == 10 then break
 				i = i + 1
 			}
+
+			if keep_comments
+				then toks = [
+				...toks,
+				Token({ kind: TokKind.Comment, ival: 0, start: cstart, len: i - cstart, text: "" }),
+			]
 			continue
 		}
 		# string literal: `"..."` — record the RAW content slice (between the quotes);
@@ -77,6 +98,7 @@ pub const lex = (*[Uint8] src, Iarch n): [Token] -> {
 		if c == 34 then {
 			const Iarch start = i + 1
 			let Iarch j = i + 1
+
 			loop {
 				if j >= n then die("cf: lex: unterminated string literal\n")
 				const Iarch d = Iarch(src[j])
@@ -87,7 +109,11 @@ pub const lex = (*[Uint8] src, Iarch n): [Token] -> {
 				if d == 34 then break
 				j = j + 1
 			}
-			toks = [...toks, Token({ kind: TokKind.StrLit, ival: 0, start: start, len: j - start, text: "" })]
+
+			toks = [
+				...toks,
+				Token({ kind: TokKind.StrLit, ival: 0, start: start, len: j - start, text: "" }),
+			]
 			i = j + 1
 			continue
 		}
@@ -97,12 +123,24 @@ pub const lex = (*[Uint8] src, Iarch n): [Token] -> {
 		# it as an ordinary integer (`p.toks[..].ival`) — no dedicated char token or parser arm.
 		if c == 39 then {
 			if i + 3 < n && Iarch(src[i + 1]) == 92 && Iarch(src[i + 3]) == 39 then {
-				toks = [...toks, Token({ kind: TokKind.IntLit, ival: char_escape_byte(Iarch(src[i + 2])), start: i, len: 4, text: "" })]
+				toks = [
+					...toks,
+					Token({
+						kind: TokKind.IntLit,
+						ival: char_escape_byte(Iarch(src[i + 2])),
+						start: i,
+						len: 4,
+						text: "",
+					}),
+				]
 				i = i + 4
 				continue
 			}
 			if i + 2 < n && Iarch(src[i + 1]) != 92 && Iarch(src[i + 2]) == 39 then {
-				toks = [...toks, Token({ kind: TokKind.IntLit, ival: Iarch(src[i + 1]), start: i, len: 3, text: "" })]
+				toks = [
+					...toks,
+					Token({ kind: TokKind.IntLit, ival: Iarch(src[i + 1]), start: i, len: 3, text: "" }),
+				]
 				i = i + 3
 				continue
 			}
@@ -117,10 +155,12 @@ pub const lex = (*[Uint8] src, Iarch n): [Token] -> {
 		if is_alpha(c) || c == 39 || c == 36 then {
 			const Iarch start = i
 			if c == 39 || c == 36 then i = i + 1
+
 			loop {
 				if i >= n then break
 				if is_alnum(Iarch(src[i])) then i = i + 1 else break
 			}
+
 			# a single trailing `!` is the allocation-effect marker (ebnf § Identifiers): `alloc!`
 			# is one identifier token. It joins the name only when it does NOT open `!=` — the `!`
 			# is absorbed iff the next character is not `=` — so `n != 0` and `n!= 0` still lex as
@@ -141,6 +181,7 @@ pub const lex = (*[Uint8] src, Iarch n): [Token] -> {
 				i = i + 2 # `0` + the base letter
 				let Iarch bv = 0
 				let Iarch ndig = 0
+
 				loop {
 					if i >= n then break
 					const Iarch d = Iarch(src[i])
@@ -149,15 +190,19 @@ pub const lex = (*[Uint8] src, Iarch n): [Token] -> {
 						bv = bv * radix + dv
 						ndig = ndig + 1
 						i = i + 1
-					}
-					else if d == 95 && ndig > 0 && i + 1 < n && in_radix(Iarch(src[i + 1]), radix) then i = i + 1
-					else break
+					} else if d == 95 && ndig > 0 && i + 1 < n && in_radix(Iarch(src[i + 1]), radix) then i = i + 1
+							else break
 				}
+
 				if ndig == 0 then die("cf: lex: a based integer literal needs at least one digit\n")
-				toks = [...toks, Token({ kind: TokKind.IntLit, ival: bv, start: start, len: i - start, text: "" })]
+				toks = [
+					...toks,
+					Token({ kind: TokKind.IntLit, ival: bv, start: start, len: i - start, text: "" }),
+				]
 				continue
 			}
 			let Iarch v = 0
+
 			loop {
 				if i >= n then break
 				const Iarch d = Iarch(src[i])
@@ -166,21 +211,29 @@ pub const lex = (*[Uint8] src, Iarch n): [Token] -> {
 				if is_digit(d) then {
 					v = v * 10 + (d - 48)
 					i = i + 1
-				}
-				else if d == 95 && i + 1 < n && is_digit(Iarch(src[i + 1])) then i = i + 1
-				else break
+				} else if d == 95 && i + 1 < n && is_digit(Iarch(src[i + 1])) then i = i + 1
+						else break
 			}
+
 			if i + 1 < n && Iarch(src[i]) == 46 && is_digit(Iarch(src[i + 1])) then {
 				i = i + 1
+
 				loop {
 					if i >= n then break
 					const Iarch d = Iarch(src[i])
 					if is_digit(d) || d == 95 then i = i + 1 else break
 				}
-				toks = [...toks, Token({ kind: TokKind.FloatLit, ival: 0, start: start, len: i - start, text: "" })]
+
+				toks = [
+					...toks,
+					Token({ kind: TokKind.FloatLit, ival: 0, start: start, len: i - start, text: "" }),
+				]
 				continue
 			}
-			toks = [...toks, Token({ kind: TokKind.IntLit, ival: v, start: start, len: i - start, text: "" })]
+			toks = [
+				...toks,
+				Token({ kind: TokKind.IntLit, ival: v, start: start, len: i - start, text: "" }),
+			]
 			continue
 		}
 		# `-` begins either the arrow `->` or the minus operator (unary/binary).
@@ -373,6 +426,15 @@ pub const lex = (*[Uint8] src, Iarch n): [Token] -> {
 		}
 		die("cf: lex: unexpected character\n")
 	}
+
 	toks = [...toks, Token({ kind: TokKind.Eof, ival: 0, start: n, len: 0, text: "" })]
+
 	return toks
 }
+
+# The compile path: strip comments, so the parser only ever sees semantic tokens.
+pub const lex = (*[Uint8] src, Iarch n): [Token] -> lex_impl(src, n, false)
+
+# The formatter path: keep `#…` comments as `Comment` tokens so the formatter can reflow and
+# reposition them (the parser never runs on this stream).
+pub const lex_fmt = (*[Uint8] src, Iarch n): [Token] -> lex_impl(src, n, true)

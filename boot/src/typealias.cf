@@ -9,29 +9,48 @@
 # (or EOF), tracking paren/bracket depth so a `(A) -> R` / `Box[Iarch]` target stays whole.
 
 import io::{ die }
-import token::{ Token, TokKind, is_ident, is_eq, is_eof, is_lbracket, is_rbracket, is_lparen, is_rparen, is_lbrace, is_rbrace, is_comma }
+import token::{
+	Token,
+	TokKind,
+	is_ident,
+	is_eq,
+	is_eof,
+	is_lbracket,
+	is_rbracket,
+	is_lparen,
+	is_rparen,
+	is_lbrace,
+	is_rbrace,
+	is_comma,
+}
 
 const str_eq = (Str a, Str b): Bool -> {
 	if a.len != b.len then return false
 	let Iarch i = 0
+
 	loop {
 		if i >= Iarch(a.len) then break
 		if Iarch(a[i]) != Iarch(b[i]) then return false
 		i = i + 1
 	}
+
 	return true
 }
+
 const tok_text! = (*[Uint8] src, Token t): Str -> {
 	if Iarch(t.text.len) > 0 then return t.text
 	let [Uint8] out = []
 	let Iarch i = 0
+
 	loop {
 		if i >= t.len then break
 		out = [...out, src[t.start + i]]
 		i = i + 1
 	}
+
 	return Str(out)
 }
+
 const is_decl_kw = (Str s): Bool -> {
 	if str_eq(s, "const") then return true
 	if str_eq(s, "pub") then return true
@@ -39,46 +58,59 @@ const is_decl_kw = (Str s): Bool -> {
 	if str_eq(s, "union") then return true
 	if str_eq(s, "type") then return true
 	if str_eq(s, "import") then return true
+
 	return false
 }
+
 # List concatenation building from `[]` (a `let o = a` would alias `a`'s store and the in-place
 # spread-append would mutate the caller's array).
 const cat_toks = ([Token] a, [Token] b): [Token] -> {
 	let [Token] o = []
 	let Iarch i = 0
+
 	loop {
 		if i >= Iarch(a.len) then break
 		o = [...o, a[i]]
 		i = i + 1
 	}
+
 	let Iarch j = 0
+
 	loop {
 		if j >= Iarch(b.len) then break
 		o = [...o, b[j]]
 		j = j + 1
 	}
+
 	return o
 }
 
 data Alias = { Str name, [Token] target }
+
 const find_alias = ([Alias] aliases, Str n): Iarch -> {
 	let Iarch i = 0
+
 	loop {
 		if i >= Iarch(aliases.len) then break
 		if str_eq(aliases[i].name, n) then return i
 		i = i + 1
 	}
+
 	return 0 - 1
 }
+
 const str_in = ([Str] names, Str n): Bool -> {
 	let Iarch i = 0
+
 	loop {
 		if i >= Iarch(names.len) then break
 		if str_eq(names[i], n) then return true
 		i = i + 1
 	}
+
 	return false
 }
+
 # Collect the DECLARATION names an alias must not collide with — data/union type names and union
 # MEMBER names. Token erasure is textual, so an alias name equal to one of these would clobber it
 # (a member `Green` inside `union Hue = { Red, Green, Blue }` would be rewritten to its target);
@@ -87,6 +119,7 @@ const str_in = ([Str] names, Str n): Bool -> {
 const collect_decl_names! = (*[Uint8] src, [Token] toks): [Str] -> {
 	let [Str] names = []
 	let Iarch i = 0
+
 	loop {
 		if i >= Iarch(toks.len) then break
 		if is_ident(toks[i].kind) && i + 1 < Iarch(toks.len) && is_ident(toks[i + 1].kind) then {
@@ -95,14 +128,17 @@ const collect_decl_names! = (*[Uint8] src, [Token] toks): [Str] -> {
 				names = [...names, tok_text!(src, toks[i + 1])]
 				if str_eq(w, "union") then {
 					let Iarch j = i + 2
+
 					loop {
 						if j >= Iarch(toks.len) || is_lbrace(toks[j].kind) then break
 						j = j + 1
 					}
+
 					j = j + 1  # past `{`
 					let Iarch bdepth = 1
 					let Iarch pdepth = 0
 					let Bool at_member = true
+
 					loop {
 						if j >= Iarch(toks.len) then break
 						const TokKind k = toks[j].kind
@@ -127,14 +163,17 @@ const collect_decl_names! = (*[Uint8] src, [Token] toks): [Str] -> {
 		}
 		i = i + 1
 	}
+
 	return names
 }
+
 # The index just past a `type Name = Target` declaration whose `type` token is at index `i` — the
 # target ends at the next top-level decl keyword (at depth 0) or EOF.
 const alias_decl_end! = (*[Uint8] src, [Token] toks, Iarch i): Iarch -> {
 	let Iarch j = i + 2  # past `type Name`
 	if j < Iarch(toks.len) && is_eq(toks[j].kind) then j = j + 1  # past `=`
 	let Iarch depth = 0
+
 	loop {
 		if j >= Iarch(toks.len) then break
 		if is_eof(toks[j].kind) then break
@@ -144,14 +183,17 @@ const alias_decl_end! = (*[Uint8] src, [Token] toks, Iarch i): Iarch -> {
 		if is_rparen(k) || is_rbracket(k) then depth = depth - 1
 		j = j + 1
 	}
+
 	return j
 }
+
 # Expand any alias names inside a target to a fixpoint (alias-of-alias); `fuel` guards a cycle.
 const expand_target! = (*[Uint8] src, [Alias] aliases, [Token] tgt, Iarch fuel): [Token] -> {
 	if fuel <= 0 then die("cf: type: a cyclic `type` alias\n")
 	let [Token] out = []
 	let Bool changed = false
 	let Iarch i = 0
+
 	loop {
 		if i >= Iarch(tgt.len) then break
 		let Bool spliced = false
@@ -166,13 +208,18 @@ const expand_target! = (*[Uint8] src, [Alias] aliases, [Token] tgt, Iarch fuel):
 		if !spliced then out = [...out, tgt[i]]
 		i = i + 1
 	}
+
 	if changed then return expand_target!(src, aliases, out, fuel - 1)
+
 	return out
 }
+
 const is_type_kw! = (*[Uint8] src, [Token] toks, Iarch i): Bool -> {
 	if !is_ident(toks[i].kind) then return false
+
 	return str_eq(tok_text!(src, toks[i]), "type")
 }
+
 # Whether the `type` token at `i` begins a GROUPED-PARAMETER decl `type X = { … }` (its target is a
 # `{ … }` field body) rather than a `type X = <type>` alias. A group is NEVER generic (628), so its
 # `=` is at i+2 and `{` at i+3. Groups are NOT erased here — they are left whole for the parser.
@@ -180,6 +227,7 @@ const is_group_type! = (*[Uint8] src, [Token] toks, Iarch i): Bool -> {
 	if !is_type_kw!(src, toks, i) then return false
 	if i + 3 >= Iarch(toks.len) then return false
 	if !is_eq(toks[i + 2].kind) then return false
+
 	return is_lbrace(toks[i + 3].kind)
 }
 
@@ -188,23 +236,33 @@ const is_group_type! = (*[Uint8] src, [Token] toks, Iarch i): Bool -> {
 const is_builtin_typename = (Str n): Bool -> {
 	if str_eq(n, "Iarch") || str_eq(n, "Int") || str_eq(n, "Uarch") then return true
 	if str_eq(n, "Str") || str_eq(n, "Bool") || str_eq(n, "Unit") then return true
-	if str_eq(n, "Int8") || str_eq(n, "Int16") || str_eq(n, "Int32") || str_eq(n, "Int64") then return true
-	if str_eq(n, "Uint8") || str_eq(n, "Uint16") || str_eq(n, "Uint32") || str_eq(n, "Uint64") then return true
+	if str_eq(n, "Int8") || str_eq(n, "Int16") || str_eq(n, "Int32") || str_eq(n, "Int64")
+		then return true
+	if str_eq(n, "Uint8") || str_eq(n, "Uint16") || str_eq(n, "Uint32") || str_eq(n, "Uint64")
+		then return true
 	if str_eq(n, "Float32") || str_eq(n, "Float64") then return true
+
 	return false
 }
+
 pub const strip_type_aliases! = (*[Uint8] src, [Token] toks): [Token] -> {
 	# pass 1 — collect every `type Name = Target`
 	let [Alias] aliases = []
 	let Iarch i = 0
+
 	loop {
 		if i >= Iarch(toks.len) then break
 		if is_type_kw!(src, toks, i) then {
-			if i >= 1 && is_ident(toks[i - 1].kind) && str_eq(tok_text!(src, toks[i - 1]), "pub") then die("cf: parse: a `type` alias cannot be `pub` (it is comptime-erased)\n")
-			if i + 1 >= Iarch(toks.len) || !is_ident(toks[i + 1].kind) then die("cf: parse: expected a name after `type`\n")
+			if i >= 1 && is_ident(toks[i - 1].kind) && str_eq(tok_text!(src, toks[i - 1]), "pub")
+				then die("cf: parse: a `type` alias cannot be `pub` (it is comptime-erased)\n")
+			if i + 1 >= Iarch(toks.len) || !is_ident(toks[i + 1].kind)
+				then die("cf: parse: expected a name after `type`\n")
 			const Str aname = tok_text!(src, toks[i + 1])
-			if i + 2 < Iarch(toks.len) && is_lbracket(toks[i + 2].kind) then die("cf: type: a generic `type` alias is not supported\n")
-			if i + 2 >= Iarch(toks.len) || !is_eq(toks[i + 2].kind) then die("cf: parse: expected `=` in a `type` alias\n")
+			if i + 2 < Iarch(toks.len) && is_lbracket(toks[i + 2].kind)
+				then die("cf: type: a generic `type` alias is not supported\n")
+			if i + 2 >= Iarch(toks.len) || !is_eq(toks[i + 2].kind)
+				then die("cf: parse: expected `=` in a `type` alias\n")
+
 			if is_group_type!(src, toks, i) then {
 				# a grouped-parameter `type X = { … }` — not an alias; leave its tokens for the parser
 				i = i + 1
@@ -212,47 +270,57 @@ pub const strip_type_aliases! = (*[Uint8] src, [Token] toks): [Token] -> {
 				const Iarch end = alias_decl_end!(src, toks, i)
 				let [Token] tgt = []
 				let Iarch t = i + 3
+
 				loop {
 					if t >= end then break
 					tgt = [...tgt, toks[t]]
 					t = t + 1
 				}
+
 				if Iarch(tgt.len) == 0 then die("cf: parse: a `type` alias needs a target type\n")
 				# a `type` alias may not shadow a built-in type name (613) nor duplicate an earlier alias (614)
-				if is_builtin_typename(aname) then die("cf: type: a `type` alias cannot shadow a built-in type name\n")
+				if is_builtin_typename(aname)
+					then die("cf: type: a `type` alias cannot shadow a built-in type name\n")
 				if find_alias(aliases, aname) >= 0 then die("cf: type: a duplicate `type` alias name\n")
 				aliases = [...aliases, Alias({ name: aname, target: tgt })]
 				i = end
 			}
 		} else i = i + 1
 	}
+
 	if Iarch(aliases.len) == 0 then return toks
 	# reject an alias whose name collides with a declared type / union member (see collect_decl_names)
 	const [Str] declnames = collect_decl_names!(src, toks)
 	let Iarch ci = 0
+
 	loop {
 		if ci >= Iarch(aliases.len) then break
-		if str_in(declnames, aliases[ci].name) then die("cf: type: a `type` alias name collides with a declared type or union member\n")
+		if str_in(declnames, aliases[ci].name)
+			then die("cf: type: a `type` alias name collides with a declared type or union member\n")
 		ci = ci + 1
 	}
+
 	# pass 2 — drop the `type` decls, splice each alias name's fully-expanded target
 	let [Token] out = []
 	let Iarch k = 0
+
 	loop {
 		if k >= Iarch(toks.len) then break
-		if is_type_kw!(src, toks, k) && !is_group_type!(src, toks, k) then k = alias_decl_end!(src, toks, k)
-		else {
-			let Bool spliced = false
-			if is_ident(toks[k].kind) then {
-				const Iarch ai = find_alias(aliases, tok_text!(src, toks[k]))
-				if ai >= 0 then {
-					out = cat_toks(out, expand_target!(src, aliases, aliases[ai].target, 1024))
-					spliced = true
+		if is_type_kw!(src, toks, k) && !is_group_type!(src, toks, k)
+			then k = alias_decl_end!(src, toks, k)
+			else {
+				let Bool spliced = false
+				if is_ident(toks[k].kind) then {
+					const Iarch ai = find_alias(aliases, tok_text!(src, toks[k]))
+					if ai >= 0 then {
+						out = cat_toks(out, expand_target!(src, aliases, aliases[ai].target, 1024))
+						spliced = true
+					}
 				}
+				if !spliced then out = [...out, toks[k]]
+				k = k + 1
 			}
-			if !spliced then out = [...out, toks[k]]
-			k = k + 1
-		}
 	}
+
 	return out
 }
