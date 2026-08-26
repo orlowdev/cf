@@ -214,6 +214,258 @@ pub const format_source! = (*[Uint8] src, Iarch n): [Uint8] -> {
 	return out
 }
 
+# --- fit-based reflow (Phase D) ----------------------------------------------
+#
+# A comma-group renders on ONE line if it fits within `line_limit` columns at its start column,
+# else ONE ELEMENT PER LINE — never crammed (two elements sharing a line of a multi-line group).
+# `reflow!` decides this per group off an already-formatted buffer and rewrites the structural
+# newlines; `format_source!` then re-canonicalises indentation and trailing commas. The two run
+# to a fixpoint (see `format_file!`): a broken group's elements settle at new columns each round.
+
+# The line-width ceiling (bytes; a hard tab counts as one).
+const line_limit = 100
+
+# gap directives for reflow emission
+const gap_verbatim = 0
+const gap_nl = 1
+const gap_space = 2
+const gap_none = 3
+
+# A width past any real line: the flat-width sentinel for a group that can NEVER be one line — it
+# holds an interior comment, or a hard break inside an element (not at a structural point).
+const uncollapsible = 1000000
+
+# The column (0-based, tabs as one) at which byte `pos` sits: distance back to the last newline.
+const col_of = (*[Uint8] src, Iarch pos): Iarch -> {
+	let Iarch k = pos - 1
+	loop {
+		if k < 0 then break
+		if Iarch(src[k]) == 10 then break
+		k = k - 1
+	}
+	return pos - k - 1
+}
+
+# The single-line width of the comma-group at opener `o`: each token's own width plus inter-token
+# spacing canonicalised at the structural points — nothing after an opener or before a closer, one
+# space after a comma, verbatim elsewhere. `uncollapsible` if any non-structural gap carries a hard
+# break (a comment, or an element the user split over lines) — such a group can never be one line.
+const group_flat_width = (*[Uint8] src, [Token] toks, [Iarch] close_of, Iarch o): Iarch -> {
+	const Iarch c = close_of[o]
+	let Iarch w = 0
+	let Iarch k = o
+	loop {
+		if k > c then break
+		if is_comment(toks[k].kind) then return uncollapsible
+		w = w + (src_hi(toks[k]) - src_lo(toks[k]))
+		if k < c then {
+			const Token a = toks[k]
+			const Token b = toks[k + 1]
+			# canonical inter-token spacing: `, ` after a comma, `{ `/` }` inside braces (cf spaces
+			# record/union braces), nothing at a `(`/`[` edge, verbatim elsewhere
+			if is_comma(a.kind) || is_lbrace(a.kind) || is_rbrace(b.kind) then w = w + 1
+			else if !is_opener(a.kind) && !is_closer(b.kind) then {
+				if count_nl(src, src_hi(a), src_lo(b)) > 0 then return uncollapsible
+				w = w + (src_lo(b) - src_hi(a))
+			}
+		}
+		k = k + 1
+	}
+	return w
+}
+
+# Is the comma-group at opener `o` already rendered one-element-per-line? — a hard break after the
+# opener, before the closer, and after every top-level comma.
+const group_one_per_line = (*[Uint8] src, [Token] toks, [Iarch] close_of, Iarch o): Bool -> {
+	const Iarch c = close_of[o]
+	if count_nl(src, src_hi(toks[o]), src_lo(toks[o + 1])) == 0 then return false
+	if count_nl(src, src_hi(toks[c - 1]), src_lo(toks[c])) == 0 then return false
+	let Iarch d = 0
+	let Iarch m = o + 1
+	loop {
+		if m >= c then break
+		const TokKind km = toks[m].kind
+		if is_opener(km) then d = d + 1
+		else if is_closer(km) then d = d - 1
+		else if is_comma(km) then {
+			if d == 0 then {
+				if count_nl(src, src_hi(toks[m]), src_lo(toks[m + 1])) == 0 then return false
+			}
+		}
+		m = m + 1
+	}
+	return true
+}
+
+# One reflow pass over an already-formatted buffer: pick each OUTERMOST comma-group that is not in
+# its desired shape and rewrite its structural newlines — collapse a fitting multi-line group to
+# one line, or explode a too-wide (or crammed) group to one element per line. Nested groups wait
+# for a later pass, once this one's layout (and thus their columns) has settled. Only structural
+# gaps change; every other byte is copied verbatim, so a buffer already in shape comes back equal.
+const reflow! = (*[Uint8] src, Iarch n): [Uint8] -> {
+	const [Token] toks = lex_fmt(src, n)
+	const Iarch nt = Iarch(toks.len)
+	# close_of[i] = matching closer for opener i (else -1); cgroup[i] = opener heads a comma-group
+	let [Iarch] close_of = []
+	let [Bool] cgroup = []
+	let [Iarch] gapd = []
+	let Iarch z = 0
+	loop {
+		if z >= nt then break
+		close_of = [...close_of, 0 - 1]
+		cgroup = [...cgroup, false]
+		gapd = [...gapd, gap_verbatim]
+		z = z + 1
+	}
+	let [Iarch] cst = []
+	let Iarch csp = 0
+	let Iarch i = 0
+	loop {
+		if i >= nt then break
+		const TokKind k = toks[i].kind
+		if is_opener(k) then {
+			if csp >= Iarch(cst.len) then cst = [...cst, 0 - 1]
+			cst[csp] = i
+			csp = csp + 1
+		} else if is_closer(k) then {
+			if csp > 0 then {
+				csp = csp - 1
+				close_of[cst[csp]] = i
+			}
+		} else if is_comma(k) then {
+			if csp > 0 then cgroup[cst[csp - 1]] = true
+		}
+		i = i + 1
+	}
+	# mark OUTERMOST actionable groups; `skip_until` keeps us out of a group already marked so its
+	# descendants are deferred to a later pass. `ostack` holds every currently-open bracket, so an
+	# explode can also break the single-line statement blocks it sits in (cf forbids a multi-line
+	# block whose `{` shares a line with its first statement).
+	let Iarch skip_until = 0 - 1
+	let [Iarch] ostack = []
+	let Iarch osp = 0
+	let Iarch g = 0
+	loop {
+		if g >= nt then break
+		const TokKind gk = toks[g].kind
+		if is_opener(gk) then {
+			if cgroup[g] && close_of[g] >= 0 && g >= skip_until then {
+				const Iarch c = close_of[g]
+				const Iarch col = col_of(src, src_lo(toks[g]))
+				const Iarch fw = group_flat_width(src, toks, close_of, g)
+				const Bool ml = count_nl(src, src_lo(toks[g]), src_hi(toks[c])) > 0
+				const Bool broken_want = fw >= uncollapsible || col + fw > line_limit
+				if broken_want then {
+					if !ml || !group_one_per_line(src, toks, close_of, g) then {
+						# EXPLODE: a hard break after the opener, after every top-level comma, and
+						# before the closer; interior (nested) gaps stay verbatim
+						gapd[g + 1] = gap_nl
+						gapd[c] = gap_nl
+						let Iarch d = 0
+						let Iarch m = g + 1
+						loop {
+							if m >= c then break
+							const TokKind km = toks[m].kind
+							if is_opener(km) then d = d + 1
+							else if is_closer(km) then d = d - 1
+							else if is_comma(km) then {
+								if d == 0 then gapd[m + 1] = gap_nl
+							}
+							m = m + 1
+						}
+						# cascade: this group is now multi-line, so break every enclosing single-line
+						# `{…}` statement block (a `{` with no top-level comma) so its `{`/`}` land on
+						# their own lines
+						let Iarch s = osp - 1
+						loop {
+							if s < 0 then break
+							const Iarch op = ostack[s]
+							if is_lbrace(toks[op].kind) && !cgroup[op] && close_of[op] >= 0 then {
+								if count_nl(src, src_lo(toks[op]), src_hi(toks[close_of[op]])) == 0 then {
+									gapd[op + 1] = gap_nl
+									gapd[close_of[op]] = gap_nl
+								}
+							}
+							s = s - 1
+						}
+						skip_until = c
+					}
+				} else {
+					if ml then {
+						# COLLAPSE: flatten every interior gap — `{ `/` }` spaced (cf spaces braces),
+						# tight at a `(`/`[` edge, one space after a comma, verbatim otherwise (a
+						# leftover trailing comma is stripped by the following `format_source!` pass)
+						let Iarch m = g + 1
+						loop {
+							if m > c then break
+							const Token a = toks[m - 1]
+							const Token b = toks[m]
+							if is_lbrace(a.kind) then gapd[m] = gap_space
+							else if is_rbrace(b.kind) then gapd[m] = gap_space
+							else if is_opener(a.kind) then gapd[m] = gap_none
+							else if is_closer(b.kind) then gapd[m] = gap_none
+							else if is_comma(a.kind) then gapd[m] = gap_space
+							else gapd[m] = gap_verbatim
+							m = m + 1
+						}
+						skip_until = c
+					}
+				}
+			}
+			if osp >= Iarch(ostack.len) then ostack = [...ostack, 0 - 1]
+			ostack[osp] = g
+			osp = osp + 1
+		} else if is_closer(gk) then {
+			if osp > 0 then osp = osp - 1
+		}
+		g = g + 1
+	}
+	# emit: token text verbatim, each gap-before per its directive (verbatim copies the source gap)
+	let [Uint8] out = []
+	let Iarch prev_hi = 0
+	let Bool first = true
+	let Iarch e = 0
+	loop {
+		if e >= nt then break
+		const Token t = toks[e]
+		if is_eof(t.kind) then break
+		if first then {
+			let Iarch q = 0
+			const Iarch lo = src_lo(t)
+			loop {
+				if q >= lo then break
+				out = [...out, src[q]]
+				q = q + 1
+			}
+			first = false
+		} else {
+			const Iarch dir = gapd[e]
+			if dir == gap_nl then out = [...out, Uint8(10)]
+			else if dir == gap_space then out = [...out, Uint8(32)]
+			else if dir == gap_verbatim then {
+				let Iarch q = prev_hi
+				const Iarch gt = src_lo(t)
+				loop {
+					if q >= gt then break
+					out = [...out, src[q]]
+					q = q + 1
+				}
+			}
+		}
+		let Iarch q2 = src_lo(t)
+		const Iarch hi = src_hi(t)
+		loop {
+			if q2 >= hi then break
+			out = [...out, src[q2]]
+			q2 = q2 + 1
+		}
+		prev_hi = src_hi(t)
+		e = e + 1
+	}
+	out = [...out, Uint8(10)]
+	return out
+}
+
 # Format one file. `check` selects the `--check` gate: it never writes, and returns 1 if the
 # file is not already formatted, else 0. Without `--check` it rewrites the file in place
 # (skipping the write when the file is already formatted) and returns 0.
@@ -228,7 +480,32 @@ pub const format_file! = (Str path, Bool check): Iarch -> {
 	if n < 0 then die("cf: format: reading the input file failed\n")
 	if n >= Iarch(buf.len) then die("cf: format: the input file exceeds the read buffer — grow it in fmt.cf\n")
 
-	const [Uint8] out = format_source!(buf, n)
+	# Format-first fit reflow (Phase D): canonicalise, then alternate `reflow!` (collapse/explode
+	# one level of comma-groups) with `format_source!` (re-indent + trailing commas) until the
+	# result stops changing. `reflow!` only rewrites structural newlines and the re-format is
+	# idempotent, so this converges; the guard caps a pathological input rather than any real one.
+	let [Uint8] out = format_source!(buf, n)
+	let Iarch guard = 0
+	loop {
+		if guard >= 100 then break
+		const [Uint8] rf = reflow!(out, Iarch(out.len))
+		const [Uint8] re = format_source!(rf, Iarch(rf.len))
+		let Bool converged = Iarch(re.len) == Iarch(out.len)
+		if converged then {
+			let Iarch j = 0
+			loop {
+				if j >= Iarch(re.len) then break
+				if Iarch(re[j]) != Iarch(out[j]) then {
+					converged = false
+					break
+				}
+				j = j + 1
+			}
+		}
+		out = re
+		if converged then break
+		guard = guard + 1
+	}
 
 	# Is the file already formatted? (out == buf[0..n], byte for byte.)
 	let Bool same = Iarch(out.len) == n
