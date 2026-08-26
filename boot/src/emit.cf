@@ -45,7 +45,7 @@ import astutil::{ is_spread, spread_inner, is_skip, skip_count, is_nested, neste
 # `loop_mark` is the nearest enclosing reset-safe loop's entry mark (same `{top, limit}` shape, or
 # -1 if the nearest loop is not reset-safe) — `break`/`continue` restore it so every path back to
 # the loop head or out of it reclaims the iteration's residue, matching the back-edge rewind.
-data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs, [RecDecl] recs, [UnionDecl] unions, Iarch cur_loop, Iarch cur_slot, Str cur_ret, Iarch reset_mark, Bool fn_ptr, Iarch loop_mark, Bool alloc_stack, Bool in_loop, Iarch stack_used, [RSets] routes, [FnSum] fsums, Iarch cur_fn, Str alloc_node, Str carve_node, Str grow_node, [Str] growok, Iarch mk_env_base, Iarch sur_mark, Iarch loop_sur_mark, [Bool] nodesig, [Bool] fmints, [Str] slits, Str mat_geom }
+data Emit = { Uarch fd, Iarch next, Iarch label, [Func] funcs, [RecDecl] recs, [UnionDecl] unions, Iarch cur_loop, Iarch cur_slot, Str cur_ret, Iarch reset_mark, Bool fn_ptr, Iarch loop_mark, Bool alloc_stack, Bool in_loop, Iarch stack_used, [RSets] routes, [FnSum] fsums, Iarch cur_fn, Str alloc_node, Str carve_node, Str grow_node, [Str] growok, Iarch mk_env_base, Iarch sur_mark, Iarch loop_sur_mark, [Bool] nodesig, [Bool] fmints, [Str] slits, Str mat_geom, Iarch merge_depth }
 
 # A local/parameter in scope: its interned name, `slot`, its `rec_type` (a record/union
 # type name, `"$dyn"`, `"$ptr"`, or `"Str"` — `""` for a word), and `elem` (a dynamic
@@ -2667,32 +2667,44 @@ const emit_agg_binding! = (*Emit ctx, Expr e, [Binding] env): Iarch -> match e {
 	_ -> copy_agg!(ctx, emit_expr!(e, ctx, env))
 }
 
-# Emit an `if <cond> then <a> else <b>` value. The branches merge through a stack
-# slot (not a phi): evaluate the condition, branch, each arm stores its value into
-# the slot, and the join block loads it. Robust under nesting; QBE accepts an
-# `alloc` in a non-entry block.
+# The address of merge-slot `d` in the `@start` pool (`%mpool + d*8`). `d` is the current
+# `if`/`&&`/`||` nesting depth, so nested expressions never reuse a live parent's slot; drawing
+# from the hoisted pool (rather than a fresh `alloc` here) is what keeps a value-`if`/`&&`/`||`
+# inside a loop from leaking the stack each iteration. Dies past the 64-slot pool.
+const emit_merge_slot! = (*Emit ctx): Str -> {
+	if ctx.merge_depth >= 64 then die("cf: emit: `if`/`&&`/`||` value nesting exceeds the 64-slot merge pool — flatten the expression\n")
+	const Iarch a = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${a} =l add %mpool, ${ctx.merge_depth * 8}\n")
+	return "%t${a}"
+}
+
+# Emit an `if <cond> then <a> else <b>` value. The branches merge through a stack slot (not a
+# phi): evaluate the condition, branch, each arm stores its value into the slot, and the join
+# block loads it. Robust under nesting; the slot comes from the hoisted `%mpool` (see
+# `emit_merge_slot!`) so a value-`if` in a loop does not leak.
 const emit_if! = (*Emit ctx, Expr cond, Expr then_e, Expr else_e, [Binding] env): Str -> {
+	const Str slot = emit_merge_slot!(ctx)
+	ctx.merge_depth = ctx.merge_depth + 1
 	const Str c = emit_expr!(cond, ctx, env)
 	# the merge slot stores/loads in the branches' QBE type (a float `if` value uses `d`/`s`)
 	const Str qt = qtype_of!(ctx, env, then_e)
-	const Iarch slot = ctx.next
-	ctx.next = ctx.next + 1
 	const Iarch lid = ctx.label
 	ctx.label = ctx.label + 1
-	write_str(ctx.fd, "\t%t${slot} =l alloc8 8\n")
 	write_str(ctx.fd, "\tjnz ${c}, @then${lid}, @else${lid}\n")
 	write_str(ctx.fd, "@then${lid}\n")
 	const Str a = emit_expr!(then_e, ctx, env)
-	write_str(ctx.fd, "\tstore${qt} ${a}, %t${slot}\n")
+	write_str(ctx.fd, "\tstore${qt} ${a}, ${slot}\n")
 	write_str(ctx.fd, "\tjmp @end${lid}\n")
 	write_str(ctx.fd, "@else${lid}\n")
 	const Str b = emit_expr!(else_e, ctx, env)
-	write_str(ctx.fd, "\tstore${qt} ${b}, %t${slot}\n")
+	write_str(ctx.fd, "\tstore${qt} ${b}, ${slot}\n")
 	write_str(ctx.fd, "\tjmp @end${lid}\n")
 	write_str(ctx.fd, "@end${lid}\n")
+	ctx.merge_depth = ctx.merge_depth - 1
 	const Iarch rt = ctx.next
 	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${rt} =${qt} load${qt} %t${slot}\n")
+	write_str(ctx.fd, "\t%t${rt} =${qt} load${qt} ${slot}\n")
 	return "%t${rt}"
 }
 
@@ -2702,29 +2714,31 @@ const emit_if! = (*Emit ctx, Expr cond, Expr then_e, Expr else_e, [Binding] env)
 # merges through a slot, like `if`. For `&&`: a false lhs short-circuits to 0; for
 # `||`: a true lhs short-circuits to 1; otherwise the result is `rhs != 0`.
 const emit_logical! = (*Emit ctx, Bool is_and, Expr l, Expr r, [Binding] env): Str -> {
+	# reserve this operator's slot at the current depth BEFORE emitting the operands, so a nested
+	# `&&`/`||`/`if` in either operand draws a deeper slot and cannot clobber this merge
+	const Str slot = emit_merge_slot!(ctx)
+	ctx.merge_depth = ctx.merge_depth + 1
 	const Str a = emit_expr!(l, ctx, env)
-	const Iarch slot = ctx.next
-	ctx.next = ctx.next + 1
 	const Iarch lid = ctx.label
 	ctx.label = ctx.label + 1
-	write_str(ctx.fd, "\t%t${slot} =l alloc8 8\n")
 	if is_and then write_str(ctx.fd, "\tjnz ${a}, @rhs${lid}, @sc${lid}\n")
 	if !is_and then write_str(ctx.fd, "\tjnz ${a}, @sc${lid}, @rhs${lid}\n")
 	write_str(ctx.fd, "@sc${lid}\n")
-	if is_and then write_str(ctx.fd, "\tstorel 0, %t${slot}\n")
-	if !is_and then write_str(ctx.fd, "\tstorel 1, %t${slot}\n")
+	if is_and then write_str(ctx.fd, "\tstorel 0, ${slot}\n")
+	if !is_and then write_str(ctx.fd, "\tstorel 1, ${slot}\n")
 	write_str(ctx.fd, "\tjmp @end${lid}\n")
 	write_str(ctx.fd, "@rhs${lid}\n")
 	const Str b = emit_expr!(r, ctx, env)
 	const Iarch bb = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${bb} =l cnel ${b}, 0\n")
-	write_str(ctx.fd, "\tstorel %t${bb}, %t${slot}\n")
+	write_str(ctx.fd, "\tstorel %t${bb}, ${slot}\n")
 	write_str(ctx.fd, "\tjmp @end${lid}\n")
 	write_str(ctx.fd, "@end${lid}\n")
+	ctx.merge_depth = ctx.merge_depth - 1
 	const Iarch rt = ctx.next
 	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${rt} =l loadl %t${slot}\n")
+	write_str(ctx.fd, "\t%t${rt} =l loadl ${slot}\n")
 	return "%t${rt}"
 }
 
@@ -5053,6 +5067,14 @@ const emit_func! = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 		return 0
 	}
 	write_str(ctx.fd, "@start\n")
+	# The merge-slot POOL (one alloc, at @start where QBE demands allocs live). `if…then…else`,
+	# `&&` and `||` value-expressions merge their arms through a stack slot; drawing that slot from
+	# this pool (indexed by nesting depth, see `emit_if!`/`emit_logical!`) instead of a fresh
+	# `alloc` at the use site is what keeps them from leaking the stack every iteration of a loop —
+	# a per-site alloc inside a loop body emits a bare `sub sp` that is never restored. 64 slots is
+	# far past any real expression nesting; `emit_if!`/`emit_logical!` die if it is exceeded.
+	write_str(ctx.fd, "\t%mpool =l alloc8 512\n")
+	ctx.merge_depth = 0
 	# a materialized body's dynamic-growth pushes (`cf_dyn_push_g` / `cf_*_append_g`) reserve
 	# through the geometry's bump half via a FUNCTION POINTER; copy the survivor reserve symbol into
 	# `%rfsur_0` once here (it dominates every site, one copy per body). The residue reserve pointer
@@ -5871,7 +5893,7 @@ pub const emit_program! = (Program prog, RouteInfo ri, [Str] mat_names, [Str] ma
 		# an asm function is emitted into the floor, not through QBE; an intrinsic has no body at
 		# all — the compiler supplies its behavior at each call site, so it emits no function.
 		if !prog.funcs[i].is_asm && !prog.funcs[i].is_intrinsic then {
-			let Emit ctx = Emit({ fd: qbe_fd, next: 0, label: 0, funcs: prog.funcs, recs: prog.recs, unions: prog.unions, cur_loop: 0 - 1, cur_slot: 0 - 1, cur_ret: "", reset_mark: 0 - 1, fn_ptr: false, loop_mark: 0 - 1, alloc_stack: false, in_loop: false, stack_used: 0, routes: ri.sets, fsums: ri.sums, cur_fn: 0 - 1, alloc_node: "%node_0", carve_node: "%node_0", grow_node: "%node_0", growok: no_names(), mk_env_base: 0 - 1, sur_mark: 0 - 1, loop_sur_mark: 0 - 1, nodesig: nsig, fmints: mts, slits: slt, mat_geom: mat_geom_of(mat_names, mat_geoms, prog.funcs[i].name) })
+			let Emit ctx = Emit({ fd: qbe_fd, next: 0, label: 0, funcs: prog.funcs, recs: prog.recs, unions: prog.unions, cur_loop: 0 - 1, cur_slot: 0 - 1, cur_ret: "", reset_mark: 0 - 1, fn_ptr: false, loop_mark: 0 - 1, alloc_stack: false, in_loop: false, stack_used: 0, routes: ri.sets, fsums: ri.sums, cur_fn: 0 - 1, alloc_node: "%node_0", carve_node: "%node_0", grow_node: "%node_0", growok: no_names(), mk_env_base: 0 - 1, sur_mark: 0 - 1, loop_sur_mark: 0 - 1, nodesig: nsig, fmints: mts, slits: slt, mat_geom: mat_geom_of(mat_names, mat_geoms, prog.funcs[i].name), merge_depth: 0 })
 			emit_func!(&ctx, prog.funcs[i], i)
 		}
 		i = i + 1
