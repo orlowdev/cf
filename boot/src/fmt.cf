@@ -110,6 +110,15 @@ const tok_is_return = (*[Uint8] src, Token t): Bool -> {
 	return true
 }
 
+# Does token `t`'s source text equal the keyword `if` (bytes i,f)?
+const tok_is_if = (*[Uint8] src, Token t): Bool -> {
+	if Iarch(t.len) != 2 then return false
+	if Iarch(src[t.start]) != 105 then return false
+	if Iarch(src[t.start + 1]) != 102 then return false
+
+	return true
+}
+
 # Is the `{` at token `o` the opener of a STATEMENT block (a function/loop/if/arm body), as
 # opposed to a single-element import list `::{ x }`, a bare record `{ f: v }` or a one-arm
 # `match … { A -> … }` (all comma-less, so `cgroup` cannot tell them apart)? A statement block is
@@ -119,6 +128,79 @@ const opens_stmt_block = (*[Uint8] src, [Token] toks, Iarch o): Bool -> {
 	const Token p = toks[o - 1]
 
 	return is_arrow(p.kind) || tok_is_then(src, p) || tok_is_else(src, p) || tok_is_loop(src, p)
+}
+
+# If token `li` begins a statement-level if-chain whose EVERY branch body is a `{…}` BLOCK
+# (`if C then {…} [else if C then {…}]* [else {…}]`), return the index of the chain's final `}`;
+# otherwise return -1. An `else if` extends the SAME chain (not a new statement); a bare (unbraced)
+# body anywhere — a one-line `if x then break`, a value conditional `if a then b else c`, or a
+# `then …`/`else …` without a `{` — aborts, so only whole braced chains are ever fenced.
+const if_chain_end = (*[Uint8] src, [Token] toks, Iarch li): Iarch -> {
+	const Iarch nt = Iarch(toks.len)
+	let Iarch j = li
+	let Iarch end = 0 - 1
+
+	loop {
+		# find this branch's `then` at bracket-depth 0 (a nested value-if in the condition is inside
+		# `()` and its `then` is skipped)
+		let Iarch tk = j + 1
+		let Iarch d = 0
+
+		loop {
+			if tk >= nt then break
+			const TokKind kk = toks[tk].kind
+			if is_opener(kk) then d = d + 1
+				else if is_closer(kk) then d = d - 1
+				else if d == 0 && tok_is_then(src, toks[tk]) then break
+			tk = tk + 1
+		}
+
+		if tk >= nt then return 0 - 1
+		if tk + 1 >= nt then return 0 - 1
+		# the branch body must be a brace block
+		if !is_lbrace(toks[tk + 1].kind) then return 0 - 1
+		# skip the balanced body to its `}`
+		let Iarch bd = 0
+		let Iarch m = tk + 1
+
+		loop {
+			if m >= nt then break
+			if is_opener(toks[m].kind) then bd = bd + 1
+				else if is_closer(toks[m].kind) then {
+				bd = bd - 1
+				if bd == 0 then break
+			}
+			m = m + 1
+		}
+
+		if m >= nt then return 0 - 1
+		end = m
+		# does an `else` continue the chain right after this `}`?
+		if m + 1 < nt && tok_is_else(src, toks[m + 1]) then {
+			if m + 2 < nt && tok_is_if(src, toks[m + 2]) then j = m + 2
+				else if m + 2 < nt && is_lbrace(toks[m + 2].kind) then {
+				# a final `else {…}` — skip its balanced body and end the chain there
+				let Iarch ed = 0
+				let Iarch em = m + 2
+
+				loop {
+					if em >= nt then break
+					if is_opener(toks[em].kind) then ed = ed + 1
+						else if is_closer(toks[em].kind) then {
+						ed = ed - 1
+						if ed == 0 then break
+					}
+					em = em + 1
+				}
+
+				if em >= nt then return 0 - 1
+
+				return em
+			} else return 0 - 1
+		} else return end
+	}
+
+	return end
 }
 
 # The formatted bytes of `src[0..n]`. The output vector rides out to the caller (a survivor)
@@ -168,11 +250,13 @@ pub const format_source! = (*[Uint8] src, Iarch n): [Uint8] -> {
 		if pi >= Iarch(toks.len) then break
 		const TokKind pk = toks[pi].kind
 		if is_eof(pk) then break
+
 		if is_opener(pk) then {
 			if sp >= Iarch(stk_last.len) then {
 				stk_last = [...stk_last, 0 - 1]
 				stk_comma = [...stk_comma, false]
 			}
+
 			stk_last[sp] = 0 - 1
 			stk_comma[sp] = false
 			sp = sp + 1
@@ -181,6 +265,7 @@ pub const format_source! = (*[Uint8] src, Iarch n): [Uint8] -> {
 				const Iarch last = stk_last[sp - 1]
 				const Bool hasc = stk_comma[sp - 1]
 				sp = sp - 1
+
 				if hasc && last >= 0 then {
 					# an existing trailing comma sits after the last content token (nothing but a
 					# comma and comments can follow it before the closer)
@@ -189,20 +274,24 @@ pub const format_source! = (*[Uint8] src, Iarch n): [Uint8] -> {
 
 					loop {
 						if s >= pi then break
+
 						if is_comma(toks[s].kind) then {
 							existing = s
 							break
 						}
+
 						s = s + 1
 					}
 
 					const Iarch nl = count_nl(src, src_hi(toks[last]), src_lo(toks[pi]))
+
 					if nl > 0 then {
 						if existing < 0 then add_after[last] = true
 					} else {
 						if existing >= 0 then drop_tok[existing] = true
 					}
 				}
+
 				# this closer is a content token of the enclosing group
 				if sp > 0 then stk_last[sp - 1] = pi
 			}
@@ -211,18 +300,24 @@ pub const format_source! = (*[Uint8] src, Iarch n): [Uint8] -> {
 		} else if !is_comment(pk) then {
 			if sp > 0 then stk_last[sp - 1] = pi
 		}
+
 		pi = pi + 1
 	}
 
-	# Blank lines around `loop` and `return` STATEMENTS. `blank_before[j]` forces one blank line
-	# before token j. A `loop {…}` run for effect is fenced ABOVE (unless it is the block's first
-	# statement, i.e. `{` sits right before it) and BELOW (unless the token after its matching `}` is
-	# the block's own `}`, i.e. it is the block's last statement); a `return` gets a blank ABOVE
-	# unless it is the block's first statement. EXCLUDED in both cases: a `->`/`then`/`else` body (the
-	# loop or return IS the body, not a block statement) and — for loops — a `= …` value loop. A
-	# comment glued directly above the statement (on the line right above, no blank between) is
-	# carried WITH it: the blank opens above the comment so it stays attached to what it documents.
-	# The gap is only ever emitted where a newline already falls, so a same-line value loop is untouched.
+	# Blank lines around `loop`, `return` and if-chain STATEMENTS. `blank_before[j]` forces one blank
+	# line before token j. Each fenceable statement is opened ABOVE (unless it is the block's first
+	# statement, i.e. `{` sits right before it) and — where it has a closing `}` — closed BELOW
+	# (unless the token after that `}` is the block's own `}`, i.e. it is the block's last statement):
+	#   • a `loop {…}` run for effect — fenced above and below;
+	#   • a `return` — fenced above only (nothing follows it in a block);
+	#   • a braced if-chain `if C then {…} [else if …]* [else {…}]` — fenced above and below, `below`
+	#     landing on the chain's FINAL `}` (an `else if` continues the same chain; `if_chain_end`
+	#     returns -1 for a bare-body / value if, which is then left alone).
+	# EXCLUDED everywhere: a `->`/`then`/`else`/`=` body or an `(`/`[`/`,` expression position (the
+	# statement is really a body or sub-expression, not a block statement). A comment glued directly
+	# above the statement (on the line right above, no blank between) is carried WITH it, so the blank
+	# opens above the comment and it stays attached to what it documents. The gap is only ever emitted
+	# where a newline already falls, so a same-line value loop/if is untouched.
 	let [Bool] blank_before = []
 	let Iarch bz = 0
 
@@ -238,7 +333,9 @@ pub const format_source! = (*[Uint8] src, Iarch n): [Uint8] -> {
 		if li >= Iarch(toks.len) then break
 		const Bool is_loop_stmt = tok_is_loop(src, toks[li]) && li + 1 < Iarch(toks.len) && is_lbrace(toks[li + 1].kind)
 		const Bool is_ret_stmt = tok_is_return(src, toks[li])
-		if (is_loop_stmt || is_ret_stmt) && li > 0 then {
+		const Bool is_if_tok = tok_is_if(src, toks[li])
+
+		if (is_loop_stmt || is_ret_stmt || is_if_tok) && li > 0 then {
 			# the statement's head: walk back over comment lines glued directly above it (each on the
 			# line right above, no blank line intervening), so the blank opens above the comment run
 			let Iarch head = li
@@ -252,10 +349,15 @@ pub const format_source! = (*[Uint8] src, Iarch n): [Uint8] -> {
 
 			if head > 0 then {
 				const Token pv = toks[head - 1]
-				const Bool body = is_arrow(pv.kind) || tok_is_then(src, pv) || tok_is_else(src, pv) || is_eq(pv.kind)
-				if !body && !is_lbrace(pv.kind) then blank_before[head] = true
-				# a loop is also fenced BELOW unless it closes the block
-				if is_loop_stmt && !body then {
+				const Bool body = is_arrow(pv.kind) || tok_is_then(src, pv) || tok_is_else(src, pv) || is_eq(pv.kind) || tok_is_return(
+					src,
+					pv,
+				) || is_lparen(pv.kind) || is_lbracket(pv.kind) || is_comma(pv.kind)
+				# `below` = the statement's closing `}` (loop or if-chain), or -1 when there is none (a
+				# `return`, or an `if` that is not a whole braced chain — the latter is not fenced at all)
+				let Iarch below = 0 - 1
+
+				if is_loop_stmt then {
 					let Iarch d = 0
 					let Iarch m = li + 1
 
@@ -269,11 +371,19 @@ pub const format_source! = (*[Uint8] src, Iarch n): [Uint8] -> {
 						m = m + 1
 					}
 
-					if m + 1 < Iarch(toks.len) && !is_rbrace(toks[m + 1].kind) && !is_eof(toks[m + 1].kind)
-						then blank_before[m + 1] = true
+					below = m
+				} else if is_if_tok then below = if_chain_end(src, toks, li)
+
+				const Bool fenceable = is_loop_stmt || is_ret_stmt || (is_if_tok && below >= 0)
+
+				if !body && fenceable then {
+					if !is_lbrace(pv.kind) then blank_before[head] = true
+					if below >= 0 && below + 1 < Iarch(toks.len) && !is_rbrace(toks[below + 1].kind) && !is_eof(toks[below + 1].kind)
+						then blank_before[below + 1] = true
 				}
 			}
 		}
+
 		li = li + 1
 	}
 
@@ -292,6 +402,7 @@ pub const format_source! = (*[Uint8] src, Iarch n): [Uint8] -> {
 			const Iarch gfrom = src_hi(p)
 			const Iarch gto = src_lo(t)
 			const Iarch nl = count_nl(src, gfrom, gto)
+
 			if nl == 0 then {
 				let Iarch k = gfrom
 
@@ -327,6 +438,7 @@ pub const format_source! = (*[Uint8] src, Iarch n): [Uint8] -> {
 				}
 			}
 		}
+
 		# the token's own text — a `StrLit` re-wrapped in its quotes, a `Comment` right-trimmed,
 		# everything else its verbatim source slice (multi-line `asm`/interp strings ride through
 		# untouched: their inner newlines and indentation are string content, never reflowed). A
@@ -370,6 +482,7 @@ pub const format_source! = (*[Uint8] src, Iarch n): [Uint8] -> {
 				k = k + 1
 			}
 		}
+
 		# a Phase-C trailing comma, injected directly after the last content token's text
 		if add_after[i] then out = [...out, Uint8(44)]
 		# `({` and `})` — a record threaded straight into a call (`Ctor({ … })`) — count as ONE
@@ -444,6 +557,7 @@ const group_flat_width = (*[Uint8] src, [Token] toks, [Iarch] close_of, [Bool] c
 		)
 			then return uncollapsible
 		w = w + (src_hi(toks[k]) - src_lo(toks[k]))
+
 		if k < c then {
 			const Token a = toks[k]
 			const Token b = toks[k + 1]
@@ -455,6 +569,7 @@ const group_flat_width = (*[Uint8] src, [Token] toks, [Iarch] close_of, [Bool] c
 				w = w + (src_lo(b) - src_hi(a))
 			}
 		}
+
 		k = k + 1
 	}
 
@@ -515,6 +630,7 @@ const reflow! = (*[Uint8] src, Iarch n): [Uint8] -> {
 	loop {
 		if i >= nt then break
 		const TokKind k = toks[i].kind
+
 		if is_opener(k) then {
 			if csp >= Iarch(cst.len) then cst = [...cst, 0 - 1]
 			cst[csp] = i
@@ -527,6 +643,7 @@ const reflow! = (*[Uint8] src, Iarch n): [Uint8] -> {
 		} else if is_comma(k) then {
 			if csp > 0 then cgroup[cst[csp - 1]] = true
 		}
+
 		i = i + 1
 	}
 
@@ -541,19 +658,23 @@ const reflow! = (*[Uint8] src, Iarch n): [Uint8] -> {
 	loop {
 		if g >= nt then break
 		const TokKind gk = toks[g].kind
+
 		if is_lbrace(gk) && !cgroup[g] && close_of[g] >= 0 && opens_stmt_block(src, toks, g) then {
 			const Iarch bc = close_of[g]
+
 			if bc > g + 1 && count_nl(src, src_hi(toks[g]), src_lo(toks[bc])) == 0 then {
 				gapd[g + 1] = Uint8(gap_nl)
 				gapd[bc] = Uint8(gap_nl)
 			}
 		}
+
 		if is_opener(gk) && cgroup[g] && close_of[g] >= 0 && g >= skip_until then {
 			const Iarch c = close_of[g]
 			const Iarch col = col_of(src, src_lo(toks[g]))
 			const Iarch fw = group_flat_width(src, toks, close_of, cgroup, g)
 			const Bool ml = count_nl(src, src_lo(toks[g]), src_hi(toks[c])) > 0
 			const Bool broken_want = fw >= uncollapsible || col + fw > line_limit
+
 			if broken_want then {
 				if !ml || !group_one_per_line(src, toks, close_of, g) then {
 					# EXPLODE: a hard break after the opener, after every top-level comma, and
@@ -600,6 +721,7 @@ const reflow! = (*[Uint8] src, Iarch n): [Uint8] -> {
 				}
 			}
 		}
+
 		g = g + 1
 	}
 
@@ -613,6 +735,7 @@ const reflow! = (*[Uint8] src, Iarch n): [Uint8] -> {
 		if e >= nt then break
 		const Token t = toks[e]
 		if is_eof(t.kind) then break
+
 		if first then {
 			let Iarch q = 0
 			const Iarch lo = src_lo(t)
@@ -639,6 +762,7 @@ const reflow! = (*[Uint8] src, Iarch n): [Uint8] -> {
 				}
 			}
 		}
+
 		let Iarch q2 = src_lo(t)
 		const Iarch hi = src_hi(t)
 
@@ -700,14 +824,17 @@ const break_expr! = (*[Uint8] src, Iarch n): [Uint8] -> {
 
 			loop {
 				if w >= ti then break
+
 				if !is_comment(toks[w].kind) then {
 					cend = src_hi(toks[w])
 					belast = w
 				}
+
 				w = w + 1
 			}
 
 			if cend > le then cend = le
+
 			# a line whose last content token is a bare opener is a group-header mid-explosion (its
 			# body continues on the following lines), not a complete expression — leave it alone so
 			# a partial (already argument-broken) body is never re-broken at the wrong indent
@@ -753,6 +880,7 @@ const break_expr! = (*[Uint8] src, Iarch n): [Uint8] -> {
 				if arrow >= 0 && !did_if then {
 					const Iarch bs = arrow + 1
 					const Iarch bodylen = indent + 1 + cend - src_lo(toks[bs])
+
 					if bodylen <= line_limit then {
 						# the body fits on one continuation line — drop it after the `->`
 						gapd[bs] = Uint8(gap_nl)
@@ -778,6 +906,7 @@ const break_expr! = (*[Uint8] src, Iarch n): [Uint8] -> {
 						}
 
 						if indent + 1 + src_hi(toks[belast]) - src_lo(toks[segstart]) > line_limit then ok = false
+
 						if ok && segstart > bs then {
 							# break after the `->` and before each top-level operator
 							gapd[bs] = Uint8(gap_nl)
@@ -796,6 +925,7 @@ const break_expr! = (*[Uint8] src, Iarch n): [Uint8] -> {
 					}
 				}
 			}
+
 			ls = p + 1
 			p = p + 1
 		}
@@ -810,6 +940,7 @@ const break_expr! = (*[Uint8] src, Iarch n): [Uint8] -> {
 		if e >= nt then break
 		const Token t = toks[e]
 		if is_eof(t.kind) then break
+
 		if first then {
 			let Iarch q = 0
 			const Iarch lo = src_lo(t)
@@ -833,6 +964,7 @@ const break_expr! = (*[Uint8] src, Iarch n): [Uint8] -> {
 				}
 			}
 		}
+
 		let Iarch q2 = src_lo(t)
 		const Iarch hi = src_hi(t)
 
@@ -895,18 +1027,22 @@ pub const format_file! = (Str path, Bool check): Iarch -> {
 		const [Uint8] ab = break_and_format!(out, Iarch(out.len))
 		const [Uint8] re = reflow_and_format!(ab, Iarch(ab.len))
 		let Bool converged = Iarch(re.len) == Iarch(out.len)
+
 		if converged then {
 			let Iarch j = 0
 
 			loop {
 				if j >= Iarch(re.len) then break
+
 				if Iarch(re[j]) != Iarch(out[j]) then {
 					converged = false
 					break
 				}
+
 				j = j + 1
 			}
 		}
+
 		out = re
 		if converged then break
 		guard = guard + 1
@@ -914,15 +1050,18 @@ pub const format_file! = (Str path, Bool check): Iarch -> {
 
 	# Is the file already formatted? (out == buf[0..n], byte for byte.)
 	let Bool same = Iarch(out.len) == n
+
 	if same then {
 		let Iarch j = 0
 
 		loop {
 			if j >= n then break
+
 			if Iarch(buf[j]) != Iarch(out[j]) then {
 				same = false
 				break
 			}
+
 			j = j + 1
 		}
 	}
@@ -933,6 +1072,7 @@ pub const format_file! = (Str path, Bool check): Iarch -> {
 
 		return 1
 	}
+
 	if same then return 0
 	const Iarch wfd = open(path.bytes, Uarch(o_wronly_creat_trunc), Uarch(mode_644))
 	if wfd < 0 then die("cf: format: cannot open the file for writing\n")
