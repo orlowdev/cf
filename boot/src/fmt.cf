@@ -11,12 +11,12 @@
 # breaks and canonicalises only indentation, spacing, blank-line runs, comment width, group
 # layout, trailing commas, and top-level ordering.
 #
-# Phase A: read / write-in-place / `--check` plumbing. Phase B (here): indentation + blank-line
-# runs. The core stays a pure `[Uint8] -> [Uint8]` so the CLI command and the pipeline
-# canonicaliser share one implementation.
+# Phase A: read / write-in-place / `--check` plumbing. Phase B: indentation + blank-line runs.
+# Phase C (here): trailing commas. The core stays a pure `[Uint8] -> [Uint8]` so the CLI command
+# and the pipeline canonicaliser share one implementation.
 
 import io::{ open, read, write, close, die, eprint, o_rdonly, o_wronly_creat_trunc, mode_644 }
-import token::{ Token, TokKind, is_eof, is_strlit, is_comment, is_lparen, is_rparen, is_lbrace, is_rbrace, is_lbracket, is_rbracket }
+import token::{ Token, TokKind, is_eof, is_strlit, is_comment, is_comma, is_lparen, is_rparen, is_lbrace, is_rbrace, is_lbracket, is_rbracket }
 import lexer::{ lex_fmt }
 
 # --- token geometry ----------------------------------------------------------
@@ -42,21 +42,93 @@ const count_nl = (*[Uint8] src, Iarch from, Iarch to): Iarch -> {
 	return c
 }
 
-# The formatted bytes of `src[0..n]`. The whole output vector rides out to the caller (a
-# survivor), so this frame is residue-free and non-`!` — it allocates under the caller's ambient
-# arena (`format_file!`'s), where the returned bytes then live.
+# The formatted bytes of `src[0..n]`. The output vector rides out to the caller (a survivor)
+# and lives in the caller's ambient arena (`format_file!`'s); the Phase-C pre-pass scratch
+# (`add_after`/`drop_tok` and the group stack) is residue, so this frame is `!` — that scratch
+# is reclaimed at frame exit while the returned bytes persist.
 #
-# Phase B (line formatting): reproduce the token stream, but rewrite every line START to `depth`
+# Line formatting (Phase B): reproduce the token stream, but rewrite every line START to `depth`
 # hard tabs (nesting depth over `(){}[]`) and collapse each run of blank lines to a single one.
 # Inter-token spacing WITHIN a line is preserved verbatim — cf's newlines are statement
 # separators, so the user's line breaks stand; only leading indentation and blank runs are
 # canonicalised (both invisible to the lexer, so the output always re-lexes to the same tokens).
 #
+# Trailing commas (Phase C): a pre-pass classifies each bracketed group by whether it holds a
+# top-level comma (the safe marker of a comma-separated LIST — cf places commas only inside
+# `()`/`[]`/comma-list `{}`, never bare in a statement block). A multi-line list (its closer on
+# a later line than its last element) is given exactly one trailing comma; a single-line list is
+# stripped of one. `(e)` is grouping, not a one-tuple, so a strip never changes meaning.
+#
 # Every byte append is INLINED on the single `out` local: a `[Uint8]` grows byte-packed only
 # while tracked as element `Uint8`, which a parameter loses (a `[Uint8]` arg stores 8-wide in
 # the callee) — so there are no `([Uint8] out) -> [Uint8]` builder helpers here.
-pub const format_source = (*[Uint8] src, Iarch n): [Uint8] -> {
+pub const format_source! = (*[Uint8] src, Iarch n): [Uint8] -> {
 	const [Token] toks = lex_fmt(src, n)
+	# Pre-pass: per token, `add_after[j]` appends a `,` right after token j, `drop_tok[j]` elides
+	# the comma at j. Both start all-false, one slot per token.
+	let [Bool] add_after = []
+	let [Bool] drop_tok = []
+	let Iarch z = 0
+	loop {
+		if z >= Iarch(toks.len) then break
+		add_after = [...add_after, false]
+		drop_tok = [...drop_tok, false]
+		z = z + 1
+	}
+	# A per-group stack: `stk_last[d]` = index of group d's last content token (not a comma or
+	# comment), `stk_comma[d]` = whether it holds a top-level comma. `sp` is the live depth;
+	# entries past `sp` are stale (the stack is grown once, never shrunk).
+	let [Iarch] stk_last = []
+	let [Bool] stk_comma = []
+	let Iarch sp = 0
+	let Iarch pi = 0
+	loop {
+		if pi >= Iarch(toks.len) then break
+		const TokKind pk = toks[pi].kind
+		if is_eof(pk) then break
+		if is_opener(pk) then {
+			if sp >= Iarch(stk_last.len) then {
+				stk_last = [...stk_last, 0 - 1]
+				stk_comma = [...stk_comma, false]
+			}
+			stk_last[sp] = 0 - 1
+			stk_comma[sp] = false
+			sp = sp + 1
+		} else if is_closer(pk) then {
+			if sp > 0 then {
+				const Iarch last = stk_last[sp - 1]
+				const Bool hasc = stk_comma[sp - 1]
+				sp = sp - 1
+				if hasc && last >= 0 then {
+					# an existing trailing comma sits after the last content token (nothing but a
+					# comma and comments can follow it before the closer)
+					let Iarch existing = 0 - 1
+					let Iarch s = last + 1
+					loop {
+						if s >= pi then break
+						if is_comma(toks[s].kind) then {
+							existing = s
+							break
+						}
+						s = s + 1
+					}
+					const Iarch nl = count_nl(src, src_hi(toks[last]), src_lo(toks[pi]))
+					if nl > 0 then {
+						if existing < 0 then add_after[last] = true
+					} else {
+						if existing >= 0 then drop_tok[existing] = true
+					}
+				}
+				# this closer is a content token of the enclosing group
+				if sp > 0 then stk_last[sp - 1] = pi
+			}
+		} else if is_comma(pk) then {
+			if sp > 0 then stk_comma[sp - 1] = true
+		} else if !is_comment(pk) then {
+			if sp > 0 then stk_last[sp - 1] = pi
+		}
+		pi = pi + 1
+	}
 	let [Uint8] out = []
 	let Iarch depth = 0
 	let Bool first = true
@@ -95,8 +167,10 @@ pub const format_source = (*[Uint8] src, Iarch n): [Uint8] -> {
 		}
 		# the token's own text — a `StrLit` re-wrapped in its quotes, a `Comment` right-trimmed,
 		# everything else its verbatim source slice (multi-line `asm`/interp strings ride through
-		# untouched: their inner newlines and indentation are string content, never reflowed)
-		if is_strlit(t.kind) then {
+		# untouched: their inner newlines and indentation are string content, never reflowed). A
+		# `drop_tok` comma emits nothing — its neighbouring gaps close over the elided byte.
+		if drop_tok[i] then {
+		} else if is_strlit(t.kind) then {
 			out = [...out, Uint8(34)]
 			let Iarch k = t.start
 			const Iarch se = t.start + t.len
@@ -128,6 +202,8 @@ pub const format_source = (*[Uint8] src, Iarch n): [Uint8] -> {
 				k = k + 1
 			}
 		}
+		# a Phase-C trailing comma, injected directly after the last content token's text
+		if add_after[i] then out = [...out, Uint8(44)]
 		if is_opener(t.kind) then depth = depth + 1
 		if is_closer(t.kind) then depth = depth - 1
 		i = i + 1
@@ -152,7 +228,7 @@ pub const format_file! = (Str path, Bool check): Iarch -> {
 	if n < 0 then die("cf: format: reading the input file failed\n")
 	if n >= Iarch(buf.len) then die("cf: format: the input file exceeds the read buffer — grow it in fmt.cf\n")
 
-	const [Uint8] out = format_source(buf, n)
+	const [Uint8] out = format_source!(buf, n)
 
 	# Is the file already formatted? (out == buf[0..n], byte for byte.)
 	let Bool same = Iarch(out.len) == n
