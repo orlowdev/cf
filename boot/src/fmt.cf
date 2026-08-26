@@ -39,12 +39,14 @@ import lexer::{ lex_fmt }
 # --- token geometry ----------------------------------------------------------
 
 const is_opener = (TokKind k): Bool -> is_lparen(k) || is_lbracket(k) || is_lbrace(k)
+
 const is_closer = (TokKind k): Bool -> is_rparen(k) || is_rbracket(k) || is_rbrace(k)
 
 # A token's span in the SOURCE buffer. A `StrLit`'s stored (start, len) is the CONTENT between
 # the quotes, so its source span also covers the two quote bytes; every other kind's (start, len)
 # already covers its full source text.
 const src_lo = (Token t): Iarch -> if is_strlit(t.kind) then t.start - 1 else t.start
+
 const src_hi = (Token t): Iarch -> if is_strlit(t.kind)
 	then t.start + t.len + 1
 	else t.start + t.len
@@ -129,6 +131,32 @@ const tok_is_match = (*[Uint8] src, Token t): Bool -> {
 	if Iarch(src[t.start + 4]) != 104 then return false
 
 	return true
+}
+
+# Does token `t` open a TOP-LEVEL declaration? — a keyword that begins one (`pub` covers every
+# `pub …` form): `const`/`pub`/`data`/`union`/`type`/`import`/`intrinsic`. At bracket depth 0 and
+# line-leading, such a token marks a declaration boundary (a `const` inside a body is a local, but
+# it lives at depth > 0). Matched by RAW BYTES — never a `Str` literal, whose materialisation would
+# add a per-token temporary on this hot walk.
+const is_decl_kw = (*[Uint8] src, Token t): Bool -> {
+	const Iarch l = Iarch(t.len)
+	const Iarch s = t.start
+	if l == 5 && Iarch(src[s]) == 99 && Iarch(src[s + 1]) == 111 && Iarch(src[s + 2]) == 110 && Iarch(src[s + 3]) == 115 && Iarch(src[s + 4]) == 116
+		then return true
+	if l == 3 && Iarch(src[s]) == 112 && Iarch(src[s + 1]) == 117 && Iarch(src[s + 2]) == 98
+		then return true
+	if l == 4 && Iarch(src[s]) == 100 && Iarch(src[s + 1]) == 97 && Iarch(src[s + 2]) == 116 && Iarch(src[s + 3]) == 97
+		then return true
+	if l == 5 && Iarch(src[s]) == 117 && Iarch(src[s + 1]) == 110 && Iarch(src[s + 2]) == 105 && Iarch(src[s + 3]) == 111 && Iarch(src[s + 4]) == 110
+		then return true
+	if l == 4 && Iarch(src[s]) == 116 && Iarch(src[s + 1]) == 121 && Iarch(src[s + 2]) == 112 && Iarch(src[s + 3]) == 101
+		then return true
+	if l == 6 && Iarch(src[s]) == 105 && Iarch(src[s + 1]) == 109 && Iarch(src[s + 2]) == 112 && Iarch(src[s + 3]) == 111 && Iarch(src[s + 4]) == 114 && Iarch(src[s + 5]) == 116
+		then return true
+	if l == 9 && Iarch(src[s]) == 105 && Iarch(src[s + 1]) == 110 && Iarch(src[s + 2]) == 116
+		then return true
+
+	return false
 }
 
 # Is the `{` at token `o` the opener of a STATEMENT block (a function/loop/if/arm body), as
@@ -506,12 +534,28 @@ pub const format_source! = (*[Uint8] src, Iarch n): [Uint8] -> {
 
 	let [Iarch] elstk = [0]
 	let Iarch lbd = 0
+	# top-level decl-starts, collected on this same walk (a separate per-token loop would be redundant
+	# work); `prev_hi` tracks the previous token's end so a line-leading test needs no fresh Token copy
+	let [Iarch] decls = []
+	let Iarch prev_hi = 0
 	let Iarch lx = 0
 
 	loop {
 		if lx >= Iarch(toks.len) then break
 		const Token lt = toks[lx]
 		const TokKind ltk = lt.kind
+		# a top-level decl-start: a line-leading declaration keyword at bracket depth 0 (a `const`
+		# inside a body is a local at depth > 0). `lbd` is the depth entering `lt`; a decl keyword is
+		# not a bracket, so it is unchanged here
+		if lbd == 0 then {
+			let Bool lead = lx == 0
+			if lx > 0 && count_nl(src, prev_hi, lt.start) > 0 then lead = true
+			if lead then {
+				if is_decl_kw(src, lt) then decls = [...decls, lx]
+			}
+		}
+
+		prev_hi = lt.start + lt.len
 
 		if is_opener(ltk) then {
 			lbd = lbd + 1
@@ -531,6 +575,55 @@ pub const format_source! = (*[Uint8] src, Iarch n): [Uint8] -> {
 		}
 
 		lx = lx + 1
+	}
+
+	# Blank lines around top-level FUNCTIONS: a function decl (`[pub] const NAME = … -> …`, told apart
+	# from a value/data/type/import by a `->` at bracket depth 0) is separated from its neighbours by a
+	# blank line — set before decl k's head when decl k OR decl k-1 is a function. The blank opens
+	# above a glued leading comment so it rides with its function; value/type/import runs stay tight.
+	let Bool pfunc = false
+	let Iarch dk = 0
+
+	loop {
+		if dk >= Iarch(decls.len) then break
+		const Iarch ds = decls[dk]
+		const Iarch de = if dk + 1 < Iarch(decls.len) then decls[dk + 1] else Iarch(toks.len)
+		let Bool isf = false
+		let Iarch sd = 0
+		let Iarch sx = ds + 1
+
+		loop {
+			if sx >= de then break
+			const TokKind sk = toks[sx].kind
+			if is_opener(sk) then sd = sd + 1
+				else if is_closer(sk) then sd = sd - 1
+					else if is_arrow(sk) then {
+				if sd == 0 then {
+					isf = true
+					break
+				}
+			}
+			sx = sx + 1
+		}
+
+		if dk > 0 then {
+			if isf || pfunc then {
+				# head — walk back over comment lines glued directly above the declaration
+				let Iarch h = ds
+
+				loop {
+					if h <= 0 then break
+					if !is_comment(toks[h - 1].kind) then break
+					if count_nl(src, src_hi(toks[h - 1]), src_lo(toks[h])) != 1 then break
+					h = h - 1
+				}
+
+				blank_before[h] = true
+			}
+		}
+
+		pfunc = isf
+		dk = dk + 1
 	}
 
 	let [Uint8] out = []
