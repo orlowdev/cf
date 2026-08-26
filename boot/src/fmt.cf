@@ -444,7 +444,12 @@ pub const format_source! = (*[Uint8] src, Iarch n): [Uint8] -> {
 		if tok_is_match(src, toks[li]) && li > 0 then {
 			const Token imm = toks[li - 1]
 
-			if !is_arrow(imm.kind) && !tok_is_then(src, imm) && !tok_is_else(src, imm) && !is_lparen(imm.kind) && !is_lbracket(imm.kind) && !is_comma(imm.kind) then {
+			if !is_arrow(imm.kind)
+				&& !tok_is_then(src, imm)
+				&& !tok_is_else(src, imm)
+				&& !is_lparen(imm.kind)
+				&& !is_lbracket(imm.kind)
+				&& !is_comma(imm.kind) then {
 				const Iarch mend = match_end(src, toks, li)
 
 				if mend >= 0 then {
@@ -506,7 +511,8 @@ pub const format_source! = (*[Uint8] src, Iarch n): [Uint8] -> {
 					out = [...out, src[k]]
 					k = k + 1
 				}
-			} else if (tok_is_else(src, t) || tok_is_then(src, t)) && (is_rbrace(p.kind) || (i + 1 < Iarch(toks.len) && is_lbrace(toks[i + 1].kind))) then {
+			} else if (tok_is_else(src, t) || tok_is_then(src, t))
+				&& (is_rbrace(p.kind) || (i + 1 < Iarch(toks.len) && is_lbrace(toks[i + 1].kind))) then {
 				# a `then`/`else` clause keyword rides on the previous line, not its own, when it
 				# closes a block (`} else`) or opens one (`else {`, `else if … then {`) — a statement
 				# guard's clauses stay attached to their `}`/`if`. (An `else`/`then` broken onto its
@@ -933,88 +939,124 @@ const break_expr! = (*[Uint8] src, Iarch n): [Uint8] -> {
 			# a line whose last content token is a bare opener is a group-header mid-explosion (its
 			# body continues on the following lines), not a complete expression — leave it alone so
 			# a partial (already argument-broken) body is never re-broken at the wrong indent
-			if cend - ls > line_limit && tstart < ti && belast >= 0 && !is_opener(toks[belast].kind) then {
+			if cend - ls > line_limit && tstart < ti && belast >= 0 then {
 				const Iarch indent = src_lo(toks[tstart]) - ls
-				# HIGHEST priority: a conditional `if … then … [else …]` splits at its clauses — the
-				# `if …` stays put and every top-level `then`/`else` drops to its own line (indented a
-				# further tab by `format_source!`). This outranks the operator/argument breaks below:
-				# a conditional's shape wins over its `||`/`&&` contents.
-				let Iarch rc = 0
-				let Bool did_if = false
-				let Iarch jc = tstart
+				# A statement-guard header `… then {` (an `if`/`else if` whose block body opens on this
+				# line) overflows because of its CONDITION: break the condition on its top-level `||`/`&&`,
+				# one operand per line (`format_source!` indents a `||`/`&&`-led line a further tab). This
+				# is why such a line — though it ends in an opener — is NOT treated as a mid-explosion
+				# group header (those, ending in a bare `(`/`[`, are left alone in the final `else if`).
+				const Bool guard = is_lbrace(toks[belast].kind) && belast > tstart && tok_is_then(
+					src,
+					toks[belast - 1],
+				)
 
-				loop {
-					if jc >= ti then break
-					const TokKind ck = toks[jc].kind
-					if is_opener(ck) then rc = rc + 1
-						else if is_closer(ck) then rc = rc - 1
-						else if rc == 0 && (tok_is_then(src, toks[jc]) || tok_is_else(src, toks[jc])) then {
-						gapd[jc] = Uint8(gap_nl)
-						did_if = true
+				if guard then {
+					# the guard's `if` keyword — the condition runs from just after it to the `then` at
+					# `belast - 1`. Starting the depth count HERE (not at the line's leading `}` of a
+					# `} else if …`, which would skew it to -1) keeps the condition's brackets balanced, so
+					# a top-level `||`/`&&` reads at depth 0 and the `&&` inside a `(…)` stays put.
+					let Iarch gif = tstart
+
+					loop {
+						if gif >= belast then break
+						if tok_is_if(src, toks[gif]) then break
+						gif = gif + 1
 					}
-					jc = jc + 1
-				}
 
-				# the FIRST top-level (relative depth 0) `->` with an expression (non-block) body
-				let Iarch rel = 0
-				let Iarch arrow = 0 - 1
-				let Iarch j = tstart
+					let Iarch rg = 0
+					let Iarch qg = gif + 1
 
-				loop {
-					if j >= ti then break
-					const TokKind jk = toks[j].kind
-					if is_opener(jk) then rel = rel + 1
-						else if is_closer(jk) then rel = rel - 1
-						else if is_arrow(jk) && rel == 0 && j + 1 < ti && !is_lbrace(toks[j + 1].kind) then {
-						arrow = j
-						break
+					loop {
+						if qg >= belast then break
+						const TokKind qgk = toks[qg].kind
+						if is_opener(qgk) then rg = rg + 1
+							else if is_closer(qgk) then rg = rg - 1
+							else if (is_logor(qgk) || is_logand(qgk)) && rg == 0 then gapd[qg] = Uint8(gap_nl)
+						qg = qg + 1
 					}
-					j = j + 1
-				}
+				} else if !is_opener(toks[belast].kind) then {
+					# HIGHEST priority: a conditional `if … then … [else …]` splits at its clauses — the
+					# `if …` stays put and every top-level `then`/`else` drops to its own line (indented a
+					# further tab by `format_source!`). This outranks the operator/argument breaks below:
+					# a conditional's shape wins over its `||`/`&&` contents.
+					let Iarch rc = 0
+					let Bool did_if = false
+					let Iarch jc = tstart
 
-				if arrow >= 0 && !did_if then {
-					const Iarch bs = arrow + 1
-					const Iarch bodylen = indent + 1 + cend - src_lo(toks[bs])
-
-					if bodylen <= line_limit then {
-						# the body fits on one continuation line — drop it after the `->`
-						gapd[bs] = Uint8(gap_nl)
-					} else {
-						# else split the body on its top-level `||`/`&&`, but only if every operand
-						# then fits on its own continuation line (no nested breaking attempted)
-						let Iarch r2 = 0
-						let Bool ok = true
-						let Iarch segstart = bs
-						let Iarch m = bs
-
-						loop {
-							if m > belast then break
-							const TokKind mk = toks[m].kind
-							if is_opener(mk) then r2 = r2 + 1
-								else if is_closer(mk) then r2 = r2 - 1
-								else if r2 == 0 && tok_is_then(src, toks[m]) then ok = false
-								else if (is_logor(mk) || is_logand(mk)) && r2 == 0 then {
-								if indent + 1 + src_hi(toks[m - 1]) - src_lo(toks[segstart]) > line_limit then ok = false
-								segstart = m
-							}
-							m = m + 1
+					loop {
+						if jc >= ti then break
+						const TokKind ck = toks[jc].kind
+						if is_opener(ck) then rc = rc + 1
+							else if is_closer(ck) then rc = rc - 1
+							else if rc == 0 && (tok_is_then(src, toks[jc]) || tok_is_else(src, toks[jc])) then {
+							gapd[jc] = Uint8(gap_nl)
+							did_if = true
 						}
+						jc = jc + 1
+					}
 
-						if indent + 1 + src_hi(toks[belast]) - src_lo(toks[segstart]) > line_limit then ok = false
+					# the FIRST top-level (relative depth 0) `->` with an expression (non-block) body
+					let Iarch rel = 0
+					let Iarch arrow = 0 - 1
+					let Iarch j = tstart
 
-						if ok && segstart > bs then {
-							# break after the `->` and before each top-level operator
+					loop {
+						if j >= ti then break
+						const TokKind jk = toks[j].kind
+						if is_opener(jk) then rel = rel + 1
+							else if is_closer(jk) then rel = rel - 1
+							else if is_arrow(jk) && rel == 0 && j + 1 < ti && !is_lbrace(toks[j + 1].kind) then {
+							arrow = j
+							break
+						}
+						j = j + 1
+					}
+
+					if arrow >= 0 && !did_if then {
+						const Iarch bs = arrow + 1
+						const Iarch bodylen = indent + 1 + cend - src_lo(toks[bs])
+
+						if bodylen <= line_limit then {
+							# the body fits on one continuation line — drop it after the `->`
 							gapd[bs] = Uint8(gap_nl)
-							let Iarch r3 = 0
-							let Iarch q = bs
+						} else {
+							# else split the body on its top-level `||`/`&&`, but only if every operand
+							# then fits on its own continuation line (no nested breaking attempted)
+							let Iarch r2 = 0
+							let Bool ok = true
+							let Iarch segstart = bs
+							let Iarch m = bs
 
 							loop {
-								if q > belast then break
-								const TokKind qk = toks[q].kind
-								if is_opener(qk) then r3 = r3 + 1
-									else if is_closer(qk) then r3 = r3 - 1
-									else if (is_logor(qk) || is_logand(qk)) && r3 == 0 then gapd[q] = Uint8(gap_nl)
-								q = q + 1
+								if m > belast then break
+								const TokKind mk = toks[m].kind
+								if is_opener(mk) then r2 = r2 + 1
+									else if is_closer(mk) then r2 = r2 - 1
+									else if r2 == 0 && tok_is_then(src, toks[m]) then ok = false
+									else if (is_logor(mk) || is_logand(mk)) && r2 == 0 then {
+									if indent + 1 + src_hi(toks[m - 1]) - src_lo(toks[segstart]) > line_limit then ok = false
+									segstart = m
+								}
+								m = m + 1
+							}
+
+							if indent + 1 + src_hi(toks[belast]) - src_lo(toks[segstart]) > line_limit then ok = false
+
+							if ok && segstart > bs then {
+								# break after the `->` and before each top-level operator
+								gapd[bs] = Uint8(gap_nl)
+								let Iarch r3 = 0
+								let Iarch q = bs
+
+								loop {
+									if q > belast then break
+									const TokKind qk = toks[q].kind
+									if is_opener(qk) then r3 = r3 + 1
+										else if is_closer(qk) then r3 = r3 - 1
+										else if (is_logor(qk) || is_logand(qk)) && r3 == 0 then gapd[q] = Uint8(gap_nl)
+									q = q + 1
+								}
 							}
 						}
 					}
