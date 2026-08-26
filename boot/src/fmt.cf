@@ -24,6 +24,7 @@ import token::{
 	is_comment,
 	is_comma,
 	is_arrow,
+	is_eq,
 	is_logor,
 	is_logand,
 	is_lparen,
@@ -52,11 +53,13 @@ const src_hi = (Token t): Iarch -> if is_strlit(t.kind)
 const count_nl = (*[Uint8] src, Iarch from, Iarch to): Iarch -> {
 	let Iarch c = 0
 	let Iarch k = from
+
 	loop {
 		if k >= to then break
 		if Iarch(src[k]) == 10 then c = c + 1
 		k = k + 1
 	}
+
 	return c
 }
 
@@ -128,12 +131,14 @@ pub const format_source! = (*[Uint8] src, Iarch n): [Uint8] -> {
 	let [Bool] add_after = []
 	let [Bool] drop_tok = []
 	let Iarch z = 0
+
 	loop {
 		if z >= Iarch(toks.len) then break
 		add_after = [...add_after, false]
 		drop_tok = [...drop_tok, false]
 		z = z + 1
 	}
+
 	# A per-group stack: `stk_last[d]` = index of group d's last content token (not a comma or
 	# comment), `stk_comma[d]` = whether it holds a top-level comma. `sp` is the live depth;
 	# entries past `sp` are stale (the stack is grown once, never shrunk).
@@ -141,6 +146,7 @@ pub const format_source! = (*[Uint8] src, Iarch n): [Uint8] -> {
 	let [Bool] stk_comma = []
 	let Iarch sp = 0
 	let Iarch pi = 0
+
 	loop {
 		if pi >= Iarch(toks.len) then break
 		const TokKind pk = toks[pi].kind
@@ -163,6 +169,7 @@ pub const format_source! = (*[Uint8] src, Iarch n): [Uint8] -> {
 					# comma and comments can follow it before the closer)
 					let Iarch existing = 0 - 1
 					let Iarch s = last + 1
+
 					loop {
 						if s >= pi then break
 						if is_comma(toks[s].kind) then {
@@ -171,6 +178,7 @@ pub const format_source! = (*[Uint8] src, Iarch n): [Uint8] -> {
 						}
 						s = s + 1
 					}
+
 					const Iarch nl = count_nl(src, src_hi(toks[last]), src_lo(toks[pi]))
 					if nl > 0 then {
 						if existing < 0 then add_after[last] = true
@@ -188,23 +196,70 @@ pub const format_source! = (*[Uint8] src, Iarch n): [Uint8] -> {
 		}
 		pi = pi + 1
 	}
+
+	# Blank lines around a `loop` STATEMENT (a `loop {…}` run for effect — NOT a `->`/`then`/`else`
+	# body loop nor a `= …` value loop). `blank_before[j]` forces one blank line before token j: it
+	# is set on the `loop` keyword to open a gap ABOVE (unless the loop is the block's first
+	# statement, i.e. `{` sits right before it) and on the token AFTER the loop's matching `}` to
+	# open a gap BELOW (unless that token is the block's own `}`, i.e. the loop is the block's last
+	# statement). The gap is only ever emitted where a newline already falls, so a same-line value
+	# loop is untouched.
+	let [Bool] blank_before = []
+	let Iarch bz = 0
+
+	loop {
+		if bz >= Iarch(toks.len) then break
+		blank_before = [...blank_before, false]
+		bz = bz + 1
+	}
+
+	let Iarch li = 0
+
+	loop {
+		if li >= Iarch(toks.len) then break
+		if tok_is_loop(src, toks[li]) && li > 0 && li + 1 < Iarch(toks.len) && is_lbrace(toks[li + 1].kind) then {
+			const Token pv = toks[li - 1]
+			if !is_arrow(pv.kind) && !tok_is_then(src, pv) && !tok_is_else(src, pv) && !is_eq(pv.kind) then {
+				if !is_lbrace(pv.kind) then blank_before[li] = true
+				# find the loop's matching `}` by tracking brace/bracket depth from its opener
+				let Iarch d = 0
+				let Iarch m = li + 1
+
+				loop {
+					if m >= Iarch(toks.len) then break
+					if is_opener(toks[m].kind) then d = d + 1
+						else if is_closer(toks[m].kind) then {
+						d = d - 1
+						if d == 0 then break
+					}
+					m = m + 1
+				}
+
+				if m + 1 < Iarch(toks.len) && !is_rbrace(toks[m + 1].kind) && !is_eof(toks[m + 1].kind)
+					then blank_before[m + 1] = true
+			}
+		}
+		li = li + 1
+	}
+
 	let [Uint8] out = []
 	let Iarch depth = 0
 	let Bool first = true
 	let Iarch i = 0
+
 	loop {
 		if i >= Iarch(toks.len) then break
 		const Token t = toks[i]
 		if is_eof(t.kind) then break
 		# whitespace before this token: verbatim within a line, canonical indent across a break
-		if first then first = false
-			else {
+		if first then first = false else {
 			const Token p = toks[i - 1]
 			const Iarch gfrom = src_hi(p)
 			const Iarch gto = src_lo(t)
 			const Iarch nl = count_nl(src, gfrom, gto)
 			if nl == 0 then {
 				let Iarch k = gfrom
+
 				loop {
 					if k >= gto then break
 					out = [...out, src[k]]
@@ -219,7 +274,7 @@ pub const format_source! = (*[Uint8] src, Iarch n): [Uint8] -> {
 				out = [...out, Uint8(32)]
 			} else {
 				out = [...out, Uint8(10)]
-				if nl >= 2 then out = [...out, Uint8(10)]
+				if nl >= 2 || blank_before[i] then out = [...out, Uint8(10)]
 				let Iarch ind = depth
 				if is_closer(t.kind) then ind = depth - 1
 				# a line broken right after a `->`, or led by a `||`/`&&` operator or a `then`/`else`
@@ -229,6 +284,7 @@ pub const format_source! = (*[Uint8] src, Iarch n): [Uint8] -> {
 					else if tok_is_then(src, t) || tok_is_else(src, t) then ind = ind + 1
 				if ind < 0 then ind = 0
 				let Iarch ti = 0
+
 				loop {
 					if ti >= ind then break
 					out = [...out, Uint8(9)]
@@ -245,20 +301,25 @@ pub const format_source! = (*[Uint8] src, Iarch n): [Uint8] -> {
 			out = [...out, Uint8(34)]
 			let Iarch k = t.start
 			const Iarch se = t.start + t.len
+
 			loop {
 				if k >= se then break
 				out = [...out, src[k]]
 				k = k + 1
 			}
+
 			out = [...out, Uint8(34)]
 		} else if is_comment(t.kind) then {
 			let Iarch e = t.start + t.len
+
 			loop {
 				if e <= t.start then break
 				const Iarch cb = Iarch(src[e - 1])
 				if cb == 32 || cb == 9 then e = e - 1 else break
 			}
+
 			let Iarch k = t.start
+
 			loop {
 				if k >= e then break
 				out = [...out, src[k]]
@@ -267,6 +328,7 @@ pub const format_source! = (*[Uint8] src, Iarch n): [Uint8] -> {
 		} else {
 			let Iarch k = t.start
 			const Iarch te = t.start + t.len
+
 			loop {
 				if k >= te then break
 				out = [...out, src[k]]
@@ -279,10 +341,13 @@ pub const format_source! = (*[Uint8] src, Iarch n): [Uint8] -> {
 		# indent stop, not two: the `(` is transparent when a `{` follows, and the `)` when a `}`
 		# precedes. So the fields indent once under the constructor and the closing `})` de-indents
 		# to the constructor's own line.
-		if is_opener(t.kind) && !(is_lparen(t.kind) && i + 1 < Iarch(toks.len) && is_lbrace(toks[i + 1].kind)) then depth = depth + 1
-		if is_closer(t.kind) && !(is_rparen(t.kind) && i > 0 && is_rbrace(toks[i - 1].kind)) then depth = depth - 1
+		if is_opener(t.kind) && !(is_lparen(t.kind) && i + 1 < Iarch(toks.len) && is_lbrace(toks[i + 1].kind))
+			then depth = depth + 1
+		if is_closer(t.kind) && !(is_rparen(t.kind) && i > 0 && is_rbrace(toks[i - 1].kind))
+			then depth = depth - 1
 		i = i + 1
 	}
+
 	# trailing newline. NB: this is a STATEMENT append, not `return [...out, Uint8(10)]` — a
 	# spread in RETURN position corrupts (drops the last byte of) a large survivor array.
 	out = [...out, Uint8(10)]
@@ -313,11 +378,13 @@ const uncollapsible = 1000000
 # The column (0-based, tabs as one) at which byte `pos` sits: distance back to the last newline.
 const col_of = (*[Uint8] src, Iarch pos): Iarch -> {
 	let Iarch k = pos - 1
+
 	loop {
 		if k < 0 then break
 		if Iarch(src[k]) == 10 then break
 		k = k - 1
 	}
+
 	return pos - k - 1
 }
 
@@ -330,6 +397,7 @@ const group_flat_width = (*[Uint8] src, [Token] toks, [Iarch] close_of, [Bool] c
 	const Iarch c = close_of[o]
 	let Iarch w = 0
 	let Iarch k = o
+
 	loop {
 		if k > c then break
 		if is_comment(toks[k].kind) then return uncollapsible
@@ -353,6 +421,7 @@ const group_flat_width = (*[Uint8] src, [Token] toks, [Iarch] close_of, [Bool] c
 		}
 		k = k + 1
 	}
+
 	return w
 }
 
@@ -364,6 +433,7 @@ const group_one_per_line = (*[Uint8] src, [Token] toks, [Iarch] close_of, Iarch 
 	if count_nl(src, src_hi(toks[c - 1]), src_lo(toks[c])) == 0 then return false
 	let Iarch d = 0
 	let Iarch m = o + 1
+
 	loop {
 		if m >= c then break
 		const TokKind km = toks[m].kind
@@ -376,6 +446,7 @@ const group_one_per_line = (*[Uint8] src, [Token] toks, [Iarch] close_of, Iarch 
 		}
 		m = m + 1
 	}
+
 	return true
 }
 
@@ -392,6 +463,7 @@ const reflow! = (*[Uint8] src, Iarch n): [Uint8] -> {
 	let [Bool] cgroup = []
 	let [Uint8] gapd = []
 	let Iarch z = 0
+
 	loop {
 		if z >= nt then break
 		close_of = [...close_of, 0 - 1]
@@ -399,9 +471,11 @@ const reflow! = (*[Uint8] src, Iarch n): [Uint8] -> {
 		gapd = [...gapd, Uint8(gap_verbatim)]
 		z = z + 1
 	}
+
 	let [Iarch] cst = []
 	let Iarch csp = 0
 	let Iarch i = 0
+
 	loop {
 		if i >= nt then break
 		const TokKind k = toks[i].kind
@@ -419,6 +493,7 @@ const reflow! = (*[Uint8] src, Iarch n): [Uint8] -> {
 		}
 		i = i + 1
 	}
+
 	# Two independent markings per token. (1) A `{…}` STATEMENT block (a brace with no top-level
 	# comma — a function/loop/if/arm body) is ALWAYS multi-line: a single-line one with content
 	# takes a break after its `{` and before its `}`, so nothing shares those lines. (2) The
@@ -426,6 +501,7 @@ const reflow! = (*[Uint8] src, Iarch n): [Uint8] -> {
 	# `skip_until` keeps its nested groups for a later pass, once this layout (their columns) settles.
 	let Iarch skip_until = 0 - 1
 	let Iarch g = 0
+
 	loop {
 		if g >= nt then break
 		const TokKind gk = toks[g].kind
@@ -450,6 +526,7 @@ const reflow! = (*[Uint8] src, Iarch n): [Uint8] -> {
 					gapd[c] = Uint8(gap_nl)
 					let Iarch d = 0
 					let Iarch m = g + 1
+
 					loop {
 						if m >= c then break
 						const TokKind km = toks[m].kind
@@ -460,6 +537,7 @@ const reflow! = (*[Uint8] src, Iarch n): [Uint8] -> {
 						}
 						m = m + 1
 					}
+
 					skip_until = c
 				}
 			} else {
@@ -468,6 +546,7 @@ const reflow! = (*[Uint8] src, Iarch n): [Uint8] -> {
 					# tight at a `(`/`[` edge, one space after a comma, verbatim otherwise (a
 					# leftover trailing comma is stripped by the following `format_source!` pass)
 					let Iarch m = g + 1
+
 					loop {
 						if m > c then break
 						const Token a = toks[m - 1]
@@ -480,17 +559,20 @@ const reflow! = (*[Uint8] src, Iarch n): [Uint8] -> {
 							else gapd[m] = Uint8(gap_verbatim)
 						m = m + 1
 					}
+
 					skip_until = c
 				}
 			}
 		}
 		g = g + 1
 	}
+
 	# emit: token text verbatim, each gap-before per its directive (verbatim copies the source gap)
 	let [Uint8] out = []
 	let Iarch prev_hi = 0
 	let Bool first = true
 	let Iarch e = 0
+
 	loop {
 		if e >= nt then break
 		const Token t = toks[e]
@@ -498,11 +580,13 @@ const reflow! = (*[Uint8] src, Iarch n): [Uint8] -> {
 		if first then {
 			let Iarch q = 0
 			const Iarch lo = src_lo(t)
+
 			loop {
 				if q >= lo then break
 				out = [...out, src[q]]
 				q = q + 1
 			}
+
 			first = false
 		} else {
 			const Iarch dir = Iarch(gapd[e])
@@ -511,6 +595,7 @@ const reflow! = (*[Uint8] src, Iarch n): [Uint8] -> {
 				else if dir == gap_verbatim then {
 				let Iarch q = prev_hi
 				const Iarch gt = src_lo(t)
+
 				loop {
 					if q >= gt then break
 					out = [...out, src[q]]
@@ -520,14 +605,17 @@ const reflow! = (*[Uint8] src, Iarch n): [Uint8] -> {
 		}
 		let Iarch q2 = src_lo(t)
 		const Iarch hi = src_hi(t)
+
 		loop {
 			if q2 >= hi then break
 			out = [...out, src[q2]]
 			q2 = q2 + 1
 		}
+
 		prev_hi = src_hi(t)
 		e = e + 1
 	}
+
 	out = [...out, Uint8(10)]
 	return out
 }
@@ -544,30 +632,35 @@ const break_expr! = (*[Uint8] src, Iarch n): [Uint8] -> {
 	const Iarch nt = Iarch(toks.len)
 	let [Uint8] gapd = []
 	let Iarch z = 0
+
 	loop {
 		if z >= nt then break
 		gapd = [...gapd, Uint8(gap_verbatim)]
 		z = z + 1
 	}
+
 	let Iarch ti = 0
 	let Iarch ls = 0
 	let Iarch p = 0
+
 	loop {
 		if p >= n then break
-		if Iarch(src[p]) != 10 then p = p + 1
-			else {
+		if Iarch(src[p]) != 10 then p = p + 1 else {
 			const Iarch le = p
 			const Iarch tstart = ti
+
 			loop {
 				if ti >= nt then break
 				if is_eof(toks[ti].kind) then break
 				if src_lo(toks[ti]) >= le then break
 				ti = ti + 1
 			}
+
 			# width through the last non-comment token (`belast`), capped at the visual line end
 			let Iarch cend = ls
 			let Iarch belast = 0 - 1
 			let Iarch w = tstart
+
 			loop {
 				if w >= ti then break
 				if !is_comment(toks[w].kind) then {
@@ -576,6 +669,7 @@ const break_expr! = (*[Uint8] src, Iarch n): [Uint8] -> {
 				}
 				w = w + 1
 			}
+
 			if cend > le then cend = le
 			# a line whose last content token is a bare opener is a group-header mid-explosion (its
 			# body continues on the following lines), not a complete expression — leave it alone so
@@ -589,6 +683,7 @@ const break_expr! = (*[Uint8] src, Iarch n): [Uint8] -> {
 				let Iarch rc = 0
 				let Bool did_if = false
 				let Iarch jc = tstart
+
 				loop {
 					if jc >= ti then break
 					const TokKind ck = toks[jc].kind
@@ -600,10 +695,12 @@ const break_expr! = (*[Uint8] src, Iarch n): [Uint8] -> {
 					}
 					jc = jc + 1
 				}
+
 				# the FIRST top-level (relative depth 0) `->` with an expression (non-block) body
 				let Iarch rel = 0
 				let Iarch arrow = 0 - 1
 				let Iarch j = tstart
+
 				loop {
 					if j >= ti then break
 					const TokKind jk = toks[j].kind
@@ -615,6 +712,7 @@ const break_expr! = (*[Uint8] src, Iarch n): [Uint8] -> {
 					}
 					j = j + 1
 				}
+
 				if arrow >= 0 && !did_if then {
 					const Iarch bs = arrow + 1
 					const Iarch bodylen = indent + 1 + cend - src_lo(toks[bs])
@@ -628,6 +726,7 @@ const break_expr! = (*[Uint8] src, Iarch n): [Uint8] -> {
 						let Bool ok = true
 						let Iarch segstart = bs
 						let Iarch m = bs
+
 						loop {
 							if m > belast then break
 							const TokKind mk = toks[m].kind
@@ -640,12 +739,14 @@ const break_expr! = (*[Uint8] src, Iarch n): [Uint8] -> {
 							}
 							m = m + 1
 						}
+
 						if indent + 1 + src_hi(toks[belast]) - src_lo(toks[segstart]) > line_limit then ok = false
 						if ok && segstart > bs then {
 							# break after the `->` and before each top-level operator
 							gapd[bs] = Uint8(gap_nl)
 							let Iarch r3 = 0
 							let Iarch q = bs
+
 							loop {
 								if q > belast then break
 								const TokKind qk = toks[q].kind
@@ -662,10 +763,12 @@ const break_expr! = (*[Uint8] src, Iarch n): [Uint8] -> {
 			p = p + 1
 		}
 	}
+
 	let [Uint8] out = []
 	let Iarch prev_hi = 0
 	let Bool first = true
 	let Iarch e = 0
+
 	loop {
 		if e >= nt then break
 		const Token t = toks[e]
@@ -673,17 +776,19 @@ const break_expr! = (*[Uint8] src, Iarch n): [Uint8] -> {
 		if first then {
 			let Iarch q = 0
 			const Iarch lo = src_lo(t)
+
 			loop {
 				if q >= lo then break
 				out = [...out, src[q]]
 				q = q + 1
 			}
+
 			first = false
 		} else {
-			if Iarch(gapd[e]) == gap_nl then out = [...out, Uint8(10)]
-				else {
+			if Iarch(gapd[e]) == gap_nl then out = [...out, Uint8(10)] else {
 				let Iarch q = prev_hi
 				const Iarch gt = src_lo(t)
+
 				loop {
 					if q >= gt then break
 					out = [...out, src[q]]
@@ -693,14 +798,17 @@ const break_expr! = (*[Uint8] src, Iarch n): [Uint8] -> {
 		}
 		let Iarch q2 = src_lo(t)
 		const Iarch hi = src_hi(t)
+
 		loop {
 			if q2 >= hi then break
 			out = [...out, src[q2]]
 			q2 = q2 + 1
 		}
+
 		prev_hi = src_hi(t)
 		e = e + 1
 	}
+
 	out = [...out, Uint8(10)]
 	return out
 }
@@ -741,6 +849,7 @@ pub const format_file! = (Str path, Bool check): Iarch -> {
 	# so this converges; the guard caps a pathological input rather than any real one.
 	let [Uint8] out = format_source!(buf, n)
 	let Iarch guard = 0
+
 	loop {
 		if guard >= 100 then break
 		const [Uint8] ab = break_and_format!(out, Iarch(out.len))
@@ -748,6 +857,7 @@ pub const format_file! = (Str path, Bool check): Iarch -> {
 		let Bool converged = Iarch(re.len) == Iarch(out.len)
 		if converged then {
 			let Iarch j = 0
+
 			loop {
 				if j >= Iarch(re.len) then break
 				if Iarch(re[j]) != Iarch(out[j]) then {
@@ -766,6 +876,7 @@ pub const format_file! = (Str path, Bool check): Iarch -> {
 	let Bool same = Iarch(out.len) == n
 	if same then {
 		let Iarch j = 0
+
 		loop {
 			if j >= n then break
 			if Iarch(buf[j]) != Iarch(out[j]) then {
