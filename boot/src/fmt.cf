@@ -119,6 +119,18 @@ const tok_is_if = (*[Uint8] src, Token t): Bool -> {
 	return true
 }
 
+# Does token `t`'s source text equal the keyword `match` (bytes m,a,t,c,h)?
+const tok_is_match = (*[Uint8] src, Token t): Bool -> {
+	if Iarch(t.len) != 5 then return false
+	if Iarch(src[t.start]) != 109 then return false
+	if Iarch(src[t.start + 1]) != 97 then return false
+	if Iarch(src[t.start + 2]) != 116 then return false
+	if Iarch(src[t.start + 3]) != 99 then return false
+	if Iarch(src[t.start + 4]) != 104 then return false
+
+	return true
+}
+
 # Is the `{` at token `o` the opener of a STATEMENT block (a function/loop/if/arm body), as
 # opposed to a single-element import list `::{ x }`, a bare record `{ f: v }` or a one-arm
 # `match … { A -> … }` (all comma-less, so `cgroup` cannot tell them apart)? A statement block is
@@ -201,6 +213,42 @@ const if_chain_end = (*[Uint8] src, [Token] toks, Iarch li): Iarch -> {
 	}
 
 	return end
+}
+
+# If token `li` is a `match`, return the index of its arms `{…}` block's closing `}`; otherwise -1.
+# The scrutinee may carry its own brackets (`match Foo(x) {…}`), so the arms `{` is the first `{` at
+# bracket-depth 0 after `match`. A match is fenced regardless of whether it renders on one line or
+# many: `reflow!` collapses a small match's arms AFTER the fence is placed, so gating on line count
+# would make the fencing depend on the input's line breaks rather than on the final shape.
+const match_end = (*[Uint8] src, [Token] toks, Iarch li): Iarch -> {
+	const Iarch nt = Iarch(toks.len)
+	let Iarch b = li + 1
+	let Iarch d = 0
+
+	loop {
+		if b >= nt then return 0 - 1
+		const TokKind kk = toks[b].kind
+		if d == 0 && is_lbrace(kk) then break
+		if is_opener(kk) then d = d + 1
+			else if is_closer(kk) then d = d - 1
+		b = b + 1
+	}
+
+	# skip the balanced arms block from its `{` to its `}`
+	let Iarch bd = 0
+	let Iarch m = b
+
+	loop {
+		if m >= nt then return 0 - 1
+		if is_opener(toks[m].kind) then bd = bd + 1
+			else if is_closer(toks[m].kind) then {
+			bd = bd - 1
+			if bd == 0 then break
+		}
+		m = m + 1
+	}
+
+	return m
 }
 
 # The formatted bytes of `src[0..n]`. The output vector rides out to the caller (a survivor)
@@ -380,6 +428,49 @@ pub const format_source! = (*[Uint8] src, Iarch n): [Uint8] -> {
 					if !is_lbrace(pv.kind) then blank_before[head] = true
 					if below >= 0 && below + 1 < Iarch(toks.len) && !is_rbrace(toks[below + 1].kind) && !is_eof(toks[below + 1].kind)
 						then blank_before[below + 1] = true
+				}
+			}
+		}
+
+		# A multi-line `match` — fenced like an if-chain, but it is usually VALUE-position
+		# (`let x = match …`), so the blank opens above the whole STATEMENT: walk back over the
+		# match's own line (`let x =`) to its first token, then over glued comments. A `->`/`then`/
+		# `else` body match (the dominant `-> match` arrow body) or an `(`/`[`/`,` sub-expression
+		# match is left alone — its immediate predecessor gates that out before the walkback.
+		if tok_is_match(src, toks[li]) && li > 0 then {
+			const Token imm = toks[li - 1]
+
+			if !is_arrow(imm.kind) && !tok_is_then(src, imm) && !tok_is_else(src, imm) && !is_lparen(imm.kind) && !is_lbracket(imm.kind) && !is_comma(imm.kind) then {
+				const Iarch mend = match_end(src, toks, li)
+
+				if mend >= 0 then {
+					let Iarch mhead = li
+
+					loop {
+						if mhead <= 0 then break
+						if count_nl(src, src_hi(toks[mhead - 1]), src_lo(toks[mhead])) > 0 then break
+						mhead = mhead - 1
+					}
+
+					loop {
+						if mhead <= 0 then break
+						if !is_comment(toks[mhead - 1].kind) then break
+						if count_nl(src, src_hi(toks[mhead - 1]), src_lo(toks[mhead])) != 1 then break
+						mhead = mhead - 1
+					}
+
+					if mhead > 0 then {
+						const Token mpv = toks[mhead - 1]
+						# reject a mid-expression start (a broken `= …` RHS lands the match on its own
+						# line): only a real statement boundary before the head is fenced
+						const Bool mbody = is_arrow(mpv.kind) || tok_is_then(src, mpv) || tok_is_else(src, mpv) || is_eq(mpv.kind) || is_lparen(mpv.kind) || is_lbracket(mpv.kind) || is_comma(mpv.kind)
+
+						if !mbody then {
+							if !is_lbrace(mpv.kind) then blank_before[mhead] = true
+							if mend + 1 < Iarch(toks.len) && !is_rbrace(toks[mend + 1].kind) && !is_eof(toks[mend + 1].kind)
+								then blank_before[mend + 1] = true
+						}
+					}
 				}
 			}
 		}
