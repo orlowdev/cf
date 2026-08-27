@@ -6,16 +6,16 @@
 # back to search, `r` resets the query, Ctrl-C exits (restoring the terminal first).
 #
 # The browser is split across `docs/`:
-#   state    — the `DocState` model + mode constants
+#   state    — the `DocState` model + mode constants + in-place query editing
 #   synopsis — parse a definition's signature into structured synopsis pieces
-#   text     — word-wrap, doc-comment Markdown, padding, query editing
+#   text     — word-wrap, doc-comment Markdown, padding
 #   search   — fuzzy-filter the corpus (`ranked!`, `has_exact`)
 #   page     — build a definition's read-view body + its scroll geometry
 #   render   — draw a frame (list / read page / status bar)
 #   keys     — turn a keystroke into the next `DocState`
 # This file only wires them into the read → key → dispatch loop.
 import docscan::{ Def, scan_std! }
-import docs::state::{ DocState, Mode }
+import docs::state::{ DocState, Mode, query_cap, query_str, put_query_byte }
 import docs::search::{ ranked!, has_exact }
 import docs::page::{ read_max_scroll! }
 import docs::render::{ render! }
@@ -45,7 +45,19 @@ pub const docs_run! = ([Str] args): Iarch -> {
 		if has_exact(all, q0) then mode0 = Mode.Read
 	}
 
-	let DocState st = DocState({ all: all, query: q0, mode: mode0, sel: 0, scroll: 0 })
+	# the query lives in an INLINE fixed buffer (edited in place, never rebuilt), so it is omitted from
+	# the literal and seeded here from the CLI arg — copied byte-by-byte, capped at the buffer size.
+	let DocState st = DocState({ all: all, qlen: 0, mode: mode0, sel: 0, scroll: 0 })
+	let Iarch qi = 0
+
+	loop {
+		if qi >= Iarch(q0.len) then break
+		if qi >= query_cap() then break
+		put_query_byte(st.query, qi, Iarch(q0[qi]))
+		qi = qi + 1
+	}
+
+	st.qlen = qi
 	let [72 Uint8] tio
 	let [64 Uint8] kdata
 	let [2 Uint8] kmeta = [0, 0]
@@ -54,7 +66,7 @@ pub const docs_run! = ([Str] args): Iarch -> {
 	hide_cursor!()
 
 	loop {
-		const [Def] view = ranked!(st.all, st.query)
+		const [Def] view = ranked!(st.all, query_str(st))
 		const TermSize sz = size!()
 		const Iarch width = if sz.cols > 20 then sz.cols else 80
 

@@ -4,8 +4,7 @@
 # re-renders the amended state. A key with no binding in the current mode leaves `st` untouched.
 # `viewlen`/`maxscroll` are passed in because clamping the selection / scroll needs the rendered
 # view's size, which the loop already computed. `st.all` is never written — only query/mode/sel/scroll.
-import docs::state::{ DocState, Mode }
-import docs::text::{ append_char, drop_last }
+import docs::state::{ DocState, Mode, query_cap, put_query_byte }
 import std::io::term::{ key_up, key_down, key_enter, key_esc }
 
 # The Enter key is CR (13) on a raw terminal, but a terminal's ICRNL maps it to LF (10) on input;
@@ -24,19 +23,22 @@ const dispatch_search = (*DocState st, Iarch key): () -> {
 		return
 	}
 
-	# 127 = DEL, 8 = BS — either backspaces the query
+	# 127 = DEL, 8 = BS — either backspaces the query (drop the last byte in place)
 	if key == 127 || key == 8 then {
-		st.query = drop_last(st.query)
+		if st.qlen > 0 then st.qlen = st.qlen - 1
 		st.sel = 0
 		st.scroll = 0
 
 		return
 	}
 
-	# a printable ASCII byte types into the query (capped — a search box needs no novella, and the cap
-	# keeps `append_char`'s rebuild-the-whole-string cost from going quadratic on key-spam)
-	if key >= 32 && key <= 126 && Iarch(st.query.len) < 128 then {
-		st.query = append_char(st.query, key)
+	# a printable ASCII byte types into the query — written into the inline buffer in place and the
+	# length bumped. The `qlen < query_cap()` guard is load-bearing: `put_query_byte` writes through
+	# a raw (unchecked) pointer, so a write at index `query_cap()` would clobber the adjacent `qlen`
+	# field — past the cap, further printable keys are ignored until a backspace frees room.
+	if key >= 32 && key <= 126 && st.qlen < query_cap() then {
+		put_query_byte(st.query, st.qlen, key)
+		st.qlen = st.qlen + 1
 		st.sel = 0
 		st.scroll = 0
 	}
@@ -77,7 +79,7 @@ const dispatch_select = (*DocState st, Iarch key, Iarch viewlen): () -> {
 		return
 	}
 
-	if key == 114 then st.query = ""
+	if key == 114 then st.qlen = 0
 
 	if key == 105 || key == 115 || key == 114 || key == key_esc then {
 		st.mode = Mode.Search
@@ -106,7 +108,7 @@ const dispatch_read = (*DocState st, Iarch key, Iarch maxscroll): () -> {
 	}
 
 	if key == 114 then {
-		st.query = ""
+		st.qlen = 0
 		st.mode = Mode.Search
 		st.sel = 0
 		st.scroll = 0
