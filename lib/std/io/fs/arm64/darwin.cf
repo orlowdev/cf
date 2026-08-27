@@ -4,7 +4,7 @@
 # legacy 188 returns garbage) and surfaces `st_size` (offset 96, i64) and `st_mode` (offset 4, u16).
 import std::sys::{ syscall6 }
 import std::data::{ Either }
-import std::io::fd::{ IoRrr, rrr_of, Stat }
+import std::io::fd::{ IoRrr, rrr_of, Stat, DirEntry }
 
 # Assemble a little-endian integer of `width` bytes from `buf` starting at `at`.
 const le = (*[Uint8] buf, Iarch at, Iarch width): Iarch -> {
@@ -97,4 +97,72 @@ pub const chdir = (Str path): Either[IoRrr, Iarch] -> {
 	if r < 0 then return Either[IoRrr, Iarch].Left(rrr_of(r))
 
 	return Either[IoRrr, Iarch].Right(r)
+}
+
+# getdirentries() into `buf`, returning bytes read (0 at end) or a negated errno. `fd` is an open
+# directory; `basep` is an 8-byte scratch the kernel tracks position in. The `*[Uint8]` parameters are
+# the hop the `[N Uint8]` locals need to reach `syscall6`'s `Uarch` operands.
+const getdents_raw = (Iarch fd, *[Uint8] buf, Uarch n, *[Uint8] basep): Iarch ->
+	syscall6(196, Uarch(fd), buf, n, basep, 0, 0)
+
+# Copy `len` bytes from `buf` starting at `start` into a fresh owned `Str` — the raw directory buffer
+# is scratch, so an entry name is lifted out of it before the buffer is reused.
+const slice_str = (*[Uint8] buf, Iarch start, Iarch len): Str -> {
+	let [Uint8] out = []
+	let Iarch i = 0
+
+	loop {
+		if i >= len then break
+
+		out = [...out, buf[start + i]]
+		i = i + 1
+	}
+
+	return Str({ bytes: out, len: Iarch(out.len) })
+}
+
+# List a directory: `Right` carries a `[DirEntry]` (each with an owned `name` and a `kind`, including
+# `.` and `..`); `Left` an error. Reads the legacy darwin dirent stream (getdirentries = syscall 196:
+# d_reclen@4, d_type@6, d_namlen@7, d_name@8) in 8 KiB batches until it drains.
+pub const read_dir! = (Str path): Either[IoRrr, [DirEntry]] -> {
+	const Iarch fd = syscall6(5, path.bytes, 0, 0, 0, 0, 0)
+
+	if fd < 0 then return Either[IoRrr, [DirEntry]].Left(rrr_of(fd))
+
+	let [DirEntry] entries = []
+	let [8192 Uint8] buf
+	let [8 Uint8] basep = [0, 0, 0, 0, 0, 0, 0, 0]
+	let Iarch err = 0
+
+	loop {
+		const Iarch n = getdents_raw(fd, buf, Uarch(8192), basep)
+
+		if n < 0 then {
+			err = n
+
+			break
+		}
+
+		if n == 0 then break
+
+		let Iarch off = 0
+
+		loop {
+			if off >= n then break
+
+			const Iarch reclen = le(buf, off + 4, 2)
+			const Iarch kind = Iarch(buf[off + 6])
+			const Iarch namlen = Iarch(buf[off + 7])
+			const Str name = slice_str(buf, off + 8, namlen)
+
+			entries = [...entries, DirEntry({ name: name, kind: kind })]
+			off = off + reclen
+		}
+	}
+
+	syscall6(6, Uarch(fd), 0, 0, 0, 0, 0)
+
+	if err < 0 then return Either[IoRrr, [DirEntry]].Left(rrr_of(err))
+
+	return Either[IoRrr, [DirEntry]].Right(entries)
 }
