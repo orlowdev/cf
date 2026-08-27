@@ -4,7 +4,7 @@
 # filter, the matches ranked by a fuzzy score. SELECTION: move the highlight with the arrows or j/k.
 # READ: the selected definition's signature and doc comment. Enter/esc/arrows move between modes;
 # `i`/`s` jump back to search, `r` resets the query, Ctrl-C exits (restoring the terminal first).
-import docscan::{ Def, scan_std! }
+import docscan::{ Def, scan_std!, split_lines }
 import std::str::{ fuzzy_score, no_match, eq }
 import std::io::term::{
 	raw_mode!,
@@ -176,28 +176,56 @@ const has_exact = ([Def] all, Str q): Bool -> {
 # The visible rows for a list, given the terminal height (a sane default off a real terminal).
 const visible_rows = (Iarch rows): Iarch -> if rows > 8 then rows - 5 else 20
 
-const render_read! = ([Def] view, Iarch sel): () -> {
+const render_read! = (DocState st, [Def] view, Iarch rows): () -> {
 	if Iarch(view.len) == 0 then {
 		println("(no definition)")
 
 		return ()
 	}
 
-	let Iarch idx = sel
+	let Iarch idx = st.sel
 
 	if idx >= Iarch(view.len) then idx = Iarch(view.len) - 1
 	if idx < 0 then idx = 0
 
 	const Def d = view[idx]
 
-	println("${d.kind} ${d.name}")
-	println("${d.module}")
-	println("")
-	println(sig_head(d.sig))
-	println("")
-	println("DESCRIPTION")
+	# assemble every content line, then render only what fits above the legend — the man-style layout
+	# NAME / SYNOPSIS / DESCRIPTION, the doc split into its own lines
+	let [Str] body = []
 
-	if Iarch(d.doc.len) == 0 then println("empty") else println(d.doc)
+	body = [...body, "${d.kind} ${d.name}"]
+	body = [...body, d.module]
+	body = [...body, ""]
+	body = [...body, "SYNOPSIS"]
+	body = [...body, ""]
+	body = [...body, sig_head(d.sig)]
+	body = [...body, ""]
+	body = [...body, "DESCRIPTION"]
+	body = [...body, ""]
+
+	if Iarch(d.doc.len) == 0 then body = [...body, "empty"] else {
+		const [Str] dl = split_lines(d.doc)
+
+		for line in dl {
+			body = [...body, line]
+		}
+	}
+
+	# leave the bottom row for the legend; if the body is taller than that, cap it and flag the rest
+	# (the top — name and signature — stays put; a too-short window means resize)
+	const Iarch vis = if rows > 2 then rows - 1 else 200
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(body.len) then break
+		if i >= vis then break
+
+		if i == vis - 1 && Iarch(body.len) > vis then println("  ... (${Iarch(body.len) - vis + 1} more lines — resize)")
+			else println(body[i])
+
+		i = i + 1
+	}
 
 	return ()
 }
@@ -252,7 +280,7 @@ const render_list! = (DocState st, [Def] view, Iarch rows): () -> {
 const render! = (DocState st, [Def] view, Iarch rows): () -> {
 	clear!()
 
-	if st.mode == mode_read then render_read!(view, st.sel) else render_list!(st, view, rows)
+	if st.mode == mode_read then render_read!(st, view, rows) else render_list!(st, view, rows)
 
 	# the mode's keymap legend, pinned to the bottom row in reverse video (a status bar) — off a real
 	# terminal (rows 0) it just follows the content
