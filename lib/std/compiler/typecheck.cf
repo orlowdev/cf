@@ -161,6 +161,12 @@ const fixed_ty = (Str name): Ty -> Ty.TFixed(fixed_bits(name), fixed_signed(name
 
 const is_tptr = (Ty t): Bool -> match t { Ty.TPtr -> true, _ -> false }
 
+# `Never` is the bottom type — the type of an expression that diverges (`die`, `exit`) and
+# never yields a value. It is a subtype of every type: a `Never` value fits any hole, so
+# `return die(...)`, `<- die(...)`, and `x = die(...)` all typecheck. `ty_eq` treats it as
+# compatible with everything (§ Never).
+const is_never = (Ty t): Bool -> match t { Ty.TNever -> true, _ -> false }
+
 # The record / union / dynamic-array-element type name of a type, or "" otherwise.
 const rec_of = (Ty t): Str -> match t { Ty.TRec(n) -> n, _ -> "" }
 
@@ -520,7 +526,13 @@ const element_type_name! = (Ty t, Expr e, Ctx ctx): TupElem -> {
 const lit_val = (Expr e): Iarch -> match e { Expr.Lit(v) -> v, _ -> -1 }
 
 # Structural equality of two types (records/unions/arrays equal iff same name/element).
-const ty_eq = (Ty a, Ty b): Bool -> match a {
+const ty_eq = (Ty a, Ty b): Bool -> {
+	# `Never` is the bottom type: a diverging value fits any expected type, and any value fits a
+	# `Never`-typed hole — so it compares equal to everything on either side.
+	if is_never(a) then return true
+	if is_never(b) then return true
+
+	return match a {
 	Ty.TInt -> is_tint(b),
 	Ty.TBool -> is_tbool(b),
 	Ty.TPtr -> match b { Ty.TPtr -> true, _ -> false },
@@ -534,6 +546,8 @@ const ty_eq = (Ty a, Ty b): Bool -> match a {
 	Ty.TFloat(ab) -> match b { Ty.TFloat(bb) -> ab == bb, _ -> false },
 	Ty.TTuple(ae) -> match b { Ty.TTuple(be) -> tuple_elems_eq(ae, be), _ -> false },
 	Ty.TFn(asig) -> match b { Ty.TFn(bsig) -> tuple_elems_eq(asig, bsig), _ -> false },
+	Ty.TNever -> true,
+	}
 }
 
 # Byte-wise `Str` equality (name lookup).
@@ -617,6 +631,8 @@ pub const named_ty = (Str type_name, Str elem, [RecDecl] recs, [UnionDecl] union
 	if eq(type_name, "Bool") then return Ty.TBool
 	if eq(type_name, "Str") then return Ty.TStr
 	if eq(type_name, "Unit") then return Ty.TUnit
+	# `Never` — the bottom type, the return type of a diverging function (`die`/`exit`)
+	if eq(type_name, "Never") then return Ty.TNever
 	# a fixed-width leaf (`Int8`...`Uint64`) is its own width/signedness type, NOT the word `TInt`
 	if is_fixed_name(type_name) then return Ty.TFixed(fixed_bits(type_name), fixed_signed(type_name))
 	if is_float_name(type_name) then return Ty.TFloat(float_bits(type_name))
@@ -665,6 +681,7 @@ pub const ty_name = (Ty t): Str -> match t {
 	Ty.TPtr -> "",
 	Ty.TTuple(e) -> "",
 	Ty.TFn(s) -> "",
+	Ty.TNever -> "Never",
 }
 
 # Resolve a parameter's declared type to a `Ty`: a `*[Uint8]` byte pointer (`TPtr`) or a
@@ -789,6 +806,8 @@ const func_ret_ty = (Func fn, [RecDecl] recs, [UnionDecl] unions): Ty -> {
 	if eq(fn.ret_name, "Bool") then return Ty.TBool
 	if eq(fn.ret_name, "Str") then return Ty.TStr
 	if eq(fn.ret_name, "Unit") then return Ty.TUnit
+	# a diverging function (`die`/`exit`) returns `Never`, the bottom type
+	if eq(fn.ret_name, "Never") then return Ty.TNever
 	if is_fixed_name(fn.ret_name)
 		then return Ty.TFixed(fixed_bits(fn.ret_name), fixed_signed(fn.ret_name))
 	if is_float_name(fn.ret_name) then return Ty.TFloat(float_bits(fn.ret_name))
@@ -1052,6 +1071,9 @@ const if_type! = (Expr c, Expr t, Expr e, [VarTy] env, Ctx ctx): Ty -> {
 	const Ty tt = type_of!(t, env, ctx)
 	const Ty te = type_of!(e, env, ctx)
 	if !ty_eq(tt, te) then die("cf: type: the branches of an `if` must have the same type\n")
+	# `Never` is bottom: `if c then die(...) else v` has the type of its NON-diverging branch, so
+	# the value flows on as `v`'s type (not `Never`, which no downstream use would accept).
+	if is_never(tt) then return te
 
 	return tt
 }
@@ -1949,6 +1971,22 @@ const match_arm_meta = ([MatchArm] arms): [[Str]] -> {
 	return out
 }
 
+# The result type of a match EXPRESSION: the first arm whose body is not `Never`. A `die`/`exit`
+# arm diverges (bottom type), which no downstream use accepts — so `match x { A -> 5, _ -> die(..) }`
+# has type `Iarch`, driven by the real arm. Falls back to the first arm's type if every arm diverges.
+const arms_result_ty! = ([MatchArm] arms, [VarTy] env, Ctx ctx): Ty -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(arms.len) then break
+		const Ty at = type_arm_body!(arms[i], env, ctx)
+		if !is_never(at) then return at
+		i = i + 1
+	}
+
+	return type_arm_body!(arms[0], env, ctx)
+}
+
 const str_match_type! = (Ty sty, [MatchArm] arms, [VarTy] env, Ctx ctx): Ty -> {
 	let [Iarch] wilds = []
 	let [Str] tns = []
@@ -1962,7 +2000,7 @@ const str_match_type! = (Ty sty, [MatchArm] arms, [VarTy] env, Ctx ctx): Ty -> {
 	}
 
 	check_str_arms!(sty, wilds, tns, match_arm_meta(arms))
-	const Ty rty = type_arm_body!(arms[0], env, ctx)
+	const Ty rty = arms_result_ty!(arms, env, ctx)
 	let Iarch i = 0
 
 	loop {
@@ -2049,7 +2087,7 @@ const int_match_type! = (Ty sty, [MatchArm] arms, [VarTy] env, Ctx ctx): Ty -> {
 	}
 
 	check_int_arms!(sty, wilds, tns, match_arm_meta(arms))
-	const Ty rty = type_arm_body!(arms[0], env, ctx)
+	const Ty rty = arms_result_ty!(arms, env, ctx)
 	let Iarch i = 0
 
 	loop {
@@ -2126,7 +2164,7 @@ const match_type! = (Expr scrut, [MatchArm] arms, [VarTy] env, Ctx ctx): Ty -> {
 	if ui >= 0 then mems = ctx.unions[ui].members
 	const Iarch na = Iarch(arms.len)
 	if na == 0 then die("cf: type: a match needs at least one arm\n")
-	const Ty rty = type_arm_body!(arms[0], env, ctx)
+	const Ty rty = arms_result_ty!(arms, env, ctx)
 	let [Iarch] covered = []
 	let Bool wild_seen = false
 	let Iarch i = 0
@@ -3469,17 +3507,23 @@ const check_simple_stmt! = (Stmt s, [VarTy] env, Ctx ctx, Iarch loop_kind): Iarc
 			const Iarch tc = check_simple_stmt!(tb, env, ctx, loop_kind)
 			const Iarch ec = check_simple_stmt!(eb, env, ctx, loop_kind)
 			# terminal only if BOTH branches terminate; the function returns on this path
-			# only if both branches `return` (a `break`/`continue` leaves the loop, not the fn).
+			# only if both branches `return` or diverge (a `break`/`continue` leaves the loop,
+			# not the fn). A diverging branch (code 3) counts as terminating here (`>= 2`).
 			if tc >= 1 then {
 				if ec >= 1 then code = 1
 			}
-			if tc == 2 then {
-				if ec == 2 then code = 2
+			if tc >= 2 then {
+				if ec >= 2 then code = 2
 			}
 		},
 		Stmt.Do(e) -> {
-			# a call-for-effect: type it (validates the callee and arguments), discard the result
-			type_of!(e, env, ctx)
+			# a call-for-effect: type it (validates the callee and arguments), discard the result.
+			# A call that yields `Never` (`die(...)`, `exit(...)`) DIVERGES — it never returns, so it
+			# satisfies "the body must return or diverge" (code 3): a function ending in it needs no
+			# trailing `return`. Unlike a genuine `return`/`break` (codes 2/1), a bare diverging call
+			# does NOT hard-flag a following statement as unreachable — the genesis idiom writes
+			# `die(...)` then a now-dead default `return`, and those are cleaned up at leisure.
+			if is_never(type_of!(e, env, ctx)) then code = 3
 		},
 		Stmt.Block(stmts) -> {
 			# a `{ ... }` guard body — its own scope; its terminal code is the block's.
@@ -3981,7 +4025,8 @@ const check_closure! = (Str nm, [Param] params, Str ret, [Stmt] body, [VarTy] en
 	}
 
 	const Iarch dr = check_stmts!(body, cenv, cctx, lk_none)
-	if dr != 2 then die("cf: type: a closure body must end with `return`\n")
+	# a closure body must return or diverge (`dr >= 2`) — a `()` closure may fall through to unit
+	if dr < 2 && !is_tunit(crt) then die("cf: type: a closure body must end with `return`\n")
 
 	return [
 		...env,
@@ -4077,10 +4122,11 @@ const check_stmts! = ([Stmt] stmts, [VarTy] env0, Ctx ctx, Iarch loop_kind): Iar
 			},
 			_ -> {
 				const Iarch t = check_simple_stmt!(s, env, ctx, loop_kind)
-				if t >= 1 then {
-					terminated = true
-					term_code = t
-				}
+				if t >= 1 then term_code = t
+				# a genuine terminator (`return`/`break`/`continue`, codes 2/1) makes a following
+				# statement a hard error; a bare diverging call (code 3) does not (dead trailing
+				# default `return`s live at diverging sites until they are cleaned up).
+				if t == 1 || t == 2 then terminated = true
 			},
 		}
 
@@ -4356,7 +4402,10 @@ const check_func! = (Func fn, Ctx ctx): Iarch -> {
 	# a defer-tap VALUE (`defer f(x)` / `|> defer f`) is admitted only in a top-level binding/return
 	enforce_toplevel_defertap(fn.body)
 	const Iarch dr = check_stmts!(fn.body, env, fctx, lk_none)
-	if dr != 2 then die("cf: type: a function body must end with `return`\n")
+	# The body must DEFINITELY return or diverge (`dr >= 2`: a `return`, or a diverging `die`/`exit`
+	# tail) — except a `()` function, which may fall through: reaching the end yields the implicit
+	# unit. (emit synthesizes the trailing `ret` for a fell-through `()` body.)
+	if dr < 2 && !is_tunit(frt) then die("cf: type: a function body must end with `return`\n")
 
 	return 0
 }
@@ -4384,6 +4433,7 @@ const is_known_typename = (Str name, [RecDecl] recs, [UnionDecl] unions): Bool -
 	if name_has_byte(name, 91) || name_has_byte(name, 46) then return true
 	if eq(name, "$dyn") || eq(name, "$ptr") || eq(name, "$tuple") then return true
 	if eq(name, "Str") || eq(name, "Bool") || eq(name, "Unit") then return true
+	if eq(name, "Never") then return true
 	if is_cast_type(name) then return true
 	if is_float_name(name) then return true
 	if find_rec(recs, name) >= 0 then return true
