@@ -5,21 +5,34 @@
 # `syscall6`'s `Uarch` operand.
 import std::sys::{ syscall6 }
 
-# `read_key!` returns a key's byte, or one of these codes for the arrow keys (an ESC-`[`-A/B/C/D
-# sequence) and end-of-input.
+# The codes `read_key` returns for keys that have no single byte. The arrows arrive as a 3-byte
+# ESC-`[`-A/B/C/D sequence, decoded to these well outside the 0-255 byte range so they never collide
+# with an ordinary keystroke; `key_eof` marks end of input. An ordinary key returns its raw byte.
+
+# The up arrow.
 pub const key_up = 1001
+# The down arrow.
 pub const key_down = 1002
+# The left arrow.
 pub const key_left = 1003
+# The right arrow.
 pub const key_right = 1004
+# The Escape key (byte 27) — also the lead byte of an arrow sequence, so a lone `key_esc` is Escape
+# pressed on its own.
 pub const key_esc = 27
+# The Enter/Return key (byte 13). A terminal in raw mode with input processing on may deliver newline
+# (byte 10) instead, so match both when acting on Enter.
 pub const key_enter = 13
+# End of input — stdin is closed or drained (`read` returned 0 or an error).
 pub const key_eof = -1
 
-const ioctl = (Iarch fd, Uarch req, *[Uint8] argp): Iarch -> syscall6(54, Uarch(fd), req, argp, 0, 0, 0)
+const ioctl = (Iarch fd, Uarch req, *[Uint8] argp): Iarch ->
+	syscall6(54, Uarch(fd), req, argp, 0, 0, 0)
 
 # The termios ioctl request codes. TIOCSETA (0x80487414) carries the write-direction bit 0x80000000,
 # which exceeds cf's i32 literal range, so it is assembled as (1 << 31) + the rest.
 const tiocgeta = (): Uarch -> Uarch(0x40487413)
+
 const tiocseta = (): Uarch -> Uarch(0x00487414) + (Uarch(1) << Uarch(31))
 
 # Put stdin into raw mode: no line buffering, no echo, and no signal generation — so Ctrl-C arrives
@@ -108,6 +121,8 @@ pub const read_key = (*[Uint8] data, *[Uint8] meta, Uarch cap): Iarch -> {
 # rows u16 @ 0, cols u16 @ 2). On a non-terminal the ioctl fails and both read back 0.
 pub data TermSize = { Iarch rows, Iarch cols }
 
+# Query the terminal's current size in character cells. On a non-terminal (a pipe or file) the query
+# fails and both fields read back 0 — check for that before dividing the screen by them.
 pub const size! = (): TermSize -> {
 	let [8 Uint8] ws = [0, 0, 0, 0, 0, 0, 0, 0]
 
@@ -158,7 +173,8 @@ pub const clear! = (): () -> {
 	return ()
 }
 
-# Hide / show the cursor — ESC[?25l / ESC[?25h.
+# Hide the cursor — ESC[?25l. A full-screen redraw looks calmer without the cursor skittering across
+# it; pair with `show_cursor!` on the way out.
 pub const hide_cursor! = (): () -> {
 	let [6 Uint8] s = [27, 91, 63, 50, 53, 108]
 
@@ -167,6 +183,8 @@ pub const hide_cursor! = (): () -> {
 	return ()
 }
 
+# Show the cursor — ESC[?25h. Undoes `hide_cursor!`; call it before leaving the alternate/raw display
+# so the shell prompt gets its cursor back.
 pub const show_cursor! = (): () -> {
 	let [6 Uint8] s = [27, 91, 63, 50, 53, 104]
 
@@ -175,7 +193,8 @@ pub const show_cursor! = (): () -> {
 	return ()
 }
 
-# Reverse video (highlight the current line) / reset attributes — ESC[7m / ESC[0m.
+# Turn on reverse video — ESC[7m. Everything printed after it swaps foreground and background, the
+# usual way to highlight a selected row or a status bar. Turn it back off with `reset!`.
 pub const reverse! = (): () -> {
 	let [4 Uint8] s = [27, 91, 55, 109]
 
@@ -184,6 +203,8 @@ pub const reverse! = (): () -> {
 	return ()
 }
 
+# Reset all text attributes to normal — ESC[0m. Clears reverse video, colour, and bold at once; emit
+# it after any styled run so the styling does not bleed into what follows.
 pub const reset! = (): () -> {
 	let [4 Uint8] s = [27, 91, 48, 109]
 
