@@ -1615,7 +1615,45 @@ const record_inits = (Expr e): [FieldInit] -> {
 	return r
 }
 
+# A `Str({ bytes: <byte pointer/array>, len: <integer> })` construction. `Str` is a builtin, not a
+# declared record, so it takes this dedicated path: validate the two fields (order-free, both
+# required, no spread) and yield `TStr`. The byte pointer is stored at offset 0 and the length at 8 —
+# the `{bytes@0, len@8}` header `.bytes`/`.len` read back (emit mirrors this in `emit_str_ctor!`).
+const str_ctor_type! = ([FieldInit] inits, [VarTy] env, Ctx ctx): Ty -> {
+	if Iarch(inits.len) != 2 then die("cf: type: a `Str` literal must set exactly `bytes` and `len`\n")
+	let Bool has_bytes = false
+	let Bool has_len = false
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(inits.len) then break
+		const Str f = inits[i].field
+
+		if str_eq(f, "$spread") then die("cf: type: a `Str` literal has no spread form\n")
+
+		const Ty vt = type_of!(inits[i].value, env, ctx)
+
+		if str_eq(f, "bytes") then {
+			has_bytes = true
+			if !is_tptr(vt) && !is_tdyn(vt)
+				then die("cf: type: a `Str` literal's `bytes` must be a byte pointer or array\n")
+		} else if str_eq(f, "len") then {
+			has_len = true
+			if !is_wordish(vt) then die("cf: type: a `Str` literal's `len` must be an integer\n")
+		} else {
+			die("cf: type: a `Str` literal has only `bytes` and `len`\n")
+		}
+
+		i = i + 1
+	}
+
+	if !has_bytes || !has_len then die("cf: type: a `Str` literal must set both `bytes` and `len`\n")
+
+	return Ty.TStr
+}
+
 const record_type! = (Str type_name, [FieldInit] inits, [VarTy] env, Ctx ctx): Ty -> {
+	if str_eq(type_name, "Str") then return str_ctor_type!(inits, env, ctx)
 	const Iarch ri = find_rec(ctx.recs, type_name)
 	if ri < 0 then die("cf: type: unknown record type in a data literal\n")
 	const Iarch nf = Iarch(ctx.recs[ri].fields.len)

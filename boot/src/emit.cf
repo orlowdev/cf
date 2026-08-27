@@ -2411,7 +2411,37 @@ const emit_geom_reserve! = (*Emit ctx, Iarch size): Iarch -> {
 	return t
 }
 
+# The value expression of the init named `fname` (order-free lookup). Typecheck guarantees it exists.
+const finit_value = ([FieldInit] inits, Str fname): Expr -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(inits.len) then break
+		if str_eq(inits[i].field, fname) then return inits[i].value
+		i = i + 1
+	}
+
+	return inits[0].value
+}
+
+# Construct a `Str({ bytes, len })` header: 16 bytes, the byte pointer at offset 0 (an array value
+# decays to its `data@0`, a raw pointer passes through — `emit_ptr_arg!`), the length word at offset
+# 8. Mirrors the `{bytes@0, len@8}` layout `.bytes`/`.len` read back. Yields the base pointer.
+const emit_str_ctor! = (*Emit ctx, [FieldInit] inits, [Binding] env): Iarch -> {
+	const Iarch base = emit_agg_alloc!(ctx, 16)
+	const Str bv = emit_ptr_arg!(ctx, env, finit_value(inits, "bytes"))
+	write_str(ctx.fd, "\tstorel ${bv}, %t${base}\n")
+	const Str lv = emit_expr!(finit_value(inits, "len"), ctx, env)
+	const Iarch la = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${la} =l add %t${base}, 8\n")
+	write_str(ctx.fd, "\tstorel ${lv}, %t${la}\n")
+
+	return base
+}
+
 const emit_record_lit! = (*Emit ctx, Str type_name, [FieldInit] inits, [Binding] env): Iarch -> {
+	if str_eq(type_name, "Str") then return emit_str_ctor!(ctx, inits, env)
 	const Iarch ri = find_rec(ctx.recs, type_name)
 	const Iarch nfld = Iarch(ctx.recs[ri].fields.len)
 	const Iarch size = nfld * 8
