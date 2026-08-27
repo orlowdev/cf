@@ -1,0 +1,146 @@
+# std::io::term — raw terminal control for arm64/darwin: put the terminal into raw mode, read a
+# keystroke (arrow keys decoded), query the window size, and emit the ANSI sequences a full-screen
+# TUI needs. All output goes to stdout (fd 1); the terminal is stdin (fd 0). Terminal ioctls use the
+# `ioctl` syscall (54); the `*[Uint8]` argument is the hop a `[N Uint8]` local needs to reach
+# `syscall6`'s `Uarch` operand.
+import std::sys::{ syscall6 }
+
+# `read_key!` returns a key's byte, or one of these codes for the arrow keys (an ESC-`[`-A/B/C/D
+# sequence) and end-of-input.
+pub const key_up = 1001
+pub const key_down = 1002
+pub const key_left = 1003
+pub const key_right = 1004
+pub const key_esc = 27
+pub const key_enter = 13
+pub const key_eof = 0 - 1
+
+const ioctl = (Iarch fd, Uarch req, *[Uint8] argp): Iarch -> syscall6(54, Uarch(fd), req, argp, 0, 0, 0)
+
+# The termios ioctl request codes. TIOCSETA (0x80487414) carries the write-direction bit 0x80000000,
+# which exceeds cf's i32 literal range, so it is assembled as (1 << 31) + the rest.
+const tiocgeta = (): Uarch -> Uarch(0x40487413)
+const tiocseta = (): Uarch -> Uarch(0x00487414) + (Uarch(1) << Uarch(31))
+
+# Put stdin into raw mode: no line buffering, no echo — but keep ISIG, so Ctrl-C still interrupts.
+# `saved` (72 bytes, caller-owned) receives the prior `termios` for `restore!`. TIOCGETA/TIOCSETA and
+# the 72-byte struct (c_lflag at offset 24, c_cc at 32) are the arm64 darwin ABI.
+pub const raw_mode! = (*[Uint8] saved): () -> {
+	ioctl(0, tiocgeta(), saved)
+
+	let [72 Uint8] work
+	let Iarch i = 0
+
+	loop {
+		if i >= 72 then break
+
+		work[i] = saved[i]
+		i = i + 1
+	}
+
+	# c_lflag @ 24: clear ECHO (byte 24, bit 0x08) and ICANON (byte 25, bit 0x01)
+	work[24] = Uint8(Iarch(work[24]) & 247)
+	work[25] = Uint8(Iarch(work[25]) & 254)
+	# c_cc: VMIN (index 16 @ offset 48) = 1, VTIME (index 17 @ offset 49) = 0 — block for one byte
+	work[48] = Uint8(1)
+	work[49] = Uint8(0)
+
+	ioctl(0, tiocseta(), work)
+
+	return ()
+}
+
+# Restore the terminal to the state `raw_mode!` saved.
+pub const restore = (*[Uint8] saved): () -> {
+	ioctl(0, tiocseta(), saved)
+
+	return ()
+}
+
+const read_stdin = (*[Uint8] buf, Uarch n): Iarch -> syscall6(3, 0, buf, n, 0, 0, 0)
+
+# Read one keypress. A regular key returns its byte; an arrow returns `key_up`/`key_down`/…; end of
+# input returns `key_eof`. An arrow arrives as the 3-byte burst ESC `[` A/B/C/D, read together.
+pub const read_key! = (): Iarch -> {
+	let [8 Uint8] buf = [0, 0, 0, 0, 0, 0, 0, 0]
+	const Iarch n = read_stdin(buf, Uarch(8))
+
+	if n <= 0 then return key_eof
+
+	if n >= 3 && Iarch(buf[0]) == 27 && Iarch(buf[1]) == 91 then {
+		const Iarch d = Iarch(buf[2])
+
+		if d == 65 then return key_up
+		if d == 66 then return key_down
+		if d == 67 then return key_right
+		if d == 68 then return key_left
+
+		return key_esc
+	}
+
+	return Iarch(buf[0])
+}
+
+# The terminal window size in character cells, queried on stdout via TIOCGWINSZ (an 8-byte `winsize`:
+# rows u16 @ 0, cols u16 @ 2). On a non-terminal the ioctl fails and both read back 0.
+pub data TermSize = { Iarch rows, Iarch cols }
+
+pub const size! = (): TermSize -> {
+	let [8 Uint8] ws = [0, 0, 0, 0, 0, 0, 0, 0]
+
+	ioctl(1, Uarch(0x40087468), ws)
+
+	const Iarch rows = Iarch(ws[0]) + Iarch(ws[1]) * 256
+	const Iarch cols = Iarch(ws[2]) + Iarch(ws[3]) * 256
+
+	return TermSize({ rows: rows, cols: cols })
+}
+
+const out = (*[Uint8] buf, Uarch n): () -> {
+	syscall6(4, 1, buf, n, 0, 0, 0)
+
+	return ()
+}
+
+# Clear the screen and home the cursor — ESC[2J ESC[H.
+pub const clear! = (): () -> {
+	let [7 Uint8] s = [27, 91, 50, 74, 27, 91, 72]
+
+	out(s, Uarch(7))
+
+	return ()
+}
+
+# Hide / show the cursor — ESC[?25l / ESC[?25h.
+pub const hide_cursor! = (): () -> {
+	let [6 Uint8] s = [27, 91, 63, 50, 53, 108]
+
+	out(s, Uarch(6))
+
+	return ()
+}
+
+pub const show_cursor! = (): () -> {
+	let [6 Uint8] s = [27, 91, 63, 50, 53, 104]
+
+	out(s, Uarch(6))
+
+	return ()
+}
+
+# Reverse video (highlight the current line) / reset attributes — ESC[7m / ESC[0m.
+pub const reverse! = (): () -> {
+	let [4 Uint8] s = [27, 91, 55, 109]
+
+	out(s, Uarch(4))
+
+	return ()
+}
+
+pub const reset! = (): () -> {
+	let [4 Uint8] s = [27, 91, 48, 109]
+
+	out(s, Uarch(4))
+
+	return ()
+}
