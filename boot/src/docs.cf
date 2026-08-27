@@ -25,6 +25,7 @@ import std::io::term::{
 	key_eof,
 }
 import std::io::console::{ print, println }
+import std::mem::arena::growing_arena
 
 pub const mode_search = 0
 pub const mode_select = 1
@@ -871,6 +872,37 @@ const dispatch = (DocState st, Iarch key, Iarch viewlen, Iarch maxscroll): DocSt
 	return dispatch_read(st, key, maxscroll)
 }
 
+# What the event loop needs from a rendered frame after its transient state is gone: the number of
+# rows in the filtered view (to clamp a SELECT move) and the current definition's scroll bound (to
+# clamp a READ scroll).
+data FrameInfo = { Iarch viewlen, Iarch maxscroll }
+
+# Draw one frame — rank the view, render it, and measure the read-mode scroll bound — returning only
+# the two counts the loop needs. Every transient allocation (the ranked view, the wrapped body, the
+# rendered lines) is this call's own residue, reclaimed when it returns: the loop can then run for a
+# whole session without growing the arena frame by frame. The keystroke read is left to the caller so
+# input blocks OUTSIDE this scope, holding no residue while it waits.
+const draw_frame! = (DocState st): FrameInfo -> {
+	const [Def] view = ranked!(st.all, st.query)
+	const TermSize sz = size!()
+	const Iarch width = if sz.cols > 20 then sz.cols else 80
+
+	render!(st, view, sz.rows, width)
+
+	let Iarch maxscroll = 0
+
+	if st.mode == mode_read && Iarch(view.len) > 0 then {
+		let Iarch ri = st.sel
+
+		if ri >= Iarch(view.len) then ri = Iarch(view.len) - 1
+		if ri < 0 then ri = 0
+
+		maxscroll = read_max_scroll!(view[ri], sz.rows, width)
+	}
+
+	return FrameInfo({ viewlen: Iarch(view.len), maxscroll: maxscroll })
+}
+
 # The browser. `args` is the whole command line — `cf docs [<term>]`; a `<term>` prefills the query,
 # and an exact name opens READ mode on it directly. Runs until Ctrl-C (byte 3) or end of input.
 pub const docs_run! = ([Str] args): Iarch -> {
@@ -893,29 +925,24 @@ pub const docs_run! = ([Str] args): Iarch -> {
 	hide_cursor!()
 
 	loop {
-		const [Def] view = ranked!(st.all, st.query)
-		const TermSize sz = size!()
-		const Iarch width = if sz.cols > 20 then sz.cols else 80
+		# Each frame renders into its OWN arena, torn down the moment the frame is drawn. The ranked
+		# view, the wrapped body, and the rendered lines are all transient, so a session of thousands of
+		# keystrokes never grows memory (`all` and the browser state live in the caller's arena and are
+		# untouched). `draw_frame!(st) in fa` routes the frame's residue into `fa`; only the two clamp
+		# counts survive (in the caller's arena), so they are copied out before the teardown. The
+		# teardown runs BEFORE the blocking key read, so no frame memory is held while awaiting input.
+		const fa = growing_arena::of(4194304)
+		const FrameInfo fi = draw_frame!(st) in fa
+		const Iarch vlen = fi.viewlen
+		const Iarch mscroll = fi.maxscroll
 
-		render!(st, view, sz.rows, width)
+		growing_arena::destroy(fa)
 
 		const Iarch key = read_key(kdata, kmeta, Uarch(64))
 
 		if key == 3 || key == key_eof then break
 
-		# in read mode, tell the dispatcher how far the current definition can scroll
-		let Iarch maxscroll = 0
-
-		if st.mode == mode_read && Iarch(view.len) > 0 then {
-			let Iarch ri = st.sel
-
-			if ri >= Iarch(view.len) then ri = Iarch(view.len) - 1
-			if ri < 0 then ri = 0
-
-			maxscroll = read_max_scroll!(view[ri], sz.rows, width)
-		}
-
-		st = dispatch(st, key, Iarch(view.len), maxscroll)
+		st = dispatch(st, key, vlen, mscroll)
 	}
 
 	show_cursor!()
