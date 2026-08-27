@@ -31,12 +31,10 @@
 # escaping-position machinery), and makes a binding of the result a forward alias of the
 # argument (`const q = f(gg.inner); q.p = v` rehomes `v` through the call). The polarity is
 # fixed: an UNRESOLVED callee — indirect (a fn-value name), recursive/SCC (still in progress
-# on the DFS stack), asm (opaque body), or plain unknown — is ⊤: every argument escapes.
+# on the DFS stack), or plain unknown — is ⊤: every argument escapes.
 # Intrinsics get exact rows: a numeric cast and `Str(v[,n])` and `fixed_buffer.of` return
-# (an alias of) argument 0 and retain nothing; the arena constructors take only sizes. The
-# asm floor whitelists exactly `syscall6`/`exit` (the kernel copies or fills during the call
-# and retains no user pointer; exit never returns), which frees the whole write→eprint→die
-# chain — every other asm body is ⊤.
+# (an alias of) argument 0 and retain nothing; the arena constructors take only sizes. An asm
+# body is a TRUST BOUNDARY — it retains nothing as far as the model is concerned (see asm_sum).
 #
 # The per-function fixpoint splits the escape set by WHY a name escapes:
 #   rset  return-reachable (returned/yielded, or flows into a returned name) → the summary's
@@ -304,14 +302,19 @@ const intrinsic_sum = (Str n): FnSum -> {
 	return none_sum(1)
 }
 
-# The asm floor whitelist: `syscall6` hands pointers to the KERNEL for the duration of the
-# call only (read fills, write copies, open reads the path — nothing is retained after
-# return), and `exit` never returns. Every other asm body is opaque ⇒ ⊤.
-const asm_sum = (Func f): FnSum -> {
-	if eq(f.name, "syscall6") || eq(f.name, "exit") then return none_sum(Iarch(f.params.len))
-
-	return top_sum()
-}
+# An asm body is a TRUST BOUNDARY: the compiler cannot read it, so it does not model it — it retains
+# NOTHING (none_sum). An asm body performs no cf-level rehoming (it constructs no cf aggregate to
+# hoist into a provided argument), and the floor's primitives borrow their pointers for the duration
+# of a SYNCHRONOUS trap. Defaulting the OTHER way (⊤, "assume it betrays every pointer because the
+# body is opaque") is wrong for that synchronous floor AND forces a name-keyed whitelist to claw the
+# trust back — which is exactly what rotted: a module rename turned `syscall6` into `std_sys_syscall6`,
+# the string match went silently false, and the whole write/read/ioctl chain leaked in every loop.
+#
+# NOTE: the compiler does NOT track survivability of a value handed to an asm across an ASYNCHRONOUS
+# call — the kernel keeps the pointer past `svc` with no lexical scope to bound it, and that lifetime
+# is out of the model. If you ever need async I/O, don't reach into the escape analysis: wrap the call
+# in a construct that owns the buffer's lifetime explicitly. Write asm, know your tool.
+const asm_sum = (Func f): FnSum -> none_sum(Iarch(f.params.len))
 
 const lookup_sum = (Sums sm, Str n): FnSum -> {
 	let Iarch i = 0
