@@ -1,0 +1,92 @@
+# docs::keys — translate a keystroke into the next `DocState`.
+#
+# Each dispatcher is a pure state→state function for one mode; `dispatch` routes to the right one. The
+# loop applies the result and re-renders. A key with no binding in the current mode returns the state
+# unchanged. `viewlen`/`maxscroll` are passed in because clamping the selection / scroll needs the
+# rendered view's size, which the loop already computed.
+import docs::state::{ DocState, mode_search, mode_select, mode_read }
+import docs::text::{ append_char, drop_last }
+import std::io::term::{ key_up, key_down, key_enter, key_esc }
+
+# The Enter key is CR (13) on a raw terminal, but a terminal's ICRNL maps it to LF (10) on input;
+# accept either.
+const is_enter = (Iarch key): Bool -> key == key_enter || key == 10
+
+# SEARCH mode: printable keys edit the query, backspace deletes, and Enter/arrows drop into the list.
+# `esc` does nothing here — search is the root mode.
+const dispatch_search = (DocState st, Iarch key): DocState -> {
+	if is_enter(key) || key == key_up || key == key_down
+		then return DocState({ all: st.all, query: st.query, mode: mode_select, sel: 0, scroll: 0 })
+
+	# 127 = DEL, 8 = BS — either backspaces the query
+	if key == 127 || key == 8
+		then return DocState({ all: st.all, query: drop_last(st.query), mode: mode_search, sel: 0, scroll: 0 })
+
+	# a printable ASCII byte types into the query
+	if key >= 32 && key <= 126
+		then return DocState({ all: st.all, query: append_char(st.query, key), mode: mode_search, sel: 0, scroll: 0 })
+
+	return st
+}
+
+# SELECT mode: j/k or the arrows move the highlight (clamped to `viewlen`), Enter opens READ, `i`/`s`
+# jump back to search, `r` resets the query, `esc` returns to search.
+const dispatch_select = (DocState st, Iarch key, Iarch viewlen): DocState -> {
+	if key == key_up || key == 107 then {
+		let Iarch ns = st.sel - 1
+
+		if ns < 0 then ns = 0
+
+		return DocState({ all: st.all, query: st.query, mode: mode_select, sel: ns, scroll: 0 })
+	}
+
+	if key == key_down || key == 106 then {
+		let Iarch ns = st.sel + 1
+
+		if ns >= viewlen then ns = viewlen - 1
+		if ns < 0 then ns = 0
+
+		return DocState({ all: st.all, query: st.query, mode: mode_select, sel: ns, scroll: 0 })
+	}
+
+	if is_enter(key) then return DocState({ all: st.all, query: st.query, mode: mode_read, sel: st.sel, scroll: 0 })
+	if key == 105 || key == 115 then return DocState({ all: st.all, query: st.query, mode: mode_search, sel: 0, scroll: 0 })
+	if key == 114 then return DocState({ all: st.all, query: "", mode: mode_search, sel: 0, scroll: 0 })
+	if key == key_esc then return DocState({ all: st.all, query: st.query, mode: mode_search, sel: 0, scroll: 0 })
+
+	return st
+}
+
+# READ mode: j/k or the arrows scroll (clamped to `maxscroll`), `esc` returns to the SELECT list, `i`/`s`
+# jump to search, `r` resets the query.
+const dispatch_read = (DocState st, Iarch key, Iarch maxscroll): DocState -> {
+	if key == key_esc then return DocState({ all: st.all, query: st.query, mode: mode_select, sel: st.sel, scroll: 0 })
+	if key == 105 || key == 115 then return DocState({ all: st.all, query: st.query, mode: mode_search, sel: st.sel, scroll: 0 })
+	if key == 114 then return DocState({ all: st.all, query: "", mode: mode_search, sel: 0, scroll: 0 })
+
+	if key == key_down || key == 106 then {
+		let Iarch ns = st.scroll + 1
+
+		if ns > maxscroll then ns = maxscroll
+
+		return DocState({ all: st.all, query: st.query, mode: mode_read, sel: st.sel, scroll: ns })
+	}
+
+	if key == key_up || key == 107 then {
+		let Iarch ns = st.scroll - 1
+
+		if ns < 0 then ns = 0
+
+		return DocState({ all: st.all, query: st.query, mode: mode_read, sel: st.sel, scroll: ns })
+	}
+
+	return st
+}
+
+# Route a keystroke to the dispatcher for the current mode, yielding the next state.
+pub const dispatch = (DocState st, Iarch key, Iarch viewlen, Iarch maxscroll): DocState -> {
+	if st.mode == mode_search then return dispatch_search(st, key)
+	if st.mode == mode_select then return dispatch_select(st, key, viewlen)
+
+	return dispatch_read(st, key, maxscroll)
+}

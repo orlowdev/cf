@@ -1,0 +1,141 @@
+# docs::page — the READ view's content and scroll geometry.
+#
+# `read_body!` renders one definition as a man-style body — NAME / SYNOPSIS / DESCRIPTION / (MEMBERS)
+# — already wrapped to the terminal width; the `read_*` helpers derive the scrollable window over it.
+# The renderer both draws this body and measures it (for the scroll clamp) through the same builder,
+# so the two always agree on height.
+import docscan::{ Def, Member, split_members_line! }
+import std::str::{ eq }
+import docs::synopsis::{ head_word, fn_layout, value_type, param_text, ret_text, mem_name, mem_payload! }
+import docs::text::{ word_wrap, wrap_doc! }
+
+# The content lines of a definition's read view, every line already wrapped to `width`.
+#
+# NOTE: `body` is built ENTIRELY from copies of `d`'s fields (interpolation, `word_wrap`, and the
+# synopsis slicers all allocate fresh) — never a bare reference into `d`. That keeps `read_body!` from
+# being classified as return-aliasing its `d` param, which would pin `body` survivor-side and defeat
+# the per-frame reclaim (the cf-long-loop-arena-reclaim memo). Hence `"${m.name}"`, not `m.name`.
+pub const read_body! = (Def d, Iarch width): [Str] -> {
+	let [Str] body = []
+	const Str head = head_word(d.kind, d.sig)
+	const Bool fnl = fn_layout(d.kind, d.sig)
+	const Bool is_value = !fnl && !eq(d.kind, "data") && !eq(d.kind, "union")
+
+	# title: `<head> <name>`, a value/param-less intrinsic carrying its type inline
+	let Str title = "${head} ${d.name}"
+
+	if is_value then {
+		const Str vt = value_type(d.sig)
+
+		if Iarch(vt.len) > 0 then title = "${head} ${d.name}: ${vt}"
+	}
+
+	const [Str] w1 = word_wrap(title, width)
+
+	for x in w1 {
+		body = [...body, x]
+	}
+
+	const [Str] w2 = word_wrap(d.module, width)
+
+	for x in w2 {
+		body = [...body, x]
+	}
+
+	# SYNOPSIS — rebuilt structurally; skipped for a value / param-less intrinsic (the title says it all)
+	if !is_value then {
+		body = [...body, ""]
+		body = [...body, "SYNOPSIS"]
+		body = [...body, ""]
+
+		if fnl then {
+			# a function / intrinsic: one `-> Type name` per parameter, then the `<- Type` return
+			const [Str] ps = split_members_line!(param_text(d.sig))
+
+			for p in ps {
+				body = [...body, "-> ${p}"]
+			}
+
+			body = [...body, ""]
+			body = [...body, "<- ${ret_text(d.sig)}"]
+		} else if eq(d.kind, "data") then {
+			# a record: one `- Type name` per field
+			const [Member] fs = d.members
+
+			for m in fs {
+				body = [...body, "- ${m.name}"]
+			}
+		} else {
+			# a union: each `- Variant`, its payload types beneath as `-> Type`
+			const [Member] ms = d.members
+
+			for m in ms {
+				body = [...body, "- ${mem_name(m.name)}"]
+
+				const [Str] pl = mem_payload!(m.name)
+
+				for a in pl {
+					body = [...body, "-> ${a}"]
+				}
+
+				body = [...body, ""]
+			}
+		}
+	}
+
+	body = [...body, ""]
+	body = [...body, "DESCRIPTION"]
+	body = [...body, ""]
+
+	if Iarch(d.doc.len) == 0 then body = [...body, "No info"] else {
+		const [Str] dl = wrap_doc!(d.doc, width)
+
+		for line in dl {
+			body = [...body, line]
+		}
+	}
+
+	# a MEMBERS section for data/union: each field/variant, a blank line, then its comment (wrapped) or
+	# "No info", and a blank line separating the next member
+	if eq(d.kind, "data") || eq(d.kind, "union") then {
+		body = [...body, ""]
+		body = [...body, "MEMBERS"]
+		body = [...body, ""]
+
+		const [Member] mems = d.members
+
+		for m in mems {
+			body = [...body, "${m.name}"]
+			body = [...body, ""]
+
+			if Iarch(m.info.len) == 0 then body = [...body, "No info"] else {
+				const [Str] iw = wrap_doc!(m.info, width)
+
+				for x in iw {
+					body = [...body, x]
+				}
+			}
+
+			body = [...body, ""]
+		}
+	}
+
+	return body
+}
+
+# The content rows available above the legend (a default off a real terminal).
+const read_vis = (Iarch rows): Iarch -> if rows > 2 then rows - 1 else 200
+
+# The content rows of the read view: the window above the legend (`read_vis`) minus the two reserved
+# chip rows (top and bottom), so the content never shifts as the "more above/below" chips appear.
+pub const read_cwin = (Iarch rows): Iarch -> read_vis(rows) - 2
+
+# The furthest the read view can scroll: the body height minus the content window (0 when it fits).
+pub const read_max_scroll! = (Def d, Iarch rows, Iarch width): Iarch -> {
+	const Iarch h = Iarch(read_body!(d, width).len)
+	const Iarch cwin = read_cwin(rows)
+
+	if h <= cwin then return 0
+
+	return h - cwin
+}
