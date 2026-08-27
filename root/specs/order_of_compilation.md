@@ -101,7 +101,7 @@ neither has an intermediate worth emitting, so neither is an arc.
 
 Turns a set of files into **one flat program**:
 
-- **Evaluate comptime conditional imports.** The module-level `if … then … else`
+- **Evaluate comptime conditional imports.** The module-level `if ... then ... else`
   (see [[ebnf.md]], Modules) is run here, at comptime, against the target triple
   exposed by the compiler-supplied `std::comptime` module. Exactly one branch's
   items survive; the scaffolding dissolves, so a name like `read_file` resolves to
@@ -125,7 +125,7 @@ flat, unique name.
 Binds every name and checks types. This gate owns: type inference and checking;
 the casing rule (PascalCase types, snake_case values); `const`/immutability and
 lvalue checks; **aggregate-literal kind** resolution (array fixed vs dynamic, plus
-record-literal typing — tuples are now syntactic `(…)`; see [[ebnf.md]], Aggregate
+record-literal typing — tuples are now syntactic `(...)`; see [[ebnf.md]], Aggregate
 Literals); and **`match` exhaustiveness**. It annotates
 the tree and rejects the ill-typed; it changes nothing, so it is a gate, not an
 arc. All _later_ desugars are type-directed, which is exactly why the type gate
@@ -221,7 +221,7 @@ runtime shape. Fold `identity(x)` to `x`, propagate constants, and **inline the
 bodies of non-deferred hooks** to their literal operations (an `on_alloc` becomes
 the bump it stands for). The one carve-out: **fold does not reach inside a
 `defer`.** A deferred hook must stay a _call_ through this arc — inlining it would
-produce `defer { …instructions… }` before placement, and while `defer { block }`
+produce `defer { ...instructions... }` before placement, and while `defer { block }`
 is legal, an _instruction_ block is not a thing to defer. Deferred hooks are
 inlined _and_ placed together at emit.
 
@@ -332,7 +332,7 @@ Everything the `desugared` arc rewrites, and the two forms held back for emit.
 | else-less `if c then v`                    | `if c then v else ()` (the `then` runs for effect; yields `Unit`) |
 | `for x in xs body`                         | an indexed `loop`                                                 |
 | record spread `...Identifiable`            | the spliced fields, in place                                      |
-| named-tuple splat (`type X = { … }` param) | its fields, positionally                                          |
+| named-tuple splat (`type X = { ... }` param) | its fields, positionally                                          |
 | self-spread reassign `xs = [...xs, e]`     | grow-in-place (→ `on_realloc` in memory)                          |
 | self-spread copy `let ys = [...xs, e]`     | fresh copy (→ `on_alloc`/`on_ret` in memory)                      |
 

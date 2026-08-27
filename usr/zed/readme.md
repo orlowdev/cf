@@ -28,7 +28,7 @@ fetches the _grammar_ from a git commit — see `extension.toml`:
 ```toml
 [grammars.cflang]
 repository = "file:///Users/orlowdev/Code/cflang"  # this repo, local — no push
-rev = "…"                                            # a commit containing the grammar
+rev = "..."                                            # a commit containing the grammar
 path = "usr/zed/tree-sitter-cflang"                     # its subdirectory
 ```
 
@@ -45,7 +45,7 @@ state, so the grammar must live at a real commit and `rev` pins it.
   cd tree-sitter-cflang
   npx tree-sitter-cli generate      # regenerate src/
   npx tree-sitter-cli parse FILE.cf # sanity-check (look for ERROR nodes)
-  cd - && git commit -am "…"        # grammar must be committed for Zed to fetch it
+  cd - && git commit -am "..."        # grammar must be committed for Zed to fetch it
   git rev-parse HEAD                 # put this SHA in extension.toml `rev`
   ```
 

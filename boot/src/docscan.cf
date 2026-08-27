@@ -1,0 +1,441 @@
+# docscan — extract the public API documentation from cf source, live.
+#
+# `cf docs` reads the standard-library `.cf` files as they are on disk (no cache, no index) and pulls
+# out every `pub` definition together with the `#` comment block written directly above it. It is a
+# line-oriented text scan — cf-syntax-aware but not the full parser — so a definition's own signature
+# line is its synopsis and the comment above it is its prose. Compiler-side (it knows what a
+# `pub const`/`data`/`union`/`intrinsic` is); the TUI that presents the result lives in `docs`.
+import std::io::file::{ read_file! }
+import std::io::fs::{ read_dir! }
+import std::io::fd::{ IoRrr, DirEntry, entry_is_dir }
+import std::str::{ starts_with, ends_with, eq }
+import std::data::{ Either }
+
+# One documented public definition: its `name`, its `kind` (`const`/`data`/`union`/`intrinsic`), the
+# `sig` (the definition's own source line), the `doc` (the `#` comment block above, `#` stripped), and
+# the `module` it lives in (a `::` path derived from the file).
+pub data Def = { Str name, Str kind, Str sig, Str doc, Str module, [Member] members }
+
+# Split `s` into lines on `\n` (the newline dropped). A trailing line without a newline is kept. Each
+# line is a fresh owned Str — after a line is pushed, `cur` is rebound to a new empty vector, so the
+# pushed line's bytes are never grown over.
+pub const split_lines = (Str s): [Str] -> {
+	let [Str] out = []
+	let [Uint8] cur = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(s.len) then break
+
+		const Iarch c = Iarch(s[i])
+
+		if c == 10 then {
+			out = [...out, Str({ bytes: cur, len: Iarch(cur.len) })]
+			cur = []
+		} else {
+			cur = [...cur, Uint8(c)]
+		}
+
+		i = i + 1
+	}
+
+	if Iarch(cur.len) > 0 then out = [...out, Str({ bytes: cur, len: Iarch(cur.len) })]
+
+	return out
+}
+
+# The kind of a `pub` definition line (`const`/`data`/`union`/`intrinsic`), or `""` if the line is not
+# a public definition.
+const def_kind = (Str line): Str -> {
+	if starts_with(line, "pub const ") then return "const"
+	if starts_with(line, "pub data ") then return "data"
+	if starts_with(line, "pub union ") then return "union"
+	if starts_with(line, "pub intrinsic ") then return "intrinsic"
+
+	return ""
+}
+
+# The definition name on a `pub <kind> NAME ...` line: the token after `pub <kind> ` (prefix length is
+# `5 + kind.len`, i.e. `pub ` + kind + ` `), taken up to the first delimiter (space, `=`, `:`, `(`,
+# `[`). A trailing `!` on a name stays part of it (it precedes those delimiters).
+const def_name = (Str line, Str kind): Str -> {
+	const Iarch start = 5 + Iarch(kind.len)
+	let [Uint8] out = []
+	let Iarch i = start
+
+	loop {
+		if i >= Iarch(line.len) then break
+
+		const Iarch c = Iarch(line[i])
+
+		if c == 32 || c == 61 || c == 58 || c == 40 || c == 91 then break
+
+		out = [...out, Uint8(c)]
+		i = i + 1
+	}
+
+	return Str({ bytes: out, len: Iarch(out.len) })
+}
+
+# Is `line` a comment line (its first non-blank byte is `#`)?
+const is_comment = (Str line): Bool -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(line.len) then return false
+
+		const Iarch c = Iarch(line[i])
+
+		if c == 35 then return true
+		if c != 32 && c != 9 then return false
+
+		i = i + 1
+	}
+
+	return false
+}
+
+# The comment block ending just above the definition at `defline`: walk up while the lines are
+# comments, then join them top-to-bottom, each stripped of its leading blanks + `#` + one space. Blank
+# (`""`) when there is no comment above. A block that reaches line 0 is the file's MODULE header (it
+# describes the module, not this definition), so it is not attributed here — the definition reads as
+# undocumented.
+const collect_doc = ([Str] lines, Iarch defline): Str -> {
+	let Iarch top = defline - 1
+
+	loop {
+		if top < 0 then break
+		if !is_comment(lines[top]) then break
+
+		top = top - 1
+	}
+
+	top = top + 1
+
+	if top == 0 then return ""
+
+	let [Uint8] out = []
+	let Iarch j = top
+
+	loop {
+		if j >= defline then break
+
+		const Str ln = lines[j]
+		# skip leading blanks, then the `#`, then one optional space
+		let Iarch k = 0
+
+		loop {
+			if k >= Iarch(ln.len) then break
+			if Iarch(ln[k]) != 32 && Iarch(ln[k]) != 9 then break
+
+			k = k + 1
+		}
+
+		if k < Iarch(ln.len) && Iarch(ln[k]) == 35 then k = k + 1
+		if k < Iarch(ln.len) && Iarch(ln[k]) == 32 then k = k + 1
+
+		loop {
+			if k >= Iarch(ln.len) then break
+
+			out = [...out, Uint8(Iarch(ln[k]))]
+			k = k + 1
+		}
+
+		if j < defline - 1 then out = [...out, Uint8(10)]
+
+		j = j + 1
+	}
+
+	return Str({ bytes: out, len: Iarch(out.len) })
+}
+
+# One member of a `data`/`union`: its source text (a field `Iarch a`, a variant `Left('L)`) and any
+# comment written above it (empty when none).
+pub data Member = { Str name, Str info }
+
+# Trim leading/trailing blanks and a trailing comma from a member's text.
+const trim_member = (Str s): Str -> {
+	let Iarch a = 0
+
+	loop {
+		if a >= Iarch(s.len) then break
+		if Iarch(s[a]) != 32 && Iarch(s[a]) != 9 then break
+
+		a = a + 1
+	}
+
+	let Iarch b = Iarch(s.len)
+
+	loop {
+		if b <= a then break
+
+		const Iarch c = Iarch(s[b - 1])
+
+		if c != 32 && c != 9 && c != 44 then break
+
+		b = b - 1
+	}
+
+	let [Uint8] out = []
+	let Iarch i = a
+
+	loop {
+		if i >= b then break
+
+		out = [...out, Uint8(Iarch(s[i]))]
+		i = i + 1
+	}
+
+	return Str({ bytes: out, len: Iarch(out.len) })
+}
+
+# Split a single-line member list (`Iarch a, Left('L), ...`) on commas at paren/bracket depth 0, so a
+# payload like `Pair(Iarch, Str)` stays one member.
+const split_members_line! = (Str inner): [Str] -> {
+	let [Str] out = []
+	let [Uint8] cur = []
+	let Iarch depth = 0
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(inner.len) then break
+
+		const Iarch c = Iarch(inner[i])
+
+		if c == 40 || c == 91 then depth = depth + 1
+		if c == 41 || c == 93 then depth = depth - 1
+
+		if c == 44 && depth == 0 then {
+			out = [...out, trim_member(Str({ bytes: cur, len: Iarch(cur.len) }))]
+			cur = []
+		} else {
+			cur = [...cur, Uint8(c)]
+		}
+
+		i = i + 1
+	}
+
+	const Str last = trim_member(Str({ bytes: cur, len: Iarch(cur.len) }))
+
+	if Iarch(last.len) > 0 then out = [...out, last]
+
+	return out
+}
+
+# The members of the `data`/`union` at `defline`: the fields/variants inside `{ ... }`, each with any
+# comment written directly above it (multi-line declarations only — a single-line body has none).
+const parse_members! = ([Str] lines, Iarch defline): [Member] -> {
+	let [Member] out = []
+	const Str first = lines[defline]
+	let Iarch br = -1
+	let Iarch bi = 0
+
+	loop {
+		if bi >= Iarch(first.len) then break
+
+		if Iarch(first[bi]) == 123 then {
+			br = bi
+
+			break
+		}
+
+		bi = bi + 1
+	}
+
+	if br < 0 then return out
+
+	let Iarch close = -1
+	let Iarch ci = br + 1
+
+	loop {
+		if ci >= Iarch(first.len) then break
+
+		if Iarch(first[ci]) == 125 then {
+			close = ci
+
+			break
+		}
+
+		ci = ci + 1
+	}
+
+	if close >= 0 then {
+		let [Uint8] inner = []
+		let Iarch k = br + 1
+
+		loop {
+			if k >= close then break
+
+			inner = [...inner, Uint8(Iarch(first[k]))]
+			k = k + 1
+		}
+
+		const [Str] parts = split_members_line!(Str({ bytes: inner, len: Iarch(inner.len) }))
+
+		for p in parts {
+			out = [...out, Member({ name: p, info: "" })]
+		}
+
+		return out
+	}
+
+	let [Uint8] pend = []
+	let Iarch j = defline + 1
+
+	loop {
+		if j >= Iarch(lines.len) then break
+
+		const Str ln = lines[j]
+		let Iarch f = 0
+
+		loop {
+			if f >= Iarch(ln.len) then break
+			if Iarch(ln[f]) != 32 && Iarch(ln[f]) != 9 then break
+
+			f = f + 1
+		}
+
+		if f < Iarch(ln.len) && Iarch(ln[f]) == 125 then break
+
+		if f >= Iarch(ln.len) then {
+			pend = []
+		} else if Iarch(ln[f]) == 35 then {
+			let Iarch c = f + 1
+
+			if c < Iarch(ln.len) && Iarch(ln[c]) == 32 then c = c + 1
+			if Iarch(pend.len) > 0 then pend = [...pend, Uint8(32)]
+
+			loop {
+				if c >= Iarch(ln.len) then break
+
+				pend = [...pend, Uint8(Iarch(ln[c]))]
+				c = c + 1
+			}
+		} else {
+			out = [...out, Member({ name: trim_member(ln), info: Str({ bytes: pend, len: Iarch(pend.len) }) })]
+			pend = []
+		}
+
+		j = j + 1
+	}
+
+	return out
+}
+
+# Extract every `pub` definition from a file's `content`, tagging each with `module`.
+const scan_content! = (Str content, Str module): [Def] -> {
+	const [Str] lines = split_lines(content)
+	let [Def] defs = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(lines.len) then break
+
+		const Str line = lines[i]
+		const Str kind = def_kind(line)
+
+		if !eq(kind, "") then {
+			const Str name = def_name(line, kind)
+			const Str doc = collect_doc(lines, i)
+			let [Member] members = []
+
+			if eq(kind, "data") || eq(kind, "union") then members = parse_members!(lines, i)
+
+			defs = [...defs, Def({ name: name, kind: kind, sig: line, doc: doc, module: module, members: members })]
+		}
+
+		i = i + 1
+	}
+
+	return defs
+}
+
+# The `::` module path for a source file: drop a leading `lib/` and a trailing `.cf`, and turn each
+# `/` into `::` — `lib/std/io/file/arm64/darwin.cf` → `std::io::file::arm64::darwin`.
+const path_to_module = (Str path): Str -> {
+	let Iarch start = 0
+
+	if starts_with(path, "lib/") then start = 4
+
+	let Iarch stop = Iarch(path.len)
+
+	if ends_with(path, ".cf") then stop = stop - 3
+
+	let [Uint8] out = []
+	let Iarch i = start
+
+	loop {
+		if i >= stop then break
+
+		const Iarch c = Iarch(path[i])
+
+		if c == 47 then {
+			out = [...out, Uint8(58)]
+			out = [...out, Uint8(58)]
+		} else {
+			out = [...out, Uint8(c)]
+		}
+
+		i = i + 1
+	}
+
+	return Str({ bytes: out, len: Iarch(out.len) })
+}
+
+# Scan one `.cf` file at `path`. A read failure yields no definitions (the file is simply skipped).
+const scan_file! = (Str path): [Def] -> {
+	const Either[IoRrr, Str] r = read_file!(path)
+	let [Def] out = []
+
+	match r {
+		Either.Left(e) -> {},
+		Either.Right(content) -> {
+			const [Def] ds = scan_content!(content, path_to_module(path))
+
+			for d in ds {
+				out = [...out, d]
+			}
+		},
+	}
+
+	return out
+}
+
+# Recursively scan a directory tree for `.cf` files, returning every definition. Skips `.`/`..`;
+# descends into subdirectories; a directory that cannot be read contributes nothing.
+const scan_dir! = (Str dir): [Def] -> {
+	const Either[IoRrr, [DirEntry]] r = read_dir!(dir)
+	let [Def] defs = []
+
+	match r {
+		Either.Left(e) -> {},
+		Either.Right(entries) -> {
+			for e in entries {
+				if !eq(e.name, ".") && !eq(e.name, "..") then {
+					const Str child = "${dir}/${e.name}"
+
+					if entry_is_dir(e) then {
+						const [Def] sub = scan_dir!(child)
+
+						for d in sub {
+							defs = [...defs, d]
+						}
+					} else if ends_with(e.name, ".cf") then {
+						const [Def] one = scan_file!(child)
+
+						for d in one {
+							defs = [...defs, d]
+						}
+					}
+				}
+			}
+		},
+	}
+
+	return defs
+}
+
+# Scan the whole standard library (under `lib/std`, resolved from the current directory the same way
+# the compiler resolves `std::` imports).
+pub const scan_std! = (): [Def] -> scan_dir!("lib/std")
+

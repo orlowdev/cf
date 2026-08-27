@@ -15,10 +15,10 @@ _(temporary)_ are placeholders that will be widened in later rounds.
   `[`, or `{` is not a terminator: a parameter list, aggregate, or data literal
   may still span lines.) Statement termination is a lexer concern and is likewise
   omitted from the rules below.
-- **Multi-line blocks set their braces alone.** A statement block `{ … }` that
+- **Multi-line blocks set their braces alone.** A statement block `{ ... }` that
   spans more than one line puts its opening `{` and closing `}` each on their own
   line — neither shares a line with a statement. A block that fits entirely on one
-  line (`… -> { one_stmt }`, a short value block `{ <- v }`) stays inline. This is
+  line (`... -> { one_stmt }`, a short value block `{ <- v }`) stays inline. This is
   enforced by the parser, not merely a style convention.
 - **Comments** start with `#` and run to the end of the line; there are no block
   comments. Like whitespace, a comment is a lexer concern and is stripped before
@@ -58,7 +58,7 @@ inert.
 A trailing `!` joins the name only when it does **not** open the `!=` operator —
 the lexer takes the `!` into the identifier iff the next character is not `=`. So
 `alloc!` and `alloc!()` are one identifier, but `n != 0` and `n!= 0` both lex as
-`n`, `!=`, `0`. Write `alloc! = …` with a space so the `!` binds to the name
+`n`, `!=`, `0`. Write `alloc! = ...` with a space so the `!` binds to the name
 rather than to the operator. (Because `!` is not a legal symbol character for the
 QBE/`as` backend, it is mangled off the emitted symbol — internally to a `_b`
 suffix (`alloc!` → `alloc_b`), and stripped bare only for a C export
@@ -174,7 +174,7 @@ A string is delimited by `"` and may span multiple lines (raw newlines are
 part of the literal). `${ expression }` interpolates any expression;
 `\` escapes the next character. Only three escapes are structurally required —
 those that would otherwise clash with the string's own delimiters. The full set
-of recognized escapes (`\n`, `\t`, `\u{…}`, …) is a lexical detail and will be
+of recognized escapes (`\n`, `\t`, `\u{...}`, ...) is a lexical detail and will be
 pinned down in the lexer spec.
 
 ```ebnf
@@ -184,7 +184,7 @@ string_element = interpolation | escape | string_char ;
 interpolation  = "${" , expression , "}" ;       (* expression: see Expressions *)
 
 escape         = "\" , escape_char ;
-escape_char    = '"' | "\" | "$" ;                (* structural escapes; lexer spec adds \n, \t, \u{…}, … *)
+escape_char    = '"' | "\" | "$" ;                (* structural escapes; lexer spec adds \n, \t, \u{...}, ... *)
 
 string_char    = ? any source character except an unescaped '"', a '\', or a '$' that starts '${' ? ;
 ```
@@ -200,8 +200,8 @@ bool = "true" | "false" ;
 
 ## Aggregate Literals
 
-Arrays and fixed arrays share one **bracket** literal — a `[…]` comma-separated
-list of values; **tuples** are the **paren** literal `(…)` (see Types). The array's
+Arrays and fixed arrays share one **bracket** literal — a `[...]` comma-separated
+list of values; **tuples** are the **paren** literal `(...)` (see Types). The array's
 concrete kind (fixed vs dynamic) is a **type** decision resolved by inference or
 annotation, not by the parser:
 
@@ -294,7 +294,7 @@ _declaration_ spread `...named_type` (Data & Type Declarations, which splices a
 _type_'s fields) and of the aggregate spread `...expression` — same `...`, one tier
 per plane.
 
-A `{ … }` opens either a **`data_literal`** or a **`block`** — blocks are values
+A `{ ... }` opens either a **`data_literal`** or a **`block`** — blocks are values
 too (see Blocks as Values under Expressions). In **statement** position (a
 function body after `->`, a nested block) it is always a `block`. In **value**
 position the two overlap, so a two-token peek past the `{` forks them:
@@ -303,8 +303,8 @@ position the two overlap, so a two-token peek past the `{` forks them:
 - a `var_name` then `:`, `,`, or `}` → `data_literal` (an explicit field or a pun).
 - `...` → `data_literal` (a value-level `field_spread`).
 - anything else → `block` — a statement keyword (`const`, `let`, `return`, `<-`),
-  or a `var_name` that continues as a statement rather than a field (`x = …`,
-  `x.f = …`, `x + 1`, `f(x)`), or any other expression-leading token.
+  or a `var_name` that continues as a statement rather than a field (`x = ...`,
+  `x.f = ...`, `x + 1`, `f(x)`), or any other expression-leading token.
 
 So `{ x }` stays the pun and a value block over `x` is `{ <- x }` (a value block
 must yield with `<-`, per Control Flow). Whether a data literal may be written
@@ -413,7 +413,7 @@ always inhabits exactly one member (a concrete subtype) and carries a **tag** th
 says which. A function may take the union as a parameter type — it then accepts
 _any_ member and recovers which one with `match` — but you never instantiate the
 union itself; you instantiate a member. There is no runtime `Node`, only an
-`IntLit`-or-`BinOp`-or-… that a `Node`-typed slot can hold.
+`IntLit`-or-`BinOp`-or-... that a `Node`-typed slot can hold.
 
 A union member takes one of a few forms, along independent axes:
 
@@ -425,7 +425,7 @@ A union member takes one of a few forms, along independent axes:
   declaration's `=`. The right-hand side is a struct body (`IntLit = { Int32 value }`, a
   payload record), a type (`Wrap = Int32`, the _named_ way to compose over a type), or a
   **literal** (`Semicolon = ";"`, a **singleton**).
-- **Positional payload `Name(T1, …, Tn)`** — a member carrying a positional tuple payload
+- **Positional payload `Name(T1, ..., Tn)`** — a member carrying a positional tuple payload
   (`Just('Value)`, `IntLit(Int32)`), the union counterpart of a positional record;
   constructed by application (`Maybe.Just(1)`).
 - **Member spread `...Other`** — splice another union's members in place (`...Int` in
@@ -435,7 +435,7 @@ A member may also carry its **own `generic_params`**, placing the type parameter
 member rather than the union head — `Node['Value]('Value)` in an otherwise-concrete union.
 
 These are orthogonal — a union freely mixes bare-resolved, bare-nullary, named, and positional
-members. So `union U = { A = { … }, B }` is exactly `data A = { … }`, a nullary `B`, and a
+members. So `union U = { A = { ... }, B }` is exactly `data A = { ... }`, a nullary `B`, and a
 union over `{ A, B }`: the declaration is its members' definition site.
 
 A member is a first-class type, but **how you reach it depends on how it was declared** — you
@@ -444,7 +444,7 @@ A member is a first-class type, but **how you reach it depends on how it was dec
 - A **compose-over** member (a standalone type the union merely references, like `Uint8`) is
   reached **on its own** (`Uint8` — you are naming the independent type, which happens to
   also be a member), and redundantly qualified (`PositiveInteger.Uint8`).
-- An **inline-declared** member — a nullary tag or a `Name = …` / `Name(…)` payload
+- An **inline-declared** member — a nullary tag or a `Name = ...` / `Name(...)` payload
   (`Node.Nil`, `Maybe.Nothing`, `Node.IntLit`) — exists **only within its union** and is reached
   **only qualified** (`Maybe.Nothing`, `NodeKind.IntLit`). There is no bare inline member.
 
@@ -522,13 +522,13 @@ A member-constructor synthesizes the **precise member type** (`n : Node.IntLit`)
 **widens to the union `Node`** by member→union subtyping only where a union is expected — an
 annotation, param, return, or unification against a sibling member (see the type-system spec,
 §8). A nullary member is written **qualified** and is just its tag (`Node.Nil`,
-`Maybe.Nothing`). There is no bare-union literal `Node { … }` — a `Node`-typed slot is always
+`Maybe.Nothing`). There is no bare-union literal `Node { ... }` — a `Node`-typed slot is always
 filled by a member (constructed, or narrowed via `match`).
 
 **Narrowing** — recovering which member a union *value* is — is done with `match` (see Pattern
 Matching). An arm is a member `type_pattern`: the member name **qualified by the scrutinee's
 union**, then a parenthesized sub-pattern for its payload (binding the whole payload, or a
-`{ … }` record pattern destructuring its fields) — `Maybe.Just(x)`, `Shape.Point({ x, y })`:
+`{ ... }` record pattern destructuring its fields) — `Maybe.Just(x)`, `Shape.Point({ x, y })`:
 
 ```
 match n {
@@ -588,7 +588,7 @@ type_args      = "[" , type_arg , { "," , type_arg } , "]" ;                    
 type_arg       = type | expression ;                                                (* Int32 (type)  |  8 (comptime value) *)
 argument       = expression ;
 qualified_path = path_seg , "::" , path_seg , { "::" , path_seg } ;   (* a ::-path to a module member: std::comptime::os::target — resolved through the module graph, module_system §4 *)
-primary        = qualified_path | var_name | type_name | member_access | value | block ;   (* qualified_path = a namespace-qualified reference (mem::alloc, std::io::print); type_name/member_access = a construction callee (Point, Maybe.Just); a block is a value too; a grouped/tuple ( … ) is the `tuple` value *)
+primary        = qualified_path | var_name | type_name | member_access | value | block ;   (* qualified_path = a namespace-qualified reference (mem::alloc, std::io::print); type_name/member_access = a construction callee (Point, Maybe.Just); a block is a value too; a grouped/tuple ( ... ) is the `tuple` value *)
 ```
 
 Each tier binds tighter than the one above and is left-associative, so
@@ -639,7 +639,7 @@ depends on the receiver's type (a semantic rule — see Aggregate Literals). Arr
 fixed or dynamic, accept a runtime index (`xs[i]`); a **tuple** accepts only a
 comptime **integer literal** (`t[0]`).
 
-A **call** `(…)` is a postfix accessor like `.field` and `[n]`, so it chains and
+A **call** `(...)` is a postfix accessor like `.field` and `[n]`, so it chains and
 binds as tightly: `f()[0].x` is `((f())[0]).x`, and `&p.read()` is `&((p.read()))`.
 The callee is whatever the postfix chain resolves to — a name, an accessed field,
 a parenthesized lambda, or a **type** (a construction callee).
@@ -656,7 +656,7 @@ compose (`Tree.Node[Int32](x)`). Whether the payload is a tuple `T(a, b)` or a d
 literal `T({ f: v })` follows the type's declaration; these are type-system rules,
 the grammar only admits the application. An **annotation is the same construction** —
 `const Point p = { x: 0, y: 0 }` is `const p = Point({ x: 0, y: 0 })`, so a bare
-`{ … }` in value position is a _payload_, typed by the enclosing `T(…)` or the
+`{ ... }` in value position is a _payload_, typed by the enclosing `T(...)` or the
 annotation, never a standalone typed record.
 
 **`.field` auto-dereferences a pointer.** There is no `->` operator and no
@@ -667,11 +667,11 @@ aggregates and exactly one level deep (see [[memory_model.md]]), a single `.`
 always lands on the field — there is no multi-level deref to spell out. `&p.x` is
 `&(p.x)`, the address of the field, not of `p`.
 
-A call may carry **explicit type arguments** in a `[…]` right before its `(`:
-`max[Int32](a, b)`, `zeros[8, Int32]()`. A `[…]` in a postfix chain forks by a
+A call may carry **explicit type arguments** in a `[...]` right before its `(`:
+`max[Int32](a, b)`, `zeros[8, Int32]()`. A `[...]` in a postfix chain forks by a
 single-token lookahead past the matching `]`, then — if needed — by the receiver:
 
-- **`(` follows** the `]` → the `[…]` is a call's **`type_args`** (`max[Int32](a, b)`).
+- **`(` follows** the `]` → the `[...]` is a call's **`type_args`** (`max[Int32](a, b)`).
 - **no `(` follows**, contents **type-level** (a `type`, a `'T`, or several
   comma-separated `type_arg`s) → a standalone **`type_apply`** — an array is never
   indexed by a type, so this can only be partial type application
@@ -757,7 +757,7 @@ mid-chain (`x |> f |> defer log |> g`). Which argument is the tapped one when a
 call takes several, when deferred cleanups fire, and their order (LIFO), are
 semantic rules.
 
-**`defer { … }`** defers a whole **block** instead of a single call. The block is
+**`defer { ... }`** defers a whole **block** instead of a single call. The block is
 an ordinary nested scope — its own `on_scope_enter`/`on_scope_exit` (a nested mark
 on the ambient node, never a new node) — scheduled to run at scope exit. Unlike
 the call form it taps no argument and yields nothing, so it is a statement:
@@ -864,7 +864,7 @@ reuses `const_decl` wholesale. The lambda is
 `[generics] (params) [":" return] -> body`. The `->` **yields the body** (a value),
 exactly as the function *type*'s `->` yields its return type; when a lambda states
 its return type explicitly, that type is set off with a **colon** before the arrow
-(`(a): Int32 -> …`), so the single `->` never has to mean two things at once. The
+(`(a): Int32 -> ...`), so the single `->` never has to mean two things at once. The
 return type is usually inferred and omitted; state it (via `:`) where inference
 can't reach or where you want it documented. The `!` that may end the _name_ is the
 allocation-effect marker (see Identifiers and the memory model), part of the
@@ -913,19 +913,19 @@ f(1, 2)                                                (* same call, type arg in
 Points:
 
 - **A param's type may be omitted** when it can be supplied from elsewhere —
-  chiefly a function-type annotation on the binding (`const Sum sum = (a, b) -> …`,
+  chiefly a function-type annotation on the binding (`const Sum sum = (a, b) -> ...`,
   where `Sum = (Int32, Int32) -> Int32` types `a` and `b`). A bare param is a lone
   `var_name`; a typed one leads with a `type` (`Int32 x`) — cased apart the usual
   way, since a type starts uppercase, `'`, `*`, or `[` and a value name
-  lowercase. A `record_pattern` param still requires its type (`ServerOptions { … }`).
+  lowercase. A `record_pattern` param still requires its type (`ServerOptions { ... }`).
   That every bare param's type is actually derivable is a semantic check; the
   grammar only permits the omission.
 - **A stated return type is set off with `:` between the params and the arrow**
-  (`(Int32 x): Int32 -> …`). Omit it (`(Int32 x) -> …`) to infer it from the body —
+  (`(Int32 x): Int32 -> ...`). Omit it (`(Int32 x) -> ...`) to infer it from the body —
   or for a function that returns nothing. The `->` always immediately precedes the
   body; the `:` return keeps it from colliding with the function *type*'s `->`.
 - **The body is a `block` or a single `expression`.** `-> a + b` is a
-  single-line body whose value is the implicit return; `-> { … }` is a braced
+  single-line body whose value is the implicit return; `-> { ... }` is a braced
   block that returns via `return`. So `(Int32 a, Int32 b) -> a + b` and
   `(Int32 a, Int32 b) -> { return a + b }` are the same function.
 - **A leading `[` opens `generic_params`, not an `aggregate`, when its contents
@@ -936,7 +936,7 @@ Points:
 - **A `{` right after `->` always opens a `block`, never a data literal.**
   This settles the brace ambiguity flagged under Data Literals even though the
   body may now be a bare expression: a single-expression body that _is_ a data
-  literal must be parenthesized — `-> ({ x: 0 })`. Inside a block, `{…}` in value
+  literal must be parenthesized — `-> ({ x: 0 })`. Inside a block, `{...}` in value
   position forks between a `data_literal` and a value `block` by the two-token
   peek (see Data Literals).
 - **`(` opens a lambda vs. a tuple by lookahead to `->`.** In value position a
@@ -1042,11 +1042,11 @@ asm_block = "asm" , string ;   (* body is an ordinary string — multiline, with
 `asm` is a **reserved keyword**; right after a lambda's `->` it can only open an
 `asm_block`, never a reference. The body is an **ordinary `string`** (already
 multiline — raw newlines are part of a C! string), so no new literal form is
-introduced. The one asm-specific twist is what `${…}` means inside it (below).
+introduced. The one asm-specific twist is what `${...}` means inside it (below).
 `$`, `%`, `#` pass through untouched — only `${` starts an interpolation, and a
 lone `$` is literal (see Strings); `\` still escapes, rarely a concern in asm.
 
-**`${…}` interpolation is operand-aware and resolved at comptime** — the same
+**`${...}` interpolation is operand-aware and resolved at comptime** — the same
 syntax as any string, but in an asm body a name resolves to its _operand
 location_, not a runtime value (asm has none):
 
@@ -1096,7 +1096,7 @@ pub const write = (Iarch fd, *[Uint8] buf, Uarch n): Uarch ->  (* ordinary C! at
   syscall6(4, fd, buf, n, 0, 0, 0)
 ```
 
-**No inline asm.** A mid-expression `asm(…)` would have to interoperate with
+**No inline asm.** A mid-expression `asm(...)` would have to interoperate with
 QBE's register allocation — naming operands, declaring clobbers — which QBE
 cannot support, forcing the whole enclosing function to lower as assembly. The
 whole-function form sidesteps this: the asm is a separate symbol at a clean ABI,
@@ -1106,7 +1106,7 @@ be revisited; the floor does not require it.
 ## Control Flow
 
 `if` is primarily an **expression** — it yields a value, so it may be bound
-(`let x = if …`) or stand alone as an expression-statement
+(`let x = if ...`) or stand alone as an expression-statement
 (`if c then f() else g()`). It is a top-level alternative of `expression` (see
 Expressions), so to nest it inside an operator you parenthesize it. `if` also has
 a **statement form** (`if_stmt`) for control flow: its branches are *statements*
@@ -1163,14 +1163,14 @@ Points:
   `expression` may itself be an `if_expr`, so `if a then 1 else if b then 2 else 3`
   chains for free.
 - **The statement form (`if_stmt`) drives control flow.** Its branches are
-  *statements* — `if err then return None`, `if done then break`, `if x < 0 then { … }`
+  *statements* — `if err then return None`, `if done then break`, `if x < 0 then { ... }`
   — so a branch may `return` (an early return from the whole function), `break`/
   `continue` a loop, `<-` a value-loop, assign, or call. Its `else` is optional and
   it yields no value (it is not bound). When **both** branches diverge (each ends in
   `return`/`break`/`continue`/`<-`), the `if` is itself terminal and satisfies a
   function's or block's obligation to end by diverging. `else if` chains for free
   here too (a `stmt_branch` may be another `if_stmt`). The value form and the
-  statement form share the `if … then … [else …]` surface; a use that supplies a
+  statement form share the `if ... then ... [else ...]` surface; a use that supplies a
   value (bound, or an operand) is the expression, a use that acts for effect or
   diverges is the statement.
 
@@ -1182,7 +1182,7 @@ position tells them apart, exactly as it does for prefix-vs-binary `*`/`&`.
 
 `match` is an **expression**, like `if`: it tests a scrutinee against ordered
 arms and yields the value of the first arm whose pattern matches. An arm's body
-is a `branch` — a single-line expression or a `{ … }` block that yields with
+is a `branch` — a single-line expression or a `{ ... }` block that yields with
 `<-`, exactly as an `if` branch.
 
 ```ebnf
@@ -1238,9 +1238,9 @@ Points:
   to. (Bare naming of a compose-over member — `Int8`, `Point` — is for type and value
   position; in a `type_pattern` the union qualifier is required. This is also what
   keeps a short name that lives in more than one union unambiguous — see Union Types.)
-- **Or-patterns** — `p0 | p1 | …` matches when the scrutinee matches _any_ of the
-  alternatives, so one arm can cover several cases (`Weekday.Sat | Weekday.Sun -> …`,
-  `NodeKind.IndexField | NodeKind.LocalIndexField -> …`). The separator is a single
+- **Or-patterns** — `p0 | p1 | ...` matches when the scrutinee matches _any_ of the
+  alternatives, so one arm can cover several cases (`Weekday.Sat | Weekday.Sun -> ...`,
+  `NodeKind.IndexField | NodeKind.LocalIndexField -> ...`). The separator is a single
   `|`, not `||`: a pattern is never an expression, so `|` in pattern position is
   unambiguously alternation, never bitwise-or (which only exists in expressions).
 - **Payload sub-patterns recurse**, so any `match_pattern` may sit inside the
@@ -1308,14 +1308,14 @@ Points:
 
 - **`loop` is the primitive**, an unconditional repeat with an optional lowercase
   **label** (`outer`). After `loop`, a `var_name` is the label and a `{` opens the
-  body, so `loop { … }` and `loop outer { … }` never collide. Its body is a
+  body, so `loop { ... }` and `loop outer { ... }` never collide. Its body is a
   `block`.
 - **`for var in iterable body`** binds each element to `var` and runs the body.
   `for` is **nameless** — no label. The body is a `branch` (a `block` or a single
-  expression), which is what makes it one-lineable (`for i in xs if …`) and an
-  expression (`… then i else 2`). The iterable is a full `expression`; because
+  expression), which is what makes it one-lineable (`for i in xs if ...`) and an
+  expression (`... then i else 2`). The iterable is a full `expression`; because
   expressions never juxtapose (calls always use `()`), the boundary between it
-  and the body is unambiguous — `xs { … }` and `xs if …` both split cleanly. The
+  and the body is unambiguous — `xs { ... }` and `xs if ...` both split cleanly. The
   `in` here is the loop's own, distinct from the geometry `in` clause (the `for`
   keyword leads, so there is no clash).
 - **`break` / `continue` are never-typed expressions.** Each takes an optional
@@ -1324,7 +1324,7 @@ Points:
   branch (`if true then break outer`, `if i != 2 then continue`).
 - **A loop's value comes from `<-`, which breaks with that value.** `<- v` inside
   a loop terminates it and yields `v`; a plain `break` terminates with no value.
-  A one-line expression body (`for i in xs … then i else 2`) instead carries the
+  A one-line expression body (`for i in xs ... then i else 2`) instead carries the
   value of its last evaluated iteration. Exactly what a loop yields on ordinary
   exhaustion or a valueless `break` is a semantic rule; the grammar only places
   the forms.
@@ -1362,7 +1362,7 @@ Extraction need not be exhaustive — a field left out of the pattern is just no
 bound. Field names only; no renaming yet.
 
 **Array patterns** (fixed and dynamic arrays) and **tuple patterns** (tuples and
-positional records) match by position — arrays in `[…]`, tuples in `(…)`, matching
+positional records) match by position — arrays in `[...]`, tuples in `(...)`, matching
 the value syntax. A `skip` drops elements without binding: bare `_` skips one, `_n`
 skips `n`. Because `_` and `_2` begin with `_` (not a lowercase letter) they are not
 `var_name`s, so there is no clash with a binding.
@@ -1383,12 +1383,12 @@ Nested patterns and a rest element are later widenings.
 
 **Disambiguation in a decl.** After `let`/`const`, a leading `{` can only begin a
 `record_pattern` — no `type` starts with `{`. A leading `[` forks against a
-bracket `type` (`const [Int32] darr = …`): scan past the matching `]` — a `=` next
-means the `[…]` was an `array_pattern`; a `var_name` next means it was the decl's
+bracket `type` (`const [Int32] darr = ...`): scan past the matching `]` — a `=` next
+means the `[...]` was an `array_pattern`; a `var_name` next means it was the decl's
 `type` and the name follows. A leading `(` forks the same way against a tuple /
-function `type`: a `=` after the matching `)` means the `(…)` was a `tuple_pattern`;
+function `type`: a `=` after the matching `)` means the `(...)` was a `tuple_pattern`;
 a `var_name` (or a return `type` then a `var_name`) means it was the decl's `type`
-and the name follows. A pattern's `{…}`/`[…]`/`(…)` sits in LHS position, so it is
+and the name follows. A pattern's `{...}`/`[...]`/`(...)` sits in LHS position, so it is
 never read as a `data_literal`, `aggregate`, or `tuple` value (those are values, on
 the RHS).
 
@@ -1421,7 +1421,7 @@ import_name  = var_name | type_name ;
 Examples:
 
 ```
-import std::mem                       (* binds `mem` — mem::alloc, mem::Arena, … *)
+import std::mem                       (* binds `mem` — mem::alloc, mem::Arena, ... *)
 import std::mem::{ alloc, Arena }      (* destructures alloc (value) and Arena (type) *)
 import std::comptime::os as comptime_os  (* binds `comptime_os` — comptime_os::target *)
 pub import std::mem::{ arena }         (* reexport: arena is importable from this module too *)
@@ -1437,16 +1437,16 @@ Four forms:
   value/type split on the binding: a single `::` path reaches any member.)
 - **A renamed path** `import a::b::c as n` binds `n` instead of the last segment `c`
   as the namespace abbreviation, so `n::member` means `a::b::c::member`. The rename is
-  namespace-only (it never applies to `::{ … }`); it disambiguates a segment name that
+  namespace-only (it never applies to `::{ ... }`); it disambiguates a segment name that
   would collide, and — paired with `pub import` and a `comptime_if` — lets a barrel
   give every platform's implementation a single shared name (`pub import
-  …::darwin::arm64 as console`).
+  ...::darwin::arm64 as console`).
 - **A destructured path** `import a::b::c::{ x, Y }` pulls the named members straight
   into scope, so `x` means `a::b::c::x` and `Y` means `a::b::c::Y`. It mirrors a
   `record_pattern` but also admits a `type_name`, since a member may itself be a type.
 - **A wildcard** `import a::b::c as *` splices `a::b::c`'s **whole exported surface**
   into the current module **flat** — every member at its own name, no nesting and no
-  enumeration — so a `pub import … as *` **reexport** forwards the lot without re-listing
+  enumeration — so a `pub import ... as *` **reexport** forwards the lot without re-listing
   them (and can never fall out of sync when the target gains a member). The natural
   barrel form: `pub import std::io::console::arm64::darwin as *` makes each of the
   platform module's members reachable through the barrel directly (`console::print`),
@@ -1495,7 +1495,7 @@ A **module is a `.cf` file**. Its top level is a sequence of imports and
 declarations in any order; there is no separate module keyword or wrapper.
 The "any order" here is about **layout** — imports and declarations may interleave freely,
 with no forced grouping; it does not mean every *reference* resolves regardless of position.
-**Reference-resolution caveat:** a binding to a **lambda** (a *function*, `const f = (…) -> …`)
+**Reference-resolution caveat:** a binding to a **lambda** (a *function*, `const f = (...) -> ...`)
 may be referenced before its declaration — functions resolve whole-module, so mutual and
 forward calls are fine. A binding to a **non-function value** (`const x = <value>`, `let x =
 <value>`) must be **declared before it is referenced** — a deliberately orthodox rule that
@@ -1512,7 +1512,7 @@ module_branch = module_item | "{" , { module_item } , "}" ;   (* one item, or a 
 ```
 
 A **`comptime_if`** brings **build-time conditional compilation** to the top
-level. It reuses `if … then … else` — position tells it from the value-level
+level. It reuses `if ... then ... else` — position tells it from the value-level
 `if_expr`, since a module item is never an expression — but it is evaluated at
 **comptime**, during import resolution, against comptime-known values, chiefly the
 compiler-supplied `std::comptime` module (`os`, `arch`, and the target). Exactly one

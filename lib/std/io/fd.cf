@@ -1,0 +1,100 @@
+# std::io::fd — the shared IO carriers, platform-independent.
+#
+# `Fd` is a typed file descriptor: a newtype over the kernel's integer handle, so an fd can never be
+# confused with an ordinary number (a byte count, a flag) at a call boundary. `file::open_read`/
+# `create` mint one; `read`/`write`/`close` and the console take one.
+#
+# `stdin`/`stdout`/`stderr` are the three POSIX standard descriptors as typed `Fd` values.
+pub data Fd = {
+	# the kernel's integer descriptor number
+	Uarch n,
+}
+
+# Standard input (descriptor 0) — where a program reads from, a terminal or a pipe.
+pub const stdin = Fd({ n: Uarch(0) })
+# Standard output (descriptor 1) — a program's ordinary output, what `print` writes to.
+pub const stdout = Fd({ n: Uarch(1) })
+# Standard error (descriptor 2) — the diagnostic channel, redirectable apart from `stdout`.
+pub const stderr = Fd({ n: Uarch(2) })
+
+# `Rrrno` is the raw failure at the floor: the negated kernel errno (darwin returns `-errno` from a
+# failed syscall via the carry flag). The syscall wrappers speak in it; `IoRrr` is what the C! surface
+# hands back.
+pub data Rrrno = {
+	# the negated kernel errno — a failed darwin syscall reports `-errno`
+	Iarch code,
+}
+
+# `IoRrr` is a fallible IO operation's failure, named so a caller reads the meaning off the variant
+# instead of memorising numbers: `match e { IoRrr.NotFound -> ..., IoRrr.Permission -> ... }`. The common
+# POSIX causes get their own variant; anything else rides `Other`, carrying the raw `Rrrno`. Fallible
+# operations return `Either[IoRrr, T]` (std::data) — `Left` on failure, `Right(value)` on success.
+pub union IoRrr = {
+	# nothing exists at the path (ENOENT)
+	NotFound,
+	# the target already exists (EEXIST)
+	Exists,
+	# the operation is not permitted for this user (EACCES / EPERM)
+	Permission,
+	# a directory was named where a non-directory was required (EISDIR)
+	IsDir,
+	# a path component that had to be a directory is not one (ENOTDIR)
+	NotDir,
+	# the filesystem has no room left (ENOSPC)
+	NoSpace,
+	# any other failure, carrying the raw `Rrrno` so no cause is lost
+	Other(Rrrno),
+}
+
+# Lift a raw negated errno into the named `IoRrr`. The mapped values are the POSIX-common low errno
+# numbers (identical on darwin and linux); everything else becomes `Other` with the code preserved.
+pub const rrr_of = (Iarch errno): IoRrr -> {
+	if errno == -2 then return IoRrr.NotFound
+	if errno == -17 then return IoRrr.Exists
+	if errno == -13 || errno == -1 then return IoRrr.Permission
+	if errno == -21 then return IoRrr.IsDir
+	if errno == -20 then return IoRrr.NotDir
+	if errno == -28 then return IoRrr.NoSpace
+
+	return IoRrr.Other(Rrrno({ code: errno }))
+}
+
+# Metadata about a filesystem entry, from `std::io::fs::stat!`. `size` is the byte length; `mode` is
+# the raw permission-and-type word (POSIX `st_mode`). The file-type predicates read the top nibble of
+# `mode` (`mode / 4096`): 4 = directory (S_IFDIR), 8 = regular file (S_IFREG), 10 = symlink (S_IFLNK).
+pub data Stat = {
+	# the file's length in bytes (POSIX `st_size`)
+	Iarch size,
+	# the raw permission-and-type word (POSIX `st_mode`); the file-type predicates read its top nibble
+	Iarch mode,
+}
+
+# Does this `Stat` describe a directory?
+pub const is_dir = (Stat s): Bool -> s.mode / 4096 == 4
+
+# Does this `Stat` describe a regular file (not a directory, device, or symlink)?
+pub const is_regular = (Stat s): Bool -> s.mode / 4096 == 8
+
+# Does this `Stat` describe a symbolic link? (`stat!` follows links, so this is rarely true through
+# it — it reads the type bits directly.)
+pub const is_symlink = (Stat s): Bool -> s.mode / 4096 == 10
+
+# One entry from `std::io::fs::read_dir!`: the entry `name` (owned, not the raw directory buffer) and
+# its `kind` — the POSIX `d_type` (4 = directory, 8 = regular file, 10 = symlink).
+pub data DirEntry = {
+	# the entry's name, owned — lifted out of the raw directory buffer, which is reused as the scan
+	# proceeds
+	Str name,
+	# the entry's POSIX `d_type`: 4 = directory, 8 = regular file, 10 = symlink
+	Iarch kind,
+}
+
+# Is this directory entry itself a directory? (Reads the entry's `d_type`, so no extra `stat!` call.)
+pub const entry_is_dir = (DirEntry e): Bool -> e.kind == 4
+
+# Is this directory entry a regular file?
+pub const entry_is_file = (DirEntry e): Bool -> e.kind == 8
+
+# Is this directory entry a symbolic link? (Unlike a followed `stat!`, `read_dir!` reports the link
+# itself, so this can be true.)
+pub const entry_is_symlink = (DirEntry e): Bool -> e.kind == 10

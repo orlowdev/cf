@@ -1,0 +1,219 @@
+# std::io::term — raw terminal control for arm64/darwin: put the terminal into raw mode, read a
+# keystroke (arrow keys decoded), query the window size, and emit the ANSI sequences a full-screen
+# TUI needs. All output goes to stdout (fd 1); the terminal is stdin (fd 0). Terminal ioctls use the
+# `ioctl` syscall (54); the `*[Uint8]` argument is the hop a `[N Uint8]` local needs to reach
+# `syscall6`'s `Uarch` operand.
+import std::sys::{ syscall6 }
+
+# The codes `read_key` returns for keys that have no single byte. The arrows arrive as a 3-byte
+# ESC-`[`-A/B/C/D sequence, decoded to these well outside the 0-255 byte range so they never collide
+# with an ordinary keystroke; `key_eof` marks end of input. An ordinary key returns its raw byte.
+
+# The up arrow.
+pub const key_up = 1001
+# The down arrow.
+pub const key_down = 1002
+# The left arrow.
+pub const key_left = 1003
+# The right arrow.
+pub const key_right = 1004
+# The Escape key (byte 27) — also the lead byte of an arrow sequence, so a lone `key_esc` is Escape
+# pressed on its own.
+pub const key_esc = 27
+# The Enter/Return key (byte 13). A terminal in raw mode with input processing on may deliver newline
+# (byte 10) instead, so match both when acting on Enter.
+pub const key_enter = 13
+# End of input — stdin is closed or drained (`read` returned 0 or an error).
+pub const key_eof = -1
+
+const ioctl = (Iarch fd, Uarch req, *[Uint8] argp): Iarch ->
+	syscall6(54, Uarch(fd), req, argp, 0, 0, 0)
+
+# The termios ioctl request codes. TIOCSETA (0x80487414) carries the write-direction bit 0x80000000,
+# which exceeds cf's i32 literal range, so it is assembled as (1 << 31) + the rest.
+const tiocgeta = (): Uarch -> Uarch(0x40487413)
+
+const tiocseta = (): Uarch -> Uarch(0x00487414) + (Uarch(1) << Uarch(31))
+
+# Put stdin into raw mode: no line buffering, no echo, and no signal generation — so Ctrl-C arrives
+# as byte 3 for the app to handle (letting it restore the terminal before exiting) rather than killing
+# the process mid-raw-mode. `saved` (72 bytes, caller-owned) receives the prior `termios` for
+# `restore`. TIOCGETA/TIOCSETA and the 72-byte struct (c_lflag at offset 24, c_cc at 32) are the arm64
+# darwin ABI. Output processing (c_oflag) is left on, so `\n` still returns the cursor to column 0.
+pub const raw_mode! = (*[Uint8] saved): () -> {
+	ioctl(0, tiocgeta(), saved)
+
+	let [72 Uint8] work
+	let Iarch i = 0
+
+	loop {
+		if i >= 72 then break
+
+		work[i] = saved[i]
+		i = i + 1
+	}
+
+	# c_lflag @ 24: clear ECHO (byte 24, 0x08) and ISIG (byte 24, 0x80) — mask 0x77 — and ICANON
+	# (byte 25, 0x01)
+	work[24] = Uint8(Iarch(work[24]) & 119)
+	work[25] = Uint8(Iarch(work[25]) & 254)
+	# c_cc: VMIN (index 16 @ offset 48) = 1, VTIME (index 17 @ offset 49) = 0 — block for one byte
+	work[48] = Uint8(1)
+	work[49] = Uint8(0)
+
+	ioctl(0, tiocseta(), work)
+
+	return ()
+}
+
+# Restore the terminal to the state `raw_mode!` saved.
+pub const restore = (*[Uint8] saved): () -> {
+	ioctl(0, tiocseta(), saved)
+
+	return ()
+}
+
+const read_stdin = (*[Uint8] buf, Uarch n): Iarch -> syscall6(3, 0, buf, n, 0, 0, 0)
+
+# Read one keypress, draining a buffered batch so bulk input — a paste, or typing that arrives faster
+# than the caller loops — is never dropped. The caller owns the batch: `data` (capacity `cap` bytes,
+# `cap` <= 255) holds a read of stdin, and `meta` (2 bytes) is the cursor — byte 0 = position, byte 1
+# = the batch length. Zero `meta` once before the first call; thereafter `read_key` refills `data`
+# only when the batch drains and yields the batch's keys across successive calls. A regular key
+# returns its byte; an arrow (the 3-byte ESC `[` A/B/C/D sequence, whole within one batch) returns
+# `key_up`/`key_down`/...; end of input returns `key_eof`.
+pub const read_key = (*[Uint8] data, *[Uint8] meta, Uarch cap): Iarch -> {
+	let Iarch pos = Iarch(meta[0])
+	let Iarch len = Iarch(meta[1])
+
+	if pos >= len then {
+		const Iarch n = read_stdin(data, cap)
+
+		if n <= 0 then return key_eof
+
+		len = n
+		pos = 0
+	}
+
+	const Iarch b0 = Iarch(data[pos])
+
+	if b0 == 27 && len - pos >= 3 && Iarch(data[pos + 1]) == 91 then {
+		const Iarch d = Iarch(data[pos + 2])
+
+		meta[0] = Uint8(pos + 3)
+		meta[1] = Uint8(len)
+
+		if d == 65 then return key_up
+		if d == 66 then return key_down
+		if d == 67 then return key_right
+		if d == 68 then return key_left
+
+		return key_esc
+	}
+
+	meta[0] = Uint8(pos + 1)
+	meta[1] = Uint8(len)
+
+	return b0
+}
+
+# The terminal window size in character cells, queried on stdout via TIOCGWINSZ (an 8-byte `winsize`:
+# rows u16 @ 0, cols u16 @ 2). On a non-terminal the ioctl fails and both read back 0.
+pub data TermSize = {
+	# the terminal height in character cells (0 on a non-terminal)
+	Iarch rows,
+	# the terminal width in character cells (0 on a non-terminal)
+	Iarch cols,
+}
+
+# Query the terminal's current size in character cells. On a non-terminal (a pipe or file) the query
+# fails and both fields read back 0 — check for that before dividing the screen by them.
+pub const size! = (): TermSize -> {
+	let [8 Uint8] ws = [0, 0, 0, 0, 0, 0, 0, 0]
+
+	ioctl(1, Uarch(0x40087468), ws)
+
+	const Iarch rows = Iarch(ws[0]) + Iarch(ws[1]) * 256
+	const Iarch cols = Iarch(ws[2]) + Iarch(ws[3]) * 256
+
+	return TermSize({ rows: rows, cols: cols })
+}
+
+const out = (*[Uint8] buf, Uarch n): () -> {
+	syscall6(4, 1, buf, n, 0, 0, 0)
+
+	return ()
+}
+
+# Move the cursor to (`row`, `col`), both 1-based — ESC[<row>;<col>H. The numeric parameters are
+# formatted with interpolation and the leading ESC `[` prepended as raw bytes (cf strings have no
+# `\x1b`).
+pub const move_to! = (Iarch row, Iarch col): () -> {
+	let [Uint8] buf = []
+
+	buf = [...buf, Uint8(27)]
+	buf = [...buf, Uint8(91)]
+
+	const Str tail = "${row};${col}H"
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(tail.len) then break
+
+		buf = [...buf, Uint8(Iarch(tail[i]))]
+		i = i + 1
+	}
+
+	out(buf, Uarch(buf.len))
+
+	return ()
+}
+
+# Clear the screen and home the cursor — ESC[2J ESC[H.
+pub const clear! = (): () -> {
+	let [7 Uint8] s = [27, 91, 50, 74, 27, 91, 72]
+
+	out(s, Uarch(7))
+
+	return ()
+}
+
+# Hide the cursor — ESC[?25l. A full-screen redraw looks calmer without the cursor skittering across
+# it; pair with `show_cursor!` on the way out.
+pub const hide_cursor! = (): () -> {
+	let [6 Uint8] s = [27, 91, 63, 50, 53, 108]
+
+	out(s, Uarch(6))
+
+	return ()
+}
+
+# Show the cursor — ESC[?25h. Undoes `hide_cursor!`; call it before leaving the alternate/raw display
+# so the shell prompt gets its cursor back.
+pub const show_cursor! = (): () -> {
+	let [6 Uint8] s = [27, 91, 63, 50, 53, 104]
+
+	out(s, Uarch(6))
+
+	return ()
+}
+
+# Turn on reverse video — ESC[7m. Everything printed after it swaps foreground and background, the
+# usual way to highlight a selected row or a status bar. Turn it back off with `reset!`.
+pub const reverse! = (): () -> {
+	let [4 Uint8] s = [27, 91, 55, 109]
+
+	out(s, Uarch(4))
+
+	return ()
+}
+
+# Reset all text attributes to normal — ESC[0m. Clears reverse video, colour, and bold at once; emit
+# it after any styled run so the styling does not bleed into what follows.
+pub const reset! = (): () -> {
+	let [4 Uint8] s = [27, 91, 48, 109]
+
+	out(s, Uarch(4))
+
+	return ()
+}

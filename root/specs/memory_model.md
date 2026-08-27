@@ -349,7 +349,7 @@ things, and both are copy-free:
 
 So residue is reclaimed where it was born; only the cloaked return leaves the
 frame. One case does move a *block* upward, and only bookkeeping-deep: a value
-escaping an **explicitly-carved sub-node** (`const a = fixed_arena::of(n); … return
+escaping an **explicitly-carved sub-node** (`const a = fixed_arena::of(n); ... return
 x` with `x` in `a`). `a`'s binding dies while `x` must survive; because `a` is
 physically carved from its parent, its **walls dissolve** and `x`'s storage is
 **re-attributed to the parent, in place** — same address, returned pointer stays

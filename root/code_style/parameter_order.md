@@ -27,5 +27,5 @@ It also gives every call a predictable shape — the subject is always in the sa
 place — and reads as "do _this_ (with these settings) _to that_".
 
 **Exemption.** A raw primitive that mirrors an external ABI keeps that ABI's
-order, not this one — e.g. `syscall6(num, a0, …, a5)` follows the kernel's
+order, not this one — e.g. `syscall6(num, a0, ..., a5)` follows the kernel's
 register layout. The rule governs C!-domain functions, not the asm floor.

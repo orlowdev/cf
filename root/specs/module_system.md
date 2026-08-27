@@ -9,7 +9,7 @@ the surface of the compiler-supplied **`std::comptime`** module (`os`/`arch`, `O
 It is the semantics behind the module *grammar* of [[ebnf.md]] (§ Imports, § Visibility,
 § Modules), which shapes only the surface and repeatedly defers the semantic rules —
 "which names a module exports", "how `::` paths resolve to files", and, explicitly, "the
-`std::comptime` module's full surface … its own deferred spec" — to here. It sits against the pipeline of [[order_of_compilation.md]],
+`std::comptime` module's full surface ... its own deferred spec" — to here. It sits against the pipeline of [[order_of_compilation.md]],
 where it is **phase 2, Resolve & flatten** (`cf-stage: resolved`): the resolver runs the
 comptime conditional imports, resolves paths, jumps barrels, flattens every module into
 one file, mangles module-qualified names, and prunes what no longer applies — turning a
@@ -34,7 +34,7 @@ Per [[order_of_compilation.md]] §Resolve the module system owns, and this spec 
   names, or an `as *` wildcard that splices the whole surface flat).
 - **barrels / reexport** (§5) — `pub import` reexports what it brings in, and barrels
   chain transitively.
-- **comptime conditional compilation** (§6) — the module-level `if … then … else`
+- **comptime conditional compilation** (§6) — the module-level `if ... then ... else`
   that selects exactly one backing per target and dissolves the rest.
 - **the `std::comptime` module surface** (§7) — the compiler-supplied `os`/`arch`
   namespaces, the `Os`/`Arch` enums, and the `target`/`current` members that drive §6.
@@ -91,10 +91,10 @@ modules. Without `pub` a declaration is **file-private** and invisible outside i
 hence functions, which are `const`-bound lambdas).
 
 ```
-pub const lex = (…) -> …       (* exported *)
-const scan_ident = (…) -> …    (* file-private *)
-pub data Token = { … }         (* exported *)
-pub union TokKind = { … }      (* exported *)
+pub const lex = (...) -> ...       (* exported *)
+const scan_ident = (...) -> ...    (* file-private *)
+pub data Token = { ... }         (* exported *)
+pub union TokKind = { ... }      (* exported *)
 ```
 
 `pub` lives only on a top-level `declaration`. A `var_decl` used as a block statement is a
@@ -120,7 +120,7 @@ runtime namespace object**).
 const t = std::comptime::os::target        (* no import needed — the full path resolves *)
 ```
 
-An import (`[ "pub" ] "import" <module_path> ( [ "::" "{" … "}" ] | [ "as" ( <name> | "*" ) ] )`,
+An import (`[ "pub" ] "import" <module_path> ( [ "::" "{" ... "}" ] | [ "as" ( <name> | "*" ) ] )`,
 [[ebnf.md]] § Imports) has four forms:
 
 - **A bare path** `import a::b::c` binds the path's **last segment** `c` as a namespace over
@@ -131,7 +131,7 @@ An import (`[ "pub" ] "import" <module_path> ( [ "::" "{" … "}" ] | [ "as" ( <
   value-vs-type namespace split: a single `::` path reaches any member.)
 - **A renamed path** `import a::b::c as n` binds `n` — not the last segment `c` — as the
   namespace over the same **whole** surface, so `n::member` expands to `a::b::c::member`. The
-  rename applies to the namespace binding only (never to `::{ … }` destructuring). It resolves
+  rename applies to the namespace binding only (never to `::{ ... }` destructuring). It resolves
   a last-segment collision, and — paired with **`pub import`** and a `comptime_if` (§6) — lets
   a barrel expose every platform's implementation under one shared name:
 
@@ -146,10 +146,10 @@ An import (`[ "pub" ] "import" <module_path> ( [ "::" "{" … "}" ] | [ "as" ( <
   must name a member the module exports.
 - **A wildcard** `import a::b::c as *` splices `a::b::c`'s **whole exported surface** into the
   current module **flat** — every member at its own name, no nesting prefix and no enumeration.
-  As a **`pub import … as *`** it reexports the entire surface without re-listing it, so a
+  As a **`pub import ... as *`** it reexports the entire surface without re-listing it, so a
   barrel stays in sync automatically when the target gains a member (the enumeration a
-  destructured `::{ … }` reexport would otherwise have to spell out and keep updated). This is
-  the barrel form for platform dispatch — `pub import …::arm64::darwin as *` makes each of the
+  destructured `::{ ... }` reexport would otherwise have to spell out and keep updated). This is
+  the barrel form for platform dispatch — `pub import ...::arm64::darwin as *` makes each of the
   chosen implementation's members reachable through the barrel directly (`console::print`), not
   under an implementation-named nesting. (A wildcard forwards the value plane through the rename
   table; types, which are never mangled, come into scope simply because the target module is
@@ -192,7 +192,7 @@ barrel's surface with the same shape the import gave it:
   reexport that enumerated them would, but without the enumeration (so a new member in `impl`
   joins the barrel automatically).
 - A **bare-path** reexport contributes a **nested namespace** — `pub import impl::io`
-  adds `io` to the surface as a namespace, whose own members are reached through it (`io::…`).
+  adds `io` to the surface as a namespace, whose own members are reached through it (`io::...`).
 
 **A namespace path windows over the whole surface.** Reaching a module `M` by path — via an
 `import M` abbreviation or a full path — exposes **all of `M`'s exported surface** (its `pub`
@@ -203,17 +203,17 @@ reexported namespace is reached and traversed `M::io::open`. Two barrel shapes:
 (* --- destructured reexport → flat member --- *)
 (* file "barrel.cf"   *)  pub import impl::{ x }       (* x joins barrel's surface *)
 (* file "consumer.cf" *)  import barrel                (* window over the surface (or write barrel::x inline) *)
-                          … barrel::x …                (* the flat member *)
+                          ... barrel::x ...                (* the flat member *)
 
 (* --- bare-path reexport → nested namespace --- *)
 (* file "blah_barrel.cf" *)  pub import ext::blah      (* blah joins the surface, nested *)
 (* file "consumer.cf"    *)  import blah_barrel
-                             … blah_barrel::blah::open …   (* traversed through the nesting *)
+                             ... blah_barrel::blah::open ...   (* traversed through the nesting *)
 
 (* --- wildcard reexport → all flat members --- *)
 (* file "barrel.cf"   *)  pub import impl as *          (* every impl member joins barrel's surface *)
 (* file "consumer.cf" *)  import barrel
-                          … barrel::x … barrel::y …      (* each flat member, no re-listing in barrel *)
+                          ... barrel::x ... barrel::y ...      (* each flat member, no re-listing in barrel *)
 ```
 
 Barrels **chain transitively** with no depth limit; the resolver "jumps through barrels"
@@ -277,7 +277,7 @@ flattened output.
 
 `std::comptime` is a **standard-library module** reached by `::` path like any other (§2/§4),
 with **no special path-casing** — `std::comptime::os::target` resolves the ordinary way, and
-the abbreviations come from `import std::comptime::{ … }`. What makes it special is not the
+the abbreviations come from `import std::comptime::{ ... }`. What makes it special is not the
 path but its **members**: the target descriptors `os`/`arch` are **compiler-supplied comptime
 intrinsics** — the compiler provides `target`/`current` from the build's `--target`
 ([[type_system.md]] § Intrinsics) — so nothing the module exposes emits runtime code; it
@@ -315,7 +315,7 @@ arch : { target: Arch, current: Arch }
 
 `os` and `arch` are the value half — namespaces exposing the two members below, reached by
 `::` (`os::target`, or fully `std::comptime::os::target`). The conventional form imports the
-abbreviations: `import std::comptime::{ os, arch, Os, Arch }`. The `{ … }` above names each
+abbreviations: `import std::comptime::{ os, arch, Os, Arch }`. The `{ ... }` above names each
 namespace's comptime members, not a runtime record value (§4: there is no runtime namespace
 object). Each exposes two comptime-known members:
 
