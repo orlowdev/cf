@@ -15,7 +15,10 @@
 # Phase C (here): trailing commas. The core stays a pure `[Uint8] -> [Uint8]` so the CLI command
 # and the pipeline canonicaliser share one implementation.
 
-import io::{ open, read, write, close, die, eprint, o_rdonly, o_wronly_creat_trunc, mode_644 }
+import std::data::{ Either }
+import std::io::console::{ die, eprint }
+import std::io::file::{ open_read, read, write_bytes, create, close }
+import std::io::fd::{ Fd, IoErr }
 import token::{
 	Token,
 	TokKind,
@@ -1494,11 +1497,21 @@ pub const format_file! = (Str path, Bool check): Iarch -> {
 	# One file's read buffer — sized like resolve's (cf's own largest module, emit.cf, is past
 	# 256 KB; 1 MB leaves headroom). A read that FILLS the buffer means truncation — die loudly.
 	let [1048576 Uint8] buf
-	const Iarch fd = open(path.bytes, Uarch(o_rdonly), 0)
-	if fd < 0 then die("cf: format: cannot open the input file\n")
-	const Iarch n = read(Uarch(fd), buf, Uarch(buf.len))
-	close(Uarch(fd))
-	if n < 0 then die("cf: format: reading the input file failed\n")
+	const Fd fd = match open_read(path) {
+		Either.Left(e) -> {
+			die("cf: format: cannot open the input file\n")
+
+			<- Fd({ n: Uarch(0) })
+		},
+		Either.Right(f) -> f,
+	}
+	const Iarch n = match read(fd, buf, Uarch(buf.len)) {
+		Either.Left(e) -> die("cf: format: reading the input file failed\n"),
+		Either.Right(k) -> k,
+	}
+
+	close(fd)
+
 	if n >= Iarch(buf.len)
 		then die("cf: format: the input file exceeds the read buffer — grow it in fmt.cf\n")
 
@@ -1562,10 +1575,17 @@ pub const format_file! = (Str path, Bool check): Iarch -> {
 	}
 
 	if same then return 0
-	const Iarch wfd = open(path.bytes, Uarch(o_wronly_creat_trunc), Uarch(mode_644))
-	if wfd < 0 then die("cf: format: cannot open the file for writing\n")
-	write(Uarch(wfd), out, Uarch(out.len))
-	close(Uarch(wfd))
+	const Fd wfd = match create(path) {
+		Either.Left(e) -> {
+			die("cf: format: cannot open the file for writing\n")
+
+			<- Fd({ n: Uarch(0) })
+		},
+		Either.Right(f) -> f,
+	}
+
+	write_bytes(wfd, out, Uarch(out.len))
+	close(wfd)
 
 	return 0
 }

@@ -17,7 +17,9 @@
 # do not yet apply the §5.6 divide-by-zero guard; `const` vs `let` mutability is
 # not yet enforced (that is the typecheck brick).
 
-import io::{ write_str, die }
+import std::io::console::{ die }
+import std::io::file::{ write_str }
+import std::io::fd::{ Fd }
 import routing::{ RouteInfo, RSets, FnSum, kids, stmt_exprs }
 import alloc::{ address_taken }
 import ast::{
@@ -82,7 +84,7 @@ import astutil::{
 # -1 if the nearest loop is not reset-safe) — `break`/`continue` restore it so every path back to
 # the loop head or out of it reclaims the iteration's residue, matching the back-edge rewind.
 data Emit = {
-	Uarch fd,
+	Fd fd,
 	Iarch next,
 	Iarch label,
 	[Func] funcs,
@@ -5802,7 +5804,7 @@ const slit_program = (Program prog): [Str] -> {
 
 # Lay each interned literal down as static data: the NUL-terminated bytes and the
 # `{bytes*@0, len@8}` header every evaluation will `copy`.
-const emit_slits! = (Uarch fd, [Str] tbl): Iarch -> {
+const emit_slits! = (Fd fd, [Str] tbl): Iarch -> {
 	let Iarch i = 0
 
 	loop {
@@ -6290,7 +6292,7 @@ const emit_func! = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 # is carried by the pointer, so one shared floor helper serves every geometry (no per-geometry
 # copy, no runtime kind-dispatch). The `_g` suffix is historical: the legacy non-`_g` set that
 # grew via the now-deleted `cf_alloc` kind-switch is gone (every allocation is materialized).
-const emit_dyn_helpers! = (Uarch fd): Iarch -> {
+const emit_dyn_helpers! = (Fd fd): Iarch -> {
 	const Str sfx = "_g"
 	const Str rf = ", l %reservefn"
 	write_str(fd, "function l $cf_dyn_push${sfx}(l %node, l %hdr, w %esize${rf}) {\n")
@@ -6589,7 +6591,7 @@ const emit_dyn_helpers! = (Uarch fd): Iarch -> {
 	return 0
 }
 
-const emit_arena_qbe! = (Uarch fd, Bool is_bare, Iarch root_size, Bool dyn_g, Iarch pgidx): Iarch -> {
+const emit_arena_qbe! = (Fd fd, Bool is_bare, Iarch root_size, Bool dyn_g, Iarch pgidx): Iarch -> {
 	# a `Bare` target's root is a fixed `root_size`-byte BSS block (`$cf_root`, default 1 MiB) — no
 	# mmap. cf_root_page_init seeds $cf_page over it as a two-ended block (survivor limit == residue top == base+root_size), so the page reserve bumps within it and
 	# traps (cf_oom) at the end. In zero-root mode (root_size 0) the usable region is empty (the floor
@@ -6691,7 +6693,7 @@ const main_takes_argv = (Program prog): Bool -> {
 # header (BORROWING the OS's already-NUL-terminated argv bytes) and pushes it onto a fresh
 # `[Str]` vector, returning the header. `_start` calls it with (argc in x0, argv in x1) — the
 # darwin C-ABI entry values — and hands the result to `main`.
-const emit_argv_qbe! = (Uarch fd, Iarch pgr): Iarch -> {
+const emit_argv_qbe! = (Fd fd, Iarch pgr): Iarch -> {
 	write_str(fd, "function l $cf_strlen(l %p) {\n")
 	write_str(fd, "@start\n")
 	write_str(fd, "\t%pp =l alloc8 8\n")
@@ -6756,7 +6758,7 @@ const emit_argv_qbe! = (Uarch fd, Iarch pgr): Iarch -> {
 # crosses the committed watermark — the same base address throughout, so every outstanding pointer
 # stays valid (memory_model §8). `cf_oom` fires only at RESERVATION exhaustion; `cf_mmap_fail` on a
 # failed map/commit. All are leaf routines (no `bl`) touching only caller-saved regs (x0-x16).
-const emit_arena_floor! = (Uarch fd, Bool is_bare, Iarch root_size): Iarch -> {
+const emit_arena_floor! = (Fd fd, Bool is_bare, Iarch root_size): Iarch -> {
 	# BARE floor (ELF, no OS): `qbe -t arm64` emits SysV symbols with no leading `_`, and ELF uses
 	# `:lo12:` page-offset relocations (vs Mach-O `@PAGE`/`@PAGEOFF`). cf_root_page_init seeds $cf_page over
 	# the static 1 MiB $cf_root (survivor limit == residue top == base+root_size ⇒ the reserve bumps within it and traps at the end);
@@ -6899,7 +6901,7 @@ const param_index = ([Param] params, Str name): Iarch -> {
 # replaced by the argument register `x<index>` that parameter occupies (arm64 C ABI: param
 # i is in x<i>; the function is naked — no prologue — and supplies its own `ret`). Labeled
 # `_f<idx>` to match the positional symbol QBE-lowered callers reference (`$f<idx>`).
-const emit_asm_func! = (Uarch fd, Func fn, Iarch idx): Iarch -> {
+const emit_asm_func! = (Fd fd, Func fn, Iarch idx): Iarch -> {
 	write_str(fd, ".globl _f${idx}\n")
 	write_str(fd, ".p2align 2\n")
 	write_str(fd, "_f${idx}:")
@@ -6983,8 +6985,8 @@ pub const emit_program! = (
 	RouteInfo ri,
 	[Str] mat_names,
 	[Str] mat_geoms,
-	Uarch qbe_fd,
-	Uarch asm_fd,
+	Fd qbe_fd,
+	Fd asm_fd,
 	Str target_os,
 	Iarch root_size,
 ): Iarch -> {

@@ -92,9 +92,9 @@ _cf_oom:
 	mov x0, #70
 	mov x16, #1
 	svc #0x80
-.globl _f1
+.globl _f221
 .p2align 2
-_f1:
+_f221:
 	mov x16, x0
 	mov x0, x1
 	mov x1, x2
@@ -105,9 +105,9 @@ _f1:
 	svc #0x80
 	ret
 
-.globl _f14
+.globl _f319
 .p2align 2
-_f14:
+_f319:
 	mov x0, x0
 	mov x16, #1
 	svc #0x80
