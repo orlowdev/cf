@@ -4,31 +4,44 @@
 # confused with an ordinary number (a byte count, a flag) at a call boundary. `file::open_read`/
 # `create` mint one; `read`/`write`/`close` and the console take one.
 #
-# `IoErr` carries the failure of a fallible IO operation: the negated kernel `errno` (darwin returns
-# `-errno` from a failed syscall, kept verbatim so the code is inspectable). Fallible operations in
-# `std::io` return `Either[IoErr, T]` (std::data) — `Left(err)` on failure, `Right(value)` on success.
-#
 # `stdin`/`stdout`/`stderr` are the three POSIX standard descriptors as typed `Fd` values.
 pub data Fd = { Uarch n }
-pub data IoErr = { Iarch errno }
 
 pub const stdin = Fd({ n: Uarch(0) })
 pub const stdout = Fd({ n: Uarch(1) })
 pub const stderr = Fd({ n: Uarch(2) })
 
-# The positive errno an `IoErr` carries (the kernel returns it negated). `.errno` is the raw negative
-# value; `code` flips it back for display or comparison against a POSIX number.
-pub const code = (IoErr e): Iarch -> 0 - e.errno
+# `Rrrno` is the raw failure at the floor: the negated kernel errno (darwin returns `-errno` from a
+# failed syscall via the carry flag). The syscall wrappers speak in it; `IoRrr` is what the C! surface
+# hands back.
+pub data Rrrno = { Iarch code }
 
-# Meaning of a failure, so a caller branches on the cause instead of a raw number. The values below
-# are the POSIX-common low errno numbers (identical on darwin and linux); higher-numbered codes
-# diverge per platform and are not surfaced here yet.
-pub const is_not_found = (IoErr e): Bool -> e.errno == 0 - 2
-pub const is_permission = (IoErr e): Bool -> e.errno == 0 - 13 || e.errno == 0 - 1
-pub const is_exists = (IoErr e): Bool -> e.errno == 0 - 17
-pub const is_a_directory = (IoErr e): Bool -> e.errno == 0 - 21
-pub const is_not_a_directory = (IoErr e): Bool -> e.errno == 0 - 20
-pub const is_no_space = (IoErr e): Bool -> e.errno == 0 - 28
+# `IoRrr` is a fallible IO operation's failure, named so a caller reads the meaning off the variant
+# instead of memorising numbers: `match e { IoRrr.NotFound -> …, IoRrr.Permission -> … }`. The common
+# POSIX causes get their own variant; anything else rides `Other`, carrying the raw `Rrrno`. Fallible
+# operations return `Either[IoRrr, T]` (std::data) — `Left` on failure, `Right(value)` on success.
+pub union IoRrr = {
+	NotFound,
+	Exists,
+	Permission,
+	IsDir,
+	NotDir,
+	NoSpace,
+	Other(Rrrno),
+}
+
+# Lift a raw negated errno into the named `IoRrr`. The mapped values are the POSIX-common low errno
+# numbers (identical on darwin and linux); everything else becomes `Other` with the code preserved.
+pub const rrr_of = (Iarch errno): IoRrr -> {
+	if errno == 0 - 2 then return IoRrr.NotFound
+	if errno == 0 - 17 then return IoRrr.Exists
+	if errno == 0 - 13 || errno == 0 - 1 then return IoRrr.Permission
+	if errno == 0 - 21 then return IoRrr.IsDir
+	if errno == 0 - 20 then return IoRrr.NotDir
+	if errno == 0 - 28 then return IoRrr.NoSpace
+
+	return IoRrr.Other(Rrrno({ code: errno }))
+}
 
 # Metadata about a filesystem entry, from `std::io::fs::stat!`. `size` is the byte length; `mode` is
 # the raw permission-and-type word (POSIX `st_mode`). The file-type predicates read the top nibble of

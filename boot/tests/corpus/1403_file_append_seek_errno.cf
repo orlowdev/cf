@@ -1,21 +1,21 @@
-# std::io::file append + seek + error ergonomics. write_file "12", append_file "345" → "12345";
-# open_read, seek to offset 3 from the start, read the remaining bytes ("45", 2 bytes). Then probe a
-# missing path and confirm the is_not_found predicate fires. Result = bytes-after-seek (2) plus a 40
-# bonus when the predicate held → exit 42.
+# std::io::file append + seek + the named IoRrr error union. write_file "12", append_file "345" →
+# "12345"; open_read, seek to offset 3 from the start, read the remaining bytes ("45", 2 bytes). Then
+# probe a missing path and confirm the failure matches IoRrr.NotFound (not a raw errno). Result =
+# bytes-after-seek (2) plus a 40 bonus when the error read as NotFound → exit 42.
 # expect: exit 42
 import std::data::{ Either }
 import std::io::file::{ write_file, append_file, open_read, read, seek, close }
-import std::io::fd::{ Fd, IoErr, is_not_found }
+import std::io::fd::{ Fd, IoRrr }
 import std::mem::arena::growing_arena
 
 const tail_after_seek! = (Fd fd): Iarch -> {
 	let [16 Uint8] buf = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-	const Either[IoErr, Iarch] sr = seek(fd, 3, 0)
+	const Either[IoRrr, Iarch] sr = seek(fd, 3, 0)
 	const Iarch off = match sr {
 		Either.Left(e) -> 0 - 1,
 		Either.Right(k) -> k,
 	}
-	const Either[IoErr, Iarch] rr = read(fd, buf, Uarch(16))
+	const Either[IoRrr, Iarch] rr = read(fd, buf, Uarch(16))
 
 	return match rr {
 		Either.Left(e) -> 0 - 1,
@@ -23,11 +23,14 @@ const tail_after_seek! = (Fd fd): Iarch -> {
 	}
 }
 
-const missing_is_not_found = (): Iarch -> {
-	const Either[IoErr, Fd] o = open_read("/no/such/file/here")
+const missing_reads_as_not_found = (): Iarch -> {
+	const Either[IoRrr, Fd] o = open_read("/no/such/file/here")
 
 	return match o {
-		Either.Left(e) -> if is_not_found(e) then 40 else 0,
+		Either.Left(e) -> match e {
+			IoRrr.NotFound -> 40,
+			_ -> 0,
+		},
 		Either.Right(f) -> 0,
 	}
 }
@@ -36,7 +39,7 @@ const run! = (): Iarch -> {
 	write_file("/tmp/cf_t1403.txt", "12")
 	append_file("/tmp/cf_t1403.txt", "345")
 
-	const Either[IoErr, Fd] o = open_read("/tmp/cf_t1403.txt")
+	const Either[IoRrr, Fd] o = open_read("/tmp/cf_t1403.txt")
 	const Fd fd = match o {
 		Either.Left(e) -> Fd({ n: Uarch(0) }),
 		Either.Right(f) -> f,
@@ -45,7 +48,7 @@ const run! = (): Iarch -> {
 
 	close(fd)
 
-	return tail + missing_is_not_found()
+	return tail + missing_reads_as_not_found()
 }
 
 pub const main = () -> {
