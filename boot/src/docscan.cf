@@ -14,7 +14,7 @@ import std::data::{ Either }
 # One documented public definition: its `name`, its `kind` (`const`/`data`/`union`/`intrinsic`), the
 # `sig` (the definition's own source line), the `doc` (the `#` comment block above, `#` stripped), and
 # the `module` it lives in (a `::` path derived from the file).
-pub data Def = { Str name, Str kind, Str sig, Str doc, Str module }
+pub data Def = { Str name, Str kind, Str sig, Str doc, Str module, [Member] members }
 
 # Split `s` into lines on `\n` (the newline dropped). A trailing line without a newline is kept. Each
 # line is a fresh owned Str — after a line is pushed, `cur` is rebound to a new empty vector, so the
@@ -149,8 +149,181 @@ const collect_doc = ([Str] lines, Iarch defline): Str -> {
 	return Str({ bytes: out, len: Iarch(out.len) })
 }
 
+# One member of a `data`/`union`: its source text (a field `Iarch a`, a variant `Left('L)`) and any
+# comment written above it (empty when none).
+pub data Member = { Str name, Str info }
+
+# Trim leading/trailing blanks and a trailing comma from a member's text.
+const trim_member = (Str s): Str -> {
+	let Iarch a = 0
+
+	loop {
+		if a >= Iarch(s.len) then break
+		if Iarch(s[a]) != 32 && Iarch(s[a]) != 9 then break
+
+		a = a + 1
+	}
+
+	let Iarch b = Iarch(s.len)
+
+	loop {
+		if b <= a then break
+
+		const Iarch c = Iarch(s[b - 1])
+
+		if c != 32 && c != 9 && c != 44 then break
+
+		b = b - 1
+	}
+
+	let [Uint8] out = []
+	let Iarch i = a
+
+	loop {
+		if i >= b then break
+
+		out = [...out, Uint8(Iarch(s[i]))]
+		i = i + 1
+	}
+
+	return Str({ bytes: out, len: Iarch(out.len) })
+}
+
+# Split a single-line member list (`Iarch a, Left('L), ...`) on commas at paren/bracket depth 0, so a
+# payload like `Pair(Iarch, Str)` stays one member.
+const split_members_line! = (Str inner): [Str] -> {
+	let [Str] out = []
+	let [Uint8] cur = []
+	let Iarch depth = 0
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(inner.len) then break
+
+		const Iarch c = Iarch(inner[i])
+
+		if c == 40 || c == 91 then depth = depth + 1
+		if c == 41 || c == 93 then depth = depth - 1
+
+		if c == 44 && depth == 0 then {
+			out = [...out, trim_member(Str({ bytes: cur, len: Iarch(cur.len) }))]
+			cur = []
+		} else {
+			cur = [...cur, Uint8(c)]
+		}
+
+		i = i + 1
+	}
+
+	const Str last = trim_member(Str({ bytes: cur, len: Iarch(cur.len) }))
+
+	if Iarch(last.len) > 0 then out = [...out, last]
+
+	return out
+}
+
+# The members of the `data`/`union` at `defline`: the fields/variants inside `{ ... }`, each with any
+# comment written directly above it (multi-line declarations only — a single-line body has none).
+const parse_members! = ([Str] lines, Iarch defline): [Member] -> {
+	let [Member] out = []
+	const Str first = lines[defline]
+	let Iarch br = 0 - 1
+	let Iarch bi = 0
+
+	loop {
+		if bi >= Iarch(first.len) then break
+
+		if Iarch(first[bi]) == 123 then {
+			br = bi
+
+			break
+		}
+
+		bi = bi + 1
+	}
+
+	if br < 0 then return out
+
+	let Iarch close = 0 - 1
+	let Iarch ci = br + 1
+
+	loop {
+		if ci >= Iarch(first.len) then break
+
+		if Iarch(first[ci]) == 125 then {
+			close = ci
+
+			break
+		}
+
+		ci = ci + 1
+	}
+
+	if close >= 0 then {
+		let [Uint8] inner = []
+		let Iarch k = br + 1
+
+		loop {
+			if k >= close then break
+
+			inner = [...inner, Uint8(Iarch(first[k]))]
+			k = k + 1
+		}
+
+		const [Str] parts = split_members_line!(Str({ bytes: inner, len: Iarch(inner.len) }))
+
+		for p in parts {
+			out = [...out, Member({ name: p, info: "" })]
+		}
+
+		return out
+	}
+
+	let [Uint8] pend = []
+	let Iarch j = defline + 1
+
+	loop {
+		if j >= Iarch(lines.len) then break
+
+		const Str ln = lines[j]
+		let Iarch f = 0
+
+		loop {
+			if f >= Iarch(ln.len) then break
+			if Iarch(ln[f]) != 32 && Iarch(ln[f]) != 9 then break
+
+			f = f + 1
+		}
+
+		if f < Iarch(ln.len) && Iarch(ln[f]) == 125 then break
+
+		if f >= Iarch(ln.len) then {
+			pend = []
+		} else if Iarch(ln[f]) == 35 then {
+			let Iarch c = f + 1
+
+			if c < Iarch(ln.len) && Iarch(ln[c]) == 32 then c = c + 1
+			if Iarch(pend.len) > 0 then pend = [...pend, Uint8(32)]
+
+			loop {
+				if c >= Iarch(ln.len) then break
+
+				pend = [...pend, Uint8(Iarch(ln[c]))]
+				c = c + 1
+			}
+		} else {
+			out = [...out, Member({ name: trim_member(ln), info: Str({ bytes: pend, len: Iarch(pend.len) }) })]
+			pend = []
+		}
+
+		j = j + 1
+	}
+
+	return out
+}
+
 # Extract every `pub` definition from a file's `content`, tagging each with `module`.
-const scan_content = (Str content, Str module): [Def] -> {
+const scan_content! = (Str content, Str module): [Def] -> {
 	const [Str] lines = split_lines(content)
 	let [Def] defs = []
 	let Iarch i = 0
@@ -164,8 +337,11 @@ const scan_content = (Str content, Str module): [Def] -> {
 		if !eq(kind, "") then {
 			const Str name = def_name(line, kind)
 			const Str doc = collect_doc(lines, i)
+			let [Member] members = []
 
-			defs = [...defs, Def({ name: name, kind: kind, sig: line, doc: doc, module: module })]
+			if eq(kind, "data") || eq(kind, "union") then members = parse_members!(lines, i)
+
+			defs = [...defs, Def({ name: name, kind: kind, sig: line, doc: doc, module: module, members: members })]
 		}
 
 		i = i + 1
@@ -214,7 +390,7 @@ const scan_file! = (Str path): [Def] -> {
 	match r {
 		Either.Left(e) -> {},
 		Either.Right(content) -> {
-			const [Def] ds = scan_content(content, path_to_module(path))
+			const [Def] ds = scan_content!(content, path_to_module(path))
 
 			for d in ds {
 				out = [...out, d]
