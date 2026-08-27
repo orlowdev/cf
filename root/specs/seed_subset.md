@@ -180,7 +180,7 @@ The whole of [[ebnf.md]] is live in `cf0`, because `cf`'s source uses it:
 - **Data modelling** — `data`, `type` (including named-tuple splat), `union` with
   payloads, record and aggregate literals, spreads, field puns, defaults.
 - **Generics, with inference.** Full monomorphisation from both explicit
-  (`f[Int](…)`) and inferred (`f(…)`) type arguments — `cf`'s source is not made
+  (`f[Int](...)`) and inferred (`f(...)`) type arguments — `cf`'s source is not made
   to spell out every type argument.
 - **Closures and higher-order functions.** Capturing function values lower to
   hidden parameters at specialization (the fake-closure model — see
@@ -282,9 +282,9 @@ indirect jump). `cf0` takes the cheaper path QBE gives for free — a
 
 ```
 match n {
-  Node.IntLit(v)     -> …,
-  Node.BinOp({ op }) -> …,
-  Nil                -> …,
+  Node.IntLit(v)     -> ...,
+  Node.BinOp({ op }) -> ...,
+  Nil                -> ...,
 }
 ```
 
@@ -318,7 +318,7 @@ table.
 - **Constant folding** (the `folded` arc) — reduce comptime-known expressions that
   survived into runtime shape, and inline non-deferred hook bodies to their literal
   operations.
-- **Comptime conditional imports** — evaluate the module-level `if … then … else`
+- **Comptime conditional imports** — evaluate the module-level `if ... then ... else`
   against the target triple, so a name resolves to one backing per target. In
   `cf0` the triple is fixed (§3): every selection lands on darwin/arm64, though
   `cf`'s source still writes the portable form.

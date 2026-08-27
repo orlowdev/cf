@@ -62,7 +62,7 @@ cf compile <file> [options]
 `compile` takes **one file** — the compilation entry. It must be a `.cf` file, and
 (unless `--lib`) must define a `pub const main` (see [[ebnf.md]], Entry Point).
 Every path is resolved relative to that file's location, **except** standard
-library paths (`std::…`), which the toolchain resolves. This single-entry,
+library paths (`std::...`), which the toolchain resolves. This single-entry,
 relative-path rule is the whole module-resolution story; there is no ambient
 search path.
 
@@ -181,8 +181,8 @@ Two targets carry known asterisks, both deferred (§8):
   `cf compile <file> --run`.
 - **`--watch`** recompiles when `<file>` or any of its non-std imports change,
   walking the transitive import graph.
-- **Program arguments pass through `--`**: `cf run <file> -- <args…>` (equivalently
-  `cf compile <file> --run -- <args…>`) forwards `<args…>` to the built binary's
+- **Program arguments pass through `--`**: `cf run <file> -- <args...>` (equivalently
+  `cf compile <file> --run -- <args...>`) forwards `<args...>` to the built binary's
   `main(argc, argv, envp)` (see [[ebnf.md]], Entry Point). Without the `--` the
   program receives no arguments.
 

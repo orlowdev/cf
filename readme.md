@@ -38,7 +38,7 @@ C!'s memory model is a deliberate descendant of
 [region-based memory management](https://en.wikipedia.org/wiki/Region-based_memory_management).
 The lineage:
 
-- **Tofte & Talpin** (_Region-Based Memory Management_, 1997; _…using a Stack of
+- **Tofte & Talpin** (_Region-Based Memory Management_, 1997; _...using a Stack of
   Regions_, POPL 1994) showed you can reclaim memory safely with no garbage
   collector by partitioning the heap into _regions_: every allocation goes into
   some region, and an entire region is freed in one step when its lifetime ends.

@@ -67,7 +67,7 @@ with four fixed widths plus a pointer-width member:
   `Int = { Int8, Int16, Int32, Int64, Iarch }` and likewise `Uint`. They are the
   **generic bounds** ("any signed integer"), never a runtime value type — a
   `[Int 'T]` function is parametric over one width, monomorphized (§5.4, §8). There
-  is no bare `Int` value; everyday code names a width (`Iarch`, `Int32`, …).
+  is no bare `Int` value; everyday code names a width (`Iarch`, `Int32`, ...).
 - **Each width is an intrinsic type carrying its constructor** —
   `pub intrinsic type Uint8 = (Number value): Uint8` — so `Uint8(x)` is the cast
   (§4), and the argument bound `Number` (§8) rejects `Uint8("hi")` cleanly.
@@ -234,7 +234,7 @@ integer type** (a point means a real).
 ### 3.3 Aggregate and data literals
 
 Aggregate and data literals type the same way — checked against an expected type —
-but the details (array `[…]` vs tuple `(…)`, fixed vs dynamic, and nominal-vs-
+but the details (array `[...]` vs tuple `(...)`, fixed vs dynamic, and nominal-vs-
 structural record typing) are §7.
 
 ## 4. Conversions and casts
@@ -434,7 +434,7 @@ These defined-but-possibly-wrong results are consistent at comptime and runtime;
 compiler does **not** substitute its judgement for the developer's. When the
 developer wants a *chosen* or *guaranteed* result instead, the std supplies it,
 never the core operators: `wrapping_*` / `saturating_*` for explicit integer intent,
-and `checked_*` (`checked_add`, `checked_div`, …) returning an `Either` whose `Left`
+and `checked_*` (`checked_add`, `checked_div`, ...) returning an `Either` whose `Left`
 names the condition (overflow, divide-by-zero, non-finite). The `checked_*`/
 `wrapping_*` families are a standard-library surface, not new type rules.
 
@@ -498,7 +498,7 @@ three.
 - **Two or more** elements form a genuine product: `(a, b)`, `(a, b, c)`.
 
 Parentheses play two roles by position, exactly as elsewhere: in **expression**
-position `(…)` is grouping / a tuple value; in **binding/pattern** position `(…)` is
+position `(...)` is grouping / a tuple value; in **binding/pattern** position `(...)` is
 a positional destructuring pattern (`const (a, b) = pair`). A bare name binds the
 whole value; a parenthesized pattern pulls elements out by position. Destructuring is
 **sugar for positional element extraction** — `const (a, b) = pair` desugars to
@@ -507,7 +507,7 @@ whole value; a parenthesized pattern pulls elements out by position. Destructuri
 index past the tuple's arity is the ordinary comptime out-of-range error, and extra
 trailing elements are simply left unbound.
 
-Brackets are now **arrays only** (§6.2), which removes the old overload where `[…]`
+Brackets are now **arrays only** (§6.2), which removes the old overload where `[...]`
 meant tuple, fixed array, or dynamic array depending on content.
 
 ### 6.2 Brackets: arrays
@@ -527,7 +527,7 @@ T]` report their length as a `Uarch`, and `xs[i]` expects a `Uarch` index — so
 index computed from narrower/signed data needs an explicit conversion (§4), like Rust's
 `usize`.
 
-`[N T]`, `[T]`, and `(T1, …, Tn)` remain distinct types with distinct
+`[N T]`, `[T]`, and `(T1, ..., Tn)` remain distinct types with distinct
 representations ([[memory_model.md]] enumerates `struct`, `array`, `tuple`,
 `string`); the syntactic split (brackets = homogeneous sequence, parentheses =
 positional product) now matches that type distinction directly.
@@ -574,8 +574,8 @@ that is a binding/effect check, not a distinct pointer type.
 ### 6.5 Named and generic types
 
 A **named type** is a `type_name`, optionally applied to type arguments with
-**brackets**: `Int32`, `Map[Str, Int32]`, `Maybe['Value]`. Type application uses `[…]`;
-value construction uses `(…)` (§6.6) — so `Vector[Uint8]` is *the type* "vector of
+**brackets**: `Int32`, `Map[Str, Int32]`, `Maybe['Value]`. Type application uses `[...]`;
+value construction uses `(...)` (§6.6) — so `Vector[Uint8]` is *the type* "vector of
 `Uint8`", while `Vector(xs)` *constructs* a vector value. Bracket-vs-parenthesis is
 what keeps the type plane and the value plane from colliding even when a type is
 generic. A **type variable** is `'T` (§5, generics); it appears only on the
@@ -603,8 +603,8 @@ one construction form per type, not two.
 - **Ascription is construction.** `const T x = v` is sugar for `const x = T(v)`
   (§4). The annotation *is* the constructor application, so literal typing (§3),
   casting (§4), and construction are one operation — `const Uint8 x = 0` and
-  `const x = Uint8(0)` are the same. A bare `{ … }` in value position is no longer a
-  typed record — it is a *payload*, typed by an enclosing `T({ … })` (or the
+  `const x = Uint8(0)` are the same. A bare `{ ... }` in value position is no longer a
+  typed record — it is a *payload*, typed by an enclosing `T({ ... })` (or the
   annotation, §7.3).
 - **A constructor is a function** — the type's type-theoretic introduction form,
   with the same standing as any function (`Maybe.Just` may be passed where a
@@ -633,20 +633,20 @@ The per-kind details — record field checking and nominal-vs-structural typing
 
 The old grammar packed fixed array, tuple, and dynamic array into one bracket
 literal whose *kind* the type gate had to resolve. The move to parentheses for
-tuples (§6.1) makes most of that a **syntactic** decision now: `(…)` is a tuple,
-`[…]` is an array. What remains for the type gate is the array's fixed-vs-dynamic
+tuples (§6.1) makes most of that a **syntactic** decision now: `(...)` is a tuple,
+`[...]` is an array. What remains for the type gate is the array's fixed-vs-dynamic
 choice, tuple element typing, and record-literal typing.
 
 ### 7.1 Tuple literals
 
-`(e1, …, en)` is a tuple value; each element is typed **independently** (a tuple is
+`(e1, ..., en)` is a tuple value; each element is typed **independently** (a tuple is
 heterogeneous), so `(1, "hi")` in a `(Int32, Str)` context is `(Int32, Str)`. `()`
 is unit, `(e)` is `e` (§6.1). A tuple element adopts its position's expected type
 (§3) — the context is per-position, from an annotation or the callee's domain.
 
 ### 7.2 Array literals — fixed vs dynamic
 
-`[e1, …, en]` is an array literal; all elements must **unify to one element type**
+`[e1, ..., en]` is an array literal; all elements must **unify to one element type**
 (arrays are homogeneous, §6.2), taken from the elements if they are already typed,
 else from the expected element type (§3). The **kind** follows the context:
 
@@ -674,14 +674,14 @@ one record has exactly one construction form:
 | `data Point = { Int32 x, Int32 y }` | named | `Point({ x: 1, y: 2 })` | `p.x`, `p.y` |
 
 A **positional** record is a nominal tuple — its payload is the positional tuple
-`(…)`, constructed by applying the type to that tuple (`Point(1, 2)`) and indexed by
+`(...)`, constructed by applying the type to that tuple (`Point(1, 2)`) and indexed by
 position. A **named** record is a nominal named-tuple — its payload is the **data
-literal** `{ field: value, … }` (colon, per [[ebnf.md]]; the `=` you may recall is
+literal** `{ field: value, ... }` (colon, per [[ebnf.md]]; the `=` you may recall is
 the field *default* in the declaration, `Int32 x = 0`, deliberately distinct). Either
 way the annotation sugar `const Point p = <payload>` is `Point(<payload>)` (§6.6).
 
 - **Nominal vs structural — the question [[ebnf.md]] defers here — resolves through
-  the existing `data`/`type` split.** A payload literal (`(…)` or `{…}`) is
+  the existing `data`/`type` split.** A payload literal (`(...)` or `{...}`) is
   structural *syntax* with no type of its own; the named type in context supplies it.
   If that type is a **`data`** declaration, the value is **nominal** — `Point` and
   `Vec2` with the same shape are different types, and `data Meters = Uint32` is not a
@@ -730,8 +730,8 @@ A union body lists members; each is one of ([[ebnf.md]]):
   and importing such a name is an explicit act — the compose-over is intended, not a
   trap to warn about.
 - **A payload member**, whose payload mirrors a record declaration (§7.3): a
-  **positional** `Name(T1, …, Tn)` (`Just('Value)`, `IntLit(Int32)`) or a **named**
-  `Name = { type field, … }` (`IntLit = { Int32 value }`). Constructed and matched by
+  **positional** `Name(T1, ..., Tn)` (`Just('Value)`, `IntLit(Int32)`) or a **named**
+  `Name = { type field, ... }` (`IntLit = { Int32 value }`). Constructed and matched by
   the matching shape (`Maybe.Just(1)` / `Node.IntLit({ value: 5 })`).
 - **A named compose-over or singleton `Name = <rhs>`** — `<rhs>` a **type** (`Wrap =
   Int32`) or a **literal** (a **singleton**, `Semicolon = ";"`, a tag recoverable as
@@ -750,7 +750,7 @@ declared* — you **import the union, not its members**:
 - A **compose-over member** is a standalone type the union only references, so it is
   reached **on its own** (`Int8`, `Float32` — you are naming the independent type,
   which happens to also be a member), and redundantly as `Uint.Uint8`.
-- An **inline-declared member** — a nullary tag or a `Name = …` payload/type/singleton
+- An **inline-declared member** — a nullary tag or a `Name = ...` payload/type/singleton
   (`Just`, `Nothing`, `Left`, `Right`, `IntLit`) — exists **only within its union** and
   is reached **only qualified**: `Maybe.Just`, `Either.Left`, `Node.IntLit`. There is no
   bare `Just` or `Nothing`, in value **or** type position. This keeps the namespace
@@ -820,7 +820,7 @@ the representation gate encodes a shared member's tag identically in both unions
 
 A `match` inspects which member the scrutinee is. Each arm is a member `type_pattern`
 **qualified by the scrutinee's union** that **narrows** the scrutinee to that member
-and binds its payload — `Node.IntLit(v) -> …` binds `v` to an `IntLit`'s payload. Two
+and binds its payload — `Node.IntLit(v) -> ...` binds `v` to an `IntLit`'s payload. Two
 rules make the frame explicit:
 
 - **Arms may only name members of the scrutinee's own union.** Matching an `Int` offers
@@ -938,8 +938,8 @@ first.
 The union system offers two ways to give a union its members: **declare them inline**
 (reachable only through the union — §8.1), or **declare each type separately and reuse
 it** inside the union (compose-over). The **numeric** unions use the *latter* — every
-width (`Int8`, `Int32`, `Iarch`, …) is a **standalone, directly-usable type**
-(`const Int32 x = …`) the union merely composes over, so the widths are first-class on
+width (`Int8`, `Int32`, `Iarch`, ...) is a **standalone, directly-usable type**
+(`const Int32 x = ...`) the union merely composes over, so the widths are first-class on
 their own and the union just adds the "any of them" bound. **`Bool` uses the former** —
 `False` and `True` are **inline nullary singletons**, reached only qualified
 (`Bool.False`, or the `true`/`false` sugar), not standalone types. Either way the
@@ -953,7 +953,7 @@ pub union Number = { ...Int, ...Uint, ...Float }        # union (∪) of all 12 
 pub union Bool   = { False, True }                      # two nullary singleton members
 ```
 
-- **`Int`/`Uint`/`Float`/`Number`** give width-generic functions: `[Number 'T](…)`
+- **`Int`/`Uint`/`Float`/`Number`** give width-generic functions: `[Number 'T](...)`
   is "any numeric type", monomorphized per type (§2.1, §2.2). A value is a `Number`
   iff its type is one of the twelve leaves; the spread `...Int` splices the members.
 - **`Bool`** is `{ False, True }` — both nullary, so all-tag-only, so it lowers to a
@@ -1012,7 +1012,7 @@ comptime-known. Three positions require the property:
    *types* only because `4`/`n` are comptime-known; `[len xs]` with a `let len` is
    not a type — either the length is comptime, or the array is the dynamic `[T]`.
    This is exactly the fixed-vs-dynamic decision the gate owns (§1, §7.2).
-2. **A type argument** — explicit `f[Int32](…)` or inferred `f(…)` (§5.4). A type is
+2. **A type argument** — explicit `f[Int32](...)` or inferred `f(...)` (§5.4). A type is
    comptime by nature, so this is automatic; the gate's duty is only that an
    *inferred* `'T` resolve to a concrete type, never a runtime value.
 3. **A comptime value argument** — where a callee declares `[n 'T]`, the caller's
@@ -1054,7 +1054,7 @@ bottom-up over the call graph; §5's read-a-signature-locally guarantee is about
 *type* inference and is untouched. Two structural restrictions fall out and are
 enforced here:
 
-- **No `*Scalar`** — `*Int32`, `*Uint8`, … are not types (§6.4). A pointer's
+- **No `*Scalar`** — `*Int32`, `*Uint8`, ... are not types (§6.4). A pointer's
   referent is always an aggregate; a scalar is passed by value, or lives as a field
   of a pointed-to aggregate.
 - **No `&` of a `const`** — `&c` on a `const` is an error, so a `*T` argument is

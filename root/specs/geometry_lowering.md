@@ -48,7 +48,7 @@ everything after is one-way.
 
 A **geometry is a module** — there is no `geometry` keyword. It is any module
 that exposes the closed hook set below plus the **node-lifecycle pair** that
-brackets it: a constructor (`of`, `with_capacity`, …) that carves a child node,
+brackets it: a constructor (`of`, `with_capacity`, ...) that carves a child node,
 and **`destroy`** that dissolves it back into its parent (§3, Wall dissolution).
 The constructor and `destroy` are the node's birth and teardown; the nine hooks
 below place and reclaim the *values* that live between them. `destroy` is
@@ -175,10 +175,10 @@ fixed placement:
 
 | escape class       | site                        | placement                                   |
 | ------------------ | --------------------------- | ------------------------------------------- |
-| _local_            | `let/const x = <agg>`       | wrap RHS in `on_alloc(node, …)`             |
-| _grow-in-place_    | `xs = [...xs, e]`           | wrap RHS in `on_realloc(node_xs, …)`        |
-| _escapes-via-return_ | `return <agg>`            | the CONSTRUCTION is `on_ret`-placed at birth (survivor side); `on_alloc_ret(node, …)` stays wrapping the call in the caller (the bump fold is the identity) |
-| _rehomed_          | store `<agg>` into a foreign aggregate | the stored value is classified escaping and `on_ret`-placed at birth; `on_rehome(node_target, target, …)` stays placed at the store (bump fold: no-op) |
+| _local_            | `let/const x = <agg>`       | wrap RHS in `on_alloc(node, ...)`             |
+| _grow-in-place_    | `xs = [...xs, e]`           | wrap RHS in `on_realloc(node_xs, ...)`        |
+| _escapes-via-return_ | `return <agg>`            | the CONSTRUCTION is `on_ret`-placed at birth (survivor side); `on_alloc_ret(node, ...)` stays wrapping the call in the caller (the bump fold is the identity) |
+| _rehomed_          | store `<agg>` into a foreign aggregate | the stored value is classified escaping and `on_ret`-placed at birth; `on_rehome(node_target, target, ...)` stays placed at the store (bump fold: no-op) |
 
 The node handle threaded into each hook follows the node-locality law: `on_alloc`
 takes the ambient `node`, but `on_realloc`/`on_rehome` take the *target's* node,
@@ -188,7 +188,7 @@ Birth routing generalizes the third and fourth rows beyond named sites: an
 **anonymous construction in argument position** is `on_alloc`-placed (residue)
 when the callee's summary proves the argument is neither stored beyond the
 callee's frame nor aliased by its return — it is statement scratch, dead once
-the call returns. A `write_str(fd, "…${x}…")` interpolation is the canonical
+the call returns. A `write_str(fd, "...${x}...")` interpolation is the canonical
 shape. Everything the summaries cannot prove defaults to survivor.
 
 ### Scope brackets
@@ -257,7 +257,7 @@ destination still holds the **old** reference — so no separate `old` argument 
 needed. A counting/tracing policy reads that old value out of `dst` before
 overwriting: `rc` increments `new` and decrements old; a generational `gc` marks
 the card / records the SATB snapshot, then writes. A non-barrier geometry (arena,
-pool, …) just does the write, so its `on_store` is **not a no-op** — it **folds to
+pool, ...) just does the write, so its `on_store` is **not a no-op** — it **folds to
 a plain store** at the `folded` arc, exactly as `on_alloc` folds to a bump. Only
 genuine no-ops are swept (below); `on_store` always carries the store. (The
 non-barrier geometries are `arena`, `fixed_buffer`, `page`.)
@@ -467,13 +467,13 @@ every call site.
 A call proven **node-free** carries no `%node`. The criterion is **body-driven,
 not color-driven** — an earlier draft said "colorless, no `!` argument, scalar
 return", which is wrong in both directions: a colorless constructor
-(`-> P({…})`) or a rehoming colorless function (`g.inner = P({…})` through a
+(`-> P({...})`) or a rehoming colorless function (`g.inner = P({...})` through a
 `*T` param) still allocates, while a frame holding only `$`-stack aggregates
 does not. A function keeps `%node_0` iff it can ever NEED a node:
 
 - it is `!` (every bang frame brackets its residue subnode);
 - its body **allocates** — a construction outside `$`-stack storage, a string
-  literal or string-pattern match (both materialize at runtime), a `Str(…)`
+  literal or string-pattern match (both materialize at runtime), a `Str(...)`
   seal, or an arena/buffer constructor;
 - it makes an **indirect** call (the target is unknown; the site passes a node
   uniformly), or is **address-taken** (an indirect site targets it);
