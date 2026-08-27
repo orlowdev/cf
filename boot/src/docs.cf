@@ -34,7 +34,7 @@ pub const mode_read = 2
 # mode — j/k type in search, esc has nothing to go back to there).
 const legend_search = "[type] filter   [down/enter] select   [ctrl-c] quit"
 const legend_select = "[j/k up/dn] move   [enter] read   [i/esc] search   [r] reset   [ctrl-c] quit"
-const legend_read = "[esc] back   [i] search   [r] reset   [ctrl-c] quit"
+const legend_read = "[j/k up/dn] scroll   [esc] back   [i] search   [r] reset   [ctrl-c] quit"
 
 const legend_for = (Iarch mode): Str -> {
 	if mode == mode_search then return legend_search
@@ -43,9 +43,9 @@ const legend_for = (Iarch mode): Str -> {
 	return legend_read
 }
 
-# The browser state: every definition, the current query, the mode, and the highlighted row (an index
-# into the filtered view).
-data DocState = { [Def] all, Str query, Iarch mode, Iarch sel }
+# The browser state: every definition, the current query, the mode, the highlighted row (an index
+# into the filtered view), and the read-view scroll offset (top line shown, 0 in the list modes).
+data DocState = { [Def] all, Str query, Iarch mode, Iarch sel, Iarch scroll }
 
 # Append the byte `b` to `s` as a character (interpolation would render a byte as a decimal number).
 const append_char = (Str s, Iarch b): Str -> {
@@ -176,22 +176,10 @@ const has_exact = ([Def] all, Str q): Bool -> {
 # The visible rows for a list, given the terminal height (a sane default off a real terminal).
 const visible_rows = (Iarch rows): Iarch -> if rows > 8 then rows - 5 else 20
 
-const render_read! = (DocState st, [Def] view, Iarch rows): () -> {
-	if Iarch(view.len) == 0 then {
-		println("(no definition)")
-
-		return ()
-	}
-
-	let Iarch idx = st.sel
-
-	if idx >= Iarch(view.len) then idx = Iarch(view.len) - 1
-	if idx < 0 then idx = 0
-
-	const Def d = view[idx]
-
-	# assemble every content line, then render only what fits above the legend — the man-style layout
-	# NAME / SYNOPSIS / DESCRIPTION, the doc split into its own lines
+# The content lines of a definition's read view — the man-style NAME / SYNOPSIS / DESCRIPTION layout,
+# the doc split into its own lines. Shared by the renderer and the scroll clamp so both measure the
+# same height.
+const read_body = (Def d): [Str] -> {
 	let [Str] body = []
 
 	body = [...body, "${d.kind} ${d.name}"]
@@ -212,19 +200,58 @@ const render_read! = (DocState st, [Def] view, Iarch rows): () -> {
 		}
 	}
 
-	# leave the bottom row for the legend; if the body is taller than that, cap it and flag the rest
-	# (the top — name and signature — stays put; a too-short window means resize)
-	const Iarch vis = if rows > 2 then rows - 1 else 200
-	let Iarch i = 0
+	return body
+}
+
+# The content rows available above the legend (a default off a real terminal).
+const read_vis = (Iarch rows): Iarch -> if rows > 2 then rows - 1 else 200
+
+# The furthest the read view can scroll: the body height minus the window (0 when it all fits).
+const read_max_scroll = (Def d, Iarch rows): Iarch -> {
+	const Iarch h = Iarch(read_body(d).len)
+	const Iarch vis = read_vis(rows)
+
+	if h > vis then return h - vis
+
+	return 0
+}
+
+const render_read! = (DocState st, [Def] view, Iarch rows): () -> {
+	if Iarch(view.len) == 0 then {
+		println("(no definition)")
+
+		return ()
+	}
+
+	let Iarch idx = st.sel
+
+	if idx >= Iarch(view.len) then idx = Iarch(view.len) - 1
+	if idx < 0 then idx = 0
+
+	const Def d = view[idx]
+	const [Str] body = read_body(d)
+	const Iarch vis = read_vis(rows)
+
+	# clamp the scroll offset to a valid window
+	let Iarch top = st.scroll
+	const Iarch maxs = read_max_scroll(d, rows)
+
+	if top > maxs then top = maxs
+	if top < 0 then top = 0
+
+	# render body[top .. top+vis]; the last visible row flags any lines still below
+	let Iarch i = top
+	let Iarch shown = 0
 
 	loop {
 		if i >= Iarch(body.len) then break
-		if i >= vis then break
+		if shown >= vis then break
 
-		if i == vis - 1 && Iarch(body.len) > vis then println("  ... (${Iarch(body.len) - vis + 1} more lines — resize)")
+		if shown == vis - 1 && i < Iarch(body.len) - 1 then println("  ... (${Iarch(body.len) - i} more — j/k to scroll)")
 			else println(body[i])
 
 		i = i + 1
+		shown = shown + 1
 	}
 
 	return ()
@@ -302,13 +329,13 @@ const is_enter = (Iarch key): Bool -> key == key_enter || key == 10
 const dispatch_search = (DocState st, Iarch key): DocState -> {
 	# enter or an arrow moves into the list; esc does nothing here (search is the root)
 	if is_enter(key) || key == key_up || key == key_down
-		then return DocState({ all: st.all, query: st.query, mode: mode_select, sel: 0 })
+		then return DocState({ all: st.all, query: st.query, mode: mode_select, sel: 0, scroll: 0 })
 
 	if key == 127 || key == 8
-		then return DocState({ all: st.all, query: drop_last(st.query), mode: mode_search, sel: 0 })
+		then return DocState({ all: st.all, query: drop_last(st.query), mode: mode_search, sel: 0, scroll: 0 })
 
 	if key >= 32 && key <= 126
-		then return DocState({ all: st.all, query: append_char(st.query, key), mode: mode_search, sel: 0 })
+		then return DocState({ all: st.all, query: append_char(st.query, key), mode: mode_search, sel: 0, scroll: 0 })
 
 	return st
 }
@@ -319,7 +346,7 @@ const dispatch_select = (DocState st, Iarch key, Iarch viewlen): DocState -> {
 
 		if ns < 0 then ns = 0
 
-		return DocState({ all: st.all, query: st.query, mode: mode_select, sel: ns })
+		return DocState({ all: st.all, query: st.query, mode: mode_select, sel: ns, scroll: 0 })
 	}
 
 	if key == key_down || key == 106 then {
@@ -328,30 +355,46 @@ const dispatch_select = (DocState st, Iarch key, Iarch viewlen): DocState -> {
 		if ns >= viewlen then ns = viewlen - 1
 		if ns < 0 then ns = 0
 
-		return DocState({ all: st.all, query: st.query, mode: mode_select, sel: ns })
+		return DocState({ all: st.all, query: st.query, mode: mode_select, sel: ns, scroll: 0 })
 	}
 
-	if is_enter(key) then return DocState({ all: st.all, query: st.query, mode: mode_read, sel: st.sel })
-	if key == 105 || key == 115 then return DocState({ all: st.all, query: st.query, mode: mode_search, sel: 0 })
-	if key == 114 then return DocState({ all: st.all, query: "", mode: mode_search, sel: 0 })
-	if key == key_esc then return DocState({ all: st.all, query: st.query, mode: mode_search, sel: 0 })
+	if is_enter(key) then return DocState({ all: st.all, query: st.query, mode: mode_read, sel: st.sel, scroll: 0 })
+	if key == 105 || key == 115 then return DocState({ all: st.all, query: st.query, mode: mode_search, sel: 0, scroll: 0 })
+	if key == 114 then return DocState({ all: st.all, query: "", mode: mode_search, sel: 0, scroll: 0 })
+	if key == key_esc then return DocState({ all: st.all, query: st.query, mode: mode_search, sel: 0, scroll: 0 })
 
 	return st
 }
 
-const dispatch_read = (DocState st, Iarch key): DocState -> {
-	if key == key_esc then return DocState({ all: st.all, query: st.query, mode: mode_select, sel: st.sel })
-	if key == 105 || key == 115 then return DocState({ all: st.all, query: st.query, mode: mode_search, sel: st.sel })
-	if key == 114 then return DocState({ all: st.all, query: "", mode: mode_search, sel: 0 })
+const dispatch_read = (DocState st, Iarch key, Iarch maxscroll): DocState -> {
+	if key == key_esc then return DocState({ all: st.all, query: st.query, mode: mode_select, sel: st.sel, scroll: 0 })
+	if key == 105 || key == 115 then return DocState({ all: st.all, query: st.query, mode: mode_search, sel: st.sel, scroll: 0 })
+	if key == 114 then return DocState({ all: st.all, query: "", mode: mode_search, sel: 0, scroll: 0 })
+
+	if key == key_down || key == 106 then {
+		let Iarch ns = st.scroll + 1
+
+		if ns > maxscroll then ns = maxscroll
+
+		return DocState({ all: st.all, query: st.query, mode: mode_read, sel: st.sel, scroll: ns })
+	}
+
+	if key == key_up || key == 107 then {
+		let Iarch ns = st.scroll - 1
+
+		if ns < 0 then ns = 0
+
+		return DocState({ all: st.all, query: st.query, mode: mode_read, sel: st.sel, scroll: ns })
+	}
 
 	return st
 }
 
-const dispatch = (DocState st, Iarch key, Iarch viewlen): DocState -> {
+const dispatch = (DocState st, Iarch key, Iarch viewlen, Iarch maxscroll): DocState -> {
 	if st.mode == mode_search then return dispatch_search(st, key)
 	if st.mode == mode_select then return dispatch_select(st, key, viewlen)
 
-	return dispatch_read(st, key)
+	return dispatch_read(st, key, maxscroll)
 }
 
 # The browser. `args` is the whole command line — `cf docs [<term>]`; a `<term>` prefills the query,
@@ -367,7 +410,7 @@ pub const docs_run! = ([Str] args): Iarch -> {
 		if has_exact(all, q0) then mode0 = mode_read
 	}
 
-	let DocState st = DocState({ all: all, query: q0, mode: mode0, sel: 0 })
+	let DocState st = DocState({ all: all, query: q0, mode: mode0, sel: 0, scroll: 0 })
 	let [72 Uint8] tio
 	let [64 Uint8] kdata
 	let [2 Uint8] kmeta = [0, 0]
@@ -385,7 +428,19 @@ pub const docs_run! = ([Str] args): Iarch -> {
 
 		if key == 3 || key == key_eof then break
 
-		st = dispatch(st, key, Iarch(view.len))
+		# in read mode, tell the dispatcher how far the current definition can scroll
+		let Iarch maxscroll = 0
+
+		if st.mode == mode_read && Iarch(view.len) > 0 then {
+			let Iarch ri = st.sel
+
+			if ri >= Iarch(view.len) then ri = Iarch(view.len) - 1
+			if ri < 0 then ri = 0
+
+			maxscroll = read_max_scroll(view[ri], sz.rows)
+		}
+
+		st = dispatch(st, key, Iarch(view.len), maxscroll)
 	}
 
 	show_cursor!()
