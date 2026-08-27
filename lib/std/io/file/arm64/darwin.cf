@@ -65,3 +65,81 @@ pub const write_bytes = (Fd fd, *[Uint8] buf, Uarch n): () -> {
 
 	return ()
 }
+
+pub const open_append = (Str path): Either[IoErr, Fd] -> {
+	const Iarch r = syscall6(5, path.bytes, 521, 420, 0, 0, 0)
+
+	if r < 0 then return Either[IoErr, Fd].Left(IoErr({ errno: r }))
+
+	return Either[IoErr, Fd].Right(Fd({ n: Uarch(r) }))
+}
+
+pub const seek = (Fd fd, Iarch off, Iarch whence): Either[IoErr, Iarch] -> {
+	const Iarch r = syscall6(199, fd.n, Uarch(off), Uarch(whence), 0, 0, 0)
+
+	if r < 0 then return Either[IoErr, Iarch].Left(IoErr({ errno: r }))
+
+	return Either[IoErr, Iarch].Right(r)
+}
+
+# Write a whole Str to a fresh file at `path` (truncating any existing content), then close it.
+# `Left` reports a failed create or close (the two actionable errors); the write itself is
+# fire-and-forget. `Right(0)` on success. The close result is returned directly, so this composes
+# without holding residue.
+pub const write_file = (Str path, Str s): Either[IoErr, Iarch] -> match create(path) {
+	Either.Left(e) -> Either[IoErr, Iarch].Left(e),
+	Either.Right(fd) -> {
+		write_str(fd, s)
+
+		<- close(fd)
+	},
+}
+
+# Append a whole Str to `path` (creating it if absent), then close it. Same error contract as
+# `write_file`.
+pub const append_file = (Str path, Str s): Either[IoErr, Iarch] -> match open_append(path) {
+	Either.Left(e) -> Either[IoErr, Iarch].Left(e),
+	Either.Right(fd) -> {
+		write_str(fd, s)
+
+		<- close(fd)
+	},
+}
+
+# Raw byte read: the kernel's count (0 = EOF) or a negative errno, with no `Either` boxing — for
+# hot bytewise loops like `read_line!`. Passing the `*[Uint8]` buffer to `syscall6`'s `Uarch` operand
+# is the same decay `read` relies on; a `[N Uint8]` local reaches it through this `*[Uint8]` hop.
+const read_raw = (Fd fd, *[Uint8] buf, Uarch n): Iarch -> syscall6(3, fd.n, buf, n, 0, 0, 0)
+
+# Read one line from `fd` into `buf` (capacity `cap` bytes), up to but excluding the newline, which
+# is consumed. `Right(n)` for n >= 0 is a line of `n` bytes (0 = a bare blank line); `Right(-1)` is
+# end of input — nothing more to read — so a caller distinguishes EOF from a blank line. `Left` is a
+# read error. Reads a byte at a time through `read_raw` (no per-byte `Either` boxing), so it needs no
+# geometry beyond its own one-byte scratch. A line longer than `cap` fills the buffer and stops; the
+# rest stays unread for the next call. A final line with no trailing newline still yields its bytes.
+pub const read_line! = (Fd fd, *[Uint8] buf, Uarch cap): Either[IoErr, Iarch] -> {
+	let [1 Uint8] one = [0]
+	let Iarch i = 0
+	let Bool got = false
+
+	loop {
+		if Uarch(i) >= cap then break
+		const Iarch r = read_raw(fd, one, Uarch(1))
+
+		if r < 0 then return Either[IoErr, Iarch].Left(IoErr({ errno: r }))
+		if r == 0 then break
+
+		got = true
+
+		const Iarch b = Iarch(one[0])
+
+		if b == 10 then break
+
+		buf[i] = Uint8(b)
+		i = i + 1
+	}
+
+	if !got && i == 0 then return Either[IoErr, Iarch].Right(0 - 1)
+
+	return Either[IoErr, Iarch].Right(i)
+}

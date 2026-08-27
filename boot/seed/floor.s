@@ -103,6 +103,9 @@ _f221:
 	mov x4, x5
 	mov x5, x6
 	svc #0x80
+	b.cc 1f
+	neg x0, x0
+1:
 	ret
 
 .globl _f319
