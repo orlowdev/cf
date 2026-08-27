@@ -176,6 +176,39 @@ const has_exact = ([Def] all, Str q): Bool -> {
 # The visible rows for a list, given the terminal height (a sane default off a real terminal).
 const visible_rows = (Iarch rows): Iarch -> if rows > 8 then rows - 5 else 20
 
+# A run of `n` spaces.
+const spaces = (Iarch n): Str -> {
+	let [Uint8] out = []
+	let Iarch i = 0
+
+	loop {
+		if i >= n then break
+
+		out = [...out, Uint8(32)]
+		i = i + 1
+	}
+
+	return Str({ bytes: out, len: Iarch(out.len) })
+}
+
+# Print a centered, highlighted chip on its own row: a reverse-video ` text ` pill leading-padded to
+# the horizontal middle of `width`.
+const print_chip! = (Str text, Iarch width): () -> {
+	let Iarch pad = (width - (Iarch(text.len) + 2)) / 2
+
+	if pad < 0 then pad = 0
+
+	print(spaces(pad))
+	reverse!()
+	print(" ")
+	print(text)
+	print(" ")
+	reset!()
+	print("\n")
+
+	return ()
+}
+
 # `s` padded with spaces (or truncated) to exactly `width` columns — for a full-width status bar.
 const pad_to = (Str s, Iarch width): Str -> {
 	let [Uint8] out = []
@@ -375,15 +408,18 @@ const read_body! = (Def d, Iarch width): [Str] -> {
 # The content rows available above the legend (a default off a real terminal).
 const read_vis = (Iarch rows): Iarch -> if rows > 2 then rows - 1 else 200
 
-# The furthest the read view can scroll. When it overflows, a scrolled view keeps an "above" chip on
-# the top row, so the last screen shows `vis - 1` content lines — hence `h - (vis - 1)`.
+# The content rows of the read view: the window above the legend (`read_vis`) minus the two reserved
+# chip rows (top and bottom), so the content never shifts as chips appear.
+const read_cwin = (Iarch rows): Iarch -> read_vis(rows) - 2
+
+# The furthest the read view can scroll: the body height minus the content window (0 when it fits).
 const read_max_scroll! = (Def d, Iarch rows, Iarch width): Iarch -> {
 	const Iarch h = Iarch(read_body!(d, width).len)
-	const Iarch vis = read_vis(rows)
+	const Iarch cwin = read_cwin(rows)
 
-	if h <= vis then return 0
+	if h <= cwin then return 0
 
-	return h - (vis - 1)
+	return h - cwin
 }
 
 const render_read! = (DocState st, [Def] view, Iarch rows, Iarch width): () -> {
@@ -400,7 +436,7 @@ const render_read! = (DocState st, [Def] view, Iarch rows, Iarch width): () -> {
 
 	const Def d = view[idx]
 	const [Str] body = read_body!(d, width)
-	const Iarch vis = read_vis(rows)
+	const Iarch cwin = read_cwin(rows)
 
 	# clamp the scroll offset to a valid window
 	let Iarch top = st.scroll
@@ -409,40 +445,29 @@ const render_read! = (DocState st, [Def] view, Iarch rows, Iarch width): () -> {
 	if top > maxs then top = maxs
 	if top < 0 then top = 0
 
-	# a chip on the top/bottom row marks hidden lines in that direction, each consuming one row
+	# the top and bottom rows are RESERVED chip slots — a centered highlighted pill when content is
+	# hidden in that direction, an empty line otherwise — so the content area (`cwin` rows) never moves
+	let Iarch shown = Iarch(body.len) - top
+
+	if shown > cwin then shown = cwin
+	if shown < 0 then shown = 0
+
 	const Bool above = top > 0
-	const Iarch avail = if above then vis - 1 else vis
-	const Iarch remaining = Iarch(body.len) - top
-	let Bool below = false
-	let Iarch shown = remaining
+	const Bool below = top + shown < Iarch(body.len)
 
-	if remaining > avail then {
-		below = true
-		shown = avail - 1
-	}
-
-	if above then {
-		reverse!()
-		print(" ${top} more above ")
-		reset!()
-		print("\n")
-	}
+	if above then print_chip!("${top} more above", width) else println("")
 
 	let Iarch k = 0
 
 	loop {
-		if k >= shown then break
+		if k >= cwin then break
 
-		println(body[top + k])
+		if k < shown then println(body[top + k]) else println("")
+
 		k = k + 1
 	}
 
-	if below then {
-		reverse!()
-		print(" ${Iarch(body.len) - top - shown} more below ")
-		reset!()
-		print("\n")
-	}
+	if below then print_chip!("${Iarch(body.len) - top - shown} more below", width) else println("")
 
 	return ()
 }
