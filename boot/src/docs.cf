@@ -176,24 +176,171 @@ const has_exact = ([Def] all, Str q): Bool -> {
 # The visible rows for a list, given the terminal height (a sane default off a real terminal).
 const visible_rows = (Iarch rows): Iarch -> if rows > 8 then rows - 5 else 20
 
-# The content lines of a definition's read view — the man-style NAME / SYNOPSIS / DESCRIPTION layout,
-# the doc split into its own lines. Shared by the renderer and the scroll clamp so both measure the
-# same height.
-const read_body = (Def d): [Str] -> {
-	let [Str] body = []
+# Word-wrap `line` to `width` columns, breaking only at spaces. A line that already fits is returned
+# whole; an over-long single word overflows its row (rare — a long code token). An empty line is
+# preserved.
+const word_wrap = (Str line, Iarch width): [Str] -> {
+	let [Str] out = []
 
-	body = [...body, "${d.kind} ${d.name}"]
-	body = [...body, d.module]
+	if Iarch(line.len) == 0 then {
+		out = [...out, line]
+
+		return out
+	}
+
+	let [Uint8] cur = []
+	let Iarch curlen = 0
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(line.len) then break
+
+		const Iarch ws = i
+
+		loop {
+			if i >= Iarch(line.len) then break
+			if Iarch(line[i]) == 32 then break
+
+			i = i + 1
+		}
+
+		const Iarch we = i
+
+		loop {
+			if i >= Iarch(line.len) then break
+			if Iarch(line[i]) != 32 then break
+
+			i = i + 1
+		}
+
+		const Iarch wl = we - ws
+
+		if wl > 0 then {
+			if curlen != 0 && curlen + 1 + wl > width then {
+				out = [...out, Str({ bytes: cur, len: curlen })]
+				cur = []
+				curlen = 0
+			}
+
+			if curlen != 0 then {
+				cur = [...cur, Uint8(32)]
+				curlen = curlen + 1
+			}
+
+			let Iarch j = ws
+
+			loop {
+				if j >= we then break
+
+				cur = [...cur, Uint8(Iarch(line[j]))]
+				j = j + 1
+			}
+
+			curlen = curlen + wl
+		}
+	}
+
+	if curlen > 0 then out = [...out, Str({ bytes: cur, len: curlen })]
+
+	return out
+}
+
+# Wrap a doc comment to `width`: consecutive non-empty source lines glue into a paragraph (joined
+# with a space, since the source line break is a word boundary) which is then word-wrapped; empty
+# source lines are kept as-is so paragraph separation survives.
+const wrap_doc! = (Str doc, Iarch width): [Str] -> {
+	const [Str] lines = split_lines(doc)
+	let [Str] out = []
+	let [Uint8] para = []
+	let Iarch paralen = 0
+	let Bool have = false
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(lines.len) then break
+
+		const Str ln = lines[i]
+
+		if Iarch(ln.len) == 0 then {
+			if have then {
+				const [Str] w = word_wrap(Str({ bytes: para, len: paralen }), width)
+
+				for x in w {
+					out = [...out, x]
+				}
+
+				para = []
+				paralen = 0
+				have = false
+			}
+
+			out = [...out, ln]
+		} else {
+			if have then {
+				para = [...para, Uint8(32)]
+				paralen = paralen + 1
+			}
+
+			let Iarch k = 0
+
+			loop {
+				if k >= Iarch(ln.len) then break
+
+				para = [...para, Uint8(Iarch(ln[k]))]
+				k = k + 1
+			}
+
+			paralen = paralen + Iarch(ln.len)
+			have = true
+		}
+
+		i = i + 1
+	}
+
+	if have then {
+		const [Str] w = word_wrap(Str({ bytes: para, len: paralen }), width)
+
+		for x in w {
+			out = [...out, x]
+		}
+	}
+
+	return out
+}
+
+# The content lines of a definition's read view — the man-style NAME / SYNOPSIS / DESCRIPTION layout,
+# every line already wrapped to `width`. Shared by the renderer and the scroll clamp so both measure
+# the same height.
+const read_body! = (Def d, Iarch width): [Str] -> {
+	let [Str] body = []
+	const [Str] w1 = word_wrap("${d.kind} ${d.name}", width)
+
+	for x in w1 {
+		body = [...body, x]
+	}
+
+	const [Str] w2 = word_wrap(d.module, width)
+
+	for x in w2 {
+		body = [...body, x]
+	}
+
 	body = [...body, ""]
 	body = [...body, "SYNOPSIS"]
 	body = [...body, ""]
-	body = [...body, sig_head(d.sig)]
+
+	const [Str] w3 = word_wrap(sig_head(d.sig), width)
+
+	for x in w3 {
+		body = [...body, x]
+	}
+
 	body = [...body, ""]
 	body = [...body, "DESCRIPTION"]
 	body = [...body, ""]
 
 	if Iarch(d.doc.len) == 0 then body = [...body, "empty"] else {
-		const [Str] dl = split_lines(d.doc)
+		const [Str] dl = wrap_doc!(d.doc, width)
 
 		for line in dl {
 			body = [...body, line]
@@ -207,8 +354,8 @@ const read_body = (Def d): [Str] -> {
 const read_vis = (Iarch rows): Iarch -> if rows > 2 then rows - 1 else 200
 
 # The furthest the read view can scroll: the body height minus the window (0 when it all fits).
-const read_max_scroll = (Def d, Iarch rows): Iarch -> {
-	const Iarch h = Iarch(read_body(d).len)
+const read_max_scroll! = (Def d, Iarch rows, Iarch width): Iarch -> {
+	const Iarch h = Iarch(read_body!(d, width).len)
 	const Iarch vis = read_vis(rows)
 
 	if h > vis then return h - vis
@@ -216,7 +363,7 @@ const read_max_scroll = (Def d, Iarch rows): Iarch -> {
 	return 0
 }
 
-const render_read! = (DocState st, [Def] view, Iarch rows): () -> {
+const render_read! = (DocState st, [Def] view, Iarch rows, Iarch width): () -> {
 	if Iarch(view.len) == 0 then {
 		println("(no definition)")
 
@@ -229,12 +376,12 @@ const render_read! = (DocState st, [Def] view, Iarch rows): () -> {
 	if idx < 0 then idx = 0
 
 	const Def d = view[idx]
-	const [Str] body = read_body(d)
+	const [Str] body = read_body!(d, width)
 	const Iarch vis = read_vis(rows)
 
 	# clamp the scroll offset to a valid window
 	let Iarch top = st.scroll
-	const Iarch maxs = read_max_scroll(d, rows)
+	const Iarch maxs = read_max_scroll!(d, rows, width)
 
 	if top > maxs then top = maxs
 	if top < 0 then top = 0
@@ -304,10 +451,10 @@ const render_list! = (DocState st, [Def] view, Iarch rows): () -> {
 	return ()
 }
 
-const render! = (DocState st, [Def] view, Iarch rows): () -> {
+const render! = (DocState st, [Def] view, Iarch rows, Iarch width): () -> {
 	clear!()
 
-	if st.mode == mode_read then render_read!(st, view, rows) else render_list!(st, view, rows)
+	if st.mode == mode_read then render_read!(st, view, rows, width) else render_list!(st, view, rows)
 
 	# the mode's keymap legend, pinned to the bottom row in reverse video (a status bar) — off a real
 	# terminal (rows 0) it just follows the content
@@ -421,8 +568,9 @@ pub const docs_run! = ([Str] args): Iarch -> {
 	loop {
 		const [Def] view = ranked!(st.all, st.query)
 		const TermSize sz = size!()
+		const Iarch width = if sz.cols > 20 then sz.cols else 80
 
-		render!(st, view, sz.rows)
+		render!(st, view, sz.rows, width)
 
 		const Iarch key = read_key(kdata, kmeta, Uarch(64))
 
@@ -437,7 +585,7 @@ pub const docs_run! = ([Str] args): Iarch -> {
 			if ri >= Iarch(view.len) then ri = Iarch(view.len) - 1
 			if ri < 0 then ri = 0
 
-			maxscroll = read_max_scroll(view[ri], sz.rows)
+			maxscroll = read_max_scroll!(view[ri], sz.rows, width)
 		}
 
 		st = dispatch(st, key, Iarch(view.len), maxscroll)
