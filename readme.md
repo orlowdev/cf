@@ -273,13 +273,17 @@ sh boot/test.sh          # 3. run the corpus regression suite
 
 `boot/build.sh` never needs a C! compiler you don't already have: it assembles
 the committed seed (`boot/seed/cf.qbe` + `floor.s`) straight through
-`qbe → cc`. The compiler's own source is the C! modules in
-[`boot/src/`](boot/src/) (`cf.cf` and its imports).
+`qbe → cc`. The compiler's own source is the C! modules under
+[`lib/std/compiler/`](lib/std/compiler/) — the whole pipeline, exposed as
+`std::compiler::compile!` — driven by the thin CLI entry
+[`boot/src/cf.cf`](boot/src/cf.cf) and its app-layer siblings (`cli`, `fmt`,
+`docs`).
 
 ### Changing the compiler
 
 Because cf is built from the seed, editing its source leaves the seed stale.
-After changing anything in `boot/src/*.cf`, regenerate and re-verify the seed:
+After changing any of the compiler's C! source (`lib/std/compiler/*.cf` or
+`boot/src/*.cf`), regenerate and re-verify the seed:
 
 ```sh
 sh boot/reseed.sh
