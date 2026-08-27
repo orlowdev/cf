@@ -227,8 +227,51 @@ const ptr_stride = (Str elem): Iarch -> {
 	return 8
 }
 
-# The byte offset of field `field` in record type `rt` — its declaration index × 8
-# (uniform 8-byte slots; a word field rides in the low 4 bytes). Typecheck guarantees both resolve.
+# The byte footprint of record `recs[ri]`'s field `fi`: an ordinary field is one 8-byte slot (a word
+# rides its low 4 bytes; an aggregate is an 8-byte pointer). An INLINE fixed-array field `[N Elem]`
+# ($fix) instead occupies `align8(N × stride)` bytes stored directly in the record body.
+const field_bytes_at = ([RecDecl] recs, Iarch ri, Iarch fi): Iarch -> {
+	if eq(recs[ri].ftypes[fi], "$fix") then {
+		const Iarch raw = recs[ri].fsizes[fi] * elem_bytes(recs[ri].felems[fi])
+
+		return ((raw + 7) / 8) * 8
+	}
+
+	return 8
+}
+
+# The total byte size of record `recs[ri]` — the running sum of its fields' footprints. Equals
+# `fields.len × 8` for a record with no inline fixed-array field.
+const rec_byte_size = ([RecDecl] recs, Iarch ri): Iarch -> {
+	let Iarch sz = 0
+	let Iarch fi = 0
+
+	loop {
+		if fi >= Iarch(recs[ri].fields.len) then break
+		sz = sz + field_bytes_at(recs, ri, fi)
+		fi = fi + 1
+	}
+
+	return sz
+}
+
+# Does record `recs[ri]` carry any inline fixed-array field? Such a record has a non-uniform layout
+# — its whole-record word-copy paths (spread construction) do not apply.
+const rec_has_fixfield = ([RecDecl] recs, Iarch ri): Bool -> {
+	let Iarch fi = 0
+
+	loop {
+		if fi >= Iarch(recs[ri].fields.len) then break
+		if eq(recs[ri].ftypes[fi], "$fix") then return true
+		fi = fi + 1
+	}
+
+	return false
+}
+
+# The byte offset of field `field` in record type `rt` — the running sum of the footprints of the
+# fields before it (uniform 8-byte slots, plus any inline `[N Elem]` field's `align8(N × stride)`
+# span). Typecheck guarantees both resolve.
 const field_offset = ([RecDecl] recs, Str rt, Str field): Iarch -> {
 	const Iarch ri = find_rec(recs, rt)
 	# `rt` is "" when a value's aggregate type could not be recovered (`init_agg_type` returned "")
@@ -236,11 +279,13 @@ const field_offset = ([RecDecl] recs, Str rt, Str field): Iarch -> {
 	# Fail with a clean diagnostic rather than dereferencing `recs[-1]` (a segfault).
 	if ri < 0
 		then die("cf: emit: a field access on a value whose record type is unknown here (an aggregate bound from a match payload is not yet supported)\n")
+	let Iarch off = 0
 	let Iarch fi = 0
 
 	loop {
 		if fi >= Iarch(recs[ri].fields.len) then break
-		if eq(recs[ri].fields[fi], field) then return fi * 8
+		if eq(recs[ri].fields[fi], field) then return off
+		off = off + field_bytes_at(recs, ri, fi)
 		fi = fi + 1
 	}
 
@@ -262,6 +307,8 @@ const field_is_ptr = (*Emit ctx, Str rt, Str field): Bool -> {
 			if eq(ft, "$dyn") then return true
 			if eq(ft, "$tuple") then return true
 			if eq(ft, "$ptr") then return true
+			# an inline fixed-array field reads as its INLINE byte ADDRESS — a pointer, like `$ptr`
+			if eq(ft, "$fix") then return true
 			if eq(ft, "Str") then return true
 			if find_rec(ctx.recs, ft) >= 0 then return true
 			if find_union(ctx.unions, ft) >= 0 then return union_is_boxed(ctx.unions, ft)
@@ -1657,6 +1704,18 @@ const emit_var! = (*Emit ctx, [Binding] env, Str name): Str -> {
 	return binding_ptr!(ctx, env, idx)
 }
 
+# The ADDRESS of a field within its record's block (`base + offset`). Used to read an inline
+# fixed-array field (`o.buf`): its bytes live in place, so its "value" is a raw pointer INTO the
+# record's own storage, not a loaded word.
+const emit_field_addr! = (*Emit ctx, Str bp, Iarch off): Str -> {
+	if off == 0 then return bp
+	const Iarch a = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${a} =l add ${bp}, ${off}\n")
+
+	return "%t${a}"
+}
+
 # Emit `base.field`. If `base` is a union type name, this is a tag-only union
 # construction — the member's tag, an inline word literal. Otherwise it is a record
 # field read: load the word at the record's base + the field's offset (`base` names
@@ -1695,6 +1754,9 @@ const emit_field! = (*Emit ctx, [Binding] env, Str base, Str field): Str -> {
 	}
 	# a dynamic array's `.len` — loadl the header's len@8
 	if eq(rt, "$dyn") then return load_at!(ctx, bp, 8)
+	# an inline fixed-array field — its value is the ADDRESS of its inline bytes (base + offset)
+	if eq(field_ftype(ctx, rt, field), "$fix")
+		then return emit_field_addr!(ctx, bp, field_offset(ctx.recs, rt, field))
 
 	return load_field_at!(ctx, bp, field_offset(ctx.recs, rt, field), field_scalar(ctx, rt, field))
 }
@@ -1820,6 +1882,9 @@ const emit_field_expr! = (*Emit ctx, [Binding] env, Expr base, Str field): Str -
 		return load_at!(ctx, b, 8)
 	}
 
+	# an inline fixed-array field — its value is the ADDRESS of its inline bytes (base + offset)
+	if eq(field_ftype(ctx, bt, field), "$fix")
+		then return emit_field_addr!(ctx, b, field_offset(ctx.recs, bt, field))
 	# a record base — read the field at its declared offset (a float field reads as `d`/`s`)
 	return load_field_at!(ctx, b, field_offset(ctx.recs, bt, field), field_scalar(ctx, bt, field))
 }
@@ -2010,6 +2075,7 @@ const emit_stringify_record! = (*Emit ctx, [Binding] env, Str vh, Str rt, Str ba
 	emit_lit_str!(ctx, vh, rt)
 	emit_lit_str!(ctx, vh, "({ ")
 	let Iarch f = 0
+	let Iarch off = 0
 
 	loop {
 		if f >= Iarch(ctx.recs[ri].fields.len) then break
@@ -2017,14 +2083,17 @@ const emit_stringify_record! = (*Emit ctx, [Binding] env, Str vh, Str rt, Str ba
 		emit_lit_str!(ctx, vh, ctx.recs[ri].fields[f])
 		emit_lit_str!(ctx, vh, ": ")
 		const Str ftype = ctx.recs[ri].ftypes[f]
+		# an inline fixed-array field is a raw byte span with no header/length — not stringifiable
+		if eq(ftype, "$fix")
+			then die("cf: emit: a record with an inline fixed-array field cannot be interpolated\n")
 		# an array field arrives as `$dyn` + a separate element name — respell it `[Elem]` so the
 		# stringifier's `is_nested` array arm picks it up
 		const Str fname = if eq(ftype, "$dyn") then "[${ctx.recs[ri].felems[f]}]" else ftype
-		const Iarch off = f * 8
 		const Str slot = if is_float_name(ftype)
 			then load_field_at!(ctx, base, off, ftype)
 			else load_at!(ctx, base, off)
 		emit_stringify!(ctx, env, vh, fname, ctx.recs[ri].ftelems[f], slot)
+		off = off + field_bytes_at(ctx.recs, ri, f)
 		f = f + 1
 	}
 
@@ -2450,12 +2519,18 @@ const emit_record_lit! = (*Emit ctx, Str type_name, [FieldInit] inits, [Binding]
 	if eq(type_name, "Str") then return emit_str_ctor!(ctx, inits, env)
 	const Iarch ri = find_rec(ctx.recs, type_name)
 	const Iarch nfld = Iarch(ctx.recs[ri].fields.len)
-	const Iarch size = nfld * 8
+	# the record's byte size — the running sum of field footprints, so an inline `[N Elem]` field's
+	# `align8(N × stride)` bytes are reserved in the block alongside the 8-byte slots.
+	const Iarch size = rec_byte_size(ctx.recs, ri)
 	const Iarch base = emit_agg_alloc!(ctx, size)
 	# a VALUE spread `{ ...src, ... }`: fill each field in declaration order — from its override if
 	# present, else COPY the source's word at that offset (typecheck guarantees copied fields are
-	# words, never aliasing pointers). The source's base pointer is the spread value.
+	# words, never aliasing pointers). The source's base pointer is the spread value. An inline
+	# fixed-array field would break the word-by-word copy (it spans multiple slots), so a record that
+	# carries one cannot be spread-constructed.
 	if Iarch(inits.len) > 0 && eq(inits[0].field, "$spread") then {
+		if rec_has_fixfield(ctx.recs, ri)
+			then die("cf: emit: a record with an inline fixed-array field cannot be spread-constructed\n")
 		const Str srcbp = emit_expr!(inits[0].value, ctx, env)
 		let Iarch f = 0
 
@@ -3563,9 +3638,9 @@ const is_raw_intrinsic = (Str n): Bool ->
 || eq(n, "std_mem_raw_grow")
 
 # The comptime byte size of a value's representation — the raw-intrinsic sizing rule:
-# a record is `fields.len * 8` (emit_record_lit!'s layout), a scalar is one register word.
-# Everything else (dyn arrays, Str, tuples, boxed unions) is deferred to the value-level
-# hook stage of the geometry-modules arc.
+# a record is its running-sum footprint (`rec_byte_size`, matching emit_record_lit!'s layout,
+# including any inline fixed-array field), a scalar is one register word. Everything else (dyn
+# arrays, Str, tuples, boxed unions) is deferred to the value-level hook stage of the geometry arc.
 const raw_obj_size! = (*Emit ctx, [Binding] env, Expr e): Iarch -> {
 	const Str at = init_agg_type!(ctx, env, e)
 	if eq(at, "") then return 8
@@ -3573,7 +3648,7 @@ const raw_obj_size! = (*Emit ctx, [Binding] env, Expr e): Iarch -> {
 	if ri < 0
 		then die("cf: emit: size_of/raw::place covers flat records and scalar words for now — dynamic layouts arrive with the value-level hook stage\n")
 
-	return Iarch(ctx.recs[ri].fields.len) * 8
+	return rec_byte_size(ctx.recs, ri)
 }
 
 # Does this callee resolve to a declared `intrinsic` (a bodyless token whose behavior the

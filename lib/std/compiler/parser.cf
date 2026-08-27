@@ -2818,6 +2818,7 @@ const parse_record_body! = (*Parser p, Str name, [Str] typarams, [Str] tbounds):
 	let [Str] felems = []
 	let [[TupElem]] ftelems = []
 	let [Bool] fptrs = []
+	let [Iarch] fsizes = []
 	const [TupElem] no_tel = []
 
 	loop {
@@ -2843,6 +2844,7 @@ const parse_record_body! = (*Parser p, Str name, [Str] typarams, [Str] tbounds):
 			felems = [...felems, ""]
 			ftelems = [...ftelems, no_tel]
 			fptrs = [...fptrs, false]
+			fsizes = [...fsizes, 0]
 		} else if is_star(peek(p)) then {
 			# a pointer field: `*[Uint8]` is an opaque byte pointer (`$ptr`); `*Point` is an explicit
 			# record/union pointer, representationally identical to a bare `Point` field (both are
@@ -2867,16 +2869,39 @@ const parse_record_body! = (*Parser p, Str name, [Str] typarams, [Str] tbounds):
 			ftelems = [...ftelems, no_tel]
 			# an aggregate pointer `*Record`/`*Union` is a reference (fptr); a `*[Elem]` byte pointer ($ptr) is not
 			fptrs = [...fptrs, !eq(ft, "$ptr")]
+			fsizes = [...fsizes, 0]
 			p.pos = p.pos + 1
 		} else if is_lbracket(peek(p)) then {
-			const Str felem = dyn_elem_of(parse_type!(p))
-			if !is_ident(peek(p)) then die("cf: parse: expected a field name\n")
-			fields = [...fields, cur_name!(p)]
-			ftypes = [...ftypes, "$dyn"]
-			felems = [...felems, felem]
-			ftelems = [...ftelems, no_tel]
-			fptrs = [...fptrs, false]
-			p.pos = p.pos + 1
+			# `[N Elem]` (an int-literal length) is an INLINE fixed-array field — `N` elements stored in
+			# the record body (ftype "$fix", `fsize` = N). `[Elem]` (no length) is an ordinary dynamic
+			# array field (an 8-byte pointer to a `{data,len,cap}` header).
+			if is_intlit(p.toks[p.pos + 1].kind) then {
+				p.pos = p.pos + 1 # `[`
+				const Iarch fn = p.toks[p.pos].ival
+				if fn <= 0 then die("cf: parse: an inline fixed-array field needs a positive comptime length\n")
+				p.pos = p.pos + 1 # N
+				const Str fxe = parse_fixed_elem!(p)
+				if !is_rbracket(peek(p)) then die("cf: parse: expected `]` in a fixed-array field type\n")
+				p.pos = p.pos + 1 # `]`
+				if !is_ident(peek(p)) then die("cf: parse: expected a field name\n")
+				fields = [...fields, cur_name!(p)]
+				ftypes = [...ftypes, "$fix"]
+				felems = [...felems, fxe]
+				ftelems = [...ftelems, no_tel]
+				fptrs = [...fptrs, false]
+				fsizes = [...fsizes, fn]
+				p.pos = p.pos + 1
+			} else {
+				const Str felem = dyn_elem_of(parse_type!(p))
+				if !is_ident(peek(p)) then die("cf: parse: expected a field name\n")
+				fields = [...fields, cur_name!(p)]
+				ftypes = [...ftypes, "$dyn"]
+				felems = [...felems, felem]
+				ftelems = [...ftelems, no_tel]
+				fptrs = [...fptrs, false]
+				fsizes = [...fsizes, 0]
+				p.pos = p.pos + 1
+			}
 		} else if is_lparen(peek(p)) then {
 			# a `(A, B, ...) name` tuple field — at least two comma-separated element type names
 			p.pos = p.pos + 1 # `(`
@@ -2887,6 +2912,7 @@ const parse_record_body! = (*Parser p, Str name, [Str] typarams, [Str] tbounds):
 			felems = [...felems, ""]
 			ftelems = [...ftelems, tel]
 			fptrs = [...fptrs, false]
+			fsizes = [...fsizes, 0]
 			p.pos = p.pos + 1
 		} else {
 			# a scalar/aggregate field type — a name, a type variable `'T`, or a generic type
@@ -2898,6 +2924,7 @@ const parse_record_body! = (*Parser p, Str name, [Str] typarams, [Str] tbounds):
 			felems = [...felems, ""]
 			ftelems = [...ftelems, no_tel]
 			fptrs = [...fptrs, false]
+			fsizes = [...fsizes, 0]
 			p.pos = p.pos + 1
 		}
 
@@ -2917,6 +2944,7 @@ const parse_record_body! = (*Parser p, Str name, [Str] typarams, [Str] tbounds):
 		fptrs: fptrs,
 		typarams: typarams,
 		tbounds: tbounds,
+		fsizes: fsizes,
 	})
 }
 

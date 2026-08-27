@@ -779,6 +779,10 @@ const canon_telems = ([TupElem] telems, [RecDecl] recs, [UnionDecl] unions): [Tu
 const field_decl_ty = (Iarch ri, Iarch fi, Ctx ctx): Ty -> {
 	if eq(ctx.recs[ri].ftypes[fi], "$tuple")
 		then return Ty.TTuple(canon_telems(ctx.recs[ri].ftelems[fi], ctx.recs, ctx.unions))
+	# an inline fixed-array field reads as its byte ADDRESS — a raw byte pointer (`TPtr`), like a
+	# `*[Elem]` field; it passes to a `*[Elem]` parameter and to a `Str`'s `bytes`, and strides by
+	# its element width when indexed
+	if eq(ctx.recs[ri].ftypes[fi], "$fix") then return Ty.TPtr
 
 	return named_ty(ctx.recs[ri].ftypes[fi], ctx.recs[ri].felems[fi], ctx.recs, ctx.unions)
 }
@@ -1676,6 +1680,17 @@ const record_type! = (Str type_name, [FieldInit] inits, [VarTy] env, Ctx ctx): T
 	if ri < 0 then die("cf: type: unknown record type in a data literal\n")
 	const Iarch nf = Iarch(ctx.recs[ri].fields.len)
 	const Iarch ni = Iarch(inits.len)
+	# an inline fixed-array field (`[N Elem]`) is reserved scratch with no header/length — it is NOT
+	# set in a data literal (its bytes start uninitialized; the owner tracks its own used length), so
+	# it does not count toward "set every field exactly once".
+	let Iarch nfix = 0
+	let Iarch fx = 0
+
+	loop {
+		if fx >= nf then break
+		if eq(ctx.recs[ri].ftypes[fx], "$fix") then nfix = nfix + 1
+		fx = fx + 1
+	}
 	# a VALUE spread `{ ...src, ... }` — must be the FIRST entry, single, and copy a record of the SAME
 	# type; the overrides that follow are a subset (the spread supplies the remaining fields)
 	let Bool has_spread = false
@@ -1693,8 +1708,13 @@ const record_type! = (Str type_name, [FieldInit] inits, [VarTy] env, Ctx ctx): T
 		s = s + 1
 	}
 
+	# a record carrying an inline fixed-array field has a non-uniform layout, so its word-by-word
+	# value spread is not supported (the emitter rejects it too)
+	if has_spread && nfix > 0
+		then die("cf: type: a record with an inline fixed-array field cannot be value-spread\n")
 	if !has_spread then {
-		if ni != nf then die("cf: type: a data literal must set every field exactly once\n")
+		if ni != nf - nfix
+			then die("cf: type: a data literal must set every field exactly once (an inline fixed-array field is omitted)\n")
 	}
 	let Iarch a = 0
 
@@ -1703,6 +1723,8 @@ const record_type! = (Str type_name, [FieldInit] inits, [VarTy] env, Ctx ctx): T
 		if !eq(inits[a].field, "$spread") then {
 			const Iarch fi = field_index(ctx.recs[ri].fields, inits[a].field)
 			if fi < 0 then die("cf: type: unknown field in a data literal\n")
+			if eq(ctx.recs[ri].ftypes[fi], "$fix")
+				then die("cf: type: an inline fixed-array field is not set in a data literal — it is reserved uninitialized scratch\n")
 			let Iarch b = 0
 
 			loop {
@@ -3402,6 +3424,10 @@ const check_simple_stmt! = (Stmt s, [VarTy] env, Ctx ctx, Iarch loop_kind): Iarc
 			const Iarch ri = find_rec(ctx.recs, tn)
 			const Iarch fi = field_index(ctx.recs[ri].fields, f)
 			if fi < 0 then die("cf: type: mutating a field the record does not declare\n")
+			# an inline fixed-array field is edited THROUGH its bytes (`o.buf` yields their address; write
+			# via a `*[Elem]` helper), never re-pointed — a whole-field store would clobber its inline data
+			if eq(ctx.recs[ri].ftypes[fi], "$fix")
+				then die("cf: type: an inline fixed-array field cannot be reassigned — edit its bytes through `o.${f}`\n")
 			const Ty ft = field_decl_ty(ri, fi, ctx)
 			# region-outlives: rehoming a pointer into a caller-provided aggregate (an `outer` param, which
 			# OUTLIVES this call) may not store a pointer into a function-LOCAL — it would dangle once the
@@ -3424,6 +3450,8 @@ const check_simple_stmt! = (Stmt s, [VarTy] env, Ctx ctx, Iarch loop_kind): Iarc
 			const Iarch ri = find_rec(ctx.recs, tn)
 			const Iarch fi = field_index(ctx.recs[ri].fields, f)
 			if fi < 0 then die("cf: type: mutating a field the record does not declare\n")
+			if eq(ctx.recs[ri].ftypes[fi], "$fix")
+				then die("cf: type: an inline fixed-array field cannot be reassigned — edit its bytes through `o.${f}`\n")
 			const Ty ft = field_decl_ty(ri, fi, ctx)
 			# region-outlives: rehoming through a caller-provided (`outer`) aggregate may not store a local pointer
 			const Str rn = lvalue_root_name(be)
@@ -4432,6 +4460,8 @@ const is_known_typename = (Str name, [RecDecl] recs, [UnionDecl] unions): Bool -
 	# a separate later gate, so `Point[Iarch]` on a plain record is NOT caught by this field-type check)
 	if name_has_byte(name, 91) || name_has_byte(name, 46) then return true
 	if eq(name, "$dyn") || eq(name, "$ptr") || eq(name, "$tuple") then return true
+	# an inline fixed-array field `[N Elem]` — its element is validated separately (like `$ptr`)
+	if eq(name, "$fix") then return true
 	if eq(name, "Str") || eq(name, "Bool") || eq(name, "Unit") then return true
 	if eq(name, "Never") then return true
 	if is_cast_type(name) then return true
@@ -4494,6 +4524,11 @@ const check_whole = (Program prog): Iarch -> {
 				!eq(prog.recs[r].felems[a], "") &&
 				!is_ptr_field_elem(prog.recs[r].felems[a])
 					then die("cf: type: a `*[T]` pointer field element must be `Uint8`, `Iarch`, or a fixed-width integer\n")
+			# an inline `[N Elem]` field is a flat byte span indexed by element width, so its element
+			# must be a word scalar (`Uint8`/`Iarch`/a fixed-width) — an aggregate element (a record,
+			# `Str`, nested array) has no meaningful inline stride and is a later brick
+			if eq(prog.recs[r].ftypes[a], "$fix") && !is_ptr_field_elem(prog.recs[r].felems[a])
+				then die("cf: type: an inline `[N Elem]` field element must be `Uint8`, `Iarch`, or a fixed-width integer\n")
 			a = a + 1
 		}
 
