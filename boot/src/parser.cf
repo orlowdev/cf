@@ -652,16 +652,30 @@ const after_brackets = (*Parser p, Iarch br): Iarch -> {
 # accessor `fs[i].field` / `xs[i](…)` (both are `name[…]` followed by `.`/`(`).
 const tyargs_shaped = (*Parser p, Iarch br): Bool -> {
 	let Iarch j = br + 1
+	let Iarch depth = 0
 
 	loop {
 		if j >= Iarch(p.toks.len) then return false
 		const TokKind k = p.toks[j].kind
-		if is_rbracket(k) then break
-		if !is_ident(k) && !is_comma(k) then return false
-		if is_ident(k) then {
+
+		# a nested `[Elem]` is an array type argument — descend and keep scanning; the matching `]`
+		# at depth 0 ends the list
+		if is_lbracket(k) then depth = depth + 1
+
+		if is_rbracket(k) then {
+			if depth == 0 then break
+
+			depth = depth - 1
+		}
+
+		if !is_lbracket(k) && !is_rbracket(k) && !is_comma(k) then {
+			if !is_ident(k) then return false
+
 			const Iarch c = Iarch(p.src[p.toks[j].start])
+
 			if !((c >= 65 && c <= 90) || c == 39) then return false  # uppercase-initial or `'T`
 		}
+
 		j = j + 1
 	}
 
@@ -675,15 +689,28 @@ const tyargs_shaped = (*Parser p, Iarch br): Bool -> {
 # strict type-shaped check, so `xs[1].field` stays an index-then-field, not a `[1]`-construction).
 const callargs_shaped = (*Parser p, Iarch br): Bool -> {
 	let Iarch j = br + 1
+	let Iarch depth = 0
 
 	loop {
 		if j >= Iarch(p.toks.len) then return false
 		const TokKind k = p.toks[j].kind
-		if is_rbracket(k) then break
-		if is_comma(k) || is_intlit(k) then j = j + 1 else {
+
+		if is_lbracket(k) then {
+			depth = depth + 1
+			j = j + 1
+		} else if is_rbracket(k) then {
+			if depth == 0 then break
+
+			depth = depth - 1
+			j = j + 1
+		} else if is_comma(k) || is_intlit(k) then j = j + 1
+			else {
 			if !is_ident(k) then return false
+
 			const Iarch c = Iarch(p.src[p.toks[j].start])
+
 			if !((c >= 65 && c <= 90) || c == 39) then return false  # uppercase-initial or `'T`
+
 			j = j + 1
 		}
 	}
@@ -2529,7 +2556,22 @@ const parse_type_app_tail! = (*Parser p, Str base): Str -> {
 }
 
 const parse_type_ref! = (*Parser p): Str -> {
+	# a `[Elem]` dynamic-array type argument (`Either[IoRrr, [DirEntry]]`) — encoded as the empty-base
+	# bracket string `[Elem]` that monomorph's `is_arr_enc`/`subst_slot` expand into a `$dyn` slot. The
+	# element is itself a type reference, so `[[T]]` and `[Box[T]]` nest.
+	if is_lbracket(peek(p)) then {
+		p.pos = p.pos + 1
+		const Str elem = parse_type_ref!(p)
+
+		if !is_rbracket(peek(p)) then die("cf: parse: expected `]` in an array type argument\n")
+
+		p.pos = p.pos + 1
+
+		return "[${elem}]"
+	}
+
 	if !is_ident(peek(p)) then die("cf: parse: expected a type name\n")
+
 	const Str base = cur_name!(p)
 	p.pos = p.pos + 1
 	if is_lbracket(peek(p)) then return parse_type_app_tail!(p, base)
