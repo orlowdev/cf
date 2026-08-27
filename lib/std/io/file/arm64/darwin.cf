@@ -111,6 +111,26 @@ pub const append_file = (Str path, Str s): Either[IoErr, Iarch] -> match open_ap
 # is the same decay `read` relies on; a `[N Uint8]` local reaches it through this `*[Uint8]` hop.
 const read_raw = (Fd fd, *[Uint8] buf, Uarch n): Iarch -> syscall6(3, fd.n, buf, n, 0, 0, 0)
 
+# Read a whole file at `path` into `buf` (capacity `cap` bytes) in one pass, then close it. `Right(n)`
+# carries the byte count; `n == cap` means the file may be larger than the buffer (truncated) — grow
+# `buf` and retry to be sure. `Left` reports a failed open or read. The caller owns the buffer, so
+# this allocates nothing itself and needs no geometry (it can fill a static or stack buffer with no
+# arena) — the raw fd rides `syscall6` directly rather than through a residue-holding `Fd`. cf has no
+# `Str` construction yet, so a self-allocating whole-file read into an owned string is not offered.
+pub const read_file_into = (Str path, *[Uint8] buf, Uarch cap): Either[IoErr, Iarch] -> {
+	const Iarch fdr = syscall6(5, path.bytes, 0, 0, 0, 0, 0)
+
+	if fdr < 0 then return Either[IoErr, Iarch].Left(IoErr({ errno: fdr }))
+
+	const Iarch n = syscall6(3, Uarch(fdr), buf, cap, 0, 0, 0)
+
+	syscall6(6, Uarch(fdr), 0, 0, 0, 0, 0)
+
+	if n < 0 then return Either[IoErr, Iarch].Left(IoErr({ errno: n }))
+
+	return Either[IoErr, Iarch].Right(n)
+}
+
 # Read one line from `fd` into `buf` (capacity `cap` bytes), up to but excluding the newline, which
 # is consumed. `Right(n)` for n >= 0 is a line of `n` bytes (0 = a bare blank line); `Right(-1)` is
 # end of input — nothing more to read — so a caller distinguishes EOF from a blank line. `Left` is a
