@@ -30,8 +30,18 @@ pub const mode_search = 0
 pub const mode_select = 1
 pub const mode_read = 2
 
-# The keymap legend, shown at the bottom of the window in every mode.
-const legend = "[j/k up/dn] move   [enter] select   [esc] back   [i] search   [r] reset   [ctrl-c] quit"
+# The keymap legend for each mode, shown at the bottom of the window (the keys really do differ by
+# mode — j/k type in search, esc has nothing to go back to there).
+const legend_search = "[type] filter   [down/enter] select   [ctrl-c] quit"
+const legend_select = "[j/k up/dn] move   [enter] read   [i/esc] search   [r] reset   [ctrl-c] quit"
+const legend_read = "[esc] back   [i] search   [r] reset   [ctrl-c] quit"
+
+const legend_for = (Iarch mode): Str -> {
+	if mode == mode_search then return legend_search
+	if mode == mode_select then return legend_select
+
+	return legend_read
+}
 
 # The browser state: every definition, the current query, the mode, and the highlighted row (an index
 # into the filtered view).
@@ -50,6 +60,35 @@ const append_char = (Str s, Iarch b): Str -> {
 	}
 
 	out = [...out, Uint8(b)]
+
+	return Str({ bytes: out, len: Iarch(out.len) })
+}
+
+# The signature up to (not including) its body — everything before the last ` ->`. A `data`/`union`
+# line has no `->`, so it is returned whole.
+const sig_head = (Str sig): Str -> {
+	let Iarch cut = 0 - 1
+	let Iarch i = 0
+
+	loop {
+		if i + 2 >= Iarch(sig.len) then break
+
+		if Iarch(sig[i]) == 32 && Iarch(sig[i + 1]) == 45 && Iarch(sig[i + 2]) == 62 then cut = i
+
+		i = i + 1
+	}
+
+	if cut < 0 then return sig
+
+	let [Uint8] out = []
+	let Iarch j = 0
+
+	loop {
+		if j >= cut then break
+
+		out = [...out, Uint8(Iarch(sig[j]))]
+		j = j + 1
+	}
 
 	return Str({ bytes: out, len: Iarch(out.len) })
 }
@@ -154,9 +193,11 @@ const render_read! = ([Def] view, Iarch sel): () -> {
 	println("${d.kind} ${d.name}")
 	println("${d.module}")
 	println("")
-	println(d.sig)
+	println(sig_head(d.sig))
 	println("")
-	println(d.doc)
+	println("DESCRIPTION")
+
+	if Iarch(d.doc.len) == 0 then println("empty") else println(d.doc)
 
 	return ()
 }
@@ -213,11 +254,13 @@ const render! = (DocState st, [Def] view, Iarch rows): () -> {
 
 	if st.mode == mode_read then render_read!(view, st.sel) else render_list!(st, view, rows)
 
-	# the keymap legend, pinned to the bottom row (same in every mode) — off a real terminal (rows 0)
-	# it just follows the content
+	# the mode's keymap legend, pinned to the bottom row in reverse video (a status bar) — off a real
+	# terminal (rows 0) it just follows the content
 	if rows >= 2 then move_to!(rows, 1)
 
-	print(legend)
+	reverse!()
+	print(legend_for(st.mode))
+	reset!()
 
 	return ()
 }
@@ -229,7 +272,8 @@ const render! = (DocState st, [Def] view, Iarch rows): () -> {
 const is_enter = (Iarch key): Bool -> key == key_enter || key == 10
 
 const dispatch_search = (DocState st, Iarch key): DocState -> {
-	if key == key_esc || is_enter(key) || key == key_up || key == key_down
+	# enter or an arrow moves into the list; esc does nothing here (search is the root)
+	if is_enter(key) || key == key_up || key == key_down
 		then return DocState({ all: st.all, query: st.query, mode: mode_select, sel: 0 })
 
 	if key == 127 || key == 8
