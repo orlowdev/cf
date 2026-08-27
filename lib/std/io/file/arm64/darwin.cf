@@ -111,12 +111,16 @@ pub const append_file = (Str path, Str s): Either[IoRrr, Iarch] -> match open_ap
 # is the same decay `read` relies on; a `[N Uint8]` local reaches it through this `*[Uint8]` hop.
 const read_raw = (Fd fd, *[Uint8] buf, Uarch n): Iarch -> syscall6(3, fd.n, buf, n, 0, 0, 0)
 
+# Same raw read keyed on a bare fd number (for the internal open→read→close chains that never build
+# an `Fd`). The `[N Uint8]` local reaches `syscall6`'s `Uarch` operand through this `*[Uint8]` hop.
+const read_raw_fd = (Iarch fd, *[Uint8] buf, Uarch n): Iarch -> syscall6(3, Uarch(fd), buf, n, 0, 0, 0)
+
 # Read a whole file at `path` into `buf` (capacity `cap` bytes) in one pass, then close it. `Right(n)`
 # carries the byte count; `n == cap` means the file may be larger than the buffer (truncated) — grow
 # `buf` and retry to be sure. `Left` reports a failed open or read. The caller owns the buffer, so
 # this allocates nothing itself and needs no geometry (it can fill a static or stack buffer with no
-# arena) — the raw fd rides `syscall6` directly rather than through a residue-holding `Fd`. cf has no
-# `Str` construction yet, so a self-allocating whole-file read into an owned string is not offered.
+# arena) — the raw fd rides `syscall6` directly rather than through a residue-holding `Fd`. For an
+# owned `Str` instead of a caller buffer, reach for `read_file!`.
 pub const read_file_into = (Str path, *[Uint8] buf, Uarch cap): Either[IoRrr, Iarch] -> {
 	const Iarch fdr = syscall6(5, path.bytes, 0, 0, 0, 0, 0)
 
@@ -129,6 +133,48 @@ pub const read_file_into = (Str path, *[Uint8] buf, Uarch cap): Either[IoRrr, Ia
 	if n < 0 then return Either[IoRrr, Iarch].Left(rrr_of(n))
 
 	return Either[IoRrr, Iarch].Right(n)
+}
+
+# Read a whole file at `path` into a freshly allocated `Str` in the ambient geometry, then close it.
+# `Right(s)` is the file's bytes as a `Str`; `Left` reports a failed open or read. Reads in 4 KiB
+# chunks and grows the result vector, so it fits any size without a caller buffer — but every byte is
+# appended one at a time, so for a hot path or a large file prefer `read_file_into` with your own
+# buffer. Allocates the result in the caller's arena (the returned `Str` survives), so it is `!`.
+pub const read_file! = (Str path): Either[IoRrr, Str] -> {
+	const Iarch fdr = syscall6(5, path.bytes, 0, 0, 0, 0, 0)
+
+	if fdr < 0 then return Either[IoRrr, Str].Left(rrr_of(fdr))
+
+	let [Uint8] out = []
+	let [4096 Uint8] chunk
+	let Iarch err = 0
+
+	loop {
+		const Iarch r = read_raw_fd(fdr, chunk, Uarch(4096))
+
+		if r < 0 then {
+			err = r
+
+			break
+		}
+
+		if r == 0 then break
+
+		let Iarch j = 0
+
+		loop {
+			if j >= r then break
+
+			out = [...out, chunk[j]]
+			j = j + 1
+		}
+	}
+
+	syscall6(6, Uarch(fdr), 0, 0, 0, 0, 0)
+
+	if err < 0 then return Either[IoRrr, Str].Left(rrr_of(err))
+
+	return Either[IoRrr, Str].Right(Str({ bytes: out, len: Iarch(out.len) }))
 }
 
 # Read one line from `fd` into `buf` (capacity `cap` bytes), up to but excluding the newline, which
