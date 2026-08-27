@@ -22,9 +22,11 @@ const ioctl = (Iarch fd, Uarch req, *[Uint8] argp): Iarch -> syscall6(54, Uarch(
 const tiocgeta = (): Uarch -> Uarch(0x40487413)
 const tiocseta = (): Uarch -> Uarch(0x00487414) + (Uarch(1) << Uarch(31))
 
-# Put stdin into raw mode: no line buffering, no echo — but keep ISIG, so Ctrl-C still interrupts.
-# `saved` (72 bytes, caller-owned) receives the prior `termios` for `restore!`. TIOCGETA/TIOCSETA and
-# the 72-byte struct (c_lflag at offset 24, c_cc at 32) are the arm64 darwin ABI.
+# Put stdin into raw mode: no line buffering, no echo, and no signal generation — so Ctrl-C arrives
+# as byte 3 for the app to handle (letting it restore the terminal before exiting) rather than killing
+# the process mid-raw-mode. `saved` (72 bytes, caller-owned) receives the prior `termios` for
+# `restore`. TIOCGETA/TIOCSETA and the 72-byte struct (c_lflag at offset 24, c_cc at 32) are the arm64
+# darwin ABI. Output processing (c_oflag) is left on, so `\n` still returns the cursor to column 0.
 pub const raw_mode! = (*[Uint8] saved): () -> {
 	ioctl(0, tiocgeta(), saved)
 
@@ -38,8 +40,9 @@ pub const raw_mode! = (*[Uint8] saved): () -> {
 		i = i + 1
 	}
 
-	# c_lflag @ 24: clear ECHO (byte 24, bit 0x08) and ICANON (byte 25, bit 0x01)
-	work[24] = Uint8(Iarch(work[24]) & 247)
+	# c_lflag @ 24: clear ECHO (byte 24, 0x08) and ISIG (byte 24, 0x80) — mask 0x77 — and ICANON
+	# (byte 25, 0x01)
+	work[24] = Uint8(Iarch(work[24]) & 119)
 	work[25] = Uint8(Iarch(work[25]) & 254)
 	# c_cc: VMIN (index 16 @ offset 48) = 1, VTIME (index 17 @ offset 49) = 0 — block for one byte
 	work[48] = Uint8(1)
