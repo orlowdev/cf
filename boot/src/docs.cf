@@ -4,7 +4,7 @@
 # filter, the matches ranked by a fuzzy score. SELECTION: move the highlight with the arrows or j/k.
 # READ: the selected definition's signature and doc comment. Enter/esc/arrows move between modes;
 # `i`/`s` jump back to search, `r` resets the query, Ctrl-C exits (restoring the terminal first).
-import docscan::{ Def, Member, scan_std!, split_lines }
+import docscan::{ Def, Member, scan_std!, split_lines, split_members_line! }
 import std::str::{ fuzzy_score, no_match, eq }
 import std::io::term::{
 	raw_mode!,
@@ -64,37 +64,200 @@ const append_char = (Str s, Iarch b): Str -> {
 	return Str({ bytes: out, len: Iarch(out.len) })
 }
 
-# The signature up to (not including) its body: everything before the last ` ->` (a function) or the
-# ` = {` (a data/union, whose members are shown in their own section) — whichever the line has.
-const sig_head = (Str sig): Str -> {
-	let Iarch cut = -1
+# --- structured synopsis --------------------------------------------------------
+# The SYNOPSIS is rebuilt from the signature, not echoed: a function lists each parameter on its own
+# `-> Type name` line and its return as `<- Type`; a data type lists each `- Type name` field; a union
+# lists each `- Variant` with its payload types as `-> Type`; a value states `value name: Type`.
+
+# `s[a..b)` as a fresh Str (clamped to the string length).
+const slice = (Str s, Iarch a, Iarch b): Str -> {
+	let [Uint8] out = []
+	let Iarch i = a
+
+	loop {
+		if i >= b then break
+		if i >= Iarch(s.len) then break
+
+		out = [...out, Uint8(Iarch(s[i]))]
+		i = i + 1
+	}
+
+	return Str({ bytes: out, len: Iarch(out.len) })
+}
+
+# Index of the first `(` in `s`, or -1.
+const first_lparen = (Str s): Iarch -> {
 	let Iarch i = 0
 
 	loop {
-		if i + 3 >= Iarch(sig.len) then break
-
-		# ` -> ` — a function body arrow
-		if Iarch(sig[i]) == 32 && Iarch(sig[i + 1]) == 45 && Iarch(sig[i + 2]) == 62 then cut = i
-		# ` = {` — an aggregate body; take the first (there is at most one)
-		if Iarch(sig[i]) == 32 && Iarch(sig[i + 1]) == 61 && Iarch(sig[i + 2]) == 32 && Iarch(sig[i + 3]) == 123 && cut < 0
-			then cut = i
+		if i >= Iarch(s.len) then break
+		if Iarch(s[i]) == 40 then return i
 
 		i = i + 1
 	}
 
-	if cut < 0 then return sig
+	return -1
+}
 
-	let [Uint8] out = []
-	let Iarch j = 0
+# Index of the `)` matching the `(` at `open`, or -1.
+const match_rparen = (Str s, Iarch open): Iarch -> {
+	let Iarch depth = 0
+	let Iarch i = open
 
 	loop {
-		if j >= cut then break
+		if i >= Iarch(s.len) then break
 
-		out = [...out, Uint8(Iarch(sig[j]))]
-		j = j + 1
+		const Iarch c = Iarch(s[i])
+
+		if c == 40 then depth = depth + 1
+		if c == 41 then {
+			depth = depth - 1
+
+			if depth == 0 then return i
+		}
+
+		i = i + 1
 	}
 
-	return Str({ bytes: out, len: Iarch(out.len) })
+	return -1
+}
+
+# The parameter list inside a function/intrinsic's first `(...)`, or "" when there is none.
+const param_text = (Str sig): Str -> {
+	const Iarch lp = first_lparen(sig)
+
+	if lp < 0 then return ""
+
+	const Iarch rp = match_rparen(sig, lp)
+
+	if rp < 0 then return ""
+
+	return slice(sig, lp + 1, rp)
+}
+
+# The return type — the text after the parameter list's `): ` up to a ` ->` body arrow or the end.
+const ret_text = (Str sig): Str -> {
+	const Iarch lp = first_lparen(sig)
+
+	if lp < 0 then return ""
+
+	const Iarch rp = match_rparen(sig, lp)
+
+	if rp < 0 then return ""
+
+	# skip past `)`, its `:`, and one space
+	let Iarch k = rp + 1
+
+	loop {
+		if k >= Iarch(sig.len) then break
+		if Iarch(sig[k]) != 32 && Iarch(sig[k]) != 58 then break
+
+		k = k + 1
+	}
+
+	# end at a ` ->` body arrow or the end of the string
+	let Iarch e = k
+	let Bool found = false
+
+	loop {
+		if e + 2 >= Iarch(sig.len) then break
+
+		if Iarch(sig[e]) == 32 && Iarch(sig[e + 1]) == 45 && Iarch(sig[e + 2]) == 62 then {
+			found = true
+
+			break
+		}
+
+		e = e + 1
+	}
+
+	if !found then e = Iarch(sig.len)
+
+	return slice(sig, k, e)
+}
+
+# The written type of a value or param-less intrinsic — the text after a `: ` annotation (a colon
+# FOLLOWED BY a space, so a `::` path is never mistaken for one) up to a ` = ` or the end; "" when the
+# definition carries no annotation.
+const value_type = (Str sig): Str -> {
+	let Iarch c = -1
+	let Iarch i = 0
+
+	loop {
+		if i + 1 >= Iarch(sig.len) then break
+
+		if Iarch(sig[i]) == 58 && Iarch(sig[i + 1]) == 32 then {
+			c = i
+
+			break
+		}
+
+		i = i + 1
+	}
+
+	if c < 0 then return ""
+
+	const Iarch k = c + 2
+	let Iarch e = k
+	let Bool found = false
+
+	loop {
+		if e + 2 >= Iarch(sig.len) then break
+
+		if Iarch(sig[e]) == 32 && Iarch(sig[e + 1]) == 61 && Iarch(sig[e + 2]) == 32 then {
+			found = true
+
+			break
+		}
+
+		e = e + 1
+	}
+
+	if !found then e = Iarch(sig.len)
+
+	return slice(sig, k, e)
+}
+
+# The display keyword for a definition: `data`/`union`/`intrinsic` verbatim, and a `const` shown as
+# `function` when it is a lambda (has a parameter list) or `value` otherwise.
+const head_word = (Str kind, Str sig): Str -> {
+	if eq(kind, "data") then return "data"
+	if eq(kind, "union") then return "union"
+	if eq(kind, "intrinsic") then return "intrinsic"
+	if first_lparen(sig) >= 0 then return "function"
+
+	return "value"
+}
+
+# Does this definition render with the function layout (a `-> arg` per parameter, then a `<- return`)?
+# True for a function and for an intrinsic that takes parameters; false for data/union/value.
+const fn_layout = (Str kind, Str sig): Bool -> {
+	if eq(kind, "data") || eq(kind, "union") then return false
+
+	return first_lparen(sig) >= 0
+}
+
+# The tag name of a union variant (`TFixed(Iarch, Bool)` → `TFixed`, `TInt` → `TInt`).
+const mem_name = (Str m): Str -> {
+	const Iarch lp = first_lparen(m)
+
+	if lp < 0 then return m
+
+	return slice(m, 0, lp)
+}
+
+# The positional payload types of a union variant (`TFixed(Iarch, Bool)` → `["Iarch", "Bool"]`); the
+# empty list for a tag-only variant.
+const mem_payload! = (Str m): [Str] -> {
+	const Iarch lp = first_lparen(m)
+
+	if lp < 0 then return []
+
+	const Iarch rp = match_rparen(m, lp)
+
+	if rp < 0 then return []
+
+	return split_members_line!(slice(m, lp + 1, rp))
 }
 
 # Drop the last character of `s` (backspace).
@@ -394,7 +557,20 @@ const wrap_doc! = (Str doc, Iarch width): [Str] -> {
 # the same height.
 const read_body! = (Def d, Iarch width): [Str] -> {
 	let [Str] body = []
-	const [Str] w1 = word_wrap("${d.kind} ${d.name}", width)
+	const Str head = head_word(d.kind, d.sig)
+	const Bool fnl = fn_layout(d.kind, d.sig)
+	const Bool is_value = !fnl && !eq(d.kind, "data") && !eq(d.kind, "union")
+
+	# title: `<head> <name>`, a value/param-less intrinsic carrying its type inline
+	let Str title = "${head} ${d.name}"
+
+	if is_value then {
+		const Str vt = value_type(d.sig)
+
+		if Iarch(vt.len) > 0 then title = "${head} ${d.name}: ${vt}"
+	}
+
+	const [Str] w1 = word_wrap(title, width)
 
 	for x in w1 {
 		body = [...body, x]
@@ -406,14 +582,45 @@ const read_body! = (Def d, Iarch width): [Str] -> {
 		body = [...body, x]
 	}
 
-	body = [...body, ""]
-	body = [...body, "SYNOPSIS"]
-	body = [...body, ""]
+	# SYNOPSIS — rebuilt structurally; skipped for a value / param-less intrinsic (the title says it all)
+	if !is_value then {
+		body = [...body, ""]
+		body = [...body, "SYNOPSIS"]
+		body = [...body, ""]
 
-	const [Str] w3 = word_wrap(sig_head(d.sig), width)
+		if fnl then {
+			# a function / intrinsic: one `-> Type name` per parameter, then the `<- Type` return
+			const [Str] ps = split_members_line!(param_text(d.sig))
 
-	for x in w3 {
-		body = [...body, x]
+			for p in ps {
+				body = [...body, "-> ${p}"]
+			}
+
+			body = [...body, ""]
+			body = [...body, "<- ${ret_text(d.sig)}"]
+		} else if eq(d.kind, "data") then {
+			# a record: one `- Type name` per field
+			const [Member] fs = d.members
+
+			for m in fs {
+				body = [...body, "- ${m.name}"]
+			}
+		} else {
+			# a union: each `- Variant`, its payload types beneath as `-> Type`
+			const [Member] ms = d.members
+
+			for m in ms {
+				body = [...body, "- ${mem_name(m.name)}"]
+
+				const [Str] pl = mem_payload!(m.name)
+
+				for a in pl {
+					body = [...body, "-> ${a}"]
+				}
+
+				body = [...body, ""]
+			}
+		}
 	}
 
 	body = [...body, ""]
