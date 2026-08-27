@@ -108,9 +108,9 @@ _f228:
 1:
 	ret
 
-.globl _f348
+.globl _f349
 .p2align 2
-_f348:
+_f349:
 	mov x0, x0
 	mov x16, #1
 	svc #0x80

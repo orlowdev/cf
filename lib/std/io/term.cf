@@ -62,16 +62,33 @@ pub const restore = (*[Uint8] saved): () -> {
 
 const read_stdin = (*[Uint8] buf, Uarch n): Iarch -> syscall6(3, 0, buf, n, 0, 0, 0)
 
-# Read one keypress. A regular key returns its byte; an arrow returns `key_up`/`key_down`/…; end of
-# input returns `key_eof`. An arrow arrives as the 3-byte burst ESC `[` A/B/C/D, read together.
-pub const read_key! = (): Iarch -> {
-	let [8 Uint8] buf = [0, 0, 0, 0, 0, 0, 0, 0]
-	const Iarch n = read_stdin(buf, Uarch(8))
+# Read one keypress, draining a buffered batch so bulk input — a paste, or typing that arrives faster
+# than the caller loops — is never dropped. The caller owns the batch: `data` (capacity `cap` bytes,
+# `cap` <= 255) holds a read of stdin, and `meta` (2 bytes) is the cursor — byte 0 = position, byte 1
+# = the batch length. Zero `meta` once before the first call; thereafter `read_key` refills `data`
+# only when the batch drains and yields the batch's keys across successive calls. A regular key
+# returns its byte; an arrow (the 3-byte ESC `[` A/B/C/D sequence, whole within one batch) returns
+# `key_up`/`key_down`/…; end of input returns `key_eof`.
+pub const read_key = (*[Uint8] data, *[Uint8] meta, Uarch cap): Iarch -> {
+	let Iarch pos = Iarch(meta[0])
+	let Iarch len = Iarch(meta[1])
 
-	if n <= 0 then return key_eof
+	if pos >= len then {
+		const Iarch n = read_stdin(data, cap)
 
-	if n >= 3 && Iarch(buf[0]) == 27 && Iarch(buf[1]) == 91 then {
-		const Iarch d = Iarch(buf[2])
+		if n <= 0 then return key_eof
+
+		len = n
+		pos = 0
+	}
+
+	const Iarch b0 = Iarch(data[pos])
+
+	if b0 == 27 && len - pos >= 3 && Iarch(data[pos + 1]) == 91 then {
+		const Iarch d = Iarch(data[pos + 2])
+
+		meta[0] = Uint8(pos + 3)
+		meta[1] = Uint8(len)
 
 		if d == 65 then return key_up
 		if d == 66 then return key_down
@@ -81,7 +98,10 @@ pub const read_key! = (): Iarch -> {
 		return key_esc
 	}
 
-	return Iarch(buf[0])
+	meta[0] = Uint8(pos + 1)
+	meta[1] = Uint8(len)
+
+	return b0
 }
 
 # The terminal window size in character cells, queried on stdout via TIOCGWINSZ (an 8-byte `winsize`:
