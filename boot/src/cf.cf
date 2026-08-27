@@ -13,32 +13,11 @@
 #
 #   cf <input.cf> <out.qbe> <out.s>
 
-import std::data::{ Either }
 import std::str::{ eq }
-import std::io::console::{ die }
-import std::io::file::{ create, close }
-import std::io::fd::{ Fd, IoRrr }
 import cli::{ Cli, cli_parse, FmtCli, is_fmt_cmd, fmt_cli_parse }
 import fmt::{ format_file! }
 import docs::{ docs_run! }
-import std::compiler::ast::{ Program }
-import std::compiler::resolve::{ resolve_program! }
-import std::compiler::monomorph::{ mono_program! }
-import std::compiler::materialize::{ materialize_program!, Mat }
-import std::compiler::typecheck::{ check_program! }
-import std::compiler::alloc::{ check_alloc_program!, check_root_program! }
-import std::compiler::hoist_defertap::{ hoist_defertaps! }
-import std::compiler::defer::{ lower_defers! }
-import std::compiler::closures::{ lift_program! }
-import std::compiler::routing::{
-	routing_tables!,
-	routing_check!,
-	routing_dump!,
-	check_destroy!,
-	check_geom_escape!,
-	RouteInfo,
-}
-import std::compiler::emit::{ emit_program! }
+import std::compiler::{ compile! }
 import std::mem::arena::growing_arena
 
 pub const main = ([Str] args) -> {
@@ -60,93 +39,20 @@ pub const main = ([Str] args) -> {
 	}
 
 	# cf runs its whole compilation under ONE growing arena grafted from the root page (memory_model
-	# §2, §4): main itself holds no residue on the root, and every allocating pass runs `in a`, so the
-	# AST, the instances, and the emitted text all live in `a`. The arena grows from the page as needed
-	# (16 MiB initial), and is reclaimed wholesale at process exit — the compiler's own geometry.
+	# §2, §4): main itself holds no residue on the root, and the pipeline runs `in a`, so the AST, the
+	# instances, and the emitted text all live in `a`. The arena grows from the page as needed (16 MiB
+	# initial), and is reclaimed wholesale at process exit — the compiler's own geometry. The pipeline
+	# itself is `std::compiler::compile!`; main only parses the command line and hands it the arena.
 	const a = growing_arena::of(16777216)
 	const Cli c = cli_parse(args) in a
 
-	# front end: resolve the entry module and its transitive imports (lexing and parsing
-	# each) into one flattened AST — module_system §8
-	const Str inp = c.input
-	const Program raw = resolve_program!(inp, c.target_os, c.target_arch) in a
-
-	# the `!` allocation algebra, checked both ways (memory_model §5) — UNCONDITIONAL: the whole
-	# tree (compiler + lib + corpus) is colored, so there is no flag. Run PRE-mono so the color is
-	# per SOURCE function (a generic that may allocate in any instantiation is `!` once).
-	check_alloc_program!(raw) in a
-
-	# root-allocation validation (memory_model §2): reject residue placed on the ROOT page —
-	# UNCONDITIONAL, no flag. Every program must run its allocating work `in` some arena; only the
-	# entry floor (cf_build_args, pre-main) may touch the page. In ZERO-ROOT mode (`--root-size 0` on
-	# `Bare`), the rule tightens to reject ANY page use at all — direct residue in `main` and arena
-	# grafts alike — so the binary provably never dynamically allocates.
-	const Bool zero_root = eq(c.target_os, "Bare") && c.root_size == 0
-	check_root_program!(raw, zero_root) in a
-
-	# monomorphize generic functions into concrete instances (type_system §8.1) — after this
-	# the program has no generic templates, only ordinary functions
-	const Program mono = mono_program!(raw) in a
-
-	# the Materialize substep of the Memory arc (geometry_lowering §2): duplicate per
-	# (fn × geometry) under the std-source geometries, retarget the `in b` seed calls, and
-	# mint per-type value-hook instances from the PRE-mono templates (`raw` still holds
-	# them). Runs before typecheck so every minted body is checked, lowered, and routed
-	# like hand-written source. A program that touches no std-source geometry passes
-	# through untouched (one name scan).
-	const Mat mm = materialize_program!(mono, raw) in a
-	const Program prog = mm.prog
-
-	# middle: typecheck (rejects type errors before any output is produced)
-	check_program!(prog) in a
-
-	# lift `defer`-tap VALUES (`defer f(x)` / `|> defer f`) out of expression position into a
-	# snapshot binding + a scheduled `defer` statement (memory_model §6) — before lower_defers, so
-	# the emitted `Stmt.Defer`s are lowered like any other
-	const Program tapped = hoist_defertaps!(prog) in a
-
-	# lower `defer` to explicit scope-exit code (memory_model §6): rewrite each `return e` in a
-	# defer-bearing function to snapshot the value, run the pending defers (LIFO), then return —
-	# before the closure lift, so a `defer f()` calling a local closure is a plain call site
-	const Program deferred = lower_defers!(tapped) in a
-
-	# lower local closures to top-level functions with hidden capture parameters (memory_model
-	# §7) — after typecheck (which validated them), before emit
-	const Program lowered = lift_program!(deferred) in a
-
-	# the residue/survivor classification (memory_model §5, geometry_lowering §2-§3), computed
-	# ONCE: the same tables feed the oracle tripwire (every `!`-oracle escape must appear in the
-	# shadow sets — a divergence is a compiler bug), the `--dump-routing` inspection hatch, and
-	# emit's classification-at-birth routing (the duplex node's whole soundness story).
-	const RouteInfo ri = routing_tables!(lowered) in a
-	routing_check!(lowered, ri) in a
-	# reject an unsound `<geom>::destroy(b)` — one whose child `b` escapes its frame (geometry_lowering
-	# §3): the teardown would dangle the escaped value. Uses the survivor sets routing just computed.
-	check_destroy!(lowered, ri) in a
-	# reject a geometry handle that escapes its constructing frame (geometry_lowering §1): a
-	# `<geom>::of(...)` node must be spent in place, never returned/rehomed, so materialize can
-	# always trace an `... in h` ambient to its constructor (no runtime-dispatch `cf_alloc` fallback).
-	check_geom_escape!(lowered) in a
-	if c.dump_routing then routing_dump!(lowered, ri) in a
-
-	# back end: emit QBE IL + the asm floor to the two output paths
-	const Fd qf = opened(create(c.out_qbe), "cf: cannot create the QBE output\n")
-	const Fd af = opened(create(c.out_asm), "cf: cannot create the asm output\n")
-
-	emit_program!(lowered, ri, mm.names, mm.geoms, qf, af, c.target_os, c.root_size) in a
-	close(qf)
-	close(af)
-
-	return 0
-}
-
-# Extract the opened `Fd` from `create`'s outcome, or `die` with `msg` if it failed. `die` never
-# returns (it exits), so the trailing `<- Fd(...)` is a nominal yield that satisfies the arm's type.
-const opened = (Either[IoRrr, Fd] r, Str msg): Fd -> match r {
-	Either.Left(e) -> {
-		die(msg)
-
-		<- Fd({ n: Uarch(0) })
-	},
-	Either.Right(fd) -> fd,
+	return compile!(
+		c.input,
+		c.out_qbe,
+		c.out_asm,
+		c.target_os,
+		c.target_arch,
+		c.root_size,
+		c.dump_routing,
+	) in a
 }

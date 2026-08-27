@@ -1,0 +1,137 @@
+# std::compiler — the cf compiler as a library.
+#
+# The whole compile pipeline the ratified specs pin — resolve, check, monomorphize,
+# materialize, typecheck, lower, route, emit — behind one call. The `cf` binary is a thin
+# CLI over this facade (boot/src/cf.cf); any cf program can `import std::compiler::{ compile! }`
+# and drive the same pipeline. The individual stages remain importable as `std::compiler::<stage>`
+# for tools that need finer control.
+
+import std::data::{ Either }
+import std::str::{ eq }
+import std::io::console::{ die }
+import std::io::file::{ create, close }
+import std::io::fd::{ Fd, IoRrr }
+import std::compiler::ast::{ Program }
+import std::compiler::resolve::{ resolve_program! }
+import std::compiler::monomorph::{ mono_program! }
+import std::compiler::materialize::{ materialize_program!, Mat }
+import std::compiler::typecheck::{ check_program! }
+import std::compiler::alloc::{ check_alloc_program!, check_root_program! }
+import std::compiler::hoist_defertap::{ hoist_defertaps! }
+import std::compiler::defer::{ lower_defers! }
+import std::compiler::closures::{ lift_program! }
+import std::compiler::routing::{
+	routing_tables!,
+	routing_check!,
+	routing_dump!,
+	check_destroy!,
+	check_geom_escape!,
+	RouteInfo,
+}
+import std::compiler::emit::{ emit_program! }
+
+# Compile one entry module to QBE IL + an asm floor at `out_qbe`/`out_asm`, targeting
+# `<target_os>-<target_arch>` with a `root_size`-byte root page (`dump_routing` prints the
+# residue/survivor tables). Returns 0. Allocation runs in the caller's ambient arena — the pass
+# products (AST, instances, emitted text) live there and are reclaimed wholesale on scope exit,
+# so the caller grafts one growing arena and spends this call `in` it (memory_model §2, §4).
+#
+# The pipeline mirrors the ratified order (order_of_compilation): resolve the entry and its
+# transitive imports into one flattened AST, run the `!` allocation algebra and root-page checks
+# PRE-mono (so the color is per SOURCE function), monomorphize, Materialize the std-source
+# geometries, typecheck, hoist defer-taps, lower defers, lift closures, compute the routing tables
+# ONCE (feeding the oracle tripwire, `--dump-routing`, and emit's classification-at-birth), reject
+# unsound geometry teardown/escape, then emit. Compile errors `die` with a diagnostic; only the two
+# output-file opens surface as recoverable failures here (also via `die`).
+pub const compile! = (
+	Str input,
+	Str out_qbe,
+	Str out_asm,
+	Str target_os,
+	Str target_arch,
+	Iarch root_size,
+	Bool dump_routing,
+): Iarch -> {
+	# front end: resolve the entry module and its transitive imports (lexing and parsing
+	# each) into one flattened AST — module_system §8
+	const Program raw = resolve_program!(input, target_os, target_arch)
+
+	# the `!` allocation algebra, checked both ways (memory_model §5) — UNCONDITIONAL: the whole
+	# tree (compiler + lib + corpus) is colored, so there is no flag. Run PRE-mono so the color is
+	# per SOURCE function (a generic that may allocate in any instantiation is `!` once).
+	check_alloc_program!(raw)
+
+	# root-allocation validation (memory_model §2): reject residue placed on the ROOT page —
+	# UNCONDITIONAL, no flag. Every program must run its allocating work `in` some arena; only the
+	# entry floor (cf_build_args, pre-main) may touch the page. In ZERO-ROOT mode (`--root-size 0` on
+	# `Bare`), the rule tightens to reject ANY page use at all — direct residue in `main` and arena
+	# grafts alike — so the binary provably never dynamically allocates.
+	const Bool zero_root = eq(target_os, "Bare") && root_size == 0
+	check_root_program!(raw, zero_root)
+
+	# monomorphize generic functions into concrete instances (type_system §8.1) — after this
+	# the program has no generic templates, only ordinary functions
+	const Program mono = mono_program!(raw)
+
+	# the Materialize substep of the Memory arc (geometry_lowering §2): duplicate per
+	# (fn × geometry) under the std-source geometries, retarget the `in b` seed calls, and
+	# mint per-type value-hook instances from the PRE-mono templates (`raw` still holds
+	# them). Runs before typecheck so every minted body is checked, lowered, and routed
+	# like hand-written source. A program that touches no std-source geometry passes
+	# through untouched (one name scan).
+	const Mat mm = materialize_program!(mono, raw)
+	const Program prog = mm.prog
+
+	# middle: typecheck (rejects type errors before any output is produced)
+	check_program!(prog)
+
+	# lift `defer`-tap VALUES (`defer f(x)` / `|> defer f`) out of expression position into a
+	# snapshot binding + a scheduled `defer` statement (memory_model §6) — before lower_defers, so
+	# the emitted `Stmt.Defer`s are lowered like any other
+	const Program tapped = hoist_defertaps!(prog)
+
+	# lower `defer` to explicit scope-exit code (memory_model §6): rewrite each `return e` in a
+	# defer-bearing function to snapshot the value, run the pending defers (LIFO), then return —
+	# before the closure lift, so a `defer f()` calling a local closure is a plain call site
+	const Program deferred = lower_defers!(tapped)
+
+	# lower local closures to top-level functions with hidden capture parameters (memory_model
+	# §7) — after typecheck (which validated them), before emit
+	const Program lowered = lift_program!(deferred)
+
+	# the residue/survivor classification (memory_model §5, geometry_lowering §2-§3), computed
+	# ONCE: the same tables feed the oracle tripwire (every `!`-oracle escape must appear in the
+	# shadow sets — a divergence is a compiler bug), the `--dump-routing` inspection hatch, and
+	# emit's classification-at-birth routing (the duplex node's whole soundness story).
+	const RouteInfo ri = routing_tables!(lowered)
+	routing_check!(lowered, ri)
+	# reject an unsound `<geom>::destroy(b)` — one whose child `b` escapes its frame (geometry_lowering
+	# §3): the teardown would dangle the escaped value. Uses the survivor sets routing just computed.
+	check_destroy!(lowered, ri)
+	# reject a geometry handle that escapes its constructing frame (geometry_lowering §1): a
+	# `<geom>::of(...)` node must be spent in place, never returned/rehomed, so materialize can
+	# always trace an `... in h` ambient to its constructor (no runtime-dispatch `cf_alloc` fallback).
+	check_geom_escape!(lowered)
+	if dump_routing then routing_dump!(lowered, ri)
+
+	# back end: emit QBE IL + the asm floor to the two output paths
+	const Fd qf = opened(create(out_qbe), "cf: cannot create the QBE output\n")
+	const Fd af = opened(create(out_asm), "cf: cannot create the asm output\n")
+
+	emit_program!(lowered, ri, mm.names, mm.geoms, qf, af, target_os, root_size)
+	close(qf)
+	close(af)
+
+	return 0
+}
+
+# Extract the opened `Fd` from `create`'s outcome, or `die` with `msg` if it failed. `die` never
+# returns (it exits), so the trailing `<- Fd(...)` is a nominal yield that satisfies the arm's type.
+const opened = (Either[IoRrr, Fd] r, Str msg): Fd -> match r {
+	Either.Left(e) -> {
+		die(msg)
+
+		<- Fd({ n: Uarch(0) })
+	},
+	Either.Right(fd) -> fd,
+}
