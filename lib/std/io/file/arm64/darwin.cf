@@ -1,16 +1,9 @@
 # File IO for arm64/darwin, over the raw BSD syscalls (read 3, write 4, open 5, close 6).
 #
-# The FALLIBLE, once-per-file operations return `Either[IoRrr, T]`: darwin reports failure as a
-# negative return (the negated errno), so each tests `< 0` once and lifts the result into
-# `Left(IoRrr)` or `Right(value)`. Callers `match` the outcome — no raw negative codes leak past
-# this floor. `open_read` is O_RDONLY (0); `create` is O_WRONLY|O_CREAT|O_TRUNC (darwin 1|0x200|0x400
-# = 1537) mode 0644 (= 420) — the two intents cover the whole need, so the flag soup stays private.
-#
-# The BULK-OUTPUT operations `write_str`/`write_bytes` are FIRE-AND-FORGET, yielding unit: they are
-# the hot path (a compiler emits its IL line by line), and returning an `Either` per line would box a
-# node on every call — the same reason `std::io::console`'s prints yield unit. A failed write to an
-# already-opened descriptor is not recoverable here, so the result is dropped. Reach for a checked
-# write only when one is added; today nothing needs it.
+# Fallible operations return `Either[IoRrr, T]` — darwin returns a negated errno on failure, lifted
+# into `Left`. The open modes are intent-named: `open_read` is O_RDONLY, `create` truncates, and
+# `open_append` appends, so the flag values stay private. The bulk writes are fire-and-forget (they
+# yield unit and drop the count — a failed write to an open descriptor is not recoverable here).
 import std::sys::{ syscall6 }
 import std::data::{ Either }
 import std::io::fd::{ Fd, IoRrr, rrr_of }
@@ -83,9 +76,8 @@ pub const seek = (Fd fd, Iarch off, Iarch whence): Either[IoRrr, Iarch] -> {
 }
 
 # Write a whole Str to a fresh file at `path` (truncating any existing content), then close it.
-# `Left` reports a failed create or close (the two actionable errors); the write itself is
-# fire-and-forget. `Right(0)` on success. The close result is returned directly, so this composes
-# without holding residue.
+# `Left` reports a failed create or close (the write itself is fire-and-forget); `Right(0)` on
+# success.
 pub const write_file = (Str path, Str s): Either[IoRrr, Iarch] -> match create(path) {
 	Either.Left(e) -> Either[IoRrr, Iarch].Left(e),
 	Either.Right(fd) -> {
@@ -106,21 +98,16 @@ pub const append_file = (Str path, Str s): Either[IoRrr, Iarch] -> match open_ap
 	},
 }
 
-# Raw byte read: the kernel's count (0 = EOF) or a negative errno, with no `Either` boxing — for
-# hot bytewise loops like `read_line!`. Passing the `*[Uint8]` buffer to `syscall6`'s `Uarch` operand
-# is the same decay `read` relies on; a `[N Uint8]` local reaches it through this `*[Uint8]` hop.
+# Raw byte read (kernel count / negated errno, no `Either`), for internal bytewise loops. Keyed on an
+# `Fd` or a bare fd number. The `*[Uint8]` parameter is the hop a `[N Uint8]` local needs to reach
+# `syscall6`'s `Uarch` operand (a local array does not coerce to `Uarch` directly).
 const read_raw = (Fd fd, *[Uint8] buf, Uarch n): Iarch -> syscall6(3, fd.n, buf, n, 0, 0, 0)
-
-# Same raw read keyed on a bare fd number (for the internal open→read→close chains that never build
-# an `Fd`). The `[N Uint8]` local reaches `syscall6`'s `Uarch` operand through this `*[Uint8]` hop.
 const read_raw_fd = (Iarch fd, *[Uint8] buf, Uarch n): Iarch -> syscall6(3, Uarch(fd), buf, n, 0, 0, 0)
 
-# Read a whole file at `path` into `buf` (capacity `cap` bytes) in one pass, then close it. `Right(n)`
-# carries the byte count; `n == cap` means the file may be larger than the buffer (truncated) — grow
-# `buf` and retry to be sure. `Left` reports a failed open or read. The caller owns the buffer, so
-# this holds no residue and needs no geometry — it can fill a static or stack buffer with none in
-# scope, because the raw fd rides `syscall6` directly rather than through a residue-holding `Fd`. For
-# an owned `Str` instead of a caller buffer, reach for `read_file!`.
+# Read a whole file at `path` into the caller's `buf` (capacity `cap` bytes) in one pass, then close
+# it. `Right(n)` is the byte count; `n == cap` means the file may be larger than the buffer, so grow
+# it and retry to be sure. `Left` reports a failed open or read. For an owned `Str` instead of a
+# caller buffer, reach for `read_file!`.
 pub const read_file_into = (Str path, *[Uint8] buf, Uarch cap): Either[IoRrr, Iarch] -> {
 	const Iarch fdr = syscall6(5, path.bytes, 0, 0, 0, 0, 0)
 
@@ -135,13 +122,10 @@ pub const read_file_into = (Str path, *[Uint8] buf, Uarch cap): Either[IoRrr, Ia
 	return Either[IoRrr, Iarch].Right(n)
 }
 
-# Read a whole file at `path` into a freshly grown `Str`, then close it. `Right(s)` is the file's
-# bytes as a `Str` — a survivor that rides out to whatever geometry the caller runs this under; `Left`
-# reports a failed open or read. Reads in 4 KiB chunks and grows the result vector, so it fits any
-# size without a caller buffer — but every byte is appended one at a time, so for a hot path or a
-# large file prefer `read_file_into` with your own buffer. It is `!` because of the 4 KiB `chunk`
-# scratch (in-frame residue, reclaimed at exit) — NOT because of the result: a survivor never colours
-# a function `!`.
+# Read a whole file at `path` into an owned `Str`, then close it. `Right(s)` is the file's bytes;
+# `Left` reports a failed open or read. Reads in 4 KiB chunks and grows the result a byte at a time,
+# so it fits any size but is slower than `read_file_into` with your own buffer — prefer that on a hot
+# path or a large file.
 pub const read_file! = (Str path): Either[IoRrr, Str] -> {
 	const Iarch fdr = syscall6(5, path.bytes, 0, 0, 0, 0, 0)
 
@@ -181,10 +165,9 @@ pub const read_file! = (Str path): Either[IoRrr, Str] -> {
 
 # Read one line from `fd` into `buf` (capacity `cap` bytes), up to but excluding the newline, which
 # is consumed. `Right(n)` for n >= 0 is a line of `n` bytes (0 = a bare blank line); `Right(-1)` is
-# end of input — nothing more to read — so a caller distinguishes EOF from a blank line. `Left` is a
-# read error. Reads a byte at a time through `read_raw` (no per-byte `Either` boxing), so it needs no
-# geometry beyond its own one-byte scratch. A line longer than `cap` fills the buffer and stops; the
-# rest stays unread for the next call. A final line with no trailing newline still yields its bytes.
+# end of input, so a caller distinguishes EOF from a blank line; `Left` is a read error. A line longer
+# than `cap` fills the buffer and stops, leaving the rest for the next call; a final line with no
+# trailing newline still yields its bytes.
 pub const read_line! = (Fd fd, *[Uint8] buf, Uarch cap): Either[IoRrr, Iarch] -> {
 	let [1 Uint8] one = [0]
 	let Iarch i = 0
