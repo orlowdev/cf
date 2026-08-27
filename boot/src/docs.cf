@@ -176,6 +176,28 @@ const has_exact = ([Def] all, Str q): Bool -> {
 # The visible rows for a list, given the terminal height (a sane default off a real terminal).
 const visible_rows = (Iarch rows): Iarch -> if rows > 8 then rows - 5 else 20
 
+# `s` padded with spaces (or truncated) to exactly `width` columns — for a full-width status bar.
+const pad_to = (Str s, Iarch width): Str -> {
+	let [Uint8] out = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(s.len) then break
+		if i >= width then break
+
+		out = [...out, Uint8(Iarch(s[i]))]
+		i = i + 1
+	}
+
+	loop {
+		if Iarch(out.len) >= width then break
+
+		out = [...out, Uint8(32)]
+	}
+
+	return Str({ bytes: out, len: Iarch(out.len) })
+}
+
 # Word-wrap `line` to `width` columns, breaking only at spaces. A line that already fits is returned
 # whole; an over-long single word overflows its row (rare — a long code token). An empty line is
 # preserved.
@@ -353,14 +375,15 @@ const read_body! = (Def d, Iarch width): [Str] -> {
 # The content rows available above the legend (a default off a real terminal).
 const read_vis = (Iarch rows): Iarch -> if rows > 2 then rows - 1 else 200
 
-# The furthest the read view can scroll: the body height minus the window (0 when it all fits).
+# The furthest the read view can scroll. When it overflows, a scrolled view keeps an "above" chip on
+# the top row, so the last screen shows `vis - 1` content lines — hence `h - (vis - 1)`.
 const read_max_scroll! = (Def d, Iarch rows, Iarch width): Iarch -> {
 	const Iarch h = Iarch(read_body!(d, width).len)
 	const Iarch vis = read_vis(rows)
 
-	if h > vis then return h - vis
+	if h <= vis then return 0
 
-	return 0
+	return h - (vis - 1)
 }
 
 const render_read! = (DocState st, [Def] view, Iarch rows, Iarch width): () -> {
@@ -386,19 +409,39 @@ const render_read! = (DocState st, [Def] view, Iarch rows, Iarch width): () -> {
 	if top > maxs then top = maxs
 	if top < 0 then top = 0
 
-	# render body[top .. top+vis]; the last visible row flags any lines still below
-	let Iarch i = top
-	let Iarch shown = 0
+	# a chip on the top/bottom row marks hidden lines in that direction, each consuming one row
+	const Bool above = top > 0
+	const Iarch avail = if above then vis - 1 else vis
+	const Iarch remaining = Iarch(body.len) - top
+	let Bool below = false
+	let Iarch shown = remaining
+
+	if remaining > avail then {
+		below = true
+		shown = avail - 1
+	}
+
+	if above then {
+		reverse!()
+		print(" ${top} more above ")
+		reset!()
+		print("\n")
+	}
+
+	let Iarch k = 0
 
 	loop {
-		if i >= Iarch(body.len) then break
-		if shown >= vis then break
+		if k >= shown then break
 
-		if shown == vis - 1 && i < Iarch(body.len) - 1 then println("  ... (${Iarch(body.len) - i} more — j/k to scroll)")
-			else println(body[i])
+		println(body[top + k])
+		k = k + 1
+	}
 
-		i = i + 1
-		shown = shown + 1
+	if below then {
+		reverse!()
+		print(" ${Iarch(body.len) - top - shown} more below ")
+		reset!()
+		print("\n")
 	}
 
 	return ()
@@ -456,12 +499,12 @@ const render! = (DocState st, [Def] view, Iarch rows, Iarch width): () -> {
 
 	if st.mode == mode_read then render_read!(st, view, rows, width) else render_list!(st, view, rows)
 
-	# the mode's keymap legend, pinned to the bottom row in reverse video (a status bar) — off a real
-	# terminal (rows 0) it just follows the content
+	# the mode's keymap legend, a full-width reverse-video status bar pinned to the bottom row — off a
+	# real terminal (rows 0) it just follows the content
 	if rows >= 2 then move_to!(rows, 1)
 
 	reverse!()
-	print(legend_for(st.mode))
+	print(pad_to(legend_for(st.mode), width))
 	reset!()
 
 	return ()
