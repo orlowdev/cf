@@ -21,7 +21,7 @@
 # trapped. A `defer` body is analyzed in the enclosing frame (its residence is the function's); a
 # closure body is analyzed with its OWN context and a `!` closure colors the function that holds it.
 
-import ast::{
+import std::compiler::ast::{
 	Expr,
 	Stmt,
 	MatchArm,
@@ -34,20 +34,8 @@ import ast::{
 	Func,
 	Program,
 }
+import std::str::{ eq }
 import std::io::console::{ die }
-
-const str_eq = (Str a, Str b): Bool -> {
-	if a.len != b.len then return false
-	let Iarch i = 0
-
-	loop {
-		if i >= Iarch(a.len) then break
-		if Iarch(a[i]) != Iarch(b[i]) then return false
-		i = i + 1
-	}
-
-	return true
-}
 
 # A name carries the allocation marker iff it contains a `!` (byte 33). The marker rides directly
 # after the base name in the source (`alloc!`); monomorphization then appends an instance suffix
@@ -74,7 +62,7 @@ const has_name = ([Str] xs, Str s): Bool -> {
 
 	loop {
 		if i >= Iarch(xs.len) then break
-		if str_eq(xs[i], s) then return true
+		if eq(xs[i], s) then return true
 		i = i + 1
 	}
 
@@ -168,7 +156,7 @@ const union_boxed = ([UnionDecl] unions, Str name): Bool -> {
 
 	loop {
 		if i >= Iarch(unions.len) then break
-		if str_eq(unions[i].name, name) then {
+		if eq(unions[i].name, name) then {
 			let Iarch j = 0
 
 			loop {
@@ -652,6 +640,9 @@ const esc_roots_stmtarms = ([Str] params, [Str] esc, [StmtArm] arms): [Str] -> {
 	return r
 }
 
+# The local names that ESCAPE the frame — returned, yielded, or rehomed into a parameter or an
+# already-escaping aggregate — closed to a fixpoint (a store into an escaping name escapes its
+# stored value in turn). A construction whose value never reaches one of these is trapped residue.
 pub const compute_esc = ([Str] params, [Stmt] body): [Str] -> {
 	let [Str] esc = []
 
@@ -793,7 +784,7 @@ const find_func = ([Func] funcs, Str name): Iarch -> {
 
 	loop {
 		if i >= Iarch(funcs.len) then break
-		if str_eq(funcs[i].name, name) then return i
+		if eq(funcs[i].name, name) then return i
 		i = i + 1
 	}
 
@@ -915,7 +906,7 @@ const stmt_calls_bang = ([Func] funcs, [Bool] bang, [Str] params, Stmt s): Bool 
 	_ -> false,
 }
 
-const is_main = (Func f): Bool -> str_eq(f.name, "main")
+const is_main = (Func f): Bool -> eq(f.name, "main")
 
 # The color of every function, as a `[Bool]` parallel to `prog.funcs`. Seeded bottom-up from local
 # residue (an asm/intrinsic body cannot be analyzed, so its declared marker is TRUSTED), then the
@@ -990,7 +981,7 @@ pub const check_alloc_program! = (Program prog) -> {
 # holds trapped residue, that residue would land on the root — a compile error. An `in`-grafted
 # call's ARGUMENTS still evaluate in the caller's ambient, so they keep propagating.
 const bare_calls_expr = (Expr e): [Str] -> match e {
-	Expr.Call(n, _, args, g) -> if str_eq(g, "")
+	Expr.Call(n, _, args, g) -> if eq(g, "")
 		then cat_s(exl_one_s(n), bare_calls_list(args))
 		else bare_calls_list(args),
 	Expr.DeferTap(_, args) -> bare_calls_list(args),
@@ -1089,6 +1080,10 @@ const root_ambient_set! = (Program prog): [Str] -> {
 	return r
 }
 
+# Enforce the root-page rule (memory_model §2): reject a `!` function reached from `main` by BARE
+# (non-`in`) calls — residue must run under a grafted geometry, never on the root page. In
+# `zero_root` mode the root has no bytes, so it tightens to reject ANY page use: an arena graft or
+# a root-ambient function that constructs residue on the page.
 pub const check_root_program! = (Program prog, Bool zero_root) -> {
 	const [Func] funcs = prog.funcs
 	const [Str] root = root_ambient_set!(prog)

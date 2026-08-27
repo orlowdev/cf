@@ -1,0 +1,141 @@
+# docs::keys — amend the `DocState` in place for a keystroke.
+#
+# Each dispatcher mutates `*st` for one mode; `dispatch` routes to the right one. The loop then
+# re-renders the amended state. A key with no binding in the current mode leaves `st` untouched.
+# `viewlen`/`maxscroll` are passed in because clamping the selection / scroll needs the rendered
+# view's size, which the loop already computed. `st.all` is never written — only query/mode/sel/scroll.
+import docs::state::{ DocState, Mode, query_cap, put_query_byte }
+import std::io::term::{ key_up, key_down, key_enter, key_esc }
+
+# The Enter key is CR (13) on a raw terminal, but a terminal's ICRNL maps it to LF (10) on input;
+# accept either.
+const is_enter = (Iarch key): Bool -> key == key_enter || key == 10
+
+# SEARCH mode: printable keys edit the query, backspace deletes, and Enter/arrows drop into the list.
+# Every edit resets the selection to the top (the ranked view changes under it); `esc` does nothing —
+# search is the root mode.
+const dispatch_search = (*DocState st, Iarch key): () -> {
+	if is_enter(key) || key == key_up || key == key_down then {
+		st.mode = Mode.Select
+		st.sel = 0
+		st.scroll = 0
+
+		return
+	}
+
+	# 127 = DEL, 8 = BS — either backspaces the query (drop the last byte in place)
+	if key == 127 || key == 8 then {
+		if st.qlen > 0 then st.qlen = st.qlen - 1
+		st.sel = 0
+		st.scroll = 0
+
+		return
+	}
+
+	# a printable ASCII byte types into the query — written into the inline buffer in place and the
+	# length bumped. The `qlen < query_cap()` guard is load-bearing: `put_query_byte` writes through
+	# a raw (unchecked) pointer, so a write at index `query_cap()` would clobber the adjacent `qlen`
+	# field — past the cap, further printable keys are ignored until a backspace frees room.
+	if key >= 32 && key <= 126 && st.qlen < query_cap() then {
+		put_query_byte(st.query, st.qlen, key)
+		st.qlen = st.qlen + 1
+		st.sel = 0
+		st.scroll = 0
+	}
+}
+
+# SELECT mode: j/k or the arrows move the highlight (clamped to `viewlen`), Enter opens READ, `i`/`s`
+# or `esc` return to search, `r` resets the query.
+const dispatch_select = (*DocState st, Iarch key, Iarch viewlen): () -> {
+	if key == key_up || key == 107 then {
+		let Iarch ns = st.sel - 1
+
+		if ns < 0 then ns = 0
+
+		st.sel = ns
+		st.scroll = 0
+
+		return
+	}
+
+	if key == key_down || key == 106 then {
+		let Iarch ns = st.sel + 1
+
+		if ns >= viewlen then ns = viewlen - 1
+		if ns < 0 then ns = 0
+
+		st.sel = ns
+		st.scroll = 0
+
+		return
+	}
+
+	if is_enter(key) then {
+		st.mode = Mode.Read
+		st.scroll = 0
+
+		return
+	}
+
+	if key == 114 then st.qlen = 0
+
+	if key == 105 || key == 115 || key == 114 || key == key_esc then {
+		st.mode = Mode.Search
+		st.sel = 0
+		st.scroll = 0
+	}
+}
+
+# READ mode: j/k or the arrows scroll (clamped to `maxscroll`), `esc` returns to the SELECT list, `i`/`s`
+# jump to search (keeping the selection), `r` resets the query.
+const dispatch_read = (*DocState st, Iarch key, Iarch maxscroll): () -> {
+	if key == key_esc then {
+		st.mode = Mode.Select
+		st.scroll = 0
+
+		return
+	}
+
+	if key == 105 || key == 115 then {
+		st.mode = Mode.Search
+		st.scroll = 0
+
+		return
+	}
+
+	if key == 114 then {
+		st.qlen = 0
+		st.mode = Mode.Search
+		st.sel = 0
+		st.scroll = 0
+
+		return
+	}
+
+	if key == key_down || key == 106 then {
+		let Iarch ns = st.scroll + 1
+
+		if ns > maxscroll then ns = maxscroll
+
+		st.scroll = ns
+
+		return
+	}
+
+	if key == key_up || key == 107 then {
+		let Iarch ns = st.scroll - 1
+
+		if ns < 0 then ns = 0
+
+		st.scroll = ns
+	}
+}
+
+# Route a keystroke to the dispatcher for the current mode, amending `st` in place.
+pub const dispatch = (*DocState st, Iarch key, Iarch viewlen, Iarch maxscroll): () -> {
+	match st.mode {
+		Mode.Search -> dispatch_search(st, key),
+		Mode.Select -> dispatch_select(st, key, viewlen),
+		Mode.Read -> dispatch_read(st, key, maxscroll),
+	}
+}

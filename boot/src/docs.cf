@@ -1,11 +1,25 @@
-# docs — the interactive `cf docs` browser.
+# docs — the interactive `cf docs` browser: entry point and event loop.
 #
 # Three modes over the definitions `docscan` reads live from the standard library. SEARCH: type to
 # filter, the matches ranked by a fuzzy score. SELECTION: move the highlight with the arrows or j/k.
-# READ: the selected definition's signature and doc comment. Enter/esc/arrows move between modes;
-# `i`/`s` jump back to search, `r` resets the query, Ctrl-C exits (restoring the terminal first).
-import docscan::{ Def, Member, scan_std!, split_lines }
-import std::str::{ fuzzy_score, no_match, eq }
+# READ: the selected definition's man-style page. Enter/esc/arrows move between modes; `i`/`s` jump
+# back to search, `r` resets the query, Ctrl-C exits (restoring the terminal first).
+#
+# The browser is split across `docs/`:
+#   state    — the `DocState` model + mode constants + in-place query editing
+#   synopsis — parse a definition's signature into structured synopsis pieces
+#   text     — word-wrap, doc-comment Markdown, padding
+#   search   — fuzzy-filter the corpus (`ranked!`, `has_exact`)
+#   page     — build a definition's read-view body + its scroll geometry
+#   render   — draw a frame (list / read page / status bar)
+#   keys     — turn a keystroke into the next `DocState`
+# This file only wires them into the read → key → dispatch loop.
+import docscan::{ Def, scan_std! }
+import docs::state::{ DocState, Mode, query_cap, query_str, put_query_byte }
+import docs::search::{ ranked!, has_exact }
+import docs::page::{ read_max_scroll! }
+import docs::render::{ render! }
+import docs::keys::{ dispatch }
 import std::io::term::{
 	raw_mode!,
 	restore,
@@ -14,654 +28,8 @@ import std::io::term::{
 	clear!,
 	hide_cursor!,
 	show_cursor!,
-	reverse!,
-	reset!,
-	move_to!,
 	TermSize,
-	key_up,
-	key_down,
-	key_enter,
-	key_esc,
 	key_eof,
-}
-import std::io::console::{ print, println }
-
-pub const mode_search = 0
-pub const mode_select = 1
-pub const mode_read = 2
-
-# The keymap legend for each mode, shown at the bottom of the window (the keys really do differ by
-# mode — j/k type in search, esc has nothing to go back to there).
-const legend_search = "[type] filter   [down/enter] select   [ctrl-c] quit"
-const legend_select = "[j/k up/dn] move   [enter] read   [i/esc] search   [r] reset   [ctrl-c] quit"
-const legend_read = "[j/k up/dn] scroll   [esc] back   [i] search   [r] reset   [ctrl-c] quit"
-
-const legend_for = (Iarch mode): Str -> {
-	if mode == mode_search then return legend_search
-	if mode == mode_select then return legend_select
-
-	return legend_read
-}
-
-# The browser state: every definition, the current query, the mode, the highlighted row (an index
-# into the filtered view), and the read-view scroll offset (top line shown, 0 in the list modes).
-data DocState = { [Def] all, Str query, Iarch mode, Iarch sel, Iarch scroll }
-
-# Append the byte `b` to `s` as a character (interpolation would render a byte as a decimal number).
-const append_char = (Str s, Iarch b): Str -> {
-	let [Uint8] out = []
-	let Iarch i = 0
-
-	loop {
-		if i >= Iarch(s.len) then break
-
-		out = [...out, Uint8(Iarch(s[i]))]
-		i = i + 1
-	}
-
-	out = [...out, Uint8(b)]
-
-	return Str({ bytes: out, len: Iarch(out.len) })
-}
-
-# The signature up to (not including) its body: everything before the last ` ->` (a function) or the
-# ` = {` (a data/union, whose members are shown in their own section) — whichever the line has.
-const sig_head = (Str sig): Str -> {
-	let Iarch cut = -1
-	let Iarch i = 0
-
-	loop {
-		if i + 3 >= Iarch(sig.len) then break
-
-		# ` -> ` — a function body arrow
-		if Iarch(sig[i]) == 32 && Iarch(sig[i + 1]) == 45 && Iarch(sig[i + 2]) == 62 then cut = i
-		# ` = {` — an aggregate body; take the first (there is at most one)
-		if Iarch(sig[i]) == 32 && Iarch(sig[i + 1]) == 61 && Iarch(sig[i + 2]) == 32 && Iarch(sig[i + 3]) == 123 && cut < 0
-			then cut = i
-
-		i = i + 1
-	}
-
-	if cut < 0 then return sig
-
-	let [Uint8] out = []
-	let Iarch j = 0
-
-	loop {
-		if j >= cut then break
-
-		out = [...out, Uint8(Iarch(sig[j]))]
-		j = j + 1
-	}
-
-	return Str({ bytes: out, len: Iarch(out.len) })
-}
-
-# Drop the last character of `s` (backspace).
-const drop_last = (Str s): Str -> {
-	if Iarch(s.len) == 0 then return s
-
-	let [Uint8] out = []
-	let Iarch i = 0
-	const Iarch keep = Iarch(s.len) - 1
-
-	loop {
-		if i >= keep then break
-
-		out = [...out, Uint8(Iarch(s[i]))]
-		i = i + 1
-	}
-
-	return Str({ bytes: out, len: Iarch(out.len) })
-}
-
-# The filtered, ranked view of `all` for `query`: every definition whose name fuzzy-matches, ordered
-# by score descending (a selection sort — the corpus is small). An empty query lists everything.
-const ranked! = ([Def] all, Str query): [Def] -> {
-	if Iarch(query.len) == 0 then return all
-
-	let [Bool] used = []
-	let Iarch z = 0
-
-	loop {
-		if z >= Iarch(all.len) then break
-
-		used = [...used, false]
-		z = z + 1
-	}
-
-	let [Def] out = []
-
-	loop {
-		let Iarch best = -1
-		let Iarch best_score = no_match
-		let Iarch i = 0
-
-		loop {
-			if i >= Iarch(all.len) then break
-
-			if !used[i] then {
-				const Iarch sc = fuzzy_score(query, all[i].name)
-
-				if sc > no_match && sc > best_score then {
-					best_score = sc
-					best = i
-				}
-			}
-
-			i = i + 1
-		}
-
-		if best < 0 then break
-
-		used[best] = true
-		out = [...out, all[best]]
-	}
-
-	return out
-}
-
-# Is `q` the exact name of some definition?
-const has_exact = ([Def] all, Str q): Bool -> {
-	let Iarch i = 0
-
-	loop {
-		if i >= Iarch(all.len) then break
-		if eq(all[i].name, q) then return true
-
-		i = i + 1
-	}
-
-	return false
-}
-
-# --- rendering ---------------------------------------------------------------
-
-# The visible rows for a list, given the terminal height (a sane default off a real terminal).
-const visible_rows = (Iarch rows): Iarch -> if rows > 8 then rows - 5 else 20
-
-# A run of `n` spaces.
-const spaces = (Iarch n): Str -> {
-	let [Uint8] out = []
-	let Iarch i = 0
-
-	loop {
-		if i >= n then break
-
-		out = [...out, Uint8(32)]
-		i = i + 1
-	}
-
-	return Str({ bytes: out, len: Iarch(out.len) })
-}
-
-# Print a centered, highlighted chip on its own row: a reverse-video ` text ` pill leading-padded to
-# the horizontal middle of `width`.
-const print_chip! = (Str text, Iarch width): () -> {
-	let Iarch pad = (width - (Iarch(text.len) + 2)) / 2
-
-	if pad < 0 then pad = 0
-
-	print(spaces(pad))
-	reverse!()
-	print(" ")
-	print(text)
-	print(" ")
-	reset!()
-	print("\n")
-
-	return ()
-}
-
-# `s` padded with spaces (or truncated) to exactly `width` columns — for a full-width status bar.
-const pad_to = (Str s, Iarch width): Str -> {
-	let [Uint8] out = []
-	let Iarch i = 0
-
-	loop {
-		if i >= Iarch(s.len) then break
-		if i >= width then break
-
-		out = [...out, Uint8(Iarch(s[i]))]
-		i = i + 1
-	}
-
-	loop {
-		if Iarch(out.len) >= width then break
-
-		out = [...out, Uint8(32)]
-	}
-
-	return Str({ bytes: out, len: Iarch(out.len) })
-}
-
-# Word-wrap `line` to `width` columns, breaking only at spaces. A line that already fits is returned
-# whole; an over-long single word overflows its row (rare — a long code token). An empty line is
-# preserved.
-const word_wrap = (Str line, Iarch width): [Str] -> {
-	let [Str] out = []
-
-	if Iarch(line.len) == 0 then {
-		out = [...out, line]
-
-		return out
-	}
-
-	let [Uint8] cur = []
-	let Iarch curlen = 0
-	let Iarch i = 0
-
-	loop {
-		if i >= Iarch(line.len) then break
-
-		const Iarch ws = i
-
-		loop {
-			if i >= Iarch(line.len) then break
-			if Iarch(line[i]) == 32 then break
-
-			i = i + 1
-		}
-
-		const Iarch we = i
-
-		loop {
-			if i >= Iarch(line.len) then break
-			if Iarch(line[i]) != 32 then break
-
-			i = i + 1
-		}
-
-		const Iarch wl = we - ws
-
-		if wl > 0 then {
-			if curlen != 0 && curlen + 1 + wl > width then {
-				out = [...out, Str({ bytes: cur, len: curlen })]
-				cur = []
-				curlen = 0
-			}
-
-			if curlen != 0 then {
-				cur = [...cur, Uint8(32)]
-				curlen = curlen + 1
-			}
-
-			let Iarch j = ws
-
-			loop {
-				if j >= we then break
-
-				cur = [...cur, Uint8(Iarch(line[j]))]
-				j = j + 1
-			}
-
-			curlen = curlen + wl
-		}
-	}
-
-	if curlen > 0 then out = [...out, Str({ bytes: cur, len: curlen })]
-
-	return out
-}
-
-# A fenced-code-block delimiter: a line beginning (at column 0) with three backticks.
-const is_fence = (Str ln): Bool ->
-	Iarch(ln.len) >= 3 && Iarch(ln[0]) == 96 && Iarch(ln[1]) == 96 && Iarch(ln[2]) == 96
-
-# Wrap a doc comment to `width` with simplistic Markdown: consecutive non-empty source lines glue into
-# a paragraph (joined with a space) which is word-wrapped, and empty lines keep paragraph separation.
-# A ``` fence at the start of a line opens a code block whose lines are emitted VERBATIM (unwrapped)
-# until the closing ```; the fence lines themselves are not shown.
-const wrap_doc! = (Str doc, Iarch width): [Str] -> {
-	const [Str] lines = split_lines(doc)
-	let [Str] out = []
-	let [Uint8] para = []
-	let Iarch paralen = 0
-	let Bool have = false
-	let Bool in_code = false
-	let Iarch i = 0
-
-	loop {
-		if i >= Iarch(lines.len) then break
-
-		const Str ln = lines[i]
-
-		if is_fence(ln) then {
-			if have then {
-				const [Str] w = word_wrap(Str({ bytes: para, len: paralen }), width)
-
-				for x in w {
-					out = [...out, x]
-				}
-
-				para = []
-				paralen = 0
-				have = false
-			}
-
-			in_code = !in_code
-		} else if in_code then {
-			out = [...out, ln]
-		} else if Iarch(ln.len) == 0 then {
-			if have then {
-				const [Str] w = word_wrap(Str({ bytes: para, len: paralen }), width)
-
-				for x in w {
-					out = [...out, x]
-				}
-
-				para = []
-				paralen = 0
-				have = false
-			}
-
-			out = [...out, ln]
-		} else {
-			if have then {
-				para = [...para, Uint8(32)]
-				paralen = paralen + 1
-			}
-
-			let Iarch k = 0
-
-			loop {
-				if k >= Iarch(ln.len) then break
-
-				para = [...para, Uint8(Iarch(ln[k]))]
-				k = k + 1
-			}
-
-			paralen = paralen + Iarch(ln.len)
-			have = true
-		}
-
-		i = i + 1
-	}
-
-	if have then {
-		const [Str] w = word_wrap(Str({ bytes: para, len: paralen }), width)
-
-		for x in w {
-			out = [...out, x]
-		}
-	}
-
-	return out
-}
-
-# The content lines of a definition's read view — the man-style NAME / SYNOPSIS / DESCRIPTION layout,
-# every line already wrapped to `width`. Shared by the renderer and the scroll clamp so both measure
-# the same height.
-const read_body! = (Def d, Iarch width): [Str] -> {
-	let [Str] body = []
-	const [Str] w1 = word_wrap("${d.kind} ${d.name}", width)
-
-	for x in w1 {
-		body = [...body, x]
-	}
-
-	const [Str] w2 = word_wrap(d.module, width)
-
-	for x in w2 {
-		body = [...body, x]
-	}
-
-	body = [...body, ""]
-	body = [...body, "SYNOPSIS"]
-	body = [...body, ""]
-
-	const [Str] w3 = word_wrap(sig_head(d.sig), width)
-
-	for x in w3 {
-		body = [...body, x]
-	}
-
-	body = [...body, ""]
-	body = [...body, "DESCRIPTION"]
-	body = [...body, ""]
-
-	if Iarch(d.doc.len) == 0 then body = [...body, "No info"] else {
-		const [Str] dl = wrap_doc!(d.doc, width)
-
-		for line in dl {
-			body = [...body, line]
-		}
-	}
-
-	# a MEMBERS section for data/union: each field/variant, a blank line, then its comment (wrapped) or
-	# "No info", and a blank line separating the next member
-	if eq(d.kind, "data") || eq(d.kind, "union") then {
-		body = [...body, ""]
-		body = [...body, "MEMBERS"]
-		body = [...body, ""]
-
-		const [Member] mems = d.members
-
-		for m in mems {
-			body = [...body, m.name]
-			body = [...body, ""]
-
-			if Iarch(m.info.len) == 0 then body = [...body, "No info"] else {
-				const [Str] iw = wrap_doc!(m.info, width)
-
-				for x in iw {
-					body = [...body, x]
-				}
-			}
-
-			body = [...body, ""]
-		}
-	}
-
-	return body
-}
-
-# The content rows available above the legend (a default off a real terminal).
-const read_vis = (Iarch rows): Iarch -> if rows > 2 then rows - 1 else 200
-
-# The content rows of the read view: the window above the legend (`read_vis`) minus the two reserved
-# chip rows (top and bottom), so the content never shifts as chips appear.
-const read_cwin = (Iarch rows): Iarch -> read_vis(rows) - 2
-
-# The furthest the read view can scroll: the body height minus the content window (0 when it fits).
-const read_max_scroll! = (Def d, Iarch rows, Iarch width): Iarch -> {
-	const Iarch h = Iarch(read_body!(d, width).len)
-	const Iarch cwin = read_cwin(rows)
-
-	if h <= cwin then return 0
-
-	return h - cwin
-}
-
-const render_read! = (DocState st, [Def] view, Iarch rows, Iarch width): () -> {
-	if Iarch(view.len) == 0 then {
-		println("(no definition)")
-
-		return ()
-	}
-
-	let Iarch idx = st.sel
-
-	if idx >= Iarch(view.len) then idx = Iarch(view.len) - 1
-	if idx < 0 then idx = 0
-
-	const Def d = view[idx]
-	const [Str] body = read_body!(d, width)
-	const Iarch cwin = read_cwin(rows)
-
-	# clamp the scroll offset to a valid window
-	let Iarch top = st.scroll
-	const Iarch maxs = read_max_scroll!(d, rows, width)
-
-	if top > maxs then top = maxs
-	if top < 0 then top = 0
-
-	# the top and bottom rows are RESERVED chip slots — a centered highlighted pill when content is
-	# hidden in that direction, an empty line otherwise — so the content area (`cwin` rows) never moves
-	let Iarch shown = Iarch(body.len) - top
-
-	if shown > cwin then shown = cwin
-	if shown < 0 then shown = 0
-
-	const Bool above = top > 0
-	const Bool below = top + shown < Iarch(body.len)
-
-	if above then print_chip!("${top} more above", width) else println("")
-
-	let Iarch k = 0
-
-	loop {
-		if k >= cwin then break
-
-		if k < shown then println(body[top + k]) else println("")
-
-		k = k + 1
-	}
-
-	if below then print_chip!("${Iarch(body.len) - top - shown} more below", width) else println("")
-
-	return ()
-}
-
-const render_list! = (DocState st, [Def] view, Iarch rows): () -> {
-	if st.mode == mode_search then println("cf docs  [search]   ${Iarch(view.len)} matches")
-		else println("cf docs  [select]   ${Iarch(view.len)} matches")
-
-	if st.mode == mode_search then print("/ ") else print("  ")
-
-	print(st.query)
-
-	if st.mode == mode_search then print("_")
-
-	println("")
-	println("")
-
-	if Iarch(view.len) == 0 then {
-		println("  (no matches)")
-
-		return ()
-	}
-
-	const Iarch maxvis = visible_rows(rows)
-	let Iarch start = 0
-
-	if st.sel >= maxvis then start = st.sel - maxvis + 1
-
-	let Iarch i = start
-	let Iarch shown = 0
-
-	loop {
-		if i >= Iarch(view.len) then break
-		if shown >= maxvis then break
-
-		const Def d = view[i]
-
-		if st.mode == mode_select && i == st.sel then {
-			reverse!()
-			println("> ${d.kind} ${d.name}   ${d.module}")
-			reset!()
-		} else {
-			println("  ${d.kind} ${d.name}   ${d.module}")
-		}
-
-		i = i + 1
-		shown = shown + 1
-	}
-
-	return ()
-}
-
-const render! = (DocState st, [Def] view, Iarch rows, Iarch width): () -> {
-	clear!()
-
-	if st.mode == mode_read then render_read!(st, view, rows, width) else render_list!(st, view, rows)
-
-	# the mode's keymap legend, a full-width reverse-video status bar pinned to the bottom row — off a
-	# real terminal (rows 0) it just follows the content
-	if rows >= 2 then move_to!(rows, 1)
-
-	reverse!()
-	print(pad_to(legend_for(st.mode), width))
-	reset!()
-
-	return ()
-}
-
-# --- key dispatch (each returns the next state) ------------------------------
-
-# The Enter key is CR (13) on a raw terminal, but a terminal's ICRNL maps it to LF (10) on input;
-# accept either.
-const is_enter = (Iarch key): Bool -> key == key_enter || key == 10
-
-const dispatch_search = (DocState st, Iarch key): DocState -> {
-	# enter or an arrow moves into the list; esc does nothing here (search is the root)
-	if is_enter(key) || key == key_up || key == key_down
-		then return DocState({ all: st.all, query: st.query, mode: mode_select, sel: 0, scroll: 0 })
-
-	if key == 127 || key == 8
-		then return DocState({ all: st.all, query: drop_last(st.query), mode: mode_search, sel: 0, scroll: 0 })
-
-	if key >= 32 && key <= 126
-		then return DocState({ all: st.all, query: append_char(st.query, key), mode: mode_search, sel: 0, scroll: 0 })
-
-	return st
-}
-
-const dispatch_select = (DocState st, Iarch key, Iarch viewlen): DocState -> {
-	if key == key_up || key == 107 then {
-		let Iarch ns = st.sel - 1
-
-		if ns < 0 then ns = 0
-
-		return DocState({ all: st.all, query: st.query, mode: mode_select, sel: ns, scroll: 0 })
-	}
-
-	if key == key_down || key == 106 then {
-		let Iarch ns = st.sel + 1
-
-		if ns >= viewlen then ns = viewlen - 1
-		if ns < 0 then ns = 0
-
-		return DocState({ all: st.all, query: st.query, mode: mode_select, sel: ns, scroll: 0 })
-	}
-
-	if is_enter(key) then return DocState({ all: st.all, query: st.query, mode: mode_read, sel: st.sel, scroll: 0 })
-	if key == 105 || key == 115 then return DocState({ all: st.all, query: st.query, mode: mode_search, sel: 0, scroll: 0 })
-	if key == 114 then return DocState({ all: st.all, query: "", mode: mode_search, sel: 0, scroll: 0 })
-	if key == key_esc then return DocState({ all: st.all, query: st.query, mode: mode_search, sel: 0, scroll: 0 })
-
-	return st
-}
-
-const dispatch_read = (DocState st, Iarch key, Iarch maxscroll): DocState -> {
-	if key == key_esc then return DocState({ all: st.all, query: st.query, mode: mode_select, sel: st.sel, scroll: 0 })
-	if key == 105 || key == 115 then return DocState({ all: st.all, query: st.query, mode: mode_search, sel: st.sel, scroll: 0 })
-	if key == 114 then return DocState({ all: st.all, query: "", mode: mode_search, sel: 0, scroll: 0 })
-
-	if key == key_down || key == 106 then {
-		let Iarch ns = st.scroll + 1
-
-		if ns > maxscroll then ns = maxscroll
-
-		return DocState({ all: st.all, query: st.query, mode: mode_read, sel: st.sel, scroll: ns })
-	}
-
-	if key == key_up || key == 107 then {
-		let Iarch ns = st.scroll - 1
-
-		if ns < 0 then ns = 0
-
-		return DocState({ all: st.all, query: st.query, mode: mode_read, sel: st.sel, scroll: ns })
-	}
-
-	return st
-}
-
-const dispatch = (DocState st, Iarch key, Iarch viewlen, Iarch maxscroll): DocState -> {
-	if st.mode == mode_search then return dispatch_search(st, key)
-	if st.mode == mode_select then return dispatch_select(st, key, viewlen)
-
-	return dispatch_read(st, key, maxscroll)
 }
 
 # The browser. `args` is the whole command line — `cf docs [<term>]`; a `<term>` prefills the query,
@@ -669,15 +37,27 @@ const dispatch = (DocState st, Iarch key, Iarch viewlen, Iarch maxscroll): DocSt
 pub const docs_run! = ([Str] args): Iarch -> {
 	const [Def] all = scan_std!()
 	let Str q0 = ""
-	let Iarch mode0 = mode_search
+	let Mode mode0 = Mode.Search
 
 	if Iarch(args.len) >= 3 then {
 		q0 = args[2]
 
-		if has_exact(all, q0) then mode0 = mode_read
+		if has_exact(all, q0) then mode0 = Mode.Read
 	}
 
-	let DocState st = DocState({ all: all, query: q0, mode: mode0, sel: 0, scroll: 0 })
+	# the query lives in an INLINE fixed buffer (edited in place, never rebuilt), so it is omitted from
+	# the literal and seeded here from the CLI arg — copied byte-by-byte, capped at the buffer size.
+	let DocState st = DocState({ all: all, qlen: 0, mode: mode0, sel: 0, scroll: 0 })
+	let Iarch qi = 0
+
+	loop {
+		if qi >= Iarch(q0.len) then break
+		if qi >= query_cap() then break
+		put_query_byte(st.query, qi, Iarch(q0[qi]))
+		qi = qi + 1
+	}
+
+	st.qlen = qi
 	let [72 Uint8] tio
 	let [64 Uint8] kdata
 	let [2 Uint8] kmeta = [0, 0]
@@ -686,7 +66,7 @@ pub const docs_run! = ([Str] args): Iarch -> {
 	hide_cursor!()
 
 	loop {
-		const [Def] view = ranked!(st.all, st.query)
+		const [Def] view = ranked!(st.all, query_str(st))
 		const TermSize sz = size!()
 		const Iarch width = if sz.cols > 20 then sz.cols else 80
 
@@ -699,7 +79,7 @@ pub const docs_run! = ([Str] args): Iarch -> {
 		# in read mode, tell the dispatcher how far the current definition can scroll
 		let Iarch maxscroll = 0
 
-		if st.mode == mode_read && Iarch(view.len) > 0 then {
+		if st.mode == Mode.Read && Iarch(view.len) > 0 then {
 			let Iarch ri = st.sel
 
 			if ri >= Iarch(view.len) then ri = Iarch(view.len) - 1
@@ -708,7 +88,7 @@ pub const docs_run! = ([Str] args): Iarch -> {
 			maxscroll = read_max_scroll!(view[ri], sz.rows, width)
 		}
 
-		st = dispatch(st, key, Iarch(view.len), maxscroll)
+		dispatch(&st, key, Iarch(view.len), maxscroll)
 	}
 
 	show_cursor!()

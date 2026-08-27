@@ -9,7 +9,8 @@
 # (`acc = Expr.Add(acc, rhs)`) — one function per precedence level.
 
 import std::io::console::{ die }
-import token::{
+import std::str::{ eq }
+import std::compiler::token::{
 	Token,
 	TokKind,
 	is_eof,
@@ -53,8 +54,8 @@ import token::{
 	is_floatlit,
 	is_pipearrow,
 }
-import lexer::{ lex }
-import ast::{
+import std::compiler::lexer::{ lex }
+import std::compiler::ast::{
 	Expr,
 	Stmt,
 	Param,
@@ -73,7 +74,7 @@ import ast::{
 	Program,
 	with_geom,
 }
-import astutil::{ tel_leaf, tel_nest, tel_fn, tel_is_fn }
+import std::compiler::astutil::{ tel_leaf, tel_nest, tel_fn, tel_is_fn }
 
 # The parse cursor: the token stream, the source (for keyword text), a position.
 pub data Parser = {
@@ -988,7 +989,7 @@ const parse_arm_head! = (*Parser p): MatchArm -> {
 				if !is_ident(peek(p)) then die("cf: parse: expected `Type.member` after `|`\n")
 				const Str q = cur_name!(p)
 				p.pos = p.pos + 1
-				if !str_eq(q, first)
+				if !eq(q, first)
 					then die("cf: parse: or-pattern alternatives must share the union qualifier\n")
 				if !is_dot(peek(p)) then die("cf: parse: expected `.` in an or-pattern alternative\n")
 				p.pos = p.pos + 1
@@ -1009,7 +1010,7 @@ const parse_arm_head! = (*Parser p): MatchArm -> {
 			body: Expr.Lit(0),
 		})
 	}
-	if !str_eq(first, "_") then die("cf: parse: a match-arm pattern is `_` or `Type.member`\n")
+	if !eq(first, "_") then die("cf: parse: a match-arm pattern is `_` or `Type.member`\n")
 	if is_pipe(peek(p))
 		then die("cf: parse: `_` is a standalone wildcard, not an or-pattern alternative\n")
 	if !is_arrow(peek(p)) then die("cf: parse: expected `->` after `_`\n")
@@ -1213,9 +1214,9 @@ const parse_primary! = (*Parser p): Expr -> {
 			# `Bool.True` / `Bool.False` — the explicit qualified form of the `true`/`false` literal
 			# sugar (§8.6: `Bool` is the union `{ False, True }`, which cf lowers to a 1-byte int).
 			# Both members are nullary, so this is a bare value; a stray `(...)` after is a parse error.
-			if str_eq(name, "Bool") then {
-				if str_eq(field, "True") then return Expr.BoolLit(true)
-				if str_eq(field, "False") then return Expr.BoolLit(false)
+			if eq(name, "Bool") then {
+				if eq(field, "True") then return Expr.BoolLit(true)
+				if eq(field, "False") then return Expr.BoolLit(false)
 				die("cf: parse: `Bool` has only the members `True` and `False`\n")
 			}
 			# `Type.member(args)` is a payload-member construction; `base.field` (no
@@ -1511,7 +1512,7 @@ const parse_let! = (*Parser p, Bool mutable): Stmt -> {
 			# an UNINITIALIZED `[N Elem] buf` is a byte buffer (a read target): it needs a POSITIVE size
 			# and holds `Uint8` only — a `[0 Uint8]` (188) or a non-`Uint8` element (189) is rejected
 			if n <= 0 then die("cf: parse: a byte buffer needs a positive comptime length\n")
-			if !str_eq(felem, "Uint8")
+			if !eq(felem, "Uint8")
 				then die("cf: parse: an uninitialized byte buffer holds `Uint8` only\n")
 
 			return Stmt.Let(bname, mutable, "", Expr.Buffer(Expr.Lit(n)))
@@ -1731,7 +1732,7 @@ const in_clause_name! = (*Parser p): Str -> {
 # program ONLY at a call site (memory_model §4): only `Expr.Call` has a geom slot, so on any
 # other expression the clause would silently fall back to the ambient node — refuse it loudly.
 const geom_stamp = (Expr e, Str g): Expr -> {
-	if str_eq(g, "") then return e
+	if eq(g, "") then return e
 
 	const Bool isc = match e { Expr.Call(_, _, _, _) -> true, _ -> false }
 
@@ -1742,7 +1743,7 @@ const geom_stamp = (Expr e, Str g): Expr -> {
 
 # Apply an `in <geometry>` clause to a binding: it governs the binding's initializer call.
 const let_with_geom = (Stmt s, Str g): Stmt -> {
-	if str_eq(g, "") then return s
+	if eq(g, "") then return s
 
 	return match s { Stmt.Let(n, m, t, init) -> Stmt.Let(n, m, t, geom_stamp(init, g)), _ -> s }
 }
@@ -1967,26 +1968,13 @@ const is_pascal_name = (Str n): Bool -> {
 	return c >= 65 && c <= 90
 }
 
-const str_eq = (Str a, Str b): Bool -> {
-	if a.len != b.len then return false
-	let Iarch i = 0
-
-	loop {
-		if i >= Iarch(a.len) then break
-		if Iarch(a[i]) != Iarch(b[i]) then return false
-		i = i + 1
-	}
-
-	return true
-}
-
 # Is `name` already among the parameters parsed so far?
 const params_has = ([Param] params, Str name): Bool -> {
 	let Iarch i = 0
 
 	loop {
 		if i >= Iarch(params.len) then break
-		if str_eq(params[i].name, name) then return true
+		if eq(params[i].name, name) then return true
 		i = i + 1
 	}
 
@@ -2116,21 +2104,21 @@ const parse_type! = (*Parser p): Ty -> {
 # The one allowed byte pointer is `*[Uint8]`, spelled with brackets — it never reaches this helper.
 # Mirrors typecheck's `is_cast_type` + `Bool` + `Str`.
 const is_ptr_scalar_kw = (Str n): Bool -> {
-	if str_eq(n, "Iarch") then return true
-	if str_eq(n, "Uarch") then return true
-	if str_eq(n, "Int") then return true
-	if str_eq(n, "Int8") then return true
-	if str_eq(n, "Int16") then return true
-	if str_eq(n, "Int32") then return true
-	if str_eq(n, "Int64") then return true
-	if str_eq(n, "Uint8") then return true
-	if str_eq(n, "Uint16") then return true
-	if str_eq(n, "Uint32") then return true
-	if str_eq(n, "Uint64") then return true
-	if str_eq(n, "Float32") then return true
-	if str_eq(n, "Float64") then return true
-	if str_eq(n, "Bool") then return true
-	if str_eq(n, "Str") then return true
+	if eq(n, "Iarch") then return true
+	if eq(n, "Uarch") then return true
+	if eq(n, "Int") then return true
+	if eq(n, "Int8") then return true
+	if eq(n, "Int16") then return true
+	if eq(n, "Int32") then return true
+	if eq(n, "Int64") then return true
+	if eq(n, "Uint8") then return true
+	if eq(n, "Uint16") then return true
+	if eq(n, "Uint32") then return true
+	if eq(n, "Uint64") then return true
+	if eq(n, "Float32") then return true
+	if eq(n, "Float64") then return true
+	if eq(n, "Bool") then return true
+	if eq(n, "Str") then return true
 
 	return false
 }
@@ -2830,6 +2818,7 @@ const parse_record_body! = (*Parser p, Str name, [Str] typarams, [Str] tbounds):
 	let [Str] felems = []
 	let [[TupElem]] ftelems = []
 	let [Bool] fptrs = []
+	let [Iarch] fsizes = []
 	const [TupElem] no_tel = []
 
 	loop {
@@ -2855,6 +2844,7 @@ const parse_record_body! = (*Parser p, Str name, [Str] typarams, [Str] tbounds):
 			felems = [...felems, ""]
 			ftelems = [...ftelems, no_tel]
 			fptrs = [...fptrs, false]
+			fsizes = [...fsizes, 0]
 		} else if is_star(peek(p)) then {
 			# a pointer field: `*[Uint8]` is an opaque byte pointer (`$ptr`); `*Point` is an explicit
 			# record/union pointer, representationally identical to a bare `Point` field (both are
@@ -2878,17 +2868,40 @@ const parse_record_body! = (*Parser p, Str name, [Str] typarams, [Str] tbounds):
 			felems = [...felems, fe]
 			ftelems = [...ftelems, no_tel]
 			# an aggregate pointer `*Record`/`*Union` is a reference (fptr); a `*[Elem]` byte pointer ($ptr) is not
-			fptrs = [...fptrs, !str_eq(ft, "$ptr")]
+			fptrs = [...fptrs, !eq(ft, "$ptr")]
+			fsizes = [...fsizes, 0]
 			p.pos = p.pos + 1
 		} else if is_lbracket(peek(p)) then {
-			const Str felem = dyn_elem_of(parse_type!(p))
-			if !is_ident(peek(p)) then die("cf: parse: expected a field name\n")
-			fields = [...fields, cur_name!(p)]
-			ftypes = [...ftypes, "$dyn"]
-			felems = [...felems, felem]
-			ftelems = [...ftelems, no_tel]
-			fptrs = [...fptrs, false]
-			p.pos = p.pos + 1
+			# `[N Elem]` (an int-literal length) is an INLINE fixed-array field — `N` elements stored in
+			# the record body (ftype "$fix", `fsize` = N). `[Elem]` (no length) is an ordinary dynamic
+			# array field (an 8-byte pointer to a `{data,len,cap}` header).
+			if is_intlit(p.toks[p.pos + 1].kind) then {
+				p.pos = p.pos + 1 # `[`
+				const Iarch fn = p.toks[p.pos].ival
+				if fn <= 0 then die("cf: parse: an inline fixed-array field needs a positive comptime length\n")
+				p.pos = p.pos + 1 # N
+				const Str fxe = parse_fixed_elem!(p)
+				if !is_rbracket(peek(p)) then die("cf: parse: expected `]` in a fixed-array field type\n")
+				p.pos = p.pos + 1 # `]`
+				if !is_ident(peek(p)) then die("cf: parse: expected a field name\n")
+				fields = [...fields, cur_name!(p)]
+				ftypes = [...ftypes, "$fix"]
+				felems = [...felems, fxe]
+				ftelems = [...ftelems, no_tel]
+				fptrs = [...fptrs, false]
+				fsizes = [...fsizes, fn]
+				p.pos = p.pos + 1
+			} else {
+				const Str felem = dyn_elem_of(parse_type!(p))
+				if !is_ident(peek(p)) then die("cf: parse: expected a field name\n")
+				fields = [...fields, cur_name!(p)]
+				ftypes = [...ftypes, "$dyn"]
+				felems = [...felems, felem]
+				ftelems = [...ftelems, no_tel]
+				fptrs = [...fptrs, false]
+				fsizes = [...fsizes, 0]
+				p.pos = p.pos + 1
+			}
 		} else if is_lparen(peek(p)) then {
 			# a `(A, B, ...) name` tuple field — at least two comma-separated element type names
 			p.pos = p.pos + 1 # `(`
@@ -2899,6 +2912,7 @@ const parse_record_body! = (*Parser p, Str name, [Str] typarams, [Str] tbounds):
 			felems = [...felems, ""]
 			ftelems = [...ftelems, tel]
 			fptrs = [...fptrs, false]
+			fsizes = [...fsizes, 0]
 			p.pos = p.pos + 1
 		} else {
 			# a scalar/aggregate field type — a name, a type variable `'T`, or a generic type
@@ -2910,6 +2924,7 @@ const parse_record_body! = (*Parser p, Str name, [Str] typarams, [Str] tbounds):
 			felems = [...felems, ""]
 			ftelems = [...ftelems, no_tel]
 			fptrs = [...fptrs, false]
+			fsizes = [...fsizes, 0]
 			p.pos = p.pos + 1
 		}
 
@@ -2929,6 +2944,7 @@ const parse_record_body! = (*Parser p, Str name, [Str] typarams, [Str] tbounds):
 		fptrs: fptrs,
 		typarams: typarams,
 		tbounds: tbounds,
+		fsizes: fsizes,
 	})
 }
 
@@ -2964,13 +2980,13 @@ const parse_group! = (*Parser p): RecDecl -> {
 
 	loop {
 		if di >= Iarch(g.fields.len) then break
-		if str_eq(g.ftypes[di], "$spread")
+		if eq(g.ftypes[di], "$spread")
 			then die("cf: parse: a grouped-parameter `type` cannot use a `...` spread\n")
 		let Iarch dj = 0
 
 		loop {
 			if dj >= di then break
-			if str_eq(g.fields[dj], g.fields[di])
+			if eq(g.fields[dj], g.fields[di])
 				then die("cf: parse: a duplicate field in a grouped-parameter `type`\n")
 			dj = dj + 1
 		}
@@ -3385,27 +3401,27 @@ const parse_cond! = (*Parser p): Bool -> {
 
 	p.pos = p.pos + 1
 	const Str ename = expect_ident!(p, "cf: parse: expected an enum name in a comptime condition\n")
-	if is_os && !str_eq(ename, "Os") then die("cf: parse: the `os` namespace compares against `Os`\n")
-	if is_arch && !str_eq(ename, "Arch")
+	if is_os && !eq(ename, "Os") then die("cf: parse: the `os` namespace compares against `Os`\n")
+	if is_arch && !eq(ename, "Arch")
 		then die("cf: parse: the `arch` namespace compares against `Arch`\n")
 	expect_cond_dot(p)
 	const Str variant = expect_ident!(p, "cf: parse: expected a variant name after the enum name\n")
 	# The enum variant sets are closed (module_system §7.1): `Os` is `{ Darwin, Linux }` and
 	# `Arch` is `{ Arm64, Amd64, Riscv64, Wasm }`. A variant outside its enum (a typo, or a
 	# cross-enum name like `Os.Arm64`) is a parse error, not a silently-false comparison.
-	if is_os && !str_eq(variant, "Darwin") && !str_eq(variant, "Linux") && !str_eq(variant, "Bare")
+	if is_os && !eq(variant, "Darwin") && !eq(variant, "Linux") && !eq(variant, "Bare")
 		then die("cf: parse: `Os` has no such variant (expected `Darwin`, `Linux`, or `Bare`)\n")
 	if is_arch &&
-		!str_eq(variant, "Arm64") &&
-		!str_eq(variant, "Amd64") &&
-		!str_eq(variant, "Riscv64") &&
-		!str_eq(variant, "Wasm")
+		!eq(variant, "Arm64") &&
+		!eq(variant, "Amd64") &&
+		!eq(variant, "Riscv64") &&
+		!eq(variant, "Wasm")
 			then die("cf: parse: `Arch` has no such variant (expected `Arm64`, `Amd64`, `Riscv64`, or `Wasm`)\n")
 	# the target comes from `--target` (via the CLI), defaulting to the host os/arch — threaded on the
 	# Parser. `target` and `current` coincide on a non-cross build (both are this compile's target).
 	let Str fixed = p.target_arch
 	if is_os then fixed = p.target_os
-	const Bool same = str_eq(fixed, variant)
+	const Bool same = eq(fixed, variant)
 	if is_eq then return same
 
 	return !same
@@ -3506,7 +3522,7 @@ const parse_static! = (*Parser p): Func -> {
 	const Iarch n = p.toks[p.pos].ival
 	p.pos = p.pos + 1
 	const Str felem = parse_fixed_elem!(p)
-	if !str_eq(felem, "Uint8") then die("cf: parse: a `static` buffer holds `Uint8` only\n")
+	if !eq(felem, "Uint8") then die("cf: parse: a `static` buffer holds `Uint8` only\n")
 	if !is_rbracket(peek(p)) then die("cf: parse: expected `]` in a `static` type\n")
 	p.pos = p.pos + 1
 	if n <= 0 then die("cf: parse: a `static` buffer needs a positive size\n")
@@ -3539,6 +3555,8 @@ const parse_static! = (*Parser p): Func -> {
 	})
 }
 
+# Parse one module's token stream (held by `p`) into its `Program` AST — the imports and the
+# top-level type, value, and function definitions of a single `.cf` file.
 pub const parse_program! = (*Parser p): Program -> {
 	let Program acc = empty_program()
 

@@ -1,0 +1,157 @@
+# docs::render — draw the current frame to the terminal.
+#
+# One entry, `render!`, paints either the SEARCH/SELECT list or the READ page (chosen by mode), then
+# the full-width status bar. Everything writes straight to stdout; the caller has already cleared and
+# positioned via the terminal control codes these functions emit.
+import docscan::{ Def }
+import docs::state::{ DocState, Mode, query_str }
+import docs::page::{ read_body!, read_cwin, read_max_scroll! }
+import docs::text::{ pad_to, spaces }
+import std::io::term::{ reverse!, reset!, move_to!, clear! }
+import std::io::console::{ print, println }
+
+# The keymap legend for each mode, shown at the bottom of the window (the keys really do differ by
+# mode — j/k type in search, esc has nothing to go back to there).
+const legend_search = "[type] filter   [down/enter] select   [ctrl-c] quit"
+const legend_select = "[j/k up/dn] move   [enter] read   [i/esc] search   [r] reset   [ctrl-c] quit"
+const legend_read = "[j/k up/dn] scroll   [esc] back   [i] search   [r] reset   [ctrl-c] quit"
+
+const legend_for = (Mode mode): Str -> match mode {
+	Mode.Search -> legend_search,
+	Mode.Select -> legend_select,
+	Mode.Read -> legend_read,
+}
+
+# The visible rows for a list, given the terminal height (a sane default off a real terminal).
+const visible_rows = (Iarch rows): Iarch -> if rows > 8 then rows - 5 else 20
+
+# Print a centered, highlighted chip on its own row: a reverse-video ` text ` pill leading-padded to
+# the horizontal middle of `width`. Used for the "N more above/below" scroll hints.
+const print_chip! = (Str text, Iarch width): () -> {
+	let Iarch pad = (width - (Iarch(text.len) + 2)) / 2
+
+	if pad < 0 then pad = 0
+
+	print(spaces(pad))
+	reverse!()
+	print(" ")
+	print(text)
+	print(" ")
+	reset!()
+	print("\n")
+}
+
+# Draw the READ page: the selected definition's body, scrolled to `st.scroll`, inside a fixed content
+# window bracketed by two reserved chip rows. The top/bottom rows show a "more above/below" chip when
+# content is hidden that way and a blank line otherwise, so the body never shifts as they appear.
+const render_read! = (DocState st, [Def] view, Iarch rows, Iarch width): () -> {
+	if Iarch(view.len) == 0 then {
+		println("(no definition)")
+
+		return
+	}
+
+	let Iarch idx = st.sel
+
+	if idx >= Iarch(view.len) then idx = Iarch(view.len) - 1
+	if idx < 0 then idx = 0
+
+	const Def d = view[idx]
+	const [Str] body = read_body!(d, width)
+	const Iarch cwin = read_cwin(rows)
+
+	# clamp the scroll offset to a valid window
+	let Iarch top = st.scroll
+	const Iarch maxs = read_max_scroll!(d, rows, width)
+
+	if top > maxs then top = maxs
+	if top < 0 then top = 0
+
+	# how many body rows fall in the content window at this scroll offset
+	let Iarch shown = Iarch(body.len) - top
+
+	if shown > cwin then shown = cwin
+	if shown < 0 then shown = 0
+
+	const Bool above = top > 0
+	const Bool below = top + shown < Iarch(body.len)
+
+	if above then print_chip!("${top} more above", width) else println("")
+
+	let Iarch k = 0
+
+	loop {
+		if k >= cwin then break
+
+		if k < shown then println(body[top + k]) else println("")
+
+		k = k + 1
+	}
+
+	if below then print_chip!("${Iarch(body.len) - top - shown} more below", width) else println("")
+}
+
+# Draw the SEARCH/SELECT list: a header with the match count, the query line (a `/ ` prompt with a
+# cursor in search mode), then a window of matches scrolled to keep the selection visible. In select
+# mode the highlighted row is a reverse-video `> ` marker.
+const render_list! = (DocState st, [Def] view, Iarch rows): () -> {
+	if st.mode == Mode.Search then println("cf docs  [search]   ${Iarch(view.len)} matches")
+		else println("cf docs  [select]   ${Iarch(view.len)} matches")
+
+	if st.mode == Mode.Search then print("/ ") else print("  ")
+
+	print(query_str(st))
+
+	if st.mode == Mode.Search then print("_")
+
+	println("")
+	println("")
+
+	if Iarch(view.len) == 0 then {
+		println("  (no matches)")
+
+		return
+	}
+
+	# scroll the window so the selected row stays on screen
+	const Iarch maxvis = visible_rows(rows)
+	let Iarch start = 0
+
+	if st.sel >= maxvis then start = st.sel - maxvis + 1
+
+	let Iarch i = start
+	let Iarch shown = 0
+
+	loop {
+		if i >= Iarch(view.len) then break
+		if shown >= maxvis then break
+
+		const Def d = view[i]
+
+		if st.mode == Mode.Select && i == st.sel then {
+			reverse!()
+			println("> ${d.kind} ${d.name}   ${d.module}")
+			reset!()
+		} else {
+			println("  ${d.kind} ${d.name}   ${d.module}")
+		}
+
+		i = i + 1
+		shown = shown + 1
+	}
+}
+
+# Paint one whole frame: clear the screen, draw the mode's body (READ page or the list), then pin the
+# mode's keymap legend to the bottom row as a full-width reverse-video status bar. Off a real terminal
+# (`rows` 0) the bar just follows the content.
+pub const render! = (DocState st, [Def] view, Iarch rows, Iarch width): () -> {
+	clear!()
+
+	if st.mode == Mode.Read then render_read!(st, view, rows, width) else render_list!(st, view, rows)
+
+	if rows >= 2 then move_to!(rows, 1)
+
+	reverse!()
+	print(pad_to(legend_for(st.mode), width))
+	reset!()
+}

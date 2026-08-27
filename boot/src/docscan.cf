@@ -190,8 +190,9 @@ const trim_member = (Str s): Str -> {
 }
 
 # Split a single-line member list (`Iarch a, Left('L), ...`) on commas at paren/bracket depth 0, so a
-# payload like `Pair(Iarch, Str)` stays one member.
-const split_members_line! = (Str inner): [Str] -> {
+# payload like `Pair(Iarch, Str)` stays one member. Also the shared depth-0 splitter for a function's
+# parameter list and a union variant's payload types in the docs synopsis.
+pub const split_members_line! = (Str inner): [Str] -> {
 	let [Str] out = []
 	let [Uint8] cur = []
 	let Iarch depth = 0
@@ -322,6 +323,120 @@ const parse_members! = ([Str] lines, Iarch defline): [Member] -> {
 	return out
 }
 
+# Is `s` empty or all spaces/tabs?
+const is_blank = (Str s): Bool -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(s.len) then break
+		if Iarch(s[i]) != 32 && Iarch(s[i]) != 9 then return false
+
+		i = i + 1
+	}
+
+	return true
+}
+
+# Does `s` contain a ` ->` body arrow (space, `-`, `>`)?
+const has_arrow = (Str s): Bool -> {
+	let Iarch i = 0
+
+	loop {
+		if i + 2 >= Iarch(s.len) then break
+		if Iarch(s[i]) == 32 && Iarch(s[i + 1]) == 45 && Iarch(s[i + 2]) == 62 then return true
+
+		i = i + 1
+	}
+
+	return false
+}
+
+# A definition's full signature. A function whose header wraps across lines (the params on their own
+# lines, the `->` further down) is folded back into ONE line, so the synopsis is the whole signature
+# and not just its opening `pub const name = (`. A single-line def (the common case) and a
+# `data`/`union` (whose `= {` sits on the first line, members shown separately) are returned verbatim.
+# The fold stops at the ` ->` line and aborts on a blank line, so a plain constant value — which has
+# no arrow — is never swallowed into the def below it.
+const join_sig = ([Str] lines, Iarch defline, Str kind): Str -> {
+	const Str first = lines[defline]
+
+	if has_arrow(first) || eq(kind, "data") || eq(kind, "union") then return first
+
+	let [Uint8] out = []
+	let Iarch p = 0
+
+	loop {
+		if p >= Iarch(first.len) then break
+
+		out = [...out, Uint8(Iarch(first[p]))]
+		p = p + 1
+	}
+
+	let Iarch j = defline + 1
+	let Bool done = false
+
+	loop {
+		if j >= Iarch(lines.len) then break
+
+		const Str ln = lines[j]
+		# a blank line ends the signature region: this def had no multi-line header
+		if is_blank(ln) then break
+
+		# skip the continuation's leading indentation
+		let Iarch k = 0
+
+		loop {
+			if k >= Iarch(ln.len) then break
+			if Iarch(ln[k]) != 32 && Iarch(ln[k]) != 9 then break
+
+			k = k + 1
+		}
+
+		# first content byte of this continuation (after its indentation)
+		let Iarch fc = 0
+
+		if k < Iarch(ln.len) then fc = Iarch(ln[k])
+
+		# drop the trailing comma of a multi-line param list when the closing `)` follows
+		if fc == 41 && Iarch(out.len) > 0 && Iarch(out[out.len - 1]) == 44 then {
+			let [Uint8] tmp = []
+			let Iarch t = 0
+
+			loop {
+				if t + 1 >= Iarch(out.len) then break
+
+				tmp = [...tmp, out[t]]
+				t = t + 1
+			}
+
+			out = tmp
+		}
+
+		# a separating space, unless the header ends with `(` or the closing `)` follows
+		if Iarch(out.len) > 0 && Iarch(out[out.len - 1]) != 40 && fc != 41
+			then out = [...out, Uint8(32)]
+
+		loop {
+			if k >= Iarch(ln.len) then break
+
+			out = [...out, Uint8(Iarch(ln[k]))]
+			k = k + 1
+		}
+
+		if has_arrow(ln) then {
+			done = true
+			break
+		}
+
+		j = j + 1
+	}
+
+	# no `->` before a blank/EOF — not actually a multi-line signature
+	if !done then return first
+
+	return Str({ bytes: out, len: Iarch(out.len) })
+}
+
 # Extract every `pub` definition from a file's `content`, tagging each with `module`.
 const scan_content! = (Str content, Str module): [Def] -> {
 	const [Str] lines = split_lines(content)
@@ -341,7 +456,7 @@ const scan_content! = (Str content, Str module): [Def] -> {
 
 			if eq(kind, "data") || eq(kind, "union") then members = parse_members!(lines, i)
 
-			defs = [...defs, Def({ name: name, kind: kind, sig: line, doc: doc, module: module, members: members })]
+			defs = [...defs, Def({ name: name, kind: kind, sig: join_sig(lines, i, kind), doc: doc, module: module, members: members })]
 		}
 
 		i = i + 1

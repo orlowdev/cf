@@ -1,0 +1,205 @@
+# docs::text — text formatting for the TUI.
+#
+# Terminal-width word-wrapping, a light Markdown pass for doc comments (paragraph reflow + verbatim
+# fenced code), and fixed-width padding for the status bar. All pure Str→Str(/[Str]); nothing here
+# touches the terminal. (Query editing lives in docs::state, which edits the inline buffer in place.)
+import docscan::{ split_lines }
+
+# A run of `n` spaces.
+pub const spaces = (Iarch n): Str -> {
+	let [Uint8] out = []
+	let Iarch i = 0
+
+	loop {
+		if i >= n then break
+
+		out = [...out, Uint8(32)]
+		i = i + 1
+	}
+
+	return Str({ bytes: out, len: Iarch(out.len) })
+}
+
+# `s` padded with spaces (or truncated) to exactly `width` columns — for a full-width status bar.
+pub const pad_to = (Str s, Iarch width): Str -> {
+	let [Uint8] out = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(s.len) then break
+		if i >= width then break
+
+		out = [...out, Uint8(Iarch(s[i]))]
+		i = i + 1
+	}
+
+	loop {
+		if Iarch(out.len) >= width then break
+
+		out = [...out, Uint8(32)]
+	}
+
+	return Str({ bytes: out, len: Iarch(out.len) })
+}
+
+# Word-wrap `line` to `width` columns, breaking only at spaces. A line that already fits is returned
+# whole; an over-long single word overflows its row (rare — a long code token). An empty line is
+# preserved (as a fresh "", never the input — aliasing the input would pin the result to the caller's
+# region, see the cf-long-loop-arena-reclaim memo).
+pub const word_wrap = (Str line, Iarch width): [Str] -> {
+	let [Str] out = []
+
+	if Iarch(line.len) == 0 then {
+		out = [...out, ""]
+
+		return out
+	}
+
+	let [Uint8] cur = []
+	let Iarch curlen = 0
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(line.len) then break
+
+		# span the next word [ws, we), then the run of spaces after it
+		const Iarch ws = i
+
+		loop {
+			if i >= Iarch(line.len) then break
+			if Iarch(line[i]) == 32 then break
+
+			i = i + 1
+		}
+
+		const Iarch we = i
+
+		loop {
+			if i >= Iarch(line.len) then break
+			if Iarch(line[i]) != 32 then break
+
+			i = i + 1
+		}
+
+		const Iarch wl = we - ws
+
+		if wl > 0 then {
+			# the word won't fit on the current row → flush it and start a fresh one
+			if curlen != 0 && curlen + 1 + wl > width then {
+				out = [...out, Str({ bytes: cur, len: curlen })]
+				cur = []
+				curlen = 0
+			}
+
+			# a single separating space between words on the same row
+			if curlen != 0 then {
+				cur = [...cur, Uint8(32)]
+				curlen = curlen + 1
+			}
+
+			let Iarch j = ws
+
+			loop {
+				if j >= we then break
+
+				cur = [...cur, Uint8(Iarch(line[j]))]
+				j = j + 1
+			}
+
+			curlen = curlen + wl
+		}
+	}
+
+	if curlen > 0 then out = [...out, Str({ bytes: cur, len: curlen })]
+
+	return out
+}
+
+# A fenced-code-block delimiter: a line beginning (at column 0) with three backticks.
+const is_fence = (Str ln): Bool ->
+	Iarch(ln.len) >= 3 && Iarch(ln[0]) == 96 && Iarch(ln[1]) == 96 && Iarch(ln[2]) == 96
+
+# Wrap a doc comment to `width` with simplistic Markdown: consecutive non-empty source lines glue into
+# a paragraph (joined with a space) which is word-wrapped, and empty lines keep paragraph separation.
+# A ``` fence at the start of a line opens a code block whose lines are emitted VERBATIM (unwrapped)
+# until the closing ```; the fence lines themselves are not shown.
+pub const wrap_doc! = (Str doc, Iarch width): [Str] -> {
+	const [Str] lines = split_lines(doc)
+	let [Str] out = []
+	let [Uint8] para = []
+	let Iarch paralen = 0
+	let Bool have = false
+	let Bool in_code = false
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(lines.len) then break
+
+		const Str ln = lines[i]
+
+		if is_fence(ln) then {
+			# a fence toggles code mode; first flush any pending prose paragraph
+			if have then {
+				const [Str] w = word_wrap(Str({ bytes: para, len: paralen }), width)
+
+				for x in w {
+					out = [...out, x]
+				}
+
+				para = []
+				paralen = 0
+				have = false
+			}
+
+			in_code = !in_code
+		} else if in_code then {
+			out = [...out, ln]
+		} else if Iarch(ln.len) == 0 then {
+			# a blank line ends the current paragraph and is itself preserved as separation
+			if have then {
+				const [Str] w = word_wrap(Str({ bytes: para, len: paralen }), width)
+
+				for x in w {
+					out = [...out, x]
+				}
+
+				para = []
+				paralen = 0
+				have = false
+			}
+
+			out = [...out, ln]
+		} else {
+			# a prose line: glue onto the paragraph buffer with a single joining space
+			if have then {
+				para = [...para, Uint8(32)]
+				paralen = paralen + 1
+			}
+
+			let Iarch k = 0
+
+			loop {
+				if k >= Iarch(ln.len) then break
+
+				para = [...para, Uint8(Iarch(ln[k]))]
+				k = k + 1
+			}
+
+			paralen = paralen + Iarch(ln.len)
+			have = true
+		}
+
+		i = i + 1
+	}
+
+	# flush a trailing paragraph (a doc that doesn't end in a blank line)
+	if have then {
+		const [Str] w = word_wrap(Str({ bytes: para, len: paralen }), width)
+
+		for x in w {
+			out = [...out, x]
+		}
+	}
+
+	return out
+}
