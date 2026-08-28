@@ -1,0 +1,74 @@
+# release — cut a GenVer release when a ring branch advances.
+#
+# On a push to a release-ring branch, compute the ring's next version from the commits since its last
+# tag (`versioning tag`), and — if that version has no release yet — create the tag and a GitHub
+# Release whose notes are the grouped changelog (`versioning changelog`). Idempotent: a push that added
+# no glory/enhancement/nurture commits yields the existing version, so nothing is created. Creating the
+# release then fans out to the binary build via `workflow_call` (a tag created with GITHUB_TOKEN does
+# NOT itself trigger `on: push: tags`, so the fan-out is explicit, not tag-driven).
+name: release
+
+on:
+  push:
+    branches: [behemoth, azazello, koroviev, master]
+
+permissions:
+  contents: write
+
+jobs:
+  version:
+    runs-on: macos-14
+    outputs:
+      version: ${{ steps.compute.outputs.version }}
+      created: ${{ steps.compute.outputs.created }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history + tags: `versioning` reads `git describe` and the commit log
+
+      - name: Map ring branch to pre-release label
+        id: ring
+        run: |
+          case "${{ github.ref_name }}" in
+            behemoth) echo "ring=nightly" >> "$GITHUB_OUTPUT" ;;
+            azazello) echo "ring=rc"      >> "$GITHUB_OUTPUT" ;;
+            koroviev) echo "ring=latest"  >> "$GITHUB_OUTPUT" ;;
+            master)   echo "ring=stable"  >> "$GITHUB_OUTPUT" ;;
+            *) echo "release: unmapped branch ${{ github.ref_name }}" >&2; exit 1 ;;
+          esac
+
+      - name: Build cf and the versioning tool
+        run: |
+          ./boot/build.sh
+          ./var/cf c lib/versioning/versioning.cf -o var/versioning
+
+      - name: Compute next version, create the release if it is new
+        id: compute
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ring="${{ steps.ring.outputs.ring }}"
+          version="$(./var/versioning tag "$ring")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "next version on $ring: $version"
+
+          if gh release view "$version" >/dev/null 2>&1; then
+            echo "release $version already exists — nothing to cut"
+            echo "created=false" >> "$GITHUB_OUTPUT"
+          else
+            ./var/versioning changelog "$ring" > release-notes.md
+            gh release create "$version" \
+              --title "$version" \
+              --notes-file release-notes.md \
+              --target "${{ github.sha }}"
+            echo "created=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  binaries:
+    needs: version
+    if: needs.version.outputs.created == 'true'
+    uses: ./.github/workflows/build-binaries.yml
+    permissions:
+      contents: write
+    with:
+      version: ${{ needs.version.outputs.version }}
