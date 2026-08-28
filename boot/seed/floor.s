@@ -1,27 +1,3 @@
-.globl _start
-.p2align 2
-_start:
-	mov x19, x0
-	mov x20, x1
-	mov x21, x2
-	bl _cf_root_page_init
-	adrp x0, _cf_page@PAGE
-	add x0, x0, _cf_page@PAGEOFF
-	mov x1, x19
-	mov x2, x20
-	bl _cf_build_args
-	mov x22, x0
-	adrp x0, _cf_page@PAGE
-	add x0, x0, _cf_page@PAGEOFF
-	mov x1, x21
-	bl _cf_build_env
-	mov x2, x0
-	mov x1, x22
-	adrp x0, _cf_page@PAGE
-	add x0, x0, _cf_page@PAGEOFF
-	bl _main
-	mov x16, #1
-	svc #0x80
 .globl _f39
 .p2align 2
 _f39:
@@ -137,9 +113,34 @@ _cf_oom:
 	mov x16, #1
 	svc #0x80
 
-.globl _f373
+.globl _start
 .p2align 2
-_f373:
+_start:
+	mov x19, x0
+	mov x20, x1
+	mov x21, x2
+	bl _cf_root_page_init
+	adrp x0, _cf_page@PAGE
+	add x0, x0, _cf_page@PAGEOFF
+	mov x1, x19
+	mov x2, x20
+	bl _cf_build_args
+	mov x22, x0
+	adrp x0, _cf_page@PAGE
+	add x0, x0, _cf_page@PAGEOFF
+	mov x1, x21
+	bl _cf_build_env
+	mov x2, x0
+	mov x1, x22
+	adrp x0, _cf_page@PAGE
+	add x0, x0, _cf_page@PAGEOFF
+	bl _main
+	mov x16, #1
+	svc #0x80
+
+.globl _f374
+.p2align 2
+_f374:
 	mov x16, x0
 	mov x0, x1
 	mov x1, x2
