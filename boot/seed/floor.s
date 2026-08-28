@@ -129,9 +129,9 @@ _f313:
 2:
 	ret
 
-.globl _f367
+.globl _f369
 .p2align 2
-_f367:
+_f369:
 	mov x16, x0
 	mov x0, x1
 	mov x1, x2

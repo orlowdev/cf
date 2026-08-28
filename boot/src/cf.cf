@@ -26,11 +26,15 @@ import std::data::{ Either }
 import std::io::console::{ eprint, print, println }
 
 # target_os/arch -> the embedded QBE's target id (see qbe_translate): darwin arm64_apple = 0,
-# arm64 ELF (bare metal / linux) = 1. Linux-arm64 and bare-arm64 share QBE's `T_arm64` (SysV ELF,
-# no-underscore symbols); only the floor/link differ.
+# arm64 ELF (bare metal / linux) = 1, rv64 = 4. Linux-arm64 and bare-arm64 share QBE's `T_arm64`
+# (SysV ELF, no-underscore symbols); linux-riscv64 selects `T_rv64`. Only the floor/link differ.
 const target_id_of = (Cli c): Iarch -> {
 	if eq(c.target_os, "Bare") then return 1
-	if eq(c.target_os, "Linux") then return 1
+	if eq(c.target_os, "Linux") then {
+		if eq(c.target_arch, "Riscv64") then return 4
+
+		return 1
+	}
 
 	return 0
 }
@@ -128,21 +132,25 @@ const link_bare! = ([Str] env, Str floor_s, Str prog_s, Str out, Iarch pid, Bool
 	return lr
 }
 
-# linux link: assemble the floor + program as AArch64 ELF objects with `clang`'s aarch64 backend
+# linux link: assemble the floor + program as ELF objects with `clang`'s backend for the target arch
 # (works on any host — a darwin box cross-assembles a linux object just as it does a bare one), then
 # link a STATIC, freestanding executable with `ld.lld`. No linker script and no crt: the floor owns
 # `_start` and the program never touches libc, so `-static -e _start` over the two objects is the whole
-# link. `-nostdlib` is implicit — nothing but our objects is fed to the linker.
-const link_linux! = ([Str] env, Str floor_s, Str prog_s, Str out, Iarch pid, Bool preserve): Iarch -> {
+# link. `-nostdlib` is implicit — nothing but our objects is fed to the linker. The `-target` triple
+# tracks `arch`: aarch64 or riscv64 (both `*-linux-gnu`). NOTE the resolved `clang` must support the
+# target arch — Apple's clang lacks a RISC-V backend, so cross-building riscv64 needs an LLVM `clang`
+# ahead of it on PATH (a native riscv64 host's `cc` already qualifies).
+const link_linux! = ([Str] env, Str floor_s, Str prog_s, Str out, Str arch, Iarch pid, Bool preserve): Iarch -> {
 	const Str fo = "/tmp/cf-${pid}.floor.o"
 	const Str po = "/tmp/cf-${pid}.prog.o"
 	const Str clang = need_tool!(env, "clang")
+	const Str triple = if eq(arch, "Riscv64") then "riscv64-linux-gnu" else "aarch64-linux-gnu"
 
-	const Iarch a1 = run!(clang, ["clang", "-target", "aarch64-linux-gnu", "-c", floor_s, "-o", fo], env)
+	const Iarch a1 = run!(clang, ["clang", "-target", triple, "-c", floor_s, "-o", fo], env)
 
 	if a1 != 0 then return a1
 
-	const Iarch a2 = run!(clang, ["clang", "-target", "aarch64-linux-gnu", "-c", prog_s, "-o", po], env)
+	const Iarch a2 = run!(clang, ["clang", "-target", triple, "-c", prog_s, "-o", po], env)
 
 	if a2 != 0 then return a2
 
@@ -180,7 +188,7 @@ const run_full! = (Cli c, [Str] env): Iarch -> {
 
 	if eq(c.target_os, "Bare") then st = link_bare!(env, tfl, tpr, c.output, pid, c.preserve)
 	else {
-		if eq(c.target_os, "Linux") then st = link_linux!(env, tfl, tpr, c.output, pid, c.preserve)
+		if eq(c.target_os, "Linux") then st = link_linux!(env, tfl, tpr, c.output, c.target_arch, pid, c.preserve)
 		else st = link_darwin!(env, tfl, tpr, c.output)
 	}
 

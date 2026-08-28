@@ -7140,7 +7140,7 @@ const emit_env_qbe! = (Fd fd, Iarch pgr): Iarch -> {
 # crosses the committed watermark — the same base address throughout, so every outstanding pointer
 # stays valid (memory_model §8). `cf_oom` fires only at RESERVATION exhaustion; `cf_mmap_fail` on a
 # failed map/commit. All are leaf routines (no `bl`) touching only caller-saved regs (x0-x16).
-const emit_arena_floor! = (Fd fd, Bool is_bare, Bool is_linux, Iarch root_size): Iarch -> {
+const emit_arena_floor! = (Fd fd, Bool is_bare, Bool is_linux, Bool is_riscv, Iarch root_size): Iarch -> {
 	# BARE floor (ELF, no OS): `qbe -t arm64` emits SysV symbols with no leading `_`, and ELF uses
 	# `:lo12:` page-offset relocations (vs Mach-O `@PAGE`/`@PAGEOFF`). cf_root_page_init seeds $cf_page over
 	# the static 1 MiB $cf_root (survivor limit == residue top == base+root_size ⇒ the reserve bumps within it and traps at the end);
@@ -7182,6 +7182,95 @@ const emit_arena_floor! = (Fd fd, Bool is_bare, Bool is_linux, Iarch root_size):
 	# is not charged against commit). ELF symbols carry no leading underscore and use `:lo12:` page
 	# offsets (vs Mach-O `_`/`@PAGEOFF`), matching what `qbe -t arm64` emits for the callers.
 	if is_linux then {
+		# RISC-V64 linux floor: same mmap-backed growing root as arm64 linux, in the riscv ISA — number
+		# in `a7`, trap `ecall`, failure `-errno` in `a0` (fail test `a0 unsigned >= -4096`, threshold in
+		# t6). mmap 222, mprotect 226, MAP_PRIVATE|ANON|NORESERVE = 0x4022. `la` for symbol addresses.
+		# Regs: a0-a7 args, t0-t6 temps; nothing callee-saved is touched so it is call-clobber clean.
+		if is_riscv then {
+			write_str(fd, ".globl cf_root_page_init\n")
+			write_str(fd, ".globl cf_root_page_grow\n")
+			write_str(fd, ".globl cf_oom\n")
+			write_str(fd, ".p2align 1\n")
+			write_str(fd, "cf_root_page_init:\n")
+			write_str(fd, "\tli t6, -4096\n")
+			write_str(fd, "\tli a0, 0\n")
+			write_str(fd, "\tli a1, 0x100000000\n")
+			write_str(fd, "\tli a2, 0\n")
+			write_str(fd, "\tli a3, 0x4022\n")
+			write_str(fd, "\tli a4, -1\n")
+			write_str(fd, "\tli a5, 0\n")
+			write_str(fd, "\tli a7, 222\n")
+			write_str(fd, "\tecall\n")
+			write_str(fd, "\tbgeu a0, t6, cf_mmap_fail\n")
+			write_str(fd, "\tmv t0, a0\n")
+			write_str(fd, "\tmv a0, t0\n")
+			write_str(fd, "\tli a1, 0x10000000\n")
+			write_str(fd, "\tli a2, 3\n")
+			write_str(fd, "\tli a7, 226\n")
+			write_str(fd, "\tecall\n")
+			write_str(fd, "\tbgeu a0, t6, cf_mmap_fail\n")
+			write_str(fd, "\tla t1, cf_page\n")
+			write_str(fd, "\tsd t0, 0(t1)\n")
+			write_str(fd, "\tli a1, 0x100000000\n")
+			write_str(fd, "\tadd t2, t0, a1\n")
+			write_str(fd, "\tsd t2, 8(t1)\n")
+			write_str(fd, "\tli a1, 0x10000000\n")
+			write_str(fd, "\tadd t3, t0, a1\n")
+			write_str(fd, "\tsd t3, 24(t1)\n")
+			write_str(fd, "\tli a0, 0\n")
+			write_str(fd, "\tli a1, 0x40000000\n")
+			write_str(fd, "\tli a2, 0\n")
+			write_str(fd, "\tli a3, 0x4022\n")
+			write_str(fd, "\tli a4, -1\n")
+			write_str(fd, "\tli a5, 0\n")
+			write_str(fd, "\tli a7, 222\n")
+			write_str(fd, "\tecall\n")
+			write_str(fd, "\tbgeu a0, t6, cf_mmap_fail\n")
+			write_str(fd, "\tmv t0, a0\n")
+			write_str(fd, "\tmv a0, t0\n")
+			write_str(fd, "\tli a1, 0x1000000\n")
+			write_str(fd, "\tli a2, 3\n")
+			write_str(fd, "\tli a7, 226\n")
+			write_str(fd, "\tecall\n")
+			write_str(fd, "\tbgeu a0, t6, cf_mmap_fail\n")
+			write_str(fd, "\tsd t0, 40(t1)\n")
+			write_str(fd, "\tli a1, 0x40000000\n")
+			write_str(fd, "\tadd t2, t0, a1\n")
+			write_str(fd, "\tsd t2, 48(t1)\n")
+			write_str(fd, "\tli a1, 0x1000000\n")
+			write_str(fd, "\tadd t3, t0, a1\n")
+			write_str(fd, "\tsd t3, 64(t1)\n")
+			write_str(fd, "\tret\n")
+			# cf_root_page_grow(a0 = node, a1 = target): commit up to round_up(target, 256 MiB) from the
+			# node's committed watermark (aux, node+24) via mprotect.
+			write_str(fd, "cf_root_page_grow:\n")
+			write_str(fd, "\tli t6, -4096\n")
+			write_str(fd, "\taddi t1, a0, 24\n")
+			write_str(fd, "\tld t2, 0(t1)\n")
+			write_str(fd, "\tli t3, 0x10000000\n")
+			write_str(fd, "\taddi t4, t3, -1\n")
+			write_str(fd, "\tadd t5, a1, t4\n")
+			write_str(fd, "\tnot t0, t4\n")
+			write_str(fd, "\tand t5, t5, t0\n")
+			write_str(fd, "\tsub a1, t5, t2\n")
+			write_str(fd, "\tmv a0, t2\n")
+			write_str(fd, "\tli a2, 3\n")
+			write_str(fd, "\tli a7, 226\n")
+			write_str(fd, "\tecall\n")
+			write_str(fd, "\tbgeu a0, t6, cf_mmap_fail\n")
+			write_str(fd, "\tsd t5, 0(t1)\n")
+			write_str(fd, "\tret\n")
+			write_str(fd, "cf_mmap_fail:\n")
+			write_str(fd, "\tli a0, 71\n")
+			write_str(fd, "\tli a7, 94\n")
+			write_str(fd, "\tecall\n")
+			write_str(fd, "cf_oom:\n")
+			write_str(fd, "\tli a0, 70\n")
+			write_str(fd, "\tli a7, 94\n")
+			write_str(fd, "\tecall\n")
+
+			return 0
+		}
 		write_str(fd, ".globl cf_root_page_init\n")
 		write_str(fd, ".globl cf_root_page_grow\n")
 		write_str(fd, ".globl cf_oom\n")
@@ -7379,12 +7468,14 @@ const param_index = ([Param] params, Str name): Iarch -> {
 # Emit one asm-bodied function naked into the asm floor (ebnf § Assembly): `.globl` so the
 # QBE-lowered callers can `bl` it, then the body's segments verbatim, each `${param}`
 # replaced by the argument register `x<index>` that parameter occupies (arm64 C ABI: param
-# i is in x<i>; the function is naked — no prologue — and supplies its own `ret`). The symbol
-# matches the positional name QBE-lowered callers reference (`$f<idx>`): Mach-O keeps the
-# leading underscore (`_f<idx>`), an ELF target (`is_elf`: bare / linux) drops it (`f<idx>`),
-# so the hand-written floor label lines up with QBE's per-target symbol convention.
-const emit_asm_func! = (Fd fd, Func fn, Iarch idx, Bool is_elf): Iarch -> {
+# i is in the arch's arg register i; the function is naked — no prologue — and supplies its own
+# `ret`). The symbol matches the positional name QBE-lowered callers reference (`$f<idx>`): Mach-O
+# keeps the leading underscore (`_f<idx>`), an ELF target (`is_elf`: bare / linux) drops it (`f<idx>`),
+# so the hand-written floor label lines up with QBE's per-target symbol convention. The arg register a
+# `${param}` hole resolves to is arch-specific: arm64 passes param i in `x<i>`, riscv64 in `a<i>`.
+const emit_asm_func! = (Fd fd, Func fn, Iarch idx, Bool is_elf, Bool is_riscv): Iarch -> {
 	const Str sym = if is_elf then "f${idx}" else "_f${idx}"
+	const Str reg = if is_riscv then "a" else "x"
 	write_str(fd, ".globl ${sym}\n")
 	write_str(fd, ".p2align 2\n")
 	write_str(fd, "${sym}:")
@@ -7397,7 +7488,7 @@ const emit_asm_func! = (Fd fd, Func fn, Iarch idx, Bool is_elf): Iarch -> {
 		if sg.is_hole then {
 			const Iarch pidx = param_index(fn.params, sg.name)
 			if pidx < 0 then die("cf: emit: an asm interpolation hole must name a parameter\n")
-			write_str(fd, "x${pidx}")
+			write_str(fd, "${reg}${pidx}")
 		} else {
 			write_str(fd, Str(sg.lit))
 		}
@@ -7471,6 +7562,7 @@ pub const emit_program! = (
 	Fd qbe_fd,
 	Fd asm_fd,
 	Str target_os,
+	Str target_arch,
 	Iarch root_size,
 	Bool skip_embeds,
 ): Iarch -> {
@@ -7483,6 +7575,10 @@ pub const emit_program! = (
 	# the no-underscore, `:lo12:` symbol form `qbe -t arm64` emits, vs darwin's Mach-O `_`/`@PAGEOFF`.
 	const Bool is_linux = eq(target_os, "Linux")
 	const Bool is_elf = is_bare || is_linux
+	# RISC-V64 is the first NON-arm64 arch: a distinct ISA for the hand-written floor (`_start`, the
+	# mmap arena floor, the asm-fn register shuffle). Only wired for linux today (no bare/darwin rv64).
+	# arm64 stays the default when this is false, so darwin/bare are unaffected.
+	const Bool is_riscv = eq(target_arch, "Riscv64")
 	# the `_g` dynamic helpers are emitted when the program has materialized geometry bodies (they
 	# alone reference `cf_dyn_push_g`/`cf_*_append_g`) OR takes argv (the bridge below grows its
 	# `[Str]` through `cf_dyn_push_g` + the page reserve); off both the floor stays byte-identical.
@@ -7609,6 +7705,42 @@ pub const emit_program! = (
 		write_str(asm_fd, "\tb cf_halt\n")
 	} else {
 		if is_linux then {
+			if is_riscv then {
+			# LINUX ELF entry (riscv64). Same stack layout as arm64 linux ([sp]=argc, argv=sp+8, envp
+			# after argv's NULL), driven the same way — only the ISA differs: args/number in a0-a7,
+			# `ecall` traps, `exit_group` (94) ends it. argc/argv/envp parked in callee-saved s1/s2/s3
+			# (cf_root_page_init + the QBE-emitted cf_build_* preserve them); `la` loads cf_page's address.
+			write_str(asm_fd, ".globl _start\n")
+			write_str(asm_fd, ".p2align 1\n")
+			write_str(asm_fd, "_start:\n")
+			write_str(asm_fd, "\tld s1, 0(sp)\n")
+			write_str(asm_fd, "\taddi s2, sp, 8\n")
+			write_str(asm_fd, "\tslli t0, s1, 3\n")
+			write_str(asm_fd, "\tadd t0, s2, t0\n")
+			write_str(asm_fd, "\taddi s3, t0, 8\n")
+			write_str(asm_fd, "\tcall cf_root_page_init\n")
+			write_str(asm_fd, "\tla a0, cf_page\n")
+			if argv_form then write_str(asm_fd, "\tmv a1, s1\n")
+			if argv_form then write_str(asm_fd, "\tmv a2, s2\n")
+			if argv_form then write_str(asm_fd, "\tcall cf_build_args\n")
+			if argv_form then write_str(asm_fd, "\tmv a1, a0\n")
+			if argv_form then write_str(asm_fd, "\tla a0, cf_page\n")
+			if env_form then write_str(asm_fd, "\tmv a1, s1\n")
+			if env_form then write_str(asm_fd, "\tmv a2, s2\n")
+			if env_form then write_str(asm_fd, "\tcall cf_build_args\n")
+			if env_form then write_str(asm_fd, "\tmv s4, a0\n")
+			if env_form then write_str(asm_fd, "\tla a0, cf_page\n")
+			if env_form then write_str(asm_fd, "\tmv a1, s3\n")
+			if env_form then write_str(asm_fd, "\tcall cf_build_env\n")
+			if env_form then write_str(asm_fd, "\tmv a2, a0\n")
+			if env_form then write_str(asm_fd, "\tmv a1, s4\n")
+			if env_form then write_str(asm_fd, "\tla a0, cf_page\n")
+			if !wants_args then write_str(asm_fd, "\tmv a1, s1\n")
+			if !wants_args then write_str(asm_fd, "\tmv a2, s2\n")
+			write_str(asm_fd, "\tcall main\n")
+			write_str(asm_fd, "\tli a7, 94\n")
+			write_str(asm_fd, "\tecall\n")
+			} else {
 			# LINUX ELF entry (arm64). The kernel does NOT pass argc/argv in registers — it lays the
 			# stack out as [sp]=argc, [sp+8..]=argv[], NULL, envp[], NULL, auxv. Load argc (x19), argv
 			# (x20 = sp+8), envp (x21 = argv + (argc+1)*8) into callee-saved regs (cf_root_page_init and
@@ -7648,6 +7780,7 @@ pub const emit_program! = (
 			write_str(asm_fd, "\tbl main\n")
 			write_str(asm_fd, "\tmov x8, #94\n")
 			write_str(asm_fd, "\tsvc #0\n")
+			}
 		} else {
 		write_str(asm_fd, ".globl _start\n")
 		write_str(asm_fd, ".p2align 2\n")
@@ -7695,13 +7828,13 @@ pub const emit_program! = (
 		}
 	}
 
-	emit_arena_floor!(asm_fd, is_bare, is_linux, root_size)
+	emit_arena_floor!(asm_fd, is_bare, is_linux, is_riscv, root_size)
 	# the user's asm-bodied functions, naked beside the floor (QBE has no asm/`svc` path)
 	let Iarch k = 0
 
 	loop {
 		if k >= Iarch(prog.funcs.len) then break
-		if prog.funcs[k].is_asm then emit_asm_func!(asm_fd, prog.funcs[k], k, is_elf)
+		if prog.funcs[k].is_asm then emit_asm_func!(asm_fd, prog.funcs[k], k, is_elf, is_riscv)
 		k = k + 1
 	}
 
