@@ -7,7 +7,7 @@ hermetic and offline. Nothing here is fetched at build time.
 
 The QBE backend (<https://c9x.me/qbe/>), MIT-licensed (see `qbe/LICENSE`). cf uses QBE two ways:
 
-1. **Build-time:** the standalone `qbe` assembles the committed IL seed (`boot/seed/cf.qbe`)
+1. **Build-time:** the standalone `qbe` assembles the committed IL seed (`boot/seed_<os>/cf.qbe`)
    into the cf binary — the pinned-qbe link of the trust chain (`public seed → pinned qbe → cc`).
 2. **Use-time:** QBE's objects are linked *into* the shipped `cf` (minus `main.o`, plus
    `cf_embed.c`) so cf translates IL→asm in-process — users need no separate qbe install.

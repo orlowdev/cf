@@ -1,0 +1,96 @@
+# build-binaries — compile cf for the supported platforms and attach them to a release.
+#
+# Runs on `workflow_call` (from release.yml, with the version to stamp) and on a hand-pushed ring tag.
+# Each platform builds from its OWN committed seed (boot/seed_mac / boot/seed_linux), so there is no
+# cross-emit and no foreign toolchain — only the system `cc` and the vendored qbe:
+#   darwin-arm64   → macOS runner, native `build.sh`
+#   linux-arm64    → ubuntu-arm runner, native `build.sh linux-arm64`
+#   linux-riscv64  → ubuntu-arm runner, `build.sh linux-riscv64` cross-linked with the distro's
+#                    gcc-riscv64-linux-gnu (shared linux IL, riscv floor)
+# Every binary is stamped with the release version via lib/std/compiler/buildinfo.cf, so it reports
+# itself through `std::comptime::version::compiler`.
+#
+# STATUS: all three targets validated. darwin byte-reproduces the seed. Both linux targets are static
+# musl (the floor calls musl's `__init_libc`): linux-arm64 built + ran natively on a real aarch64 Linux
+# VM; linux-riscv64 cross-built (musl.cc toolchain) + ran under qemu-riscv64 — cf compiles+runs programs
+# and its embedded QBE works under the custom `_start` on both. The riscv leg downloads its musl cross
+# from musl.cc (the one external fetch here).
+name: build-binaries
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+  push:
+    tags:
+      - '*-nightly'
+      - '*-rc'
+      - '*-latest'
+      - '*-stable'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: darwin-arm64
+            runner: macos-14
+            target: darwin-arm64
+            experimental: false
+          - name: linux-arm64
+            runner: ubuntu-24.04-arm
+            target: linux-arm64
+            experimental: false
+          - name: linux-riscv64
+            runner: ubuntu-24.04-arm
+            target: linux-riscv64
+            experimental: false
+    continue-on-error: ${{ matrix.experimental }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: v
+        run: echo "version=${{ inputs.version || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Stamp the compiler version
+        run: |
+          sed -i.bak 's/"0.0.0-dev"/"${{ steps.v.outputs.version }}"/' lib/std/compiler/buildinfo.cf
+          rm -f lib/std/compiler/buildinfo.cf.bak
+          grep compiler_version lib/std/compiler/buildinfo.cf
+
+      - name: Install linux build tools (musl + libgcc)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y build-essential musl-tools
+
+      - name: Install the riscv64 musl cross toolchain
+        if: matrix.target == 'linux-riscv64'
+        run: |
+          curl -fsSL https://musl.cc/riscv64-linux-musl-cross.tgz | sudo tar xz -C /opt
+          echo "/opt/riscv64-linux-musl-cross/bin" >> "$GITHUB_PATH"
+          echo "RISCV_CC=riscv64-linux-musl-gcc" >> "$GITHUB_ENV"
+
+      - name: Build
+        env:
+          CF_STRIP: 1   # release binaries are stripped (objects already carry no -g)
+        run: ./boot/build.sh "${{ matrix.target }}"
+
+      - name: Package
+        id: pkg
+        run: |
+          bin="cf-${{ steps.v.outputs.version }}-${{ matrix.name }}"
+          cp var/cf "$bin"
+          if command -v sha256sum >/dev/null; then sha256sum "$bin" > "$bin.sha256"; else shasum -a 256 "$bin" > "$bin.sha256"; fi
+          echo "bin=$bin" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ steps.v.outputs.version }}" "${{ steps.pkg.outputs.bin }}" "${{ steps.pkg.outputs.bin }}.sha256" --clobber

@@ -159,3 +159,11 @@ cf_qbe_run(int target_id, const char *in_path, const char *out_path)
 	fclose(outf);
 	return 0;
 }
+
+#ifdef __linux__
+/* cf's asm FFI (boot/src/qbe.cf) calls `_cf_qbe_run` — the darwin Mach-O name, where C symbols get a
+ * leading underscore. Linux ELF has no such prefix, so the same `bl _cf_qbe_run` would be undefined.
+ * Export `_cf_qbe_run` as an explicit alias (ELF permits a leading underscore in a symbol name) so the
+ * one FFI call links unchanged on both platforms — no per-OS asm in the compiler, no reseed. */
+extern int _cf_qbe_run(int, const char *, const char *) __attribute__((alias("cf_qbe_run")));
+#endif

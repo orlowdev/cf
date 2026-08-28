@@ -1,0 +1,145 @@
+# genver — the pure Genetic Versioning arithmetic (root/specs/versioning.md).
+#
+# GenVer carries three independent axes — glory (breaking), enhancement (additive), nurture (fix) —
+# and, unlike SemVer, NEVER resets a lower axis when a higher one moves: `2.3.12` gaining one glory
+# is `3.3.12`, not `3.0.0`. So the next version of a ring is just its previous version with the count
+# of each kind of commit landed since ADDED to the matching axis.
+#
+# Commit kind is read off the subject line per root/code_style/git_committing.md: `GLORIOUSLY …` is a
+# glory, `Enhance … by …` an enhancement, `Nurture … by …` a nurture. Every other subject is a
+# non-versioning change and does not move any axis. This module is pure: it turns a previous version
+# string and a list of commit subjects into the next version, with no I/O and no git — the entry
+# point feeds it what git reports.
+
+# A point in GenVer space: the three axis counts. Used both for an absolute version (glory=1,
+# enh=22, nur=58 is `1.22.58`) and for a delta (the per-kind commit counts since the last release).
+pub data Ver = { Iarch glory, Iarch enh, Iarch nur }
+
+# Byte `i` of `b` widened to Iarch — a bare `b[i]` is a Uint8 that can't be compared or returned.
+const byte_of = (*[Uint8] b, Iarch i): Iarch -> Iarch(b[i])
+
+# Copy `len` bytes of `buf` from `start` into a fresh owned Str (the fs::slice idiom — append inline
+# onto one local, never return a bare indexed byte).
+const slice = (*[Uint8] buf, Iarch start, Iarch len): Str -> {
+	let [Uint8] out = []
+	let Iarch i = 0
+
+	loop {
+		if i >= len then break
+
+		out = [...out, buf[start + i]]
+		i = i + 1
+	}
+
+	return Str({ bytes: out, len: Iarch(out.len) })
+}
+
+# The substring of `s` over the byte range [start, end) as a fresh owned Str.
+const substr = (Str s, Iarch start, Iarch end): Str -> slice(s.bytes, start, end - start)
+
+# Drop trailing whitespace (space, tab, CR, LF) from `s` — git output carries a trailing newline, and
+# a stray newline threaded into a shell command or a version string would corrupt it.
+pub const trim_end = (Str s): Str -> {
+	let Iarch end = s.len
+
+	loop {
+		if end <= 0 then break
+
+		const Iarch c = byte_of(s.bytes, end - 1)
+
+		if c == 10 || c == 13 || c == 32 || c == 9 then end = end - 1 else break
+	}
+
+	return substr(s, 0, end)
+}
+
+# Split `s` into lines on '\n', dropping empty lines. Each element is a fresh owned Str, so it may be
+# passed on freely (a bare `[Str]` element only exposes `.len`, but a full owned Str carries `.bytes`).
+pub const split_lines = (Str s): [Str] -> {
+	let [Str] out = []
+	let Iarch start = 0
+	let Iarch i = 0
+
+	loop {
+		if i >= s.len then break
+
+		if byte_of(s.bytes, i) == 10 then {
+			if i > start then out = [...out, substr(s, start, i)]
+
+			start = i + 1
+		}
+
+		i = i + 1
+	}
+
+	if s.len > start then out = [...out, substr(s, start, s.len)]
+
+	return out
+}
+
+# Split `s` into fields on the byte `sep`, KEEPING empties (so field positions stay aligned even when
+# one is empty). Used to break a `sha\0author\0subject` git record on its NUL separators — a byte that
+# cannot occur inside commit text, so it never collides with the content.
+pub const split_fields = (Str s, Iarch sep): [Str] -> {
+	let [Str] out = []
+	let Iarch start = 0
+	let Iarch i = 0
+
+	loop {
+		if i >= s.len then break
+
+		if byte_of(s.bytes, i) == sep then {
+			out = [...out, substr(s, start, i)]
+			start = i + 1
+		}
+
+		i = i + 1
+	}
+
+	return [...out, substr(s, start, s.len)]
+}
+
+# Parse a version string into its three axes. Reads decimal digits into glory, then (after the first
+# '.') enhancement, then (after the second '.') nurture, and STOPS at '-' so a pre-release label
+# (`1.22.58-nightly`) is ignored. A missing or empty string yields `0.0.0` — the base before any
+# release exists on a ring (glory only reaches 1 once a glory commit lands; `0.x.x` is a glory hole).
+pub const parse_ver = (Str s): Ver -> {
+	let Iarch g = 0
+	let Iarch e = 0
+	let Iarch n = 0
+	let Iarch field = 0
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(s.len) then break
+
+		const Iarch c = Iarch(s[i])
+
+		if c == 45 then break
+
+		if c == 46 then {
+			field = field + 1
+			i = i + 1
+			continue
+		}
+
+		if c >= 48 && c <= 57 then {
+			const Iarch d = c - 48
+
+			if field == 0 then g = g * 10 + d
+			if field == 1 then e = e * 10 + d
+			if field == 2 then n = n * 10 + d
+		}
+
+		i = i + 1
+	}
+
+	return Ver({ glory: g, enh: e, nur: n })
+}
+
+# Add a delta onto a base version, axis by axis — the whole of GenVer's non-resetting bump.
+pub const bump = (Ver base, Ver delta): Ver ->
+	Ver({ glory: base.glory + delta.glory, enh: base.enh + delta.enh, nur: base.nur + delta.nur })
+
+# Render a version as its ring tag `G.E.N-<label>` (e.g. `1.23.61-nightly`).
+pub const format_tag = (Ver v, Str label): Str -> "${v.glory}.${v.enh}.${v.nur}-${label}"

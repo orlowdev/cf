@@ -6,19 +6,35 @@
 # file in-process — no external `qbe` binary. It is app-layer, not std: only the cf
 # binary links QBE, so only cf may reference `_cf_qbe_run`.
 #
-# Unlike `syscall6` (which traps via `svc`, leaving x30 untouched), this body `bl`s a C
-# function and so must save/restore the link register itself — the asm body IS the whole
-# function, with no compiler-generated prologue. The three args already arrive in x0-x2
-# (param registers), so they feed the C call directly.
+# Unlike `syscall6` (which traps, leaving the return register untouched), this body calls a C
+# function and so must save/restore the return address itself — the asm body IS the whole
+# function, with no compiler-generated prologue. The three args already arrive in the param
+# registers, so they feed the C call directly.
+import std::comptime::arch
+import std::sys::{ Arch }
 
-# The raw FFI: `cf_qbe_run(int target_id, const char *in, const char *out)`, args in x0-x2,
-# result (0 = ok, else an error code) in x0.
-const cf_qbe_run_raw = (Iarch target, Uarch in_ptr, Uarch out_ptr): Iarch -> asm "
+# The raw FFI: `cf_qbe_run(int target_id, const char *in, const char *out)`, args in the C arg
+# registers, result (0 = ok, else an error code) in the return register. The tiny trampoline is
+# per-ISA (it saves the return address around the call), comptime-selected on the target arch —
+# arm64 for darwin/bare/linux-arm64, riscv for linux-riscv64. `_cf_qbe_run` is the symbol cf calls;
+# qbe_embed.c defines it (with a `_`-prefixed alias on ELF), so the same name links on both.
+if arch::target == Arch.Riscv64 then {
+	const cf_qbe_run_raw = (Iarch target, Uarch in_ptr, Uarch out_ptr): Iarch -> asm "
+	addi sp, sp, -16
+	sd ra, 8(sp)
+	call _cf_qbe_run
+	ld ra, 8(sp)
+	addi sp, sp, 16
+	ret
+"
+} else {
+	const cf_qbe_run_raw = (Iarch target, Uarch in_ptr, Uarch out_ptr): Iarch -> asm "
 	stp x29, x30, [sp, #-16]!
 	bl _cf_qbe_run
 	ldp x29, x30, [sp], #16
 	ret
 "
+}
 
 # Translate the QBE IL file at `in_path` into a target asm file at `out_path`, in-process.
 # `target_id`: 0 arm64_apple (darwin), 1 arm64 (bare ELF), 2 amd64_apple, 3 amd64_sysv, 4 rv64.

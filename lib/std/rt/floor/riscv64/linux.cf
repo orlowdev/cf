@@ -91,15 +91,37 @@ pub const cf_oom = (): () -> asm "
 "
 
 # The freestanding entry (riscv64/linux). Same stack layout as arm64/linux ([sp]=argc, argv=sp+8,
-# envp after argv's NULL) read into callee-saved s1/s2/s3; seeds the root page, then ALWAYS builds
-# argv AND env through the pre-main bridges (uniform entry ABI; `main` ignores what it doesn't
-# declare), calls `main`, exits via exit_group (94). ELF; args in a0-a7, `la` for addresses.
+# envp after argv's NULL) read into callee-saved s1/s2/s3; inits the embedded QBE's libc, seeds the
+# root page, then ALWAYS builds argv AND env through the pre-main bridges (uniform entry ABI; `main`
+# ignores what it doesn't declare), calls `main`, exits via exit_group (94). ELF; args in a0-a7.
+#
+# As on arm64/linux, the embedded QBE's static musl needs `__init_libc(envp, argv[0])` before any call,
+# and this floor is shared with freestanding (libc-less) programs — so `__init_libc` is a WEAK ref read
+# through the GOT and null-guarded (its GOT slot is 0 when undefined-weak, so a plain program skips it).
+# cf's own build force-pulls musl's real one with `-Wl,-u,__init_libc`. envp is s3, argv[0] is [s2].
+#
+# Two RISC-V specifics before that: set `gp` (the global pointer) — musl is built with linker relaxation
+# and addresses globals gp-relative, so an unset gp faults; and cf's build links `-no-pie` (this custom
+# `_start` does no PIE self-relocation, and some musl toolchains default to static-PIE).
 pub const _start = (): () -> asm "
+	.option push
+	.option norelax
+	lla gp, __global_pointer$
+	.option pop
+	.weak __init_libc
 	ld s1, 0(sp)
 	addi s2, sp, 8
 	slli t0, s1, 3
 	add t0, s2, t0
 	addi s3, t0, 8
+1:
+	auipc t0, %got_pcrel_hi(__init_libc)
+	ld t0, %pcrel_lo(1b)(t0)
+	beqz t0, 2f
+	mv a0, s3
+	ld a1, 0(s2)
+	jalr t0
+2:
 	call cf_root_page_init
 	la a0, cf_page
 	mv a1, s1
