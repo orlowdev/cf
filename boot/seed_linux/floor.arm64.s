@@ -1,0 +1,147 @@
+.globl f40
+.p2align 2
+f40:
+	stp x29, x30, [sp, #-16]!
+	bl _cf_qbe_run
+	ldp x29, x30, [sp], #16
+	ret
+
+.globl f46
+.p2align 2
+f46:
+	mov x8, x0
+	mov x0, x1
+	mov x1, x2
+	mov x2, x3
+	mov x3, x4
+	mov x4, x5
+	mov x5, x6
+	svc #0
+	ret
+
+.globl f316
+.p2align 2
+f316:
+	mov x0, x0
+	mov x8, #94
+	svc #0
+	ret
+
+.globl cf_root_page_init
+.p2align 2
+cf_root_page_init:
+	movn x15, #4095
+	mov x0, #0
+	mov x1, #0x100000000
+	mov x2, #0
+	mov x3, #0x4022
+	mov x4, #-1
+	mov x5, #0
+	mov x8, #222
+	svc #0
+	cmp x0, x15
+	b.hs cf_mmap_fail
+	mov x12, x0
+	mov x0, x12
+	mov x1, #0x10000000
+	mov x2, #3
+	mov x8, #226
+	svc #0
+	cmp x0, x15
+	b.hs cf_mmap_fail
+	adrp x9, cf_page
+	add x9, x9, :lo12:cf_page
+	str x12, [x9]
+	mov x1, #0x100000000
+	add x11, x12, x1
+	str x11, [x9, #8]
+	mov x1, #0x10000000
+	add x13, x12, x1
+	str x13, [x9, #24]
+	mov x0, #0
+	mov x1, #0x40000000
+	mov x2, #0
+	mov x3, #0x4022
+	mov x4, #-1
+	mov x5, #0
+	mov x8, #222
+	svc #0
+	cmp x0, x15
+	b.hs cf_mmap_fail
+	mov x12, x0
+	mov x0, x12
+	mov x1, #0x1000000
+	mov x2, #3
+	mov x8, #226
+	svc #0
+	cmp x0, x15
+	b.hs cf_mmap_fail
+	str x12, [x9, #40]
+	mov x1, #0x40000000
+	add x11, x12, x1
+	str x11, [x9, #48]
+	mov x1, #0x1000000
+	add x13, x12, x1
+	str x13, [x9, #64]
+	ret
+
+.globl cf_root_page_grow
+.p2align 2
+cf_root_page_grow:
+	movn x15, #4095
+	add x9, x0, #24
+	ldr x10, [x9]
+	mov x11, #0x10000000
+	sub x12, x11, #1
+	add x13, x1, x12
+	bic x14, x13, x12
+	sub x1, x14, x10
+	mov x0, x10
+	mov x2, #3
+	mov x8, #226
+	svc #0
+	cmp x0, x15
+	b.hs cf_mmap_fail
+	str x14, [x9]
+	ret
+
+.globl cf_mmap_fail
+.p2align 2
+cf_mmap_fail:
+	mov x0, #71
+	mov x8, #94
+	svc #0
+
+.globl cf_oom
+.p2align 2
+cf_oom:
+	mov x0, #70
+	mov x8, #94
+	svc #0
+
+.globl _start
+.p2align 2
+_start:
+	ldr x19, [sp]
+	add x20, sp, #8
+	add x21, x20, x19, lsl #3
+	add x21, x21, #8
+	bl cf_root_page_init
+	adrp x0, cf_page
+	add x0, x0, :lo12:cf_page
+	mov x1, x19
+	mov x2, x20
+	bl cf_build_args
+	mov x22, x0
+	adrp x0, cf_page
+	add x0, x0, :lo12:cf_page
+	mov x1, x21
+	bl cf_build_env
+	mov x2, x0
+	mov x1, x22
+	adrp x0, cf_page
+	add x0, x0, :lo12:cf_page
+	bl main
+	mov x8, #94
+	svc #0
+

@@ -1,14 +1,19 @@
-# build-binaries — compile cf for the supported host platforms and attach them to a release.
+# build-binaries — compile cf for the supported platforms and attach them to a release.
 #
 # Runs on `workflow_call` (from release.yml, with the version to stamp) and on a hand-pushed ring tag.
-# Every leg runs on ONE macOS-arm64 runner: darwin-arm64 is a native `build.sh`; the linux targets are
-# cross-compiled with `zig cc` (which bundles a musl sysroot, so QBE's C runtime links static without a
-# host toolchain). Each binary is stamped with the release version via `lib/std/compiler/buildinfo.cf`,
-# so it reports itself through `std::comptime::version::compiler`.
+# Each platform builds from its OWN committed seed (boot/seed_mac / boot/seed_linux), so there is no
+# cross-emit and no foreign toolchain — only the system `cc` and the vendored qbe:
+#   darwin-arm64   → macOS runner, native `build.sh`
+#   linux-arm64    → ubuntu-arm runner, native `build.sh linux-arm64`
+#   linux-riscv64  → ubuntu-arm runner, `build.sh linux-riscv64` cross-linked with the distro's
+#                    gcc-riscv64-linux-gnu (shared linux IL, riscv floor)
+# Every binary is stamped with the release version via lib/std/compiler/buildinfo.cf, so it reports
+# itself through `std::comptime::version::compiler`.
 #
-# STATUS: darwin-arm64 is validated (the same `build.sh` used locally). The linux/riscv64 legs are
-# EXPERIMENTAL — cross-linking the compiler's embedded QBE (a libc-using C runtime) has not been run in
-# CI yet, so they carry `continue-on-error` and never block a release. See boot/build-cross.sh.
+# STATUS: darwin-arm64 is validated (the same build.sh used locally, byte-reproducing the seed). The
+# linux legs are UNVALIDATED IN CI — the freestanding-`_start` + static-libc link (cf's floor owns
+# `_start`; embedded QBE needs libc) works on darwin but has not yet been exercised on linux — so they
+# carry `continue-on-error` and never block a release until a first run confirms them.
 name: build-binaries
 
 on:
@@ -29,21 +34,22 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: darwin-arm64
-            method: native
+            runner: macos-14
+            target: darwin-arm64
             experimental: false
           - name: linux-arm64
-            method: cross
-            arch: arm64
+            runner: ubuntu-24.04-arm
+            target: linux-arm64
             experimental: true
           - name: linux-riscv64
-            method: cross
-            arch: riscv64
+            runner: ubuntu-24.04-arm
+            target: linux-riscv64
             experimental: true
     continue-on-error: ${{ matrix.experimental }}
     steps:
@@ -59,30 +65,26 @@ jobs:
           rm -f lib/std/compiler/buildinfo.cf.bak
           grep compiler_version lib/std/compiler/buildinfo.cf
 
-      - name: Install zig (cross legs only)
-        if: matrix.method == 'cross'
-        run: brew install zig
+      - name: Install linux build tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y build-essential
 
-      - name: Build (native)
-        if: matrix.method == 'native'
+      - name: Install the riscv64 cross toolchain
+        if: matrix.target == 'linux-riscv64'
+        run: sudo apt-get install -y gcc-riscv64-linux-gnu
+
+      - name: Build
+        run: ./boot/build.sh "${{ matrix.target }}"
+
+      - name: Package
+        id: pkg
         run: |
-          ./boot/build.sh
-          cp var/cf "cf-${{ steps.v.outputs.version }}-${{ matrix.name }}"
-
-      - name: Build (cross)
-        if: matrix.method == 'cross'
-        run: |
-          ./boot/build-cross.sh "${{ matrix.arch }}"
-          cp "var/cf-linux-${{ matrix.arch }}" "cf-${{ steps.v.outputs.version }}-${{ matrix.name }}"
-
-      - name: Checksum
-        run: shasum -a 256 "cf-${{ steps.v.outputs.version }}-${{ matrix.name }}" > "cf-${{ steps.v.outputs.version }}-${{ matrix.name }}.sha256"
+          bin="cf-${{ steps.v.outputs.version }}-${{ matrix.name }}"
+          cp var/cf "$bin"
+          if command -v sha256sum >/dev/null; then sha256sum "$bin" > "$bin.sha256"; else shasum -a 256 "$bin" > "$bin.sha256"; fi
+          echo "bin=$bin" >> "$GITHUB_OUTPUT"
 
       - name: Upload to the release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release upload "${{ steps.v.outputs.version }}" \
-            "cf-${{ steps.v.outputs.version }}-${{ matrix.name }}" \
-            "cf-${{ steps.v.outputs.version }}-${{ matrix.name }}.sha256" \
-            --clobber
+        run: gh release upload "${{ steps.v.outputs.version }}" "${{ steps.pkg.outputs.bin }}" "${{ steps.pkg.outputs.bin }}.sha256" --clobber

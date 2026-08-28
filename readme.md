@@ -245,13 +245,16 @@ die on the frame.
 C! takes reproducibility and provenance seriously. The trust chain has exactly
 two external dependencies, and both are pinned or reproducible.
 
-**The seed is public** The permanent root of the build is
-[`boot/seed/`](boot/seed/): `cf.qbe` (the QBE IL of the compiler) and `floor.s`
-(its assembly floor). This is cf compiling its own source. It is a
-**self-reproducing fixpoint** — a cf built from the seed recompiles the source
-to a byte-identical seed. That fixpoint has been checked with
-[Diverse Double-Compilation](https://dwheeler.com/trusting-trust/) across two
-independent C compilers (clang and gcc).
+**The seed is public** The permanent root of the build is a **per-platform** seed:
+[`boot/seed_mac/`](boot/seed_mac/) and [`boot/seed_linux/`](boot/seed_linux/), each `cf.qbe` (the
+QBE IL of the compiler) plus its assembly `floor` (per arch). The seed is per-OS because the
+compiler's own I/O bakes that OS's syscall numbers into the IL through comptime module selection —
+not only into the floor; the two linux arches SHARE one IL (generic ABI) and differ only in the
+floor. Each is cf compiling its own source: a **self-reproducing fixpoint** — a cf built from the
+seed recompiles the source to a byte-identical seed. `seed_mac` (the darwin root) is checked with
+[Diverse Double-Compilation](https://dwheeler.com/trusting-trust/) across two independent C compilers
+(clang and gcc); `seed_linux` is the SAME compiler's deterministic cross-emit (`--target linux`), so
+it inherits that trust and its native fixpoint is verified in CI.
 
 **QBE is vendored by exact commit.** The backend lives *in* the tree as a squashed git subtree at
 [`boot/vendor/qbe`](boot/vendor/qbe) (pinned to `v1.3`, commit `c081897…`), so the build is
@@ -274,7 +277,7 @@ compiler uses `embed_dir("lib/std")` in its own module loader: a shipped `var/cf
 imports with **nothing on disk** (disk first for development, the baked copy as fallback). The bytes
 ride in a `data` section, emitted by cf itself — no `cc`, no separate object.
 
-**The committed seed stays std-LESS.** Baking the stdlib into `boot/seed/cf.qbe` — the trust-root —
+**The committed seed stays std-LESS.** Baking the stdlib into the seed `cf.qbe` — the trust-root —
 would bloat it and force a reseed on *every* stdlib edit. So the embed is skipped for the seed: cf
 takes a `--skip-embeds` flag that drops all `embed`/`embed_dir` data when emitting the bootstrap
 intermediates. `reseed.sh` passes it, so the seed is a plain std-less compiler that reads `lib/std`
@@ -287,9 +290,11 @@ sh boot/build.sh         # two-stage: std-less seed -> cf0 -> std-hosting var/cf
 sh boot/test.sh          # run the corpus regression suite
 ```
 
-`boot/build.sh` never needs a C! compiler you don't already have. It runs in **two stages**: stage 1
-assembles the committed (std-less) seed (`boot/seed/cf.qbe` + `floor.s`) straight through `qbe → cc`
-into a bootstrap compiler `cf0`; stage 2 has `cf0` recompile the compiler *with* embedding on —
+`boot/build.sh [target]` never needs a C! compiler you don't already have (target defaults to the
+host; darwin-arm64 and linux-arm64 build natively from their seed, linux-riscv64 cross-builds on a
+linux-arm64 host). It runs in **two stages**: stage 1 assembles the host's committed (std-less) seed
+(`boot/seed_<os>/cf.qbe` + `floor.<arch>.s`) straight through `qbe → cc` into a bootstrap compiler
+`cf0`; stage 2 has `cf0` recompile the compiler *with* embedding on —
 baking `lib/std` (read from disk) into the self-contained, std-hosting `var/cf`. So a stdlib edit
 reflows into `cf` through stage 2 alone. The compiler's own source is the C! modules under
 [`lib/std/compiler/`](lib/std/compiler/) — the whole pipeline, exposed as

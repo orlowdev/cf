@@ -2,7 +2,7 @@
 # Regenerate the committed seed after editing cf's `.cf` source, and VERIFY the fixpoint.
 #
 # The self-hosting maintenance loop (seed_subset §3): cf's binary is built from the seed
-# (`boot/seed/`), so a source edit leaves the seed stale. This rebuilds cf from the OLD
+# (`boot/seed_mac/` + `boot/seed_linux/`), so a source edit leaves the seeds stale. This rebuilds cf from the OLD
 # seed, has THAT cf recompile the (new) source into a fresh seed, then confirms the fresh
 # seed is a true fixpoint — a cf built from it recompiles the source to the SAME thing.
 # Only then is the new seed written. A non-fixpoint (the emitted IL doesn't reproduce)
@@ -40,7 +40,8 @@ fi
 root=$(cd "$(dirname "$0")/.." && pwd)
 qbedir="$root/boot/vendor/qbe"
 qbe="$qbedir/qbe"
-seed="$root/boot/seed"
+seed="$root/boot/seed_mac"
+lseed="$root/boot/seed_linux"
 src="$root/boot/src/cf.cf"
 
 # Build the vendored QBE (standalone qbe + embeddable object set) and gather the objects linked into
@@ -63,8 +64,23 @@ trap 'rm -rf "$tmp"' EXIT
 # in the committed trust-seed — so an `embed`/`embed_dir` never bloats the seed and a stdlib edit that
 # leaves the compiler's own code untouched needs no reseed at all.
 
+# Regenerate the LINUX seed by cross-emitting from the just-verified darwin compiler `$1`. The linux
+# fixpoint is verified natively by CI (reseed runs on darwin and cannot build/run a linux cf), but the
+# emit is deterministic and target-driven, so this compiler's linux emit is exactly what a linux-native
+# cf reproduces. The two linux arches share one IL (generic ABI) and differ only in the floor.
+regen_linux() { # <verified-darwin-cf>
+	mkdir -p "$lseed"
+	"$1" --skip-embeds --target linux-arm64   "$src" "$lseed/cf.qbe" "$lseed/floor.arm64.s"
+	"$1" --skip-embeds --target linux-riscv64 "$src" "$tmp/lr.qbe"   "$lseed/floor.riscv64.s"
+	if ! cmp -s "$lseed/cf.qbe" "$tmp/lr.qbe"; then
+		echo "reseed: FIXPOINT FAILED — linux arm64/riscv64 IL diverged (must be identical, generic ABI)" >&2
+		exit 1
+	fi
+	echo "reseed: ok — linux seed regenerated (native fixpoint verified in CI) -> $lseed"
+}
+
 # 1. cf₀ from the CURRENT (committed) seed.
-asm "$seed/cf.qbe" "$seed/floor.s" "$tmp/cf_old"
+asm "$seed/cf.qbe" "$seed/floor.arm64.s" "$tmp/cf_old"
 
 # 2. cf₀ recompiles the (possibly edited) source → stage-1.
 "$tmp/cf_old" --skip-embeds "$src" "$tmp/new.qbe" "$tmp/new.floor.s"
@@ -81,8 +97,9 @@ if [ "$transitional" -eq 0 ]; then
 		exit 1
 	fi
 	cp "$tmp/new.qbe" "$seed/cf.qbe"
-	cp "$tmp/new.floor.s" "$seed/floor.s"
-	echo "reseed: ok — seed regenerated and fixpoint verified -> $seed"
+	cp "$tmp/new.floor.s" "$seed/floor.arm64.s"
+	echo "reseed: ok — mac seed regenerated and fixpoint verified -> $seed"
+	regen_linux "$tmp/cf_new"
 	exit 0
 fi
 
@@ -95,5 +112,6 @@ if ! cmp -s "$tmp/chk.qbe" "$tmp/chk2.qbe" || ! cmp -s "$tmp/chk.floor.s" "$tmp/
 	exit 1
 fi
 cp "$tmp/chk.qbe" "$seed/cf.qbe"
-cp "$tmp/chk.floor.s" "$seed/floor.s"
-echo "reseed: ok — seed regenerated (transitional stage-2) and fixpoint verified -> $seed"
+cp "$tmp/chk.floor.s" "$seed/floor.arm64.s"
+echo "reseed: ok — mac seed regenerated (transitional stage-2) and fixpoint verified -> $seed"
+regen_linux "$tmp/cf_newer"
