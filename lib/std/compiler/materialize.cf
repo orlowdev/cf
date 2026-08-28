@@ -830,6 +830,7 @@ const hook_instance = (Func tmpl, Str iname, Str t): Func -> {
 		tbounds: no_typ,
 		ret_size: tmpl.ret_size,
 		is_intrinsic: tmpl.is_intrinsic,
+		asm_sym: tmpl.asm_sym,
 	})
 }
 
@@ -962,14 +963,11 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 	const Iarch mi = find_fn(prog.funcs, "main")
 	if mi < 0 then return Mat({ prog: strip_pg(prog), names: no_strs, geoms: no_strs })
 	const Bool main_allocs = alloc_body(prog.funcs[mi].body, prog.unions)
-	# `main([Str] args)` (or `main([Str] args, [Str] env)`) — the pre-main argv/env bridge builds
-	# the `[Str]`(s) on the root page through `reserve_ret__pg`, so that hook must survive even when
-	# the program otherwise materializes nothing (the page stays dormant but its ret reserve is kept).
-	# Keyed on the FIRST param being `[Str]` (1- or 2-param form); a 1-param `[Str]` main is unchanged.
-	const Bool main_argv = Iarch(prog.funcs[mi].params.len) >= 1 &&
-		Iarch(prog.funcs[mi].params.len) <= 2 &&
-		eq(prog.funcs[mi].params[0].type_name, "$dyn") &&
-		eq(prog.funcs[mi].params[0].elem, "Str")
+	# UNIFORM ENTRY ABI (std::rt::floor): the hosted `_start` ALWAYS builds argv+env before `main`, so
+	# `reserve_ret__pg` — the page reserve those pre-main bridges build the `[Str]`s through — must
+	# ALWAYS survive, regardless of main's params. (Bare builds no args; its kept reserve is a dead
+	# leaf, harmless.) Formerly keyed on `main([Str] …)`.
+	const Bool main_argv = true
 
 	const Iarch nf = Iarch(prog.funcs.len)
 
@@ -1232,6 +1230,7 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 					tbounds: fm.tbounds,
 					ret_size: fm.ret_size,
 					is_intrinsic: fm.is_intrinsic,
+					asm_sym: fm.asm_sym,
 				}),
 			]
 			if page_active then {
@@ -1240,8 +1239,11 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 			}
 		}
 		# a declared INTRINSIC always survives the rebuild: it emits no code, but typecheck/emit
-		# gate their token lowerings on resolving it (`is_intrinsic`), so it must stay in the table
-		if fi != mi && (reach[fi * 5] || prog.funcs[fi].is_intrinsic) then {
+		# gate their token lowerings on resolving it (`is_intrinsic`), so it must stay in the table.
+		# A verbatim-symbol floor fn (`asm_sym` set) likewise survives unconditionally: it is reached
+		# only by fixed asm symbol (the entry, `raw::grow`/`raw::trap`), invisible to this cf-call walk.
+		if fi != mi &&
+			(reach[fi * 5] || prog.funcs[fi].is_intrinsic || !eq(prog.funcs[fi].asm_sym, "")) then {
 			const Func f = prog.funcs[fi]
 			const [Str] bn = bind_names_of(gbinds, fi)
 			if f.is_asm || Iarch(bn.len) == 0 then out = [...out, f]
@@ -1272,6 +1274,7 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 						tbounds: f.tbounds,
 						ret_size: f.ret_size,
 						is_intrinsic: f.is_intrinsic,
+						asm_sym: f.asm_sym,
 					}),
 				]
 			}
@@ -1312,6 +1315,7 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 					tbounds: f.tbounds,
 					ret_size: f.ret_size,
 					is_intrinsic: f.is_intrinsic,
+					asm_sym: f.asm_sym,
 				}),
 			]
 			cnames = [...cnames, cnf]
@@ -1353,6 +1357,7 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 					tbounds: f.tbounds,
 					ret_size: f.ret_size,
 					is_intrinsic: f.is_intrinsic,
+					asm_sym: f.asm_sym,
 				}),
 			]
 			cnames = [...cnames, cnx]
@@ -1394,6 +1399,7 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 					tbounds: f.tbounds,
 					ret_size: f.ret_size,
 					is_intrinsic: f.is_intrinsic,
+					asm_sym: f.asm_sym,
 				}),
 			]
 			cnames = [...cnames, cne]
@@ -1435,6 +1441,7 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 					tbounds: f.tbounds,
 					ret_size: f.ret_size,
 					is_intrinsic: f.is_intrinsic,
+					asm_sym: f.asm_sym,
 				}),
 			]
 			cnames = [...cnames, cnp]

@@ -1,0 +1,193 @@
+# Filesystem operations for linux — metadata and directory manipulation, over the raw system calls.
+# Every fallible call returns `Either[IoRrr, T]` (linux returns a negated errno on failure). Linux's
+# generic syscall ABI is arch-independent (arm64, riscv64, … share these numbers + struct layouts),
+# so this module is shared across those arches — only the `syscall6` trap (std::sys) is per-arch.
+# The generic ABI uses the `*at` family exclusively (no bare `stat`/`mkdir`/
+# `unlink`/`rename`/`access`), so each passes `AT_FDCWD` (-100) to resolve a relative path against the
+# working directory. `stat!` reads the 128-byte linux `struct stat` via `newfstatat` (syscall 79) and
+# surfaces `st_size` (offset 48, i64) and `st_mode` (offset 16, u32) — a different layout from darwin.
+import std::sys::{ syscall6 }
+import std::data::{ Either }
+import std::io::fd::{ IoRrr, rrr_of, Stat, DirEntry }
+
+# Assemble a little-endian integer of `width` bytes from `buf` starting at `at`.
+const le = (*[Uint8] buf, Iarch at, Iarch width): Iarch -> {
+	let Iarch v = 0
+	let Iarch mul = 1
+	let Iarch k = 0
+
+	loop {
+		if k >= width then break
+
+		v = v + Iarch(buf[at + k]) * mul
+		mul = mul * 256
+		k = k + 1
+	}
+
+	return v
+}
+
+# newfstatat(AT_FDCWD, path, buf, 0) into `buf`. The `*[Uint8]` parameter is the hop a `[128 Uint8]`
+# local needs to reach `syscall6`'s `Uarch` operand (a local array does not coerce to `Uarch`).
+const stat_raw = (Str path, *[Uint8] buf): Iarch ->
+	syscall6(79, Uarch(Iarch(0) - 100), path.bytes, buf, 0, 0, 0)
+
+# stat() a path (follows symlinks). `Right` carries a `Stat`; `Left` an error (e.g. IoRrr.NotFound).
+pub const stat! = (Str path): Either[IoRrr, Stat] -> {
+	let [128 Uint8] st = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+	const Iarch r = stat_raw(path, st)
+
+	if r < 0 then return Either[IoRrr, Stat].Left(rrr_of(r))
+
+	const Iarch size = le(st, 48, 8)
+	const Iarch mode = le(st, 16, 4)
+
+	return Either[IoRrr, Stat].Right(Stat({ size: size, mode: mode }))
+}
+
+# Does `path` exist (as anything)? A stat that succeeds means yes; any error (not just is_not_found)
+# means the caller cannot see it, so `false`.
+pub const exists! = (Str path): Bool -> match stat!(path) {
+	Either.Left(e) -> false,
+	Either.Right(s) -> true,
+}
+
+# The byte size of the file at `path`, or the stat error.
+pub const file_size! = (Str path): Either[IoRrr, Iarch] -> match stat!(path) {
+	Either.Left(e) -> Either[IoRrr, Iarch].Left(e),
+	Either.Right(s) -> Either[IoRrr, Iarch].Right(s.size),
+}
+
+# mkdirat(AT_FDCWD, path, 0755) — create a directory with mode 0755 (= 493). `Right(0)` on success;
+# `Left` an error (is_exists if it already exists).
+pub const mkdir = (Str path): Either[IoRrr, Iarch] -> {
+	const Iarch r = syscall6(34, Uarch(Iarch(0) - 100), path.bytes, 493, 0, 0, 0)
+
+	if r < 0 then return Either[IoRrr, Iarch].Left(rrr_of(r))
+
+	return Either[IoRrr, Iarch].Right(r)
+}
+
+# rmdir an empty directory: unlinkat(AT_FDCWD, path, AT_REMOVEDIR). AT_REMOVEDIR = 0x200 (= 512).
+pub const rmdir = (Str path): Either[IoRrr, Iarch] -> {
+	const Iarch r = syscall6(35, Uarch(Iarch(0) - 100), path.bytes, 512, 0, 0, 0)
+
+	if r < 0 then return Either[IoRrr, Iarch].Left(rrr_of(r))
+
+	return Either[IoRrr, Iarch].Right(r)
+}
+
+# faccessat(AT_FDCWD, path, mode, 0) — test the calling process's permission for `path`. `mode` is a
+# bitmask: 1 = X_OK (executable), 2 = W_OK (writable), 4 = R_OK (readable), 0 = F_OK (exists). `true`
+# when the check passes (the syscall returns 0), `false` on any error — so a missing or non-executable
+# file both read as `false`. Used to resolve a program name against `PATH`.
+pub const access = (Str path, Iarch mode): Bool ->
+	syscall6(48, Uarch(Iarch(0) - 100), path.bytes, Uarch(mode), 0, 0, 0) == 0
+
+# unlinkat(AT_FDCWD, path, 0) — remove a file (not a directory) at `path`.
+pub const remove = (Str path): Either[IoRrr, Iarch] -> {
+	const Iarch r = syscall6(35, Uarch(Iarch(0) - 100), path.bytes, 0, 0, 0, 0)
+
+	if r < 0 then return Either[IoRrr, Iarch].Left(rrr_of(r))
+
+	return Either[IoRrr, Iarch].Right(r)
+}
+
+# renameat(AT_FDCWD, old, AT_FDCWD, new) — move `old` to `new` (across names on the same filesystem).
+pub const rename = (Str old, Str new): Either[IoRrr, Iarch] -> {
+	const Iarch r = syscall6(38, Uarch(Iarch(0) - 100), old.bytes, Uarch(Iarch(0) - 100), new.bytes, 0, 0)
+
+	if r < 0 then return Either[IoRrr, Iarch].Left(rrr_of(r))
+
+	return Either[IoRrr, Iarch].Right(r)
+}
+
+# chdir() — change the process working directory to `path`.
+pub const chdir = (Str path): Either[IoRrr, Iarch] -> {
+	const Iarch r = syscall6(49, path.bytes, 0, 0, 0, 0, 0)
+
+	if r < 0 then return Either[IoRrr, Iarch].Left(rrr_of(r))
+
+	return Either[IoRrr, Iarch].Right(r)
+}
+
+# getdents64() into `buf`, returning bytes read (0 at end) or a negated errno. `fd` is an open
+# directory. The `*[Uint8]` parameter is the hop the `[N Uint8]` local needs to reach `syscall6`'s
+# `Uarch` operand.
+const getdents_raw = (Iarch fd, *[Uint8] buf, Uarch n): Iarch ->
+	syscall6(61, Uarch(fd), buf, n, 0, 0, 0)
+
+# The NUL-terminated name length starting at `start` in `buf` — linux `struct linux_dirent64` stores
+# no `d_namlen`, so the name is scanned to its terminator (always present within the record).
+const namelen = (*[Uint8] buf, Iarch start): Iarch -> {
+	let Iarch i = 0
+
+	loop {
+		if Iarch(buf[start + i]) == 0 then break
+
+		i = i + 1
+	}
+
+	return i
+}
+
+# Copy `len` bytes from `buf` starting at `start` into a fresh owned `Str` — the raw directory buffer
+# is scratch, so an entry name is lifted out of it before the buffer is reused.
+const slice_str = (*[Uint8] buf, Iarch start, Iarch len): Str -> {
+	let [Uint8] out = []
+	let Iarch i = 0
+
+	loop {
+		if i >= len then break
+
+		out = [...out, buf[start + i]]
+		i = i + 1
+	}
+
+	return Str({ bytes: out, len: Iarch(out.len) })
+}
+
+# List a directory: `Right` carries a `[DirEntry]` (each with an owned `name` and a `kind`, including
+# `.` and `..`); `Left` an error. Reads the linux `struct linux_dirent64` stream (getdents64 = syscall
+# 61: d_reclen@16, d_type@18, NUL-terminated d_name@19) in 8 KiB batches until it drains.
+pub const read_dir! = (Str path): Either[IoRrr, [DirEntry]] -> {
+	const Iarch fd = syscall6(56, Uarch(Iarch(0) - 100), path.bytes, 0, 0, 0, 0)
+
+	if fd < 0 then return Either[IoRrr, [DirEntry]].Left(rrr_of(fd))
+
+	let [DirEntry] entries = []
+	let [8192 Uint8] buf
+	let Iarch err = 0
+
+	loop {
+		const Iarch n = getdents_raw(fd, buf, Uarch(8192))
+
+		if n < 0 then {
+			err = n
+
+			break
+		}
+
+		if n == 0 then break
+
+		let Iarch off = 0
+
+		loop {
+			if off >= n then break
+
+			const Iarch reclen = le(buf, off + 16, 2)
+			const Iarch kind = Iarch(buf[off + 18])
+			const Iarch namlen = namelen(buf, off + 19)
+			const Str name = slice_str(buf, off + 19, namlen)
+
+			entries = [...entries, DirEntry({ name: name, kind: kind })]
+			off = off + reclen
+		}
+	}
+
+	syscall6(57, Uarch(fd), 0, 0, 0, 0, 0)
+
+	if err < 0 then return Either[IoRrr, [DirEntry]].Left(rrr_of(err))
+
+	return Either[IoRrr, [DirEntry]].Right(entries)
+}

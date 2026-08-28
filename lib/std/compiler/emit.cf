@@ -19,6 +19,7 @@
 
 import std::io::console::{ die }
 import std::str::{ eq }
+import std::sys::{ Os, Arch }
 import std::data::{ Either }
 import std::io::file::{ write_str, read_file_into }
 import std::io::fs::{ read_dir! }
@@ -6987,50 +6988,6 @@ const emit_arena_qbe! = (Fd fd, Bool is_bare, Iarch root_size, Bool dyn_g, Iarch
 	return 0
 }
 
-# Does the program's `main` take a parameter — `main([Str] args)`? Then the freestanding
-# `_start` must convert the OS's raw `(argc, argv)` into a real cf `[Str]` before calling it
-# (see `emit_argv_qbe`). A bare `main()` takes the registers straight through.
-const main_takes_argv = (Program prog): Bool -> {
-	let Iarch i = 0
-
-	loop {
-		if i >= Iarch(prog.funcs.len) then break
-		if eq(prog.funcs[i].name, "main") then {
-			# exactly `main([Str] args)` — one dynamic-array-of-Str parameter. The old raw form
-			# `main(Iarch argc, *[Str] argv)` takes the registers straight (no argv build).
-			if Iarch(prog.funcs[i].params.len) != 1 then return false
-			if !eq(prog.funcs[i].params[0].type_name, "$dyn") then return false
-
-			return eq(prog.funcs[i].params[0].elem, "Str")
-		}
-		i = i + 1
-	}
-
-	return false
-}
-
-# `main([Str] args, [Str] env)` — the two-parameter entry: argv PLUS the process environment (also a
-# `[Str]`, one "KEY=VALUE" per entry). The floor builds both and threads env as main's second arg, so
-# a program reads the environment through main, never ambiently. Detected exactly (both params `[Str]`).
-const main_takes_env = (Program prog): Bool -> {
-	let Iarch i = 0
-
-	loop {
-		if i >= Iarch(prog.funcs.len) then break
-		if eq(prog.funcs[i].name, "main") then {
-			if Iarch(prog.funcs[i].params.len) != 2 then return false
-			if !eq(prog.funcs[i].params[0].type_name, "$dyn") then return false
-			if !eq(prog.funcs[i].params[0].elem, "Str") then return false
-			if !eq(prog.funcs[i].params[1].type_name, "$dyn") then return false
-
-			return eq(prog.funcs[i].params[1].elem, "Str")
-		}
-		i = i + 1
-	}
-
-	return false
-}
-
 # The argv bridge, emitted only for `main([Str] args)`. `cf_strlen` is a C-string length;
 # `cf_build_args` walks the `argc` C-strings in `argv`, wraps each in a `{bytes@0, len@8}` Str
 # header (BORROWING the OS's already-NUL-terminated argv bytes) and pushes it onto a fresh
@@ -7175,93 +7132,9 @@ const emit_arena_floor! = (Fd fd, Bool is_bare, Iarch root_size): Iarch -> {
 
 		return 0
 	}
-	write_str(fd, ".globl _cf_root_page_init\n")
-	write_str(fd, ".globl _cf_root_page_grow\n")
-	write_str(fd, ".globl _cf_oom\n")
-	write_str(fd, ".p2align 2\n")
-	# reserve 4 GiB of address space (PROT_NONE — no physical pages yet), commit an initial
-	# 256 MiB, and seed the $cf_page node struct { top@0, committed@8, limit@16, parent@24 }.
-	write_str(fd, "_cf_root_page_init:\n")
-	write_str(fd, "\tmov x0, #0\n")
-	write_str(fd, "\tmov x1, #0x100000000\n")
-	write_str(fd, "\tmov x2, #0\n")
-	write_str(fd, "\tmov x3, #0x1002\n")
-	write_str(fd, "\tmov x4, #-1\n")
-	write_str(fd, "\tmov x5, #0\n")
-	write_str(fd, "\tmov x16, #197\n")
-	write_str(fd, "\tsvc #0x80\n")
-	write_str(fd, "\tb.cs _cf_mmap_fail\n")
-	write_str(fd, "\tmov x12, x0\n")
-	# commit the initial 256 MiB: mprotect(base, 256 MiB, PROT_READ|PROT_WRITE)
-	write_str(fd, "\tmov x0, x12\n")
-	write_str(fd, "\tmov x1, #0x10000000\n")
-	write_str(fd, "\tmov x2, #3\n")
-	write_str(fd, "\tmov x16, #74\n")
-	write_str(fd, "\tsvc #0x80\n")
-	write_str(fd, "\tb.cs _cf_mmap_fail\n")
-	# $cf_page.top = base; .limit(+8) = base + 4 GiB; .aux/committed(+24) = base + 256 MiB
-	write_str(fd, "\tadrp x9, _cf_page@PAGE\n")
-	write_str(fd, "\tadd x9, x9, _cf_page@PAGEOFF\n")
-	write_str(fd, "\tstr x12, [x9]\n")
-	write_str(fd, "\tmov x1, #0x100000000\n")
-	write_str(fd, "\tadd x11, x12, x1\n")
-	write_str(fd, "\tstr x11, [x9, #8]\n")
-	write_str(fd, "\tmov x1, #0x10000000\n")
-	write_str(fd, "\tadd x13, x12, x1\n")
-	write_str(fd, "\tstr x13, [x9, #24]\n")
-	# the root RESIDUE lane (duplex, cf_page+40): its own small reservation — 1 GiB PROT_NONE,
-	# 16 MiB committed — an up-bumping lane with its own cf_root_page_grow watermark in `aux` (the root
-	# check keeps user residue off the page, so the lane serves only colorless-frame scraps).
-	write_str(fd, "\tmov x0, #0\n")
-	write_str(fd, "\tmov x1, #0x40000000\n")
-	write_str(fd, "\tmov x2, #0\n")
-	write_str(fd, "\tmov x3, #0x1002\n")
-	write_str(fd, "\tmov x4, #-1\n")
-	write_str(fd, "\tmov x5, #0\n")
-	write_str(fd, "\tmov x16, #197\n")
-	write_str(fd, "\tsvc #0x80\n")
-	write_str(fd, "\tb.cs _cf_mmap_fail\n")
-	write_str(fd, "\tmov x12, x0\n")
-	write_str(fd, "\tmov x0, x12\n")
-	write_str(fd, "\tmov x1, #0x1000000\n")
-	write_str(fd, "\tmov x2, #3\n")
-	write_str(fd, "\tmov x16, #74\n")
-	write_str(fd, "\tsvc #0x80\n")
-	write_str(fd, "\tb.cs _cf_mmap_fail\n")
-	write_str(fd, "\tstr x12, [x9, #40]\n")
-	write_str(fd, "\tmov x1, #0x40000000\n")
-	write_str(fd, "\tadd x11, x12, x1\n")
-	write_str(fd, "\tstr x11, [x9, #48]\n")
-	write_str(fd, "\tmov x1, #0x1000000\n")
-	write_str(fd, "\tadd x13, x12, x1\n")
-	write_str(fd, "\tstr x13, [x9, #64]\n")
-	write_str(fd, "\tret\n")
-	# cf_root_page_grow(x0 = node, x1 = target): commit up to round_up(target, 256 MiB) via mprotect from the
-	# node's committed watermark (in `aux`, node+24); the reservation bound was already checked by the caller.
-	write_str(fd, "_cf_root_page_grow:\n")
-	write_str(fd, "\tadd x9, x0, #24\n")
-	write_str(fd, "\tldr x10, [x9]\n")
-	write_str(fd, "\tmov x11, #0x10000000\n")
-	write_str(fd, "\tsub x12, x11, #1\n")
-	write_str(fd, "\tadd x13, x1, x12\n")
-	write_str(fd, "\tbic x14, x13, x12\n")
-	write_str(fd, "\tsub x1, x14, x10\n")
-	write_str(fd, "\tmov x0, x10\n")
-	write_str(fd, "\tmov x2, #3\n")
-	write_str(fd, "\tmov x16, #74\n")
-	write_str(fd, "\tsvc #0x80\n")
-	write_str(fd, "\tb.cs _cf_mmap_fail\n")
-	write_str(fd, "\tstr x14, [x9]\n")
-	write_str(fd, "\tret\n")
-	write_str(fd, "_cf_mmap_fail:\n")
-	write_str(fd, "\tmov x0, #71\n")
-	write_str(fd, "\tmov x16, #1\n")
-	write_str(fd, "\tsvc #0x80\n")
-	write_str(fd, "_cf_oom:\n")
-	write_str(fd, "\tmov x0, #70\n")
-	write_str(fd, "\tmov x16, #1\n")
-	write_str(fd, "\tsvc #0x80\n")
-
+	# hosted floors (darwin / linux / riscv) come from `std::rt::floor` (auto-injected, comptime-fenced,
+	# emitted as verbatim-symbol asm fns) — the compiler emits nothing here for them; only `Bare` (no OS
+	# to mmap) still floors inline above.
 	return 0
 }
 
@@ -7281,12 +7154,21 @@ const param_index = ([Param] params, Str name): Iarch -> {
 # Emit one asm-bodied function naked into the asm floor (ebnf § Assembly): `.globl` so the
 # QBE-lowered callers can `bl` it, then the body's segments verbatim, each `${param}`
 # replaced by the argument register `x<index>` that parameter occupies (arm64 C ABI: param
-# i is in x<i>; the function is naked — no prologue — and supplies its own `ret`). Labeled
-# `_f<idx>` to match the positional symbol QBE-lowered callers reference (`$f<idx>`).
-const emit_asm_func! = (Fd fd, Func fn, Iarch idx): Iarch -> {
-	write_str(fd, ".globl _f${idx}\n")
+# i is in the arch's arg register i; the function is naked — no prologue — and supplies its own
+# `ret`). The symbol matches the positional name QBE-lowered callers reference (`$f<idx>`): Mach-O
+# keeps the leading underscore (`_f<idx>`), an ELF target (`is_elf`: bare / linux) drops it (`f<idx>`),
+# so the hand-written floor label lines up with QBE's per-target symbol convention. The arg register a
+# `${param}` hole resolves to is arch-specific: arm64 passes param i in `x<i>`, riscv64 in `a<i>`.
+const emit_asm_func! = (Fd fd, Func fn, Iarch idx, Bool is_elf, Bool is_riscv): Iarch -> {
+	# A verbatim-symbol floor fn (`asm_sym` set by resolve for `std::rt::floor::*`) emits under its
+	# EXACT source symbol (`_start`, `cf_root_page_grow`) so the entry and the `raw::grow`/`raw::trap`
+	# lowerings link by fixed name; every other asm fn keeps positional `f<idx>`/`_f<idx>` linkage.
+	let Str sym = if is_elf then "f${idx}" else "_f${idx}"
+	if !eq(fn.asm_sym, "") then sym = fn.asm_sym
+	const Str reg = if is_riscv then "a" else "x"
+	write_str(fd, ".globl ${sym}\n")
 	write_str(fd, ".p2align 2\n")
-	write_str(fd, "_f${idx}:")
+	write_str(fd, "${sym}:")
 	let Iarch si = 0
 
 	loop {
@@ -7296,7 +7178,7 @@ const emit_asm_func! = (Fd fd, Func fn, Iarch idx): Iarch -> {
 		if sg.is_hole then {
 			const Iarch pidx = param_index(fn.params, sg.name)
 			if pidx < 0 then die("cf: emit: an asm interpolation hole must name a parameter\n")
-			write_str(fd, "x${pidx}")
+			write_str(fd, "${reg}${pidx}")
 		} else {
 			write_str(fd, Str(sg.lit))
 		}
@@ -7369,23 +7251,30 @@ pub const emit_program! = (
 	[Str] mat_geoms,
 	Fd qbe_fd,
 	Fd asm_fd,
-	Str target_os,
+	Os target_os,
+	Arch target_arch,
 	Iarch root_size,
 	Bool skip_embeds,
 ): Iarch -> {
 	# a `Bare` target (bare metal / Wasm) links no OS: the root is a static BSS region (no mmap), and
 	# there is no exit syscall — the floor halts. Every other target keeps the darwin mmap/exit floor.
 	# `root_size` sizes the `Bare` root page (ignored off `Bare`, which mmaps its own reserve).
-	const Bool is_bare = eq(target_os, "Bare")
+	const Bool is_bare = match target_os { Os.Bare -> true, _ -> false }
+	# `is_elf` (bare OR linux) picks the no-underscore, `:lo12:` symbol form `qbe -t arm64`/`-t rv64`
+	# emit, vs darwin's Mach-O `_`/`@PAGEOFF`. Hosted floors (`_start` + arena) come from `std::rt::floor`;
+	# only `Bare` still floors inline here (no OS to mmap).
+	const Bool is_linux = match target_os { Os.Linux -> true, _ -> false }
+	const Bool is_elf = is_bare || is_linux
+	# `is_riscv` drives `emit_asm_func!`'s `${param}` register letter (riscv `a<i>` vs arm64 `x<i>`) —
+	# the residual, irreducible ABI-awareness of the asm emitter.
+	const Bool is_riscv = match target_arch { Arch.Riscv64 -> true, _ -> false }
 	# the `_g` dynamic helpers are emitted when the program has materialized geometry bodies (they
 	# alone reference `cf_dyn_push_g`/`cf_*_append_g`) OR takes argv (the bridge below grows its
 	# `[Str]` through `cf_dyn_push_g` + the page reserve); off both the floor stays byte-identical.
-	const Bool argv_form = main_takes_argv(prog)
-	# `main([Str] args, [Str] env)` builds argv AND the environment; `wants_args` is either arg-taking
-	# form (both build the `[Str]` bridge), `env_form` additionally builds env. argv-only/bare programs
-	# are unaffected, so their floor stays byte-identical.
-	const Bool env_form = main_takes_env(prog)
-	const Bool wants_args = argv_form || env_form
+	# UNIFORM ENTRY ABI (std::rt::floor): a hosted `_start` ALWAYS builds argv AND env and passes both
+	# to `main`, so the compiler emits BOTH pre-main bridges for every hosted target. `Bare` builds
+	# neither (no OS, no kernel argv).
+	const Bool wants_args = !is_bare
 	const Bool dyn_g = Iarch(mat_names.len) > 0 || wants_args
 	# the root page publishes its own reserve entry (`$reserve_ret__pg`) into its `kind` slot statically
 	# in the `$cf_page` data, so an arena grafted from the page follows the pointer like any other
@@ -7409,8 +7298,8 @@ pub const emit_program! = (
 		if pgr < 0
 			then die("cf: emit: `main([Str] args)` needs `reserve_ret__pg` for the argv bridge, but materialize dropped it\n")
 		emit_argv_qbe!(qbe_fd, pgr)
-		# the env bridge rides beside it, reusing `cf_strlen`
-		if env_form then emit_env_qbe!(qbe_fd, pgr)
+		# the env bridge rides beside it (always, for the uniform entry ABI), reusing `cf_strlen`
+		emit_env_qbe!(qbe_fd, pgr)
 	}
 	# STATIC storage: each `static [N Uint8] NAME` gets a zero-filled BSS data block and a
 	# `{data, len, cap}` header beside it. Its nullary const (emit_func!) returns `$g_NAME`.
@@ -7473,8 +7362,10 @@ pub const emit_program! = (
 		i = i + 1
 	}
 
-	# asm floor: the freestanding entry. `_start` calls `_main` (argc/argv/envp still
-	# in x0/x1/x2 from the kernel), then exit-syscalls its return (in x0).
+	# The freestanding entry. HOSTED (`Darwin`/`Linux`) `_start` lives in `std::rt::floor` (auto-
+	# injected, comptime-fenced): it seeds the root page, builds argv+env through the pre-main bridges
+	# (the uniform ABI), calls `main`, and exit-syscalls its return. Only `Bare` floors its entry inline
+	# here — no OS, no kernel argv, a QEMU-semihosting halt for exit.
 	if is_bare then {
 		# BARE entry: no kernel argv, no exit syscall. Seed the static root, pass &cf_page as main's
 		# node arg, call main, then spin (a real target returns to its boot environment / resets).
@@ -7501,50 +7392,6 @@ pub const emit_program! = (
 		write_str(asm_fd, "\thlt #0xf000\n")
 		write_str(asm_fd, "cf_halt:\n")
 		write_str(asm_fd, "\tb cf_halt\n")
-	} else {
-		write_str(asm_fd, ".globl _start\n")
-		write_str(asm_fd, ".p2align 2\n")
-		write_str(asm_fd, "_start:\n")
-		# Establish the root page node first, then pass &cf_page as main's hidden node arg-0
-		# (geometry_lowering §4) — the node now occupies x0, so main's own args shift up by one.
-		# Save the kernel's `(argc, argv)` (x0/x1) across cf_root_page_init. `main([Str] args)`: build the
-		# `[Str]` header (under the page node) and pass it in x1. Otherwise pass the raw `(argc, argv)`
-		# straight into x1/x2 — harmless if `main()` ignores them, correct for `main(Iarch argc, ...)`.
-		write_str(asm_fd, "\tmov x19, x0\n")
-		write_str(asm_fd, "\tmov x20, x1\n")
-		# env form additionally saves envp (x2) across the page init + build calls
-		if env_form then write_str(asm_fd, "\tmov x21, x2\n")
-		write_str(asm_fd, "\tbl _cf_root_page_init\n")
-		write_str(asm_fd, "\tadrp x0, _cf_page@PAGE\n")
-		write_str(asm_fd, "\tadd x0, x0, _cf_page@PAGEOFF\n")
-		# argv-only: byte-identical to before — build args, hand it in x1, node back in x0
-		if argv_form then write_str(asm_fd, "\tmov x1, x19\n")
-		if argv_form then write_str(asm_fd, "\tmov x2, x20\n")
-		if argv_form then write_str(asm_fd, "\tbl _cf_build_args\n")
-		if argv_form then write_str(asm_fd, "\tmov x1, x0\n")
-		if argv_form then write_str(asm_fd, "\tadrp x0, _cf_page@PAGE\n")
-		if argv_form then write_str(asm_fd, "\tadd x0, x0, _cf_page@PAGEOFF\n")
-		# env form: build args (save in x22), build env (x2 = env), then args back in x1, node in x0.
-		# QBE-emitted cf_build_args/cf_build_env preserve x19-x22 (callee-saved); the asm page init
-		# touches only x0-x16, so argc/argv/envp survive.
-		if env_form then write_str(asm_fd, "\tmov x1, x19\n")
-		if env_form then write_str(asm_fd, "\tmov x2, x20\n")
-		if env_form then write_str(asm_fd, "\tbl _cf_build_args\n")
-		if env_form then write_str(asm_fd, "\tmov x22, x0\n")
-		if env_form then write_str(asm_fd, "\tadrp x0, _cf_page@PAGE\n")
-		if env_form then write_str(asm_fd, "\tadd x0, x0, _cf_page@PAGEOFF\n")
-		if env_form then write_str(asm_fd, "\tmov x1, x21\n")
-		if env_form then write_str(asm_fd, "\tbl _cf_build_env\n")
-		if env_form then write_str(asm_fd, "\tmov x2, x0\n")
-		if env_form then write_str(asm_fd, "\tmov x1, x22\n")
-		if env_form then write_str(asm_fd, "\tadrp x0, _cf_page@PAGE\n")
-		if env_form then write_str(asm_fd, "\tadd x0, x0, _cf_page@PAGEOFF\n")
-		# bare/no-arg main: raw (argc, argv) straight through (harmless if ignored)
-		if !wants_args then write_str(asm_fd, "\tmov x1, x19\n")
-		if !wants_args then write_str(asm_fd, "\tmov x2, x20\n")
-		write_str(asm_fd, "\tbl _main\n")
-		write_str(asm_fd, "\tmov x16, #1\n")
-		write_str(asm_fd, "\tsvc #0x80\n")
 	}
 
 	emit_arena_floor!(asm_fd, is_bare, root_size)
@@ -7553,7 +7400,7 @@ pub const emit_program! = (
 
 	loop {
 		if k >= Iarch(prog.funcs.len) then break
-		if prog.funcs[k].is_asm then emit_asm_func!(asm_fd, prog.funcs[k], k)
+		if prog.funcs[k].is_asm then emit_asm_func!(asm_fd, prog.funcs[k], k, is_elf, is_riscv)
 		k = k + 1
 	}
 

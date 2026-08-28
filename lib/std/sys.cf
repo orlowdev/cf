@@ -1,28 +1,31 @@
-# The raw system-call primitive and the target-descriptor enums (module_system). `syscall6`
-# traps into the kernel with up to six arguments; on darwin/arm64 the call number goes in `x16`
-# and the arguments in `x0`–`x5`, dispatched by `svc #0x80`. Higher-level modules wrap it — user
-# code should reach for `std/io/console` and friends, not this floor.
+# The raw system-call primitive and the target-descriptor enums (module_system). `syscall6` traps
+# into the kernel with up to six arguments; its trap convention (call-number register, dispatch
+# instruction, how failure is reported) is per-(arch, os), so the primitive itself lives in a
+# platform module and this barrel re-exports the one the fixed target selects. `Bare` has no OS, so
+# it gets NO `syscall6` — a freestanding program reaches the machine through `std::mem::raw` and MMIO
+# instead. Higher-level modules wrap it — user code should reach for `std::io::console` and friends,
+# not this floor. Only the winning branch is resolved; the losing branch's module file is never opened
+# (parser discards it), so an unimplemented target costs nothing here.
 #
-# LIFETIME NOTE: the compiler treats an asm body (this one included) as retaining nothing, so a
-# buffer passed here is freed on its normal scope exit. That is correct for a SYNCHRONOUS syscall
-# (the kernel copies/fills during the trap and keeps no pointer). It is NOT safe for an ASYNCHRONOUS
-# one — the compiler does not track a value's survivability across a call whose completion outlives
-# the trap. Async I/O must be driven by a wrapper that owns the buffer's lifetime until completion.
-pub const syscall6 = (Uarch num, Uarch a0, Uarch a1, Uarch a2, Uarch a3, Uarch a4, Uarch a5): Iarch ->
-	asm "
-	mov x16, ${num}
-	mov x0, ${a0}
-	mov x1, ${a1}
-	mov x2, ${a2}
-	mov x3, ${a3}
-	mov x4, ${a4}
-	mov x5, ${a5}
-	svc #0x80
-	b.cc 1f
-	neg x0, x0
-1:
-	ret
-"
+# `syscall6` is the ONE piece that is genuinely per-(arch, os): the trap instruction and the
+# call-number register differ by arch (arm64 `svc #0`/`x8`, riscv64 `ecall`/`a7`) and the failure
+# convention by os. So it dispatches on both — the linux branch further on `arch::target`. Everything
+# above it (std::io::*, std::process) rides linux's arch-independent generic ABI and is NOT arch-split.
+# darwin is arm64-only today; a darwin second arch adds an inner `arch::target` branch there too.
+import std::comptime::os
+import std::comptime::arch
+
+if os::target == Os.Darwin then {
+	pub import std::sys::arm64::darwin as *
+} else {
+	if os::target == Os.Linux then {
+		if arch::target == Arch.Riscv64 then {
+			pub import std::sys::riscv64::linux as *
+		} else {
+			pub import std::sys::arm64::linux as *
+		}
+	}
+}
 
 # The operating system and processor architecture a build targets. `comptime::os`/`comptime::arch`
 # compare against these variants to select a platform implementation at compile time.
