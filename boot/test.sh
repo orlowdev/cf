@@ -22,7 +22,7 @@
 #
 # PARALLEL: tests run concurrently, one job per CPU by default (override with CF_TEST_JOBS;
 # `CF_TEST_JOBS=1` restores the serial order). cf is built ONCE up front and only read after
-# that, and every driver.sh invocation works in its own mktemp dir, so the jobs share nothing
+# that, and every `cf` invocation writes to its own mktemp dir, so the jobs share nothing
 # writable. Result lines stream unordered; each job also records its line in a per-test file,
 # and the summary is counted from those (a test that vanishes without a result counts failed).
 # The old caveat about running the suite in parallel still holds ACROSS runs, not within one:
