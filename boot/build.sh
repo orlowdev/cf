@@ -59,9 +59,14 @@ knobs() { # <platform>  ->  sets seed qt fa cc link libs
 # C compiler — cc on darwin, musl-gcc on linux (matching the embedded QBE objects to the libc we link).
 knobs "$host"; hseed="$seed"; hqt="$qt"; hfa="$fa"; hcc="$cc"; hlink="$link"; hlibs="$libs"
 
+# The embedded QBE's C is built OPTIMIZED and without debug info (QBE's own Makefile defaults to
+# `-g` and no `-O`): `-O2` makes cf's IL->asm step faster, and dropping `-g` shrinks the binary. This
+# only affects how cf RUNS, never the IL it emits — the seed/fixpoint is unchanged.
+cflags="-std=c99 -O2"
+
 # The vendored QBE: the standalone `qbe` (a cross-assembler of cf's IL — emits any target's asm) plus
 # its object set, built for the HOST with the host compiler. Idempotent.
-make -C "$qbedir" -s CC="$hcc"
+make -C "$qbedir" -s CC="$hcc" CFLAGS="$cflags"
 host_embed=$(ls "$qbedir"/*.o "$qbedir"/*/*.o | grep -v '/main\.o$')
 
 mkdir -p "$root/var"
@@ -69,7 +74,7 @@ tmp=$(mktemp -d "${TMPDIR:-/tmp}/cf-build.XXXXXX") || exit 1
 trap 'rm -rf "$tmp"' EXIT
 
 # cf's C bridge, compiled for the HOST (for cf0) and, when cross-building, for the TARGET (below).
-"$hcc" -std=c99 -I "$qbedir" -c "$root/boot/qbe_embed.c" -o "$tmp/qbe_embed_host.o"
+"$hcc" $cflags -I "$qbedir" -c "$root/boot/qbe_embed.c" -o "$tmp/qbe_embed_host.o"
 
 # --- Stage 1: assemble the HOST seed into the bootstrap compiler cf0 (runs on this machine). ---
 for f in "$hseed/cf.qbe" "$hseed/floor.$hfa.s"; do
@@ -93,14 +98,24 @@ else
 	# `main.o`, already excluded from $host_embed, stay excluded), giving each a unique object name.
 	mkdir -p "$tmp/tobj"; i=0
 	for o in $host_embed; do
-		"$cc" -std=c99 -I "$qbedir" -c "${o%.o}.c" -o "$tmp/tobj/q$i.o"
+		"$cc" $cflags -I "$qbedir" -c "${o%.o}.c" -o "$tmp/tobj/q$i.o"
 		i=$((i + 1))
 	done
-	"$cc" -std=c99 -I "$qbedir" -c "$root/boot/qbe_embed.c" -o "$tmp/tobj/embed.o"
+	"$cc" $cflags -I "$qbedir" -c "$root/boot/qbe_embed.c" -o "$tmp/tobj/embed.o"
 	tembed=$(ls "$tmp/tobj"/q*.o); tqembed="$tmp/tobj/embed.o"
 fi
 
 # --- Link the target cf: floor (owns _start) + program asm + embedded QBE + bridge. ---
 # shellcheck disable=SC2086
 $cc $link -o "$out" "$tmp/cf.floor.s" "$tmp/cf.prog.s" $tembed "$tqembed" $libs
+
+# Release builds (`CF_STRIP=1`) strip the symbol table for a smaller artifact — the objects already
+# carry no `-g`, so this is the last of the size. Local builds keep symbols (cf is debuggable with
+# lldb). riscv needs its cross `strip`; darwin and native linux-arm64 use the host `strip`.
+if [ -n "${CF_STRIP:-}" ]; then
+	case "$target" in
+		linux-riscv64) "${RISCV_STRIP:-riscv64-linux-musl-strip}" "$out" ;;
+		*) strip "$out" ;;
+	esac
+fi
 echo "build: ok -> $out ($target)"
