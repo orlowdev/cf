@@ -19,8 +19,10 @@
 
 import std::io::console::{ die }
 import std::str::{ eq }
-import std::io::file::{ write_str }
-import std::io::fd::{ Fd }
+import std::data::{ Either }
+import std::io::file::{ write_str, read_file_into }
+import std::io::fs::{ read_dir! }
+import std::io::fd::{ Fd, IoRrr, DirEntry, entry_is_dir }
 import std::compiler::routing::{ RouteInfo, RSets, FnSum, kids, stmt_exprs }
 import std::compiler::alloc::{ address_taken }
 import std::compiler::ast::{
@@ -116,6 +118,7 @@ data Emit = {
 	Str mat_geom,
 	Iarch merge_depth,
 	Iarch local_slot,
+	Bool skip_embeds,
 }
 
 # A local/parameter in scope: its interned name, `slot`, its `rec_type` (a record/union
@@ -1761,7 +1764,7 @@ const emit_field! = (*Emit ctx, [Binding] env, Str base, Str field): Str -> {
 	return load_field_at!(ctx, bp, field_offset(ctx.recs, rt, field), field_scalar(ctx, rt, field))
 }
 
-# Emit a string literal. INTERNED literals (the program pre-scan, `slit_program`) are STATIC:
+# Emit a string literal. INTERNED literals (the program pre-scan, `slit_program!`) are STATIC:
 # their bytes and `{bytes*@0, len@8}` header live in `data` sections emitted once, and every
 # evaluation is a bare `copy $sl<i>` — zero runtime allocation, matching the allocation
 # oracle's "literals are static" contract (alloc.cf) that this emitter used to violate. A
@@ -3661,6 +3664,90 @@ const callee_is_intrinsic = (*Emit ctx, Str n): Bool -> {
 	return ctx.funcs[i].is_intrinsic
 }
 
+# ── compile-time file embedding (std::comptime::embed / embed_dir) ──────────────────────────────
+# The path of an embed intrinsic is a compile-time string LITERAL (typecheck rejected a non-literal),
+# so `pathlit` already holds its exact bytes. Read the whole file NOW into a fixed buffer and hand
+# back its bytes as a `[Uint8]` the caller lays down as baked literal data. Dies (with the path) if
+# it cannot be read, or if it overflows the buffer. This runs at compile time, over the compiler's
+# own memory; `read_file_into` returns a scalar count, sidestepping the match-payload-aggregate gap.
+const embed_slurp! = (Str pathlit): [Uint8] -> {
+	# a literal carries no NUL, so copy it and terminate for `open`'s C-string pointer.
+	let [Uint8] cp = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(pathlit.len) then break
+		cp = [...cp, pathlit[i]]
+		i = i + 1
+	}
+
+	cp = [...cp, 0]
+
+	# one embedded file's read buffer — 4 MB, well past any single stdlib module (emit.cf, ~260 KB).
+	let [4194304 Uint8] buf
+	const Iarch n = match read_file_into(Str(cp, Iarch(cp.len)), buf, Uarch(buf.len)) {
+		Either.Left(e) -> die("cf: emit: embed cannot read `${pathlit}`\n"),
+		Either.Right(k) -> k,
+	}
+	if n >= Iarch(buf.len) then die("cf: emit: embedded file exceeds the 4 MB buffer — grow it in emit.cf\n")
+	let [Uint8] out = []
+	let Iarch j = 0
+
+	loop {
+		if j >= n then break
+		out = [...out, buf[j]]
+		j = j + 1
+	}
+
+	return out
+}
+
+# Copy a `Str`'s bytes into a real `[Uint8]` (its `.bytes` is only a raw pointer) — used to seed a
+# synthetic `StrLit` for the path of each embedded file.
+const embed_bytes_of = (Str s): [Uint8] -> {
+	let [Uint8] out = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(s.len) then break
+		out = [...out, s[i]]
+		i = i + 1
+	}
+
+	return out
+}
+
+# Recursively collect every file path under `dir`, at compile time — the enumeration half of
+# `embed_dir` (unfiltered: every regular file, at any depth). Mirrors the directory recursion the
+# docs scanner uses. Dies if a directory cannot be read.
+const embed_walk! = (Str dir): [Str] -> {
+	let [Str] out = []
+	const Either[IoRrr, [DirEntry]] r = read_dir!(dir)
+
+	match r {
+		Either.Left(e) -> die("cf: emit: embed_dir cannot read `${dir}`\n"),
+		Either.Right(entries) -> {
+			for e in entries {
+				if !eq(e.name, ".") && !eq(e.name, "..") then {
+					const Str child = "${dir}/${e.name}"
+
+					if entry_is_dir(e) then {
+						const [Str] sub = embed_walk!(child)
+
+						for c in sub {
+							out = [...out, c]
+						}
+					} else {
+						out = [...out, child]
+					}
+				}
+			}
+		},
+	}
+
+	return out
+}
+
 const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env): Str -> {
 	# The geometry constructor INTRINSICS (honest-intrinsics Stage C): each geometry module
 	# declares `pub intrinsic of = (<user args>): Uarch` — a bodyless token, not a function. The
@@ -3806,6 +3893,54 @@ const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env)
 		write_str(ctx.fd, "\tblit ${pv}, ${pa}, ${psz}\n")
 
 		return pa
+	}
+	# `std::comptime::embed("path")` — read the file NOW (compile time) and emit its bytes as a
+	# string literal, so they ride in the binary. `emit_str_lit!` lays them down as static `data`
+	# when the pre-scan interned them, else materializes them inline — either way baked in, nothing
+	# to read at run time.
+	if eq(callee, "std_comptime_embed") && callee_is_intrinsic(ctx, callee) then {
+		# bootstrap intermediates (`--skip-embeds`): emit an empty `Str`, so no file data reaches the
+		# committed seed. The pre-scan skipped interning to match.
+		if ctx.skip_embeds then {
+			const [Uint8] none = []
+
+			return emit_str_lit!(ctx, none)
+		}
+		const Str pathlit = match args[0] {
+			Expr.StrLit(b) -> Str(b, Iarch(b.len)),
+			_ -> die("cf: emit: embed needs a string-literal path\n"),
+		}
+
+		return emit_str_lit!(ctx, embed_slurp!(pathlit))
+	}
+	# `std::comptime::embed_dir("dir")` — walk the directory NOW and synthesize the array literal
+	# `[EmbeddedFile({ path: <lit>, content: <lit> }), …]`, one entry per file, then emit it through
+	# the ordinary array/record path. Every `content` is a baked literal; only the 39-slot spine and
+	# the record headers are built at run time. This IS `embed_dir = comptime read_dir_rec + embed`.
+	if eq(callee, "std_comptime_embed_dir") && callee_is_intrinsic(ctx, callee) then {
+		# bootstrap intermediates (`--skip-embeds`): emit an empty `[EmbeddedFile]` — the seed carries
+		# no stdlib. (A shipped cf, built without the flag, bakes the real table.)
+		if ctx.skip_embeds then {
+			const [Expr] none = []
+
+			return emit_expr!(Expr.ArrayLit(false, Expr.Lit(0), none, "EmbeddedFile"), ctx, env)
+		}
+		const Str dirlit = match args[0] {
+			Expr.StrLit(b) -> Str(b, Iarch(b.len)),
+			_ -> die("cf: emit: embed_dir needs a string-literal path\n"),
+		}
+		let [Expr] elems = []
+		const [Str] paths = embed_walk!(dirlit)
+
+		for path in paths {
+			const [FieldInit] fields = [
+				FieldInit({ field: "path", value: Expr.StrLit(embed_bytes_of(path)) }),
+				FieldInit({ field: "content", value: Expr.StrLit(embed_slurp!(path)) }),
+			]
+			elems = [...elems, Expr.Record("EmbeddedFile", fields)]
+		}
+
+		return emit_expr!(Expr.ArrayLit(false, Expr.Lit(0), elems, "EmbeddedFile"), ctx, env)
 	}
 	# `Int8(x)`... narrows to the fixed width (canonicalizing); `Iarch`/`Int`/`Uarch` are identity
 	if is_cast_type(callee) then {
@@ -5812,93 +5947,134 @@ const nfp_prop_body = ([Func] funcs, [Bool] sig, [Stmt] ss): Bool -> {
 # the `"$str"` match arms' pattern members (they ride outside the expression tree) — so
 # emit_program! can lay each DISTINCT literal down once as static data. A source this walk
 # misses (a rare guard pattern) simply falls back to runtime materialization at its site.
-const slc_marms = ([MatchArm] arms): [Str] -> {
+# The static bytes an `embed`/`embed_dir` call contributes to the intern table: a `Call` node needs
+# its embedded file(s) laid down as static `data` so `emit_str_lit!` renders each as a one-instruction
+# `copy $sl` — a per-byte `storeb` materialization of a whole stdlib would blow QBE's per-function
+# instruction ceiling. The bytes are read HERE at compile time; the call site reads the same files and
+# finds them already interned. `embed` interns one file's content; `embed_dir` interns every file's
+# content under the directory (their short paths stay non-static — a handful of bytes each).
+# `skip` is the `--skip-embeds` mode (bootstrap intermediates): when set, embedded file data is NOT
+# collected, so it never reaches the seed IL — the bytes are the compiler's own `lib/std`, wanted in
+# the shipped `var/cf` but not in the committed seed. The call site emits an empty value to match.
+const slc_embed! = (Str callee, [Expr] args, Bool skip): [Str] -> {
+	if skip then return no_names()
+	if eq(callee, "std_comptime_embed") && Iarch(args.len) == 1 then {
+		const Str p = match args[0] {
+			Expr.StrLit(b) -> Str(b, Iarch(b.len)),
+			_ -> die("cf: emit: embed needs a string-literal path\n"),
+		}
+		const [Uint8] fb = embed_slurp!(p)
+
+		return one_name(Str(fb, Iarch(fb.len)))
+	}
+	if eq(callee, "std_comptime_embed_dir") && Iarch(args.len) == 1 then {
+		const Str d = match args[0] {
+			Expr.StrLit(b) -> Str(b, Iarch(b.len)),
+			_ -> die("cf: emit: embed_dir needs a string-literal path\n"),
+		}
+		const [Str] paths = embed_walk!(d)
+		let [Str] r = []
+
+		for p in paths {
+			const [Uint8] fb = embed_slurp!(p)
+
+			r = [...r, Str(fb, Iarch(fb.len))]
+		}
+
+		return r
+	}
+
+	return no_names()
+}
+
+const slc_marms! = ([MatchArm] arms, Bool skip): [Str] -> {
 	let [Str] r = []
 	let Iarch i = 0
 
 	loop {
 		if i >= Iarch(arms.len) then break
 		if !arms[i].is_wild && eq(arms[i].type_name, "$str") then r = cat_names(r, arms[i].members)
-		r = cat_names(r, slc_expr(arms[i].body))
+		r = cat_names(r, slc_expr!(arms[i].body, skip))
 		i = i + 1
 	}
 
 	return r
 }
 
-const slc_sarms = ([StmtArm] arms): [Str] -> {
+const slc_sarms! = ([StmtArm] arms, Bool skip): [Str] -> {
 	let [Str] r = []
 	let Iarch i = 0
 
 	loop {
 		if i >= Iarch(arms.len) then break
 		if !arms[i].is_wild && eq(arms[i].type_name, "$str") then r = cat_names(r, arms[i].members)
-		r = cat_names(r, slc_body(arms[i].body))
+		r = cat_names(r, slc_body!(arms[i].body, skip))
 		i = i + 1
 	}
 
 	return r
 }
 
-const slc_expr = (Expr e): [Str] -> match e {
+const slc_expr! = (Expr e, Bool skip): [Str] -> match e {
 	Expr.StrLit(b) -> one_name(Str(b, Iarch(b.len))),
-	Expr.Match(sc, arms) -> cat_names(slc_expr(sc), slc_marms(arms)),
-	Expr.Loop(ss) -> slc_body(ss),
-	_ -> slc_list(kids(e)),
+	Expr.Match(sc, arms) -> cat_names(slc_expr!(sc, skip), slc_marms!(arms, skip)),
+	Expr.Loop(ss) -> slc_body!(ss, skip),
+	Expr.Call(callee, ta, args, g) -> cat_names(slc_embed!(callee, args, skip), slc_list!(args, skip)),
+	_ -> slc_list!(kids(e), skip),
 }
 
-const slc_list = ([Expr] es): [Str] -> {
+const slc_list! = ([Expr] es, Bool skip): [Str] -> {
 	let [Str] r = []
 	let Iarch i = 0
 
 	loop {
 		if i >= Iarch(es.len) then break
-		r = cat_names(r, slc_expr(es[i]))
+		r = cat_names(r, slc_expr!(es[i], skip))
 		i = i + 1
 	}
 
 	return r
 }
 
-const slc_stmt = (Stmt s): [Str] -> {
-	let [Str] r = slc_list(stmt_exprs(s))
+const slc_stmt! = (Stmt s, Bool skip): [Str] -> {
+	let [Str] r = slc_list!(stmt_exprs(s), skip)
 
 	const [Str] deep = match s {
-		Stmt.IfThen(_, b) -> slc_stmt(b),
-		Stmt.IfElse(_, t, el) -> cat_names(slc_stmt(t), slc_stmt(el)),
-		Stmt.Block(ss) -> slc_body(ss),
-		Stmt.Loop(ss) -> slc_body(ss),
-		Stmt.ForIn(_, _, ss) -> slc_body(ss),
-		Stmt.Match(_, arms) -> slc_sarms(arms),
-		Stmt.Defer(ss) -> slc_body(ss),
-		Stmt.Closure(_, _, _, cb) -> slc_body(cb),
+		Stmt.IfThen(_, b) -> slc_stmt!(b, skip),
+		Stmt.IfElse(_, t, el) -> cat_names(slc_stmt!(t, skip), slc_stmt!(el, skip)),
+		Stmt.Block(ss) -> slc_body!(ss, skip),
+		Stmt.Loop(ss) -> slc_body!(ss, skip),
+		Stmt.ForIn(_, _, ss) -> slc_body!(ss, skip),
+		Stmt.Match(_, arms) -> slc_sarms!(arms, skip),
+		Stmt.Defer(ss) -> slc_body!(ss, skip),
+		Stmt.Closure(_, _, _, cb) -> slc_body!(cb, skip),
 		_ -> no_names(),
 	}
 
 	return cat_names(r, deep)
 }
 
-const slc_body = ([Stmt] ss): [Str] -> {
+const slc_body! = ([Stmt] ss, Bool skip): [Str] -> {
 	let [Str] r = []
 	let Iarch i = 0
 
 	loop {
 		if i >= Iarch(ss.len) then break
-		r = cat_names(r, slc_stmt(ss[i]))
+		r = cat_names(r, slc_stmt!(ss[i], skip))
 		i = i + 1
 	}
 
 	return r
 }
 
-const slit_program = (Program prog): [Str] -> {
+const slit_program! = (Program prog, Bool skip): [Str] -> {
 	let [Str] tbl = []
 	let Iarch i = 0
 
 	loop {
 		if i >= Iarch(prog.funcs.len) then break
 		if !prog.funcs[i].is_asm then {
-			const [Str] found = slc_body(prog.funcs[i].body)
+			const [Str] found = slc_body!(prog.funcs[i].body, skip)
 			let Iarch j = 0
 
 			loop {
@@ -5920,16 +6096,40 @@ const emit_slits! = (Fd fd, [Str] tbl): Iarch -> {
 
 	loop {
 		if i >= Iarch(tbl.len) then break
-		write_str(fd, "data $sld${i} = { ")
+		write_str(fd, "data $sld${i} = {")
 		let Iarch j = 0
+		# Batch printable-safe bytes into `b "..."` runs (QBE data strings) and drop to `b N` only for
+		# a quote, a backslash, or a non-printable byte — a whole embedded stdlib as one-`b N`-per-byte
+		# would multiply the seed ~5x, where mostly-text source stays near 1x this way.
+		let [Uint8] run = []
 
 		loop {
 			if j >= Iarch(tbl[i].len) then break
-			write_str(fd, "b ${Iarch(tbl[i][j])}, ")
+			const Iarch c = Iarch(tbl[i][j])
+
+			if c >= 32 && c <= 126 && c != 34 && c != 92 then {
+				run = [...run, Uint8(c)]
+			} else {
+				if Iarch(run.len) > 0 then {
+					write_str(fd, " b \"")
+					write_str(fd, Str(run, Iarch(run.len)))
+					write_str(fd, "\",")
+					run = []
+				}
+
+				write_str(fd, " b ${c},")
+			}
+
 			j = j + 1
 		}
 
-		write_str(fd, "b 0 }\n")
+		if Iarch(run.len) > 0 then {
+			write_str(fd, " b \"")
+			write_str(fd, Str(run, Iarch(run.len)))
+			write_str(fd, "\",")
+		}
+
+		write_str(fd, " b 0 }\n")
 		write_str(fd, "data $sl${i} = { l $sld${i}, l ${Iarch(tbl[i].len)} }\n")
 		i = i + 1
 	}
@@ -7171,6 +7371,7 @@ pub const emit_program! = (
 	Fd asm_fd,
 	Str target_os,
 	Iarch root_size,
+	Bool skip_embeds,
 ): Iarch -> {
 	# a `Bare` target (bare metal / Wasm) links no OS: the root is a static BSS region (no mmap), and
 	# there is no exit syscall — the floor halts. Every other target keeps the darwin mmap/exit floor.
@@ -7197,8 +7398,9 @@ pub const emit_program! = (
 	const [Str] at = address_taken(prog)
 	const [Bool] nsig = compute_nodesig(prog, at)
 	const [Bool] mts = compute_mints(prog, at)
-	# the interned string literals: laid down once as static data (see emit_str_lit!)
-	const [Str] slt = slit_program(prog)
+	# the interned string literals: laid down once as static data (see emit_str_lit!). `skip_embeds`
+	# (bootstrap intermediates) drops embedded file data so it never reaches the committed seed.
+	const [Str] slt = slit_program!(prog, skip_embeds)
 	emit_slits!(qbe_fd, slt)
 	if wants_args then {
 		# the argv bridge builds the `[Str]` on the ROOT PAGE — through the page's own reserve
@@ -7264,6 +7466,7 @@ pub const emit_program! = (
 				mat_geom: mat_geom_of(mat_names, mat_geoms, prog.funcs[i].name),
 				merge_depth: 0,
 				local_slot: 0,
+				skip_embeds: skip_embeds,
 			})
 			emit_func!(&ctx, prog.funcs[i], i)
 		}

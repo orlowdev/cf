@@ -34,13 +34,29 @@ mkdir -p "$root/var"
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/cf-build.XXXXXX") || exit 1
 trap 'rm -rf "$tmp"' EXIT
 
-# Assemble the committed seed IL with the pinned qbe (the trust chain's qbe step).
-"$qbe" -t arm64_apple -o "$tmp/prog.s" "$seed/cf.qbe"
+# The build is TWO stages because the committed seed is a std-LESS compiler (reseed emits it with
+# `--skip-embeds`, so the stdlib never bloats the trust-seed). Stage 1 assembles that seed into a
+# bootstrap compiler `cf0`; stage 2 has cf0 recompile the compiler WITHOUT the flag, baking lib/std
+# into the shipped, self-contained `var/cf`. So a stdlib edit reflows into cf via stage 2 — no reseed.
+
 # Compile cf's C bridge to the embedded QBE and gather the embeddable objects (all but qbe's main.o,
-# whose `main` would collide with cf's entry).
+# whose `main` would collide with cf's entry). Both generations link the same set.
 cc -std=c99 -I "$qbedir" -c "$root/boot/qbe_embed.c" -o "$tmp/qbe_embed.o"
 embed=$(ls "$qbedir"/*.o "$qbedir"/*/*.o | grep -v '/main\.o$')
-# Link cf: the floor, the compiler program, the embedded QBE, and the bridge.
-# shellcheck disable=SC2086
-cc -nostdlib -lSystem -Wl,-e,_start -o "$out" "$seed/floor.s" "$tmp/prog.s" $embed "$tmp/qbe_embed.o"
+
+# One IL+floor -> linked cf binary: qbe assembles the IL, then cc links the floor, the compiler
+# program, the embedded QBE object set, and the C bridge.
+link_cf() { # <in.qbe> <in.floor.s> <out-bin>
+	"$qbe" -t arm64_apple -o "$3.prog.s" "$1"
+	# shellcheck disable=SC2086
+	cc -nostdlib -lSystem -Wl,-e,_start -o "$3" "$2" "$3.prog.s" $embed "$tmp/qbe_embed.o"
+}
+
+# Stage 1: assemble the committed (std-less) seed into the bootstrap compiler cf0.
+link_cf "$seed/cf.qbe" "$seed/floor.s" "$tmp/cf0"
+
+# Stage 2: cf0 emits the compiler's IL+floor with embedding ON (no --skip-embeds), baking lib/std
+# (read from disk here) into the output; assemble + link that into the self-contained var/cf.
+"$tmp/cf0" "$root/boot/src/cf.cf" "$tmp/cf.qbe" "$tmp/cf.floor.s"
+link_cf "$tmp/cf.qbe" "$tmp/cf.floor.s" "$out"
 echo "build: ok -> $out"

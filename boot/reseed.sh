@@ -58,15 +58,20 @@ asm() { # <in.qbe> <in.floor.s> <out-bin>
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/cf-reseed.XXXXXX") || exit 1
 trap 'rm -rf "$tmp"' EXIT
 
+# `--skip-embeds`: the SEED is a std-LESS compiler (it reads lib/std from disk, like any dev build).
+# The baked-in stdlib belongs only in the shipped `var/cf` (built by build.sh WITHOUT this flag), NOT
+# in the committed trust-seed — so an `embed`/`embed_dir` never bloats the seed and a stdlib edit that
+# leaves the compiler's own code untouched needs no reseed at all.
+
 # 1. cf₀ from the CURRENT (committed) seed.
 asm "$seed/cf.qbe" "$seed/floor.s" "$tmp/cf_old"
 
 # 2. cf₀ recompiles the (possibly edited) source → stage-1.
-"$tmp/cf_old" "$src" "$tmp/new.qbe" "$tmp/new.floor.s"
+"$tmp/cf_old" --skip-embeds "$src" "$tmp/new.qbe" "$tmp/new.floor.s"
 
 # 3. Build cf₁ from stage-1 and recompile → stage-2.
 asm "$tmp/new.qbe" "$tmp/new.floor.s" "$tmp/cf_new"
-"$tmp/cf_new" "$src" "$tmp/chk.qbe" "$tmp/chk.floor.s"
+"$tmp/cf_new" --skip-embeds "$src" "$tmp/chk.qbe" "$tmp/chk.floor.s"
 
 if [ "$transitional" -eq 0 ]; then
 	# STRICT: stage-1 == stage-2, commit stage-1.
@@ -84,7 +89,7 @@ fi
 # TRANSITIONAL: build cf₂ from stage-2 and recompile → stage-3; require stage-2 == stage-3
 # (the NEW emit logic reproduces itself), then commit stage-2.
 asm "$tmp/chk.qbe" "$tmp/chk.floor.s" "$tmp/cf_newer"
-"$tmp/cf_newer" "$src" "$tmp/chk2.qbe" "$tmp/chk2.floor.s"
+"$tmp/cf_newer" --skip-embeds "$src" "$tmp/chk2.qbe" "$tmp/chk2.floor.s"
 if ! cmp -s "$tmp/chk.qbe" "$tmp/chk2.qbe" || ! cmp -s "$tmp/chk.floor.s" "$tmp/chk2.floor.s"; then
 	echo "reseed: FIXPOINT FAILED (transitional) — stage-2 does not reproduce itself; committed seed left unchanged" >&2
 	exit 1
