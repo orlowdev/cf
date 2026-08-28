@@ -6987,66 +6987,6 @@ const emit_arena_qbe! = (Fd fd, Bool is_bare, Iarch root_size, Bool dyn_g, Iarch
 	return 0
 }
 
-# Does the program's `main` take a parameter — `main([Str] args)`? Then the freestanding
-# `_start` must convert the OS's raw `(argc, argv)` into a real cf `[Str]` before calling it
-# (see `emit_argv_qbe`). A bare `main()` takes the registers straight through.
-const main_takes_argv = (Program prog): Bool -> {
-	let Iarch i = 0
-
-	loop {
-		if i >= Iarch(prog.funcs.len) then break
-		if eq(prog.funcs[i].name, "main") then {
-			# exactly `main([Str] args)` — one dynamic-array-of-Str parameter. The old raw form
-			# `main(Iarch argc, *[Str] argv)` takes the registers straight (no argv build).
-			if Iarch(prog.funcs[i].params.len) != 1 then return false
-			if !eq(prog.funcs[i].params[0].type_name, "$dyn") then return false
-
-			return eq(prog.funcs[i].params[0].elem, "Str")
-		}
-		i = i + 1
-	}
-
-	return false
-}
-
-# `main([Str] args, [Str] env)` — the two-parameter entry: argv PLUS the process environment (also a
-# `[Str]`, one "KEY=VALUE" per entry). The floor builds both and threads env as main's second arg, so
-# a program reads the environment through main, never ambiently. Detected exactly (both params `[Str]`).
-const main_takes_env = (Program prog): Bool -> {
-	let Iarch i = 0
-
-	loop {
-		if i >= Iarch(prog.funcs.len) then break
-		if eq(prog.funcs[i].name, "main") then {
-			if Iarch(prog.funcs[i].params.len) != 2 then return false
-			if !eq(prog.funcs[i].params[0].type_name, "$dyn") then return false
-			if !eq(prog.funcs[i].params[0].elem, "Str") then return false
-			if !eq(prog.funcs[i].params[1].type_name, "$dyn") then return false
-
-			return eq(prog.funcs[i].params[1].elem, "Str")
-		}
-		i = i + 1
-	}
-
-	return false
-}
-
-# Does the program already carry a `_start` from `std::rt::floor` (a verbatim-symbol asm fn whose
-# emitted symbol is exactly `_start`)? While the entry is migrating out of the compiler, a hosted
-# floor may or may not provide `_start` yet — the compiler emits its INLINE hosted `_start` only when
-# the floor does NOT, so the two never collide during the staged bootstrap.
-const has_floor_start = (Program prog): Bool -> {
-	let Iarch i = 0
-
-	loop {
-		if i >= Iarch(prog.funcs.len) then break
-		if prog.funcs[i].is_asm && eq(prog.funcs[i].asm_sym, "_start") then return true
-		i = i + 1
-	}
-
-	return false
-}
-
 # The argv bridge, emitted only for `main([Str] args)`. `cf_strlen` is a C-string length;
 # `cf_build_args` walks the `argc` C-strings in `argv`, wraps each in a `{bytes@0, len@8}` Str
 # header (BORROWING the OS's already-NUL-terminated argv bytes) and pushes it onto a fresh
@@ -7331,13 +7271,6 @@ pub const emit_program! = (
 	# the `_g` dynamic helpers are emitted when the program has materialized geometry bodies (they
 	# alone reference `cf_dyn_push_g`/`cf_*_append_g`) OR takes argv (the bridge below grows its
 	# `[Str]` through `cf_dyn_push_g` + the page reserve); off both the floor stays byte-identical.
-	# `argv_form`/`env_form` feed only the DEAD guarded inline entry now (pending its Stage-C removal);
-	# the live path uses `wants_args` below.
-	const Bool argv_form = main_takes_argv(prog)
-	# `main([Str] args, [Str] env)` builds argv AND the environment; `wants_args` is either arg-taking
-	# form (both build the `[Str]` bridge), `env_form` additionally builds env. argv-only/bare programs
-	# are unaffected, so their floor stays byte-identical.
-	const Bool env_form = main_takes_env(prog)
 	# UNIFORM ENTRY ABI (std::rt::floor): a hosted `_start` ALWAYS builds argv AND env and passes both
 	# to `main`, so the compiler emits BOTH pre-main bridges for every hosted target. `Bare` builds
 	# neither (no OS, no kernel argv).
@@ -7429,8 +7362,10 @@ pub const emit_program! = (
 		i = i + 1
 	}
 
-	# asm floor: the freestanding entry. `_start` calls `_main` (argc/argv/envp still
-	# in x0/x1/x2 from the kernel), then exit-syscalls its return (in x0).
+	# The freestanding entry. HOSTED (`Darwin`/`Linux`) `_start` lives in `std::rt::floor` (auto-
+	# injected, comptime-fenced): it seeds the root page, builds argv+env through the pre-main bridges
+	# (the uniform ABI), calls `main`, and exit-syscalls its return. Only `Bare` floors its entry inline
+	# here — no OS, no kernel argv, a QEMU-semihosting halt for exit.
 	if is_bare then {
 		# BARE entry: no kernel argv, no exit syscall. Seed the static root, pass &cf_page as main's
 		# node arg, call main, then spin (a real target returns to its boot environment / resets).
@@ -7457,133 +7392,6 @@ pub const emit_program! = (
 		write_str(asm_fd, "\thlt #0xf000\n")
 		write_str(asm_fd, "cf_halt:\n")
 		write_str(asm_fd, "\tb cf_halt\n")
-	} else {
-		# HOSTED entry: emit the compiler's INLINE `_start` only while the program has no floor-provided
-		# `_start` (the staged migration into `std::rt::floor`). Once the floor supplies it, this is skipped.
-		if !has_floor_start(prog) then {
-		if is_linux then {
-			if is_riscv then {
-			# LINUX ELF entry (riscv64). Same stack layout as arm64 linux ([sp]=argc, argv=sp+8, envp
-			# after argv's NULL), driven the same way — only the ISA differs: args/number in a0-a7,
-			# `ecall` traps, `exit_group` (94) ends it. argc/argv/envp parked in callee-saved s1/s2/s3
-			# (cf_root_page_init + the QBE-emitted cf_build_* preserve them); `la` loads cf_page's address.
-			write_str(asm_fd, ".globl _start\n")
-			write_str(asm_fd, ".p2align 1\n")
-			write_str(asm_fd, "_start:\n")
-			write_str(asm_fd, "\tld s1, 0(sp)\n")
-			write_str(asm_fd, "\taddi s2, sp, 8\n")
-			write_str(asm_fd, "\tslli t0, s1, 3\n")
-			write_str(asm_fd, "\tadd t0, s2, t0\n")
-			write_str(asm_fd, "\taddi s3, t0, 8\n")
-			write_str(asm_fd, "\tcall cf_root_page_init\n")
-			write_str(asm_fd, "\tla a0, cf_page\n")
-			if argv_form then write_str(asm_fd, "\tmv a1, s1\n")
-			if argv_form then write_str(asm_fd, "\tmv a2, s2\n")
-			if argv_form then write_str(asm_fd, "\tcall cf_build_args\n")
-			if argv_form then write_str(asm_fd, "\tmv a1, a0\n")
-			if argv_form then write_str(asm_fd, "\tla a0, cf_page\n")
-			if env_form then write_str(asm_fd, "\tmv a1, s1\n")
-			if env_form then write_str(asm_fd, "\tmv a2, s2\n")
-			if env_form then write_str(asm_fd, "\tcall cf_build_args\n")
-			if env_form then write_str(asm_fd, "\tmv s4, a0\n")
-			if env_form then write_str(asm_fd, "\tla a0, cf_page\n")
-			if env_form then write_str(asm_fd, "\tmv a1, s3\n")
-			if env_form then write_str(asm_fd, "\tcall cf_build_env\n")
-			if env_form then write_str(asm_fd, "\tmv a2, a0\n")
-			if env_form then write_str(asm_fd, "\tmv a1, s4\n")
-			if env_form then write_str(asm_fd, "\tla a0, cf_page\n")
-			if !wants_args then write_str(asm_fd, "\tmv a1, s1\n")
-			if !wants_args then write_str(asm_fd, "\tmv a2, s2\n")
-			write_str(asm_fd, "\tcall main\n")
-			write_str(asm_fd, "\tli a7, 94\n")
-			write_str(asm_fd, "\tecall\n")
-			} else {
-			# LINUX ELF entry (arm64). The kernel does NOT pass argc/argv in registers — it lays the
-			# stack out as [sp]=argc, [sp+8..]=argv[], NULL, envp[], NULL, auxv. Load argc (x19), argv
-			# (x20 = sp+8), envp (x21 = argv + (argc+1)*8) into callee-saved regs (cf_root_page_init and
-			# the QBE-emitted cf_build_* preserve x19-x22), then drive main exactly as darwin does but
-			# with ELF symbols (no underscore, `:lo12:`) and an exit_group (94) syscall. Mirrors the darwin
-			# arm build below step for step; only the argc/argv source and the ABI/symbol form differ.
-			write_str(asm_fd, ".globl _start\n")
-			write_str(asm_fd, ".p2align 2\n")
-			write_str(asm_fd, "_start:\n")
-			write_str(asm_fd, "\tldr x19, [sp]\n")
-			write_str(asm_fd, "\tadd x20, sp, #8\n")
-			write_str(asm_fd, "\tadd x21, x20, x19, lsl #3\n")
-			write_str(asm_fd, "\tadd x21, x21, #8\n")
-			write_str(asm_fd, "\tbl cf_root_page_init\n")
-			write_str(asm_fd, "\tadrp x0, cf_page\n")
-			write_str(asm_fd, "\tadd x0, x0, :lo12:cf_page\n")
-			if argv_form then write_str(asm_fd, "\tmov x1, x19\n")
-			if argv_form then write_str(asm_fd, "\tmov x2, x20\n")
-			if argv_form then write_str(asm_fd, "\tbl cf_build_args\n")
-			if argv_form then write_str(asm_fd, "\tmov x1, x0\n")
-			if argv_form then write_str(asm_fd, "\tadrp x0, cf_page\n")
-			if argv_form then write_str(asm_fd, "\tadd x0, x0, :lo12:cf_page\n")
-			if env_form then write_str(asm_fd, "\tmov x1, x19\n")
-			if env_form then write_str(asm_fd, "\tmov x2, x20\n")
-			if env_form then write_str(asm_fd, "\tbl cf_build_args\n")
-			if env_form then write_str(asm_fd, "\tmov x22, x0\n")
-			if env_form then write_str(asm_fd, "\tadrp x0, cf_page\n")
-			if env_form then write_str(asm_fd, "\tadd x0, x0, :lo12:cf_page\n")
-			if env_form then write_str(asm_fd, "\tmov x1, x21\n")
-			if env_form then write_str(asm_fd, "\tbl cf_build_env\n")
-			if env_form then write_str(asm_fd, "\tmov x2, x0\n")
-			if env_form then write_str(asm_fd, "\tmov x1, x22\n")
-			if env_form then write_str(asm_fd, "\tadrp x0, cf_page\n")
-			if env_form then write_str(asm_fd, "\tadd x0, x0, :lo12:cf_page\n")
-			if !wants_args then write_str(asm_fd, "\tmov x1, x19\n")
-			if !wants_args then write_str(asm_fd, "\tmov x2, x20\n")
-			write_str(asm_fd, "\tbl main\n")
-			write_str(asm_fd, "\tmov x8, #94\n")
-			write_str(asm_fd, "\tsvc #0\n")
-			}
-		} else {
-		write_str(asm_fd, ".globl _start\n")
-		write_str(asm_fd, ".p2align 2\n")
-		write_str(asm_fd, "_start:\n")
-		# Establish the root page node first, then pass &cf_page as main's hidden node arg-0
-		# (geometry_lowering §4) — the node now occupies x0, so main's own args shift up by one.
-		# Save the kernel's `(argc, argv)` (x0/x1) across cf_root_page_init. `main([Str] args)`: build the
-		# `[Str]` header (under the page node) and pass it in x1. Otherwise pass the raw `(argc, argv)`
-		# straight into x1/x2 — harmless if `main()` ignores them, correct for `main(Iarch argc, ...)`.
-		write_str(asm_fd, "\tmov x19, x0\n")
-		write_str(asm_fd, "\tmov x20, x1\n")
-		# env form additionally saves envp (x2) across the page init + build calls
-		if env_form then write_str(asm_fd, "\tmov x21, x2\n")
-		write_str(asm_fd, "\tbl _cf_root_page_init\n")
-		write_str(asm_fd, "\tadrp x0, _cf_page@PAGE\n")
-		write_str(asm_fd, "\tadd x0, x0, _cf_page@PAGEOFF\n")
-		# argv-only: byte-identical to before — build args, hand it in x1, node back in x0
-		if argv_form then write_str(asm_fd, "\tmov x1, x19\n")
-		if argv_form then write_str(asm_fd, "\tmov x2, x20\n")
-		if argv_form then write_str(asm_fd, "\tbl _cf_build_args\n")
-		if argv_form then write_str(asm_fd, "\tmov x1, x0\n")
-		if argv_form then write_str(asm_fd, "\tadrp x0, _cf_page@PAGE\n")
-		if argv_form then write_str(asm_fd, "\tadd x0, x0, _cf_page@PAGEOFF\n")
-		# env form: build args (save in x22), build env (x2 = env), then args back in x1, node in x0.
-		# QBE-emitted cf_build_args/cf_build_env preserve x19-x22 (callee-saved); the asm page init
-		# touches only x0-x16, so argc/argv/envp survive.
-		if env_form then write_str(asm_fd, "\tmov x1, x19\n")
-		if env_form then write_str(asm_fd, "\tmov x2, x20\n")
-		if env_form then write_str(asm_fd, "\tbl _cf_build_args\n")
-		if env_form then write_str(asm_fd, "\tmov x22, x0\n")
-		if env_form then write_str(asm_fd, "\tadrp x0, _cf_page@PAGE\n")
-		if env_form then write_str(asm_fd, "\tadd x0, x0, _cf_page@PAGEOFF\n")
-		if env_form then write_str(asm_fd, "\tmov x1, x21\n")
-		if env_form then write_str(asm_fd, "\tbl _cf_build_env\n")
-		if env_form then write_str(asm_fd, "\tmov x2, x0\n")
-		if env_form then write_str(asm_fd, "\tmov x1, x22\n")
-		if env_form then write_str(asm_fd, "\tadrp x0, _cf_page@PAGE\n")
-		if env_form then write_str(asm_fd, "\tadd x0, x0, _cf_page@PAGEOFF\n")
-		# bare/no-arg main: raw (argc, argv) straight through (harmless if ignored)
-		if !wants_args then write_str(asm_fd, "\tmov x1, x19\n")
-		if !wants_args then write_str(asm_fd, "\tmov x2, x20\n")
-		write_str(asm_fd, "\tbl _main\n")
-		write_str(asm_fd, "\tmov x16, #1\n")
-		write_str(asm_fd, "\tsvc #0x80\n")
-		}
-		}
 	}
 
 	emit_arena_floor!(asm_fd, is_bare, root_size)
