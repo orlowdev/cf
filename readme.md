@@ -266,16 +266,32 @@ So the entire tail from source to binary is unchanged: **public seed** (DDC-veri
 **pinned QBE** → **system `cc`**. Nothing else is trusted; embedding links the *same* pinned QBE
 in rather than forking it out.
 
+**cf hosts its own standard library** — and does it *in the language*, not with another linked C
+blob. `std::comptime` exposes two comptime intrinsics: `embed("path")` bakes a file's bytes into the
+binary as a static `Str`, and `embed_dir("dir")` walks a directory and bakes every file into a
+`[EmbeddedFile]` — general tools any program can use for a template, a shader, a lookup table. The
+compiler uses `embed_dir("lib/std")` in its own module loader: a shipped `var/cf` resolves `std::…`
+imports with **nothing on disk** (disk first for development, the baked copy as fallback). The bytes
+ride in a `data` section, emitted by cf itself — no `cc`, no separate object.
+
+**The committed seed stays std-LESS.** Baking the stdlib into `boot/seed/cf.qbe` — the trust-root —
+would bloat it and force a reseed on *every* stdlib edit. So the embed is skipped for the seed: cf
+takes a `--skip-embeds` flag that drops all `embed`/`embed_dir` data when emitting the bootstrap
+intermediates. `reseed.sh` passes it, so the seed is a plain std-less compiler that reads `lib/std`
+from disk; a stdlib edit that leaves the compiler's own code untouched needs no reseed at all.
+
 ## Building the compiler
 
 ```sh
-sh boot/build.sh         # build cf from the committed seed (also builds the vendored QBE)  ->  var/cf
+sh boot/build.sh         # two-stage: std-less seed -> cf0 -> std-hosting var/cf  ->  var/cf
 sh boot/test.sh          # run the corpus regression suite
 ```
 
-`boot/build.sh` never needs a C! compiler you don't already have: it builds the vendored QBE, then
-assembles the committed seed (`boot/seed/cf.qbe` + `floor.s`) straight through `qbe → cc`, linking
-QBE's objects into the result. The compiler's own source is the C! modules under
+`boot/build.sh` never needs a C! compiler you don't already have. It runs in **two stages**: stage 1
+assembles the committed (std-less) seed (`boot/seed/cf.qbe` + `floor.s`) straight through `qbe → cc`
+into a bootstrap compiler `cf0`; stage 2 has `cf0` recompile the compiler *with* embedding on —
+baking `lib/std` (read from disk) into the self-contained, std-hosting `var/cf`. So a stdlib edit
+reflows into `cf` through stage 2 alone. The compiler's own source is the C! modules under
 [`lib/std/compiler/`](lib/std/compiler/) — the whole pipeline, exposed as
 `std::compiler::compile!` — driven by the thin CLI entry
 [`boot/src/cf.cf`](boot/src/cf.cf) and its app-layer siblings (`cli`, `fmt`,
@@ -289,19 +305,24 @@ var/cf hello.cf -o hello   # compile + embedded-QBE + link (finds cc on PATH)  -
 
 ### Changing the compiler
 
-Because cf is built from the seed, editing its source leaves the seed stale.
-After changing any of the compiler's C! source (`lib/std/compiler/*.cf` or
-`boot/src/*.cf`), regenerate and re-verify the seed:
+Editing the **compiler's own** C! source (`lib/std/compiler/*.cf` or
+`boot/src/*.cf`) leaves the seed stale, since the seed *is* the compiler.
+Regenerate and re-verify it:
 
 ```sh
 sh boot/reseed.sh
 ```
 
-`reseed.sh` builds cf from the _old_ seed, has it recompile the _new_ source,
-then confirms the result is a true fixpoint (a cf built from the new seed
-reproduces it exactly). Only then is the committed seed replaced; a
-non-fixpoint aborts without touching it. Commit the regenerated seed alongside
-the source change.
+`reseed.sh` builds cf from the _old_ seed, has it recompile the _new_ source
+(with `--skip-embeds`, so the seed stays std-less), then confirms the result is
+a true fixpoint (a cf built from the new seed reproduces it exactly). Only then
+is the committed seed replaced; a non-fixpoint aborts without touching it.
+Commit the regenerated seed alongside the source change.
+
+Editing the rest of **`lib/std`** (anything the compiler doesn't itself import —
+`std::math`, a new module, a doc fix) needs **no reseed**: the seed carries no
+stdlib, so it is unaffected. Just `sh boot/build.sh` — stage 2 rebakes the
+current `lib/std` into `var/cf`.
 
 > One bootstrap constraint: the old cf must already accept the new source. A
 > change to the language subset cf itself uses needs a transitional two-step
