@@ -26,6 +26,7 @@ import std::io::fs::{ read_dir! }
 import std::io::fd::{ Fd, IoRrr, DirEntry, entry_is_dir }
 import std::compiler::routing::{ RouteInfo, RSets, FnSum, kids, stmt_exprs }
 import std::compiler::alloc::{ address_taken }
+import std::compiler::buildinfo::{ compiler_version }
 import std::compiler::ast::{
 	Expr,
 	Stmt,
@@ -120,6 +121,7 @@ data Emit = {
 	Iarch merge_depth,
 	Iarch local_slot,
 	Bool skip_embeds,
+	Str build_version,
 }
 
 # A local/parameter in scope: its interned name, `slot`, its `rec_type` (a record/union
@@ -1795,6 +1797,28 @@ const slit_index = ([Str] tbl, [Uint8] b): Iarch -> {
 	}
 
 	return -1
+}
+
+# Emit a reference to an already-interned string `s` (a version stamp `slit_program!` appended to the
+# table): find its index and emit the same static `copy $sl<i>` an interned literal uses — zero runtime
+# allocation, so it is valid anywhere, including a `main` with no geometry ambient.
+const emit_str_interned! = (*Emit ctx, Str s): Str -> {
+	let Iarch si = -1
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(ctx.slits.len) then break
+		if si < 0 && eq(ctx.slits[i], s) then si = i
+		i = i + 1
+	}
+
+	if si < 0 then die("cf: emit: internal — a version stamp was not interned\n")
+
+	const Iarch st = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${st} =l copy $sl${si}\n")
+
+	return "%t${st}"
 }
 
 const emit_str_lit! = (*Emit ctx, [Uint8] bytes): Str -> {
@@ -3894,6 +3918,16 @@ const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env)
 		write_str(ctx.fd, "\tblit ${pv}, ${pa}, ${psz}\n")
 
 		return pa
+	}
+	# `std::comptime::version::current` / `::compiler` — bake a version stamp as a string literal at the
+	# call site. `current` is the program's version (from `--version`, threaded on the ctx); `compiler`
+	# is this cf binary's own version (the `buildinfo` const, stamped at the compiler's build). Both are
+	# bodyless value intrinsics — a bare reference auto-calls the nullary form, landing here with no args.
+	if eq(callee, "std_comptime_version_current") && callee_is_intrinsic(ctx, callee) then {
+		return emit_str_interned!(ctx, ctx.build_version)
+	}
+	if eq(callee, "std_comptime_version_compiler") && callee_is_intrinsic(ctx, callee) then {
+		return emit_str_interned!(ctx, compiler_version)
 	}
 	# `std::comptime::embed("path")` — read the file NOW (compile time) and emit its bytes as a
 	# string literal, so they ride in the binary. `emit_str_lit!` lays them down as static `data`
@@ -6068,7 +6102,7 @@ const slc_body! = ([Stmt] ss, Bool skip): [Str] -> {
 	return r
 }
 
-const slit_program! = (Program prog, Bool skip): [Str] -> {
+const slit_program! = (Program prog, Bool skip, Str build_version): [Str] -> {
 	let [Str] tbl = []
 	let Iarch i = 0
 
@@ -6086,6 +6120,17 @@ const slit_program! = (Program prog, Bool skip): [Str] -> {
 		}
 		i = i + 1
 	}
+
+	# The version stamps (`std::comptime::version::current`/`::compiler`) are interned like any literal,
+	# so a reference emits a static `copy $sl<i>` — no runtime allocation, which matters since they may
+	# be read where no geometry ambient exists (e.g. a bare `main`). Interned ONLY when the program
+	# actually references the intrinsic (its bodyless decl survives pruning only if used): a program
+	# that never touches `version::…` — the compiler itself included — carries neither string and emits
+	# byte-identically to before, so this stays a strict, non-self-affecting change.
+	if find_func(prog.funcs, "std_comptime_version_current") >= 0 && !has_str(tbl, build_version)
+		then tbl = [...tbl, build_version]
+	if find_func(prog.funcs, "std_comptime_version_compiler") >= 0 && !has_str(tbl, compiler_version)
+		then tbl = [...tbl, compiler_version]
 
 	return tbl
 }
@@ -7255,6 +7300,7 @@ pub const emit_program! = (
 	Arch target_arch,
 	Iarch root_size,
 	Bool skip_embeds,
+	Str build_version,
 ): Iarch -> {
 	# a `Bare` target (bare metal / Wasm) links no OS: the root is a static BSS region (no mmap), and
 	# there is no exit syscall — the floor halts. Every other target keeps the darwin mmap/exit floor.
@@ -7289,7 +7335,7 @@ pub const emit_program! = (
 	const [Bool] mts = compute_mints(prog, at)
 	# the interned string literals: laid down once as static data (see emit_str_lit!). `skip_embeds`
 	# (bootstrap intermediates) drops embedded file data so it never reaches the committed seed.
-	const [Str] slt = slit_program!(prog, skip_embeds)
+	const [Str] slt = slit_program!(prog, skip_embeds, build_version)
 	emit_slits!(qbe_fd, slt)
 	if wants_args then {
 		# the argv bridge builds the `[Str]` on the ROOT PAGE — through the page's own reserve
@@ -7356,6 +7402,7 @@ pub const emit_program! = (
 				merge_depth: 0,
 				local_slot: 0,
 				skip_embeds: skip_embeds,
+				build_version: build_version,
 			})
 			emit_func!(&ctx, prog.funcs[i], i)
 		}
