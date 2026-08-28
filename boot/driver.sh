@@ -1,9 +1,10 @@
 #!/bin/sh
-# Assemble a cf-compiled program end to end.
+# Assemble a cf-compiled program end to end — a DEV/BOOTSTRAP helper and the corpus test harness.
 #
-# cf stops at two text artifacts: the QBE IL (`prog.qbe`, user code) and the asm floor (`floor.s`,
-# `_start` + the arena runtime, emitted verbatim since QBE has no `svc`). This driver runs the
-# `qbe`→assemble→link tail, branching on the target:
+# END USERS no longer need this: the shipped cf is self-contained (`cf <input.cf> -o <output>` runs
+# the embedded QBE and spawns `cc` itself). This driver drives cf's LEGACY 3-path form (emit QBE IL +
+# asm floor to two files) through the external `qbe`→assemble→link tail — kept for the regression
+# suite and cross/bare targets, branching on the target:
 #
 #   driver.sh [--target <os>-<arch>] <input.cf> <out-binary>
 #
@@ -23,7 +24,7 @@ set -eu
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 cf="$root/var/cf"
-qbe="$root/opt/qbe/qbe"
+qbe="$root/boot/vendor/qbe/qbe"
 
 # collect leading `--flag value` pairs: `target` steers the qbe/link tail, and every flag is also
 # forwarded to cf verbatim (`$flags`) so `--root-size` etc. reach the compiler.
