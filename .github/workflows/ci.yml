@@ -1,0 +1,48 @@
+# ci — pull-request gate for changes targeting margarita.
+#
+# Two independent checks run on every PR into margarita:
+#   corpus  — build cf from the committed seed and run the whole corpus suite (boot/test.sh):
+#             the same end-to-end path a user takes (compile -> embedded QBE -> link -> run),
+#             every test's exit code matched against its `# expect:` directive.
+#   format  — build cf, then assert every `.cf` under boot/src + lib is already formatted
+#             (`cf format --check`). A drifted file fails the PR. Scope is the hand-written
+#             source only: boot/seed_* are emitted IL/asm, boot/vendor is C, and the
+#             boot/tests/corpus fixtures are deliberately varied.
+#
+# Both run on macos-14 (arm64): it matches the committed darwin seed and ships `cc`, so no
+# toolchain install is needed (same runner as release.yml's version job).
+name: ci
+
+on:
+  pull_request:
+    branches: [margarita]
+
+permissions:
+  contents: read
+
+jobs:
+  corpus:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the corpus suite
+        run: ./boot/test.sh
+
+  format:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build cf
+        run: ./boot/build.sh
+      - name: Check boot/src + lib are formatted
+        run: |
+          unformatted=""
+          for f in $(find boot/src lib -name '*.cf'); do
+            ./var/cf format --check "$f" >/dev/null 2>&1 || unformatted="$unformatted $f"
+          done
+          if [ -n "$unformatted" ]; then
+            echo "::error::unformatted cf source (run \`cf format <file>\`):"
+            for f in $unformatted; do echo "  $f"; done
+            exit 1
+          fi
+          echo "all boot/src + lib .cf files are formatted"
