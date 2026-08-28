@@ -40,18 +40,27 @@ knobs() { # <platform>  ->  sets seed qt fa cc link libs
 			seed="$root/boot/seed_mac"; qt=arm64_apple; fa=arm64
 			cc="cc"; link="-nostdlib -lSystem -Wl,-e,_start"; libs="" ;;
 		linux-arm64)
+			# musl (not glibc): static musl links cleanly under the floor's own `_start`, where glibc's
+			# static libc.a drags in crt/dynamic-loader machinery it never gets. The linux floor calls
+			# musl's `__init_libc` so the embedded QBE's libc works. Yields a portable static binary.
+			# `-u __init_libc` force-pulls musl's strong init over the floor's weak no-op (see the floor);
+			# `-lgcc` supplies the soft-float long-double helpers musl's printf uses (__addtf3, …).
 			seed="$root/boot/seed_linux"; qt=arm64; fa=arm64
-			cc="cc"; link="-nostdlib -static -Wl,-e,_start"; libs="-lc" ;;
+			cc="${LINUX_CC:-musl-gcc}"; link="-nostdlib -static -Wl,-e,_start -Wl,-u,__init_libc"; libs="-lc -lgcc" ;;
 		linux-riscv64)
 			seed="$root/boot/seed_linux"; qt=rv64; fa=riscv64
-			cc="${RISCV_CC:-riscv64-linux-gnu-gcc}"; link="-nostdlib -static -Wl,-e,_start"; libs="-lc" ;;
+			cc="${RISCV_CC:-riscv64-linux-musl-gcc}"; link="-nostdlib -static -Wl,-e,_start -Wl,-u,__init_libc"; libs="-lc -lgcc" ;;
 		*) echo "build: unknown platform $1" >&2; exit 1 ;;
 	esac
 }
 
+# Host toolchain (for cf0 + the vendored QBE), resolved from the host knobs so the whole build uses one
+# C compiler — cc on darwin, musl-gcc on linux (matching the embedded QBE objects to the libc we link).
+knobs "$host"; hseed="$seed"; hqt="$qt"; hfa="$fa"; hcc="$cc"; hlink="$link"; hlibs="$libs"
+
 # The vendored QBE: the standalone `qbe` (a cross-assembler of cf's IL — emits any target's asm) plus
-# its object set, built for the HOST. Idempotent.
-make -C "$qbedir" -s
+# its object set, built for the HOST with the host compiler. Idempotent.
+make -C "$qbedir" -s CC="$hcc"
 host_embed=$(ls "$qbedir"/*.o "$qbedir"/*/*.o | grep -v '/main\.o$')
 
 mkdir -p "$root/var"
@@ -59,10 +68,9 @@ tmp=$(mktemp -d "${TMPDIR:-/tmp}/cf-build.XXXXXX") || exit 1
 trap 'rm -rf "$tmp"' EXIT
 
 # cf's C bridge, compiled for the HOST (for cf0) and, when cross-building, for the TARGET (below).
-cc -std=c99 -I "$qbedir" -c "$root/boot/qbe_embed.c" -o "$tmp/qbe_embed_host.o"
+"$hcc" -std=c99 -I "$qbedir" -c "$root/boot/qbe_embed.c" -o "$tmp/qbe_embed_host.o"
 
 # --- Stage 1: assemble the HOST seed into the bootstrap compiler cf0 (runs on this machine). ---
-knobs "$host"; hseed="$seed"; hqt="$qt"; hfa="$fa"; hcc="$cc"; hlink="$link"; hlibs="$libs"
 for f in "$hseed/cf.qbe" "$hseed/floor.$hfa.s"; do
 	[ -f "$f" ] || { echo "build: seed missing: $f" >&2; exit 1; }
 done

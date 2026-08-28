@@ -122,10 +122,18 @@ cf_oom:
 .globl _start
 .p2align 2
 _start:
+	.weak __init_libc
 	ldr x19, [sp]
 	add x20, sp, #8
 	add x21, x20, x19, lsl #3
 	add x21, x21, #8
+	adrp x2, :got:__init_libc
+	ldr x2, [x2, :got_lo12:__init_libc]
+	cbz x2, 1f
+	mov x0, x21
+	ldr x1, [x20]
+	blr x2
+1:
 	bl cf_root_page_init
 	adrp x0, cf_page
 	add x0, x0, :lo12:cf_page

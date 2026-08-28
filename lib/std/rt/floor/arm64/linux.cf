@@ -97,13 +97,33 @@ pub const cf_oom = (): () -> asm "
 
 # The freestanding entry (arm64/linux). The kernel lays argc/argv/envp on the STACK ([sp]=argc,
 # sp+8=argv[], NULL, envp[], NULL, auxv), not registers — so `_start` reads them into callee-saved
-# x19/x20/x21, seeds the root page, then ALWAYS builds argv AND env through the pre-main bridges (the
-# uniform entry ABI; `main` ignores what it doesn't declare), calls `main`, exits via exit_group (94).
+# x19/x20/x21, initializes the embedded QBE's libc (musl), seeds the root page, then ALWAYS builds
+# argv AND env through the pre-main bridges (the uniform entry ABI; `main` ignores what it doesn't
+# declare), calls `main`, exits via exit_group (94).
+#
+# cf's own code is freestanding (raw syscalls, no libc), but the embedded QBE is C that uses libc. On
+# linux that libc is static musl, which — unlike darwin's libSystem — needs its TLS/auxv/page-size set
+# up before any call. So `_start` (still the entry — no crt, no hosted `main`) calls musl's own
+# `__init_libc(envp, argv[0])` first; x19-x21 are callee-saved across it. envp is x21, argv[0] is [x20].
+#
+# This floor is SHARED with ordinary cf programs, which are freestanding (no libc). So `__init_libc` is
+# a WEAK reference read through the GOT and guarded by a null check: for a plain program the symbol is
+# undefined-weak and its GOT slot is 0, so the call is skipped (an `adrp`+`add` can't represent absolute
+# 0 — the GOT slot can). Only cf's OWN build links static musl and passes `-Wl,-u,__init_libc`
+# (build.sh), which force-pulls musl's real `__init_libc`, filling the GOT slot so the guard runs it.
 pub const _start = (): () -> asm "
+	.weak __init_libc
 	ldr x19, [sp]
 	add x20, sp, #8
 	add x21, x20, x19, lsl #3
 	add x21, x21, #8
+	adrp x2, :got:__init_libc
+	ldr x2, [x2, :got_lo12:__init_libc]
+	cbz x2, 1f
+	mov x0, x21
+	ldr x1, [x20]
+	blr x2
+1:
 	bl cf_root_page_init
 	adrp x0, cf_page
 	add x0, x0, :lo12:cf_page
