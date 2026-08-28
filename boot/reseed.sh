@@ -38,13 +38,21 @@ if [ "${1:-}" = "--transitional" ]; then
 fi
 
 root=$(cd "$(dirname "$0")/.." && pwd)
-qbe="$root/opt/qbe/qbe"
+qbedir="$root/boot/vendor/qbe"
+qbe="$qbedir/qbe"
 seed="$root/boot/seed"
 src="$root/boot/src/cf.cf"
 
+# Build the vendored QBE (standalone qbe + embeddable object set) and gather the objects linked into
+# each generation of cf (all but qbe's own main.o). Same embed as build.sh — cf self-contains QBE.
+make -C "$qbedir" -s
+embed=$(ls "$qbedir"/*.o "$qbedir"/*/*.o | grep -v '/main\.o$')
+
 asm() { # <in.qbe> <in.floor.s> <out-bin>
 	"$qbe" -t arm64_apple -o "$3.prog.s" "$1"
-	cc -nostdlib -lSystem -Wl,-e,_start -o "$3" "$2" "$3.prog.s"
+	cc -std=c99 -I "$qbedir" -c "$root/boot/qbe_embed.c" -o "$3.qbe_embed.o"
+	# shellcheck disable=SC2086
+	cc -nostdlib -lSystem -Wl,-e,_start -o "$3" "$2" "$3.prog.s" $embed "$3.qbe_embed.o"
 }
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/cf-reseed.XXXXXX") || exit 1

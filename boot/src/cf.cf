@@ -1,29 +1,93 @@
 # cf — the self-hosted C! compiler (the KEEPER), entry point.
 #
-# This is the compiler cf's genesis produces and then reproduces: seed-subset
-# C! source, compiled during bootstrap by the throwaway `cfcc` genesis tool, and
-# eventually by itself. It runs the same pipeline the ratified specs pin —
-# lex, parse, (typecheck, ...), emit — degenerately (seed_subset §5).
+# The shipped cf is self-contained: `cf <input.cf> -o <output>` compiles the program, runs the
+# EMBEDDED QBE backend in-process (boot/qbe_embed.c, linked in), and spawns the system `cc` to
+# assemble+link the result — so a user needs only cf plus a C toolchain, never a separate qbe.
 #
-# Tracer-bullet scope: read a `.cf` file, parse `[pub] const main = () -> <int>`,
-# and emit QBE IL + an asm floor that an external driver assembles into a running
-# darwin/arm64 binary. Everything past `main`'s constant exit code fills in as the
-# front end grows. cf cannot yet spawn `qbe`/`cc`, so it stops at emitting text
-# to two output paths; the driver runs the `qbe`→`cc` tail.
+# The legacy 3-path form `cf <input.cf> <out.qbe> <out.s>` still emits QBE IL + the asm floor to two
+# paths and stops; the bootstrap (build.sh/reseed.sh) uses it with the external pinned qbe to keep
+# the trust chain (public seed -> pinned qbe -> cc). `cf format`/`cf docs` are separate subcommands.
 #
-#   cf <input.cf> <out.qbe> <out.s>
+# `main` receives argv AND env (both `[Str]`, built by the floor from the kernel's stack). Per the
+# argv/env discipline the environment is read here and threaded down explicitly (to resolve `cc` on
+# PATH), never accessed ambiently.
 
 import std::str::{ eq }
-import cli::{ Cli, cli_parse, FmtCli, is_fmt_cmd, fmt_cli_parse }
+import cli::{ Cli, cli_parse!, FmtCli, is_fmt_cmd, fmt_cli_parse }
 import fmt::{ format_file! }
 import docs::{ docs_run! }
 import std::compiler::{ compile! }
 import std::mem::arena::growing_arena
+import qbe::{ qbe_translate }
+import std::process::{ run!, find_executable!, getpid, exit }
+import std::io::fs::{ remove }
+import std::data::{ Either }
+import std::io::console::{ eprint, print, println }
 
-pub const main = ([Str] args) -> {
-	# `cf format`/`cf f` is a separate subcommand — it formats source, not compiles it, so it
-	# branches off before the whole compile pipeline. Everything else (a flag or a path as the
-	# first argument) stays the legacy positional compile call the bootstrap driver depends on.
+# target_os/arch -> the embedded QBE's target id (see qbe_translate): darwin arm64_apple = 0,
+# bare-metal arm64 ELF = 1.
+const target_id_of = (Cli c): Iarch -> {
+	if eq(c.target_os, "Bare") then return 1
+
+	return 0
+}
+
+# Resolve `cc` on PATH and link the floor + program asm into the final binary. Returns cc's exit
+# status (0 = ok), or a positive code if no C compiler is found.
+const link_with_cc! = ([Str] env, Str floor_s, Str prog_s, Str out): Iarch -> {
+	const found = find_executable!(env, "cc")
+
+	return match found {
+		Either.Left(e) -> {
+			eprint("cf: cannot find `cc` on PATH — a C toolchain is required to link\n")
+
+			<- Iarch(1)
+		},
+		Either.Right(cc) -> {
+			const [Str] argv = ["cc", "-nostdlib", "-lSystem", "-Wl,-e,_start", "-o", out, floor_s, prog_s]
+
+			<- run!(cc, argv, env)
+		},
+	}
+}
+
+# The self-contained pipeline: compile the program to IL + floor (temp files), run the embedded QBE
+# on the IL, spawn `cc` to link, then clean up (unless `-P`). Returns the final binary's build status.
+const run_full! = (Cli c, [Str] env): Iarch -> {
+	const Iarch pid = getpid()
+	const Str til = "/tmp/cf-${pid}.qbe"
+	const Str tfl = "/tmp/cf-${pid}.floor.s"
+	const Str tpr = "/tmp/cf-${pid}.prog.s"
+
+	compile!(c.input, til, tfl, c.target_os, c.target_arch, c.root_size, c.dump_routing)
+
+	const Iarch qr = qbe_translate(target_id_of(c), til, tpr)
+
+	if qr != 0 then {
+		eprint("cf: the embedded QBE backend failed on the emitted IL\n")
+		exit(1)
+	}
+
+	const Iarch st = link_with_cc!(env, tfl, tpr, c.output)
+
+	if c.preserve then {
+		print("cf: kept intermediates: ")
+		print(til)
+		print(" ")
+		print(tpr)
+		print(" ")
+		println(tfl)
+	} else {
+		remove(til)
+		remove(tpr)
+		remove(tfl)
+	}
+
+	return st
+}
+
+pub const main = ([Str] args, [Str] env) -> {
+	# `cf format`/`cf f` — formats source, not a compile; branches off before the pipeline.
 	if is_fmt_cmd(args) then {
 		const fa = growing_arena::of(16777216)
 		const FmtCli fc = fmt_cli_parse(args) in fa
@@ -39,20 +103,23 @@ pub const main = ([Str] args) -> {
 	}
 
 	# cf runs its whole compilation under ONE growing arena grafted from the root page (memory_model
-	# §2, §4): main itself holds no residue on the root, and the pipeline runs `in a`, so the AST, the
-	# instances, and the emitted text all live in `a`. The arena grows from the page as needed (16 MiB
-	# initial), and is reclaimed wholesale at process exit — the compiler's own geometry. The pipeline
-	# itself is `std::compiler::compile!`; main only parses the command line and hands it the arena.
+	# §2, §4): main holds no residue on the root, and the pipeline runs `in a`.
 	const a = growing_arena::of(16777216)
-	const Cli c = cli_parse(args) in a
+	const Cli c = cli_parse!(args) in a
 
-	return compile!(
-		c.input,
-		c.out_qbe,
-		c.out_asm,
-		c.target_os,
-		c.target_arch,
-		c.root_size,
-		c.dump_routing,
-	) in a
+	# legacy emit-IL form (bootstrap): emit QBE IL + the asm floor to the two paths and stop.
+	if !c.full then {
+		return compile!(
+			c.input,
+			c.out_qbe,
+			c.out_asm,
+			c.target_os,
+			c.target_arch,
+			c.root_size,
+			c.dump_routing,
+		) in a
+	}
+
+	# self-contained form (`-o`): compile -> embedded QBE -> cc, all in this process.
+	return run_full!(c, env) in a
 }

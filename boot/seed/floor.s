@@ -3,13 +3,20 @@
 _start:
 	mov x19, x0
 	mov x20, x1
+	mov x21, x2
 	bl _cf_root_page_init
 	adrp x0, _cf_page@PAGE
 	add x0, x0, _cf_page@PAGEOFF
 	mov x1, x19
 	mov x2, x20
 	bl _cf_build_args
-	mov x1, x0
+	mov x22, x0
+	adrp x0, _cf_page@PAGE
+	add x0, x0, _cf_page@PAGEOFF
+	mov x1, x21
+	bl _cf_build_env
+	mov x2, x0
+	mov x1, x22
 	adrp x0, _cf_page@PAGE
 	add x0, x0, _cf_page@PAGEOFF
 	bl _main
@@ -92,9 +99,17 @@ _cf_oom:
 	mov x0, #70
 	mov x16, #1
 	svc #0x80
-.globl _f309
+.globl _f39
 .p2align 2
-_f309:
+_f39:
+	stp x29, x30, [sp, #-16]!
+	bl _cf_qbe_run
+	ldp x29, x30, [sp], #16
+	ret
+
+.globl _f311
+.p2align 2
+_f311:
 	mov x16, x0
 	mov x0, x1
 	mov x1, x2
@@ -108,11 +123,25 @@ _f309:
 1:
 	ret
 
-.globl _f314
+.globl _f312
 .p2align 2
-_f314:
+_f312:
 	mov x0, x0
 	mov x16, #1
 	svc #0x80
+	ret
+
+.globl _f313
+.p2align 2
+_f313:
+	mov x16, #2
+	svc #0x80
+	b.cc 1f
+	neg x0, x0
+	ret
+1:
+	cbz x1, 2f
+	mov x0, #0
+2:
 	ret
 
