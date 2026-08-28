@@ -1,0 +1,209 @@
+# File IO for arm64/linux, over the raw system calls (read 63, write 64, openat 56, close 57,
+# lseek 62). Linux/arm64 has no bare `open` — the generic syscall ABI provides only `openat`, so
+# every open passes `AT_FDCWD` (-100) as the directory fd, resolving a relative path against the
+# working directory exactly as `open` would.
+#
+# Fallible operations return `Either[IoRrr, T]` — linux returns a negated errno on failure, lifted
+# into `Left`. The open modes are intent-named: `open_read` is O_RDONLY, `create` truncates, and
+# `open_append` appends, so the flag values stay private. The linux O_ flag bits differ from darwin's
+# (O_CREAT 0o100, O_TRUNC 0o1000, O_APPEND 0o2000). The bulk writes are fire-and-forget (they yield
+# unit and drop the count — a failed write to an open descriptor is not recoverable here).
+import std::sys::{ syscall6 }
+import std::data::{ Either }
+import std::io::fd::{ Fd, IoRrr, rrr_of }
+
+# openat(AT_FDCWD, path, flags, mode) — the linux/arm64 open. `AT_FDCWD` (-100) makes a relative
+# `path` resolve against the working directory. `path.bytes` is the NUL-terminated byte pointer.
+const openat = (Str path, Uarch flags, Uarch mode): Iarch ->
+	syscall6(56, Uarch(Iarch(0) - 100), path.bytes, flags, mode, 0, 0)
+
+# open() with O_RDONLY.
+pub const open_read = (Str path): Either[IoRrr, Fd] -> {
+	const Iarch r = openat(path, 0, 0)
+
+	if r < 0 then return Either[IoRrr, Fd].Left(rrr_of(r))
+
+	return Either[IoRrr, Fd].Right(Fd({ n: Uarch(r) }))
+}
+
+# open() a fresh output file: O_WRONLY|O_CREAT|O_TRUNC (1|0o100|0o1000 = 577), mode 0644 (= 420).
+pub const create = (Str path): Either[IoRrr, Fd] -> {
+	const Iarch r = openat(path, 577, 420)
+
+	if r < 0 then return Either[IoRrr, Fd].Left(rrr_of(r))
+
+	return Either[IoRrr, Fd].Right(Fd({ n: Uarch(r) }))
+}
+
+# read() up to `n` bytes into `buf` (a `*[Uint8]` byte pointer). `Right` carries the count read
+# (0 = EOF); `Left` an error.
+pub const read = (Fd fd, *[Uint8] buf, Uarch n): Either[IoRrr, Iarch] -> {
+	const Iarch r = syscall6(63, fd.n, buf, n, 0, 0, 0)
+
+	if r < 0 then return Either[IoRrr, Iarch].Left(rrr_of(r))
+
+	return Either[IoRrr, Iarch].Right(r)
+}
+
+# close() the descriptor. `Right(0)` on success; `Left` an error.
+pub const close = (Fd fd): Either[IoRrr, Iarch] -> {
+	const Iarch r = syscall6(57, fd.n, 0, 0, 0, 0, 0)
+
+	if r < 0 then return Either[IoRrr, Iarch].Left(rrr_of(r))
+
+	return Either[IoRrr, Iarch].Right(r)
+}
+
+# write() a whole Str to `fd`, fire-and-forget. The kernel wants the byte address and length.
+pub const write_str = (Fd fd, Str s): () -> {
+	syscall6(64, fd.n, s.bytes, Uarch(s.len), 0, 0, 0)
+}
+
+# write() `n` bytes from a raw `*[Uint8]` buffer to `fd`, fire-and-forget.
+pub const write_bytes = (Fd fd, *[Uint8] buf, Uarch n): () -> {
+	syscall6(64, fd.n, buf, n, 0, 0, 0)
+}
+
+# Open `path` for appending, creating it (mode 0644) if absent — writes land at the end regardless of
+# where the file pointer is. O_WRONLY|O_CREAT|O_APPEND (1|0o100|0o2000 = 1089). `Right` carries the
+# `Fd`; `Left` an error. The counterpart to `open_read`; for truncate-and-write use `create`.
+pub const open_append = (Str path): Either[IoRrr, Fd] -> {
+	const Iarch r = openat(path, 1089, 420)
+
+	if r < 0 then return Either[IoRrr, Fd].Left(rrr_of(r))
+
+	return Either[IoRrr, Fd].Right(Fd({ n: Uarch(r) }))
+}
+
+# Reposition `fd`'s file pointer to `off` bytes from `whence` (0 = start, 1 = current, 2 = end) and
+# return the new absolute offset in `Right`; `Left` on error. Use it to skip a header or re-read from
+# the top before the next `read`.
+pub const seek = (Fd fd, Iarch off, Iarch whence): Either[IoRrr, Iarch] -> {
+	const Iarch r = syscall6(62, fd.n, Uarch(off), Uarch(whence), 0, 0, 0)
+
+	if r < 0 then return Either[IoRrr, Iarch].Left(rrr_of(r))
+
+	return Either[IoRrr, Iarch].Right(r)
+}
+
+# Write a whole Str to a fresh file at `path` (truncating any existing content), then close it.
+# `Left` reports a failed create or close (the write itself is fire-and-forget); `Right(0)` on
+# success.
+pub const write_file = (Str path, Str s): Either[IoRrr, Iarch] -> match create(path) {
+	Either.Left(e) -> Either[IoRrr, Iarch].Left(e),
+	Either.Right(fd) -> {
+		write_str(fd, s)
+
+		<- close(fd)
+	},
+}
+
+# Append a whole Str to `path` (creating it if absent), then close it. Same error contract as
+# `write_file`.
+pub const append_file = (Str path, Str s): Either[IoRrr, Iarch] -> match open_append(path) {
+	Either.Left(e) -> Either[IoRrr, Iarch].Left(e),
+	Either.Right(fd) -> {
+		write_str(fd, s)
+
+		<- close(fd)
+	},
+}
+
+# Raw byte read (kernel count / negated errno, no `Either`), for internal bytewise loops. Keyed on an
+# `Fd` or a bare fd number. The `*[Uint8]` parameter is the hop a `[N Uint8]` local needs to reach
+# `syscall6`'s `Uarch` operand (a local array does not coerce to `Uarch` directly).
+const read_raw = (Fd fd, *[Uint8] buf, Uarch n): Iarch -> syscall6(63, fd.n, buf, n, 0, 0, 0)
+
+const read_raw_fd = (Iarch fd, *[Uint8] buf, Uarch n): Iarch ->
+	syscall6(63, Uarch(fd), buf, n, 0, 0, 0)
+
+# Read a whole file at `path` into the caller's `buf` (capacity `cap` bytes) in one pass, then close
+# it. `Right(n)` is the byte count; `n == cap` means the file may be larger than the buffer, so grow
+# it and retry to be sure. `Left` reports a failed open or read. For an owned `Str` instead of a
+# caller buffer, reach for `read_file!`.
+pub const read_file_into = (Str path, *[Uint8] buf, Uarch cap): Either[IoRrr, Iarch] -> {
+	const Iarch fdr = openat(path, 0, 0)
+
+	if fdr < 0 then return Either[IoRrr, Iarch].Left(rrr_of(fdr))
+
+	const Iarch n = syscall6(63, Uarch(fdr), buf, cap, 0, 0, 0)
+
+	syscall6(57, Uarch(fdr), 0, 0, 0, 0, 0)
+
+	if n < 0 then return Either[IoRrr, Iarch].Left(rrr_of(n))
+
+	return Either[IoRrr, Iarch].Right(n)
+}
+
+# Read a whole file at `path` into an owned `Str`, then close it. `Right(s)` is the file's bytes;
+# `Left` reports a failed open or read. Reads in 4 KiB chunks and grows the result a byte at a time,
+# so it fits any size but is slower than `read_file_into` with your own buffer — prefer that on a hot
+# path or a large file.
+pub const read_file! = (Str path): Either[IoRrr, Str] -> {
+	const Iarch fdr = openat(path, 0, 0)
+
+	if fdr < 0 then return Either[IoRrr, Str].Left(rrr_of(fdr))
+
+	let [Uint8] out = []
+	let [4096 Uint8] chunk
+	let Iarch err = 0
+
+	loop {
+		const Iarch r = read_raw_fd(fdr, chunk, Uarch(4096))
+
+		if r < 0 then {
+			err = r
+
+			break
+		}
+
+		if r == 0 then break
+
+		let Iarch j = 0
+
+		loop {
+			if j >= r then break
+
+			out = [...out, chunk[j]]
+			j = j + 1
+		}
+	}
+
+	syscall6(57, Uarch(fdr), 0, 0, 0, 0, 0)
+
+	if err < 0 then return Either[IoRrr, Str].Left(rrr_of(err))
+
+	return Either[IoRrr, Str].Right(Str({ bytes: out, len: Iarch(out.len) }))
+}
+
+# Read one line from `fd` into `buf` (capacity `cap` bytes), up to but excluding the newline, which
+# is consumed. `Right(n)` for n >= 0 is a line of `n` bytes (0 = a bare blank line); `Right(-1)` is
+# end of input, so a caller distinguishes EOF from a blank line; `Left` is a read error. A line longer
+# than `cap` fills the buffer and stops, leaving the rest for the next call; a final line with no
+# trailing newline still yields its bytes.
+pub const read_line! = (Fd fd, *[Uint8] buf, Uarch cap): Either[IoRrr, Iarch] -> {
+	let [1 Uint8] one = [0]
+	let Iarch i = 0
+	let Bool got = false
+
+	loop {
+		if Uarch(i) >= cap then break
+		const Iarch r = read_raw(fd, one, Uarch(1))
+
+		if r < 0 then return Either[IoRrr, Iarch].Left(rrr_of(r))
+		if r == 0 then break
+
+		got = true
+
+		const Iarch b = Iarch(one[0])
+
+		if b == 10 then break
+
+		buf[i] = Uint8(b)
+		i = i + 1
+	}
+
+	if !got && i == 0 then return Either[IoRrr, Iarch].Right(-1)
+
+	return Either[IoRrr, Iarch].Right(i)
+}

@@ -26,9 +26,11 @@ import std::data::{ Either }
 import std::io::console::{ eprint, print, println }
 
 # target_os/arch -> the embedded QBE's target id (see qbe_translate): darwin arm64_apple = 0,
-# bare-metal arm64 ELF = 1.
+# arm64 ELF (bare metal / linux) = 1. Linux-arm64 and bare-arm64 share QBE's `T_arm64` (SysV ELF,
+# no-underscore symbols); only the floor/link differ.
 const target_id_of = (Cli c): Iarch -> {
 	if eq(c.target_os, "Bare") then return 1
+	if eq(c.target_os, "Linux") then return 1
 
 	return 0
 }
@@ -126,9 +128,39 @@ const link_bare! = ([Str] env, Str floor_s, Str prog_s, Str out, Iarch pid, Bool
 	return lr
 }
 
+# linux link: assemble the floor + program as AArch64 ELF objects with `clang`'s aarch64 backend
+# (works on any host — a darwin box cross-assembles a linux object just as it does a bare one), then
+# link a STATIC, freestanding executable with `ld.lld`. No linker script and no crt: the floor owns
+# `_start` and the program never touches libc, so `-static -e _start` over the two objects is the whole
+# link. `-nostdlib` is implicit — nothing but our objects is fed to the linker.
+const link_linux! = ([Str] env, Str floor_s, Str prog_s, Str out, Iarch pid, Bool preserve): Iarch -> {
+	const Str fo = "/tmp/cf-${pid}.floor.o"
+	const Str po = "/tmp/cf-${pid}.prog.o"
+	const Str clang = need_tool!(env, "clang")
+
+	const Iarch a1 = run!(clang, ["clang", "-target", "aarch64-linux-gnu", "-c", floor_s, "-o", fo], env)
+
+	if a1 != 0 then return a1
+
+	const Iarch a2 = run!(clang, ["clang", "-target", "aarch64-linux-gnu", "-c", prog_s, "-o", po], env)
+
+	if a2 != 0 then return a2
+
+	const Str linker = resolve_linker!(env)
+	const Iarch lr = run!(linker, ["ld", "-static", "-e", "_start", "-o", out, fo, po], env)
+
+	if !preserve then {
+		remove(fo)
+		remove(po)
+	}
+
+	return lr
+}
+
 # The self-contained pipeline: compile the program to IL + floor (temp files), run the embedded QBE
 # on the IL, spawn the host toolchain to assemble+link, then clean up (unless `-P`). darwin links a
-# Mach-O with `cc`; a `Bare` target cross-assembles + links a freestanding ELF with `clang`/`ld.lld`.
+# Mach-O with `cc`; `Bare` and `Linux` cross-assemble + link a freestanding ELF with `clang`/`ld.lld`
+# (a bare flat image via a linker script, a linux static executable via `-static`).
 const run_full! = (Cli c, [Str] env): Iarch -> {
 	const Iarch pid = getpid()
 	const Str til = "/tmp/cf-${pid}.qbe"
@@ -147,7 +179,10 @@ const run_full! = (Cli c, [Str] env): Iarch -> {
 	let Iarch st = 0
 
 	if eq(c.target_os, "Bare") then st = link_bare!(env, tfl, tpr, c.output, pid, c.preserve)
-	else st = link_darwin!(env, tfl, tpr, c.output)
+	else {
+		if eq(c.target_os, "Linux") then st = link_linux!(env, tfl, tpr, c.output, pid, c.preserve)
+		else st = link_darwin!(env, tfl, tpr, c.output)
+	}
 
 	if c.preserve then {
 		print("cf: kept intermediates: ")

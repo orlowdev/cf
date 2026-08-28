@@ -110,6 +110,28 @@ _f39:
 .globl _f312
 .p2align 2
 _f312:
+	mov x0, x0
+	mov x16, #1
+	svc #0x80
+	ret
+
+.globl _f313
+.p2align 2
+_f313:
+	mov x16, #2
+	svc #0x80
+	b.cc 1f
+	neg x0, x0
+	ret
+1:
+	cbz x1, 2f
+	mov x0, #0
+2:
+	ret
+
+.globl _f367
+.p2align 2
+_f367:
 	mov x16, x0
 	mov x0, x1
 	mov x1, x2
@@ -121,27 +143,5 @@ _f312:
 	b.cc 1f
 	neg x0, x0
 1:
-	ret
-
-.globl _f313
-.p2align 2
-_f313:
-	mov x0, x0
-	mov x16, #1
-	svc #0x80
-	ret
-
-.globl _f314
-.p2align 2
-_f314:
-	mov x16, #2
-	svc #0x80
-	b.cc 1f
-	neg x0, x0
-	ret
-1:
-	cbz x1, 2f
-	mov x0, #0
-2:
 	ret
 
