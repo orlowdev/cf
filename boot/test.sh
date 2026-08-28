@@ -1,8 +1,10 @@
 #!/bin/sh
 # Regression for cf — the self-hosted compiler.
 #
-# Every corpus test listed in `manifest` is compiled by cf (via driver.sh: cf -> qbe ->
-# cc) and run; its exit code must match the test's `# expect:` directive. cfcc (the genesis
+# Every corpus test listed in `manifest` is built by the self-contained cf (`cf <src> -o <bin>`:
+# compile -> embedded QBE -> link) and run; its exit code must match the test's `# expect:`
+# directive — the same path a user takes, so the suite exercises the shipped compiler end to end.
+# cfcc (the genesis
 # tool) is gone, so this is no longer a differential check against a second compiler — cf
 # is validated directly against the corpus's expectations, and its self-reproduction is
 # guaranteed separately by the seed fixpoint (boot/reseed.sh).
@@ -39,7 +41,7 @@ set -u
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/.." && pwd)
 corpus="$here/tests/corpus"
-driver="$root/boot/driver.sh"
+cfbin="$root/var/cf"
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/cf-tests.XXXXXX") || exit 1
 trap 'rm -rf "$work"' EXIT
@@ -63,7 +65,7 @@ if ! "$root/boot/build.sh" >/dev/null; then
 	exit 1
 fi
 
-export corpus driver work bincache
+export corpus cfbin work bincache
 
 # One test per invocation: $1 is the manifest name. The result line is echoed live (unordered
 # under parallelism) and recorded in $work/res/<name> for the ordered count at the end.
@@ -94,9 +96,9 @@ run_one='
 	bin="$work/${name%.cf}"
 
 	if [ "$expect" = "error" ]; then
-		# The program must FAIL to compile (cf rejects it, or the qbe/cc tail fails).
+		# The program must FAIL to build (cf rejects it, or the embedded-QBE/link tail fails).
 		# shellcheck disable=SC2086
-		if "$driver" $cfflags "$cf" "$bin" >/dev/null 2>&1; then
+		if "$cfbin" $cfflags "$cf" -o "$bin" >/dev/null 2>&1; then
 			finish "FAIL $name (compiled, expected an error)"
 		else
 			finish "ok   $name (rejected)"
@@ -106,7 +108,7 @@ run_one='
 	want=${expect#exit }
 
 	# shellcheck disable=SC2086
-	if ! "$driver" $cfflags "$cf" "$bin" >/dev/null 2>&1; then
+	if ! "$cfbin" $cfflags "$cf" -o "$bin" >/dev/null 2>&1; then
 		finish "FAIL $name (cf did not compile)"
 	fi
 
