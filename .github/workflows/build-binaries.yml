@@ -62,8 +62,13 @@ jobs:
 
       - name: Stamp the compiler version
         run: |
-          sed -i.bak 's/"0.0.0-dev"/"${{ steps.v.outputs.version }}"/' lib/std/compiler/buildinfo.cf
+          v='${{ steps.v.outputs.version }}'
+          sed -i.bak "s/\"0.0.0-dev\"/\"$v\"/" lib/std/compiler/buildinfo.cf
           rm -f lib/std/compiler/buildinfo.cf.bak
+          # Fail loudly if the sed no-op'd (the `0.0.0-dev` sentinel drifted): shipping a binary that
+          # reports the wrong version is worse than a red build. `--version` reads this const.
+          grep -q "compiler_version = \"$v\"" lib/std/compiler/buildinfo.cf \
+            || { echo "stamp failed: buildinfo.cf still has no \"$v\"" >&2; exit 1; }
           grep compiler_version lib/std/compiler/buildinfo.cf
 
       - name: Install linux build tools (musl + libgcc)
@@ -113,6 +118,17 @@ jobs:
         env:
           CF_STRIP: 1   # release binaries are stripped (objects already carry no -g)
         run: ./boot/build.sh "${{ matrix.target }}"
+
+      # Prove the artifact actually carries the tag: `cf --version` reads the stamped
+      # compiler_version. Only native targets run here (riscv is cross-built and can't
+      # execute on the arm runner — its stamp is guarded at the source level above).
+      - name: Verify the binary reports the release version
+        if: matrix.target != 'linux-riscv64'
+        run: |
+          got="$(./var/cf --version)"
+          want='${{ steps.v.outputs.version }}'
+          echo "cf --version -> $got (want $want)"
+          [ "$got" = "$want" ] || { echo "version mismatch" >&2; exit 1; }
 
       - name: Package
         id: pkg
