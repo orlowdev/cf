@@ -200,8 +200,8 @@ pub const main = () -> {
 ```
 
 ```sh
-sh boot/driver.sh hello.cf hello   # cf -> qbe -> cc  ->  ./hello
-./hello                            # Hello, world!
+var/cf hello.cf -o hello   # compile + embedded QBE + link (cf finds cc itself)  ->  ./hello
+./hello                    # Hello, world!
 ```
 
 ## `$`-stack values
@@ -253,31 +253,39 @@ to a byte-identical seed. That fixpoint has been checked with
 [Diverse Double-Compilation](https://dwheeler.com/trusting-trust/) across two
 independent C compilers (clang and gcc).
 
-**QBE is pinned by exact commit.** The backend has to be fetched at the first repo pull
-(`opt/` is gitignored). [`boot/fetch-qbe.sh`](boot/fetch-qbe.sh) clones QBE from
-its upstream, then **verifies the checkout against a hard-coded commit SHA**
-before building. The transport is unauthenticated, but the pin is checked after
-fetch, so in-transit tampering is caught before anything is built. Re-running is
-idempotent and works offline once fetched.
+**QBE is vendored by exact commit.** The backend lives *in* the tree as a squashed git subtree at
+[`boot/vendor/qbe`](boot/vendor/qbe) (pinned to `v1.3`, commit `c081897…`), so the build is
+hermetic and offline — there is no fetch step. cf uses that one source two ways: the standalone
+`qbe` assembles the committed seed IL (the trust chain's qbe step), and QBE's objects are **linked
+into `cf` itself** (via [`boot/qbe_embed.c`](boot/qbe_embed.c)) so the shipped compiler translates
+IL→asm in-process — a user needs only `cf` plus a C toolchain, never a separate qbe.
+[`boot/fetch-qbe.sh`](boot/fetch-qbe.sh) is now a maintainer tool that `git subtree pull`s a new
+pin; updating the vendored source is the only time the network is touched.
 
-So the entire tail from source to binary is: **public seed** (DDC-verified
-fixpoint) → **pinned QBE** → **system `cc`**. Nothing else is trusted.
+So the entire tail from source to binary is unchanged: **public seed** (DDC-verified fixpoint) →
+**pinned QBE** → **system `cc`**. Nothing else is trusted; embedding links the *same* pinned QBE
+in rather than forking it out.
 
 ## Building the compiler
 
 ```sh
-sh boot/fetch-qbe.sh     # 1. fetch + build the pinned QBE backend into opt/qbe
-sh boot/build.sh         # 2. build cf from the committed seed  ->  var/cf
-sh boot/test.sh          # 3. run the corpus regression suite
+sh boot/build.sh         # build cf from the committed seed (also builds the vendored QBE)  ->  var/cf
+sh boot/test.sh          # run the corpus regression suite
 ```
 
-`boot/build.sh` never needs a C! compiler you don't already have: it assembles
-the committed seed (`boot/seed/cf.qbe` + `floor.s`) straight through
-`qbe → cc`. The compiler's own source is the C! modules under
+`boot/build.sh` never needs a C! compiler you don't already have: it builds the vendored QBE, then
+assembles the committed seed (`boot/seed/cf.qbe` + `floor.s`) straight through `qbe → cc`, linking
+QBE's objects into the result. The compiler's own source is the C! modules under
 [`lib/std/compiler/`](lib/std/compiler/) — the whole pipeline, exposed as
 `std::compiler::compile!` — driven by the thin CLI entry
 [`boot/src/cf.cf`](boot/src/cf.cf) and its app-layer siblings (`cli`, `fmt`,
 `docs`).
+
+Once built, `cf` compiles a program end to end by itself:
+
+```sh
+var/cf hello.cf -o hello   # compile + embedded-QBE + link (finds cc on PATH)  ->  ./hello
+```
 
 ### Changing the compiler
 
@@ -303,8 +311,14 @@ the source change.
 
 C! emits **freestanding** binaries by default — no libc, no C runtime, just
 syscalls and the tiny assembly floor. That reaches down to bare metal:
-`cf --target bare-arm64` produces a freestanding ELF (SysV relocations, no loader)
-that boots under `qemu-system-aarch64`.
+`cf app.cf --target bare-arm64 -o app` produces a freestanding ELF (SysV relocations,
+no loader) that boots under `qemu-system-aarch64` — cf cross-assembles and links it
+itself (`clang` + `ld.lld`), embedding the linker script.
+
+"Freestanding" is a guarantee about the code cf **emits** from pure C! source, not
+about the cf binary itself: the compiler links QBE (which is C, and uses libc) so it
+can translate IL in-process. Cross the FFI boundary into C and you take on C's runtime;
+programs cf compiles from C!-only source stay freestanding.
 
 The memory story follows. `fixed_buffer` is the **zero-dependency geometry**: it
 wraps a caller-provided `[Uint8]` buffer — `$`-stack, `static`, or heap — as a full
@@ -323,16 +337,16 @@ target — no OS, no heap, no allocation the compiler cannot see.
 
 ```
 boot/            build system + compiler (the trust root)
-  fetch-qbe.sh   fetch/verify/build the pinned QBE backend
-  build.sh       build cf from the committed seed
-  driver.sh      compile+assemble+link one program (cf -> qbe -> cc)
+  fetch-qbe.sh   update the vendored QBE subtree to a new pin (maintainer tool)
+  build.sh       build cf from the committed seed (builds + embeds the vendored QBE)
   reseed.sh      regenerate + fixpoint-verify the seed after a source edit
   test.sh        corpus regression suite
   seed/          cf.qbe + floor.s — the DDC-verified self-hosting seed
-  src/           the compiler, written in C!
-  tests/         corpus/ (the test programs) + manifest (the cf subset)
+  src/           the compiler entry + app layer (cf, cli, fmt, docs), written in C!
+  qbe_embed.c    cf's C bridge to the embedded QBE (cf_qbe_run)
+  vendor/qbe/    the QBE backend, vendored as a pinned git subtree
 root/specs/      the language specification
-opt/             vendored QBE (fetched, gitignored)
+opt/             FHS third-party area (gitignored; QBE now lives in boot/vendor)
 var/             build outputs (gitignored)
 ```
 

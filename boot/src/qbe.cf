@@ -1,0 +1,27 @@
+# cf's in-process bridge to the embedded QBE backend.
+#
+# The shipped cf links QBE's objects (boot/build.sh) and the C entry `cf_qbe_run`
+# (boot/qbe_embed.c). This module is the cf-side of that FFI: `qbe_translate` calls
+# `_cf_qbe_run(target_id, in_path, out_path)` to turn a QBE IL file into a target asm
+# file in-process — no external `qbe` binary. It is app-layer, not std: only the cf
+# binary links QBE, so only cf may reference `_cf_qbe_run`.
+#
+# Unlike `syscall6` (which traps via `svc`, leaving x30 untouched), this body `bl`s a C
+# function and so must save/restore the link register itself — the asm body IS the whole
+# function, with no compiler-generated prologue. The three args already arrive in x0-x2
+# (param registers), so they feed the C call directly.
+
+# The raw FFI: `cf_qbe_run(int target_id, const char *in, const char *out)`, args in x0-x2,
+# result (0 = ok, else an error code) in x0.
+const cf_qbe_run_raw = (Iarch target, Uarch in_ptr, Uarch out_ptr): Iarch -> asm "
+	stp x29, x30, [sp, #-16]!
+	bl _cf_qbe_run
+	ldp x29, x30, [sp], #16
+	ret
+"
+
+# Translate the QBE IL file at `in_path` into a target asm file at `out_path`, in-process.
+# `target_id`: 0 arm64_apple (darwin), 1 arm64 (bare ELF), 2 amd64_apple, 3 amd64_sysv, 4 rv64.
+# Returns 0 on success. The paths' `.bytes` are the NUL-terminated pointers the C side `fopen`s.
+pub const qbe_translate = (Iarch target_id, Str in_path, Str out_path): Iarch ->
+	cf_qbe_run_raw(target_id, Uarch(in_path.bytes), Uarch(out_path.bytes))

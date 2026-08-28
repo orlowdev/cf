@@ -28,6 +28,11 @@ import std::process::{ exit }
 # error) — everything must live in `$`-stack, `static` BSS, or a `fixed_buffer`. Ignored off `Bare`.
 # `dump_routing` (KEPT — the classification drives codegen now, so the dump is the standing
 # inspection hatch): prints each lowered function's shadow escape/alias sets and summary bits.
+# `full` selects the self-contained pipeline (`cf <input.cf> -o <output>`): cf compiles, runs the
+# EMBEDDED QBE backend, and spawns the system `cc` to produce `output` — no external qbe/driver. In
+# that mode `out_qbe`/`out_asm` are unused (cf picks temp paths) and `output` is the final binary;
+# `preserve` (`-P`) keeps the intermediates. Without `-o` it stays the legacy 3-path emit-IL form the
+# bootstrap (build.sh/reseed.sh) depends on: emit QBE IL + the asm floor to `out_qbe`/`out_asm`.
 pub data Cli = {
 	Str input,
 	Str out_qbe,
@@ -36,6 +41,9 @@ pub data Cli = {
 	Str target_arch,
 	Iarch root_size,
 	Bool dump_routing,
+	Bool full,
+	Str output,
+	Bool preserve,
 }
 
 # The parsed `format` subcommand line: the target `path` and the `--check` gate (cf_cli §7).
@@ -95,24 +103,45 @@ const parse_dec = (Str s): Iarch -> {
 # pairs are consumed in any order; `--target` selects the platform (default: the host, `darwin-arm64`)
 # and `--root-size` the `Bare` root page (default 1 MiB). The three positional paths follow. The `!`
 # algebra and root rule are validated unconditionally.
-pub const cli_parse = ([Str] args): Cli -> {
+pub const cli_parse! = ([Str] args): Cli -> {
 	let Str tos = "Darwin"
 	let Str tarch = "Arm64"
 	let Iarch rsize = 1048576
 	let Bool dumpr = false
-	let Iarch base = 1
+	let Bool full = false
+	let Str output = ""
+	let Bool preserve = false
+	# positionals collected wherever they fall — flags may precede or follow the input path (so
+	# `cf app.cf -o app` works, not only `cf -o app app.cf`).
+	let [Str] pos = []
+	let Iarch i = 1
 
 	loop {
-		if base >= Iarch(args.len) then break
-		const Str a = args[base]
+		if i >= Iarch(args.len) then break
+		const Str a = args[i]
+
 		if eq(a, "--dump-routing") then {
 			dumpr = true
-			base = base + 1
+			i = i + 1
 			continue
 		}
-		if base + 1 >= Iarch(args.len) then break
+		if eq(a, "-P") || eq(a, "--preserve-intermediates") then {
+			preserve = true
+			i = i + 1
+			continue
+		}
+		if eq(a, "-o") then {
+			if i + 1 >= Iarch(args.len) then eprint("cf: `-o` needs an output path\n")
+			if i + 1 >= Iarch(args.len) then exit(2)
+			output = args[i + 1]
+			full = true
+			i = i + 2
+			continue
+		}
 		if eq(a, "--target") then {
-			const Str t = args[base + 1]
+			if i + 1 >= Iarch(args.len) then eprint("cf: `--target` needs a value\n")
+			if i + 1 >= Iarch(args.len) then exit(2)
+			const Str t = args[i + 1]
 			let Bool known = false
 			if eq(t, "darwin-arm64") then {
 				tos = "Darwin"
@@ -132,24 +161,55 @@ pub const cli_parse = ([Str] args): Cli -> {
 			if !known
 				then eprint("cf: unknown --target (expected `darwin-arm64`, `linux-arm64`, or `bare-arm64`)\n")
 			if !known then exit(2)
-			base = base + 2
-		} else if eq(a, "--root-size") then {
-			rsize = parse_dec(args[base + 1])
-			base = base + 2
-		} else break
+			i = i + 2
+			continue
+		}
+		if eq(a, "--root-size") then {
+			if i + 1 >= Iarch(args.len) then eprint("cf: `--root-size` needs a value\n")
+			if i + 1 >= Iarch(args.len) then exit(2)
+			rsize = parse_dec(args[i + 1])
+			i = i + 2
+			continue
+		}
+
+		pos = [...pos, a]
+		i = i + 1
 	}
 
-	if Iarch(args.len) < base + 3
+	# full pipeline (`-o`): one positional, the input; cf produces the final binary itself.
+	if full then {
+		if Iarch(pos.len) < 1 then eprint("cf: usage: cf [flags] <input.cf> -o <output>\n")
+		if Iarch(pos.len) < 1 then exit(2)
+
+		return Cli({
+			input: pos[0],
+			out_qbe: "",
+			out_asm: "",
+			target_os: tos,
+			target_arch: tarch,
+			root_size: rsize,
+			dump_routing: dumpr,
+			full: true,
+			output: output,
+			preserve: preserve,
+		})
+	}
+
+	# legacy emit-IL form (bootstrap): the three explicit output paths.
+	if Iarch(pos.len) < 3
 		then eprint("cf: usage: cf [--target <os>-<arch>] [--root-size <bytes>] <input.cf> <out.qbe> <out.s>\n")
-	if Iarch(args.len) < base + 3 then exit(2)
+	if Iarch(pos.len) < 3 then exit(2)
 
 	return Cli({
-		input: args[base],
-		out_qbe: args[base + 1],
-		out_asm: args[base + 2],
+		input: pos[0],
+		out_qbe: pos[1],
+		out_asm: pos[2],
 		target_os: tos,
 		target_arch: tarch,
 		root_size: rsize,
 		dump_routing: dumpr,
+		full: false,
+		output: "",
+		preserve: preserve,
 	})
 }

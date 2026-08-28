@@ -1,60 +1,36 @@
 #!/bin/sh
-# Fetch and build the vendored QBE backend into opt/qbe.
+# Update the vendored QBE pin. MAINTAINER TOOL — not part of the build.
 #
-# opt/ is gitignored (FHS-style: third-party add-ons are fetched, not committed),
-# so QBE is pinned here by exact commit SHA rather than living in the repo. The
-# pin is the trust anchor: the seed subset's backend tail is `qbe` + `cc`, and
-# pinning the commit keeps that tail reproducible from a known source.
+# QBE is vendored as a git subtree at boot/vendor/qbe (committed source, hermetic
+# offline builds; see boot/vendor/README.md). This script pulls a NEW pinned tag from
+# upstream into that subtree. It touches the network (git://) only here, never at build
+# time. After running, review the diff and update the pin recorded in boot/vendor/README.md.
 #
-# Re-running is idempotent: it re-verifies the pin and rebuilds only if needed.
+#   sh boot/fetch-qbe.sh            # pull the pin below
+#   QBE_TAG=v1.4 sh boot/fetch-qbe.sh   # pull a different tag
+#
+# c9x.me serves git:// (smart transport); the transport is unauthenticated, so verify the
+# resulting commit against upstream before committing the update.
 set -eu
 
-# c9x.me serves git:// (smart transport); dumb HTTP mangles object fetches. The
-# transport is unauthenticated, but the QBE_COMMIT pin below is verified after
-# checkout, so in-transit tampering is caught before anything is built.
 QBE_REPO="git://c9x.me/qbe.git"
-QBE_TAG="v1.3"
-QBE_COMMIT="c0818978acec60ebb6167fade60fb7012cbf20ca"
+QBE_TAG="${QBE_TAG:-v1.3}"
 
 root=$(cd "$(dirname "$0")/.." && pwd)
-dest="$root/opt/qbe"
+prefix="boot/vendor/qbe"
 
-echo "fetch-qbe: pinning QBE $QBE_TAG ($QBE_COMMIT)"
-
-# Already at the pin with a built binary → nothing to do (works offline).
-if [ -x "$dest/qbe" ] && [ -d "$dest/.git" ] &&
-   [ "$(git -C "$dest" rev-parse HEAD 2>/dev/null)" = "$QBE_COMMIT" ]; then
-	echo "fetch-qbe: up to date -> $dest/qbe"
-	exit 0
-fi
-
-if [ ! -d "$dest/.git" ]; then
-	rm -rf "$dest"
-	mkdir -p "$dest"
-	git -C "$dest" init -q
-	git -C "$dest" remote add origin "$QBE_REPO"
-fi
-
-# Fetch the pinned tag and hard-checkout its commit (full fetch; QBE is tiny).
-git -C "$dest" fetch -q origin "refs/tags/$QBE_TAG"
-git -C "$dest" checkout -q -f FETCH_HEAD
-
-got=$(git -C "$dest" rev-parse HEAD)
-if [ "$got" != "$QBE_COMMIT" ]; then
-	echo "fetch-qbe: PIN MISMATCH" >&2
-	echo "  expected $QBE_COMMIT" >&2
-	echo "  got      $got" >&2
-	echo "  tag $QBE_TAG at $QBE_REPO moved or was tampered with; refusing to build." >&2
+if [ ! -d "$root/$prefix" ]; then
+	echo "fetch-qbe: $prefix missing — initial vendoring is a one-time:" >&2
+	echo "  git subtree add --prefix=$prefix $QBE_REPO $QBE_TAG --squash" >&2
 	exit 1
 fi
 
-echo "fetch-qbe: building qbe"
-make -C "$dest" -s
+echo "fetch-qbe: pulling QBE $QBE_TAG from $QBE_REPO into $prefix (squashed)"
+cd "$root"
+git subtree pull --prefix="$prefix" "$QBE_REPO" "$QBE_TAG" --squash \
+	-m "Update vendored QBE to $QBE_TAG"
 
-# Load-bearing smoke test: fail loudly if the build produced no runnable qbe.
-if ! "$dest/qbe" -h >/dev/null 2>&1; then
-	echo "fetch-qbe: build did not produce a runnable qbe at $dest/qbe" >&2
-	exit 1
-fi
-
-echo "fetch-qbe: ok -> $dest/qbe"
+echo "fetch-qbe: done. Now:"
+echo "  1. verify boot/vendor/qbe HEAD matches upstream $QBE_TAG"
+echo "  2. update the pin in boot/vendor/README.md"
+echo "  3. rebuild + reseed (boot/build.sh, boot/reseed.sh --transitional)"
