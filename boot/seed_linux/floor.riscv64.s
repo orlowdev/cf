@@ -1,9 +1,11 @@
 .globl f40
 .p2align 2
 f40:
-	stp x29, x30, [sp, #-16]!
-	bl _cf_qbe_run
-	ldp x29, x30, [sp], #16
+	addi sp, sp, -16
+	sd ra, 8(sp)
+	call _cf_qbe_run
+	ld ra, 8(sp)
+	addi sp, sp, 16
 	ret
 
 .globl f46
@@ -22,9 +24,9 @@ f46:
 .globl f316
 .p2align 2
 f316:
-	mov x0, a0
-	mov x8, #94
-	svc #0
+	mv a0, a0
+	li a7, 94
+	ecall
 	ret
 
 .globl cf_root_page_init
@@ -117,11 +119,24 @@ cf_oom:
 .globl _start
 .p2align 2
 _start:
+	.option push
+	.option norelax
+	lla gp, __global_pointer$
+	.option pop
+	.weak __init_libc
 	ld s1, 0(sp)
 	addi s2, sp, 8
 	slli t0, s1, 3
 	add t0, s2, t0
 	addi s3, t0, 8
+1:
+	auipc t0, %got_pcrel_hi(__init_libc)
+	ld t0, %pcrel_lo(1b)(t0)
+	beqz t0, 2f
+	mv a0, s3
+	ld a1, 0(s2)
+	jalr t0
+2:
 	call cf_root_page_init
 	la a0, cf_page
 	mv a1, s1

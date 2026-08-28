@@ -44,12 +44,13 @@ knobs() { # <platform>  ->  sets seed qt fa cc link libs
 			# static libc.a drags in crt/dynamic-loader machinery it never gets. The linux floor calls
 			# musl's `__init_libc` so the embedded QBE's libc works. Yields a portable static binary.
 			# `-u __init_libc` force-pulls musl's strong init over the floor's weak no-op (see the floor);
-			# `-lgcc` supplies the soft-float long-double helpers musl's printf uses (__addtf3, …).
+			# `-lgcc` supplies the soft-float long-double helpers musl's printf uses (__addtf3, …);
+			# `-no-pie` because the floor's `_start` does no PIE self-relocation (some musl gccs default PIE).
 			seed="$root/boot/seed_linux"; qt=arm64; fa=arm64
-			cc="${LINUX_CC:-musl-gcc}"; link="-nostdlib -static -Wl,-e,_start -Wl,-u,__init_libc"; libs="-lc -lgcc" ;;
+			cc="${LINUX_CC:-musl-gcc}"; link="-nostdlib -static -no-pie -Wl,-e,_start -Wl,-u,__init_libc"; libs="-lc -lgcc" ;;
 		linux-riscv64)
 			seed="$root/boot/seed_linux"; qt=rv64; fa=riscv64
-			cc="${RISCV_CC:-riscv64-linux-musl-gcc}"; link="-nostdlib -static -Wl,-e,_start -Wl,-u,__init_libc"; libs="-lc -lgcc" ;;
+			cc="${RISCV_CC:-riscv64-linux-musl-gcc}"; link="-nostdlib -static -no-pie -Wl,-e,_start -Wl,-u,__init_libc"; libs="-lc -lgcc" ;;
 		*) echo "build: unknown platform $1" >&2; exit 1 ;;
 	esac
 }
@@ -88,11 +89,11 @@ knobs "$target"
 if [ "$target" = "$host" ]; then
 	tembed="$host_embed"; tqembed="$tmp/qbe_embed_host.o"
 else
+	# Recompile FOR the target exactly the source set the host objects came from (so `tools/` and
+	# `main.o`, already excluded from $host_embed, stay excluded), giving each a unique object name.
 	mkdir -p "$tmp/tobj"; i=0
-	for c in "$qbedir"/*.c "$qbedir"/*/*.c; do
-		case "$c" in */main.c) continue ;; esac
-		[ -f "$c" ] || continue
-		"$cc" -std=c99 -I "$qbedir" -c "$c" -o "$tmp/tobj/q$i.o"
+	for o in $host_embed; do
+		"$cc" -std=c99 -I "$qbedir" -c "${o%.o}.c" -o "$tmp/tobj/q$i.o"
 		i=$((i + 1))
 	done
 	"$cc" -std=c99 -I "$qbedir" -c "$root/boot/qbe_embed.c" -o "$tmp/tobj/embed.o"
