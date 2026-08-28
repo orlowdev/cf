@@ -1,27 +1,32 @@
-# versioning — compute the next GenVer version of a release ring from git history.
+# versioning — compute a release ring's next GenVer version, or its changelog, from git history.
 #
-# `versioning <ring>` finds the previous version tag on that ring (the most recent `*-<label>` tag
-# reachable from HEAD), counts the commits landed since it by kind (glory/enhancement/nurture, per
-# their subject prefixes), adds those counts onto the previous version WITHOUT resetting lower axes,
-# and prints the next tag `G.E.N-<label>` to stdout. All diagnostics go to stderr.
+#   versioning tag       <ring>   ->  the next tag `G.E.N-<label>` (stdout)
+#   versioning changelog <ring>   ->  the commits since the previous version, grouped (stdout)
+#
+# Both subcommands find the previous version tag on the ring (the most recent `*-<label>` tag
+# reachable from HEAD) and read the commits landed since it. `tag` counts those commits by kind and
+# adds the counts onto the previous version WITHOUT resetting lower axes; `changelog` groups them for
+# display. All diagnostics go to stderr.
 #
 # `ring` is a release ring or its pre-release label (root/code_style/git_branching.md):
 #   behemoth | nightly  ->  nightly    azazello | rc      ->  rc
 #   koroviev | latest   ->  latest     master   | stable  ->  stable
 #
 # git has no in-process capture here (std::process::run! only returns an exit status), so each query
-# is run through `sh -c` redirecting its stdout to a temp file, which is then read back and deleted —
-# the same shell-redirect-to-tempfile route the compiler uses for its own subprocess intermediates.
-# This lives standalone under lib/versioning/ for now; it is destined to become `cf mod`'s versioner.
+# is run through `sh -c` redirecting its stdout to a temp file, which is read back and deleted — the
+# same shell-redirect-to-tempfile route the compiler uses for its own subprocess intermediates. This
+# lives standalone under lib/versioning/ for now; it is destined to become `cf mod`'s versioner.
 
 import std::str::{ eq }
-import std::io::console::{ println, eprintln }
+import std::io::console::{ print, println, eprintln }
 import std::process::{ run!, find_executable!, getpid, exit }
 import std::io::file::{ read_file! }
 import std::io::fs::{ remove }
 import std::data::{ Either }
 import std::mem::arena::growing_arena
-import genver::{ Ver, parse_ver, count_axes, bump, format_tag, split_lines, trim_end }
+import genver::{ Ver, parse_ver, bump, format_tag, trim_end }
+import commit::{ Commit, parse_log, count_kinds }
+import changelog::{ render }
 
 # A ring name or a pre-release label -> the canonical pre-release label, or "" if unrecognised.
 const ring_label = (Str ring): Str -> {
@@ -51,17 +56,14 @@ const read_or_empty! = (Str path): Str -> match read_file!(path) {
 	Either.Right(s) -> s,
 }
 
-# The whole computation, run under one arena so `main` holds no residue on the root page. Returns the
-# process exit code: 0 on success (next tag printed to stdout), 2 for a bad ring, 1 for a git failure.
-const compute! = ([Str] env, Str ring): Iarch -> {
-	const Str label = ring_label(ring)
+# Capture the commits since the previous version on `ring` as `[Commit]`, and report the previous tag
+# through `prevtag_out`... — cf has no out-params, so the two callers each need both the commits AND
+# the previous tag string. Bundle them.
+pub data Range = { Str prevtag, [Commit] commits }
 
-	if eq(label, "") then {
-		eprintln("versioning: unknown ring `${ring}` (expected nightly|rc|latest|stable)")
-
-		return 2
-	}
-
+# Gather the previous ring tag and the commits since it (all of HEAD when there is no prior tag), or
+# die on stderr if git cannot be read. `label` is the resolved pre-release label.
+const gather! = ([Str] env, Str label): Range -> {
 	const Str git = need_tool!(env, "git")
 	const Str sh = need_tool!(env, "sh")
 	const Iarch pid = getpid()
@@ -79,41 +81,80 @@ const compute! = ([Str] env, Str ring): Iarch -> {
 
 	remove(tagfile)
 
-	# The commit subjects landed since that tag — or all of HEAD's history when there is no prior tag.
-	let Str lcmd = "${git} log --format=%s > ${logfile} 2>/dev/null"
+	# The commits landed since that tag — or all of HEAD when there is no prior tag. `%h<NUL>%an<NUL>%s`
+	# is short-sha, author, subject; NUL separates fields (it cannot occur inside commit text).
+	let Str lcmd = "${git} log --format='%h%x00%an%x00%s' > ${logfile} 2>/dev/null"
 
-	if !eq(prevtag, "") then lcmd = "${git} log --format=%s ${prevtag}..HEAD > ${logfile} 2>/dev/null"
+	if !eq(prevtag, "") then
+		lcmd = "${git} log --format='%h%x00%an%x00%s' ${prevtag}..HEAD > ${logfile} 2>/dev/null"
 
 	const Iarch lrc = run!(sh, ["sh", "-c", lcmd], env)
 
 	if lrc != 0 then {
 		remove(logfile)
 		eprintln("versioning: cannot read git history (is this a git repository with commits?)")
-
-		return 1
+		exit(1)
 	}
 
 	const Str logtext = read_or_empty!(logfile)
 
 	remove(logfile)
 
-	const Ver base = parse_ver(prevtag)
-	const Ver delta = count_axes(split_lines(logtext))
-	const Ver next = bump(base, delta)
+	return Range({ prevtag: prevtag, commits: parse_log(logtext) })
+}
 
-	println(format_tag(next, label))
+# `versioning tag <ring>` — print the next `G.E.N-<label>` tag.
+const cmd_tag! = ([Str] env, Str label): Iarch -> {
+	const Range r = gather!(env, label)
+	const Ver base = parse_ver(r.prevtag)
+	const Ver delta = count_kinds(r.commits)
+
+	println(format_tag(bump(base, delta), label))
 
 	return 0
 }
 
+# `versioning changelog <ring>` — print the grouped changelog of commits since the previous version.
+const cmd_changelog! = ([Str] env, Str label): Iarch -> {
+	const Range r = gather!(env, label)
+
+	print(render(r.commits))
+
+	return 0
+}
+
+# The whole computation, run under one arena so `main` holds no residue on the root page.
+const compute! = ([Str] env, Str sub, Str ring): Iarch -> {
+	const Str label = ring_label(ring)
+
+	if eq(label, "") then {
+		eprintln("versioning: unknown ring `${ring}` (expected nightly|rc|latest|stable)")
+
+		return 2
+	}
+
+	if eq(sub, "tag") then return cmd_tag!(env, label)
+
+	return cmd_changelog!(env, label)
+}
+
 pub const main = ([Str] args, [Str] env) -> {
-	if Iarch(args.len) < 2 then {
-		eprintln("versioning: usage: versioning <ring>   (ring = nightly|rc|latest|stable)")
+	if Iarch(args.len) < 3 then {
+		eprintln("versioning: usage: versioning <tag|changelog> <ring>   (ring = nightly|rc|latest|stable)")
+
+		return 2
+	}
+
+	const Str sub = args[1]
+	const Str ring = args[2]
+
+	if !eq(sub, "tag") && !eq(sub, "changelog") then {
+		eprintln("versioning: unknown subcommand `${sub}` (expected tag|changelog)")
 
 		return 2
 	}
 
 	const a = growing_arena::of(16777216)
 
-	return compute!(env, args[1]) in a
+	return compute!(env, sub, ring) in a
 }
