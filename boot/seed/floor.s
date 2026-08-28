@@ -22,9 +22,37 @@ _start:
 	bl _main
 	mov x16, #1
 	svc #0x80
+.globl _f39
+.p2align 2
+_f39:
+	stp x29, x30, [sp, #-16]!
+	bl _cf_qbe_run
+	ldp x29, x30, [sp], #16
+	ret
+
+.globl _f312
+.p2align 2
+_f312:
+	mov x0, x0
+	mov x16, #1
+	svc #0x80
+	ret
+
+.globl _f313
+.p2align 2
+_f313:
+	mov x16, #2
+	svc #0x80
+	b.cc 1f
+	neg x0, x0
+	ret
+1:
+	cbz x1, 2f
+	mov x0, #0
+2:
+	ret
+
 .globl _cf_root_page_init
-.globl _cf_root_page_grow
-.globl _cf_oom
 .p2align 2
 _cf_root_page_init:
 	mov x0, #0
@@ -76,6 +104,9 @@ _cf_root_page_init:
 	add x13, x12, x1
 	str x13, [x9, #64]
 	ret
+
+.globl _cf_root_page_grow
+.p2align 2
 _cf_root_page_grow:
 	add x9, x0, #24
 	ldr x10, [x9]
@@ -91,47 +122,24 @@ _cf_root_page_grow:
 	b.cs _cf_mmap_fail
 	str x14, [x9]
 	ret
+
+.globl _cf_mmap_fail
+.p2align 2
 _cf_mmap_fail:
 	mov x0, #71
 	mov x16, #1
 	svc #0x80
+
+.globl _cf_oom
+.p2align 2
 _cf_oom:
 	mov x0, #70
 	mov x16, #1
 	svc #0x80
-.globl _f39
-.p2align 2
-_f39:
-	stp x29, x30, [sp, #-16]!
-	bl _cf_qbe_run
-	ldp x29, x30, [sp], #16
-	ret
 
-.globl _f312
+.globl _f373
 .p2align 2
-_f312:
-	mov x0, x0
-	mov x16, #1
-	svc #0x80
-	ret
-
-.globl _f313
-.p2align 2
-_f313:
-	mov x16, #2
-	svc #0x80
-	b.cc 1f
-	neg x0, x0
-	ret
-1:
-	cbz x1, 2f
-	mov x0, #0
-2:
-	ret
-
-.globl _f369
-.p2align 2
-_f369:
+_f373:
 	mov x16, x0
 	mov x0, x1
 	mov x1, x2
