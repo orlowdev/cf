@@ -7031,6 +7031,22 @@ const main_takes_env = (Program prog): Bool -> {
 	return false
 }
 
+# Does the program already carry a `_start` from `std::rt::floor` (a verbatim-symbol asm fn whose
+# emitted symbol is exactly `_start`)? While the entry is migrating out of the compiler, a hosted
+# floor may or may not provide `_start` yet — the compiler emits its INLINE hosted `_start` only when
+# the floor does NOT, so the two never collide during the staged bootstrap.
+const has_floor_start = (Program prog): Bool -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(prog.funcs.len) then break
+		if prog.funcs[i].is_asm && eq(prog.funcs[i].asm_sym, "_start") then return true
+		i = i + 1
+	}
+
+	return false
+}
+
 # The argv bridge, emitted only for `main([Str] args)`. `cf_strlen` is a C-string length;
 # `cf_build_args` walks the `argc` C-strings in `argv`, wraps each in a `{bytes@0, len@8}` Str
 # header (BORROWING the OS's already-NUL-terminated argv bytes) and pushes it onto a fresh
@@ -7437,6 +7453,9 @@ pub const emit_program! = (
 		write_str(asm_fd, "cf_halt:\n")
 		write_str(asm_fd, "\tb cf_halt\n")
 	} else {
+		# HOSTED entry: emit the compiler's INLINE `_start` only while the program has no floor-provided
+		# `_start` (the staged migration into `std::rt::floor`). Once the floor supplies it, this is skipped.
+		if !has_floor_start(prog) then {
 		if is_linux then {
 			if is_riscv then {
 			# LINUX ELF entry (riscv64). Same stack layout as arm64 linux ([sp]=argc, argv=sp+8, envp
@@ -7558,6 +7577,7 @@ pub const emit_program! = (
 		write_str(asm_fd, "\tbl _main\n")
 		write_str(asm_fd, "\tmov x16, #1\n")
 		write_str(asm_fd, "\tsvc #0x80\n")
+		}
 		}
 	}
 
