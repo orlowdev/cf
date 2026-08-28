@@ -21,6 +21,7 @@ import std::mem::arena::growing_arena
 import qbe::{ qbe_translate }
 import std::process::{ run!, find_executable!, getpid, exit }
 import std::io::fs::{ remove }
+import std::io::file::{ create, close, write_str }
 import std::data::{ Either }
 import std::io::console::{ eprint, print, println }
 
@@ -32,27 +33,102 @@ const target_id_of = (Cli c): Iarch -> {
 	return 0
 }
 
-# Resolve `cc` on PATH and link the floor + program asm into the final binary. Returns cc's exit
-# status (0 = ok), or a positive code if no C compiler is found.
-const link_with_cc! = ([Str] env, Str floor_s, Str prog_s, Str out): Iarch -> {
-	const found = find_executable!(env, "cc")
+# Resolve a required toolchain program on PATH, or die with a clear message. `exit` never returns,
+# so the `<- exit(1)` nominally yields the Str the `Left` arm's type wants.
+const need_tool! = ([Str] env, Str name): Str -> match find_executable!(env, name) {
+	Either.Left(e) -> {
+		eprint("cf: cannot find `")
+		eprint(name)
+		eprint("` on PATH\n")
+		exit(1)
 
-	return match found {
-		Either.Left(e) -> {
-			eprint("cf: cannot find `cc` on PATH — a C toolchain is required to link\n")
+		<- ""
+	},
+	Either.Right(p) -> p,
+}
 
-			<- Iarch(1)
+# darwin link: one `cc` call assembles the floor + program asm and links a Mach-O with the floor's
+# own `_start` entry (no libc symbol used, but darwin needs -lSystem present for the loader).
+const link_darwin! = ([Str] env, Str floor_s, Str prog_s, Str out): Iarch -> {
+	const Str cc = need_tool!(env, "cc")
+	const [Str] argv = ["cc", "-nostdlib", "-lSystem", "-Wl,-e,_start", "-o", out, floor_s, prog_s]
+
+	return run!(cc, argv, env)
+}
+
+# Write cf's embedded bare-metal AArch64 linker script (boot/target/bare-arm64.ld, kept in sync) to
+# `path` so a shipped cf links a freestanding ELF without any repo file. `false` if it cannot open.
+const write_bare_ld = (Str path): Bool -> match create(path) {
+	Either.Left(e) -> false,
+	Either.Right(fd) -> {
+		write_str(fd, "ENTRY(_start)\n")
+		write_str(fd, "SECTIONS {\n")
+		write_str(fd, "\t. = 0x40080000;\n")
+		write_str(fd, "\t.text : { *(.text._start) *(.text*) }\n")
+		write_str(fd, "\t.rodata : { *(.rodata*) }\n")
+		write_str(fd, "\t.data : { *(.data*) }\n")
+		write_str(fd, "\t.bss (NOLOAD) : { *(.bss*) *(COMMON) }\n")
+		write_str(fd, "\t. = ALIGN(16);\n")
+		write_str(fd, "\t. = . + 0x10000;\n")
+		write_str(fd, "\t_stack_top = .;\n")
+		write_str(fd, "\t/DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) }\n")
+		write_str(fd, "}\n")
+		close(fd)
+
+		<- true
+	},
+}
+
+# Prefer `ld.lld`, fall back to a cross `aarch64-none-elf-ld`; die if neither is present.
+const resolve_linker! = ([Str] env): Str -> match find_executable!(env, "ld.lld") {
+	Either.Right(p) -> p,
+	Either.Left(e) -> match find_executable!(env, "aarch64-none-elf-ld") {
+		Either.Right(p) -> p,
+		Either.Left(e2) -> {
+			eprint("cf: no ELF linker (`ld.lld` or `aarch64-none-elf-ld`) found for the bare target\n")
+			exit(1)
+
+			<- ""
 		},
-		Either.Right(cc) -> {
-			const [Str] argv = ["cc", "-nostdlib", "-lSystem", "-Wl,-e,_start", "-o", out, floor_s, prog_s]
+	},
+}
 
-			<- run!(cc, argv, env)
-		},
+# bare-metal link: assemble the floor + ELF program as AArch64 ELF with `clang` (its aarch64 backend
+# works on a stock host), then link a flat freestanding image with the embedded linker script.
+const link_bare! = ([Str] env, Str floor_s, Str prog_s, Str out, Iarch pid, Bool preserve): Iarch -> {
+	const Str fo = "/tmp/cf-${pid}.floor.o"
+	const Str po = "/tmp/cf-${pid}.prog.o"
+	const Str ldp = "/tmp/cf-${pid}.ld"
+	const Str clang = need_tool!(env, "clang")
+
+	const Iarch a1 = run!(clang, ["clang", "-target", "aarch64-none-elf", "-c", floor_s, "-o", fo], env)
+
+	if a1 != 0 then return a1
+
+	const Iarch a2 = run!(clang, ["clang", "-target", "aarch64-none-elf", "-c", prog_s, "-o", po], env)
+
+	if a2 != 0 then return a2
+
+	if !write_bare_ld(ldp) then {
+		eprint("cf: cannot write the bare linker script\n")
+		exit(1)
 	}
+
+	const Str linker = resolve_linker!(env)
+	const Iarch lr = run!(linker, ["ld", "-T", ldp, "-o", out, fo, po], env)
+
+	if !preserve then {
+		remove(fo)
+		remove(po)
+		remove(ldp)
+	}
+
+	return lr
 }
 
 # The self-contained pipeline: compile the program to IL + floor (temp files), run the embedded QBE
-# on the IL, spawn `cc` to link, then clean up (unless `-P`). Returns the final binary's build status.
+# on the IL, spawn the host toolchain to assemble+link, then clean up (unless `-P`). darwin links a
+# Mach-O with `cc`; a `Bare` target cross-assembles + links a freestanding ELF with `clang`/`ld.lld`.
 const run_full! = (Cli c, [Str] env): Iarch -> {
 	const Iarch pid = getpid()
 	const Str til = "/tmp/cf-${pid}.qbe"
@@ -68,7 +144,10 @@ const run_full! = (Cli c, [Str] env): Iarch -> {
 		exit(1)
 	}
 
-	const Iarch st = link_with_cc!(env, tfl, tpr, c.output)
+	let Iarch st = 0
+
+	if eq(c.target_os, "Bare") then st = link_bare!(env, tfl, tpr, c.output, pid, c.preserve)
+	else st = link_darwin!(env, tfl, tpr, c.output)
 
 	if c.preserve then {
 		print("cf: kept intermediates: ")
