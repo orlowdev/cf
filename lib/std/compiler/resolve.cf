@@ -11,7 +11,7 @@
 # a name no module declares).
 
 import std::data::{ Either }
-import std::str::{ eq }
+import std::str::{ eq, starts_with }
 import std::io::console::{ die }
 import std::io::file::{ open_read, read, close }
 import std::io::fd::{ Fd, IoRrr }
@@ -1402,6 +1402,7 @@ const mangle_module_funcs! = (Iarch idx, Rctx rc): [Func] -> {
 				tbounds: f.tbounds,
 				ret_size: f.ret_size,
 				is_intrinsic: f.is_intrinsic,
+				asm_sym: f.asm_sym,
 			}),
 		]
 		i = i + 1
@@ -1843,6 +1844,7 @@ const norm_mt_func! = (Func f, [RecDecl] recs, [UnionDecl] unions): Func -> {
 		tbounds: f.tbounds,
 		ret_size: f.ret_size,
 		is_intrinsic: f.is_intrinsic,
+		asm_sym: f.asm_sym,
 	})
 }
 
@@ -2371,6 +2373,7 @@ const splat_groups! = ([Func] funcs, [RecDecl] recs, [UnionDecl] unions, [RecDec
 				tbounds: f.tbounds,
 				ret_size: f.ret_size,
 				is_intrinsic: f.is_intrinsic,
+				asm_sym: f.asm_sym,
 			}),
 		]
 		i = i + 1
@@ -2386,6 +2389,50 @@ const is_pseudo_module = (Str path): Bool -> {
 	if eq(path, "runtime") then return true
 
 	return false
+}
+
+# Is this import path a per-target FLOOR implementation (`std/rt/floor/<arch>/<os>`)? Its asm fns are
+# the freestanding entry + arena runtime — emitted under FIXED symbols, not positional `f<idx>`.
+const is_floor_impl = (Str path): Bool -> starts_with(path, "std/rt/floor/")
+
+# `f` with its `asm_sym` set to `sym` (the sole field that changes) — cf has no record-update spread,
+# so every field is copied.
+const with_asm_sym = (Func f, Str sym): Func -> Func({
+	name: f.name,
+	is_pub: f.is_pub,
+	ret_name: f.ret_name,
+	ret_elem: f.ret_elem,
+	params: f.params,
+	body: f.body,
+	is_asm: f.is_asm,
+	asm_body: f.asm_body,
+	is_value: f.is_value,
+	ret_telems: f.ret_telems,
+	typarams: f.typarams,
+	tbounds: f.tbounds,
+	ret_size: f.ret_size,
+	is_intrinsic: f.is_intrinsic,
+	asm_sym: sym,
+})
+
+# Tag every asm function of a privileged floor module so it emits under its EXACT source symbol
+# (`_start`, `cf_root_page_grow`) — the entry and the `raw::grow`/`raw::trap` lowerings link by that
+# fixed name. Runs at load, BEFORE mangling, so `asm_sym` captures the source name (mangling rewrites
+# `name`, never this). A no-op for a module with no asm fns.
+const tag_floor_syms = (Program p): Program -> {
+	let [Func] out = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(p.funcs.len) then break
+		const Func f = p.funcs[i]
+
+		if f.is_asm then out = [...out, with_asm_sym(f, f.name)] else out = [...out, f]
+
+		i = i + 1
+	}
+
+	return Program({ imports: p.imports, recs: p.recs, unions: p.unions, funcs: out, groups: p.groups })
 }
 
 # Load the entry module and flatten its transitive import graph into one Program in TWO passes.
@@ -2436,7 +2483,8 @@ pub const resolve_program! = (Str entry, Str target_os, Str target_arch): Progra
 					geom = true
 					mtag = "pg"
 				}
-				const Program m = load_module!(mpath, target_os, target_arch)
+				const Program m0 = load_module!(mpath, target_os, target_arch)
+				const Program m = if is_floor_impl(im.path) then tag_floor_syms(m0) else m0
 				mods = [
 					...mods,
 					Modu({ prefix: sanitize_prefix!(im.path), mpath: mpath, is_geom: geom, tag: mtag, prog: m }),
