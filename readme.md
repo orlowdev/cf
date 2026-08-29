@@ -1,5 +1,7 @@
 # C!
 
+[![ci](https://github.com/orlowdev/cf/actions/workflows/ci.yml/badge.svg)](https://github.com/orlowdev/cf/actions/workflows/ci.yml)
+
 **C!** (pronounced "C-factorial") is a statically-typed systems programming
 language. It compiles to native code through [QBE](https://c9x.me/qbe/) and a
 tiny hand-written assembly floor to avoid libc where it is possible.
@@ -8,8 +10,59 @@ syscalls.
 
 > **Status.** C! is at the bootstrapping stage. The compiler, `cf`, is
 > self-hosting and passes its corpus, but it still accepts only a reduced subset
-> of the full language, and the target is currently **arm64 macOS** only. The
-> language specs live in [`root/specs/`](root/specs/).
+> of the full language. It builds for macOS (arm64/amd64) and Linux
+> (arm64/amd64/riscv64). The language specs live in [`root/specs/`](root/specs/).
+
+## Install
+
+Grab a released binary for your platform (darwin arm64/amd64, linux arm64/amd64/riscv64).
+
+> This is a nightly install, be careful.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/orlowdev/cf/margarita/install.sh | sh
+```
+
+The default channel is the bleeding-edge `nightly` ring; pick a steadier one with `CF_CHANNEL` below.
+
+It downloads one static binary from this repo's GitHub releases, **verifies it against the
+published sha256** before writing it, and drops `cf` in `~/.local/bin` — no `sudo`, no daemons.
+(Yes, it's a `curl | sh`; the script is right there in the repo, and you're welcome to read it
+first.) Knobs: `CF_CHANNEL=nightly|rc|latest|stable`, `CF_VERSION=<tag>`, `CF_INSTALL_DIR=<dir>`.
+
+Pin a **channel** to always get the newest build on a release ring:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/orlowdev/cf/margarita/install.sh | CF_CHANNEL=stable sh
+```
+
+Each ring also publishes a rolling release under a bare tag, so the download URL is stable — you can
+skip the script entirely and grab the binary directly (there's a `.sha256` next to each):
+
+```
+https://github.com/orlowdev/cf/releases/download/<ring>/cf-<ring>-<platform>
+# e.g. …/releases/download/stable/cf-stable-linux-amd64   (ring ∈ nightly|rc|latest|stable)
+```
+
+For an immutable pin, use a versioned tag: `CF_VERSION=1.23.61-stable` (or that release's asset URL,
+`…/releases/download/1.23.61-stable/cf-1.23.61-stable-<platform>`). To build from source instead, see
+[Building the compiler](#building-the-compiler).
+
+## Hello, world
+
+```c!
+import std::io::console::{ print }
+
+pub const main = () -> {
+	print("Hello, world!\n")
+	return 0
+}
+```
+
+```sh
+var/cf hello.cf -o hello   # compile + embedded QBE + link (cf finds cc itself)  ->  ./hello
+./hello                    # Hello, world!
+```
 
 ## Why C!
 
@@ -187,57 +240,6 @@ program's start) and wherever a resource has a genuine paired release
 (`defer close(open(path))` is textbook RAII). A per-object `rc` geometry would
 re-bundle the triple. The hook framework spans the whole spectrum — the arenas are
 simply its RAINI end.
-
-## Install
-
-Grab a released binary for your platform (darwin arm64/amd64, linux arm64/amd64/riscv64).
-
-> This is a nightly install, be careful.
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/orlowdev/cf/margarita/install.sh | sh
-```
-
-The default channel is the bleeding-edge `nightly` ring; pick a steadier one with `CF_CHANNEL` below.
-
-It downloads one static binary from this repo's GitHub releases, **verifies it against the
-published sha256** before writing it, and drops `cf` in `~/.local/bin` — no `sudo`, no daemons.
-(Yes, it's a `curl | sh`; the script is right there in the repo, and you're welcome to read it
-first.) Knobs: `CF_CHANNEL=nightly|rc|latest|stable`, `CF_VERSION=<tag>`, `CF_INSTALL_DIR=<dir>`.
-
-Pin a **channel** to always get the newest build on a release ring:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/orlowdev/cf/margarita/install.sh | CF_CHANNEL=stable sh
-```
-
-Each ring also publishes a rolling release under a bare tag, so the download URL is stable — you can
-skip the script entirely and grab the binary directly (there's a `.sha256` next to each):
-
-```
-https://github.com/orlowdev/cf/releases/download/<ring>/cf-<ring>-<platform>
-# e.g. …/releases/download/stable/cf-stable-linux-amd64   (ring ∈ nightly|rc|latest|stable)
-```
-
-For an immutable pin, use a versioned tag: `CF_VERSION=1.23.61-stable` (or that release's asset URL,
-`…/releases/download/1.23.61-stable/cf-1.23.61-stable-<platform>`). To build from source instead, see
-[Building the compiler](#building-the-compiler).
-
-## Hello, world
-
-```c!
-import std::io::console::{ print }
-
-pub const main = () -> {
-	print("Hello, world!\n")
-	return 0
-}
-```
-
-```sh
-var/cf hello.cf -o hello   # compile + embedded QBE + link (cf finds cc itself)  ->  ./hello
-./hello                    # Hello, world!
-```
 
 ## `$`-stack values
 
