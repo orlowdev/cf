@@ -35,12 +35,14 @@ case "$(uname -s)/$(uname -m)" in
 esac
 target="${1:-$host}"
 
-# Per-platform knobs. `seed` is the OS seed dir; `qt` the qbe `-t` target; `fa` the floor's arch name
-# (floor.$fa.s in the seed); `cc`/`link`/`libs` the C toolchain + link recipe (floor owns `_start`);
-# `march` extra flags threaded into BOTH the target C compile and the link (so a cross build targets
-# the right machine — e.g. `-arch x86_64` when an Apple-Silicon host builds darwin-amd64).
-knobs() { # <platform>  ->  sets seed qt fa cc link libs march
-	march=""
+# Per-platform knobs. `seed` is the OS seed dir; `sq` the seed IL filename inside it; `qt` the qbe `-t`
+# target; `fa` the floor's arch name (floor.$fa.s in the seed); `cc`/`link`/`libs` the C toolchain +
+# link recipe (floor owns `_start`); `march` extra flags threaded into BOTH the target C compile and
+# the link (so a cross build targets the right machine — e.g. `-arch x86_64` for darwin-amd64). Most
+# platforms share their OS seed's `cf.qbe`; linux-amd64 has its OWN IL (`sq`) because x86-64's linux
+# syscall numbers are baked differently than the generic arm64/riscv64 table.
+knobs() { # <platform>  ->  sets seed sq qt fa cc link libs march
+	march=""; sq="cf.qbe"
 	case "$1" in
 		darwin-arm64)
 			seed="$root/boot/seed_mac"; qt=arm64_apple; fa=arm64
@@ -61,6 +63,12 @@ knobs() { # <platform>  ->  sets seed qt fa cc link libs march
 			# `-no-pie` because the floor's `_start` does no PIE self-relocation (some musl gccs default PIE).
 			seed="$root/boot/seed_linux"; qt=arm64; fa=arm64
 			cc="${LINUX_CC:-musl-gcc}"; link="-nostdlib -static -no-pie -Wl,-e,_start -Wl,-u,__init_libc"; libs="-lc -lgcc" ;;
+		linux-amd64)
+			# x86-64 linux syscall numbers differ from the generic arm64/riscv64 table, so linux-amd64
+			# has its OWN seed IL (cf.amd64.qbe), not the shared seed_linux/cf.qbe. Same static-musl link
+			# as the other linux targets; native `musl-gcc` on an x86-64 host already targets x86-64.
+			seed="$root/boot/seed_linux"; sq="cf.amd64.qbe"; qt=amd64_sysv; fa=amd64
+			cc="${LINUX_CC:-musl-gcc}"; link="-nostdlib -static -no-pie -Wl,-e,_start -Wl,-u,__init_libc"; libs="-lc -lgcc" ;;
 		linux-riscv64)
 			seed="$root/boot/seed_linux"; qt=rv64; fa=riscv64
 			cc="${RISCV_CC:-riscv64-linux-musl-gcc}"; link="-nostdlib -static -no-pie -Wl,-e,_start -Wl,-u,__init_libc"; libs="-lc -lgcc" ;;
@@ -70,7 +78,7 @@ knobs() { # <platform>  ->  sets seed qt fa cc link libs march
 
 # Host toolchain (for cf0 + the vendored QBE), resolved from the host knobs so the whole build uses one
 # C compiler — cc on darwin, musl-gcc on linux (matching the embedded QBE objects to the libc we link).
-knobs "$host"; hseed="$seed"; hqt="$qt"; hfa="$fa"; hcc="$cc"; hlink="$link"; hlibs="$libs"
+knobs "$host"; hseed="$seed"; hsq="$sq"; hqt="$qt"; hfa="$fa"; hcc="$cc"; hlink="$link"; hlibs="$libs"
 
 # The embedded QBE's C is built OPTIMIZED and without debug info (QBE's own Makefile defaults to
 # `-g` and no `-O`): `-O2` makes cf's IL->asm step faster, and dropping `-g` shrinks the binary. This
@@ -90,10 +98,10 @@ trap 'rm -rf "$tmp"' EXIT
 "$hcc" $cflags -I "$qbedir" -c "$root/boot/qbe_embed.c" -o "$tmp/qbe_embed_host.o"
 
 # --- Stage 1: assemble the HOST seed into the bootstrap compiler cf0 (runs on this machine). ---
-for f in "$hseed/cf.qbe" "$hseed/floor.$hfa.s"; do
+for f in "$hseed/$hsq" "$hseed/floor.$hfa.s"; do
 	[ -f "$f" ] || { echo "build: seed missing: $f" >&2; exit 1; }
 done
-"$qbe" -t "$hqt" -o "$tmp/cf0.prog.s" "$hseed/cf.qbe"
+"$qbe" -t "$hqt" -o "$tmp/cf0.prog.s" "$hseed/$hsq"
 # shellcheck disable=SC2086
 $hcc $hlink -o "$tmp/cf0" "$hseed/floor.$hfa.s" "$tmp/cf0.prog.s" $host_embed "$tmp/qbe_embed_host.o" $hlibs
 

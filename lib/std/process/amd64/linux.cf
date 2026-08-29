@@ -1,0 +1,181 @@
+# Process control for amd64/linux, over the raw syscalls. `exit` ends the process; `run` spawns another
+# program and waits for it. Both are freestanding — raw `syscall`, no libc — so any C! program can drive
+# a subprocess without a C runtime. `getenv`/`find_executable` read the environment the caller was
+# given (a `[Str]` of "KEY=VALUE", threaded from `main`) — there is no ambient access.
+#
+# This is the x86-64 sibling of the generic (arm64/riscv64) `std::process::linux`: identical logic, but
+# the linux syscall NUMBERS differ on x86-64 (clone 56, execve 59, wait4 61, getpid 39, exit_group 231)
+# so it carries its own copy — the `std::process` barrel routes linux-amd64 here. Keep it in step with
+# the generic module when the shared logic changes.
+#
+# Linux's generic ABI has no `fork` syscall: `fork` is `clone(SIGCHLD)` with a null child stack, which
+# gives the classic copy-on-write child (0 in the child, the child pid in the parent) directly in the
+# result register — no second-register "am I the child" flag to recover, so it needs no asm body.
+import std::sys::{ syscall6 }
+import std::io::fs::{ access }
+import std::str::{ starts_with }
+import std::data::{ Either }
+import std::io::fd::{ IoRrr }
+
+# `exit` traps into the kernel with `exit_group` (x86-64 syscall 231), passing the status `code` and
+# terminating every thread. It never returns — the process is gone before the trailing `ret` — so its
+# result type is `Never`, the bottom type: an `exit(...)` expression fits any hole (`return exit(1)`,
+# `x = exit(1)`) and a call for effect diverges (ends control flow). `code` is already in `rdi` (the
+# first param register, where exit_group wants it), so the body only loads the call number.
+pub const exit = (Iarch code): Never -> asm "
+	movl $231, %eax
+	syscall
+	ret
+"
+
+# fork(): 0 in the child, the child's pid in the parent, or -errno on failure. Implemented as
+# `clone(flags = SIGCHLD (17), stack = 0, ...)` — a null stack makes the copy-on-write child continue
+# on the parent's (copied) stack, the fork semantics `run!` needs before it `execve`s.
+const fork = (): Iarch -> syscall6(56, 17, 0, 0, 0, 0, 0)
+
+# execve(): replace the process image with `path`, running with `argv` and `envp` (each a
+# NUL-terminated array of C-string pointers). Returns only on failure (-errno) — on success the
+# image is gone.
+const execve = (Str path, *[Uarch] argv, *[Uarch] envp): Iarch ->
+	syscall6(59, path.bytes, argv, envp, 0, 0, 0)
+
+# wait4() the child `pid`, filling the 4-byte status int at `st`. Returns the reaped pid or -errno.
+const wait4_raw = (Iarch pid, *[Uint8] st): Iarch -> syscall6(61, Uarch(pid), st, 0, 0, 0, 0)
+
+# getpid() — the calling process's id. Handy for unique temp-file names.
+pub const getpid = (): Iarch -> syscall6(39, 0, 0, 0, 0, 0, 0)
+
+# Copy `len` bytes of `buf` starting at `start` into a fresh owned Str (the fs::slice_str idiom —
+# append inline, never return a bare indexed byte).
+const slice = (*[Uint8] buf, Iarch start, Iarch len): Str -> {
+	let [Uint8] out = []
+	let Iarch i = 0
+
+	loop {
+		if i >= len then break
+
+		out = [...out, buf[start + i]]
+		i = i + 1
+	}
+
+	return Str({ bytes: out, len: Iarch(out.len) })
+}
+
+# The substring of `s` over the byte range [start, end) as a fresh owned Str.
+const substr = (Str s, Iarch start, Iarch end): Str -> slice(s.bytes, start, end - start)
+
+# Byte `i` of `b` widened to Iarch — for comparisons (a bare `b[i]` Uint8 can't be returned).
+const byte_of = (*[Uint8] b, Iarch i): Iarch -> Iarch(b[i])
+
+# Split `s` on ':' into segments, dropping empties — for walking a `PATH` value.
+const split_colon = (Str s): [Str] -> {
+	let [Str] out = []
+	let Iarch start = 0
+	let Iarch i = 0
+
+	loop {
+		if i >= s.len then break
+
+		if byte_of(s.bytes, i) == 58 then {
+			if i > start then out = [...out, substr(s, start, i)]
+
+			start = i + 1
+		}
+
+		i = i + 1
+	}
+
+	if s.len > start then out = [...out, substr(s, start, s.len)]
+
+	return out
+}
+
+# The whole of `s` from `start` to its end. A `[Str]` element must be passed to a `Str` parameter
+# directly (an element binding isn't a full `Str` value), so this reads its length inside.
+const rest_from = (Str s, Iarch start): Str -> substr(s, start, s.len)
+
+# Join a directory and a leaf into a path. Takes both as parameters so a `[Str]` element (`dirs[i]`)
+# can be passed straight in.
+const join_path = (Str dir, Str leaf): Str -> "${dir}/${leaf}"
+
+# The value of environment variable `name` in `env` (a `[Str]` of "KEY=VALUE"), or an empty Str
+# if unset. A linear scan — the environment is small and read rarely, so no index is warranted.
+# `env[i]` is passed to the helpers directly (a bound element isn't usable as a `Str` argument).
+pub const getenv! = ([Str] env, Str name): Str -> {
+	const Str pre = "${name}="
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(env.len) then break
+
+		if starts_with(env[i], pre) then return rest_from(env[i], Iarch(pre.len))
+
+		i = i + 1
+	}
+
+	return ""
+}
+
+# Resolve program `name` to an absolute path by searching `PATH` (from `env`) for a directory
+# holding an executable `name`. `Right(path)` is the first hit; `Left(IoRrr.NotFound)` if none.
+pub const find_executable! = ([Str] env, Str name): Either[IoRrr, Str] -> {
+	const Str path = getenv!(env, "PATH")
+	const [Str] dirs = split_colon(path)
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(dirs.len) then break
+
+		const Str cand = join_path(dirs[i], name)
+
+		if access(cand, 1) then return Either[IoRrr, Str].Right(cand)
+
+		i = i + 1
+	}
+
+	return Either[IoRrr, Str].Left(IoRrr.NotFound)
+}
+
+# Build the NUL-terminated `[Uarch]` of each Str's byte pointer that `execve` wants as a `char**`.
+# Each element is bound to a Str local first — an array's Str element exposes only `.len`, so the
+# `.bytes` pointer is read off the binding.
+const build_argv = ([Str] items): [Uarch] -> {
+	let [Uarch] out = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(items.len) then break
+
+		const Str s = items[i]
+
+		out = [...out, Uarch(s.bytes)]
+		i = i + 1
+	}
+
+	return [...out, Uarch(0)]
+}
+
+# Run `path` with `argv` (argv[0] is the program name by convention) and `env`, BLOCK until it
+# exits, and return its exit status (0 = success, 1-255 = the program's code). A negative result
+# is a spawn/wait failure (-errno). Synchronous: fork + execve in the child, wait4 in the parent.
+pub const run! = (Str path, [Str] argv, [Str] env): Iarch -> {
+	const [Uarch] av = build_argv(argv)
+	const [Uarch] ev = build_argv(env)
+	const Iarch pid = fork()
+
+	if pid < 0 then return pid
+	if pid == 0 then {
+		execve(path, av, ev)
+
+		return exit(127)
+	}
+
+	let [8 Uint8] st = [0, 0, 0, 0, 0, 0, 0, 0]
+	const Iarch r = wait4_raw(pid, st)
+
+	if r < 0 then return r
+
+	const Iarch status = Iarch(st[0]) + Iarch(st[1]) * 256 + Iarch(st[2]) * 65536 + Iarch(st[3]) * 16777216
+
+	return (status / 256) % 256
+}

@@ -76,7 +76,13 @@ regen_linux() { # <verified-darwin-cf>
 		echo "reseed: FIXPOINT FAILED — linux arm64/riscv64 IL diverged (must be identical, generic ABI)" >&2
 		exit 1
 	fi
-	echo "reseed: ok — linux seed regenerated (native fixpoint verified in CI) -> $lseed"
+	echo "reseed: ok — linux arm64/riscv64 seed regenerated (native fixpoint verified in CI) -> $lseed"
+
+	# linux-amd64 has its OWN IL: x86-64's linux syscall numbers (and struct-stat layout) differ from
+	# the generic arm64/riscv64 table, so it CANNOT share cf.qbe and is EXCLUDED from the identity check
+	# above. Emit its distinct seed; the self-hosting fixpoint is verified natively on CI (ubuntu x86-64).
+	"$1" --skip-embeds --target linux-amd64 "$src" "$lseed/cf.amd64.qbe" "$lseed/floor.amd64.s"
+	echo "reseed: ok — linux-amd64 seed regenerated (its own IL; native fixpoint verified in CI) -> $lseed"
 }
 
 # Regenerate the darwin-amd64 floor from the just-verified darwin compiler `$1`. darwin arm64 and amd64
