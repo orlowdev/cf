@@ -15,7 +15,8 @@
 # (boot/qbe_embed.c) are linked in, so cf translates IL->asm in-process. QBE uses libc; cf's floor owns
 # `_start` (freestanding), so we link libc for QBE WITHOUT its crt startup (-lSystem on darwin, static
 # -lc on linux). darwin and linux-arm64 build natively from their own seed; linux-riscv64 cross-builds
-# on a linux-arm64 host (shared IL, riscv floor, a riscv cross toolchain for QBE's C).
+# on any linux host (x86-64 in CI, to match the x86_64-hosted riscv cross toolchain) — shared IL, riscv
+# floor, a riscv cross toolchain for QBE's C. The cross toolchain's host arch must match the runner.
 #
 # After editing cf's `.cf` source, regenerate BOTH seeds with boot/reseed.sh, then commit them.
 set -eu
