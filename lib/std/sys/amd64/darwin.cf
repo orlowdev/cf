@@ -1,0 +1,34 @@
+# The raw system-call primitive for amd64/darwin. `syscall6` traps into the kernel with up to six
+# arguments; on darwin/amd64 the call number goes in `rax` with the BSD "Unix" class bit `0x2000000`
+# OR'd in, the arguments in `rdi,rsi,rdx,r10,r8,r9` (note `r10`, NOT `rcx` — the `syscall` instruction
+# clobbers `rcx`/`r11`), dispatched by `syscall`. A failed syscall sets the carry flag and returns a
+# positive errno in `rax`; the body negates it, so the result is `-errno` on failure and the kernel's
+# value on success. Higher-level modules wrap it — user code should reach for `std::io::console` and
+# friends, not this floor.
+#
+# Unlike arm64 the amd64 SysV call ABI hands the seven params (num + a0..a5) in `rdi,rsi,rdx,rcx,r8,r9`
+# with the seventh (a5) on the stack at `8(%rsp)` (the return address sits at `0(%rsp)` in this naked
+# body), so the trap opens by shuffling each incoming slot into its kernel register before `syscall` —
+# hence a hand-written, hole-free asm body rather than the `${param}` template arm64/riscv use.
+#
+# LIFETIME NOTE: the compiler treats an asm body (this one included) as retaining nothing, so a
+# buffer passed here is freed on its normal scope exit. That is correct for a SYNCHRONOUS syscall
+# (the kernel copies/fills during the trap and keeps no pointer). It is NOT safe for an ASYNCHRONOUS
+# one — the compiler does not track a value's survivability across a call whose completion outlives
+# the trap. Async I/O must be driven by a wrapper that owns the buffer's lifetime until completion.
+pub const syscall6 = (Uarch num, Uarch a0, Uarch a1, Uarch a2, Uarch a3, Uarch a4, Uarch a5): Iarch ->
+	asm "
+	movq %rdi, %rax
+	orq $0x2000000, %rax
+	movq %rsi, %rdi
+	movq %rdx, %rsi
+	movq %rcx, %rdx
+	movq %r8, %r10
+	movq %r9, %r8
+	movq 8(%rsp), %r9
+	syscall
+	jnc 1f
+	negq %rax
+1:
+	ret
+"

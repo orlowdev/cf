@@ -79,6 +79,21 @@ regen_linux() { # <verified-darwin-cf>
 	echo "reseed: ok — linux seed regenerated (native fixpoint verified in CI) -> $lseed"
 }
 
+# Regenerate the darwin-amd64 floor from the just-verified darwin compiler `$1`. darwin arm64 and amd64
+# emit BYTE-IDENTICAL IL — they share BSD syscall NUMBERS, and the amd64 `syscall` class bit lives in
+# the floor trampoline, not the IL — so amd64 REUSES the committed mac `cf.qbe`; we assert that identity
+# here and commit only the new `floor.amd64.s`. The amd64 fixpoint is verified natively under Rosetta 2
+# / CI (reseed runs on arm64 and cannot itself run an amd64 cf), but the emit is deterministic and
+# target-driven, so this compiler's amd64 emit is exactly what an amd64-native cf reproduces.
+regen_darwin_amd64() { # <verified-darwin-cf>
+	"$1" --skip-embeds --target darwin-amd64 "$src" "$tmp/da.qbe" "$seed/floor.amd64.s"
+	if ! cmp -s "$tmp/da.qbe" "$seed/cf.qbe"; then
+		echo "reseed: FIXPOINT FAILED — darwin-amd64 IL diverged from the mac seed (must be identical)" >&2
+		exit 1
+	fi
+	echo "reseed: ok — darwin-amd64 floor regenerated, IL reuses the mac seed -> $seed/floor.amd64.s"
+}
+
 # 1. cf₀ from the CURRENT (committed) seed.
 asm "$seed/cf.qbe" "$seed/floor.arm64.s" "$tmp/cf_old"
 
@@ -99,6 +114,7 @@ if [ "$transitional" -eq 0 ]; then
 	cp "$tmp/new.qbe" "$seed/cf.qbe"
 	cp "$tmp/new.floor.s" "$seed/floor.arm64.s"
 	echo "reseed: ok — mac seed regenerated and fixpoint verified -> $seed"
+	regen_darwin_amd64 "$tmp/cf_new"
 	regen_linux "$tmp/cf_new"
 	exit 0
 fi
@@ -114,4 +130,5 @@ fi
 cp "$tmp/chk.qbe" "$seed/cf.qbe"
 cp "$tmp/chk.floor.s" "$seed/floor.arm64.s"
 echo "reseed: ok — mac seed regenerated (transitional stage-2) and fixpoint verified -> $seed"
+regen_darwin_amd64 "$tmp/cf_newer"
 regen_linux "$tmp/cf_newer"

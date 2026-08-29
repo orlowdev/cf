@@ -1,29 +1,62 @@
-# Process control for arm64/darwin, over the raw BSD syscalls. `exit` ends the process; `run`
-# spawns another program and waits for it. Both are freestanding — raw `svc`, no libc — so any
+# Process control for darwin, over the raw BSD syscalls. `exit` ends the process; `run` spawns
+# another program and waits for it. Both are freestanding — raw `syscall`/`svc`, no libc — so any
 # C! program can drive a subprocess without a C runtime. `getenv`/`find_executable` read the
 # environment the caller was given (a `[Str]` of "KEY=VALUE", threaded from `main`) — there is
 # no ambient environment access.
-import std::sys::{ syscall6 }
+#
+# Both darwin arches share BSD syscall NUMBERS, so this module serves arm64 AND amd64; only the two
+# raw-asm primitives (`exit`, `fork`) are per-arch and comptime-split on `arch::target` — the amd64
+# trap uses the `syscall` instruction with the `0x2000000` Unix-class bit, the arm64 one `svc #0x80`.
+# Everything else (`execve`/`wait4`/`getpid` via `syscall6`, and the pure `run!`/`getenv` logic) is
+# arch-independent. (The file still lives under `arm64/` for historical reasons; the darwin barrel
+# routes every darwin arch here.)
+import std::sys::{ syscall6, Arch }
+import std::comptime::arch
 import std::io::fs::{ access }
 import std::str::{ starts_with }
 import std::data::{ Either }
 import std::io::fd::{ IoRrr }
 
 # `exit` traps into the kernel with the BSD `exit` system call (number 1), passing the status
-# `code` in `x0`. It never returns — the process is gone before the trailing `ret` — so its
+# `code` in `x0`/`rdi`. It never returns — the process is gone before the trailing `ret` — so its
 # result type is `Never`, the bottom type: an `exit(...)` expression fits any hole
-# (`return exit(1)`, `x = exit(1)`) and a call for effect diverges (ends control flow).
-pub const exit = (Iarch code): Never -> asm "
+# (`return exit(1)`, `x = exit(1)`) and a call for effect diverges (ends control flow). On amd64 the
+# status is already in `rdi` (the first param register) so the body only loads the call number.
+if arch::target == Arch.Amd64 then {
+	pub const exit = (Iarch code): Never -> asm "
+	movq $0x2000001, %rax
+	syscall
+	ret
+"
+} else {
+	pub const exit = (Iarch code): Never -> asm "
 	mov x0, ${code}
 	mov x16, #1
 	svc #0x80
 	ret
 "
+}
 
 # fork(): 0 in the child, the child's pid in the parent, or -errno on failure. This needs its
-# OWN asm body rather than `syscall6` because darwin returns the "am I the child" flag in x1,
-# which `syscall6` discards. Carry set = error; else x1 != 0 marks the child.
-const fork = (): Iarch -> asm "
+# OWN asm body rather than `syscall6` because darwin returns the "am I the child" flag in a second
+# register (arm64 `x1`, amd64 `edx`), which `syscall6` discards. Carry set = error; else that flag
+# != 0 marks the child (return 0).
+if arch::target == Arch.Amd64 then {
+	const fork = (): Iarch -> asm "
+	movq $0x2000002, %rax
+	syscall
+	jnc 1f
+	negq %rax
+	ret
+1:
+	testl %edx, %edx
+	jz 2f
+	xorl %eax, %eax
+2:
+	ret
+"
+} else {
+	const fork = (): Iarch -> asm "
 	mov x16, #2
 	svc #0x80
 	b.cc 1f
@@ -35,6 +68,7 @@ const fork = (): Iarch -> asm "
 2:
 	ret
 "
+}
 
 # execve(): replace the process image with `path`, running with `argv` and `envp` (each a
 # NUL-terminated array of C-string pointers). Returns only on failure (-errno) — on success the

@@ -28,12 +28,13 @@ import std::data::{ Either }
 import std::io::console::{ eprint, print, println }
 
 # target_os/arch -> the embedded QBE's target id (see qbe_translate): darwin arm64_apple = 0,
-# arm64 ELF (bare metal / linux) = 1, rv64 = 4. Linux-arm64 and bare-arm64 share QBE's `T_arm64`
-# (SysV ELF, no-underscore symbols); linux-riscv64 selects `T_rv64`. Only the floor/link differ.
+# arm64 ELF (bare metal / linux) = 1, amd64_apple = 2, amd64_sysv = 3, rv64 = 4. Linux-arm64 and
+# bare-arm64 share QBE's `T_arm64` (SysV ELF, no-underscore symbols); linux-riscv64 selects `T_rv64`;
+# the two amd64 targets select `T_amd64_apple`/`T_amd64_sysv`. Only the floor/link differ per arch.
 const target_id_of = (Cli c): Iarch -> match c.target_os {
 	Os.Bare -> 1,
-	Os.Darwin -> 0,
-	Os.Linux -> match c.target_arch { Arch.Riscv64 -> 4, _ -> 1 },
+	Os.Darwin -> match c.target_arch { Arch.Amd64 -> 2, _ -> 0 },
+	Os.Linux -> match c.target_arch { Arch.Riscv64 -> 4, Arch.Amd64 -> 3, _ -> 1 },
 }
 
 # Resolve a required toolchain program on PATH, or die with a clear message. `exit` never returns,
@@ -51,10 +52,13 @@ const need_tool! = ([Str] env, Str name): Str -> match find_executable!(env, nam
 }
 
 # darwin link: one `cc` call assembles the floor + program asm and links a Mach-O with the floor's
-# own `_start` entry (no libc symbol used, but darwin needs -lSystem present for the loader).
-const link_darwin! = ([Str] env, Str floor_s, Str prog_s, Str out): Iarch -> {
+# own `_start` entry (no libc symbol used, but darwin needs -lSystem present for the loader). `-arch`
+# tracks the target arch (arm64 or x86_64), so an Apple-Silicon host can cross-assemble+link a
+# darwin-amd64 binary (runnable under Rosetta 2) and vice versa.
+const link_darwin! = ([Str] env, Str floor_s, Str prog_s, Str out, Arch arch): Iarch -> {
 	const Str cc = need_tool!(env, "cc")
-	const [Str] argv = ["cc", "-nostdlib", "-lSystem", "-Wl,-e,_start", "-o", out, floor_s, prog_s]
+	const Str march = match arch { Arch.Amd64 -> "x86_64", _ -> "arm64" }
+	const [Str] argv = ["cc", "-arch", march, "-nostdlib", "-lSystem", "-Wl,-e,_start", "-o", out, floor_s, prog_s]
 
 	return run!(cc, argv, env)
 }
@@ -207,7 +211,7 @@ const run_full! = (Cli c, [Str] env): Iarch -> {
 	const Iarch st = match c.target_os {
 		Os.Bare -> link_bare!(env, tfl, tpr, c.output, pid, c.preserve),
 		Os.Linux -> link_linux!(env, tfl, tpr, c.output, c.target_arch, pid, c.preserve),
-		Os.Darwin -> link_darwin!(env, tfl, tpr, c.output),
+		Os.Darwin -> link_darwin!(env, tfl, tpr, c.output, c.target_arch),
 	}
 
 	if c.preserve then {
