@@ -188,6 +188,20 @@ program's start) and wherever a resource has a genuine paired release
 re-bundle the triple. The hook framework spans the whole spectrum — the arenas are
 simply its RAINI end.
 
+## Install
+
+Grab a released binary for your platform (darwin arm64/amd64, linux arm64/amd64/riscv64):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/orlowdev/cf/margarita/install.sh | sh
+```
+
+It downloads one static binary from this repo's GitHub releases, **verifies it against the
+published sha256** before writing it, and drops `cf` in `~/.local/bin` — no `sudo`, no daemons.
+(Yes, it's a `curl | sh`; the script is right there in the repo, and you're welcome to read it
+first.) Knobs: `CF_CHANNEL=nightly|rc|latest|stable`, `CF_VERSION=<tag>`, `CF_INSTALL_DIR=<dir>`.
+To build from source instead, see [Building the compiler](#building-the-compiler).
+
 ## Hello, world
 
 ```c!
