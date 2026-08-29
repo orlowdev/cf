@@ -15,9 +15,10 @@ import std::sys::{ Arch }
 
 # The raw FFI: `cf_qbe_run(int target_id, const char *in, const char *out)`, args in the C arg
 # registers, result (0 = ok, else an error code) in the return register. The tiny trampoline is
-# per-ISA (it saves the return address around the call), comptime-selected on the target arch —
-# arm64 for darwin/bare/linux-arm64, riscv for linux-riscv64. `_cf_qbe_run` is the symbol cf calls;
-# qbe_embed.c defines it (with a `_`-prefixed alias on ELF), so the same name links on both.
+# per-ISA (it keeps the return address live across the call and the stack aligned), comptime-selected
+# on the target arch — arm64 for darwin/bare/linux-arm64, amd64 for darwin/linux-amd64, riscv for
+# linux-riscv64. `_cf_qbe_run` is the symbol cf calls; qbe_embed.c defines it (with a `_`-prefixed
+# alias on ELF), so the same name links on both.
 if arch::target == Arch.Riscv64 then {
 	const cf_qbe_run_raw = (Iarch target, Uarch in_ptr, Uarch out_ptr): Iarch -> asm "
 	addi sp, sp, -16
@@ -28,12 +29,23 @@ if arch::target == Arch.Riscv64 then {
 	ret
 "
 } else {
-	const cf_qbe_run_raw = (Iarch target, Uarch in_ptr, Uarch out_ptr): Iarch -> asm "
+	if arch::target == Arch.Amd64 then {
+		# The three args already sit in the SysV C arg registers (rdi/rsi/rdx); the body only realigns
+		# the stack to 16 (rsp is 8-off entry, per the call that reached here) around the nested call.
+		const cf_qbe_run_raw = (Iarch target, Uarch in_ptr, Uarch out_ptr): Iarch -> asm "
+	subq $8, %rsp
+	call _cf_qbe_run
+	addq $8, %rsp
+	ret
+"
+	} else {
+		const cf_qbe_run_raw = (Iarch target, Uarch in_ptr, Uarch out_ptr): Iarch -> asm "
 	stp x29, x30, [sp, #-16]!
 	bl _cf_qbe_run
 	ldp x29, x30, [sp], #16
 	ret
 "
+	}
 }
 
 # Translate the QBE IL file at `in_path` into a target asm file at `out_path`, in-process.

@@ -1,0 +1,31 @@
+# The raw system-call primitive for amd64/linux. `syscall6` traps into the kernel with up to six
+# arguments; on linux/amd64 the call number goes in `rax`, the arguments in `rdi,rsi,rdx,r10,r8,r9`
+# (note `r10`, NOT `rcx` — the `syscall` instruction clobbers `rcx`/`r11`), dispatched by `syscall`.
+# Like arm64/riscv linux (and unlike darwin) the kernel returns `-errno` directly in `rax` on failure —
+# already the negative form the C! IO surface expects (`if r < 0 then Left(rrr_of(r))`), so the body
+# passes `rax` straight through. NOTE: the linux syscall NUMBERS on x86-64 DIFFER from the generic
+# arm64/riscv64 table (e.g. openat 257 vs 56, write 1 vs 64), so — unlike the two generic-ABI arches —
+# amd64 gets its own copies of the number-bearing std::io / std::process modules; only the trap is here.
+#
+# Unlike arm64 the amd64 SysV call ABI hands the seven params (num + a0..a5) in `rdi,rsi,rdx,rcx,r8,r9`
+# with the seventh (a5) on the stack at `8(%rsp)` (the return address sits at `0(%rsp)` in this naked
+# body), so the trap opens by shuffling each incoming slot into its kernel register before `syscall` —
+# hence a hand-written, hole-free asm body rather than the `${param}` template arm64/riscv use.
+#
+# LIFETIME NOTE: the compiler treats an asm body (this one included) as retaining nothing, so a
+# buffer passed here is freed on its normal scope exit. That is correct for a SYNCHRONOUS syscall
+# (the kernel copies/fills during the trap and keeps no pointer). It is NOT safe for an ASYNCHRONOUS
+# one — the compiler does not track a value's survivability across a call whose completion outlives
+# the trap. Async I/O must be driven by a wrapper that owns the buffer's lifetime until completion.
+pub const syscall6 = (Uarch num, Uarch a0, Uarch a1, Uarch a2, Uarch a3, Uarch a4, Uarch a5): Iarch ->
+	asm "
+	movq %rdi, %rax
+	movq %rsi, %rdi
+	movq %rdx, %rsi
+	movq %rcx, %rdx
+	movq %r8, %r10
+	movq %r9, %r8
+	movq 8(%rsp), %r9
+	syscall
+	ret
+"

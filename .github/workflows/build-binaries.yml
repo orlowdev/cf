@@ -4,17 +4,25 @@
 # Each platform builds from its OWN committed seed (boot/seed_mac / boot/seed_linux), so there is no
 # cross-emit and no foreign toolchain — only the system `cc` and the vendored qbe:
 #   darwin-arm64   → macOS runner, native `build.sh`
+#   darwin-amd64   → Intel macOS runner (macos-13), native `build.sh darwin-amd64` (shares the mac seed
+#                    IL with arm64 — the amd64 `syscall` class bit lives in the floor, not the IL)
 #   linux-arm64    → ubuntu-arm runner, native `build.sh linux-arm64`
+#   linux-amd64    → ubuntu x86-64 runner, native `build.sh linux-amd64` (its OWN seed IL — x86-64's
+#                    linux syscall numbers + struct-stat layout differ from the generic arm64/riscv table)
 #   linux-riscv64  → ubuntu-arm runner, `build.sh linux-riscv64` cross-linked with the distro's
 #                    gcc-riscv64-linux-gnu (shared linux IL, riscv floor)
 # Every binary is stamped with the release version via lib/std/compiler/buildinfo.cf, so it reports
 # itself through `std::comptime::version::compiler`.
 #
-# STATUS: all three targets validated. darwin byte-reproduces the seed. Both linux targets are static
-# musl (the floor calls musl's `__init_libc`): linux-arm64 built + ran natively on a real aarch64 Linux
-# VM; linux-riscv64 cross-built (musl.cc toolchain) + ran under qemu-riscv64 — cf compiles+runs programs
-# and its embedded QBE works under the custom `_start` on both. The riscv leg downloads its musl cross
-# from musl.cc (the one external fetch here).
+# STATUS: darwin-arm64/darwin-amd64/linux-arm64/linux-amd64/linux-riscv64 validated. darwin
+# byte-reproduces the seed (arm64 natively; amd64 under Rosetta 2 — arm64/amd64 emit identical IL). The
+# linux targets are static musl (the floor calls musl's `__init_libc`): linux-arm64 built + ran natively
+# on a real aarch64 Linux VM; linux-amd64 built + ran under qemu-x86_64 (its own seed IL, distinct x86-64
+# syscall numbers); linux-riscv64 cross-built (musl cross toolchain) + ran under qemu-riscv64 — cf
+# compiles+runs programs and its embedded QBE works under the custom `_start` on all. The riscv leg
+# downloads its
+# musl cross toolchain from the cross-tools/musl-cross GitHub release (a reliable GitHub-hosted mirror;
+# the old musl.cc host chronically timed out from the runners), pinned by tag + verified by sha256.
 name: build-binaries
 
 on:
@@ -44,9 +52,17 @@ jobs:
             runner: macos-14
             target: darwin-arm64
             experimental: false
+          - name: darwin-amd64
+            runner: macos-13   # macos-13 is the last Intel x86-64 image; macos-14+ are arm64
+            target: darwin-amd64
+            experimental: false
           - name: linux-arm64
             runner: ubuntu-24.04-arm
             target: linux-arm64
+            experimental: false
+          - name: linux-amd64
+            runner: ubuntu-24.04   # GitHub's default x86-64 runner — native, no VM/qemu/cross
+            target: linux-amd64
             experimental: false
           - name: linux-riscv64
             runner: ubuntu-24.04-arm
@@ -75,44 +91,40 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y build-essential musl-tools
 
-      # Cache the extracted toolchain (a static, versioned tarball) so we hit
-      # the flaky musl.cc host at most once. Kept under $HOME so actions/cache
-      # can read/restore it as the non-root runner user (no sudo, no /opt).
+      # Cache the extracted toolchain (a static, versioned tarball) so we fetch
+      # the release asset at most once. Kept under $HOME so actions/cache can
+      # read/restore it as the non-root runner user (no sudo, no /opt).
       - name: Cache the riscv64 musl cross toolchain
         id: riscv-toolchain
         if: matrix.target == 'linux-riscv64'
         uses: actions/cache@v4
         with:
-          path: ~/riscv64-linux-musl-cross
-          key: riscv64-linux-musl-cross-20211123
+          path: ~/riscv64-unknown-linux-musl
+          key: riscv64-unknown-linux-musl-cross-20260823
 
       - name: Download the riscv64 musl cross toolchain
         if: matrix.target == 'linux-riscv64' && steps.riscv-toolchain.outputs.cache-hit != 'true'
         run: |
-          tgz=riscv64-linux-musl-cross.tgz
-          # musl.cc is a single flaky host; download to a file (never pipe a
-          # possibly-truncated stream into tar), retry, then fall back to the
-          # official more.musl.cc mirror.
-          ok=
-          for url in \
-            https://musl.cc/$tgz \
-            https://more.musl.cc/x86_64-linux-musl/$tgz; do
-            echo "Fetching $url"
-            if curl -fL --connect-timeout 30 --retry 5 --retry-delay 10 \
-                    --retry-all-errors -o "$tgz" "$url"; then
-              ok=1; break
-            fi
-            echo "  failed, trying next mirror"
-          done
-          [ -n "$ok" ] || { echo "all musl.cc mirrors unreachable"; exit 1; }
-          tar xzf "$tgz" -C "$HOME"
-          rm -f "$tgz"
+          # Pinned cross-tools/musl-cross release — a reliable GitHub-hosted
+          # mirror (the old musl.cc host chronically timed out from the runners).
+          # Download to a file (never pipe a possibly-truncated stream into tar),
+          # retry, then verify against the release's published sha256.
+          tag=20260823
+          txz=riscv64-unknown-linux-musl.tar.xz
+          base=https://github.com/cross-tools/musl-cross/releases/download/$tag
+          sha=aa6630f73487e5d3eb6ffa861199c3d63dfe0db8af77452581628cd762c9a64d
+          curl -fL --connect-timeout 30 --retry 5 --retry-delay 10 \
+               --retry-all-errors -o "$txz" "$base/$txz"
+          echo "$sha  $txz" | sha256sum -c -
+          tar xJf "$txz" -C "$HOME"
+          rm -f "$txz"
 
       - name: Add the riscv64 toolchain to PATH
         if: matrix.target == 'linux-riscv64'
         run: |
-          echo "$HOME/riscv64-linux-musl-cross/bin" >> "$GITHUB_PATH"
-          echo "RISCV_CC=riscv64-linux-musl-gcc" >> "$GITHUB_ENV"
+          echo "$HOME/riscv64-unknown-linux-musl/bin" >> "$GITHUB_PATH"
+          echo "RISCV_CC=riscv64-unknown-linux-musl-gcc" >> "$GITHUB_ENV"
+          echo "RISCV_STRIP=riscv64-unknown-linux-musl-strip" >> "$GITHUB_ENV"
 
       - name: Build
         env:

@@ -21,6 +21,8 @@ jobs:
     outputs:
       version: ${{ steps.compute.outputs.version }}
       created: ${{ steps.compute.outputs.created }}
+      ring: ${{ steps.ring.outputs.ring }}
+      prerelease: ${{ steps.ring.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -59,6 +61,30 @@ jobs:
             echo "created=false" >> "$GITHUB_OUTPUT"
           else
             ./var/versioning changelog "$ring" > release-notes.md
+
+            # The tool credits commits by short sha `- <title> (<sha>)`; git carries no GitHub handle.
+            # Resolve each bullet's sha to its author `@login` via the API and append it, so GitHub
+            # linkifies the mention (and builds its own Contributors list). A commit with no linked
+            # GitHub account falls back to the plain author name (no `@`). One API call per commit.
+            resolve_authors() {
+              while IFS= read -r line; do
+                case "$line" in
+                  "- "*"("*")")
+                    sha="$(printf '%s' "$line" | sed -n 's/.*(\([0-9a-f]\{7,40\}\))$/\1/p')"
+                    if [ -n "$sha" ]; then
+                      who="$(gh api "repos/{owner}/{repo}/commits/$sha" \
+                              --jq 'if .author.login then "@" + .author.login else .commit.author.name end' \
+                              2>/dev/null || true)"
+                      [ -n "$who" ] && line="$line - $who"
+                    fi
+                    ;;
+                esac
+                printf '%s\n' "$line"
+              done
+            }
+            resolve_authors < release-notes.md > release-notes.resolved.md
+            mv release-notes.resolved.md release-notes.md
+
             prerelease=""
             if [ "${{ steps.ring.outputs.prerelease }}" = "true" ]; then prerelease="--prerelease"; fi
             # shellcheck disable=SC2086
@@ -78,3 +104,58 @@ jobs:
       contents: write
     with:
       version: ${{ needs.version.outputs.version }}
+
+  # Rolling per-ring release: a release tagged with the bare ring name (nightly/rc/latest/stable) that
+  # is re-pointed to this commit and carries the just-built binaries under version-independent names
+  # `cf-<ring>-<platform>`. This is what makes a STABLE download URL possible — GitHub embeds the
+  # release TAG in the download path, so "latest on a ring" needs a fixed tag, not just a fixed asset
+  # name. The versioned releases stay the canonical, immutable ones; these rolling releases are marked
+  # not-latest (and inherit the ring's prerelease flag) so they never displace them as "Latest".
+  #   https://github.com/<owner>/cf/releases/download/<ring>/cf-<ring>-<platform>
+  # The bare `<ring>` tags don't collide with the `<version>-<ring>` tags `versioning` matches on.
+  promote:
+    needs: [version, binaries]
+    if: needs.version.outputs.created == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Refresh the rolling `${{ needs.version.outputs.ring }}` release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RING: ${{ needs.version.outputs.ring }}
+          VERSION: ${{ needs.version.outputs.version }}
+          PRERELEASE: ${{ needs.version.outputs.prerelease }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -eu
+          mkdir dist && cd dist
+          # Mirror the just-built versioned binaries under ring-based names, with fresh checksums.
+          for name in darwin-arm64 darwin-amd64 linux-arm64 linux-amd64 linux-riscv64; do
+            if gh release download "$VERSION" -R "$REPO" -p "cf-$VERSION-$name" 2>/dev/null; then
+              mv "cf-$VERSION-$name" "cf-$RING-$name"
+              sha256sum "cf-$RING-$name" > "cf-$RING-$name.sha256"
+            else
+              echo "note: no cf-$VERSION-$name asset — skipping"
+            fi
+          done
+          cat > notes.md <<EOF
+          Rolling **$RING** channel — always serves the latest \`$RING\` build (currently $VERSION).
+
+          Stable per-platform download URL (never changes as the ring advances):
+          \`https://github.com/$REPO/releases/download/$RING/cf-$RING-<platform>\`
+          where \`<platform>\` ∈ { darwin-arm64, darwin-amd64, linux-arm64, linux-amd64, linux-riscv64 }.
+          Each binary has a \`.sha256\` sibling. For an immutable pin, use the versioned release $VERSION.
+          EOF
+          # Move the rolling tag to this commit (delete + recreate) and attach the mirrored assets.
+          gh release delete "$RING" -R "$REPO" --cleanup-tag --yes 2>/dev/null || true
+          pre=""; [ "$PRERELEASE" = "true" ] && pre="--prerelease"
+          # shellcheck disable=SC2086
+          gh release create "$RING" -R "$REPO" \
+            --target "$SHA" \
+            --title "cf $RING (rolling)" \
+            --latest=false \
+            $pre \
+            --notes-file notes.md \
+            dist/*
