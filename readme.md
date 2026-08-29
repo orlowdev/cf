@@ -190,11 +190,15 @@ simply its RAINI end.
 
 ## Install
 
-Grab a released binary for your platform (darwin arm64/amd64, linux arm64/amd64/riscv64):
+Grab a released binary for your platform (darwin arm64/amd64, linux arm64/amd64/riscv64).
+
+> This is a nightly install, be careful.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/orlowdev/cf/margarita/install.sh | sh
 ```
+
+The default channel is the bleeding-edge `nightly` ring; pick a steadier one with `CF_CHANNEL` below.
 
 It downloads one static binary from this repo's GitHub releases, **verifies it against the
 published sha256** before writing it, and drops `cf` in `~/.local/bin` — no `sudo`, no daemons.

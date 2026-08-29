@@ -37,9 +37,11 @@ die()  { printf '%serror:%s ' "$RED" "$RST" >&2; printf '%b\n' "$*" >&2; exit 1;
 if command -v curl >/dev/null 2>&1; then
 	fetch()      { curl -fsSL ${GITHUB_TOKEN:+-H "Authorization: Bearer $GITHUB_TOKEN"} "$1"; }
 	download()   { curl -fsSL --retry 3 -o "$2" "$1"; }
+	head_ok()    { curl -fsL -o /dev/null -r 0-0 "$1" 2>/dev/null; }   # does the URL exist? (1-byte GET)
 elif command -v wget >/dev/null 2>&1; then
 	fetch()      { wget -qO- ${GITHUB_TOKEN:+--header="Authorization: Bearer $GITHUB_TOKEN"} "$1"; }
 	download()   { wget -q --tries=3 -O "$2" "$1"; }
+	head_ok()    { wget -q --spider "$1" 2>/dev/null; }
 else
 	die "need either curl or wget on PATH"
 fi
@@ -86,20 +88,21 @@ elif [ -n "${CF_CHANNEL:-}" ]; then
 	asset_url="${dl}/${CF_CHANNEL}/${asset}"
 	info "selected: ${B}${asset}${RST} ${DIM}(rolling ${CF_CHANNEL} channel)${RST}"
 else
-	# Default: discover the newest release (any ring) that has a build for this platform.
-	api="https://api.github.com/repos/${REPO}/releases?per_page=50"
-	info "querying releases ${DIM}(${REPO})${RST}"
-	json="$(fetch "$api")" || die "could not reach the GitHub API"
-	urls="$(printf '%s\n' "$json" | grep -o '"browser_download_url"[[:space:]]*:[[:space:]]*"[^"]*"' \
-		| sed 's/.*"\(https[^"]*\)"$/\1/')"
-	[ -n "$urls" ] || die "no release assets found for ${REPO} (has a release been cut yet?)"
-	# Prefer a rolling ring asset (cf-<ring>-<plat>) if present, else the newest versioned one; skip
-	# .sha256 siblings by requiring the platform at end-of-line.
-	asset_url="$(printf '%s\n' "$urls" | grep -E "/cf-(nightly|rc|latest|stable)-${plat}$" | head -1 || true)"
-	[ -n "$asset_url" ] || asset_url="$(printf '%s\n' "$urls" | grep -E "/cf-.*-${plat}$" | head -1 || true)"
-	[ -n "$asset_url" ] || die "no build for ${plat}. Try CF_CHANNEL=nightly|rc|latest|stable or CF_VERSION=<tag>."
-	asset="$(basename "$asset_url")"
-	info "selected: ${B}${asset}${RST} ${DIM}(newest available)${RST}"
+	# Default: the rolling `nightly` channel (the only ring published so far). Safety net for the early
+	# days before a rolling release has been cut — fall back to the newest versioned nightly via the API.
+	asset="cf-nightly-${plat}"
+	asset_url="${dl}/nightly/${asset}"
+	if head_ok "$asset_url"; then
+		info "selected: ${B}${asset}${RST} ${DIM}(rolling nightly channel — the default)${RST}"
+	else
+		info "no rolling nightly release yet — finding the newest versioned nightly ${DIM}(${REPO})${RST}"
+		json="$(fetch "https://api.github.com/repos/${REPO}/releases?per_page=50")" || die "could not reach the GitHub API"
+		asset_url="$(printf '%s\n' "$json" | grep -o '"browser_download_url"[[:space:]]*:[[:space:]]*"[^"]*"' \
+			| sed 's/.*"\(https[^"]*\)"$/\1/' | grep -E "/cf-.*-nightly-${plat}$" | head -1 || true)"
+		[ -n "$asset_url" ] || die "no nightly build for ${plat} yet. Try CF_CHANNEL=rc|latest|stable or CF_VERSION=<tag>."
+		asset="$(basename "$asset_url")"
+		info "selected: ${B}${asset}${RST} ${DIM}(newest versioned nightly)${RST}"
+	fi
 fi
 
 # --- download + verify --------------------------------------------------------------------------
