@@ -200,7 +200,24 @@ It downloads one static binary from this repo's GitHub releases, **verifies it a
 published sha256** before writing it, and drops `cf` in `~/.local/bin` — no `sudo`, no daemons.
 (Yes, it's a `curl | sh`; the script is right there in the repo, and you're welcome to read it
 first.) Knobs: `CF_CHANNEL=nightly|rc|latest|stable`, `CF_VERSION=<tag>`, `CF_INSTALL_DIR=<dir>`.
-To build from source instead, see [Building the compiler](#building-the-compiler).
+
+Pin a **channel** to always get the newest build on a release ring:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/orlowdev/cf/margarita/install.sh | CF_CHANNEL=stable sh
+```
+
+Each ring also publishes a rolling release under a bare tag, so the download URL is stable — you can
+skip the script entirely and grab the binary directly (there's a `.sha256` next to each):
+
+```
+https://github.com/orlowdev/cf/releases/download/<ring>/cf-<ring>-<platform>
+# e.g. …/releases/download/stable/cf-stable-linux-amd64   (ring ∈ nightly|rc|latest|stable)
+```
+
+For an immutable pin, use a versioned tag: `CF_VERSION=1.23.61-stable` (or that release's asset URL,
+`…/releases/download/1.23.61-stable/cf-1.23.61-stable-<platform>`). To build from source instead, see
+[Building the compiler](#building-the-compiler).
 
 ## Hello, world
 

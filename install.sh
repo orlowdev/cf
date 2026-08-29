@@ -31,7 +31,7 @@ fi
 say()  { printf '%s\n' "$*" >&2; }
 info() { printf '%s==>%s %s\n' "$B" "$RST" "$*" >&2; }
 warn() { printf '%swarning:%s %s\n' "$YLW" "$RST" "$*" >&2; }
-die()  { printf '%serror:%s %s\n' "$RED" "$RST" "$*" >&2; exit 1; }
+die()  { printf '%serror:%s ' "$RED" "$RST" >&2; printf '%b\n' "$*" >&2; exit 1; }
 
 # --- fetch helper (curl or wget) ----------------------------------------------------------------
 if command -v curl >/dev/null 2>&1; then
@@ -65,43 +65,54 @@ esac
 info "platform: ${B}${plat}${RST}"
 
 # --- resolve the release asset ------------------------------------------------------------------
-# Assets are named `cf-<tag>-<plat>` (+ a `.sha256` sibling). We pull the release list (newest first)
-# and pick the first download URL that matches the requested version/channel for this platform.
-api="https://api.github.com/repos/${REPO}/releases?per_page=50"
-info "querying releases ${DIM}(${REPO})${RST}"
-json="$(fetch "$api")" || die "could not reach the GitHub API"
-
-urls="$(printf '%s\n' "$json" | grep -o '"browser_download_url"[[:space:]]*:[[:space:]]*"[^"]*"' \
-	| sed 's/.*"\(https[^"]*\)"$/\1/')"
-[ -n "$urls" ] || die "no release assets found for ${REPO} (has a release been cut yet?)"
+# Two kinds of release live in this repo:
+#   • versioned (immutable): tag `<version>-<ring>`, asset `cf-<version>-<ring>-<plat>` — for an exact pin.
+#   • rolling  (per ring):   tag `<ring>`,           asset `cf-<ring>-<plat>`           — always the newest
+#                            build on that ring, at a URL that never changes.
+# So a pinned request (CF_VERSION) or a channel (CF_CHANNEL) is a DIRECT, stable URL — no API needed.
+# Only the bare default has to discover "the newest thing available", which is what the API is for.
+dl="https://github.com/${REPO}/releases/download"
 
 if [ -n "${CF_VERSION:-}" ]; then
-	pat="/cf-${CF_VERSION}-${plat}$"
-	what="version ${CF_VERSION}"
+	asset="cf-${CF_VERSION}-${plat}"
+	asset_url="${dl}/${CF_VERSION}/${asset}"
+	info "selected: ${B}${asset}${RST} ${DIM}(pinned version)${RST}"
 elif [ -n "${CF_CHANNEL:-}" ]; then
-	pat="/cf-.*-${CF_CHANNEL}-${plat}$"
-	what="channel ${CF_CHANNEL}"
+	case "$CF_CHANNEL" in
+		nightly | rc | latest | stable) ;;
+		*) die "unknown CF_CHANNEL '$CF_CHANNEL' (expected nightly|rc|latest|stable)" ;;
+	esac
+	asset="cf-${CF_CHANNEL}-${plat}"
+	asset_url="${dl}/${CF_CHANNEL}/${asset}"
+	info "selected: ${B}${asset}${RST} ${DIM}(rolling ${CF_CHANNEL} channel)${RST}"
 else
-	pat="/cf-.*-${plat}$"
-	what="latest available"
+	# Default: discover the newest release (any ring) that has a build for this platform.
+	api="https://api.github.com/repos/${REPO}/releases?per_page=50"
+	info "querying releases ${DIM}(${REPO})${RST}"
+	json="$(fetch "$api")" || die "could not reach the GitHub API"
+	urls="$(printf '%s\n' "$json" | grep -o '"browser_download_url"[[:space:]]*:[[:space:]]*"[^"]*"' \
+		| sed 's/.*"\(https[^"]*\)"$/\1/')"
+	[ -n "$urls" ] || die "no release assets found for ${REPO} (has a release been cut yet?)"
+	# Prefer a rolling ring asset (cf-<ring>-<plat>) if present, else the newest versioned one; skip
+	# .sha256 siblings by requiring the platform at end-of-line.
+	asset_url="$(printf '%s\n' "$urls" | grep -E "/cf-(nightly|rc|latest|stable)-${plat}$" | head -1 || true)"
+	[ -n "$asset_url" ] || asset_url="$(printf '%s\n' "$urls" | grep -E "/cf-.*-${plat}$" | head -1 || true)"
+	[ -n "$asset_url" ] || die "no build for ${plat}. Try CF_CHANNEL=nightly|rc|latest|stable or CF_VERSION=<tag>."
+	asset="$(basename "$asset_url")"
+	info "selected: ${B}${asset}${RST} ${DIM}(newest available)${RST}"
 fi
-
-asset_url="$(printf '%s\n' "$urls" | grep -E "$pat" | head -1 || true)"
-[ -n "$asset_url" ] || die "no build for ${plat} matching ${what}. Try a different CF_CHANNEL (nightly|rc|latest|stable) or CF_VERSION."
-asset="$(basename "$asset_url")"
-tag="$(printf '%s' "$asset" | sed "s/^cf-\\(.*\\)-${plat}$/\\1/")"
-info "selected: ${B}${asset}${RST} ${DIM}(tag ${tag})${RST}"
 
 # --- download + verify --------------------------------------------------------------------------
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/cf-install.XXXXXX")" || die "mktemp failed"
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
 info "downloading"
-download "$asset_url" "$tmp/$BIN_NAME" || die "download failed: $asset_url"
+download "$asset_url" "$tmp/$BIN_NAME" \
+	|| die "download failed: $asset_url\n  (that release/asset may not exist yet — check the channel/version, or the platform build)"
 
-if sum_url_ok="$(printf '%s\n' "$urls" | grep -F "${asset}.sha256" | head -1)"; [ -n "$sum_url_ok" ]; then
+# The checksum sibling always sits next to the asset at <url>.sha256.
+if download "${asset_url}.sha256" "$tmp/sum" 2>/dev/null; then
 	info "verifying sha256"
-	download "$sum_url_ok" "$tmp/sum" || die "could not fetch the checksum"
 	want="$(awk '{print $1; exit}' "$tmp/sum")"
 	if command -v sha256sum >/dev/null 2>&1; then
 		got="$(sha256sum "$tmp/$BIN_NAME" | awk '{print $1}')"
