@@ -16,7 +16,42 @@ permissions:
   contents: write
 
 jobs:
+  # Corpus gate — the rc/latest/stable rings only. Build cf on each natively-runnable arch and run the
+  # whole corpus (boot/test.sh: compile -> embedded QBE -> link -> run, exit vs `# expect:`) BEFORE any
+  # release is cut. A failure fails the workflow and the `version` job below never creates a release, so
+  # a broken build is never published. Nightly (behemoth) SKIPS this so nightly cuts stay fast — the
+  # corpus never gated nightly. darwin-amd64 (Rosetta-only) and linux-riscv64 (needs qemu) aren't run
+  # here, but the gate covers their IL transitively — darwin-amd64 shares the mac IL exercised by
+  # darwin-arm64, riscv the linux IL exercised by linux-arm64 — leaving only their floor asm unrun.
+  corpus:
+    if: github.ref_name != 'behemoth'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: darwin-arm64
+            runner: macos-14
+          - arch: linux-arm64
+            runner: ubuntu-24.04-arm
+          - arch: linux-amd64
+            runner: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      # Linux: musl-gcc builds cf; clang + ld.lld are what cf itself uses to link the corpus programs it
+      # compiles (freestanding `-static -e _start` ELF, no libc). darwin needs neither — `cc` covers both.
+      - name: Install linux toolchain
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y build-essential musl-tools clang lld
+      - name: Build cf and run the corpus (${{ matrix.arch }})
+        run: ./boot/test.sh
+
   version:
+    needs: corpus
+    # Run when the gate PASSED (rc/latest/stable) or was SKIPPED (nightly) — but not when it FAILED or
+    # was cancelled. `!cancelled()` lifts the implicit "all needs succeeded" so a skipped gate still
+    # lets nightly through; `result != 'failure'` is what actually blocks a release on a red corpus.
+    if: ${{ !cancelled() && needs.corpus.result != 'failure' }}
     runs-on: macos-14
     outputs:
       version: ${{ steps.compute.outputs.version }}
