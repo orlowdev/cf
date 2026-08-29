@@ -59,6 +59,30 @@ jobs:
             echo "created=false" >> "$GITHUB_OUTPUT"
           else
             ./var/versioning changelog "$ring" > release-notes.md
+
+            # The tool credits commits by short sha `- <title> (<sha>)`; git carries no GitHub handle.
+            # Resolve each bullet's sha to its author `@login` via the API and append it, so GitHub
+            # linkifies the mention (and builds its own Contributors list). A commit with no linked
+            # GitHub account falls back to the plain author name (no `@`). One API call per commit.
+            resolve_authors() {
+              while IFS= read -r line; do
+                case "$line" in
+                  "- "*"("*")")
+                    sha="$(printf '%s' "$line" | sed -n 's/.*(\([0-9a-f]\{7,40\}\))$/\1/p')"
+                    if [ -n "$sha" ]; then
+                      who="$(gh api "repos/{owner}/{repo}/commits/$sha" \
+                              --jq 'if .author.login then "@" + .author.login else .commit.author.name end' \
+                              2>/dev/null || true)"
+                      [ -n "$who" ] && line="$line - $who"
+                    fi
+                    ;;
+                esac
+                printf '%s\n' "$line"
+              done
+            }
+            resolve_authors < release-notes.md > release-notes.resolved.md
+            mv release-notes.resolved.md release-notes.md
+
             prerelease=""
             if [ "${{ steps.ring.outputs.prerelease }}" = "true" ]; then prerelease="--prerelease"; fi
             # shellcheck disable=SC2086
