@@ -4,13 +4,17 @@
 # Each platform builds from its OWN committed seed (boot/seed_mac / boot/seed_linux), so there is no
 # cross-emit and no foreign toolchain — only the system `cc` and the vendored qbe:
 #   darwin-arm64   → macOS runner, native `build.sh`
-#   darwin-amd64   → Intel macOS runner (macos-13), native `build.sh darwin-amd64` (shares the mac seed
-#                    IL with arm64 — the amd64 `syscall` class bit lives in the floor, not the IL)
+#   darwin-amd64   → arm64 macOS runner (macos-14), `build.sh darwin-amd64` CROSS-built via `-arch
+#                    x86_64` (shares the mac seed IL with arm64 — the amd64 `syscall` class bit lives in
+#                    the floor, not the IL). No Intel runner: the last Intel image (macos-13) is being
+#                    retired and its queue is unreliable. The build emits x86-64 without running it; only
+#                    the `--version` verify executes the artifact, under Rosetta 2 (installed below).
 #   linux-arm64    → ubuntu-arm runner, native `build.sh linux-arm64`
 #   linux-amd64    → ubuntu x86-64 runner, native `build.sh linux-amd64` (its OWN seed IL — x86-64's
 #                    linux syscall numbers + struct-stat layout differ from the generic arm64/riscv table)
-#   linux-riscv64  → ubuntu-arm runner, `build.sh linux-riscv64` cross-linked with the distro's
-#                    gcc-riscv64-linux-gnu (shared linux IL, riscv floor)
+#   linux-riscv64  → ubuntu x86-64 runner, `build.sh linux-riscv64` cross-linked with the x86_64-hosted
+#                    riscv64 musl cross toolchain fetched below (shared linux IL, riscv floor). The runner
+#                    must be x86-64 to MATCH that toolchain's host — an arm runner cannot exec it.
 # Every binary is stamped with the release version via lib/std/compiler/buildinfo.cf, so it reports
 # itself through `std::comptime::version::compiler`.
 #
@@ -53,7 +57,7 @@ jobs:
             target: darwin-arm64
             experimental: false
           - name: darwin-amd64
-            runner: macos-13   # macos-13 is the last Intel x86-64 image; macos-14+ are arm64
+            runner: macos-14   # arm64 runner; darwin-amd64 is cross-built via `-arch x86_64` (build.sh)
             target: darwin-amd64
             experimental: false
           - name: linux-arm64
@@ -65,9 +69,9 @@ jobs:
             target: linux-amd64
             experimental: false
           - name: linux-riscv64
-            runner: ubuntu-24.04-arm
-            target: linux-riscv64
-            experimental: false
+            runner: ubuntu-24.04   # x86-64: matches the x86_64-hosted musl cross toolchain (below).
+            target: linux-riscv64  # A cross-compile — host arch is irrelevant to the riscv output, and
+            experimental: false    # this leg never runs the riscv binary (qemu verify is skipped for it).
     continue-on-error: ${{ matrix.experimental }}
     steps:
       - uses: actions/checkout@v4
@@ -125,6 +129,12 @@ jobs:
           echo "$HOME/riscv64-unknown-linux-musl/bin" >> "$GITHUB_PATH"
           echo "RISCV_CC=riscv64-unknown-linux-musl-gcc" >> "$GITHUB_ENV"
           echo "RISCV_STRIP=riscv64-unknown-linux-musl-strip" >> "$GITHUB_ENV"
+
+      # darwin-amd64 is cross-built on this arm64 runner; Rosetta 2 lets the `--version` verify below
+      # actually run the x86-64 artifact. Idempotent (a no-op if Rosetta is already present).
+      - name: Install Rosetta 2 (run the cross-built x86-64 cf on the arm64 runner)
+        if: matrix.target == 'darwin-amd64'
+        run: softwareupdate --install-rosetta --agree-to-license
 
       - name: Build
         env:

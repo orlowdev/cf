@@ -14,8 +14,9 @@ subcommands and modes are explicitly deferred (§8) and widen in later rounds.
 
 ## 1. Shape
 
-`cf` is a subcommanded CLI. Every subcommand has a one-letter alias except the two
-that are deferred and the two whole-word ones; global flags work anywhere.
+`cf` is a subcommanded CLI. Most subcommands have a one-letter alias; the
+whole-word ones (`run`, `docs`) and the deferred `repl`/`man` carry none. Global
+flags work anywhere.
 
 ```
 cf <command> [options]
@@ -27,6 +28,7 @@ Commands
   f, format <file|dir>   Format in place
   l, lint <file|dir>     Lint
   s, lsp                 Start the LSP server (stdio)
+  docs [<term>]          Browse the standard-library API (interactive)
   repl                   Read-eval-print loop                   [deferred §8]
   man                    Package manager                        [deferred §8]
 
@@ -195,13 +197,14 @@ restart — is a different execution model (a JIT backend, not the `qbe` AOT pat
 and is deferred (§8). When it lands it extends `run`; it does not change `--run`'s
 current restart semantics.
 
-## 7. `test`, `format`, `lint`, `lsp`
+## 7. `test`, `format`, `lint`, `lsp`, `docs`
 
 ```
 cf test   <file|dir>   --watch  --bail
 cf format <file|dir>   --check
 cf lint   <file|dir>   --check
 cf lsp                 [--port <n>]
+cf docs   [<term>]
 ```
 
 - **`test`** runs the tests in a `.cf` file, or walks a directory recursively and
@@ -219,6 +222,12 @@ cf lsp                 [--port <n>]
 - **`lsp`** starts the Language Server over **stdio** — an editor spawns it and
   talks stdin/stdout, so no port is needed in the normal case. `--port` is an
   optional TCP mode for debugging or remote use, likely rarely used.
+- **`docs`** browses the standard library's API in the terminal — an interactive
+  reader with fuzzy search, a selection list, and a read view over the doc surface
+  the toolchain ships. An optional `<term>` seeds the initial search; with none the
+  browser opens at the full index. It is a read-only view of the same doc comments
+  the formatter and arc emits preserve, so what `docs` shows and what the source
+  carries are one and the same.
 
 ## 8. Deferred surface
 
@@ -240,7 +249,7 @@ specs.
 This is `cf`'s API. The bootstrap `cf0` (`0.x` — see [[seed_subset.md]]) takes only
 the slice it needs to build `cf`, and no more:
 
-- **`compile` only** — no `run`, `test`, `format`, `lint`, `lsp`, `repl`, or `man`.
+- **`compile` only** — no `run`, `test`, `format`, `lint`, `lsp`, `docs`, `repl`, or `man`.
 - **`--output`**, to place the artifact.
 - **A fixed target** — `darwin-arm64` alone (see [[seed_subset.md]] §3), so no
   `--target`.
