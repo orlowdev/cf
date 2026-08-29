@@ -62,25 +62,73 @@ jobs:
 
       - name: Stamp the compiler version
         run: |
-          sed -i.bak 's/"0.0.0-dev"/"${{ steps.v.outputs.version }}"/' lib/std/compiler/buildinfo.cf
+          v='${{ steps.v.outputs.version }}'
+          sed -i.bak "s/\"0.0.0-dev\"/\"$v\"/" lib/std/compiler/buildinfo.cf
           rm -f lib/std/compiler/buildinfo.cf.bak
+          # Fail loudly if the sed no-op'd (the `0.0.0-dev` sentinel drifted): shipping a binary that
+          # reports the wrong version is worse than a red build. `--version` reads this const.
+          grep -q "compiler_version = \"$v\"" lib/std/compiler/buildinfo.cf \
+            || { echo "stamp failed: buildinfo.cf still has no \"$v\"" >&2; exit 1; }
           grep compiler_version lib/std/compiler/buildinfo.cf
 
       - name: Install linux build tools (musl + libgcc)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y build-essential musl-tools
 
-      - name: Install the riscv64 musl cross toolchain
+      # Cache the extracted toolchain (a static, versioned tarball) so we hit
+      # the flaky musl.cc host at most once. Kept under $HOME so actions/cache
+      # can read/restore it as the non-root runner user (no sudo, no /opt).
+      - name: Cache the riscv64 musl cross toolchain
+        id: riscv-toolchain
+        if: matrix.target == 'linux-riscv64'
+        uses: actions/cache@v4
+        with:
+          path: ~/riscv64-linux-musl-cross
+          key: riscv64-linux-musl-cross-20211123
+
+      - name: Download the riscv64 musl cross toolchain
+        if: matrix.target == 'linux-riscv64' && steps.riscv-toolchain.outputs.cache-hit != 'true'
+        run: |
+          tgz=riscv64-linux-musl-cross.tgz
+          # musl.cc is a single flaky host; download to a file (never pipe a
+          # possibly-truncated stream into tar), retry, then fall back to the
+          # official more.musl.cc mirror.
+          ok=
+          for url in \
+            https://musl.cc/$tgz \
+            https://more.musl.cc/x86_64-linux-musl/$tgz; do
+            echo "Fetching $url"
+            if curl -fL --connect-timeout 30 --retry 5 --retry-delay 10 \
+                    --retry-all-errors -o "$tgz" "$url"; then
+              ok=1; break
+            fi
+            echo "  failed, trying next mirror"
+          done
+          [ -n "$ok" ] || { echo "all musl.cc mirrors unreachable"; exit 1; }
+          tar xzf "$tgz" -C "$HOME"
+          rm -f "$tgz"
+
+      - name: Add the riscv64 toolchain to PATH
         if: matrix.target == 'linux-riscv64'
         run: |
-          curl -fsSL https://musl.cc/riscv64-linux-musl-cross.tgz | sudo tar xz -C /opt
-          echo "/opt/riscv64-linux-musl-cross/bin" >> "$GITHUB_PATH"
+          echo "$HOME/riscv64-linux-musl-cross/bin" >> "$GITHUB_PATH"
           echo "RISCV_CC=riscv64-linux-musl-gcc" >> "$GITHUB_ENV"
 
       - name: Build
         env:
           CF_STRIP: 1   # release binaries are stripped (objects already carry no -g)
         run: ./boot/build.sh "${{ matrix.target }}"
+
+      # Prove the artifact actually carries the tag: `cf --version` reads the stamped
+      # compiler_version. Only native targets run here (riscv is cross-built and can't
+      # execute on the arm runner — its stamp is guarded at the source level above).
+      - name: Verify the binary reports the release version
+        if: matrix.target != 'linux-riscv64'
+        run: |
+          got="$(./var/cf --version)"
+          want='${{ steps.v.outputs.version }}'
+          echo "cf --version -> $got (want $want)"
+          [ "$got" = "$want" ] || { echo "version mismatch" >&2; exit 1; }
 
       - name: Package
         id: pkg

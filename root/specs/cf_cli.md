@@ -31,7 +31,8 @@ Commands
   man                    Package manager                        [deferred §8]
 
 Global
-  -V, --version          Print the GenVer (see [[versioning.md]])
+  -V, --version          Print cf's OWN GenVer (see [[versioning.md]]); to stamp
+                         the compiled program's version use compile --set-version
   -h, --help             Help — cf <command> --help for a command's options
   -q, --quiet            No stdout; errors still on stderr   (--silent alias)
 ```
@@ -57,6 +58,8 @@ cf compile <file> [options]
       --emit-qbe|-asm|-obj   dump a backend artifact and keep going
       --watch            rebuild on change of <file> + its non-std imports
       --run              run after building (re-run under --watch)  (§6)
+      --set-version <v>  stamp the ARTIFACT's std::comptime::version::current
+                         (default 0.0.0-dev; ::compiler carries cf's own version)
 ```
 
 `compile` takes **one file** — the compilation entry. It must be a `.cf` file, and
