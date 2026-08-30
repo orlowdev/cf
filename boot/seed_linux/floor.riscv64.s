@@ -21,9 +21,9 @@ f48:
 	ecall
 	ret
 
-.globl f317
+.globl f319
 .p2align 2
-f317:
+f319:
 	mv a0, a0
 	li a7, 94
 	ecall

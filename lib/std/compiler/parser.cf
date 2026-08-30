@@ -1624,14 +1624,34 @@ const parse_let! = (*Parser p, Bool mutable): Stmt -> {
 	return Stmt.Let(name, mutable, type_name, parse_init!(p, type_name))
 }
 
-# `loop { body }` — an infinite loop (exit via `break`/`return`).
+# `loop { body }` / `loop outer { body }` — an infinite loop (exit via `break`/`return`), with an
+# optional LABEL a nested `break outer`/`continue outer` may target (ebnf loop_expr).
 const parse_loop! = (*Parser p): Stmt -> {
 	p.pos = p.pos + 1 # `loop`
+	let Str lbl = ""
+
+	if is_ident(peek(p)) then {
+		lbl = cur_name!(p)
+		p.pos = p.pos + 1
+	}
 	if !is_lbrace(peek(p)) then die("cf: parse: expected `{` after `loop`\n")
 	p.pos = p.pos + 1
 	const [Stmt] body = parse_block!(p)
 
-	return Stmt.Loop(body)
+	return Stmt.Loop(lbl, body)
+}
+
+# The optional LABEL after `break`/`continue`: an identifier on the SAME line (a next-line
+# identifier is the next statement). `else` is excluded so `if c then break else ...` keeps its
+# else-branch.
+const exit_label! = (*Parser p): Str -> {
+	if !is_ident(peek(p)) then return ""
+	if kw(p, "else") then return ""
+	if nl_before(p, p.pos) then return ""
+	const Str l = cur_name!(p)
+	p.pos = p.pos + 1
+
+	return l
 }
 
 # A guard-branch body: a brace-delimited block `{ ... }` (its own scope) or a single
@@ -1704,14 +1724,40 @@ const parse_for! = (*Parser p): Stmt -> {
 	p.pos = p.pos + 1
 	if !kw(p, "in") then die("cf: parse: expected `in` in a for-loop\n")
 	p.pos = p.pos + 1
-	if !is_ident(peek(p)) then die("cf: parse: expected an array name after `in`\n")
-	const Str arr = cur_name!(p)
-	p.pos = p.pos + 1
-	if !is_lbrace(peek(p)) then die("cf: parse: expected `{` for a for-loop body\n")
-	p.pos = p.pos + 1
-	const [Stmt] body = parse_block!(p)
+	# the iterable is a full EXPRESSION (ebnf for_expr) — a name, a field read, a call result.
+	# Expressions never juxtapose, so the boundary before the body (`{` or a same-line statement
+	# head) is unambiguous.
+	const Iarch it_tok = p.pos
+	const Expr it = parse_expr!(p)
+	const [Stmt] body = parse_for_body!(p)
+	# a bare-name iterable drives `ForIn` directly; any other expression is bound to a hidden
+	# temp first (a nested block, so the temp never leaks into the enclosing scope)
+	const Str arr = match it {
+		Expr.Var(n) -> n,
+		_ -> "",
+	}
 
-	return Stmt.ForIn(lv, arr, body)
+	if !eq(arr, "") then return Stmt.ForIn(lv, arr, body)
+	# the `$` makes the temp unlexable as a source identifier, so it can never collide
+	const Str tmp = "fiter\$${it_tok}"
+	const [Stmt] pair = [Stmt.Let(tmp, false, "", it), Stmt.ForIn(lv, tmp, body)]
+
+	return Stmt.Block(pair)
+}
+
+# A for-loop's body is a BRANCH (ebnf for_expr): a `{ ... }` block, or a single statement on the
+# SAME line (`for i in xs if odd(i) then s = s + i`).
+const parse_for_body! = (*Parser p): [Stmt] -> {
+	if is_lbrace(peek(p)) then {
+		p.pos = p.pos + 1
+
+		return parse_block!(p)
+	}
+	if nl_before(p, p.pos)
+		then die("cf: parse: a for-loop body is a `{ ... }` block or a single statement on the same line\n")
+	const [Stmt] one = [parse_stmt!(p)]
+
+	return one
 }
 
 # `defer f(args)` / `defer { ... }` — schedule a call (result discarded) or a block to run at
@@ -1798,12 +1844,12 @@ const parse_stmt! = (*Parser p): Stmt -> {
 	if kw(p, "break") then {
 		p.pos = p.pos + 1
 
-		return Stmt.Break
+		return Stmt.Break(exit_label!(p))
 	}
 	if kw(p, "continue") then {
 		p.pos = p.pos + 1
 
-		return Stmt.Continue
+		return Stmt.Continue(exit_label!(p))
 	}
 	if kw(p, "return") then {
 		p.pos = p.pos + 1

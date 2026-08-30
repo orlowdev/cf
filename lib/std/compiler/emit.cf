@@ -122,6 +122,10 @@ data Emit = {
 	Iarch local_slot,
 	Bool skip_embeds,
 	Str build_version,
+	# the open LABELED statement loops, innermost last — `break outer` resolves its jump target
+	# (`@lend<lid>`) through these parallel stacks (an unlabeled loop pushes nothing)
+	[Str] loop_labels,
+	[Iarch] loop_lids,
 }
 
 # A local/parameter in scope: its interned name, `slot`, its `rec_type` (a record/union
@@ -767,12 +771,62 @@ const stmt_locals = (Stmt s): [Str] -> match s {
 	Stmt.Let(n, _, _, _) -> one_name(n),
 	Stmt.Destructure(ns, _, _) -> ns,
 	Stmt.ForIn(lv, _, ss) -> cat_names(one_name(lv), stmts_locals(ss)),
-	Stmt.Loop(ss) -> stmts_locals(ss),
+	Stmt.Loop(ll_, ss) -> stmts_locals(ss),
 	Stmt.Block(ss) -> stmts_locals(ss),
 	Stmt.IfThen(_, s2) -> stmt_locals(s2),
 	Stmt.IfElse(_, t, el) -> cat_names(stmt_locals(t), stmt_locals(el)),
 	Stmt.Match(_, arms) -> arms_locals(arms),
 	_ -> no_names(),
+}
+
+const no_lids = (): [Iarch] -> {
+	const [Iarch] r = []
+
+	return r
+}
+
+# Fresh copies without the last element — the label stacks pop by rebuild (a saved alias would
+# see an in-place growth, the array-aliasing hazard).
+const drop_last_s = ([Str] xs): [Str] -> {
+	let [Str] out = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(xs.len) - 1 then break
+		out = [...out, xs[i]]
+		i = i + 1
+	}
+
+	return out
+}
+
+const drop_last_i = ([Iarch] xs): [Iarch] -> {
+	let [Iarch] out = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(xs.len) - 1 then break
+		out = [...out, xs[i]]
+		i = i + 1
+	}
+
+	return out
+}
+
+# The loop id `@lend`/`@ltop` a LABELED `break`/`continue` targets — innermost open loop with
+# that label. Typecheck already rejected unknown labels; -1 here means a pass dropped one.
+const labeled_lid = (*Emit ctx, Str l): Iarch -> {
+	let Iarch i = Iarch(ctx.loop_labels.len)
+
+	loop {
+		if i <= 0 then break
+		i = i - 1
+		if eq(ctx.loop_labels[i], l) then return ctx.loop_lids[i]
+	}
+
+	die("cf: emit: a `break`/`continue` label names no enclosing loop\n")
+
+	return -1
 }
 
 const no_names = (): [Str] -> {
@@ -810,8 +864,10 @@ const arms_escape = (*Emit ctx, [Binding] env, [Str] locals, [StmtArm] arms): Bo
 const stmt_escapes = (*Emit ctx, [Binding] env, [Str] locals, Stmt s): Bool -> match s {
 	Stmt.Return(_) -> true,
 	Stmt.Yield(_) -> true,
-	Stmt.Break -> false,
-	Stmt.Continue -> false,
+	# a LABELED exit jumps past enclosing loops without their back-edge rewinds, so any loop
+	# containing one must not take marks (the labeled-break emission skips resets)
+	Stmt.Break(bl_) -> Iarch(bl_.len) > 0,
+	Stmt.Continue(bl_) -> Iarch(bl_.len) > 0,
 	Stmt.Let(_, _, _, init) -> expr_has_addr(ctx, init),
 	Stmt.Assign(n, val) -> (!has_str(locals, n) && binding_is_agg(env, n)) || expr_has_addr(ctx, val),
 	Stmt.FieldAssign(base, _, val) -> !has_str(locals, base) || expr_has_addr(ctx, val),
@@ -823,7 +879,7 @@ const stmt_escapes = (*Emit ctx, [Binding] env, [Str] locals, Stmt s): Bool -> m
 	Stmt.IfElse(c, t, el) ->
 		expr_has_addr(ctx, c) || stmt_escapes(ctx, env, locals, t) || stmt_escapes(ctx, env, locals, el),
 	Stmt.Block(ss) -> body_escapes(ctx, env, locals, ss),
-	Stmt.Loop(ss) -> body_escapes(ctx, env, locals, ss),
+	Stmt.Loop(ll_, ss) -> body_escapes(ctx, env, locals, ss),
 	Stmt.ForIn(_, _, ss) -> body_escapes(ctx, env, locals, ss),
 	Stmt.Match(sc, arms) -> expr_has_addr(ctx, sc) || arms_escape(ctx, env, locals, arms),
 	Stmt.Destructure(_, _, e) -> expr_has_addr(ctx, e),
@@ -898,7 +954,7 @@ const res_stmt_escapes = (*Emit ctx, [Binding] env, [Str] locals, Stmt s): Bool 
 	Stmt.IfElse(_, t, el) ->
 		res_stmt_escapes(ctx, env, locals, t) || res_stmt_escapes(ctx, env, locals, el),
 	Stmt.Block(ss) -> res_body_escapes(ctx, env, locals, ss),
-	Stmt.Loop(ss) -> res_body_escapes(ctx, env, locals, ss),
+	Stmt.Loop(ll_, ss) -> res_body_escapes(ctx, env, locals, ss),
 	Stmt.ForIn(_, _, ss) -> res_body_escapes(ctx, env, locals, ss),
 	Stmt.Match(_, arms) -> res_arms_escape(ctx, env, locals, arms),
 	Stmt.Let(_, _, _, _) -> false,
@@ -906,8 +962,9 @@ const res_stmt_escapes = (*Emit ctx, [Binding] env, [Str] locals, Stmt s): Bool 
 	Stmt.Do(_) -> false,
 	Stmt.Return(_) -> false,
 	Stmt.Yield(_) -> false,
-	Stmt.Break -> false,
-	Stmt.Continue -> false,
+	# a labeled exit skips enclosing back-edge rewinds — see stmt_escapes
+	Stmt.Break(bl_) -> Iarch(bl_.len) > 0,
+	Stmt.Continue(bl_) -> Iarch(bl_.len) > 0,
 	_ -> true,
 }
 
@@ -1023,7 +1080,7 @@ const hv_stmt = (Str n, Stmt s): Bool -> {
 		Stmt.IfThen(_, b) -> hv_stmt(n, b),
 		Stmt.IfElse(_, t, el) -> hv_stmt(n, t) || hv_stmt(n, el),
 		Stmt.Block(ss) -> hv_body(n, ss),
-		Stmt.Loop(ss) -> hv_body(n, ss),
+		Stmt.Loop(ll_, ss) -> hv_body(n, ss),
 		Stmt.ForIn(_, _, ss) -> hv_body(n, ss),
 		Stmt.Match(_, arms) -> hv_arms(n, arms),
 		Stmt.Defer(ss) -> hv_body(n, ss),
@@ -1198,13 +1255,13 @@ const gscan_stmt = (Str n, Stmt s, Iarch seen): Iarch -> match s {
 	Stmt.IfThen(c, b2) -> gscan_ifthen(n, c, b2, seen),
 	Stmt.IfElse(c, t, el) -> gscan_ifelse(n, c, t, el, seen),
 	Stmt.Block(ss) -> gscan_stmts(n, ss, seen),
-	Stmt.Loop(ss) -> gscan_loop(n, ss, seen),
+	Stmt.Loop(ll_, ss) -> gscan_loop(n, ss, seen),
 	Stmt.ForIn(_, _, ss) -> gscan_loop(n, ss, seen),
 	Stmt.Match(sc, arms) -> gscan_smatch(n, sc, arms, seen),
 	Stmt.Defer(ss) -> gscan_loop(n, ss, seen),
 	Stmt.Closure(_, _, _, cb) -> gscan_loop(n, cb, seen),
-	Stmt.Break -> seen,
-	Stmt.Continue -> seen,
+	Stmt.Break(bl_) -> seen,
+	Stmt.Continue(bl_) -> seen,
 	_ -> -1,
 }
 
@@ -1255,7 +1312,7 @@ const gcand_stmt = (Stmt s): [Str] -> match s {
 	Stmt.IfThen(_, b2) -> gcand_stmt(b2),
 	Stmt.IfElse(_, t, el) -> cat_names(gcand_stmt(t), gcand_stmt(el)),
 	Stmt.Block(ss) -> gcand_body(ss),
-	Stmt.Loop(ss) -> gcand_body(ss),
+	Stmt.Loop(ll_, ss) -> gcand_body(ss),
 	Stmt.ForIn(_, _, ss) -> gcand_body(ss),
 	Stmt.Match(_, arms) -> gcand_arms(arms),
 	Stmt.Defer(ss) -> gcand_body(ss),
@@ -5291,7 +5348,7 @@ const emit_for_body! = (*Emit ctx, [Binding] env, Str lv, Str arr, [Stmt] body):
 # the nearest-loop target for break (`@lend`) and continue (`@ltop`); it is saved and
 # restored around the body so a nested loop targets itself. Called directly from
 # `emit_block`'s `Loop` arm, which binds the body.
-const emit_loop_body! = (*Emit ctx, [Binding] env, [Stmt] body): Iarch -> {
+const emit_loop_body! = (*Emit ctx, [Binding] env, Str lbl, [Stmt] body): Iarch -> {
 	const Iarch lid = ctx.label
 	ctx.label = ctx.label + 1
 	const Iarch saved = ctx.cur_loop
@@ -5299,6 +5356,11 @@ const emit_loop_body! = (*Emit ctx, [Binding] env, [Stmt] body): Iarch -> {
 	const Iarch saved_sur = ctx.loop_sur_mark
 	const Iarch saved_mkb = ctx.mk_env_base
 	ctx.cur_loop = lid
+	# a labeled loop opens a `break <label>` target for its whole body
+	if Iarch(lbl.len) > 0 then {
+		ctx.loop_labels = [...ctx.loop_labels, lbl]
+		ctx.loop_lids = [...ctx.loop_lids, lid]
+	}
 	# per-iteration reset (geometry_lowering §2): snapshot the node's triple at loop entry, rewind
 	# at every back-edge / break / continue, but only for a body whose residue can't escape the
 	# iteration.
@@ -5321,6 +5383,10 @@ const emit_loop_body! = (*Emit ctx, [Binding] env, [Stmt] body): Iarch -> {
 	if term == 0 && lsur >= 0 then emit_reset!(ctx, lsur, "%node_0")
 	if term == 0 then write_str(ctx.fd, "\tjmp @ltop${lid}\n")
 	write_str(ctx.fd, "@lend${lid}\n")
+	if Iarch(lbl.len) > 0 then {
+		ctx.loop_labels = drop_last_s(ctx.loop_labels)
+		ctx.loop_lids = drop_last_i(ctx.loop_lids)
+	}
 	ctx.cur_loop = saved
 	ctx.loop_mark = saved_mark
 	ctx.loop_sur_mark = saved_sur
@@ -5423,18 +5489,31 @@ const emit_simple_stmt! = (*Emit ctx, [Binding] env, Stmt s): Iarch -> {
 	let Iarch term = 0
 
 	match s {
-		Stmt.Break -> {
-			# a reset-safe loop rewinds the node on the way out too — the broken iteration's residue
-			# is dead (nothing escapes a reset-safe loop), and after the loop the node sits at entry.
-			if ctx.loop_mark >= 0 then emit_reset!(ctx, ctx.loop_mark, "%res_0")
-			if ctx.loop_sur_mark >= 0 then emit_reset!(ctx, ctx.loop_sur_mark, "%node_0")
-			write_str(ctx.fd, "\tjmp @lend${ctx.cur_loop}\n")
+		Stmt.Break(bl_) -> {
+			if Iarch(bl_.len) > 0 then {
+				# a LABELED break jumps to the labeled loop's end. No mark rewind: a body holding a
+				# labeled exit is never reset-safe (the safety scans refuse it), so every enclosing
+				# mark is -1 — the crossed iterations' residue lives to the frame's own rewind
+				# (leak-direction, never a dangle).
+				write_str(ctx.fd, "\tjmp @lend${labeled_lid(ctx, bl_)}\n")
+			} else {
+				# a reset-safe loop rewinds the node on the way out too — the broken iteration's residue
+				# is dead (nothing escapes a reset-safe loop), and after the loop the node sits at entry.
+				if ctx.loop_mark >= 0 then emit_reset!(ctx, ctx.loop_mark, "%res_0")
+				if ctx.loop_sur_mark >= 0 then emit_reset!(ctx, ctx.loop_sur_mark, "%node_0")
+				write_str(ctx.fd, "\tjmp @lend${ctx.cur_loop}\n")
+			}
 			term = 1
 		},
-		Stmt.Continue -> {
-			if ctx.loop_mark >= 0 then emit_reset!(ctx, ctx.loop_mark, "%res_0")
-			if ctx.loop_sur_mark >= 0 then emit_reset!(ctx, ctx.loop_sur_mark, "%node_0")
-			write_str(ctx.fd, "\tjmp @ltop${ctx.cur_loop}\n")
+		Stmt.Continue(bl_) -> {
+			if Iarch(bl_.len) > 0 then {
+				# a LABELED continue jumps to the labeled loop's back-edge (same no-rewind rule)
+				write_str(ctx.fd, "\tjmp @ltop${labeled_lid(ctx, bl_)}\n")
+			} else {
+				if ctx.loop_mark >= 0 then emit_reset!(ctx, ctx.loop_mark, "%res_0")
+				if ctx.loop_sur_mark >= 0 then emit_reset!(ctx, ctx.loop_sur_mark, "%node_0")
+				write_str(ctx.fd, "\tjmp @ltop${ctx.cur_loop}\n")
+			}
 			term = 1
 		},
 		Stmt.Yield(e) -> {
@@ -5614,8 +5693,8 @@ const emit_block! = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 		const Stmt s = stmts[i]
 
 		match s {
-			Stmt.Loop(bd) -> {
-				emit_loop_body!(ctx, env, bd)
+			Stmt.Loop(ll_, bd) -> {
+				emit_loop_body!(ctx, env, ll_, bd)
 			},
 			Stmt.ForIn(fv, fa, fbd) -> {
 				emit_for_body!(ctx, env, fv, fa, fbd)
@@ -5842,7 +5921,7 @@ const nfp_alloc_stmt = ([UnionDecl] unions, Stmt s): Bool -> {
 		Stmt.IfThen(_, b) -> nfp_alloc_stmt(unions, b),
 		Stmt.IfElse(_, t, el) -> nfp_alloc_stmt(unions, t) || nfp_alloc_stmt(unions, el),
 		Stmt.Block(ss) -> nfp_alloc_body(unions, ss),
-		Stmt.Loop(ss) -> nfp_alloc_body(unions, ss),
+		Stmt.Loop(ll_, ss) -> nfp_alloc_body(unions, ss),
 		Stmt.ForIn(_, _, ss) -> nfp_alloc_body(unions, ss),
 		Stmt.Match(_, arms) -> nfp_alloc_arms(unions, arms),
 		Stmt.Defer(ss) -> nfp_alloc_body(unions, ss),
@@ -5909,7 +5988,7 @@ const nfp_ind_stmt = ([Func] funcs, Stmt s): Bool -> {
 		Stmt.IfThen(_, b) -> nfp_ind_stmt(funcs, b),
 		Stmt.IfElse(_, t, el) -> nfp_ind_stmt(funcs, t) || nfp_ind_stmt(funcs, el),
 		Stmt.Block(ss) -> nfp_ind_body(funcs, ss),
-		Stmt.Loop(ss) -> nfp_ind_body(funcs, ss),
+		Stmt.Loop(ll_, ss) -> nfp_ind_body(funcs, ss),
 		Stmt.ForIn(_, _, ss) -> nfp_ind_body(funcs, ss),
 		Stmt.Match(_, arms) -> nfp_ind_arms(funcs, arms),
 		Stmt.Defer(ss) -> nfp_ind_body(funcs, ss),
@@ -5995,7 +6074,7 @@ const nfp_prop_stmt = ([Func] funcs, [Bool] sig, Stmt s): Bool -> {
 		Stmt.IfThen(_, b) -> nfp_prop_stmt(funcs, sig, b),
 		Stmt.IfElse(_, t, el) -> nfp_prop_stmt(funcs, sig, t) || nfp_prop_stmt(funcs, sig, el),
 		Stmt.Block(ss) -> nfp_prop_body(funcs, sig, ss),
-		Stmt.Loop(ss) -> nfp_prop_body(funcs, sig, ss),
+		Stmt.Loop(ll_, ss) -> nfp_prop_body(funcs, sig, ss),
 		Stmt.ForIn(_, _, ss) -> nfp_prop_body(funcs, sig, ss),
 		Stmt.Match(_, arms) -> nfp_prop_arms(funcs, sig, arms),
 		Stmt.Defer(ss) -> nfp_prop_body(funcs, sig, ss),
@@ -6131,7 +6210,7 @@ const slc_stmt! = (Stmt s, Bool skip): [Str] -> {
 		Stmt.IfThen(_, b) -> slc_stmt!(b, skip),
 		Stmt.IfElse(_, t, el) -> cat_names(slc_stmt!(t, skip), slc_stmt!(el, skip)),
 		Stmt.Block(ss) -> slc_body!(ss, skip),
-		Stmt.Loop(ss) -> slc_body!(ss, skip),
+		Stmt.Loop(ll_, ss) -> slc_body!(ss, skip),
 		Stmt.ForIn(_, _, ss) -> slc_body!(ss, skip),
 		Stmt.Match(_, arms) -> slc_sarms!(arms, skip),
 		Stmt.Defer(ss) -> slc_body!(ss, skip),
@@ -6277,7 +6356,7 @@ const mint_stmt = (Stmt s): Bool -> {
 		Stmt.IfThen(_, b) -> mint_stmt(b),
 		Stmt.IfElse(_, t, el) -> mint_stmt(t) || mint_stmt(el),
 		Stmt.Block(ss) -> mint_body(ss),
-		Stmt.Loop(ss) -> mint_body(ss),
+		Stmt.Loop(ll_, ss) -> mint_body(ss),
 		Stmt.ForIn(_, _, ss) -> mint_body(ss),
 		Stmt.Match(_, arms) -> mint_arms(arms),
 		Stmt.Defer(ss) -> mint_body(ss),
@@ -7461,6 +7540,8 @@ pub const emit_program! = (
 				local_slot: 0,
 				skip_embeds: skip_embeds,
 				build_version: build_version,
+				loop_labels: no_names(),
+				loop_lids: no_lids(),
 			})
 			emit_func!(&ctx, prog.funcs[i], i)
 		}
