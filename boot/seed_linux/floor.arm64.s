@@ -19,9 +19,9 @@ f48:
 	svc #0
 	ret
 
-.globl f319
+.globl f320
 .p2align 2
-f319:
+f320:
 	mov x0, x0
 	mov x8, #94
 	svc #0

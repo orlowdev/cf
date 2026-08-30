@@ -22,17 +22,17 @@ _f48:
 1:
 	ret
 
-.globl _f319
+.globl _f320
 .p2align 2
-_f319:
+_f320:
 	mov x0, x0
 	mov x16, #1
 	svc #0x80
 	ret
 
-.globl _f320
+.globl _f321
 .p2align 2
-_f320:
+_f321:
 	mov x16, #2
 	svc #0x80
 	b.cc 1f
