@@ -13,6 +13,7 @@ import std::io::file::{ create, close }
 import std::io::fd::{ Fd, IoRrr }
 import std::sys::{ Os, Arch }
 import std::compiler::ast::{ Program }
+import std::compiler::diag::{ Diag }
 import std::compiler::resolve::{ resolve_program! }
 import std::compiler::monomorph::{ mono_program! }
 import std::compiler::materialize::{ materialize_program!, Mat }
@@ -42,8 +43,13 @@ import std::compiler::emit::{ emit_program! }
 # PRE-mono (so the color is per SOURCE function), monomorphize, Materialize the std-source
 # geometries, typecheck, hoist defer-taps, lower defers, lift closures, compute the routing tables
 # ONCE (feeding the oracle tripwire, `--dump-routing`, and emit's classification-at-birth), reject
-# unsound geometry teardown/escape, then emit. Compile errors `die` with a diagnostic; only the two
-# output-file opens surface as recoverable failures here (also via `die`).
+# unsound geometry teardown/escape, then emit.
+#
+# TYPE errors come back as VALUES: a non-empty `[Diag]` list (one located error per declaration,
+# collected across the whole program) means the program was rejected and nothing was emitted —
+# the caller (the CLI edge, an LSP) decides how to present them. An empty list is success.
+# Errors in the passes BEFORE typecheck (lexing, parsing, resolution, the `!` algebra, monomorph)
+# still `die` fail-fast, as do the two output-file opens.
 pub const compile! = (
 	Str input,
 	Str out_qbe,
@@ -54,7 +60,7 @@ pub const compile! = (
 	Bool dump_routing,
 	Bool skip_embeds,
 	Str build_version,
-): Iarch -> {
+): [Diag] -> {
 	# front end: resolve the entry module and its transitive imports (lexing and parsing
 	# each) into one flattened AST — module_system §8
 	const Program raw = resolve_program!(input, target_os, target_arch)
@@ -86,8 +92,11 @@ pub const compile! = (
 	const Mat mm = materialize_program!(mono, raw)
 	const Program prog = mm.prog
 
-	# middle: typecheck (rejects type errors before any output is produced)
-	check_program!(prog)
+	# middle: typecheck (rejects type errors before any output is produced) — a rejection
+	# returns the collected diagnostics; no output files are touched
+	const [Diag] diags = check_program!(prog)
+
+	if Iarch(diags.len) > 0 then return diags
 
 	# lift `defer`-tap VALUES (`defer f(x)` / `|> defer f`) out of expression position into a
 	# snapshot binding + a scheduled `defer` statement (memory_model §6) — before lower_defers, so
@@ -138,7 +147,7 @@ pub const compile! = (
 	close(qf)
 	close(af)
 
-	return 0
+	return []
 }
 
 # Extract the opened `Fd` from `create`'s outcome, or `die` with `msg` if it failed. `die` never

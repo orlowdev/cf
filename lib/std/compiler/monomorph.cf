@@ -15,7 +15,7 @@
 # variables, and union BOUNDS (`[Color 'T]`) are supported; STRUCTURAL inference (fixing `'T`
 # from INSIDE a `['T]`/tuple parameter) and a tuple-typed type variable are later bricks.
 
-import std::compiler::diag::{ die_at_lc }
+import std::compiler::diag::{ die_at_lc, DiagBag, fatal_dg }
 import std::data::str::{ eq, ends_with }
 import std::compiler::ast::{
 	Expr,
@@ -1165,8 +1165,9 @@ const env_bind = (MonoEnv e, Str name, Ty ty): MonoEnv -> MonoEnv({
 # pointer type (no type variable is inferred to one — that structural inference is a later brick).
 const arg_ty! = (*MonoCtx m, Expr e, MonoEnv env): Str -> {
 	if !m.has_gen then return ""
+	let DiagBag fdg = fatal_dg()
 
-	return ty_name(type_of!(e, env.venv, build_ctx(m, env.ret)))
+	return ty_name(type_of!(e, env.venv, build_ctx(m, env.ret), &fdg))
 }
 
 # Infer a generic call's type arguments: for each type variable, a parameter whose declared
@@ -1268,7 +1269,8 @@ const infer_tyargs! = (*MonoCtx m, Func tmpl, [Expr] args, MonoEnv env): [Str] -
 			const Str pn = tmpl.params[p].type_name
 			const Bool shaped = eq(pn, tv) || eq(pn, "$dyn") || eq(pn, "$tuple")
 			if shaped && p < Iarch(args.len) then {
-				const Ty at = type_of!(args[p], env.venv, build_ctx(m, env.ret))
+				let DiagBag fdg = fatal_dg()
+				const Ty at = type_of!(args[p], env.venv, build_ctx(m, env.ret), &fdg)
 				const Str b = infer_from_param!(tv, tmpl.params[p], at)
 				if !eq(b, "") then {
 					# only a bare integer literal filling the WHOLE `'T` parameter is weak
@@ -1644,11 +1646,12 @@ const arm_env = (*MonoCtx m, Str tn, [Str] members, [Str] binds, MonoEnv env): M
 	if !m.has_gen then return env
 	if eq(tn, "") then return env
 	if Iarch(binds.len) == 0 then return env
+	let DiagBag fdg = fatal_dg()
 
 	return MonoEnv({
 		tvars: env.tvars,
 		tvals: env.tvals,
-		venv: arm_bind_env(tn, members, binds, env.venv, build_ctx(m, env.ret)),
+		venv: arm_bind_env(tn, members, binds, env.venv, build_ctx(m, env.ret), &fdg),
 		ret: env.ret,
 		vpnames: env.vpnames,
 		vpvals: env.vpvals,
@@ -1775,8 +1778,9 @@ const for_env! = (*MonoCtx m, Str v, Str a, MonoEnv env): MonoEnv -> {
 	# bind the `for` variable at the array's ELEMENT type (matching typecheck's `check_for_body`), so a
 	# generic call on the binder resolves the right instance (`for w in [Str]` → `id(w)` picks `id[Str]`).
 	const Str en = dyn_of(venv_ty(env.venv, a))
+	let DiagBag fdg = fatal_dg()
 
-	return env_bind(env, v, elem_ty!(en, build_ctx(m, env.ret)))
+	return env_bind(env, v, elem_ty!(en, build_ctx(m, env.ret), &fdg))
 }
 
 const mono_stmt! = (*MonoCtx m, Stmt s, MonoEnv env): Stmt -> match s {
@@ -1837,24 +1841,29 @@ const mono_stmt_match! = (*MonoCtx m, Expr scrut, [StmtArm] arms, MonoEnv env): 
 
 # Extend the environment for the statements after a destructure — the tuple binders' types via
 # the typechecker's `check_destructure` over the (monomorphized) initializer.
-const destr_env! = (*MonoCtx m, [Str] pat, Bool mut, Expr e, MonoEnv env): MonoEnv -> MonoEnv({
-	tvars: env.tvars,
-	tvals: env.tvals,
-	venv: check_destructure!(pat, mut, e, env.venv, build_ctx(m, env.ret)),
-	ret: env.ret,
-	vpnames: env.vpnames,
-	vpvals: env.vpvals,
-})
+const destr_env! = (*MonoCtx m, [Str] pat, Bool mut, Expr e, MonoEnv env): MonoEnv -> {
+	let DiagBag fdg = fatal_dg()
+
+	return MonoEnv({
+		tvars: env.tvars,
+		tvals: env.tvals,
+		venv: check_destructure!(pat, mut, e, env.venv, build_ctx(m, env.ret), &fdg),
+		ret: env.ret,
+		vpnames: env.vpnames,
+		vpvals: env.vpvals,
+	})
+}
 
 # After a `let` / destructure, record the binding's type (via the typechecker's `binding_ty` /
 # `check_destructure` over the monomorphized statement) so a later generic call can infer from it.
 # Only under generics; a non-generic program never consults the environment, so this is skipped.
 const mono_extend! = (*MonoCtx m, Stmt s, MonoEnv env): MonoEnv -> {
 	if !m.has_gen then return env
+	let DiagBag fdg = fatal_dg()
 
 	return match s {
 		Stmt.Let(n, mut, ann, e) ->
-			env_bind(env, n, binding_ty!(ann, e, env.venv, build_ctx(m, env.ret))),
+			env_bind(env, n, binding_ty!(ann, e, env.venv, build_ctx(m, env.ret), &fdg)),
 		Stmt.Destructure(pat, mut, e) -> destr_env!(m, pat, mut, e, env),
 		# a local closure enters the value env as its function type, so a later statement may
 		# pass it (or an anonymous lambda's hoisted name) to a generic function

@@ -5,6 +5,7 @@
 # any fn, `!` or not, so the location is printed piecewise (no interpolation, no residue).
 
 import std::io::console::{ eprint, die }
+import std::data::str::{ eq }
 
 # Print one decimal digit to stderr as a literal write (the colorless integer print's leaf).
 const eput_digit = (Iarch d): () -> {
@@ -26,16 +27,124 @@ const eput_int = (Iarch n): () -> {
 	eput_digit(n % 10)
 }
 
-# Die with `msg` prefixed by an already-computed `file:line:col: ` (a declaration's stamp, or
-# any position the caller has resolved).
-pub const die_at_lc = (Str file, Iarch line, Iarch col, Str msg): Never -> {
+# Print the `file:line:col: ` prefix of a located diagnostic to stderr (the shared leaf of
+# `die_at_lc` and `print_diags`).
+const eprint_at_lc = (Str file, Iarch line, Iarch col): () -> {
 	eprint(file)
 	eprint(":")
 	eput_int(line)
 	eprint(":")
 	eput_int(col)
 	eprint(": ")
+}
+
+# Die with `msg` prefixed by an already-computed `file:line:col: ` (a declaration's stamp, or
+# any position the caller has resolved).
+pub const die_at_lc = (Str file, Iarch line, Iarch col, Str msg): Never -> {
+	eprint_at_lc(file, line, col)
 	die(msg)
+}
+
+# One collected compile error: a source position (a declaration's stamp) and its message.
+# The typechecker returns these as VALUES at the pass boundary — nothing below the CLI edge
+# prints or exits (errors-as-values, the D1 diagnostics design).
+pub data Diag = { Str file, Iarch line, Iarch col, Str msg }
+
+# The single-slot pending diagnostic a checking pass records into, threaded as a `*DiagBag`
+# alongside `Ctx`. One slot, first error wins (`hot`), so RECORDING is colorless — plain field
+# stores, no allocation — and any helper, `!` or not, may reject. The driving loop flushes the
+# slot into its `[Diag]` between declarations (one error per declaration). `fatal` mode makes a
+# recording die on the spot instead — the monomorph pass shares the typechecker's helpers for
+# inference and keeps its fail-fast behavior.
+pub data DiagBag = { Bool fatal, Bool hot, Str file, Iarch line, Iarch col, Str msg }
+
+# Record a located rejection into the bag: die now (`fatal`), or latch the FIRST error and
+# ignore the rest until the driver flushes the slot. Colorless on purpose.
+pub const drec = (*DiagBag dg, Str file, Iarch line, Iarch col, Str msg): () -> {
+	if dg.fatal then die_at_lc(file, line, col, msg)
+	if dg.hot then return ()
+	dg.hot = true
+	dg.file = file
+	dg.line = line
+	dg.col = col
+	dg.msg = msg
+}
+
+# A throwaway FATAL bag: a pass that shares the typechecker's helpers but keeps its own
+# fail-fast behavior (the monomorph pass's inference) hands one to each shared call — a
+# rejection dies on the spot instead of latching.
+pub const fatal_dg = (): DiagBag ->
+	DiagBag({ fatal: true, hot: false, file: "", line: 0, col: 0, msg: "" })
+
+# Byte-lexicographic `<` over two strings (file paths grouping, for diagnostic order).
+const str_lt = (Str a, Str b): Bool -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(a.len) || i >= Iarch(b.len) then break
+		if Iarch(a[i]) != Iarch(b[i]) then return Iarch(a[i]) < Iarch(b[i])
+		i = i + 1
+	}
+
+	return Iarch(a.len) < Iarch(b.len)
+}
+
+const diag_before = (Diag a, Diag b): Bool -> {
+	if !eq(a.file, b.file) then return str_lt(a.file, b.file)
+	if a.line != b.line then return a.line < b.line
+
+	return a.col < b.col
+}
+
+# Order collected diagnostics by (file, line, col), so a report reads top-to-bottom per file
+# regardless of the order the passes visited declarations. Insertion by rebuild — n is the
+# ERROR count, so the quadratic rebuild is irrelevant.
+pub const sort_diags = ([Diag] ds): [Diag] -> {
+	let [Diag] out = []
+
+	for d in ds {
+		let Iarch pos = Iarch(out.len)
+		let Iarch i = 0
+
+		loop {
+			if i >= Iarch(out.len) then break
+			if diag_before(d, out[i]) then {
+				pos = i
+				break
+			}
+			i = i + 1
+		}
+
+		let [Diag] nx = []
+		let Iarch j = 0
+
+		loop {
+			if j >= pos then break
+			nx = [...nx, out[j]]
+			j = j + 1
+		}
+
+		nx = [...nx, d]
+
+		loop {
+			if j >= Iarch(out.len) then break
+			nx = [...nx, out[j]]
+			j = j + 1
+		}
+
+		out = nx
+	}
+
+	return out
+}
+
+# Print every collected diagnostic to stderr, `file:line:col: msg` each. The one place a
+# diagnostic becomes TEXT — called at the CLI edge, never inside a pass.
+pub const print_diags = ([Diag] ds): () -> {
+	for d in ds {
+		eprint_at_lc(d.file, d.line, d.col)
+		eprint(d.msg)
+	}
 }
 
 # Die with `msg` prefixed by `file:line:col: ` — the position of byte `off` in `src`. A tab
