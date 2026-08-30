@@ -15,7 +15,7 @@
 # variables, and union BOUNDS (`[Color 'T]`) are supported; STRUCTURAL inference (fixing `'T`
 # from INSIDE a `['T]`/tuple parameter) and a tuple-typed type variable are later bricks.
 
-import std::io::console::{ die }
+import std::compiler::diag::{ die_at_lc }
 import std::data::str::{ eq, ends_with }
 import std::compiler::ast::{
 	Expr,
@@ -77,6 +77,11 @@ data MonoCtx = {
 	[RecDecl] crecs,
 	[UnionDecl] cunions,
 	Bool has_gen,
+	# the CURRENTLY-WALKED declaration's source stamp (retargeted as each template / concrete
+	# declaration is processed), so a rejection anywhere below names its enclosing decl
+	Str dfile,
+	Iarch dline,
+	Iarch dcol,
 }
 
 # The context threaded through a function body: the active type-variable substitution (when
@@ -84,6 +89,16 @@ data MonoCtx = {
 # extended by `let`/match/`for`/destructure binders) and the enclosing function's return type —
 # together everything the shared `type_of` needs to derive an argument's type for inference.
 data MonoEnv = { [Str] tvars, [Str] tvals, [VarTy] venv, Ty ret, [Str] vpnames, [Iarch] vpvals }
+
+# Die with `msg` prefixed by the currently-walked declaration's `path:line:col` (`m`'s stamp).
+const merr = (*MonoCtx m, Str msg): Never -> die_at_lc(m.dfile, m.dline, m.dcol, msg)
+
+# Retarget `m`'s current-declaration stamp.
+const set_stamp = (*MonoCtx m, Str df, Iarch dl, Iarch dc): () -> {
+	m.dfile = df
+	m.dline = dl
+	m.dcol = dc
+}
 
 const find_template = ([Func] templates, Str n): Iarch -> {
 	let Iarch i = 0
@@ -162,10 +177,10 @@ const check_bound_list = (*MonoCtx m, [Str] typarams, [Str] tbounds): Iarch -> {
 		if !eq(tbounds[i], "") then {
 			# a TYPE parameter's bound must name a union; a VALUE parameter's type must be Iarch/Uarch
 			if is_tvar(typarams[i]) then {
-				if !is_union_name(m, tbounds[i]) then die("cf: type: a generic bound must name a union\n")
+				if !is_union_name(m, tbounds[i]) then merr(m, "cf: type: a generic bound must name a union\n")
 			} else {
 				if !eq(tbounds[i], "Iarch") && !eq(tbounds[i], "Uarch")
-					then die("cf: type: a comptime value parameter must be typed Iarch or Uarch\n")
+					then merr(m, "cf: type: a comptime value parameter must be typed Iarch or Uarch\n")
 			}
 		}
 		i = i + 1
@@ -179,6 +194,7 @@ const check_template_bounds = (*MonoCtx m): Iarch -> {
 
 	loop {
 		if i >= Iarch(m.templates.len) then break
+		set_stamp(m, m.templates[i].dfile, m.templates[i].dline, m.templates[i].dcol)
 		check_bound_list(m, m.templates[i].typarams, m.templates[i].tbounds)
 		i = i + 1
 	}
@@ -187,6 +203,7 @@ const check_template_bounds = (*MonoCtx m): Iarch -> {
 
 	loop {
 		if j >= Iarch(m.rec_templates.len) then break
+		set_stamp(m, m.rec_templates[j].dfile, m.rec_templates[j].dline, m.rec_templates[j].dcol)
 		check_bound_list(m, m.rec_templates[j].typarams, m.rec_templates[j].tbounds)
 		j = j + 1
 	}
@@ -195,6 +212,7 @@ const check_template_bounds = (*MonoCtx m): Iarch -> {
 
 	loop {
 		if k >= Iarch(m.union_templates.len) then break
+		set_stamp(m, m.union_templates[k].dfile, m.union_templates[k].dline, m.union_templates[k].dcol)
 		check_bound_list(m, m.union_templates[k].typarams, m.union_templates[k].tbounds)
 		k = k + 1
 	}
@@ -305,24 +323,24 @@ const check_params = (*MonoCtx m, [Str] typarams, [Str] tbounds, [Str] margs): I
 
 	loop {
 		if i >= Iarch(typarams.len) then break
-		if i >= Iarch(margs.len) then die("cf: type: a generic parameter has no argument\n")
+		if i >= Iarch(margs.len) then merr(m, "cf: type: a generic parameter has no argument\n")
 		const Str arg = margs[i]
 		if is_tvar(typarams[i]) then {
 			# a TYPE parameter — its argument must be a type (not a value), and satisfy any bound
-			if is_num_arg(arg) then die("cf: type: a comptime value was given where a type is expected\n")
+			if is_num_arg(arg) then merr(m, "cf: type: a comptime value was given where a type is expected\n")
 			const Str b = tbounds[i]
 			if !eq(b, "") then {
-				if !is_union_name(m, b) then die("cf: type: a generic bound must name a union\n")
+				if !is_union_name(m, b) then merr(m, "cf: type: a generic bound must name a union\n")
 				if !bound_satisfied(m, arg, b)
-					then die("cf: type: a type argument does not satisfy its bound\n")
+					then merr(m, "cf: type: a type argument does not satisfy its bound\n")
 			}
 		}
 		if !is_tvar(typarams[i]) then {
 			# a comptime VALUE parameter — its type must be Iarch/Uarch and its argument a value
 			const Str vt = tbounds[i]
 			if !eq(vt, "Iarch") && !eq(vt, "Uarch")
-				then die("cf: type: a comptime value parameter must be typed Iarch or Uarch\n")
-			if !is_num_arg(arg) then die("cf: type: a type was given where a comptime value is expected\n")
+				then merr(m, "cf: type: a comptime value parameter must be typed Iarch or Uarch\n")
+			if !is_num_arg(arg) then merr(m, "cf: type: a type was given where a comptime value is expected\n")
 		}
 		i = i + 1
 	}
@@ -721,7 +739,7 @@ const check_names_type_apps! = (*MonoCtx m, [Str] names): Iarch -> {
 	loop {
 		if i >= Iarch(names.len) then break
 		if !type_app_ok!(m, names[i])
-			then die("cf: type: a generic type application names a non-generic or undeclared type\n")
+			then merr(m, "cf: type: a generic type application names a non-generic or undeclared type\n")
 		i = i + 1
 	}
 
@@ -736,6 +754,7 @@ const check_concrete_type_apps! = (*MonoCtx m): Iarch -> {
 
 	loop {
 		if r >= Iarch(m.crecs.len) then break
+		set_stamp(m, m.crecs[r].dfile, m.crecs[r].dline, m.crecs[r].dcol)
 		check_names_type_apps!(m, m.crecs[r].ftypes)
 		r = r + 1
 	}
@@ -744,6 +763,7 @@ const check_concrete_type_apps! = (*MonoCtx m): Iarch -> {
 
 	loop {
 		if u >= Iarch(m.cunions.len) then break
+		set_stamp(m, m.cunions[u].dfile, m.cunions[u].dline, m.cunions[u].dcol)
 		let Iarch mi = 0
 
 		loop {
@@ -759,17 +779,18 @@ const check_concrete_type_apps! = (*MonoCtx m): Iarch -> {
 
 	loop {
 		if f >= Iarch(m.cfuncs.len) then break
+		set_stamp(m, m.cfuncs[f].dfile, m.cfuncs[f].dline, m.cfuncs[f].dcol)
 		let Iarch pi = 0
 
 		loop {
 			if pi >= Iarch(m.cfuncs[f].params.len) then break
 			if !type_app_ok!(m, m.cfuncs[f].params[pi].type_name)
-				then die("cf: type: a generic type application names a non-generic or undeclared type\n")
+				then merr(m, "cf: type: a generic type application names a non-generic or undeclared type\n")
 			pi = pi + 1
 		}
 
 		if !type_app_ok!(m, m.cfuncs[f].ret_name)
-			then die("cf: type: a generic type application names a non-generic or undeclared type\n")
+			then merr(m, "cf: type: a generic type application names a non-generic or undeclared type\n")
 		f = f + 1
 	}
 
@@ -781,7 +802,7 @@ const ensure_type_instance! = (*MonoCtx m, Str base, [Str] margs): Str -> {
 	if find_rec_template(m.rec_templates, base) >= 0 then return ensure_rec_instance!(m, base, margs)
 	if find_union_template(m.union_templates, base) >= 0
 		then return ensure_union_instance!(m, base, margs)
-	die("cf: type: a generic type application names a non-generic or undeclared type\n")
+	merr(m, "cf: type: a generic type application names a non-generic or undeclared type\n")
 
 	return ""
 }
@@ -796,7 +817,7 @@ const ensure_union_instance! = (*MonoCtx m, Str base, [Str] margs): Str -> {
 	const Iarch ui = find_union_template(m.union_templates, base)
 	const UnionDecl tmpl = m.union_templates[ui]
 	if Iarch(tmpl.typarams.len) != Iarch(margs.len)
-		then die("cf: type: wrong number of type arguments for a generic type\n")
+		then merr(m, "cf: type: wrong number of type arguments for a generic type\n")
 	check_params(m, tmpl.typarams, tmpl.tbounds, margs)
 	let [UnionMember] members = []
 	let Iarch mi = 0
@@ -815,7 +836,15 @@ const ensure_union_instance! = (*MonoCtx m, Str base, [Str] margs): Str -> {
 	const [Str] no_tp = []
 	m.union_instances = [
 		...m.union_instances,
-		UnionDecl({ name: mn, members: members, typarams: no_tp, tbounds: no_tp }),
+		UnionDecl({
+			name: mn,
+			members: members,
+			typarams: no_tp,
+			tbounds: no_tp,
+			dfile: tmpl.dfile,
+			dline: tmpl.dline,
+			dcol: tmpl.dcol,
+		}),
 	]
 
 	return mn
@@ -842,10 +871,10 @@ const ensure_rec_instance! = (*MonoCtx m, Str base, [Str] margs): Str -> {
 	if type_key_seen(m, mn) then return mn
 	m.type_keys = [...m.type_keys, mn]  # mark before recursing (a self-referential type terminates)
 	const Iarch ri = find_rec_template(m.rec_templates, base)
-	if ri < 0 then die("cf: type: a generic type application names a non-generic or undeclared type\n")
+	if ri < 0 then merr(m, "cf: type: a generic type application names a non-generic or undeclared type\n")
 	const RecDecl tmpl = m.rec_templates[ri]
 	if Iarch(tmpl.typarams.len) != Iarch(margs.len)
-		then die("cf: type: wrong number of type arguments for a generic type\n")
+		then merr(m, "cf: type: wrong number of type arguments for a generic type\n")
 	check_params(m, tmpl.typarams, tmpl.tbounds, margs)
 	const SlotList fs = subst_slots!(m, tmpl.ftypes, tmpl.felems, tmpl.ftelems, tmpl.typarams, margs)
 	const [Str] no_tp = []
@@ -861,6 +890,9 @@ const ensure_rec_instance! = (*MonoCtx m, Str base, [Str] margs): Str -> {
 			typarams: no_tp,
 			tbounds: no_tp,
 			fsizes: tmpl.fsizes,
+			dfile: tmpl.dfile,
+			dline: tmpl.dline,
+			dcol: tmpl.dcol,
 		}),
 	]
 
@@ -1028,6 +1060,9 @@ const mangle_rec_sig! = (*MonoCtx m, RecDecl r): RecDecl -> {
 		typarams: r.typarams,
 		tbounds: r.tbounds,
 		fsizes: r.fsizes,
+		dfile: r.dfile,
+		dline: r.dline,
+		dcol: r.dcol,
 	})
 }
 
@@ -1051,7 +1086,15 @@ const mangle_union_sig! = (*MonoCtx m, UnionDecl u): UnionDecl -> {
 		i = i + 1
 	}
 
-	return UnionDecl({ name: u.name, members: mem, typarams: u.typarams, tbounds: u.tbounds })
+	return UnionDecl({
+		name: u.name,
+		members: mem,
+		typarams: u.typarams,
+		tbounds: u.tbounds,
+		dfile: u.dfile,
+		dline: u.dline,
+		dcol: u.dcol,
+	})
 }
 
 # Replace the concrete declarations in `m` with their signature-mangled forms (§ above).
@@ -1238,7 +1281,7 @@ const infer_tyargs! = (*MonoCtx m, Func tmpl, [Expr] args, MonoEnv env): [Str] -
 
 		let Str bound = strong
 		if eq(bound, "") then bound = weak
-		if eq(bound, "") then die("cf: type: cannot infer a type argument for a generic call\n")
+		if eq(bound, "") then merr(m, "cf: type: cannot infer a type argument for a generic call\n")
 		tvals = [...tvals, bound]
 		t = t + 1
 	}
@@ -1257,7 +1300,7 @@ const ensure_instance! = (*MonoCtx m, Str gname, [Str] tyargs): Str -> {
 	const Iarch ti = find_template(m.templates, gname)
 	const Func tmpl = m.templates[ti]
 	if Iarch(tmpl.typarams.len) != Iarch(tyargs.len)
-		then die("cf: type: a generic call has the wrong number of type arguments\n")
+		then merr(m, "cf: type: a generic call has the wrong number of type arguments\n")
 	check_params(m, tmpl.typarams, tmpl.tbounds, tyargs)
 	const Func clone = mono_func!(m, tmpl, mn, tmpl.typarams, tyargs)
 	m.instances = [...m.instances, clone]
@@ -1273,6 +1316,12 @@ const mono_func! = (*MonoCtx m, Func f, Str newname, [Str] tvars, [Str] tvals): 
 	# its signature may be generic without the template machinery — the env-seeding below would
 	# choke resolving `'T` params it has no substitution for
 	if f.is_intrinsic then return f
+	# rejections below name this declaration (an instance names its template's decl); the
+	# caller's stamp is restored on exit — an instantiation fires mid-walk of another body
+	const Str odf = m.dfile
+	const Iarch odl = m.dline
+	const Iarch odc = m.dcol
+	set_stamp(m, f.dfile, f.dline, f.dcol)
 	# split the parameters: a TYPE parameter (`'T`) drives type substitution; a comptime VALUE
 	# parameter (`n`, its arg an int literal) is FOLDED to its literal in the body — so the two
 	# have distinct machineries (`subst_slot` vs a `Var → Lit` fold threaded on the env).
@@ -1366,6 +1415,7 @@ const mono_func! = (*MonoCtx m, Func f, Str newname, [Str] tvars, [Str] tvals): 
 	})
 	const [Stmt] body = mono_stmts!(m, f.body, env)
 	const [Str] no_tp = []
+	set_stamp(m, odf, odl, odc)
 
 	return Func({
 		name: newname,
@@ -1405,7 +1455,7 @@ const mono_callee! = (*MonoCtx m, Str n, [Str] ta, [Expr] margs, MonoEnv env): S
 
 		return ensure_instance!(m, n, fty)
 	}
-	if Iarch(rty.len) > 0 then die("cf: type: type arguments on a non-generic function\n")
+	if Iarch(rty.len) > 0 then merr(m, "cf: type: type arguments on a non-generic function\n")
 
 	return n
 }
@@ -1444,7 +1494,7 @@ const infer_union_instance! = (*MonoCtx m, Str base, Str mem, [Expr] margs, Mono
 		k = k + 1
 	}
 
-	if mmi < 0 then die("cf: type: a generic union construction names an unknown member\n")
+	if mmi < 0 then merr(m, "cf: type: a generic union construction names an unknown member\n")
 	const UnionMember um = tmpl.members[mmi]
 	let [Str] targs = []
 	let Iarch ti = 0
@@ -1463,7 +1513,7 @@ const infer_union_instance! = (*MonoCtx m, Str base, Str mem, [Expr] margs, Mono
 		}
 
 		if eq(bound, "")
-			then die("cf: type: cannot infer a generic union's type argument from its construction\n")
+			then merr(m, "cf: type: cannot infer a generic union's type argument from its construction\n")
 		targs = [...targs, bound]
 		ti = ti + 1
 	}
@@ -1659,7 +1709,7 @@ const resolve_numeric_typeswitch! = (*MonoCtx m, Expr ms, [MatchArm] arms, Str s
 		const MatchArm a = arms[i]
 		if !a.is_wild && Iarch(a.members.len) > 0 then {
 			if !str_in(a.members[0], numeric_union_members(a.type_name))
-				then die("cf: type: a numeric type-switch arm names a width outside its bound union\n")
+				then merr(m, "cf: type: a numeric type-switch arm names a width outside its bound union\n")
 		}
 		i = i + 1
 	}
@@ -1681,7 +1731,7 @@ const resolve_numeric_typeswitch! = (*MonoCtx m, Expr ms, [MatchArm] arms, Str s
 	let Iarch sel = mi
 	if sel < 0 then sel = wi
 	if sel < 0
-		then die("cf: type: a numeric type-switch has no arm for the instantiated width and no `_`\n")
+		then merr(m, "cf: type: a numeric type-switch has no arm for the instantiated width and no `_`\n")
 	const MatchArm chosen = arms[sel]
 	let Expr body = chosen.body
 	if !chosen.is_wild && Iarch(chosen.binds.len) > 0 then {
@@ -1869,7 +1919,7 @@ const check_rec_templates! = (*MonoCtx m): Iarch -> {
 		loop {
 			if f >= Iarch(r.ftypes.len) then break
 			if !typevar_declared!(r.ftypes[f], r.typarams)
-				then die("cf: type: an undeclared type variable in a generic record field\n")
+				then die_at_lc(r.dfile, r.dline, r.dcol, "cf: type: an undeclared type variable in a generic record field\n")
 			f = f + 1
 		}
 
@@ -1894,7 +1944,7 @@ const check_union_templates! = (*MonoCtx m): Iarch -> {
 			loop {
 				if pj >= Iarch(un.members[mi].payloads.len) then break
 				if !typevar_declared!(un.members[mi].payloads[pj], un.typarams)
-					then die("cf: type: an undeclared type variable in a generic union payload\n")
+					then die_at_lc(un.dfile, un.dline, un.dcol, "cf: type: an undeclared type variable in a generic union payload\n")
 				pj = pj + 1
 			}
 
@@ -1992,6 +2042,9 @@ pub const mono_program! = (Program prog): Program -> {
 		crecs: concrete_recs,
 		cunions: concrete_unions,
 		has_gen: has_gen,
+		dfile: "",
+		dline: 0,
+		dcol: 0,
 	})
 	# reject a generic record/union template whose field/payload names an undeclared type variable
 	check_rec_templates!(&m)

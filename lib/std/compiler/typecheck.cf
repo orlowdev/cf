@@ -105,6 +105,21 @@ const terr = (Ctx ctx, Str msg): Never -> die_at_lc(ctx.dfile, ctx.dline, ctx.dc
 # before any Ctx exists). Colorless.
 const ferr = (Func f, Str msg): Never -> die_at_lc(f.dfile, f.dline, f.dcol, msg)
 
+# Die with `msg` prefixed by a record declaration's stamp, and a union declaration's.
+const rerr = (RecDecl r, Str msg): Never -> die_at_lc(r.dfile, r.dline, r.dcol, msg)
+const uerr = (UnionDecl u, Str msg): Never -> die_at_lc(u.dfile, u.dline, u.dcol, msg)
+
+# Pre-check a written type name where a declaration's stamp is at hand, so an unknown name
+# dies LOCATED — `named_ty` itself stays stamp-less (the monomorph pass shares it, and its
+# own die is the unlocated backstop). A `$dyn`/`$ptr`/`$tuple`/`$fn`/`$fix` shape marker
+# (byte 36 `$`) resolves structurally, not by name — pass it through.
+const known_ty_at = (Str tn, [RecDecl] recs, [UnionDecl] unions, Func f): () -> {
+	if eq(tn, "") then return ()
+	if Iarch(tn[0]) == 36 then return ()
+	if !is_known_typename(tn, recs, unions)
+		then ferr(f, "cf: type: an undeclared type name\n")
+}
+
 # --- small helpers --------------------------------------------------------------------
 
 const is_tint = (Ty t): Bool -> match t { Ty.TInt -> true, _ -> false }
@@ -1534,6 +1549,9 @@ const call_type! = (Str callee, [Str] tyargs, [Expr] args, [VarTy] env, Ctx ctx)
 
 	loop {
 		if i >= na then break
+		# a bad written type in the CALLEE's signature dies at the callee's decl, even when the
+		# caller's body reaches it first (funcs check in declaration order)
+		known_ty_at(ctx.funcs[fidx].params[i].type_name, ctx.recs, ctx.unions, ctx.funcs[fidx])
 		const Ty pt = param_ty!(ctx.funcs[fidx].params[i], ctx.recs, ctx.unions)
 
 		# a function-type parameter takes a function reference (checked nominally), not a value
@@ -4515,6 +4533,7 @@ const check_func! = (Func fn, Ctx ctx): Iarch -> {
 	# a concrete function's signature may not mention a type variable (an undeclared `'T` in a
 	# non-generic function, or one the monomorph pass left unsubstituted)
 	if sig_has_typevar(fn) then terr(ctx, "cf: type: an undeclared type variable in a function signature\n")
+	known_ty_at(fn.ret_name, ctx.recs, ctx.unions, fn)
 	const Ty frt = func_ret_ty(fn, ctx.recs, ctx.unions)
 	# thread this function's return type on the Ctx so `type_of` (a value-loop body) can reach it
 	const Ctx fctx = Ctx({
@@ -4536,6 +4555,7 @@ const check_func! = (Func fn, Ctx ctx): Iarch -> {
 		check_ptr_pointee(fn.params[pi], ctx.recs, ctx.unions, ctx)
 		# a `(A, ...) -> R` function-type parameter: arity cap + scalar components (679/680)
 		check_fn_param_sig!(fn.params[pi], ctx)
+		known_ty_at(fn.params[pi].type_name, ctx.recs, ctx.unions, fn)
 		const Ty pty = param_ty!(fn.params[pi], ctx.recs, ctx.unions)
 		# a `*Record` pointer parameter is mutable — its fields are written through it
 		const Bool pmut = param_is_recptr(fn.params[pi], ctx.recs) || param_is_indexptr(fn.params[pi])
@@ -4620,16 +4640,17 @@ const check_whole = (Program prog): Iarch -> {
 
 		loop {
 			if q >= r then break
-			if eq(prog.recs[q].name, prog.recs[r].name) then die("cf: type: two records share a name\n")
+			if eq(prog.recs[q].name, prog.recs[r].name)
+				then rerr(prog.recs[r], "cf: type: two records share a name\n")
 			q = q + 1
 		}
 
 		# a record may not reuse a union's name (a data/union name clash, either declaration order)
 		if find_union(prog.unions, prog.recs[r].name) >= 0
-			then die("cf: type: a data type and a union cannot share a name\n")
+			then rerr(prog.recs[r], "cf: type: a data type and a union cannot share a name\n")
 		# a record needs at least one field, and its field names must be distinct
 		const Iarch nf = Iarch(prog.recs[r].fields.len)
-		if nf == 0 then die("cf: type: a record needs at least one field\n")
+		if nf == 0 then rerr(prog.recs[r], "cf: type: a record needs at least one field\n")
 		let Iarch a = 0
 
 		loop {
@@ -4639,7 +4660,7 @@ const check_whole = (Program prog): Iarch -> {
 			loop {
 				if b >= a then break
 				if eq(prog.recs[r].fields[b], prog.recs[r].fields[a])
-					then die("cf: type: a record declares a field twice\n")
+					then rerr(prog.recs[r], "cf: type: a record declares a field twice\n")
 				b = b + 1
 			}
 
@@ -4647,25 +4668,25 @@ const check_whole = (Program prog): Iarch -> {
 			# plain `data` record is not generic, so the `'T` is undeclared (validated here at the
 			# declaration, since a never-USED field would otherwise slip past resolution)
 			if name_is_typevar(prog.recs[r].ftypes[a])
-				then die("cf: type: an undeclared type variable in a record field\n")
+				then rerr(prog.recs[r], "cf: type: an undeclared type variable in a record field\n")
 			# a field type must name a known type — a builtin, `Str`/`Bool`, or a declared record/union
 			# (an unknown name like `Nope`, or a generic application on a non-generic type, is rejected)
 			if !is_known_typename(prog.recs[r].ftypes[a], prog.recs, prog.unions)
-				then die("cf: type: a record field names an unknown type\n")
+				then rerr(prog.recs[r], "cf: type: a record field names an unknown type\n")
 			if eq(prog.recs[r].ftypes[a], "$tuple") && telems_have_typevar(prog.recs[r].ftelems[a])
-				then die("cf: type: an undeclared type variable in a tuple field\n")
+				then rerr(prog.recs[r], "cf: type: an undeclared type variable in a tuple field\n")
 			# a `*[T]` raw-pointer field is indexed `f[i]` by element width, so its element must be a
 			# word scalar — `*[Uint8]` (byte) or `*[Iarch]`/a fixed-width (word). A `*[Str]`/record
 			# element has no meaningful stride and is rejected (874); a `*Record` field has `felem` ""
 			if eq(prog.recs[r].ftypes[a], "$ptr") &&
 				!eq(prog.recs[r].felems[a], "") &&
 				!is_ptr_field_elem(prog.recs[r].felems[a])
-					then die("cf: type: a `*[T]` pointer field element must be `Uint8`, `Iarch`, or a fixed-width integer\n")
+					then rerr(prog.recs[r], "cf: type: a `*[T]` pointer field element must be `Uint8`, `Iarch`, or a fixed-width integer\n")
 			# an inline `[N Elem]` field is a flat byte span indexed by element width, so its element
 			# must be a word scalar (`Uint8`/`Iarch`/a fixed-width) — an aggregate element (a record,
 			# `Str`, nested array) has no meaningful inline stride and is a later brick
 			if eq(prog.recs[r].ftypes[a], "$fix") && !is_ptr_field_elem(prog.recs[r].felems[a])
-				then die("cf: type: an inline `[N Elem]` field element must be `Uint8`, `Iarch`, or a fixed-width integer\n")
+				then rerr(prog.recs[r], "cf: type: an inline `[N Elem]` field element must be `Uint8`, `Iarch`, or a fixed-width integer\n")
 			a = a + 1
 		}
 
