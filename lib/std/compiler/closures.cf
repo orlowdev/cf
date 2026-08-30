@@ -31,7 +31,7 @@ import std::compiler::ast::{
 	Program,
 	with_geom,
 }
-import std::str::{ eq }
+import std::str::{ eq, starts_with }
 import std::io::console::{ die }
 
 const no_names = (): [Str] -> {
@@ -814,33 +814,44 @@ const rw_call = (Str n, [Str] ta, [Expr] args, RwCtx m): Expr -> {
 		const Iarch cp = capturing_clo_arg(m.fns[fi], args, m.clos)
 
 		if cp >= 0 then {
-			const Iarch ci2 = clo_find(m.clos, arg_var_name(args[cp]))
-			const CloRef cr = m.clos[ci2]
-			let [Expr] all = []
+			# retarget through EVERY capturing-closure argument, layering the spec name — each
+			# round drops one closure arg and appends its captures; the clones build inner-first
+			# (`ensure_spec`), so `hof$w0$clo1$w0$clo2` composes
+			let Str callee = n
+			let [Expr] cur = args
 
-			for (a, ai) in args {
-				if ai != cp then {
-					if ai > cp && arg_is_capturing(a, m.clos)
-						then die("cf: closure: one capturing closure per call (a second is a later brick)\n")
-					all = [...all, a]
-				}
+			loop {
+				const Iarch ai = first_capturing(cur, m.clos)
+				if ai < 0 then break
+				const Iarch ci2 = clo_find(m.clos, arg_var_name(cur[ai]))
+				const CloRef cr = m.clos[ci2]
+				let [Expr] next = []
+
+				for (a, aj) in cur if aj != ai then next = [...next, a]
+
+				for c in cr.capargs next = [...next, c]
+
+				callee = spec_name(callee, ai, cr.lifted)
+				cur = next
 			}
 
-			for c in cr.capargs all = [...all, c]
-
-			return Expr.Call(spec_name(n, cp, cr.lifted), ta, all, "")
+			return Expr.Call(callee, ta, cur, "")
 		}
 	}
 
 	return Expr.Call(n, ta, args, "")
 }
 
-# Is this argument a capturing closure reference?
-const arg_is_capturing = (Expr a, [CloRef] clos): Bool -> {
-	const Iarch ci = clo_find(clos, arg_var_name(a))
-	if ci < 0 then return false
+# The first argument position holding a capturing-closure reference, or -1.
+const first_capturing = ([Expr] args, [CloRef] clos): Iarch -> {
+	for (a, ai) in args {
+		const Iarch ci = clo_find(clos, arg_var_name(a))
+		if ci >= 0 then {
+			if Iarch(clos[ci].capargs.len) > 0 then return ai
+		}
+	}
 
-	return Iarch(clos[ci].capargs.len) > 0
+	return -1
 }
 
 const rw_stmt = (Stmt s, RwCtx m): Stmt -> match s {
@@ -1439,6 +1450,15 @@ const sp_stmts! = ([Stmt] ss, SpCtx c): [Stmt] -> {
 	return out
 }
 
+# The clone's next capture-parameter ordinal: past every `$sp<i>` an inner layer already carries.
+const count_sp = ([Param] ps): Iarch -> {
+	let Iarch k = 0
+
+	for pp in ps if starts_with("\$sp", pp.name) then k = k + 1
+
+	return k
+}
+
 # Build the clone a spec name asks for. The closure's capture parameters (its `$capref`/`$capagg`
 # tail) are re-minted as `$sp<i>` parameters of the clone — same kinds, collision-free names.
 const build_spec! = ([Func] funcs, Str nm): Func -> {
@@ -1458,7 +1478,7 @@ const build_spec! = ([Func] funcs, Str nm): Func -> {
 
 	for pp in clo.params {
 		if eq(pp.type_name, "$capref") || eq(pp.type_name, "$capagg") then {
-			const Str cn = "\$sp${k}"
+			const Str cn = "\$sp${count_sp(params)}"
 			params = [
 				...params,
 				Param({
@@ -1498,6 +1518,19 @@ const build_spec! = ([Func] funcs, Str nm): Func -> {
 
 # Build every requested specialization to a fixpoint: a clone's own body may forward the closure
 # to a further HOF (a fresh spec name), so sweep until no call names a missing spec.
+# Build `nm` and, first, any INNER layer its hof half names (`hof$w0$clo1$w0$clo2` needs the
+# `hof$w0$clo1` clone in place before its own clone derives from it).
+const ensure_spec! = ([Func] funcs0, Str nm): [Func] -> {
+	if find_func(funcs0, nm) >= 0 then return funcs0
+	const SpecReq rq = parse_spec(nm)
+	let [Func] funcs = funcs0
+
+	if find_func(funcs, rq.hof) < 0 && has_spec_marker(rq.hof)
+		then funcs = ensure_spec!(funcs, rq.hof)
+
+	return [...funcs, build_spec!(funcs, nm)]
+}
+
 const specialize_hofs! = ([Func] funcs0): [Func] -> {
 	let [Func] funcs = funcs0
 
@@ -1505,7 +1538,7 @@ const specialize_hofs! = ([Func] funcs0): [Func] -> {
 		const [Str] want = missing_specs(funcs)
 		if Iarch(want.len) == 0 then break
 
-		for w in want funcs = [...funcs, build_spec!(funcs, w)]
+		for w in want funcs = ensure_spec!(funcs, w)
 	}
 
 	return funcs
