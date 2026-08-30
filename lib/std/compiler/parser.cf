@@ -8,7 +8,7 @@
 # Left-associative operators fold in a loop that reassigns an `Expr` accumulator
 # (`acc = Expr.Add(acc, rhs)`) — one function per precedence level.
 
-import std::io::console::{ die }
+import std::compiler::diag::{ die_at }
 import std::data::str::{ eq }
 import std::sys::{ Os, Arch }
 import std::compiler::token::{
@@ -81,6 +81,11 @@ import std::compiler::astutil::{ tel_leaf, tel_nest, tel_fn, tel_is_fn }
 pub data Parser = {
 	[Token] toks,
 	*[Uint8] src,
+	# located-error context: the enclosing FILE's bytes (`esrc`) and the bias (`ebase`) added
+	# to this parse's token offsets — a hole sub-parser scans a copied buffer, so its own
+	# offsets are hole-relative and `ebase` maps them back into the file
+	*[Uint8] esrc,
+	Iarch ebase,
 	Iarch pos,
 	Str file,
 	Os target_os,
@@ -95,6 +100,13 @@ pub data Parser = {
 
 # The current token's kind.
 const peek = (*Parser p): TokKind -> p.toks[p.pos].kind
+
+# Die with `msg` prefixed by the `path:line:col: ` of byte offset `off` in this parse's file
+# (`ebase` rebases a hole sub-parse into its enclosing file). Colorless — callable from any fn.
+const perr_off = (*Parser p, Iarch off, Str msg): Never -> die_at(p.file, p.esrc, p.ebase + off, msg)
+
+# Die located at the CURRENT token.
+const perr = (*Parser p, Str msg): Never -> perr_off(p, p.toks[p.pos].start, msg)
 
 # Is the current token the identifier `kw`?
 const kw = (*Parser p, Str word): Bool -> {
@@ -199,8 +211,8 @@ const float_text! = (*[Uint8] src, Iarch start, Iarch len): Str -> {
 	return Str(v)
 }
 
-# The single byte an escape `\<e>` decodes to (`\n \t \r \0 \\ \" \$`); an unknown
-# escape is rejected.
+# The single byte an escape `\<e>` decodes to (`\n \t \r \0 \\ \" \$`); -1 for an unknown
+# escape (the caller rejects it, locating the escape's own byte).
 const escape_byte = (Iarch e): Iarch -> {
 	if e == 110 then return 10  # \n
 	if e == 116 then return 9   # \t
@@ -209,9 +221,8 @@ const escape_byte = (Iarch e): Iarch -> {
 	if e == 92 then return 92   # backslash
 	if e == 34 then return 34   # quote
 	if e == 36 then return 36   # dollar
-	die("cf: parse: unknown string escape (allowed: \\n \\t \\r \\0 \\\\ \\\" \\$)\n")
 
-	return 0
+	return -1
 }
 
 # Parse an interpolation hole's RAW byte slice (src[hstart .. hstart+hlen]) into the Expr it
@@ -219,15 +230,16 @@ const escape_byte = (Iarch e): Iarch -> {
 # as a `Str` for a `.bytes` pointer), lexed, and run through the ordinary expression parser —
 # so a hole is any expression (`a + 8`, `ctx.next`, `xs[i].f`), not just a bare name. The
 # interned names in the resulting tree are copied into the arena, so they outlive the buffer.
-# A hole must be exactly one expression (trailing tokens are an error).
-const parse_hole! = (*[Uint8] src, Iarch hstart, Iarch hlen): Expr -> {
+# A hole must be exactly one expression (trailing tokens are an error). `hstart` is relative
+# to `p`'s own source; the sub-parser's `ebase` composes it so nested holes still locate.
+const parse_hole! = (*Parser p, Iarch hstart, Iarch hlen): Expr -> {
 	let [1024 Uint8] hbuf
-	if hlen >= Iarch(hbuf.len) then die("cf: parse: an interpolation hole is too long\n")
+	if hlen >= Iarch(hbuf.len) then perr_off(p, hstart, "cf: parse: an interpolation hole is too long\n")
 	let Iarch i = 0
 
 	loop {
 		if i >= hlen then break
-		hbuf[i] = src[hstart + i]
+		hbuf[i] = p.src[hstart + i]
 		i = i + 1
 	}
 
@@ -236,8 +248,10 @@ const parse_hole! = (*[Uint8] src, Iarch hstart, Iarch hlen): Expr -> {
 	let Parser hp = Parser({
 		toks: toks,
 		src: hbuf,
+		esrc: p.esrc,
+		ebase: p.ebase + hstart,
 		pos: 0,
-		file: "",
+		file: p.file,
 		target_os: Os.Darwin,
 		target_arch: Arch.Arm64,
 		saw_fb: false,
@@ -246,7 +260,7 @@ const parse_hole! = (*[Uint8] src, Iarch hstart, Iarch hlen): Expr -> {
 		pending: nopend,
 	})
 	const Expr e = parse_expr!(&hp)
-	if !is_eof(peek(&hp)) then die("cf: parse: an interpolation hole must be a single expression\n")
+	if !is_eof(peek(&hp)) then perr(&hp, "cf: parse: an interpolation hole must be a single expression\n")
 
 	return e
 }
@@ -257,7 +271,7 @@ const parse_hole! = (*[Uint8] src, Iarch hstart, Iarch hlen): Expr -> {
 # one byte; a raw newline is content; `\$` / a lone `$` are literal; `${expr}` is a hole
 # (an expression — an empty `${}` or a missing `}` is an error). The accumulated literal
 # run `cur` is flushed to a segment and RESET at each hole.
-const parse_string! = (*[Uint8] src, Iarch start, Iarch len): Expr -> {
+const parse_string! = (*Parser p, Iarch start, Iarch len): Expr -> {
 	let [Seg] segs = []
 	let [Uint8] cur = []
 	let Bool any_hole = false
@@ -265,14 +279,16 @@ const parse_string! = (*[Uint8] src, Iarch start, Iarch len): Expr -> {
 
 	loop {
 		if i >= len then break
-		const Iarch c = Iarch(src[start + i])
+		const Iarch c = Iarch(p.src[start + i])
 		if c == 92 then {
-			if i + 1 >= len then die("cf: parse: a dangling `\\` in a string\n")
-			cur = [...cur, escape_byte(Iarch(src[start + i + 1]))]
+			if i + 1 >= len then perr_off(p, start + i, "cf: parse: a dangling `\\` in a string\n")
+			const Iarch eb = escape_byte(Iarch(p.src[start + i + 1]))
+			if eb < 0 then perr_off(p, start + i, "cf: parse: unknown string escape (allowed: \\n \\t \\r \\0 \\\\ \\\" \\$)\n")
+			cur = [...cur, eb]
 			i = i + 2
 			continue
 		}
-		if c == 36 && i + 1 < len && Iarch(src[start + i + 1]) == 123 then {
+		if c == 36 && i + 1 < len && Iarch(p.src[start + i + 1]) == 123 then {
 			# `${expr}` — flush the pending literal run, reset it, then scan to the matching
 			# `}` and lex+parse the enclosed bytes as an expression hole.
 			segs = [...segs, Seg({ is_hole: false, lit: cur, name: "", expr: Expr.Lit(0) })]
@@ -281,13 +297,13 @@ const parse_string! = (*[Uint8] src, Iarch start, Iarch len): Expr -> {
 			let Iarch j = hstart
 
 			loop {
-				if j >= len then die("cf: parse: an unterminated interpolation hole (missing `}`)\n")
-				if Iarch(src[start + j]) == 125 then break
+				if j >= len then perr_off(p, start + hstart, "cf: parse: an unterminated interpolation hole (missing `}`)\n")
+				if Iarch(p.src[start + j]) == 125 then break
 				j = j + 1
 			}
 
-			if j == hstart then die("cf: parse: an empty interpolation hole\n")
-			const Expr he = parse_hole!(src, start + hstart, j - hstart)
+			if j == hstart then perr_off(p, start + hstart, "cf: parse: an empty interpolation hole\n")
+			const Expr he = parse_hole!(p, start + hstart, j - hstart)
 			segs = [...segs, Seg({ is_hole: true, lit: cur, name: "", expr: he })]
 			any_hole = true
 			i = j + 1
@@ -340,11 +356,11 @@ const parse_pipe_target! = (*Parser p, Expr piped): Expr -> {
 	if kw(p, "defer") then {
 		p.pos = p.pos + 1
 		if is_lbrace(peek(p))
-			then die("cf: parse: `|> defer { ... }` — a defer block taps no value; pipe into `defer f`\n")
-		if !is_ident(peek(p)) then die("cf: parse: `|> defer` needs a function name\n")
+			then perr(p, "cf: parse: `|> defer { ... }` — a defer block taps no value; pipe into `defer f`\n")
+		if !is_ident(peek(p)) then perr(p, "cf: parse: `|> defer` needs a function name\n")
 		const Iarch dc = Iarch(p.src[p.toks[p.pos].start])
 		if dc >= 65 && dc <= 90
-			then die("cf: parse: a `|> defer` target must be a function, not a type\n")
+			then perr(p, "cf: parse: a `|> defer` target must be a function, not a type\n")
 		const Str dn = cur_name!(p)
 		p.pos = p.pos + 1
 		let [Expr] dargs = []
@@ -352,9 +368,9 @@ const parse_pipe_target! = (*Parser p, Expr piped): Expr -> {
 
 		return Expr.DeferTap(dn, [...dargs, piped])
 	}
-	if !is_ident(peek(p)) then die("cf: parse: a `|>` target must be a function name\n")
+	if !is_ident(peek(p)) then perr(p, "cf: parse: a `|>` target must be a function name\n")
 	const Iarch c0 = Iarch(p.src[p.toks[p.pos].start])
-	if c0 >= 65 && c0 <= 90 then die("cf: parse: a `|>` target must be a function, not a type\n")
+	if c0 >= 65 && c0 <= 90 then perr(p, "cf: parse: a `|>` target must be a function, not a type\n")
 	const Str name = cur_name!(p)
 	p.pos = p.pos + 1
 	# a generic target with explicit type arguments — `x |> map[Iarch, Iarch](f)`
@@ -564,10 +580,10 @@ const parse_branch_body! = (*Parser p): Expr -> {
 const parse_if! = (*Parser p): Expr -> {
 	p.pos = p.pos + 1 # `if`
 	const Expr cond = parse_expr!(p)
-	if !kw(p, "then") then die("cf: parse: expected `then`\n")
+	if !kw(p, "then") then perr(p, "cf: parse: expected `then`\n")
 	p.pos = p.pos + 1
 	const Expr then_e = parse_branch_body!(p)
-	if !kw(p, "else") then die("cf: parse: expected `else` (an else-less `if` is a later brick)\n")
+	if !kw(p, "else") then perr(p, "cf: parse: expected `else` (an else-less `if` is a later brick)\n")
 	p.pos = p.pos + 1
 	const Expr else_e = parse_branch_body!(p)
 
@@ -591,7 +607,7 @@ const parse_args! = (*Parser p): [Expr] -> {
 			if is_rparen(peek(p)) then break # trailing comma
 		}
 	}
-	if !is_rparen(peek(p)) then die("cf: parse: expected `)` in a call\n")
+	if !is_rparen(peek(p)) then perr(p, "cf: parse: expected `)` in a call\n")
 	p.pos = p.pos + 1
 
 	return args
@@ -618,14 +634,14 @@ const parse_tyargs! = (*Parser p): [Str] -> {
 			p.pos = p.pos + 1
 		} else {
 			if !is_ident(peek(p)) && !is_lbracket(peek(p))
-				then die("cf: parse: expected a type or value argument in `[...]`\n")
+				then perr(p, "cf: parse: expected a type or value argument in `[...]`\n")
 			tys = [...tys, parse_type_ref!(p)]
 		}
 		if !is_comma(peek(p)) then break
 		p.pos = p.pos + 1
 	}
 
-	if !is_rbracket(peek(p)) then die("cf: parse: expected `]` after type arguments\n")
+	if !is_rbracket(peek(p)) then perr(p, "cf: parse: expected `]` after type arguments\n")
 	p.pos = p.pos + 1
 
 	return tys
@@ -633,7 +649,7 @@ const parse_tyargs! = (*Parser p): [Str] -> {
 
 const parse_generic_call! = (*Parser p, Str name): Expr -> {
 	const [Str] tys = parse_tyargs!(p)
-	if !is_lparen(peek(p)) then die("cf: parse: expected `(` after type arguments\n")
+	if !is_lparen(peek(p)) then perr(p, "cf: parse: expected `(` after type arguments\n")
 
 	return Expr.Call(name, tys, parse_args!(p), "")
 }
@@ -796,7 +812,7 @@ const parse_array_lit! = (*Parser p): Expr -> {
 			}
 		}
 
-		if !is_rbracket(peek(p)) then die("cf: parse: expected `]` in an array spread\n")
+		if !is_rbracket(peek(p)) then perr(p, "cf: parse: expected `]` in an array spread\n")
 		p.pos = p.pos + 1
 
 		return Expr.ArrayLit(true, src, sp_elems, "")
@@ -816,7 +832,7 @@ const parse_array_lit! = (*Parser p): Expr -> {
 			if is_rbracket(peek(p)) then break # trailing comma
 		}
 	}
-	if !is_rbracket(peek(p)) then die("cf: parse: expected `]` in an array literal\n")
+	if !is_rbracket(peek(p)) then perr(p, "cf: parse: expected `]` in an array literal\n")
 	p.pos = p.pos + 1
 
 	# a non-spread literal carries an unread `Lit(0)` in the spread-source slot (read only
@@ -836,7 +852,7 @@ const parse_union_mk! = (*Parser p, Str type_name, Str member): Expr -> {
 			if is_rparen(peek(p)) then break # trailing comma
 		}
 	}
-	if !is_rparen(peek(p)) then die("cf: parse: expected `)` in a union construction\n")
+	if !is_rparen(peek(p)) then perr(p, "cf: parse: expected `)` in a union construction\n")
 	p.pos = p.pos + 1
 
 	return Expr.UnionMk(type_name, member, args)
@@ -884,8 +900,8 @@ const parse_arm_head! = (*Parser p): MatchArm -> {
 		const [Str] nob = []
 
 		loop {
-			if !is_strlit(peek(p)) then die("cf: parse: expected a string pattern after `|`\n")
-			const Expr se = parse_string!(p.src, p.toks[p.pos].start, p.toks[p.pos].len)
+			if !is_strlit(peek(p)) then perr(p, "cf: parse: expected a string pattern after `|`\n")
+			const Expr se = parse_string!(p, p.toks[p.pos].start, p.toks[p.pos].len)
 			let [Uint8] patb = []
 
 			match se {
@@ -893,7 +909,7 @@ const parse_arm_head! = (*Parser p): MatchArm -> {
 					patb = bytes
 				},
 				_ -> {
-					die("cf: parse: a string match pattern cannot interpolate\n")
+					perr(p, "cf: parse: a string match pattern cannot interpolate\n")
 				},
 			}
 
@@ -903,7 +919,7 @@ const parse_arm_head! = (*Parser p): MatchArm -> {
 			p.pos = p.pos + 1
 		}
 
-		if !is_arrow(peek(p)) then die("cf: parse: expected `->` in a match arm\n")
+		if !is_arrow(peek(p)) then perr(p, "cf: parse: expected `->` in a match arm\n")
 		p.pos = p.pos + 1
 
 		return MatchArm({
@@ -928,7 +944,7 @@ const parse_arm_head! = (*Parser p): MatchArm -> {
 				neg = true
 				p.pos = p.pos + 1
 			}
-			if !is_intlit(peek(p)) then die("cf: parse: expected an integer pattern\n")
+			if !is_intlit(peek(p)) then perr(p, "cf: parse: expected an integer pattern\n")
 			let Iarch v = p.toks[p.pos].ival
 			if neg then v = 0 - v
 			pats = [...pats, int_to_dec!(v)]
@@ -937,7 +953,7 @@ const parse_arm_head! = (*Parser p): MatchArm -> {
 			p.pos = p.pos + 1
 		}
 
-		if !is_arrow(peek(p)) then die("cf: parse: expected `->` in a match arm\n")
+		if !is_arrow(peek(p)) then perr(p, "cf: parse: expected `->` in a match arm\n")
 		p.pos = p.pos + 1
 
 		return MatchArm({
@@ -948,7 +964,7 @@ const parse_arm_head! = (*Parser p): MatchArm -> {
 			body: Expr.Lit(0),
 		})
 	}
-	if !is_ident(peek(p)) then die("cf: parse: expected a match-arm pattern\n")
+	if !is_ident(peek(p)) then perr(p, "cf: parse: expected a match-arm pattern\n")
 	let Str first = cur_name!(p)
 	p.pos = p.pos + 1
 	# a match arm may qualify by the union's exact INSTANCE (`U[Iarch].Pair`), not only its base
@@ -957,7 +973,7 @@ const parse_arm_head! = (*Parser p): MatchArm -> {
 	if is_lbracket(peek(p)) then first = parse_type_app_tail!(p, first)
 	if is_dot(peek(p)) then {
 		p.pos = p.pos + 1
-		if !is_ident(peek(p)) then die("cf: parse: expected a member name after `.`\n")
+		if !is_ident(peek(p)) then perr(p, "cf: parse: expected a member name after `.`\n")
 		let [Str] members = []
 		members = [...members, cur_name!(p)]
 		p.pos = p.pos + 1
@@ -977,25 +993,25 @@ const parse_arm_head! = (*Parser p): MatchArm -> {
 						gneg = true
 						p.pos = p.pos + 1
 					}
-					if !is_intlit(peek(p)) then die("cf: parse: expected an integer sub-pattern\n")
+					if !is_intlit(peek(p)) then perr(p, "cf: parse: expected an integer sub-pattern\n")
 					let Iarch gv = p.toks[p.pos].ival
 					if gneg then gv = 0 - gv
 					binds = [...binds, "#${int_to_dec!(gv)}"]
 					p.pos = p.pos + 1
 				} else {
-					if !is_ident(peek(p)) then die("cf: parse: expected a binding name, `_`, or a sub-pattern\n")
+					if !is_ident(peek(p)) then perr(p, "cf: parse: expected a binding name, `_`, or a sub-pattern\n")
 					const Str nm = cur_name!(p)
 					p.pos = p.pos + 1
 
 					if is_dot(peek(p)) then {
 						p.pos = p.pos + 1
-						if !is_ident(peek(p)) then die("cf: parse: expected a member name after `.`\n")
+						if !is_ident(peek(p)) then perr(p, "cf: parse: expected a member name after `.`\n")
 						const Str gm = cur_name!(p)
 						p.pos = p.pos + 1
-						if is_lparen(peek(p)) then die("cf: parse: a nested sub-pattern is one level only\n")
+						if is_lparen(peek(p)) then perr(p, "cf: parse: a nested sub-pattern is one level only\n")
 						binds = [...binds, "=${nm}.${gm}"]
 					} else if is_pascal_name(nm) then {
-						if is_lparen(peek(p)) then die("cf: parse: a nested sub-pattern is one level only\n")
+						if is_lparen(peek(p)) then perr(p, "cf: parse: a nested sub-pattern is one level only\n")
 						binds = [...binds, "=${nm}"]
 					} else {
 						binds = [...binds, nm]
@@ -1006,27 +1022,27 @@ const parse_arm_head! = (*Parser p): MatchArm -> {
 				p.pos = p.pos + 1
 			}
 
-			if !is_rparen(peek(p)) then die("cf: parse: expected `)` in a payload pattern\n")
+			if !is_rparen(peek(p)) then perr(p, "cf: parse: expected `)` in a payload pattern\n")
 			p.pos = p.pos + 1
 		} else {
 			# an or-pattern: further `Type.member` alternatives sharing the qualifier
 			loop {
 				if !is_pipe(peek(p)) then break
 				p.pos = p.pos + 1
-				if !is_ident(peek(p)) then die("cf: parse: expected `Type.member` after `|`\n")
+				if !is_ident(peek(p)) then perr(p, "cf: parse: expected `Type.member` after `|`\n")
 				const Str q = cur_name!(p)
 				p.pos = p.pos + 1
 				if !eq(q, first)
-					then die("cf: parse: or-pattern alternatives must share the union qualifier\n")
-				if !is_dot(peek(p)) then die("cf: parse: expected `.` in an or-pattern alternative\n")
+					then perr(p, "cf: parse: or-pattern alternatives must share the union qualifier\n")
+				if !is_dot(peek(p)) then perr(p, "cf: parse: expected `.` in an or-pattern alternative\n")
 				p.pos = p.pos + 1
-				if !is_ident(peek(p)) then die("cf: parse: expected a member name after `.`\n")
+				if !is_ident(peek(p)) then perr(p, "cf: parse: expected a member name after `.`\n")
 				members = [...members, cur_name!(p)]
 				p.pos = p.pos + 1
 			}
 		}
 
-		if !is_arrow(peek(p)) then die("cf: parse: expected `->` in a match arm\n")
+		if !is_arrow(peek(p)) then perr(p, "cf: parse: expected `->` in a match arm\n")
 		p.pos = p.pos + 1
 
 		return MatchArm({
@@ -1037,10 +1053,10 @@ const parse_arm_head! = (*Parser p): MatchArm -> {
 			body: Expr.Lit(0),
 		})
 	}
-	if !eq(first, "_") then die("cf: parse: a match-arm pattern is `_` or `Type.member`\n")
+	if !eq(first, "_") then perr(p, "cf: parse: a match-arm pattern is `_` or `Type.member`\n")
 	if is_pipe(peek(p))
-		then die("cf: parse: `_` is a standalone wildcard, not an or-pattern alternative\n")
-	if !is_arrow(peek(p)) then die("cf: parse: expected `->` after `_`\n")
+		then perr(p, "cf: parse: `_` is a standalone wildcard, not an or-pattern alternative\n")
+	if !is_arrow(peek(p)) then perr(p, "cf: parse: expected `->` after `_`\n")
 	p.pos = p.pos + 1
 	const [Str] no_members = []
 	const [Str] no_binds = []
@@ -1094,7 +1110,7 @@ const parse_stmt_arm! = (*Parser p): StmtArm -> {
 const parse_match! = (*Parser p): Expr -> {
 	p.pos = p.pos + 1 # `match`
 	const Expr scrut = parse_expr!(p)
-	if !is_lbrace(peek(p)) then die("cf: parse: expected `{` after a match scrutinee\n")
+	if !is_lbrace(peek(p)) then perr(p, "cf: parse: expected `{` after a match scrutinee\n")
 	p.pos = p.pos + 1
 	let [MatchArm] arms = []
 
@@ -1105,7 +1121,7 @@ const parse_match! = (*Parser p): Expr -> {
 		p.pos = p.pos + 1
 	}
 
-	if !is_rbrace(peek(p)) then die("cf: parse: expected `}` to close a match\n")
+	if !is_rbrace(peek(p)) then perr(p, "cf: parse: expected `}` to close a match\n")
 	p.pos = p.pos + 1
 
 	return Expr.Match(scrut, arms)
@@ -1118,7 +1134,7 @@ const parse_match! = (*Parser p): Expr -> {
 const parse_stmt_match! = (*Parser p): Stmt -> {
 	p.pos = p.pos + 1 # `match`
 	const Expr scrut = parse_expr!(p)
-	if !is_lbrace(peek(p)) then die("cf: parse: expected `{` after a match scrutinee\n")
+	if !is_lbrace(peek(p)) then perr(p, "cf: parse: expected `{` after a match scrutinee\n")
 	p.pos = p.pos + 1
 	let [StmtArm] arms = []
 
@@ -1129,7 +1145,7 @@ const parse_stmt_match! = (*Parser p): Stmt -> {
 		p.pos = p.pos + 1
 	}
 
-	if !is_rbrace(peek(p)) then die("cf: parse: expected `}` to close a match\n")
+	if !is_rbrace(peek(p)) then perr(p, "cf: parse: expected `}` to close a match\n")
 	p.pos = p.pos + 1
 
 	return Stmt.Match(scrut, arms)
@@ -1151,7 +1167,7 @@ const postfix_chain! = (*Parser p, Expr base): Expr -> {
 		let Bool advanced = false
 		if is_dot(peek(p)) then {
 			p.pos = p.pos + 1
-			if !is_ident(peek(p)) then die("cf: parse: expected a field name after `.`\n")
+			if !is_ident(peek(p)) then perr(p, "cf: parse: expected a field name after `.`\n")
 			const Str f = cur_name!(p)
 			p.pos = p.pos + 1
 			acc = Expr.FieldExpr(acc, f)
@@ -1160,7 +1176,7 @@ const postfix_chain! = (*Parser p, Expr base): Expr -> {
 		if is_lbracket(peek(p)) then {
 			p.pos = p.pos + 1
 			const Expr idx = parse_expr!(p)
-			if !is_rbracket(peek(p)) then die("cf: parse: expected `]` in an index\n")
+			if !is_rbracket(peek(p)) then perr(p, "cf: parse: expected `]` in an index\n")
 			p.pos = p.pos + 1
 			acc = Expr.IndexExpr(acc, idx)
 			advanced = true
@@ -1180,13 +1196,13 @@ const parse_primary! = (*Parser p): Expr -> {
 	# (a no-arg call has nothing to tap; a block taps no value).
 	if kw(p, "defer") then {
 		p.pos = p.pos + 1
-		if is_lbrace(peek(p)) then die("cf: parse: `defer { ... }` is a statement, not a value\n")
-		if !is_ident(peek(p)) then die("cf: parse: `defer` as a value needs a call `defer f(x)`\n")
+		if is_lbrace(peek(p)) then perr(p, "cf: parse: `defer { ... }` is a statement, not a value\n")
+		if !is_ident(peek(p)) then perr(p, "cf: parse: `defer` as a value needs a call `defer f(x)`\n")
 		const Str dn = cur_name!(p)
 		p.pos = p.pos + 1
-		if !is_lparen(peek(p)) then die("cf: parse: `defer` as a value needs a call `defer f(x)`\n")
+		if !is_lparen(peek(p)) then perr(p, "cf: parse: `defer` as a value needs a call `defer f(x)`\n")
 		const [Expr] dargs = parse_args!(p)
-		if Iarch(dargs.len) == 0 then die("cf: parse: `defer f()` as a value has no tapped argument\n")
+		if Iarch(dargs.len) == 0 then perr(p, "cf: parse: `defer f()` as a value has no tapped argument\n")
 
 		return Expr.DeferTap(dn, dargs)
 	}
@@ -1194,7 +1210,7 @@ const parse_primary! = (*Parser p): Expr -> {
 	# in statement position `parse_stmt` reads it as an effect-only `Stmt.Loop`.
 	if kw(p, "loop") then {
 		p.pos = p.pos + 1
-		if !is_lbrace(peek(p)) then die("cf: parse: expected `{` after `loop`\n")
+		if !is_lbrace(peek(p)) then perr(p, "cf: parse: expected `{` after `loop`\n")
 		p.pos = p.pos + 1
 
 		return Expr.Loop(parse_block!(p))
@@ -1224,7 +1240,7 @@ const parse_primary! = (*Parser p): Expr -> {
 			if is_lbrace(p.toks[p.pos + 1].kind) && is_pascal_name(name) then {
 				p.pos = p.pos + 1
 				const Expr rec = parse_record_lit!(p, name)
-				if !is_rparen(peek(p)) then die("cf: parse: expected `)` after a record construction\n")
+				if !is_rparen(peek(p)) then perr(p, "cf: parse: expected `)` after a record construction\n")
 				p.pos = p.pos + 1
 
 				return rec
@@ -1235,7 +1251,7 @@ const parse_primary! = (*Parser p): Expr -> {
 		}
 		if is_dot(peek(p)) then {
 			p.pos = p.pos + 1
-			if !is_ident(peek(p)) then die("cf: parse: expected a field name after `.`\n")
+			if !is_ident(peek(p)) then perr(p, "cf: parse: expected a field name after `.`\n")
 			const Str field = cur_name!(p)
 			p.pos = p.pos + 1
 			# `Bool.True` / `Bool.False` — the explicit qualified form of the `true`/`false` literal
@@ -1244,7 +1260,7 @@ const parse_primary! = (*Parser p): Expr -> {
 			if eq(name, "Bool") then {
 				if eq(field, "True") then return Expr.BoolLit(true)
 				if eq(field, "False") then return Expr.BoolLit(false)
-				die("cf: parse: `Bool` has only the members `True` and `False`\n")
+				perr(p, "cf: parse: `Bool` has only the members `True` and `False`\n")
 			}
 			# `Type.member(args)` is a payload-member construction; `base.field` (no
 			# args) is a field read or a tag-only-member construction.
@@ -1256,9 +1272,9 @@ const parse_primary! = (*Parser p): Expr -> {
 		# call/index forms; all three start with `[`)
 		if generic_ctor_ahead(p) then {
 			const Str tyapp = parse_type_app_tail!(p, name)
-			if !is_dot(peek(p)) then die("cf: parse: expected `.member` after a generic type\n")
+			if !is_dot(peek(p)) then perr(p, "cf: parse: expected `.member` after a generic type\n")
 			p.pos = p.pos + 1
-			if !is_ident(peek(p)) then die("cf: parse: expected a union member name\n")
+			if !is_ident(peek(p)) then perr(p, "cf: parse: expected a union member name\n")
 			const Str member = cur_name!(p)
 			p.pos = p.pos + 1
 			if is_lparen(peek(p)) then return postfix_chain!(p, parse_union_mk!(p, tyapp, member))
@@ -1274,11 +1290,11 @@ const parse_primary! = (*Parser p): Expr -> {
 		if is_lbracket(peek(p)) then {
 			p.pos = p.pos + 1
 			const Expr idx = parse_expr!(p)
-			if !is_rbracket(peek(p)) then die("cf: parse: expected `]` in an index\n")
+			if !is_rbracket(peek(p)) then perr(p, "cf: parse: expected `]` in an index\n")
 			p.pos = p.pos + 1
 			if is_dot(peek(p)) then {
 				p.pos = p.pos + 1
-				if !is_ident(peek(p)) then die("cf: parse: expected a field name after `.`\n")
+				if !is_ident(peek(p)) then perr(p, "cf: parse: expected a field name after `.`\n")
 				const Str ifield = cur_name!(p)
 				p.pos = p.pos + 1
 
@@ -1310,7 +1326,7 @@ const parse_primary! = (*Parser p): Expr -> {
 		const Iarch len = p.toks[p.pos].len
 		p.pos = p.pos + 1
 
-		return postfix_chain!(p, parse_string!(p.src, start, len))
+		return postfix_chain!(p, parse_string!(p, start, len))
 	}
 	# `(params) [: ret] -> body` in EXPRESSION position — an ANONYMOUS function value (ebnf
 	# Functions: a function is just a value). Parsed as a closure under a hidden name, queued for
@@ -1331,7 +1347,7 @@ const parse_primary! = (*Parser p): Expr -> {
 		# distinguish a record literal from a block body in value position (`-> ({...})` vs `-> {...}`).
 		if is_lbrace(peek(p)) then {
 			const Expr rec = parse_record_lit!(p, "")
-			if !is_rparen(peek(p)) then die("cf: parse: expected `)` after a parenthesized record literal\n")
+			if !is_rparen(peek(p)) then perr(p, "cf: parse: expected `)` after a parenthesized record literal\n")
 			p.pos = p.pos + 1
 
 			return postfix_chain!(p, rec)
@@ -1360,7 +1376,7 @@ const parse_primary! = (*Parser p): Expr -> {
 			if is_rparen(peek(p)) then break
 		}
 
-		if !is_rparen(peek(p)) then die("cf: parse: expected `)` in a tuple\n")
+		if !is_rparen(peek(p)) then perr(p, "cf: parse: expected `)` in a tuple\n")
 		p.pos = p.pos + 1
 		if Iarch(elems.len) == 1 then {
 			if !is_spread_p(elems[0]) then return postfix_chain!(p, elems[0])
@@ -1368,7 +1384,7 @@ const parse_primary! = (*Parser p): Expr -> {
 
 		return Expr.Tuple(elems)
 	}
-	die("cf: parse: expected an integer or `(`\n")
+	perr(p, "cf: parse: expected an integer or `(`\n")
 
 	return Expr.Lit(0)
 }
@@ -1392,12 +1408,12 @@ const parse_record_lit! = (*Parser p, Str type_name): Expr -> {
 		if is_ellipsis(peek(p)) then {
 			p.pos = p.pos + 1
 			if !is_ident(peek(p))
-				then die("cf: parse: expected a record variable after `...` in a data literal\n")
+				then perr(p, "cf: parse: expected a record variable after `...` in a data literal\n")
 			const Str src = cur_name!(p)
 			p.pos = p.pos + 1
 			inits = [...inits, FieldInit({ field: "$spread", value: Expr.Var(src) })]
 		} else {
-			if !is_ident(peek(p)) then die("cf: parse: expected a field name in a data literal\n")
+			if !is_ident(peek(p)) then perr(p, "cf: parse: expected a field name in a data literal\n")
 			const Str field = cur_name!(p)
 			p.pos = p.pos + 1
 
@@ -1420,7 +1436,7 @@ const parse_record_lit! = (*Parser p, Str type_name): Expr -> {
 		p.pos = p.pos + 1
 	}
 
-	if !is_rbrace(peek(p)) then die("cf: parse: expected `}` in a data literal\n")
+	if !is_rbrace(peek(p)) then perr(p, "cf: parse: expected `}` in a data literal\n")
 	p.pos = p.pos + 1
 
 	return Expr.Record(type_name, inits)
@@ -1467,16 +1483,16 @@ const is_call_e = (Expr e): Bool -> match e { Expr.Call(c, ta, args, _) -> true,
 
 # Validate a destructure pattern token: a bare name binds a position; a `_`-led token is a
 # skip — `_` (one) or `_<digits>` (n) — and anything else (`_foo`) is rejected.
-const check_pat_tok = (Str tok): Iarch -> {
-	if Iarch(tok.len) == 0 then die("cf: parse: an empty destructure pattern token\n")
+const check_pat_tok = (*Parser p, Str tok): Iarch -> {
+	if Iarch(tok.len) == 0 then perr(p, "cf: parse: an empty destructure pattern token\n")
 	if Iarch(tok[0]) != 95 then return 0
 	let Iarch i = 1
 
 	loop {
 		if i >= Iarch(tok.len) then break
 		const Iarch d = Iarch(tok[i])
-		if d < 48 then die("cf: parse: a skip token must be `_` or `_<digits>`\n")
-		if d > 57 then die("cf: parse: a skip token must be `_` or `_<digits>`\n")
+		if d < 48 then perr(p, "cf: parse: a skip token must be `_` or `_<digits>`\n")
+		if d > 57 then perr(p, "cf: parse: a skip token must be `_` or `_<digits>`\n")
 		i = i + 1
 	}
 
@@ -1491,9 +1507,9 @@ const parse_destructure! = (*Parser p, Bool mutable): Stmt -> {
 	let [Str] pat = []
 
 	loop {
-		if !is_ident(peek(p)) then die("cf: parse: expected a pattern name or `_` in a destructure\n")
+		if !is_ident(peek(p)) then perr(p, "cf: parse: expected a pattern name or `_` in a destructure\n")
 		const Str tok = cur_name!(p)
-		check_pat_tok(tok)
+		check_pat_tok(p, tok)
 		pat = [...pat, tok]
 		p.pos = p.pos + 1
 		if !is_comma(peek(p)) then break
@@ -1501,9 +1517,9 @@ const parse_destructure! = (*Parser p, Bool mutable): Stmt -> {
 		if is_rparen(peek(p)) then break
 	}
 
-	if !is_rparen(peek(p)) then die("cf: parse: expected `)` in a destructure pattern\n")
+	if !is_rparen(peek(p)) then perr(p, "cf: parse: expected `)` in a destructure pattern\n")
 	p.pos = p.pos + 1
-	if !is_eq(peek(p)) then die("cf: parse: expected `=` in a destructure\n")
+	if !is_eq(peek(p)) then perr(p, "cf: parse: expected `=` in a destructure\n")
 	p.pos = p.pos + 1
 
 	return Stmt.Destructure(pat, mutable, parse_expr!(p))
@@ -1527,9 +1543,9 @@ const parse_let! = (*Parser p, Bool mutable): Stmt -> {
 			const Iarch n = p.toks[p.pos].ival
 			p.pos = p.pos + 1 # N
 			const Str felem = parse_fixed_elem!(p)
-			if !is_rbracket(peek(p)) then die("cf: parse: expected `]` in a fixed-array type\n")
+			if !is_rbracket(peek(p)) then perr(p, "cf: parse: expected `]` in a fixed-array type\n")
 			p.pos = p.pos + 1 # `]`
-			if !is_ident(peek(p)) then die("cf: parse: expected a binding name\n")
+			if !is_ident(peek(p)) then perr(p, "cf: parse: expected a binding name\n")
 			const Str bname = cur_name!(p)
 			p.pos = p.pos + 1
 			if is_eq(peek(p)) then {
@@ -1540,9 +1556,9 @@ const parse_let! = (*Parser p, Bool mutable): Stmt -> {
 				# a scalar `= 0`, a spread — is not a fixed-array initializer (190).
 				if is_arraylit_e(init) then {
 					if !is_fixed_arraylit(init, n)
-						then die("cf: parse: a fixed-array initializer must be a plain array literal of exactly N elements (no spread)\n")
+						then perr(p, "cf: parse: a fixed-array initializer must be a plain array literal of exactly N elements (no spread)\n")
 				} else if !is_call_e(init)
-						then die("cf: parse: a fixed-array binding needs an array literal or an array-returning call\n")
+						then perr(p, "cf: parse: a fixed-array binding needs an array literal or an array-returning call\n")
 
 				# tag the binding `$fix<N>` so typecheck marks it FIXED and knows its length: it may not be
 				# a spread source or grown in place (typing is otherwise the shared dynamic-array machinery).
@@ -1550,9 +1566,9 @@ const parse_let! = (*Parser p, Bool mutable): Stmt -> {
 			}
 			# an UNINITIALIZED `[N Elem] buf` is a byte buffer (a read target): it needs a POSITIVE size
 			# and holds `Uint8` only — a `[0 Uint8]` (188) or a non-`Uint8` element (189) is rejected
-			if n <= 0 then die("cf: parse: a byte buffer needs a positive comptime length\n")
+			if n <= 0 then perr(p, "cf: parse: a byte buffer needs a positive comptime length\n")
 			if !eq(felem, "Uint8")
-				then die("cf: parse: an uninitialized byte buffer holds `Uint8` only\n")
+				then perr(p, "cf: parse: an uninitialized byte buffer holds `Uint8` only\n")
 
 			return Stmt.Let(bname, mutable, "", Expr.Buffer(Expr.Lit(n)))
 		}
@@ -1566,19 +1582,19 @@ const parse_let! = (*Parser p, Bool mutable): Stmt -> {
 			p.pos = p.pos + 1 # size name
 			const Str felem2 = cur_name!(p)
 			p.pos = p.pos + 1 # element type
-			if !is_rbracket(peek(p)) then die("cf: parse: expected `]` in a value-parameter-sized buffer\n")
+			if !is_rbracket(peek(p)) then perr(p, "cf: parse: expected `]` in a value-parameter-sized buffer\n")
 			p.pos = p.pos + 1 # `]`
-			if !is_ident(peek(p)) then die("cf: parse: expected a binding name\n")
+			if !is_ident(peek(p)) then perr(p, "cf: parse: expected a binding name\n")
 			const Str bufname = cur_name!(p)
 			p.pos = p.pos + 1
 
 			return Stmt.Let(bufname, mutable, "", Expr.Buffer(Expr.Var(szname)))
 		}
 		const Str elem = dyn_elem_of(parse_type!(p))
-		if !is_ident(peek(p)) then die("cf: parse: expected a binding name\n")
+		if !is_ident(peek(p)) then perr(p, "cf: parse: expected a binding name\n")
 		const Str dname = cur_name!(p)
 		p.pos = p.pos + 1
-		if !is_eq(peek(p)) then die("cf: parse: expected `=` in a binding\n")
+		if !is_eq(peek(p)) then perr(p, "cf: parse: expected `=` in a binding\n")
 		p.pos = p.pos + 1
 
 		return Stmt.Let(dname, mutable, "", set_arr_elem(parse_init!(p, ""), elem))
@@ -1588,22 +1604,22 @@ const parse_let! = (*Parser p, Bool mutable): Stmt -> {
 	# later brick) and its initializer must be an address `&x` (a bare aggregate value is NOT an
 	# implicit pointer). §6.4's `*Scalar` ban is enforced by `parse_star_agg_name`.
 	if is_star(peek(p)) then {
-		if mutable then die("cf: parse: a `*` pointer binding must be `const`\n")
+		if mutable then perr(p, "cf: parse: a `*` pointer binding must be `const`\n")
 		const Str pointee = parse_star_agg_name!(p)
-		if !is_ident(peek(p)) then die("cf: parse: expected a binding name after a pointer type\n")
+		if !is_ident(peek(p)) then perr(p, "cf: parse: expected a binding name after a pointer type\n")
 		const Str pname = cur_name!(p)
 		p.pos = p.pos + 1
-		if !is_eq(peek(p)) then die("cf: parse: expected `=` in a binding\n")
+		if !is_eq(peek(p)) then perr(p, "cf: parse: expected `=` in a binding\n")
 		p.pos = p.pos + 1
 		const Expr pinit = parse_init!(p, pointee)
 
 		const Bool is_addr = match pinit { Expr.Addr(_) -> true, _ -> false }
 
-		if !is_addr then die("cf: parse: a `*` pointer binding's initializer must be an address (`&x`)\n")
+		if !is_addr then perr(p, "cf: parse: a `*` pointer binding's initializer must be an address (`&x`)\n")
 
 		return Stmt.Let(pname, false, pointee, pinit)
 	}
-	if !is_ident(peek(p)) then die("cf: parse: expected a binding name\n")
+	if !is_ident(peek(p)) then perr(p, "cf: parse: expected a binding name\n")
 	# `TYPE name` (an annotation) vs a bare `name`. A generic type-application annotation
 	# `Box[Iarch] b` is recognized by the `[` after the first name (in a binding, `Name[...]` is
 	# always a type, never an index); otherwise the first ident is the name unless a second
@@ -1615,7 +1631,7 @@ const parse_let! = (*Parser p, Bool mutable): Stmt -> {
 		# a `Box[Iarch]` generic-application annotation, or a member-type annotation `Color.Red` /
 		# `Maybe[Iarch].Just` (the `.` after the first name — §8.1, collapsed to its union by resolve)
 		type_name = parse_member_type!(p)
-		if !is_ident(peek(p)) then die("cf: parse: expected a binding name after a type\n")
+		if !is_ident(peek(p)) then perr(p, "cf: parse: expected a binding name after a type\n")
 		name = cur_name!(p)
 		p.pos = p.pos + 1
 	} else {
@@ -1628,12 +1644,12 @@ const parse_let! = (*Parser p, Bool mutable): Stmt -> {
 		}
 	}
 
-	if !is_eq(peek(p)) then die("cf: parse: expected `=` in a binding\n")
+	if !is_eq(peek(p)) then perr(p, "cf: parse: expected `=` in a binding\n")
 	p.pos = p.pos + 1
 	# `const name = (params) -> ...` — a local closure (memory_model §7). A `let`-bound closure is
 	# rejected (no reassignable closures); a closure takes no type annotation.
 	if is_lparen(peek(p)) && lambda_ahead(p) then {
-		if mutable then die("cf: parse: a closure must be bound with `const`\n")
+		if mutable then perr(p, "cf: parse: a closure must be bound with `const`\n")
 
 		return parse_closure!(p, name)
 	}
@@ -1651,7 +1667,7 @@ const parse_loop! = (*Parser p): Stmt -> {
 		lbl = cur_name!(p)
 		p.pos = p.pos + 1
 	}
-	if !is_lbrace(peek(p)) then die("cf: parse: expected `{` after `loop`\n")
+	if !is_lbrace(peek(p)) then perr(p, "cf: parse: expected `{` after `loop`\n")
 	p.pos = p.pos + 1
 	const [Stmt] body = parse_block!(p)
 
@@ -1690,7 +1706,7 @@ const parse_guard_body! = (*Parser p): Stmt -> {
 const parse_guard! = (*Parser p): Stmt -> {
 	p.pos = p.pos + 1 # `if`
 	const Expr cond = parse_expr!(p)
-	if !kw(p, "then") then die("cf: parse: expected `then`\n")
+	if !kw(p, "then") then perr(p, "cf: parse: expected `then`\n")
 	p.pos = p.pos + 1
 	const Stmt body = parse_guard_body!(p)
 	if kw(p, "else") then {
@@ -1744,22 +1760,22 @@ const parse_for! = (*Parser p): Stmt -> {
 
 	if is_lparen(peek(p)) then {
 		p.pos = p.pos + 1
-		if !is_ident(peek(p)) then die("cf: parse: expected an element variable in a for-loop pattern\n")
+		if !is_ident(peek(p)) then perr(p, "cf: parse: expected an element variable in a for-loop pattern\n")
 		lv = cur_name!(p)
 		p.pos = p.pos + 1
-		if !is_comma(peek(p)) then die("cf: parse: expected `,` in a `for (x, i)` pattern\n")
+		if !is_comma(peek(p)) then perr(p, "cf: parse: expected `,` in a `for (x, i)` pattern\n")
 		p.pos = p.pos + 1
-		if !is_ident(peek(p)) then die("cf: parse: expected an index variable in a for-loop pattern\n")
+		if !is_ident(peek(p)) then perr(p, "cf: parse: expected an index variable in a for-loop pattern\n")
 		iv = cur_name!(p)
 		p.pos = p.pos + 1
-		if !is_rparen(peek(p)) then die("cf: parse: expected `)` in a `for (x, i)` pattern\n")
+		if !is_rparen(peek(p)) then perr(p, "cf: parse: expected `)` in a `for (x, i)` pattern\n")
 		p.pos = p.pos + 1
 	} else {
-		if !is_ident(peek(p)) then die("cf: parse: expected a loop variable after `for`\n")
+		if !is_ident(peek(p)) then perr(p, "cf: parse: expected a loop variable after `for`\n")
 		lv = cur_name!(p)
 		p.pos = p.pos + 1
 	}
-	if !kw(p, "in") then die("cf: parse: expected `in` in a for-loop\n")
+	if !kw(p, "in") then perr(p, "cf: parse: expected `in` in a for-loop\n")
 	p.pos = p.pos + 1
 	# the iterable is a full EXPRESSION (ebnf for_expr) — a name, a field read, a call result.
 	# Expressions never juxtapose, so the boundary before the body (`{` or a same-line statement
@@ -1808,7 +1824,7 @@ const parse_for_body! = (*Parser p): [Stmt] -> {
 		return parse_block!(p)
 	}
 	if nl_before(p, p.pos)
-		then die("cf: parse: a for-loop body is a `{ ... }` block or a single statement on the same line\n")
+		then perr(p, "cf: parse: a for-loop body is a `{ ... }` block or a single statement on the same line\n")
 	const [Stmt] one = [parse_stmt!(p)]
 
 	return one
@@ -1830,7 +1846,7 @@ const parse_defer! = (*Parser p): Stmt -> {
 
 	const Bool isc = match e { Expr.Call(cn, ct, ca, _) -> true, _ -> false }
 
-	if !isc then die("cf: parse: `defer` schedules a call `f(...)` or a block `{ ... }`\n")
+	if !isc then perr(p, "cf: parse: `defer` schedules a call `f(...)` or a block `{ ... }`\n")
 	const [Stmt] one = [Stmt.Do(e)]
 
 	return Stmt.Defer(one)
@@ -1843,7 +1859,7 @@ const parse_defer! = (*Parser p): Stmt -> {
 const in_clause_name! = (*Parser p): Str -> {
 	if !kw(p, "in") then return ""
 	p.pos = p.pos + 1
-	if !is_ident(peek(p)) then die("cf: parse: expected a geometry name after `in`\n")
+	if !is_ident(peek(p)) then perr(p, "cf: parse: expected a geometry name after `in`\n")
 	const Str g = cur_name!(p)
 	p.pos = p.pos + 1
 
@@ -1853,21 +1869,21 @@ const in_clause_name! = (*Parser p): Str -> {
 # Stamp an `in <geometry>` clause onto its governed expression. A geometry attaches to a
 # program ONLY at a call site (memory_model §4): only `Expr.Call` has a geom slot, so on any
 # other expression the clause would silently fall back to the ambient node — refuse it loudly.
-const geom_stamp = (Expr e, Str g): Expr -> {
+const geom_stamp = (*Parser p, Expr e, Str g): Expr -> {
 	if eq(g, "") then return e
 
 	const Bool isc = match e { Expr.Call(_, _, _, _) -> true, _ -> false }
 
-	if !isc then die("cf: parse: `in <geometry>` governs a call `f(...)`; this value is not a call\n")
+	if !isc then perr(p, "cf: parse: `in <geometry>` governs a call `f(...)`; this value is not a call\n")
 
 	return with_geom(e, g)
 }
 
 # Apply an `in <geometry>` clause to a binding: it governs the binding's initializer call.
-const let_with_geom = (Stmt s, Str g): Stmt -> {
+const let_with_geom = (*Parser p, Stmt s, Str g): Stmt -> {
 	if eq(g, "") then return s
 
-	return match s { Stmt.Let(n, m, t, init) -> Stmt.Let(n, m, t, geom_stamp(init, g)), _ -> s }
+	return match s { Stmt.Let(n, m, t, init) -> Stmt.Let(n, m, t, geom_stamp(p, init, g)), _ -> s }
 }
 
 const parse_stmt! = (*Parser p): Stmt -> {
@@ -1875,13 +1891,13 @@ const parse_stmt! = (*Parser p): Stmt -> {
 		p.pos = p.pos + 1
 		const Stmt cb = parse_let!(p, false)
 
-		return let_with_geom(cb, in_clause_name!(p))
+		return let_with_geom(p, cb, in_clause_name!(p))
 	}
 	if kw(p, "let") then {
 		p.pos = p.pos + 1
 		const Stmt lb = parse_let!(p, true)
 
-		return let_with_geom(lb, in_clause_name!(p))
+		return let_with_geom(p, lb, in_clause_name!(p))
 	}
 	if kw(p, "for") then return parse_for!(p)
 	if kw(p, "loop") then return parse_loop!(p)
@@ -1917,7 +1933,7 @@ const parse_stmt! = (*Parser p): Stmt -> {
 		if is_rbrace(peek(p)) || is_comma(peek(p)) then return Stmt.Return(Expr.Unit)
 		const Expr rv = parse_expr!(p)
 
-		return Stmt.Return(geom_stamp(rv, in_clause_name!(p)))
+		return Stmt.Return(geom_stamp(p, rv, in_clause_name!(p)))
 	}
 	# otherwise a call-for-effect statement (`name(args)`), a field mutation
 	# (`name.field = expr`), an element write (`name[i] = expr`), or a whole-name
@@ -1928,12 +1944,12 @@ const parse_stmt! = (*Parser p): Stmt -> {
 		if is_lparen(p.toks[p.pos + 1].kind) then {
 			const Expr de = parse_expr!(p)
 
-			return Stmt.Do(geom_stamp(de, in_clause_name!(p)))
+			return Stmt.Do(geom_stamp(p, de, in_clause_name!(p)))
 		}
 		if generic_call_stmt_ahead(p) then {
 			const Expr ge = parse_expr!(p)
 
-			return Stmt.Do(geom_stamp(ge, in_clause_name!(p)))
+			return Stmt.Do(geom_stamp(p, ge, in_clause_name!(p)))
 		}
 		const Str name = cur_name!(p)
 		p.pos = p.pos + 1
@@ -1945,7 +1961,7 @@ const parse_stmt! = (*Parser p): Stmt -> {
 			loop {
 				if !is_dot(peek(p)) then break
 				p.pos = p.pos + 1
-				if !is_ident(peek(p)) then die("cf: parse: expected a field name after `.`\n")
+				if !is_ident(peek(p)) then perr(p, "cf: parse: expected a field name after `.`\n")
 				fchain = [...fchain, cur_name!(p)]
 				p.pos = p.pos + 1
 			}
@@ -1959,7 +1975,7 @@ const parse_stmt! = (*Parser p): Stmt -> {
 			if compound then {
 				p.pos = p.pos + 2
 			} else {
-				if !is_eq(peek(p)) then die("cf: parse: expected `=` in a field assignment\n")
+				if !is_eq(peek(p)) then perr(p, "cf: parse: expected `=` in a field assignment\n")
 				p.pos = p.pos + 1
 			}
 
@@ -1990,9 +2006,9 @@ const parse_stmt! = (*Parser p): Stmt -> {
 		if is_lbracket(peek(p)) then {
 			p.pos = p.pos + 1
 			const Expr idx = parse_expr!(p)
-			if !is_rbracket(peek(p)) then die("cf: parse: expected `]` in an element assignment\n")
+			if !is_rbracket(peek(p)) then perr(p, "cf: parse: expected `]` in an element assignment\n")
 			p.pos = p.pos + 1
-			if !is_eq(peek(p)) then die("cf: parse: expected `=` in an element assignment\n")
+			if !is_eq(peek(p)) then perr(p, "cf: parse: expected `=` in an element assignment\n")
 			p.pos = p.pos + 1
 
 			return Stmt.IndexAssign(name, idx, parse_expr!(p))
@@ -2000,18 +2016,18 @@ const parse_stmt! = (*Parser p): Stmt -> {
 		# `name op= expr` — a compound assignment desugars to `name = name op expr`
 		if is_compound_op(peek(p)) then {
 			const TokKind op = peek(p)
-			if !is_eq(p.toks[p.pos + 1].kind) then die("cf: parse: expected `=` in a compound assignment\n")
+			if !is_eq(p.toks[p.pos + 1].kind) then perr(p, "cf: parse: expected `=` in a compound assignment\n")
 			p.pos = p.pos + 2 # operator + `=`
 			return Stmt.Assign(name, compound_apply(op, Expr.Var(name), parse_expr!(p)))
 		}
-		if !is_eq(peek(p)) then die("cf: parse: expected `=` in an assignment\n")
+		if !is_eq(peek(p)) then perr(p, "cf: parse: expected `=` in an assignment\n")
 		p.pos = p.pos + 1
 		# `name = <call> in <geometry>` — a reassignment whose value is a governed call
 		const Expr av = parse_expr!(p)
 
-		return Stmt.Assign(name, geom_stamp(av, in_clause_name!(p)))
+		return Stmt.Assign(name, geom_stamp(p, av, in_clause_name!(p)))
 	}
-	die("cf: parse: expected a statement\n")
+	perr(p, "cf: parse: expected a statement\n")
 
 	return Stmt.Return(Expr.Lit(0))
 }
@@ -2085,7 +2101,7 @@ const parse_block! = (*Parser p): [Stmt] -> {
 	loop {
 		if is_rbrace(peek(p)) then break
 		if Iarch(stmts.len) > 0 && !nl_before(p, p.pos)
-			then die("cf: parse: two statements share a line — each statement needs its own line\nAT ${p.file} OFFSET ${p.toks[p.pos].start} LINE ${line_of(p, p.toks[p.pos].start)}\n")
+			then perr(p, "cf: parse: two statements share a line — each statement needs its own line\n")
 		const Stmt s = parse_stmt!(p)
 		# anonymous lambdas parsed inside `s` hoist to just before it
 		stmts = flush_pending(p, stmts)
@@ -2096,9 +2112,9 @@ const parse_block! = (*Parser p): [Stmt] -> {
 	const Iarch close_line = line_of(p, p.toks[p.pos].start)
 	if open_line != close_line && Iarch(stmts.len) > 0 then {
 		if !nl_before(p, first_pos)
-			then die("cf: parse: the opening `{` of a multi-line block shares its line with a statement — put the first statement on its own line\nAT ${p.file} OFFSET ${p.toks[first_pos].start} LINE ${line_of(p, p.toks[first_pos].start)}\n")
+			then perr_off(p, p.toks[first_pos].start, "cf: parse: the opening `{` of a multi-line block shares its line with a statement — put the first statement on its own line\n")
 		if !nl_before(p, p.pos)
-			then die("cf: parse: the closing `}` of a multi-line block shares its line with a statement — put it on its own line\nAT ${p.file} OFFSET ${p.toks[p.pos].start} LINE ${line_of(p, p.toks[p.pos].start)}\n")
+			then perr(p, "cf: parse: the closing `}` of a multi-line block shares its line with a statement — put it on its own line\n")
 	}
 	p.pos = p.pos + 1 # `}`
 	return stmts
@@ -2139,12 +2155,12 @@ const parse_elem_name! = (*Parser p): Str -> {
 	if is_lbracket(peek(p)) then {
 		p.pos = p.pos + 1
 		const Str inner = parse_elem_name!(p)
-		if !is_rbracket(peek(p)) then die("cf: parse: expected `]` in a nested array type\n")
+		if !is_rbracket(peek(p)) then perr(p, "cf: parse: expected `]` in a nested array type\n")
 		p.pos = p.pos + 1
 
 		return "[${inner}]"
 	}
-	if !is_ident(peek(p)) then die("cf: parse: expected an element type name\n")
+	if !is_ident(peek(p)) then perr(p, "cf: parse: expected an element type name\n")
 	const Str n = cur_name!(p)
 	p.pos = p.pos + 1
 
@@ -2168,7 +2184,7 @@ const parse_tel! = (*Parser p): TupElem -> {
 				p.pos = p.pos + 1
 			}
 		}
-		if !is_rparen(peek(p)) then die("cf: parse: expected `)` in a parenthesised type\n")
+		if !is_rparen(peek(p)) then perr(p, "cf: parse: expected `)` in a parenthesised type\n")
 		p.pos = p.pos + 1
 		if is_arrow(peek(p)) then {
 			p.pos = p.pos + 1 # `->`
@@ -2176,7 +2192,7 @@ const parse_tel! = (*Parser p): TupElem -> {
 
 			return tel_fn([...inner, ret])
 		}
-		if Iarch(inner.len) < 2 then die("cf: parse: a tuple type needs at least two elements\n")
+		if Iarch(inner.len) < 2 then perr(p, "cf: parse: a tuple type needs at least two elements\n")
 
 		return tel_nest(inner)
 	}
@@ -2184,15 +2200,15 @@ const parse_tel! = (*Parser p): TupElem -> {
 	# element name rides in the leaf's `[Elem]` spelling (the nested-array convention `is_nested`).
 	if is_lbracket(peek(p)) then {
 		p.pos = p.pos + 1 # `[`
-		if !is_ident(peek(p)) then die("cf: parse: expected an element type name in an array component\n")
+		if !is_ident(peek(p)) then perr(p, "cf: parse: expected an element type name in an array component\n")
 		const Str en = cur_name!(p)
 		p.pos = p.pos + 1
-		if !is_rbracket(peek(p)) then die("cf: parse: expected `]` in an array component\n")
+		if !is_rbracket(peek(p)) then perr(p, "cf: parse: expected `]` in an array component\n")
 		p.pos = p.pos + 1
 
 		return tel_leaf("[${en}]")
 	}
-	if !is_ident(peek(p)) then die("cf: parse: expected a tuple element type name\n")
+	if !is_ident(peek(p)) then perr(p, "cf: parse: expected a tuple element type name\n")
 	const Str n = cur_name!(p)
 	p.pos = p.pos + 1
 	# a generic APPLICATION leaf — `Maybe['B]` in a fn-type/tuple position; the application string
@@ -2211,9 +2227,9 @@ const parse_tuple_telems! = (*Parser p): [TupElem] -> {
 		p.pos = p.pos + 1
 	}
 
-	if !is_rparen(peek(p)) then die("cf: parse: expected `)` in a tuple type\n")
+	if !is_rparen(peek(p)) then perr(p, "cf: parse: expected `)` in a tuple type\n")
 	p.pos = p.pos + 1
-	if Iarch(tel.len) < 2 then die("cf: parse: a tuple type needs at least two elements\n")
+	if Iarch(tel.len) < 2 then perr(p, "cf: parse: a tuple type needs at least two elements\n")
 
 	return tel
 }
@@ -2221,11 +2237,11 @@ const parse_tuple_telems! = (*Parser p): [TupElem] -> {
 const parse_type! = (*Parser p): Ty -> {
 	if is_star(peek(p)) then {
 		p.pos = p.pos + 1
-		if !is_lbracket(peek(p)) then die("cf: parse: expected `[` in a pointer type\n")
+		if !is_lbracket(peek(p)) then perr(p, "cf: parse: expected `[` in a pointer type\n")
 		p.pos = p.pos + 1
-		if !is_ident(peek(p)) then die("cf: parse: expected an element type name\n")
+		if !is_ident(peek(p)) then perr(p, "cf: parse: expected an element type name\n")
 		p.pos = p.pos + 1
-		if !is_rbracket(peek(p)) then die("cf: parse: expected `]`\n")
+		if !is_rbracket(peek(p)) then perr(p, "cf: parse: expected `]`\n")
 		p.pos = p.pos + 1
 
 		return Ty.TPtr
@@ -2233,12 +2249,12 @@ const parse_type! = (*Parser p): Ty -> {
 	if is_lbracket(peek(p)) then {
 		p.pos = p.pos + 1
 		const Str elem = parse_elem_name!(p)
-		if !is_rbracket(peek(p)) then die("cf: parse: expected `]`\n")
+		if !is_rbracket(peek(p)) then perr(p, "cf: parse: expected `]`\n")
 		p.pos = p.pos + 1
 
 		return Ty.TDyn(elem)
 	}
-	if !is_ident(peek(p)) then die("cf: parse: expected a type\n")
+	if !is_ident(peek(p)) then perr(p, "cf: parse: expected a type\n")
 	const Bool is_bool = kw(p, "Bool")
 	const Bool is_str = kw(p, "Str")
 	p.pos = p.pos + 1
@@ -2281,10 +2297,10 @@ const is_ptr_scalar_kw = (Str n): Bool -> {
 # ban is enforced here. (A `*[Elem]` byte pointer is handled separately by its callers.)
 const parse_star_agg_name! = (*Parser p): Str -> {
 	p.pos = p.pos + 1 # `*`
-	if !is_ident(peek(p)) then die("cf: parse: expected a pointee type name after `*`\n")
+	if !is_ident(peek(p)) then perr(p, "cf: parse: expected a pointee type name after `*`\n")
 	const Str n = cur_name!(p)
 	if is_ptr_scalar_kw(n)
-		then die("cf: parse: a pointer may not point to a scalar (only a record or union)\n")
+		then perr(p, "cf: parse: a pointer may not point to a scalar (only a record or union)\n")
 	p.pos = p.pos + 1
 	# a pointer to a generic INSTANCE — `*Ctx[Iarch]` — keeps the application as its pointee name
 	if is_lbracket(peek(p)) then return parse_type_app_tail!(p, n)
@@ -2296,7 +2312,7 @@ const parse_star_agg_name! = (*Parser p): Str -> {
 # element (the star elided — an aggregate element is already an arena pointer in cf's model, 912).
 const parse_fixed_elem! = (*Parser p): Str -> {
 	if is_star(peek(p)) then return parse_star_agg_name!(p)
-	if !is_ident(peek(p)) then die("cf: parse: expected a fixed-array element type\n")
+	if !is_ident(peek(p)) then perr(p, "cf: parse: expected a fixed-array element type\n")
 	const Str e = cur_name!(p)
 	p.pos = p.pos + 1
 
@@ -2313,25 +2329,25 @@ const parse_param! = (*Parser p): Param -> {
 		# fields are read and written through it (`type_name` names the record).
 		if is_lbracket(peek(p)) then {
 			p.pos = p.pos + 1 # `[`
-			if !is_ident(peek(p)) then die("cf: parse: expected an element type name\n")
+			if !is_ident(peek(p)) then perr(p, "cf: parse: expected an element type name\n")
 			# the element name rides in `elem` so indexing strides by its width: a `*[Uint8]`
 			# byte pointer stays byte-packed, a `*[Iarch]` word pointer strides 8 (loadl/storel).
 			const Str pelem = cur_name!(p)
 			p.pos = p.pos + 1 # elem
-			if !is_rbracket(peek(p)) then die("cf: parse: expected `]`\n")
+			if !is_rbracket(peek(p)) then perr(p, "cf: parse: expected `]`\n")
 			p.pos = p.pos + 1 # `]`
-			if !is_ident(peek(p)) then die("cf: parse: expected a parameter name\n")
+			if !is_ident(peek(p)) then perr(p, "cf: parse: expected a parameter name\n")
 			const Str bname = cur_name!(p)
 			p.pos = p.pos + 1
 
 			return Param({ name: bname, is_ptr: true, type_name: "$ptr", elem: pelem, telems: [], size: 0 })
 		}
-		if !is_ident(peek(p)) then die("cf: parse: expected a pointee type name\n")
+		if !is_ident(peek(p)) then perr(p, "cf: parse: expected a pointee type name\n")
 		let Str rec = cur_name!(p)
 		p.pos = p.pos + 1
 		# a pointer to a generic INSTANCE — `*Ctx[Iarch]` — keeps the application as its pointee name
 		if is_lbracket(peek(p)) then rec = parse_type_app_tail!(p, rec)
-		if !is_ident(peek(p)) then die("cf: parse: expected a parameter name\n")
+		if !is_ident(peek(p)) then perr(p, "cf: parse: expected a parameter name\n")
 		const Str name = cur_name!(p)
 		p.pos = p.pos + 1
 
@@ -2346,9 +2362,9 @@ const parse_param! = (*Parser p): Param -> {
 			const Iarch fn = p.toks[p.pos].ival
 			p.pos = p.pos + 1 # N
 			const Str felem = parse_fixed_elem!(p)
-			if !is_rbracket(peek(p)) then die("cf: parse: expected `]` in a fixed-array parameter type\n")
+			if !is_rbracket(peek(p)) then perr(p, "cf: parse: expected `]` in a fixed-array parameter type\n")
 			p.pos = p.pos + 1 # `]`
-			if !is_ident(peek(p)) then die("cf: parse: expected a parameter name\n")
+			if !is_ident(peek(p)) then perr(p, "cf: parse: expected a parameter name\n")
 			const Str fpname = cur_name!(p)
 			p.pos = p.pos + 1
 
@@ -2364,7 +2380,7 @@ const parse_param! = (*Parser p): Param -> {
 		# a bare `[Elem]` is a dynamic-array parameter (a `*[Elem]` is an opaque pointer);
 		# its element type is kept in `elem` so the callee can index/read it.
 		const Str elem = dyn_elem_of(parse_type!(p))
-		if !is_ident(peek(p)) then die("cf: parse: expected a parameter name\n")
+		if !is_ident(peek(p)) then perr(p, "cf: parse: expected a parameter name\n")
 		const Str name = cur_name!(p)
 		p.pos = p.pos + 1
 
@@ -2376,7 +2392,7 @@ const parse_param! = (*Parser p): Param -> {
 	&& is_rparen(p.toks[p.pos + 1].kind)
 	&& !is_arrow(p.toks[p.pos + 2].kind) then {
 		p.pos = p.pos + 2 # `()`
-		if !is_ident(peek(p)) then die("cf: parse: expected a parameter name after `()`\n")
+		if !is_ident(peek(p)) then perr(p, "cf: parse: expected a parameter name after `()`\n")
 		const Str uname = cur_name!(p)
 		p.pos = p.pos + 1
 
@@ -2397,7 +2413,7 @@ const parse_param! = (*Parser p): Param -> {
 			p.pos = p.pos + 1
 		}
 
-		if !is_rparen(peek(p)) then die("cf: parse: expected `)` in a parameter type\n")
+		if !is_rparen(peek(p)) then perr(p, "cf: parse: expected `)` in a parameter type\n")
 		p.pos = p.pos + 1
 		if is_arrow(peek(p)) then {
 			p.pos = p.pos + 1 # `->`
@@ -2407,8 +2423,8 @@ const parse_param! = (*Parser p): Param -> {
 			# fixed arguments), which already covers incomplete argument provision.
 			const TupElem rett = parse_tel!(p)
 			if tel_is_fn(rett)
-				then die("cf: parse: a function type cannot return a function; use partial application (a lambda over the fixed arguments)\n")
-			if !is_ident(peek(p)) then die("cf: parse: expected a parameter name\n")
+				then perr(p, "cf: parse: a function type cannot return a function; use partial application (a lambda over the fixed arguments)\n")
+			if !is_ident(peek(p)) then perr(p, "cf: parse: expected a parameter name\n")
 			const Str fname = cur_name!(p)
 			p.pos = p.pos + 1
 
@@ -2421,18 +2437,18 @@ const parse_param! = (*Parser p): Param -> {
 				size: 0,
 			})
 		}
-		if Iarch(tel.len) < 2 then die("cf: parse: a tuple type needs at least two elements\n")
-		if !is_ident(peek(p)) then die("cf: parse: expected a parameter name\n")
+		if Iarch(tel.len) < 2 then perr(p, "cf: parse: a tuple type needs at least two elements\n")
+		if !is_ident(peek(p)) then perr(p, "cf: parse: expected a parameter name\n")
 		const Str tname = cur_name!(p)
 		p.pos = p.pos + 1
 
 		return Param({ name: tname, is_ptr: false, type_name: "$tuple", elem: "", telems: tel, size: 0 })
 	}
-	if !is_ident(peek(p)) then die("cf: parse: expected a parameter type\n")
+	if !is_ident(peek(p)) then perr(p, "cf: parse: expected a parameter type\n")
 	# a scalar/aggregate parameter type — a name, a type variable, a generic type application, or a
 	# member-type annotation `Maybe[Iarch].Just` (§8.1, collapsed to its union by resolve)
 	const Str type_name = parse_member_type!(p)
-	if !is_ident(peek(p)) then die("cf: parse: expected a parameter name\n")
+	if !is_ident(peek(p)) then perr(p, "cf: parse: expected a parameter name\n")
 	const Str name = cur_name!(p)
 	p.pos = p.pos + 1
 
@@ -2472,10 +2488,10 @@ const lambda_ahead = (*Parser p): Bool -> {
 const parse_closure! = (*Parser p, Str name): Stmt -> {
 	p.pos = p.pos + 1 # `(`
 	const [Param] params = parse_params!(p)
-	if !is_rparen(peek(p)) then die("cf: parse: expected `)` in a closure\n")
+	if !is_rparen(peek(p)) then perr(p, "cf: parse: expected `)` in a closure\n")
 	p.pos = p.pos + 1
 	const RetSig rs = parse_ret_name!(p)
-	if !is_arrow(peek(p)) then die("cf: parse: expected `->` in a closure\n")
+	if !is_arrow(peek(p)) then perr(p, "cf: parse: expected `->` in a closure\n")
 	p.pos = p.pos + 1
 	const [Stmt] nobody = []
 	if is_lbrace(peek(p)) then {
@@ -2504,7 +2520,7 @@ const parse_params! = (*Parser p): [Param] -> {
 
 	loop {
 		const Param pm = parse_param!(p)
-		if params_has(params, pm.name) then die("cf: parse: duplicate parameter name\n")
+		if params_has(params, pm.name) then perr(p, "cf: parse: duplicate parameter name\n")
 		params = [...params, pm]
 		if !is_comma(peek(p)) then break
 		p.pos = p.pos + 1
@@ -2533,7 +2549,7 @@ const parse_ret_name! = (*Parser p): RetSig -> {
 			const Iarch n = p.toks[p.pos].ival
 			p.pos = p.pos + 1 # N
 			const Str felem = parse_fixed_elem!(p)
-			if !is_rbracket(peek(p)) then die("cf: parse: expected `]` in a fixed-array return type\n")
+			if !is_rbracket(peek(p)) then perr(p, "cf: parse: expected `]` in a fixed-array return type\n")
 			p.pos = p.pos + 1 # `]`
 			return RetSig({ name: "$dyn", elem: felem, telems: [], size: n })
 		}
@@ -2551,7 +2567,7 @@ const parse_ret_name! = (*Parser p): RetSig -> {
 			return RetSig({ name: "Unit", elem: "", telems: [], size: 0 })
 		}
 		const [TupElem] tel = parse_tuple_telems!(p)
-		if Iarch(tel.len) < 2 then die("cf: parse: a tuple return type needs at least two elements\n")
+		if Iarch(tel.len) < 2 then perr(p, "cf: parse: a tuple return type needs at least two elements\n")
 
 		return RetSig({ name: "$tuple", elem: "", telems: tel, size: 0 })
 	}
@@ -2559,7 +2575,7 @@ const parse_ret_name! = (*Parser p): RetSig -> {
 	# the bare pointee name (the star elided; §6.4 `*Scalar` rejected in `parse_star_agg_name`)
 	if is_star(peek(p))
 		then return RetSig({ name: parse_star_agg_name!(p), elem: "", telems: [], size: 0 })
-	if !is_ident(peek(p)) then die("cf: parse: expected a return type name after `:`\n")
+	if !is_ident(peek(p)) then perr(p, "cf: parse: expected a return type name after `:`\n")
 	# a named return type — possibly a generic type application `Box['T]` or a member-type
 	# annotation `Maybe[Iarch].Just` (§8.1, collapsed to its union by resolve)
 	const Str n = parse_member_type!(p)
@@ -2571,33 +2587,33 @@ const parse_ret_name! = (*Parser p): RetSig -> {
 # VERBATIM (no escape decoding; the assembler wants the raw bytes). A hole names a
 # parameter, resolved to its argument register at emit. Mirrors `parse_string`'s segment
 # loop but keeps every byte literal.
-const scan_asm_segs! = (*[Uint8] src, Iarch start, Iarch len): [Seg] -> {
+const scan_asm_segs! = (*Parser p, Iarch start, Iarch len): [Seg] -> {
 	let [Seg] segs = []
 	let [Uint8] cur = []
 	let Iarch i = 0
 
 	loop {
 		if i >= len then break
-		const Iarch c = Iarch(src[start + i])
+		const Iarch c = Iarch(p.src[start + i])
 
-		if c == 36 && i + 1 < len && Iarch(src[start + i + 1]) == 123 then {
+		if c == 36 && i + 1 < len && Iarch(p.src[start + i + 1]) == 123 then {
 			# `${name}` — flush the literal run, then read the bare name up to `}`
 			segs = [...segs, Seg({ is_hole: false, lit: cur, name: "", expr: Expr.Lit(0) })]
 			cur = []
 			let Iarch j = i + 2
 
 			loop {
-				if j >= len then die("cf: parse: an unterminated asm hole (missing `}`)\n")
-				if Iarch(src[start + j]) == 125 then break
+				if j >= len then perr_off(p, start + j, "cf: parse: an unterminated asm hole (missing `}`)\n")
+				if Iarch(p.src[start + j]) == 125 then break
 				j = j + 1
 			}
 
-			const Str nm = intern!(src, start + i + 2, j - i - 2)
+			const Str nm = intern!(p.src, start + i + 2, j - i - 2)
 			segs = [...segs, Seg({ is_hole: true, lit: cur, name: nm, expr: Expr.Lit(0) })]
 			cur = []
 			i = j + 1
 		} else {
-			cur = [...cur, src[start + i]]
+			cur = [...cur, p.src[start + i]]
 			i = i + 1
 		}
 	}
@@ -2626,7 +2642,7 @@ const parse_typarams! = (*Parser p): TyParams -> {
 	let [Str] tbs = []
 
 	loop {
-		if !is_ident(peek(p)) then die("cf: parse: expected a type variable in a `['T]` list\n")
+		if !is_ident(peek(p)) then perr(p, "cf: parse: expected a type variable in a `['T]` list\n")
 		# a non-`'T` ident preceding the name is either a BOUND on a type variable (`[Color 'T]`)
 		# or the TYPE of a comptime VALUE parameter (`[Iarch n]` — the name is a plain ident, not
 		# a `'T`); whether it is a bound or a value type is told apart later by the name's `'T`.
@@ -2635,7 +2651,7 @@ const parse_typarams! = (*Parser p): TyParams -> {
 			bound = cur_name!(p)
 			p.pos = p.pos + 1
 			if !is_ident(peek(p))
-				then die("cf: parse: a bound or value-parameter type must be followed by a name\n")
+				then perr(p, "cf: parse: a bound or value-parameter type must be followed by a name\n")
 		}
 		tps = [...tps, cur_name!(p)]
 		tbs = [...tbs, bound]
@@ -2644,7 +2660,7 @@ const parse_typarams! = (*Parser p): TyParams -> {
 		p.pos = p.pos + 1
 	}
 
-	if !is_rbracket(peek(p)) then die("cf: parse: expected `]` after type parameters\n")
+	if !is_rbracket(peek(p)) then perr(p, "cf: parse: expected `]` after type parameters\n")
 	p.pos = p.pos + 1
 
 	return TyParams({ names: tps, bounds: tbs })
@@ -2695,7 +2711,7 @@ const parse_type_app_tail! = (*Parser p, Str base): Str -> {
 		p.pos = p.pos + 1
 	}
 
-	if !is_rbracket(peek(p)) then die("cf: parse: expected `]` in a type application\n")
+	if !is_rbracket(peek(p)) then perr(p, "cf: parse: expected `]` in a type application\n")
 	p.pos = p.pos + 1
 
 	return "${s}]"
@@ -2709,14 +2725,14 @@ const parse_type_ref! = (*Parser p): Str -> {
 		p.pos = p.pos + 1
 		const Str elem = parse_type_ref!(p)
 
-		if !is_rbracket(peek(p)) then die("cf: parse: expected `]` in an array type argument\n")
+		if !is_rbracket(peek(p)) then perr(p, "cf: parse: expected `]` in an array type argument\n")
 
 		p.pos = p.pos + 1
 
 		return "[${elem}]"
 	}
 
-	if !is_ident(peek(p)) then die("cf: parse: expected a type name\n")
+	if !is_ident(peek(p)) then perr(p, "cf: parse: expected a type name\n")
 
 	const Str base = cur_name!(p)
 	p.pos = p.pos + 1
@@ -2735,7 +2751,7 @@ const parse_member_type! = (*Parser p): Str -> {
 	const Str base = parse_type_ref!(p)
 	if is_dot(peek(p)) then {
 		p.pos = p.pos + 1 # `.`
-		if !is_ident(peek(p)) then die("cf: parse: expected a member name after `.` in a type\n")
+		if !is_ident(peek(p)) then perr(p, "cf: parse: expected a member name after `.` in a type\n")
 		const Str member = cur_name!(p)
 		p.pos = p.pos + 1
 
@@ -2760,11 +2776,11 @@ const parse_func! = (*Parser p): Func -> {
 		is_intrin = true
 		p.pos = p.pos + 1
 	} else {
-		if !kw(p, "const") then die("cf: parse: expected `const` or `intrinsic`\n")
+		if !kw(p, "const") then perr(p, "cf: parse: expected `const` or `intrinsic`\n")
 		p.pos = p.pos + 1
 	}
 
-	if !is_ident(peek(p)) then die("cf: parse: expected a function name\n")
+	if !is_ident(peek(p)) then perr(p, "cf: parse: expected a function name\n")
 	const Str name = cur_name!(p)
 	p.pos = p.pos + 1
 	# `[pub] intrinsic name: Type` — a bodyless compiler-supplied VALUE (no `=`, no params, no `()`),
@@ -2795,7 +2811,7 @@ const parse_func! = (*Parser p): Func -> {
 			asm_sym: "",
 		})
 	}
-	if !is_eq(peek(p)) then die("cf: parse: expected `=`\n")
+	if !is_eq(peek(p)) then perr(p, "cf: parse: expected `=`\n")
 	p.pos = p.pos + 1
 	# `= ['T](...)` / `= [Color 'T](...)` — a generic function's (optionally bounded) type parameters
 	let [Str] typarams = []
@@ -2813,11 +2829,11 @@ const parse_func! = (*Parser p): Func -> {
 	# word (`ret_name` "") — cf's value consts are literals (flags, sizes, greetings).
 	if !is_lparen(peek(p)) then {
 		if is_intrin
-			then die("cf: parse: an `intrinsic` needs a parameter list — `intrinsic name = (args): Ret`\n")
-		if Iarch(typarams.len) > 0 then die("cf: parse: a top-level value const cannot be generic\n")
+			then perr(p, "cf: parse: an `intrinsic` needs a parameter list — `intrinsic name = (args): Ret`\n")
+		if Iarch(typarams.len) > 0 then perr(p, "cf: parse: a top-level value const cannot be generic\n")
 		# a value name is lowercase-initial (uppercase-initial is a TYPE) — ebnf § Identifiers
 		if Iarch(name[0]) >= 65 && Iarch(name[0]) <= 90
-			then die("cf: parse: a value name must be lowercase — an uppercase-initial name is a type\n")
+			then perr(p, "cf: parse: a value name must be lowercase — an uppercase-initial name is a type\n")
 		const [Param] noparams = []
 		const [Stmt] vempty = []
 		const Expr vexpr = parse_expr!(p)
@@ -2847,13 +2863,13 @@ const parse_func! = (*Parser p): Func -> {
 	}
 	p.pos = p.pos + 1
 	const [Param] params = parse_params!(p)
-	if !is_rparen(peek(p)) then die("cf: parse: expected `)`\n")
+	if !is_rparen(peek(p)) then perr(p, "cf: parse: expected `)`\n")
 	p.pos = p.pos + 1
 	const RetSig rs = parse_ret_name!(p)
 	# an `intrinsic` stops at its signature — no `->`, no body; the compiler supplies it.
 	if is_intrin then {
 		if is_arrow(peek(p))
-			then die("cf: parse: an `intrinsic` declares only a signature and takes no `-> body`\n")
+			then perr(p, "cf: parse: an `intrinsic` declares only a signature and takes no `-> body`\n")
 		const [Stmt] ibody = []
 		const [Seg] inoasm = []
 
@@ -2875,7 +2891,7 @@ const parse_func! = (*Parser p): Func -> {
 			asm_sym: "",
 		})
 	}
-	if !is_arrow(peek(p)) then die("cf: parse: expected `->`\n")
+	if !is_arrow(peek(p)) then perr(p, "cf: parse: expected `->`\n")
 	p.pos = p.pos + 1
 	const [Stmt] nobody = []
 	const [Seg] noasm = []
@@ -2883,8 +2899,8 @@ const parse_func! = (*Parser p): Func -> {
 	# segments (literal runs + `${param}` holes) are emitted verbatim into the asm floor.
 	if kw(p, "asm") then {
 		p.pos = p.pos + 1
-		if !is_strlit(peek(p)) then die("cf: parse: expected a string after `asm`\n")
-		const [Seg] segs = scan_asm_segs!(p.src, p.toks[p.pos].start, p.toks[p.pos].len)
+		if !is_strlit(peek(p)) then perr(p, "cf: parse: expected a string after `asm`\n")
+		const [Seg] segs = scan_asm_segs!(p, p.toks[p.pos].start, p.toks[p.pos].len)
 		p.pos = p.pos + 1
 
 		return Func({
@@ -2957,7 +2973,7 @@ const parse_func! = (*Parser p): Func -> {
 const parse_data! = (*Parser p): RecDecl -> {
 	if kw(p, "pub") then p.pos = p.pos + 1 # optional `pub` (visibility filtering is a later brick)
 	p.pos = p.pos + 1 # `data`
-	if !is_ident(peek(p)) then die("cf: parse: expected a record type name\n")
+	if !is_ident(peek(p)) then perr(p, "cf: parse: expected a record type name\n")
 	const Str name = cur_name!(p)
 	p.pos = p.pos + 1
 	# `data Pair['A, 'B] = ...` / `data Tagged[Color 'T] = ...` — a record's (bounded) type parameters
@@ -2968,9 +2984,9 @@ const parse_data! = (*Parser p): RecDecl -> {
 		typarams = tpb.names
 		tbounds = tpb.bounds
 	}
-	if !is_eq(peek(p)) then die("cf: parse: expected `=` in a data declaration\n")
+	if !is_eq(peek(p)) then perr(p, "cf: parse: expected `=` in a data declaration\n")
 	p.pos = p.pos + 1
-	if !is_lbrace(peek(p)) then die("cf: parse: expected `{` in a data declaration\n")
+	if !is_lbrace(peek(p)) then perr(p, "cf: parse: expected `{` in a data declaration\n")
 	p.pos = p.pos + 1
 
 	return parse_record_body!(p, name, typarams, tbounds)
@@ -3001,11 +3017,11 @@ const parse_record_body! = (*Parser p, Str name, [Str] typarams, [Str] tbounds):
 			# `...Box[Iarch]` cannot be spread (rejected here); a generic TEMPLATE `...Box` is
 			# rejected at resolve time (its arity is only known there).
 			p.pos = p.pos + 1 # `...`
-			if !is_ident(peek(p)) then die("cf: parse: expected a record name after `...`\n")
+			if !is_ident(peek(p)) then perr(p, "cf: parse: expected a record name after `...`\n")
 			const Str src = cur_name!(p)
 			p.pos = p.pos + 1
 			if is_lbracket(peek(p))
-				then die("cf: parse: cannot spread a generic type application in a declaration\n")
+				then perr(p, "cf: parse: cannot spread a generic type application in a declaration\n")
 			fields = [...fields, src]
 			ftypes = [...ftypes, "$spread"]
 			felems = [...felems, ""]
@@ -3023,13 +3039,13 @@ const parse_record_body! = (*Parser p, Str name, [Str] typarams, [Str] tbounds):
 				# its width (a `*[Uint8]` stays byte-packed, a `*[Iarch]` strides 8), like a `*[T]` param.
 				p.pos = p.pos + 1 # `*`
 				p.pos = p.pos + 1 # `[`
-				if !is_ident(peek(p)) then die("cf: parse: expected an element type name\n")
+				if !is_ident(peek(p)) then perr(p, "cf: parse: expected an element type name\n")
 				fe = cur_name!(p)
 				p.pos = p.pos + 1 # elem
-				if !is_rbracket(peek(p)) then die("cf: parse: expected `]` in a pointer field type\n")
+				if !is_rbracket(peek(p)) then perr(p, "cf: parse: expected `]` in a pointer field type\n")
 				p.pos = p.pos + 1 # `]`
 			} else ft = parse_star_agg_name!(p)
-			if !is_ident(peek(p)) then die("cf: parse: expected a field name\n")
+			if !is_ident(peek(p)) then perr(p, "cf: parse: expected a field name\n")
 			fields = [...fields, cur_name!(p)]
 			ftypes = [...ftypes, ft]
 			felems = [...felems, fe]
@@ -3045,12 +3061,12 @@ const parse_record_body! = (*Parser p, Str name, [Str] typarams, [Str] tbounds):
 			if is_intlit(p.toks[p.pos + 1].kind) then {
 				p.pos = p.pos + 1 # `[`
 				const Iarch fn = p.toks[p.pos].ival
-				if fn <= 0 then die("cf: parse: an inline fixed-array field needs a positive comptime length\n")
+				if fn <= 0 then perr(p, "cf: parse: an inline fixed-array field needs a positive comptime length\n")
 				p.pos = p.pos + 1 # N
 				const Str fxe = parse_fixed_elem!(p)
-				if !is_rbracket(peek(p)) then die("cf: parse: expected `]` in a fixed-array field type\n")
+				if !is_rbracket(peek(p)) then perr(p, "cf: parse: expected `]` in a fixed-array field type\n")
 				p.pos = p.pos + 1 # `]`
-				if !is_ident(peek(p)) then die("cf: parse: expected a field name\n")
+				if !is_ident(peek(p)) then perr(p, "cf: parse: expected a field name\n")
 				fields = [...fields, cur_name!(p)]
 				ftypes = [...ftypes, "$fix"]
 				felems = [...felems, fxe]
@@ -3060,7 +3076,7 @@ const parse_record_body! = (*Parser p, Str name, [Str] typarams, [Str] tbounds):
 				p.pos = p.pos + 1
 			} else {
 				const Str felem = dyn_elem_of(parse_type!(p))
-				if !is_ident(peek(p)) then die("cf: parse: expected a field name\n")
+				if !is_ident(peek(p)) then perr(p, "cf: parse: expected a field name\n")
 				fields = [...fields, cur_name!(p)]
 				ftypes = [...ftypes, "$dyn"]
 				felems = [...felems, felem]
@@ -3073,7 +3089,7 @@ const parse_record_body! = (*Parser p, Str name, [Str] typarams, [Str] tbounds):
 			# a `(A, B, ...) name` tuple field — at least two comma-separated element type names
 			p.pos = p.pos + 1 # `(`
 			const [TupElem] tel = parse_tuple_telems!(p)
-			if !is_ident(peek(p)) then die("cf: parse: expected a field name\n")
+			if !is_ident(peek(p)) then perr(p, "cf: parse: expected a field name\n")
 			fields = [...fields, cur_name!(p)]
 			ftypes = [...ftypes, "$tuple"]
 			felems = [...felems, ""]
@@ -3085,7 +3101,7 @@ const parse_record_body! = (*Parser p, Str name, [Str] typarams, [Str] tbounds):
 			# a scalar/aggregate field type — a name, a type variable `'T`, or a generic type
 			# application `Box[Iarch]` (kept as a bracketed string for the monomorph pass)
 			const Str ftype = parse_type_ref!(p)
-			if !is_ident(peek(p)) then die("cf: parse: expected a field name\n")
+			if !is_ident(peek(p)) then perr(p, "cf: parse: expected a field name\n")
 			fields = [...fields, cur_name!(p)]
 			ftypes = [...ftypes, ftype]
 			felems = [...felems, ""]
@@ -3099,7 +3115,7 @@ const parse_record_body! = (*Parser p, Str name, [Str] typarams, [Str] tbounds):
 		p.pos = p.pos + 1
 	}
 
-	if !is_rbrace(peek(p)) then die("cf: parse: expected `}` in a data declaration\n")
+	if !is_rbrace(peek(p)) then perr(p, "cf: parse: expected `}` in a data declaration\n")
 	p.pos = p.pos + 1
 
 	return RecDecl({
@@ -3124,7 +3140,7 @@ const parse_record_body! = (*Parser p, Str name, [Str] typarams, [Str] tbounds):
 const parse_group! = (*Parser p): RecDecl -> {
 	# a group is never `pub` — a `pub type ...` is already rejected earlier (typealias.cf)
 	p.pos = p.pos + 1 # `type`
-	if !is_ident(peek(p)) then die("cf: parse: expected a group type name after `type`\n")
+	if !is_ident(peek(p)) then perr(p, "cf: parse: expected a group type name after `type`\n")
 	const Str name = cur_name!(p)
 	p.pos = p.pos + 1
 	let [Str] typarams = []
@@ -3134,13 +3150,13 @@ const parse_group! = (*Parser p): RecDecl -> {
 		typarams = tpb.names
 		tbounds = tpb.bounds
 	}
-	if !is_eq(peek(p)) then die("cf: parse: expected `=` in a group `type` declaration\n")
+	if !is_eq(peek(p)) then perr(p, "cf: parse: expected `=` in a group `type` declaration\n")
 	p.pos = p.pos + 1
-	if !is_lbrace(peek(p)) then die("cf: parse: expected `{` in a group `type` declaration\n")
+	if !is_lbrace(peek(p)) then perr(p, "cf: parse: expected `{` in a group `type` declaration\n")
 	p.pos = p.pos + 1
 	const RecDecl g = parse_record_body!(p, name, typarams, tbounds)
 	if Iarch(g.fields.len) == 0
-		then die("cf: parse: a grouped-parameter `type` must declare at least one field\n")
+		then perr(p, "cf: parse: a grouped-parameter `type` must declare at least one field\n")
 	# reject a duplicate field name AND a `...` declaration spread (a group is never used as a record,
 	# so neither typecheck-of-use nor the record-spread expansion — which handle these for `data` — runs)
 	let Iarch di = 0
@@ -3148,13 +3164,13 @@ const parse_group! = (*Parser p): RecDecl -> {
 	loop {
 		if di >= Iarch(g.fields.len) then break
 		if eq(g.ftypes[di], "$spread")
-			then die("cf: parse: a grouped-parameter `type` cannot use a `...` spread\n")
+			then perr(p, "cf: parse: a grouped-parameter `type` cannot use a `...` spread\n")
 		let Iarch dj = 0
 
 		loop {
 			if dj >= di then break
 			if eq(g.fields[dj], g.fields[di])
-				then die("cf: parse: a duplicate field in a grouped-parameter `type`\n")
+				then perr(p, "cf: parse: a duplicate field in a grouped-parameter `type`\n")
 			dj = dj + 1
 		}
 
@@ -3169,7 +3185,7 @@ const parse_group! = (*Parser p): RecDecl -> {
 const parse_union! = (*Parser p): UnionDecl -> {
 	if kw(p, "pub") then p.pos = p.pos + 1 # optional `pub` (visibility filtering is a later brick)
 	p.pos = p.pos + 1 # `union`
-	if !is_ident(peek(p)) then die("cf: parse: expected a union type name\n")
+	if !is_ident(peek(p)) then perr(p, "cf: parse: expected a union type name\n")
 	const Str name = cur_name!(p)
 	p.pos = p.pos + 1
 	# `union Maybe['V] = ...` / `union Wrapper[Color 'T] = ...` — a union's (bounded) type parameters
@@ -3180,9 +3196,9 @@ const parse_union! = (*Parser p): UnionDecl -> {
 		typarams = tpb.names
 		tbounds = tpb.bounds
 	}
-	if !is_eq(peek(p)) then die("cf: parse: expected `=` in a union declaration\n")
+	if !is_eq(peek(p)) then perr(p, "cf: parse: expected `=` in a union declaration\n")
 	p.pos = p.pos + 1
-	if !is_lbrace(peek(p)) then die("cf: parse: expected `{` in a union declaration\n")
+	if !is_lbrace(peek(p)) then perr(p, "cf: parse: expected `{` in a union declaration\n")
 	p.pos = p.pos + 1
 	let [UnionMember] members = []
 
@@ -3194,11 +3210,11 @@ const parse_union! = (*Parser p): UnionDecl -> {
 			# resolve pass expands it. A generic application `...Box[Iarch]` is rejected here; a
 			# generic template `...Box` at resolve time.
 			p.pos = p.pos + 1 # `...`
-			if !is_ident(peek(p)) then die("cf: parse: expected a union name after `...`\n")
+			if !is_ident(peek(p)) then perr(p, "cf: parse: expected a union name after `...`\n")
 			const Str usrc = cur_name!(p)
 			p.pos = p.pos + 1
 			if is_lbracket(peek(p))
-				then die("cf: parse: cannot spread a generic type application in a declaration\n")
+				then perr(p, "cf: parse: cannot spread a generic type application in a declaration\n")
 			const [Str] sp_mark = ["$spread"]
 			const [Str] sp_pe = []
 			const [[TupElem]] sp_pt = []
@@ -3210,7 +3226,7 @@ const parse_union! = (*Parser p): UnionDecl -> {
 			p.pos = p.pos + 1
 			continue
 		}
-		if !is_ident(peek(p)) then die("cf: parse: expected a member name\n")
+		if !is_ident(peek(p)) then perr(p, "cf: parse: expected a member name\n")
 		const Str mname = cur_name!(p)
 		p.pos = p.pos + 1
 		# an optional payload `(T, T, ...)` — positional payload types (any type: a word,
@@ -3235,11 +3251,11 @@ const parse_union! = (*Parser p): UnionDecl -> {
 					# tag word (runtime-harmless). A `*[Uint8]` byte-pointer payload is a later brick (emit's
 					# `payload_is_ptr` has no `$ptr` payload case yet).
 					if is_lbracket(p.toks[p.pos + 1].kind)
-						then die("cf: parse: a `*[...]` byte-pointer payload is not yet supported\n")
+						then perr(p, "cf: parse: a `*[...]` byte-pointer payload is not yet supported\n")
 					p.pos = p.pos + 1 # `*`
-					if !is_ident(peek(p)) then die("cf: parse: expected a pointee type name after `*`\n")
+					if !is_ident(peek(p)) then perr(p, "cf: parse: expected a pointee type name after `*`\n")
 					if is_ptr_scalar_kw(cur_name!(p))
-						then die("cf: parse: a pointer may not point to a scalar (only a record or union)\n")
+						then perr(p, "cf: parse: a pointer may not point to a scalar (only a record or union)\n")
 					payloads = [...payloads, parse_type_ref!(p)]
 					pelems = [...pelems, ""]
 					ptelems = [...ptelems, no_ptel]
@@ -3267,7 +3283,7 @@ const parse_union! = (*Parser p): UnionDecl -> {
 				p.pos = p.pos + 1
 			}
 
-			if !is_rparen(peek(p)) then die("cf: parse: expected `)` after a payload\n")
+			if !is_rparen(peek(p)) then perr(p, "cf: parse: expected `)` after a payload\n")
 			p.pos = p.pos + 1
 		}
 		members = [
@@ -3278,7 +3294,7 @@ const parse_union! = (*Parser p): UnionDecl -> {
 		p.pos = p.pos + 1
 	}
 
-	if !is_rbrace(peek(p)) then die("cf: parse: expected `}` in a union declaration\n")
+	if !is_rbrace(peek(p)) then perr(p, "cf: parse: expected `}` in a union declaration\n")
 	p.pos = p.pos + 1
 
 	return UnionDecl({ name: name, members: members, typarams: typarams, tbounds: tbounds })
@@ -3323,7 +3339,7 @@ const parse_import_path! = (*Parser p): Import -> {
 			p.pos = p.pos + 1 # `{`
 			loop {
 				if is_rbrace(peek(p)) then break
-				if !is_ident(peek(p)) then die("cf: parse: expected an imported member name\n")
+				if !is_ident(peek(p)) then perr(p, "cf: parse: expected an imported member name\n")
 				names = [...names, cur_name!(p)]
 				p.pos = p.pos + 1
 				if is_comma(peek(p)) then p.pos = p.pos + 1
@@ -3333,7 +3349,7 @@ const parse_import_path! = (*Parser p): Import -> {
 			destructured = true
 			break
 		}
-		if !is_ident(peek(p)) then die("cf: parse: expected a path segment or `{` after `::`\n")
+		if !is_ident(peek(p)) then perr(p, "cf: parse: expected a path segment or `{` after `::`\n")
 		segs = [...segs, cur_name!(p)]
 		p.pos = p.pos + 1
 	}
@@ -3351,7 +3367,7 @@ const parse_import_path! = (*Parser p): Import -> {
 			p.pos = p.pos + 1 # `*`
 			return Import({ path: path, names: none, alias: "", wildcard: true })
 		}
-		if !is_ident(peek(p)) then die("cf: parse: expected a namespace name or `*` after `as`\n")
+		if !is_ident(peek(p)) then perr(p, "cf: parse: expected a namespace name or `*` after `as`\n")
 		alias = cur_name!(p)
 		p.pos = p.pos + 1
 	}
@@ -3366,7 +3382,7 @@ const parse_import! = (*Parser p): Import -> {
 	if kw(p, "pub") then p.pos = p.pos + 1 # `pub`
 	p.pos = p.pos + 1 # `import`
 	# `::`-path form (module_system §4): `import a::b::c [::{ ... }]` — no string; `as` is optional.
-	if !is_ident(peek(p)) then die("cf: parse: expected a module path after `import`\n")
+	if !is_ident(peek(p)) then perr(p, "cf: parse: expected a module path after `import`\n")
 
 	return parse_import_path!(p)
 }
@@ -3486,7 +3502,7 @@ const prog_cat = (Program a, Program b): Program -> {
 
 # Consume the current identifier token, returning its interned text; die with `msg` otherwise.
 const expect_ident! = (*Parser p, Str msg): Str -> {
-	if !is_ident(peek(p)) then die(msg)
+	if !is_ident(peek(p)) then perr(p, msg)
 	const Str s = cur_name!(p)
 	p.pos = p.pos + 1
 
@@ -3495,7 +3511,7 @@ const expect_ident! = (*Parser p, Str msg): Str -> {
 
 # Consume a `.` token in a comptime condition; die if the current token is not a dot.
 const expect_cond_dot = (*Parser p): Bool -> {
-	if !is_dot(peek(p)) then die("cf: parse: expected `.` in a comptime condition\n")
+	if !is_dot(peek(p)) then perr(p, "cf: parse: expected `.` in a comptime condition\n")
 	p.pos = p.pos + 1
 
 	return true
@@ -3553,7 +3569,7 @@ const parse_cond! = (*Parser p): Bool -> {
 	} else if comptime_tok_is(head, "std_comptime_arch") then {
 		is_arch = true
 	} else {
-		die("cf: parse: a comptime condition reads `os::target`/`arch::target` (import `std::comptime`)\n")
+		perr(p, "cf: parse: a comptime condition reads `os::target`/`arch::target` (import `std::comptime`)\n")
 	}
 
 	let Bool is_eq = false
@@ -3563,27 +3579,27 @@ const parse_cond! = (*Parser p): Bool -> {
 	} else if is_ne(peek(p)) then {
 		is_eq = false
 	} else {
-		die("cf: parse: expected `==` or `!=` in a comptime condition\n")
+		perr(p, "cf: parse: expected `==` or `!=` in a comptime condition\n")
 	}
 
 	p.pos = p.pos + 1
 	const Str ename = expect_ident!(p, "cf: parse: expected an enum name in a comptime condition\n")
-	if is_os && !eq(ename, "Os") then die("cf: parse: the `os` namespace compares against `Os`\n")
+	if is_os && !eq(ename, "Os") then perr(p, "cf: parse: the `os` namespace compares against `Os`\n")
 	if is_arch && !eq(ename, "Arch")
-		then die("cf: parse: the `arch` namespace compares against `Arch`\n")
+		then perr(p, "cf: parse: the `arch` namespace compares against `Arch`\n")
 	expect_cond_dot(p)
 	const Str variant = expect_ident!(p, "cf: parse: expected a variant name after the enum name\n")
 	# The enum variant sets are closed (module_system §7.1): `Os` is `{ Darwin, Linux }` and
 	# `Arch` is `{ Arm64, Amd64, Riscv64, Wasm }`. A variant outside its enum (a typo, or a
 	# cross-enum name like `Os.Arm64`) is a parse error, not a silently-false comparison.
 	if is_os && !eq(variant, "Darwin") && !eq(variant, "Linux") && !eq(variant, "Bare")
-		then die("cf: parse: `Os` has no such variant (expected `Darwin`, `Linux`, or `Bare`)\n")
+		then perr(p, "cf: parse: `Os` has no such variant (expected `Darwin`, `Linux`, or `Bare`)\n")
 	if is_arch &&
 		!eq(variant, "Arm64") &&
 		!eq(variant, "Amd64") &&
 		!eq(variant, "Riscv64") &&
 		!eq(variant, "Wasm")
-			then die("cf: parse: `Arch` has no such variant (expected `Arm64`, `Amd64`, `Riscv64`, or `Wasm`)\n")
+			then perr(p, "cf: parse: `Arch` has no such variant (expected `Arm64`, `Amd64`, `Riscv64`, or `Wasm`)\n")
 	# the target comes from `--target` (via the CLI), defaulting to the host os/arch — threaded on the
 	# Parser as an `Os`/`Arch` union. `target` and `current` coincide on a non-cross build. The fold
 	# matches the union against the source variant NAME (the token just parsed) — the one place the
@@ -3615,7 +3631,7 @@ const parse_branch! = (*Parser p): Program -> {
 
 		loop {
 			if is_rbrace(peek(p)) then break
-			if is_eof(peek(p)) then die("cf: parse: unterminated comptime branch block\n")
+			if is_eof(peek(p)) then perr(p, "cf: parse: unterminated comptime branch block\n")
 			acc = prog_cat(acc, parse_item!(p))
 		}
 
@@ -3634,7 +3650,7 @@ const parse_branch! = (*Parser p): Program -> {
 const parse_comptime_if! = (*Parser p): Program -> {
 	p.pos = p.pos + 1 # `if`
 	const Bool taken = parse_cond!(p)
-	if !kw(p, "then") then die("cf: parse: expected `then` in a comptime `if`\n")
+	if !kw(p, "then") then perr(p, "cf: parse: expected `then` in a comptime `if`\n")
 	p.pos = p.pos + 1
 	const Program then_frag = parse_branch!(p)
 	let Program else_frag = empty_program()
@@ -3692,24 +3708,24 @@ const parse_static! = (*Parser p): Func -> {
 		is_pub = true
 		p.pos = p.pos + 1
 	}
-	if !kw(p, "static") then die("cf: parse: expected `static`\n")
+	if !kw(p, "static") then perr(p, "cf: parse: expected `static`\n")
 	p.pos = p.pos + 1
-	if !is_lbracket(peek(p)) then die("cf: parse: a `static` needs a `[N Uint8]` buffer type\n")
+	if !is_lbracket(peek(p)) then perr(p, "cf: parse: a `static` needs a `[N Uint8]` buffer type\n")
 	if !is_intlit(p.toks[p.pos + 1].kind)
-		then die("cf: parse: a `static` buffer needs a comptime size\n")
+		then perr(p, "cf: parse: a `static` buffer needs a comptime size\n")
 	p.pos = p.pos + 1
 	const Iarch n = p.toks[p.pos].ival
 	p.pos = p.pos + 1
 	const Str felem = parse_fixed_elem!(p)
-	if !eq(felem, "Uint8") then die("cf: parse: a `static` buffer holds `Uint8` only\n")
-	if !is_rbracket(peek(p)) then die("cf: parse: expected `]` in a `static` type\n")
+	if !eq(felem, "Uint8") then perr(p, "cf: parse: a `static` buffer holds `Uint8` only\n")
+	if !is_rbracket(peek(p)) then perr(p, "cf: parse: expected `]` in a `static` type\n")
 	p.pos = p.pos + 1
-	if n <= 0 then die("cf: parse: a `static` buffer needs a positive size\n")
-	if !is_ident(peek(p)) then die("cf: parse: expected a `static` name\n")
+	if n <= 0 then perr(p, "cf: parse: a `static` buffer needs a positive size\n")
+	if !is_ident(peek(p)) then perr(p, "cf: parse: expected a `static` name\n")
 	const Str name = cur_name!(p)
 	# a value name is lowercase-initial (uppercase-initial is a TYPE) — ebnf § Identifiers
 	if Iarch(name[0]) >= 65 && Iarch(name[0]) <= 90
-		then die("cf: parse: a `static` name must be lowercase — an uppercase-initial name is a type\n")
+		then perr(p, "cf: parse: a `static` name must be lowercase — an uppercase-initial name is a type\n")
 	p.pos = p.pos + 1
 	const [Param] noparams = []
 	const [Stmt] body = [Stmt.Return(Expr.Buffer(Expr.Lit(n)))]
