@@ -4588,6 +4588,36 @@ const emit_stmt_match! = (*Emit ctx, [Binding] env, Expr scrut, [StmtArm] arms):
 # is data=0, len=0, cap=0. Returns the header pointer.
 const emit_array_lit! = (*Emit ctx, [Expr] elems, Str elem_type, [Binding] env): Str -> {
 	const Iarch n = Iarch(elems.len)
+	# a literal holding a NON-leading spread (`[x, ...a]`) has a runtime length, so the pre-sized
+	# data block below cannot hold it — build an empty growable header and push through the
+	# append path (which splices spread elements) instead
+	let Bool any_spread = false
+	let Iarch si = 0
+
+	loop {
+		if si >= n then break
+		if is_spread(elems[si]) then any_spread = true
+		si = si + 1
+	}
+
+	if any_spread then {
+		const Str el0 = if !eq(elem_type, "") then elem_type
+			else if is_spread(elems[0]) then spread_src_elem!(ctx, env, spread_inner(elems[0]))
+			else scalar_of!(ctx, env, elems[0])
+		const Iarch ghdr = emit_agg_node!(ctx, 24)
+		write_str(ctx.fd, "\tstorel 0, %t${ghdr}\n")
+		const Iarch g8 = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${g8} =l add %t${ghdr}, 8\n")
+		write_str(ctx.fd, "\tstorel 0, %t${g8}\n")
+		const Iarch g16 = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${g16} =l add %t${ghdr}, 16\n")
+		write_str(ctx.fd, "\tstorel 0, %t${g16}\n")
+		emit_append!(ctx, env, "%t${ghdr}", elems, el0)
+
+		return "%t${ghdr}"
+	}
 	const Iarch hdr = emit_agg_alloc!(ctx, 24)
 
 	if n == 0 then {
@@ -4672,8 +4702,18 @@ const emit_arraylit_spread! = (*Emit ctx, Expr src, [Expr] elems, Str elem_type,
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${h16} =l add %t${hdr}, 16\n")
 	write_str(ctx.fd, "\tstorel 0, %t${h16}\n")
-	# runtime copy of the source array's live elements (0 .. src.len) — the source is any
-	# expression yielding a dynamic-array header (a name, a field read, a call result)
+	# runtime copy of the source array's live elements, then append the listed ones
+	emit_spread_copy!(ctx, env, "%t${hdr}", src, esz)
+	emit_append!(ctx, env, "%t${hdr}", elems, el)
+
+	return "%t${hdr}"
+}
+
+# Copy every live element of the dynamic array `src` (0 .. src.len) onto the header `hdr` via
+# the push path. The source is any expression yielding a dynamic-array header (a name, a field
+# read, a call result). Shared by the leading spread of `[...src, e...]` and a NON-leading
+# spread element (`[...a, x, ...b]` — the grammar admits a spread at any element position).
+const emit_spread_copy! = (*Emit ctx, [Binding] env, Str hdr, Expr src, Iarch esz): Iarch -> {
 	const Str shdr = emit_expr!(src, ctx, env)
 	const Iarch lid = ctx.label
 	ctx.label = ctx.label + 1
@@ -4709,7 +4749,7 @@ const emit_arraylit_spread! = (*Emit ctx, Expr src, [Expr] elems, Str elem_type,
 	ctx.next = ctx.next + 1
 	if esz == 1 then write_str(ctx.fd, "\t%t${sval} =l loadub %t${saddr}\n")
 	if esz != 1 then write_str(ctx.fd, "\t%t${sval} =l loadl %t${saddr}\n")
-	const Str slot = emit_dyn_push_call!(ctx, "%t${hdr}", esz)
+	const Str slot = emit_dyn_push_call!(ctx, hdr, esz)
 	if esz == 1 then write_str(ctx.fd, "\tstoreb %t${sval}, ${slot}\n")
 	if esz != 1 then write_str(ctx.fd, "\tstorel %t${sval}, ${slot}\n")
 	const Iarch iv2 = ctx.next
@@ -4721,10 +4761,8 @@ const emit_arraylit_spread! = (*Emit ctx, Expr src, [Expr] elems, Str elem_type,
 	write_str(ctx.fd, "\tstorel %t${iv3}, %t${ci}\n")
 	write_str(ctx.fd, "\tjmp @cptop${lid}\n")
 	write_str(ctx.fd, "@cpend${lid}\n")
-	# append the listed elements after the copied ones
-	emit_append!(ctx, env, "%t${hdr}", elems, el)
 
-	return "%t${hdr}"
+	return 0
 }
 
 # Allocate an N-byte buffer in the arena; the returned pointer is a byte pointer ("$ptr").
@@ -4982,11 +5020,17 @@ const emit_append! = (*Emit ctx, [Binding] env, Str hdr, [Expr] elems, Str elem)
 
 	loop {
 		if i >= Iarch(elems.len) then break
-		const Str v = emit_expr!(elems[i], ctx, env)
-		const Str slot = emit_dyn_push_call!(ctx, hdr, esz)
-		# a `[Uint8]` element is one byte (`storeb`); every other rides in an 8-byte slot (`storel`)
-		if esz == 1 then write_str(ctx.fd, "\tstoreb ${v}, ${slot}\n")
-		if esz != 1 then write_str(ctx.fd, "\tstorel ${v}, ${slot}\n")
+		# a SPREAD element splices its whole source array (a runtime copy loop); a plain
+		# element pushes one slot
+		if is_spread(elems[i]) then {
+			emit_spread_copy!(ctx, env, hdr, spread_inner(elems[i]), esz)
+		} else {
+			const Str v = emit_expr!(elems[i], ctx, env)
+			const Str slot = emit_dyn_push_call!(ctx, hdr, esz)
+			# a `[Uint8]` element is one byte (`storeb`); every other rides in an 8-byte slot (`storel`)
+			if esz == 1 then write_str(ctx.fd, "\tstoreb ${v}, ${slot}\n")
+			if esz != 1 then write_str(ctx.fd, "\tstorel ${v}, ${slot}\n")
+		}
 		i = i + 1
 	}
 

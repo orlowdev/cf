@@ -771,8 +771,9 @@ const parse_array_lit! = (*Parser p): Expr -> {
 	p.pos = p.pos + 1 # `[`
 	if is_ellipsis(peek(p)) then {
 		p.pos = p.pos + 1
-		# the spread source is any expression yielding a dynamic array (a name, a field read
-		# `h.xs`, a call result, ...) — not only a bare local
+		# a LEADING spread rides the dedicated source slot (it is what the self-append
+		# `xs = [...xs, e]` in-place growth keys on); its source is any expression yielding a
+		# dynamic array (a name, a field read `h.xs`, a call result, ...) — not only a bare local
 		const Expr src = parse_expr!(p)
 		let [Expr] sp_elems = []
 
@@ -780,7 +781,14 @@ const parse_array_lit! = (*Parser p): Expr -> {
 			if !is_comma(peek(p)) then break
 			p.pos = p.pos + 1
 			if is_rbracket(peek(p)) then break # trailing comma
-			sp_elems = [...sp_elems, parse_expr!(p)]
+			# a FURTHER spread (`[...a, x, ...b]`, ebnf: any element may spread) is an ordinary
+			# element wrapped in `Spread` — typecheck/emit splice its source's elements in place
+			if is_ellipsis(peek(p)) then {
+				p.pos = p.pos + 1
+				sp_elems = [...sp_elems, Expr.Spread(parse_expr!(p))]
+			} else {
+				sp_elems = [...sp_elems, parse_expr!(p)]
+			}
 		}
 
 		if !is_rbracket(peek(p)) then die("cf: parse: expected `]` in an array spread\n")
@@ -791,7 +799,13 @@ const parse_array_lit! = (*Parser p): Expr -> {
 	let [Expr] lit_elems = []
 	if !is_rbracket(peek(p)) then {
 		loop {
-			lit_elems = [...lit_elems, parse_expr!(p)]
+			# a non-leading spread in a literal without a leading one — `[x, ...a]`
+			if is_ellipsis(peek(p)) then {
+				p.pos = p.pos + 1
+				lit_elems = [...lit_elems, Expr.Spread(parse_expr!(p))]
+			} else {
+				lit_elems = [...lit_elems, parse_expr!(p)]
+			}
 			if !is_comma(peek(p)) then break
 			p.pos = p.pos + 1
 			if is_rbracket(peek(p)) then break # trailing comma

@@ -2347,7 +2347,18 @@ const arraylit_elem! = (
 		return sen
 	}
 	if !eq(elem_type, "") then return elem_type
-	if Iarch(elems.len) > 0 then return elem_name_of(type_of!(elems[0], env, ctx))
+	if Iarch(elems.len) > 0 then {
+		# `[...a, x]` put its leading spread in the source slot, but `[x, ...a]` leads with a plain
+		# element — a SPREAD first element infers the element from its source array instead
+		if is_spread(elems[0]) then {
+			const Str sen = dyn_of(type_of!(spread_inner(elems[0]), env, ctx))
+			if eq(sen, "") then die("cf: type: a spread source must be a dynamic array\n")
+
+			return sen
+		}
+
+		return elem_name_of(type_of!(elems[0], env, ctx))
+	}
 
 	return "Iarch"
 }
@@ -2385,16 +2396,28 @@ const arraylit_type! = (
 
 	loop {
 		if i >= Iarch(elems.len) then break
-		const Ty evt = type_of!(elems[i], env, ctx)
-		# a general fixed-width element accepts an exact fixed VALUE (`Int32(x)`) or an adopting integer
-		# literal (`[3 Int32] = [1,2,3]`); a `[Uint8]` byte buffer stores plain word bytes and an explicit
-		# 8-bit fixed value (`Uint8(x)`/`Int8(x)`) — a WIDER fixed value there is a silently-truncating store.
-		if en_fixed then {
-			if !ty_eq(evt, ety) && !is_adoptable_lit(elems[i])
-				then die("cf: type: a dynamic-array element's type must match the array's element type\n")
-		} else if !ty_eq(evt, ety) && !(eq(en, "Uint8") &&
-				tfixed_bits(evt) == 8) then die("cf: type: a dynamic-array element's type must match the array's element type\n")
-		i = i + 1
+		# a SPREAD element (`[...a, x, ...b]` — any position per the grammar) splices another
+		# dynamic array of the SAME element type; it contributes its source's elements, not one value
+		if is_spread(elems[i]) then {
+			if spread_src_fixed(spread_inner(elems[i]), env)
+				then die("cf: type: a fixed array `[N T]` cannot be a spread source — only a dynamic `[T]` may be copy-appended or grown\n")
+			const Str sen2 = dyn_of(type_of!(spread_inner(elems[i]), env, ctx))
+			if eq(sen2, "") then die("cf: type: a spread source must be a dynamic array\n")
+			if !eq(sen2, en)
+				then die("cf: type: a spread source's element type must match the array's element type\n")
+			i = i + 1
+		} else {
+			const Ty evt = type_of!(elems[i], env, ctx)
+			# a general fixed-width element accepts an exact fixed VALUE (`Int32(x)`) or an adopting integer
+			# literal (`[3 Int32] = [1,2,3]`); a `[Uint8]` byte buffer stores plain word bytes and an explicit
+			# 8-bit fixed value (`Uint8(x)`/`Int8(x)`) — a WIDER fixed value there is a silently-truncating store.
+			if en_fixed then {
+				if !ty_eq(evt, ety) && !is_adoptable_lit(elems[i])
+					then die("cf: type: a dynamic-array element's type must match the array's element type\n")
+			} else if !ty_eq(evt, ety) && !(eq(en, "Uint8") &&
+					tfixed_bits(evt) == 8) then die("cf: type: a dynamic-array element's type must match the array's element type\n")
+			i = i + 1
+		}
 	}
 
 	return Ty.TDyn(en)
