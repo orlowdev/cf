@@ -42,12 +42,12 @@ const digit_value = (Iarch c): Iarch -> {
 	return -1
 }
 
-# The radix of a base-prefix letter following a leading `0` (`x`/`o`/`b`, case-insensitive), or 0
-# if the byte is not a base prefix (so the `0` begins an ordinary decimal literal).
+# The radix of a base-prefix letter following a leading `0` (`x`/`o`/`b` — lowercase only, ebnf
+# § Numbers), or 0 if the byte is not a base prefix (so the `0` begins an ordinary decimal literal).
 const base_radix = (Iarch c): Iarch -> {
-	if c == 120 || c == 88 then return 16   # x / X
-	if c == 111 || c == 79 then return 8    # o / O
-	if c == 98 || c == 66 then return 2     # b / B
+	if c == 120 then return 16   # x
+	if c == 111 then return 8    # o
+	if c == 98 then return 2     # b
 	return 0
 }
 
@@ -174,8 +174,13 @@ const lex_impl = (*[Uint8] src, Iarch n, Bool keep_comments): [Token] -> {
 		# as its SOURCE SPAN (the parser strips `_` and passes the text to QBE as a `d_...` constant).
 		if is_digit(c) then {
 			const Iarch start = i
-			# a BASE-prefixed integer: `0x`/`0o`/`0b` (case-insensitive) + digits in that radix, with
-			# `_` separators BETWEEN digits. A leading `0` followed by a base letter; else it is decimal.
+			# an UPPERCASE base letter after a leading `0` (`0XFF`) is a spelling error, not two
+			# tokens — reject it here with the fix in hand (ebnf § Numbers: prefixes are lowercase)
+			if c == 48 && i + 1 < n
+				&& (Iarch(src[i + 1]) == 88 || Iarch(src[i + 1]) == 79 || Iarch(src[i + 1]) == 66)
+				then die("cf: lex: a base prefix is lowercase — write 0x, 0o or 0b\n")
+			# a BASE-prefixed integer: `0x`/`0o`/`0b` + digits in that radix, with `_` separators
+			# BETWEEN digits. A leading `0` followed by a base letter; else it is decimal.
 			if c == 48 && i + 1 < n && base_radix(Iarch(src[i + 1])) > 0 then {
 				const Iarch radix = base_radix(Iarch(src[i + 1]))
 				i = i + 2 # `0` + the base letter
@@ -221,7 +226,11 @@ const lex_impl = (*[Uint8] src, Iarch n, Bool keep_comments): [Token] -> {
 				loop {
 					if i >= n then break
 					const Iarch d = Iarch(src[i])
-					if is_digit(d) || d == 95 then i = i + 1 else break
+					# same `_` rule as the integer part: BETWEEN digits only — a trailing/doubled `_`
+					# stops the number, leaving a stray `_` identifier the parser rejects
+					if is_digit(d) then i = i + 1
+						else if d == 95 && i + 1 < n && is_digit(Iarch(src[i + 1])) then i = i + 1
+							else break
 				}
 
 				toks = [
