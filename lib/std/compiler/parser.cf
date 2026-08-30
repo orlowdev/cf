@@ -88,6 +88,9 @@ pub data Parser = {
 	Bool saw_fb,
 	Bool saw_fx,
 	Bool saw_el,
+	# ANONYMOUS lambdas parsed mid-expression, awaiting their hoist: each becomes a hidden named
+	# `Stmt.Closure` spliced in just before the statement that referenced it (`flush_pending`)
+	[Stmt] pending,
 }
 
 # The current token's kind.
@@ -229,6 +232,7 @@ const parse_hole! = (*[Uint8] src, Iarch hstart, Iarch hlen): Expr -> {
 	}
 
 	const [Token] toks = lex(hbuf, hlen)
+	const [Stmt] nopend = []
 	let Parser hp = Parser({
 		toks: toks,
 		src: hbuf,
@@ -239,6 +243,7 @@ const parse_hole! = (*[Uint8] src, Iarch hstart, Iarch hlen): Expr -> {
 		saw_fb: false,
 		saw_fx: false,
 		saw_el: false,
+		pending: nopend,
 	})
 	const Expr e = parse_expr!(&hp)
 	if !is_eof(peek(&hp)) then die("cf: parse: an interpolation hole must be a single expression\n")
@@ -1307,6 +1312,18 @@ const parse_primary! = (*Parser p): Expr -> {
 
 		return postfix_chain!(p, parse_string!(p.src, start, len))
 	}
+	# `(params) [: ret] -> body` in EXPRESSION position — an ANONYMOUS function value (ebnf
+	# Functions: a function is just a value). Parsed as a closure under a hidden name, queued for
+	# the hoist (`flush_pending` splices it in just before the enclosing statement), and replaced
+	# by a reference to that name. A lambda cannot capture a match-arm or one-line-for binding: the
+	# hoist sits above the statement, so such a capture is rejected as an unknown name.
+	if is_lparen(peek(p)) && lambda_ahead(p) then {
+		const Str lname = "lam\$${p.pos}"
+		const Stmt cl = parse_closure!(p, lname)
+		p.pending = [...p.pending, cl]
+
+		return postfix_chain!(p, Expr.Var(lname))
+	}
 	if is_lparen(peek(p)) then {
 		p.pos = p.pos + 1
 		# `({ ... })` — a parenthesized bare record literal (empty type_name), typed by its context
@@ -2038,17 +2055,43 @@ const line_of = (*Parser p, Iarch off): Iarch -> {
 # the last. (A whole block that fits on ONE line — `{ <one stmt> }`, a short value block `{ <- v }` —
 # stays inline.) A statement's own expression may still span lines inside brackets / a `|>` chain;
 # the checks fire only at statement boundaries and the block's braces.
+# A fresh empty pending queue (the committed-seed compiler predates the typed `field = []` reset,
+# so the clear rides a call).
+const no_pending = (): [Stmt] -> {
+	const [Stmt] r = []
+
+	return r
+}
+
+# Splice the pending anonymous-lambda hoists (each a hidden named `Stmt.Closure`) into `stmts`
+# ahead of the statement that referenced them, and clear the queue.
+const flush_pending = (*Parser p, [Stmt] stmts): [Stmt] -> {
+	if Iarch(p.pending.len) == 0 then return stmts
+	const [Stmt] out = [...stmts, ...p.pending]
+	p.pending = no_pending()
+
+	return out
+}
+
 const parse_block! = (*Parser p): [Stmt] -> {
 	const Iarch open_line = line_of(p, p.toks[p.pos - 1].start)
 	const Iarch first_pos = p.pos
+	# lambdas queued by the ENCLOSING statement (this block is nested mid-statement — a match
+	# arm, a guard body) must not leak into this block's scope: shelve them for the duration
+	const [Stmt] shelved = [...p.pending]
+	p.pending = no_pending()
 	let [Stmt] stmts = []
 
 	loop {
 		if is_rbrace(peek(p)) then break
 		if Iarch(stmts.len) > 0 && !nl_before(p, p.pos)
 			then die("cf: parse: two statements share a line — each statement needs its own line\nAT ${p.file} OFFSET ${p.toks[p.pos].start} LINE ${line_of(p, p.toks[p.pos].start)}\n")
-		stmts = [...stmts, parse_stmt!(p)]
+		const Stmt s = parse_stmt!(p)
+		# anonymous lambdas parsed inside `s` hoist to just before it
+		stmts = flush_pending(p, stmts)
+		stmts = [...stmts, s]
 	}
+	p.pending = [...shelved]
 
 	const Iarch close_line = line_of(p, p.toks[p.pos].start)
 	if open_line != close_line && Iarch(stmts.len) > 0 then {
@@ -2441,7 +2484,14 @@ const parse_closure! = (*Parser p, Str name): Stmt -> {
 
 		return Stmt.Closure(name, params, rs.name, body)
 	}
-	const [Stmt] one = [...nobody, Stmt.Return(parse_expr!(p))]
+	# an expression body: nested anonymous lambdas hoist INTO this closure (they may capture its
+	# parameters), while lambdas queued by the enclosing statement stay shelved outside
+	const [Stmt] shelved = [...p.pending]
+	p.pending = no_pending()
+	const Expr bexpr = parse_expr!(p)
+	let [Stmt] one = flush_pending(p, nobody)
+	one = [...one, Stmt.Return(bexpr)]
+	p.pending = [...shelved]
 
 	return Stmt.Closure(name, params, rs.name, one)
 }
@@ -2877,7 +2927,10 @@ const parse_func! = (*Parser p): Func -> {
 			asm_sym: "",
 		})
 	}
-	const [Stmt] one = [...nobody, Stmt.Return(parse_expr!(p))]
+	# an expression body: anonymous lambdas parsed inside it hoist into this function's body
+	const Expr fbexpr = parse_expr!(p)
+	let [Stmt] one = flush_pending(p, nobody)
+	one = [...one, Stmt.Return(fbexpr)]
 
 	return Func({
 		name: name,
