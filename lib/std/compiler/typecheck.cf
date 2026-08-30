@@ -2991,6 +2991,18 @@ pub const binding_ty! = (Str ann, Expr e, [VarTy] env, Ctx ctx): Ty -> {
 
 		return rt
 	}
+	# a FLOAT-annotated binding's value must carry that exact width. There is NO literal
+	# adoption here (unlike a fixed-width integer): a bare literal is `Float64`, so a `Float32`
+	# binding wraps it in an explicit `Float32(...)` cast — the annotation otherwise silently
+	# masqueraded a mismatched width past the checker into a QBE store-class error (or worse,
+	# a double stored under a single-width read).
+	if is_float_name(ann) then {
+		const Ty ft = type_of!(e, env, ctx)
+		if !ty_eq(ft, Ty.TFloat(float_bits(ann)))
+			then terr(ctx, "cf: type: a float binding needs a value of its exact width — wrap a literal in `Float32(...)`/`Float64(...)`\n")
+
+		return ft
+	}
 
 	# an array-literal binding must be annotated — the element type is NOT inferred from the elements
 	# (`const xs = [1, 2, 3]` is rejected; write `const [3 Iarch] xs = ...`). An annotated binding carries
@@ -3003,6 +3015,27 @@ pub const binding_ty! = (Str ann, Expr e, [VarTy] env, Ctx ctx): Ty -> {
 	}
 
 	return type_of!(e, env, ctx)
+}
+
+# Enforce a binding's remaining NAMED annotation (`Str`/`Bool`/`Unit`/a union/an integer word —
+# the shapes `binding_ty!` leaves to `type_of`'s fall-through): the name must be known and the
+# value must be that exact type — an annotation is a check, never decoration. Lives OUTSIDE
+# `binding_ty!` on purpose: the monomorph pass shares that helper while inference still sees
+# pre-narrowing types (a `for` binder is element-typed there but word-typed here), so this runs
+# only in the typecheck walk. A shape marker, a generic-application / member-type residue
+# (`[` / `.` — monomorph's to validate), and the shapes `binding_ty!` already enforces
+# (fixed-width, float, record) pass through.
+const check_binding_ann! = (Str ann, Expr e, [VarTy] env, Ctx ctx): () -> {
+	if eq(ann, "") then return ()
+	if is_shape_marker(ann) then return ()
+	if name_has_byte(ann, 91) || name_has_byte(ann, 46) then return ()
+	if is_fixed_name(ann) || is_float_name(ann) then return ()
+	if find_rec(ctx.recs, ann) >= 0 then return ()
+	if eq(ann, "Int") then return ()
+	if !is_known_typename(ann, ctx.recs, ctx.unions)
+		then terr(ctx, "cf: type: a binding annotation names an unknown type\n")
+	if !ty_eq(type_of!(e, env, ctx), named_ty(ann, "", ctx.recs, ctx.unions))
+		then terr(ctx, "cf: type: a binding's value does not match its annotation\n")
 }
 
 # The enclosing-loop kind threaded through statement checking, so `break`/`continue`/`<-`
@@ -4196,6 +4229,7 @@ const check_stmts! = ([Stmt] stmts, [VarTy] env0, Ctx ctx, Iarch loop_kind): Iar
 				if m && is_ptr_field_read(e, env, ctx)
 					then terr(ctx, "cf: type: an inferred pointer local (a `*` reference field read) binds `const`, not `let` — a reference cannot be repointed\n")
 				const Ty ty = binding_ty!(ann, e, env, ctx)
+				check_binding_ann!(ann, e, env, ctx)
 				# a `[N T]` FIXED binding whose initializer length is statically known (an array-returning
 				# CALL, or a literal not already caught at parse) must match N (905).
 				const Iarch fs = fix_ann_size(ann)
