@@ -109,13 +109,16 @@ const ferr = (Func f, Str msg): Never -> die_at_lc(f.dfile, f.dline, f.dcol, msg
 const rerr = (RecDecl r, Str msg): Never -> die_at_lc(r.dfile, r.dline, r.dcol, msg)
 const uerr = (UnionDecl u, Str msg): Never -> die_at_lc(u.dfile, u.dline, u.dcol, msg)
 
+# A `$dyn`/`$ptr`/`$tuple`/`$fn`/`$fix` shape marker (byte 36 `$`) — a type position that
+# resolves structurally, not by name.
+const is_shape_marker = (Str n): Bool -> Iarch(n.len) > 0 && Iarch(n[0]) == 36
+
 # Pre-check a written type name where a declaration's stamp is at hand, so an unknown name
 # dies LOCATED — `named_ty` itself stays stamp-less (the monomorph pass shares it, and its
-# own die is the unlocated backstop). A `$dyn`/`$ptr`/`$tuple`/`$fn`/`$fix` shape marker
-# (byte 36 `$`) resolves structurally, not by name — pass it through.
+# own die is the unlocated backstop). A shape marker passes through.
 const known_ty_at = (Str tn, [RecDecl] recs, [UnionDecl] unions, Func f): () -> {
 	if eq(tn, "") then return ()
-	if Iarch(tn[0]) == 36 then return ()
+	if is_shape_marker(tn) then return ()
 	if !is_known_typename(tn, recs, unions)
 		then ferr(f, "cf: type: an undeclared type name\n")
 }
@@ -4687,10 +4690,61 @@ const check_whole = (Program prog): Iarch -> {
 			# `Str`, nested array) has no meaningful inline stride and is a later brick
 			if eq(prog.recs[r].ftypes[a], "$fix") && !is_ptr_field_elem(prog.recs[r].felems[a])
 				then rerr(prog.recs[r], "cf: type: an inline `[N Elem]` field element must be `Uint8`, `Iarch`, or a fixed-width integer\n")
+			# a `[Elem]` field's ELEMENT must itself name a known type — layout never resolves it
+			# (an 8-byte slot either way), so an unused `[Nope]` field would otherwise slip forever
+			if eq(prog.recs[r].ftypes[a], "$dyn") && !eq(prog.recs[r].felems[a], "") &&
+				!is_shape_marker(prog.recs[r].felems[a]) then {
+				if name_is_typevar(prog.recs[r].felems[a])
+					then rerr(prog.recs[r], "cf: type: an undeclared type variable in a record field\n")
+				if !is_known_typename(prog.recs[r].felems[a], prog.recs, prog.unions)
+					then rerr(prog.recs[r], "cf: type: a record field's array element names an unknown type\n")
+			}
 			a = a + 1
 		}
 
 		r = r + 1
+	}
+
+	# the union mirror of the record-field checks: every member's payload TYPES must be known at
+	# the declaration. A payload is an 8-byte slot regardless of its type, so nothing later (layout,
+	# a sibling member's construction) resolves a bogus name — only constructing the member itself
+	# would, and a never-constructed member must not smuggle an unknown type past the checker.
+	let Iarch uw = 0
+
+	loop {
+		if uw >= Iarch(prog.unions.len) then break
+		let Iarch um = 0
+
+		loop {
+			if um >= Iarch(prog.unions[uw].members.len) then break
+			const UnionMember umem = prog.unions[uw].members[um]
+			let Iarch up = 0
+
+			loop {
+				if up >= Iarch(umem.payloads.len) then break
+				# a `'T` payload needs a generic union declaration to bind it (a template's payloads
+				# are validated at the template; this catches a plain union's stray type variable)
+				if name_is_typevar(umem.payloads[up])
+					then uerr(prog.unions[uw], "cf: type: an undeclared type variable in a union payload\n")
+				if !is_known_typename(umem.payloads[up], prog.recs, prog.unions)
+					then uerr(prog.unions[uw], "cf: type: a union payload names an unknown type\n")
+				if eq(umem.payloads[up], "$tuple") && telems_have_typevar(umem.ptelems[up])
+					then uerr(prog.unions[uw], "cf: type: an undeclared type variable in a tuple payload\n")
+				# a `[Elem]` payload's element, like a record field's
+				if eq(umem.payloads[up], "$dyn") && !eq(umem.pelems[up], "") &&
+					!is_shape_marker(umem.pelems[up]) then {
+					if name_is_typevar(umem.pelems[up])
+						then uerr(prog.unions[uw], "cf: type: an undeclared type variable in a union payload\n")
+					if !is_known_typename(umem.pelems[up], prog.recs, prog.unions)
+						then uerr(prog.unions[uw], "cf: type: a union payload's array element names an unknown type\n")
+				}
+				up = up + 1
+			}
+
+			um = um + 1
+		}
+
+		uw = uw + 1
 	}
 
 	let Iarch mains = 0
