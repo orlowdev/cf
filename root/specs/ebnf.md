@@ -1275,7 +1275,7 @@ sit anywhere an expression may — notably as an `if` branch).
 
 ```ebnf
 loop_expr     = "loop" , [ var_name ] , block ;                 (* infinite loop; optional label *)
-for_expr      = "for" , var_name , "in" , expression , branch ; (* iterate a value; nameless *)
+for_expr      = "for" , ( var_name | "(" , var_name , "," , var_name , ")" ) , "in" , expression , branch ; (* iterate a value, optionally with its index; nameless *)
 
 break_expr    = "break" , [ var_name ] ;                        (* exit a loop, optionally by label *)
 continue_expr = "continue" , [ var_name ] ;                     (* next iteration, optionally by label *)
@@ -1311,6 +1311,10 @@ Points:
   body, so `loop { ... }` and `loop outer { ... }` never collide. Its body is a
   `block`.
 - **`for var in iterable body`** binds each element to `var` and runs the body.
+  The two-binder form **`for (x, i) in xs`** is a tuple-shaped pattern (mirroring
+  destructuring): the element first, its zero-based index (an `Iarch`) second;
+  both binders are per-iteration constants. The parenthesised pattern keeps the
+  form unambiguous against the one-binder `for x in`.
   `for` is **nameless** — no label. The body is a `branch` (a `block` or a single
   expression), which is what makes it one-lineable (`for i in xs if ...`) and an
   expression (`... then i else 2`). The iterable is a full `expression`; because

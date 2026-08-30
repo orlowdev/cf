@@ -1719,9 +1719,29 @@ const compound_apply = (TokKind k, Expr lhs, Expr rhs): Expr -> {
 # `for <var> in <arr> { body }` — iterate a dynamic array's elements.
 const parse_for! = (*Parser p): Stmt -> {
 	p.pos = p.pos + 1 # `for`
-	if !is_ident(peek(p)) then die("cf: parse: expected a loop variable after `for`\n")
-	const Str lv = cur_name!(p)
-	p.pos = p.pos + 1
+	# `for (x, i) in xs` — the two-binder form is a tuple-shaped pattern (mirroring
+	# destructuring): the ELEMENT first, its zero-based index (an Iarch) second. The parens keep
+	# it unambiguous against the one-binder `for x in`.
+	let Str lv = ""
+	let Str iv = ""
+
+	if is_lparen(peek(p)) then {
+		p.pos = p.pos + 1
+		if !is_ident(peek(p)) then die("cf: parse: expected an element variable in a for-loop pattern\n")
+		lv = cur_name!(p)
+		p.pos = p.pos + 1
+		if !is_comma(peek(p)) then die("cf: parse: expected `,` in a `for (x, i)` pattern\n")
+		p.pos = p.pos + 1
+		if !is_ident(peek(p)) then die("cf: parse: expected an index variable in a for-loop pattern\n")
+		iv = cur_name!(p)
+		p.pos = p.pos + 1
+		if !is_rparen(peek(p)) then die("cf: parse: expected `)` in a `for (x, i)` pattern\n")
+		p.pos = p.pos + 1
+	} else {
+		if !is_ident(peek(p)) then die("cf: parse: expected a loop variable after `for`\n")
+		lv = cur_name!(p)
+		p.pos = p.pos + 1
+	}
 	if !kw(p, "in") then die("cf: parse: expected `in` in a for-loop\n")
 	p.pos = p.pos + 1
 	# the iterable is a full EXPRESSION (ebnf for_expr) — a name, a field read, a call result.
@@ -1730,6 +1750,20 @@ const parse_for! = (*Parser p): Stmt -> {
 	const Iarch it_tok = p.pos
 	const Expr it = parse_expr!(p)
 	const [Stmt] body = parse_for_body!(p)
+	# the index binder desugars to a hidden counter OUTSIDE the loop (starting at -1) that the
+	# body increments FIRST — so a `continue` still advances it — then binds per iteration as the
+	# user's constant. The `$` makes hidden names unlexable as source identifiers (no collision).
+	let [Stmt] fbody = body
+	const Str ctr = "fidx\$${it_tok}"
+
+	if !eq(iv, "") then {
+		const [Stmt] pre = [
+			Stmt.Assign(ctr, Expr.Add(Expr.Var(ctr), Expr.Lit(1))),
+			Stmt.Let(iv, false, "", Expr.Var(ctr)),
+		]
+		const [Stmt] wrapped = [...pre, ...body]
+		fbody = wrapped
+	}
 	# a bare-name iterable drives `ForIn` directly; any other expression is bound to a hidden
 	# temp first (a nested block, so the temp never leaks into the enclosing scope)
 	const Str arr = match it {
@@ -1737,12 +1771,15 @@ const parse_for! = (*Parser p): Stmt -> {
 		_ -> "",
 	}
 
-	if !eq(arr, "") then return Stmt.ForIn(lv, arr, body)
-	# the `$` makes the temp unlexable as a source identifier, so it can never collide
-	const Str tmp = "fiter\$${it_tok}"
-	const [Stmt] pair = [Stmt.Let(tmp, false, "", it), Stmt.ForIn(lv, tmp, body)]
+	if eq(iv, "") && !eq(arr, "") then return Stmt.ForIn(lv, arr, fbody)
+	const Str tmp = if eq(arr, "") then "fiter\$${it_tok}" else arr
+	let [Stmt] blk = []
 
-	return Stmt.Block(pair)
+	if eq(arr, "") then blk = [...blk, Stmt.Let(tmp, false, "", it)]
+	if !eq(iv, "") then blk = [...blk, Stmt.Let(ctr, true, "", Expr.Lit(-1))]
+	const [Stmt] whole = [...blk, Stmt.ForIn(lv, tmp, fbody)]
+
+	return Stmt.Block(whole)
 }
 
 # A for-loop's body is a BRANCH (ebnf for_expr): a `{ ... }` block, or a single statement on the
