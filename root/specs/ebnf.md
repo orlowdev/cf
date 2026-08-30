@@ -46,7 +46,7 @@ hex_digit = dec_digit | "a" | "b" | "c" | "d" | "e" | "f"
 
 ```ebnf
 type_name = uppercase , { uppercase | lowercase | dec_digit } ;         (* PascalCase: Int, Uint8 *)
-var_name  = lowercase , { lowercase | dec_digit | "_" } , [ "!" ] ;     (* snake_case: x, the_number, alloc! *)
+var_name  = [ "$" ] , lowercase , { lowercase | dec_digit | "_" } , [ "!" ] ;   (* snake_case: x, the_number, alloc!, $buf *)
 ```
 
 A `var_name` may end in a single `!`. Lexically the `!` is part of the
@@ -54,6 +54,15 @@ identifier (`alloc!` is one token). It is the **allocation-effect marker** and
 is meaningful only on function names — a `!` function allocates; see the memory
 model. Elsewhere a trailing `!` is grammatically permitted but semantically
 inert.
+
+A `var_name` may also **lead with a single `$`** — the **stack-storage marker**,
+part of the identifier exactly as the trailing `!` is (`$buf` is one token). A
+`$`-marked binding lives on the **stack frame**, reclaimed when the frame pops —
+not residue, off every geometry node, so it neither colors its function with `!`
+nor obeys escape rules (it must not escape at all; see [[memory_model.md]]). It
+is meaningful on local bindings; the marker is read wherever the name is
+(`const $p = ...`, `$p.x`). A `$` in code never collides with string
+interpolation — `${` opens an interpolation only **inside a string literal**.
 
 A trailing `!` joins the name only when it does **not** open the `!=` operator —
 the lexer takes the `!` into the identifier iff the next character is not `=`. So
@@ -163,7 +172,8 @@ hex_run = hex_digit , { [ "_" ] , hex_digit } ;
 integer = dec_run                (* 42, 1_000_000 *)
         | "0b" , bin_run         (* 0b1010 *)
         | "0o" , oct_run         (* 0o755 *)
-        | "0x" , hex_run ;       (* 0xff, 0xDE_AD_BE_EF *)
+        | "0x" , hex_run         (* 0xff, 0xDE_AD_BE_EF *)
+        | char_lit ;             (* 'A' — a byte value; see Characters *)
 
 float = dec_run , "." , dec_run ;   (* 1.0, 3_000.5 — digits on both sides *)
 ```
@@ -192,11 +202,34 @@ string_char    = ? any source character except an unescaped '"', a '\', or a '$'
 A lone `$` not followed by `{` is a literal `$`; `\$` forces a literal `$` even
 before `{`.
 
+## Characters
+
+A character literal is a single byte between apostrophes — an **`integer` in
+disguise**: `'A'` denotes `65` and is an ordinary integer wherever the grammar
+wants one (it is an alternative of `integer`, see Numbers). There is no separate
+character type or token; the lexer emits the byte value directly.
+
+```ebnf
+char_lit    = "'" , ( char_escape | char_char ) , "'" ;    (* 'A', '0', '\n' — exactly one byte *)
+char_escape = "\" , ( "n" | "t" | "r" | "0" | "\" | "'" ) ;
+char_char   = ? any source character except a "\" or a "'" ? ;
+```
+
+A `char_lit` holds **exactly one** character or escape. It is told apart from a
+type variable (`'T`, see Types) by its **closing apostrophe**, which a type var
+never has. The escape set is the character literal's own — `\'` exists here and
+not in strings, `\"`/`\$` exist in strings and not here; `\n`, `\t`, `\r`, `\0`,
+`\\` are shared.
+
 ## Booleans
 
 ```ebnf
 bool = "true" | "false" ;
 ```
+
+The two values are also reachable by their qualified spellings `Bool.True` and
+`Bool.False` — the ordinary `member_access` path to the same constants (nullary,
+never applied); `true`/`false` are simply the idiomatic short forms.
 
 ## Aggregate Literals
 
@@ -1468,6 +1501,31 @@ separator — distinct from `.`, which stays the runtime `field_access` and the
 union-variant qualifier (`rec.field`, `Maybe.Just`, `Os.Darwin`). Which names a module
 exports is a semantic rule; the grammar fixes only the surface.
 
+## Static Buffers
+
+A **`static`** declares a module-level **byte buffer**: `N` zero bytes placed in
+the binary's BSS, program-lifetime, off every geometry node — the substrate a
+`fixed_buffer` geometry runs on. There is no initializer (the buffer is born
+zeroed) and no runtime construction; the bare name is the buffer value.
+
+```ebnf
+static_decl = "static" , "[" , integer , type_name , "]" , var_name ;   (* static [4096 Uint8] pool *)
+```
+
+The bracketed type reuses the `fixed_array` spelling, but the form is narrower
+than the grammar shows — semantic rules pin it down: the element type must be
+**`Uint8`** (a `static` is bytes, nothing else), the size a **positive comptime
+integer**, and the name lowercase (it is a value). Because the buffer is
+global-lifetime it is **not residue** and obeys no escape rules — it never
+dangles; referencing it (`pool`) yields the buffer, typically handed to
+`fixed_buffer::of(pool)`. A `static` is a top-level `declaration` (below), so it
+may be `pub`:
+
+```
+static [64 Uint8] pool
+pub static [4096 Uint8] shared
+```
+
 ## Visibility
 
 A top-level declaration may be prefixed with **`pub`**, which exports it — a
@@ -1475,7 +1533,7 @@ A top-level declaration may be prefixed with **`pub`**, which exports it — a
 module-private. There is no scoping argument, just the bare keyword.
 
 ```ebnf
-declaration = [ "pub" ] , ( data_decl | type_decl | union_decl | var_decl | intrinsic_decl ) ;   (* top-level item *)
+declaration = [ "pub" ] , ( data_decl | type_decl | union_decl | var_decl | intrinsic_decl | static_decl ) ;   (* top-level item *)
 ```
 
 `pub` sits before the declaration keyword and applies to **data, types, and
