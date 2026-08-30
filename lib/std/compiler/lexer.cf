@@ -7,7 +7,7 @@
 # the lexer stays allocation-light (no per-token Str). Integer tokens carry their
 # decoded value.
 
-import std::io::console::{ die }
+import std::compiler::diag::{ die_at }
 import std::compiler::token::{ TokKind, Token }
 
 # Byte classes (ASCII).
@@ -19,8 +19,9 @@ const is_alpha = (Iarch c): Bool -> (c >= 97 && c <= 122) || (c >= 65 && c <= 90
 
 const is_alnum = (Iarch c): Bool -> is_alpha(c) || is_digit(c)
 
-# The byte a char-literal escape `\<e>` decodes to. Mirrors the parser's string `escape_byte`,
-# plus `\'` (a quote inside a char literal) and minus the string-only `\"`/`\$`.
+# The byte a char-literal escape `\<e>` decodes to, or -1 for an unknown escape (the caller
+# rejects it at the escape's own byte). Mirrors the parser's string `escape_byte`, plus `\'`
+# (a quote inside a char literal) and minus the string-only `\"`/`\$`.
 const char_escape_byte = (Iarch e): Iarch -> {
 	if e == 110 then return 10  # \n
 	if e == 116 then return 9   # \t
@@ -28,9 +29,8 @@ const char_escape_byte = (Iarch e): Iarch -> {
 	if e == 48 then return 0    # \0
 	if e == 92 then return 92   # backslash
 	if e == 39 then return 39   # \'
-	die("cf: lex: unknown char escape (allowed: \\n \\t \\r \\0 \\\\ \\')\n")
 
-	return 0
+	return -1
 }
 
 # The numeric value of a hex digit byte (`0-9`, `a-f`, `A-F`), or -1 if not a hex digit. Callers
@@ -60,8 +60,10 @@ const in_radix = (Iarch c, Iarch radix): Bool -> {
 
 # Lex the first `n` bytes of `src` into a token stream terminated by `Eof`. `keep_comments`
 # selects whether a `#...` line comment becomes a `Comment` token (the formatter's `lex_fmt`) or
-# is dropped (the compile path's `lex`, so the parser never meets a comment token).
-const lex_impl = (*[Uint8] src, Iarch n, Bool keep_comments): [Token] -> {
+# is dropped (the compile path's `lex`, so the parser never meets a comment token). A rejection
+# reports `file:line:col` via (`esrc`, `ebase`) — the enclosing file's bytes and the bias mapping
+# this buffer's offsets into it (the buffer itself and 0 outside a hole).
+const lex_impl = (*[Uint8] src, Iarch n, Bool keep_comments, Str file, *[Uint8] esrc, Iarch ebase): [Token] -> {
 	let [Token] toks = []
 	let Iarch i = 0
 
@@ -100,7 +102,7 @@ const lex_impl = (*[Uint8] src, Iarch n, Bool keep_comments): [Token] -> {
 			let Iarch j = i + 1
 
 			loop {
-				if j >= n then die("cf: lex: unterminated string literal\n")
+				if j >= n then die_at(file, esrc, ebase + start - 1, "cf: lex: unterminated string literal\n")
 				const Iarch d = Iarch(src[j])
 				if d == 92 then {
 					j = j + 2
@@ -123,11 +125,13 @@ const lex_impl = (*[Uint8] src, Iarch n, Bool keep_comments): [Token] -> {
 		# it as an ordinary integer (`p.toks[..].ival`) — no dedicated char token or parser arm.
 		if c == 39 then {
 			if i + 3 < n && Iarch(src[i + 1]) == 92 && Iarch(src[i + 3]) == 39 then {
+				const Iarch cb = char_escape_byte(Iarch(src[i + 2]))
+				if cb < 0 then die_at(file, esrc, ebase + i + 2, "cf: lex: unknown char escape (allowed: \\n \\t \\r \\0 \\\\ \\')\n")
 				toks = [
 					...toks,
 					Token({
 						kind: TokKind.IntLit,
-						ival: char_escape_byte(Iarch(src[i + 2])),
+						ival: cb,
 						start: i,
 						len: 4,
 						text: "",
@@ -178,7 +182,7 @@ const lex_impl = (*[Uint8] src, Iarch n, Bool keep_comments): [Token] -> {
 			# tokens — reject it here with the fix in hand (ebnf § Numbers: prefixes are lowercase)
 			if c == 48 && i + 1 < n
 				&& (Iarch(src[i + 1]) == 88 || Iarch(src[i + 1]) == 79 || Iarch(src[i + 1]) == 66)
-				then die("cf: lex: a base prefix is lowercase — write 0x, 0o or 0b\n")
+				then die_at(file, esrc, ebase + i + 1, "cf: lex: a base prefix is lowercase — write 0x, 0o or 0b\n")
 			# a BASE-prefixed integer: `0x`/`0o`/`0b` + digits in that radix, with `_` separators
 			# BETWEEN digits. A leading `0` followed by a base letter; else it is decimal.
 			if c == 48 && i + 1 < n && base_radix(Iarch(src[i + 1])) > 0 then {
@@ -199,7 +203,7 @@ const lex_impl = (*[Uint8] src, Iarch n, Bool keep_comments): [Token] -> {
 							else break
 				}
 
-				if ndig == 0 then die("cf: lex: a based integer literal needs at least one digit\n")
+				if ndig == 0 then die_at(file, esrc, ebase + i, "cf: lex: a based integer literal needs at least one digit\n")
 				toks = [
 					...toks,
 					Token({ kind: TokKind.IntLit, ival: bv, start: start, len: i - start, text: "" }),
@@ -433,7 +437,7 @@ const lex_impl = (*[Uint8] src, Iarch n, Bool keep_comments): [Token] -> {
 			i = i + 1
 			continue
 		}
-		die("cf: lex: unexpected character\n")
+		die_at(file, esrc, ebase + i, "cf: lex: unexpected character\n")
 	}
 
 	toks = [...toks, Token({ kind: TokKind.Eof, ival: 0, start: n, len: 0, text: "" })]
@@ -442,8 +446,12 @@ const lex_impl = (*[Uint8] src, Iarch n, Bool keep_comments): [Token] -> {
 }
 
 # The compile path: strip comments, so the parser only ever sees semantic tokens.
-pub const lex = (*[Uint8] src, Iarch n): [Token] -> lex_impl(src, n, false)
+pub const lex = (*[Uint8] src, Iarch n, Str file): [Token] -> lex_impl(src, n, false, file, src, 0)
+
+# The HOLE path: lex a copied `${...}` slice whose offsets rebase into the enclosing file
+# through (`esrc`, `ebase`) — see `lex_impl`.
+pub const lex_hole = (*[Uint8] src, Iarch n, Str file, *[Uint8] esrc, Iarch ebase): [Token] -> lex_impl(src, n, false, file, esrc, ebase)
 
 # The formatter path: keep `#...` comments as `Comment` tokens so the formatter can reflow and
 # reposition them (the parser never runs on this stream).
-pub const lex_fmt = (*[Uint8] src, Iarch n): [Token] -> lex_impl(src, n, true)
+pub const lex_fmt = (*[Uint8] src, Iarch n, Str file): [Token] -> lex_impl(src, n, true, file, src, 0)
