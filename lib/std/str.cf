@@ -1,9 +1,45 @@
-# std::str — small string utilities over the builtin `Str` (a `{bytes, len}` byte vector, indexable
-# by `s[i]` for its bytes). Every function takes the subject string LAST, so a value pipes straight
-# into a preconfigured call: `name |> starts_with("pub ")`.
+# std::str — string utilities over the builtin `Str` (a `{bytes, len}` byte vector, indexable by
+# `s[i]` for its bytes). Every function takes the subject string LAST, so a value pipes straight into
+# a preconfigured call: `name |> starts_with("pub ")`, `line |> split(",")`. Functions that build a
+# string return a fresh owned `Str` — the input is never mutated or aliased.
 
 # Lowercase one ASCII byte (`A`–`Z` → `a`–`z`); other bytes pass through.
 const lower = (Iarch c): Iarch -> if c >= 65 && c <= 90 then c + 32 else c
+
+# Uppercase one ASCII byte (`a`–`z` → `A`–`Z`); other bytes pass through.
+const upper = (Iarch c): Iarch -> if c >= 97 && c <= 122 then c - 32 else c
+
+# ASCII whitespace: space, tab, LF, CR.
+const is_space = (Iarch c): Bool -> c == 32 || c == 9 || c == 10 || c == 13
+
+# Copy the byte range [start, stop) of `s` into a fresh owned Str (append inline onto one local,
+# never return a bare indexed byte).
+const copy_range = (Str s, Iarch start, Iarch stop): Str -> {
+	let [Uint8] out = []
+	let Iarch i = start
+
+	loop {
+		if i >= stop then break
+
+		out = [...out, s[i]]
+		i = i + 1
+	}
+
+	return Str({ bytes: out, len: Iarch(out.len) })
+}
+
+# Do the bytes of `needle` sit verbatim in `s` at offset `at`? The caller guarantees the range fits.
+const matches_at = (Str s, Str needle, Iarch at): Bool -> {
+	let Iarch j = 0
+
+	loop {
+		if j >= Iarch(needle.len) then break
+		if Iarch(s[at + j]) != Iarch(needle[j]) then return false
+		j = j + 1
+	}
+
+	return true
+}
 
 # Byte-wise equality.
 pub const eq = (Str a, Str b): Bool -> {
@@ -20,35 +56,248 @@ pub const eq = (Str a, Str b): Bool -> {
 	return true
 }
 
+# Is `s` the empty string?
+pub const is_empty = (Str s): Bool -> Iarch(s.len) == 0
+
 # Does `s` begin with `pre`?
 pub const starts_with = (Str pre, Str s): Bool -> {
 	if Iarch(pre.len) > Iarch(s.len) then return false
 
-	let Iarch i = 0
-
-	loop {
-		if i >= Iarch(pre.len) then break
-		if Iarch(s[i]) != Iarch(pre[i]) then return false
-		i = i + 1
-	}
-
-	return true
+	return matches_at(s, pre, 0)
 }
 
 # Does `s` end with `suf`?
 pub const ends_with = (Str suf, Str s): Bool -> {
 	if Iarch(suf.len) > Iarch(s.len) then return false
 
-	const Iarch off = Iarch(s.len) - Iarch(suf.len)
+	return matches_at(s, suf, Iarch(s.len) - Iarch(suf.len))
+}
+
+# The sentinel `index_of` returns when `needle` does not occur in `s`. Compare a result against it
+# (`i != not_found`) to tell a hit from a miss.
+pub const not_found = -1
+
+# The byte offset of the first occurrence of `needle` in `s`, or `not_found`. An empty needle is
+# found at 0.
+pub const index_of = (Str needle, Str s): Iarch -> {
+	if Iarch(needle.len) == 0 then return 0
+	if Iarch(needle.len) > Iarch(s.len) then return not_found
+
 	let Iarch i = 0
 
 	loop {
-		if i >= Iarch(suf.len) then break
-		if Iarch(s[off + i]) != Iarch(suf[i]) then return false
+		if i > Iarch(s.len) - Iarch(needle.len) then break
+		if matches_at(s, needle, i) then return i
 		i = i + 1
 	}
 
-	return true
+	return not_found
+}
+
+# Does `needle` occur anywhere in `s`?
+pub const contains = (Str needle, Str s): Bool -> index_of(needle, s) != not_found
+
+# The byte range [start, stop) of `s` as a fresh owned Str. The bounds are clamped to the string, so
+# an out-of-range request yields the overlap (possibly empty) rather than a trap.
+pub const slice = (Iarch start, Iarch stop, Str s): Str -> {
+	let Iarch a = start
+	let Iarch b = stop
+
+	if a < 0 then a = 0
+	if b > Iarch(s.len) then b = Iarch(s.len)
+	if a >= b then return ""
+
+	return copy_range(s, a, b)
+}
+
+# `s` with every ASCII letter lowercased; other bytes pass through.
+pub const to_lower = (Str s): Str -> {
+	let [Uint8] out = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(s.len) then break
+
+		out = [...out, Uint8(lower(Iarch(s[i])))]
+		i = i + 1
+	}
+
+	return Str({ bytes: out, len: Iarch(out.len) })
+}
+
+# `s` with every ASCII letter uppercased; other bytes pass through.
+pub const to_upper = (Str s): Str -> {
+	let [Uint8] out = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(s.len) then break
+
+		out = [...out, Uint8(upper(Iarch(s[i])))]
+		i = i + 1
+	}
+
+	return Str({ bytes: out, len: Iarch(out.len) })
+}
+
+# `s` without its leading ASCII whitespace (space, tab, LF, CR).
+pub const trim_start = (Str s): Str -> {
+	let Iarch start = 0
+
+	loop {
+		if start >= Iarch(s.len) then break
+		if !is_space(Iarch(s[start])) then break
+		start = start + 1
+	}
+
+	return copy_range(s, start, Iarch(s.len))
+}
+
+# `s` without its trailing ASCII whitespace (space, tab, LF, CR).
+pub const trim_end = (Str s): Str -> {
+	let Iarch stop = Iarch(s.len)
+
+	loop {
+		if stop <= 0 then break
+		if !is_space(Iarch(s[stop - 1])) then break
+		stop = stop - 1
+	}
+
+	return copy_range(s, 0, stop)
+}
+
+# `s` without leading or trailing ASCII whitespace (space, tab, LF, CR).
+pub const trim = (Str s): Str -> {
+	let Iarch start = 0
+	let Iarch stop = Iarch(s.len)
+
+	loop {
+		if start >= stop then break
+		if !is_space(Iarch(s[start])) then break
+		start = start + 1
+	}
+
+	loop {
+		if stop <= start then break
+		if !is_space(Iarch(s[stop - 1])) then break
+		stop = stop - 1
+	}
+
+	return copy_range(s, start, stop)
+}
+
+# Split `s` on every occurrence of `sep`, KEEPING empty pieces (so `","` split on `","` is two empty
+# strings and field positions stay aligned). Each element is a fresh owned Str. An empty separator
+# does not split: the result is the whole string as its one element.
+pub const split = (Str sep, Str s): [Str] -> {
+	if Iarch(sep.len) == 0 then return [copy_range(s, 0, Iarch(s.len))]
+
+	let [Str] out = []
+	let Iarch start = 0
+	let Iarch i = 0
+
+	loop {
+		if i > Iarch(s.len) - Iarch(sep.len) then break
+
+		if matches_at(s, sep, i) then {
+			out = [...out, copy_range(s, start, i)]
+			i = i + Iarch(sep.len)
+			start = i
+		} else {
+			i = i + 1
+		}
+	}
+
+	return [...out, copy_range(s, start, Iarch(s.len))]
+}
+
+# Concatenate `parts` with `sep` between each pair, as one fresh owned Str.
+pub const join = (Str sep, [Str] parts): Str -> {
+	let [Uint8] out = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(parts.len) then break
+
+		if i > 0 then {
+			let Iarch j = 0
+
+			loop {
+				if j >= Iarch(sep.len) then break
+
+				out = [...out, sep[j]]
+				j = j + 1
+			}
+		}
+
+		const Str p = parts[i]
+		let Iarch k = 0
+
+		loop {
+			if k >= Iarch(p.len) then break
+
+			out = [...out, p[k]]
+			k = k + 1
+		}
+
+		i = i + 1
+	}
+
+	return Str({ bytes: out, len: Iarch(out.len) })
+}
+
+# `s` repeated `n` times as one fresh owned Str; `n <= 0` yields the empty string.
+pub const repeat = (Iarch n, Str s): Str -> {
+	let [Uint8] out = []
+	let Iarch i = 0
+
+	loop {
+		if i >= n then break
+
+		let Iarch j = 0
+
+		loop {
+			if j >= Iarch(s.len) then break
+
+			out = [...out, s[j]]
+			j = j + 1
+		}
+
+		i = i + 1
+	}
+
+	return Str({ bytes: out, len: Iarch(out.len) })
+}
+
+# `s` with every occurrence of `from` replaced by `to`, scanning left to right without rescanning
+# what a replacement produced. An empty `from` replaces nothing.
+pub const replace = (Str from, Str to, Str s): Str -> {
+	if Iarch(from.len) == 0 then return copy_range(s, 0, Iarch(s.len))
+
+	let [Uint8] out = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(s.len) then break
+
+		if i + Iarch(from.len) <= Iarch(s.len) && matches_at(s, from, i) then {
+			let Iarch j = 0
+
+			loop {
+				if j >= Iarch(to.len) then break
+
+				out = [...out, to[j]]
+				j = j + 1
+			}
+
+			i = i + Iarch(from.len)
+		} else {
+			out = [...out, s[i]]
+			i = i + 1
+		}
+	}
+
+	return Str({ bytes: out, len: Iarch(out.len) })
 }
 
 # The sentinel `fuzzy_score` returns when `needle` is not a subsequence of `hay` at all — a large
