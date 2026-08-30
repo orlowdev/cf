@@ -1,14 +1,14 @@
-.globl _f41
+.globl _f42
 .p2align 2
-_f41:
+_f42:
 	stp x29, x30, [sp, #-16]!
 	bl _cf_qbe_run
 	ldp x29, x30, [sp], #16
 	ret
 
-.globl _f47
+.globl _f48
 .p2align 2
-_f47:
+_f48:
 	mov x16, x0
 	mov x0, x1
 	mov x1, x2

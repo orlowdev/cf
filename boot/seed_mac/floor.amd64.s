@@ -1,14 +1,14 @@
-.globl _f41
+.globl _f42
 .p2align 2
-_f41:
+_f42:
 	subq $8, %rsp
 	call _cf_qbe_run
 	addq $8, %rsp
 	ret
 
-.globl _f47
+.globl _f48
 .p2align 2
-_f47:
+_f48:
 	movq %rdi, %rax
 	orq $0x2000000, %rax
 	movq %rsi, %rdi

@@ -352,11 +352,13 @@ const parse_pipe_target! = (*Parser p, Expr piped): Expr -> {
 	if c0 >= 65 && c0 <= 90 then die("cf: parse: a `|>` target must be a function, not a type\n")
 	const Str name = cur_name!(p)
 	p.pos = p.pos + 1
+	# a generic target with explicit type arguments — `x |> map[Iarch, Iarch](f)`
+	let [Str] tys = []
+	if is_lbracket(peek(p)) then tys = parse_tyargs!(p)
 	let [Expr] args = []
 	if is_lparen(peek(p)) then args = parse_args!(p)
-	const [Str] no_ty = []
 
-	return Expr.Call(name, no_ty, [...args, piped], "")
+	return Expr.Call(name, tys, [...args, piped], "")
 }
 
 const parse_or! = (*Parser p): Expr -> {
@@ -597,18 +599,23 @@ const parse_call! = (*Parser p, Str name): Expr -> {
 }
 
 # `f[T1, T2](args)` — a call to a generic function with explicit type arguments. Each type
-# argument is a type NAME (`Iarch`/a record/a `'T` in a generic body/a fixed or float leaf).
+# argument is a type REFERENCE (`Iarch`/a record/a `'T` in a generic body/a generic application
+# `Maybe[Iarch]`/an array `[T]`) or a comptime VALUE argument (an int literal, `f[8]()`).
 const parse_tyargs! = (*Parser p): [Str] -> {
 	p.pos = p.pos + 1 # `[`
 	let [Str] tys = []
 
 	loop {
-		# a TYPE argument (an ident) or a comptime VALUE argument (an int literal, `f[8]()`) —
-		# either is kept as its source text; the monomorph pass tells them apart by the parameter
-		if !is_ident(peek(p)) && !is_intlit(peek(p))
-			then die("cf: parse: expected a type or value argument in `[...]`\n")
-		tys = [...tys, cur_name!(p)]
-		p.pos = p.pos + 1
+		# an int literal is kept as its source text; the monomorph pass tells the two apart by
+		# the parameter. Anything else is a full type reference (which may itself apply/nest).
+		if is_intlit(peek(p)) then {
+			tys = [...tys, cur_name!(p)]
+			p.pos = p.pos + 1
+		} else {
+			if !is_ident(peek(p)) && !is_lbracket(peek(p))
+				then die("cf: parse: expected a type or value argument in `[...]`\n")
+			tys = [...tys, parse_type_ref!(p)]
+		}
 		if !is_comma(peek(p)) then break
 		p.pos = p.pos + 1
 	}
@@ -2048,6 +2055,9 @@ const parse_tel! = (*Parser p): TupElem -> {
 	if !is_ident(peek(p)) then die("cf: parse: expected a tuple element type name\n")
 	const Str n = cur_name!(p)
 	p.pos = p.pos + 1
+	# a generic APPLICATION leaf — `Maybe['B]` in a fn-type/tuple position; the application string
+	# rides in the leaf name and monomorph's telem substitution mangles it to its instance
+	if is_lbracket(peek(p)) then return tel_leaf(parse_type_app_tail!(p, n))
 
 	return tel_leaf(n)
 }

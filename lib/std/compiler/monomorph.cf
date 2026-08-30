@@ -424,8 +424,9 @@ const subst_tys = ([Str] names, [Str] tvars, [Str] tvals): [Str] -> {
 }
 
 # Substitute type variables inside a tuple's position list — a nested position recurses, a leaf
-# substitutes its name — so a `('T, Iarch)` param/return in a generic instance is concretized.
-const subst_telems = ([TupElem] tels, [Str] tvars, [Str] tvals): [TupElem] -> {
+# MANGLES its name — so a `('T, Iarch)` param/return in a generic instance is concretized, and an
+# APPLICATION leaf (`Maybe['B]` in a fn-type return position) resolves to its registered instance.
+const subst_telems! = (*MonoCtx m, [TupElem] tels, [Str] tvars, [Str] tvals): [TupElem] -> {
 	let [TupElem] out = []
 	let Iarch i = 0
 
@@ -435,12 +436,12 @@ const subst_telems = ([TupElem] tels, [Str] tvars, [Str] tvals): [TupElem] -> {
 		# a nested TUPLE or nested FUNCTION-TYPE position keeps its structure — recurse into `sub` so
 		# a `((A) -> B) -> R` function-type component survives monomorphization (a leaf drops `sub`)
 		if eq(t.name, "$tuple")
-			then out = [...out, TupElem({ name: "$tuple", sub: subst_telems(t.sub, tvars, tvals) })]
+			then out = [...out, TupElem({ name: "$tuple", sub: subst_telems!(m, t.sub, tvars, tvals) })]
 		if eq(t.name, "$fn")
-			then out = [...out, TupElem({ name: "$fn", sub: subst_telems(t.sub, tvars, tvals) })]
+			then out = [...out, TupElem({ name: "$fn", sub: subst_telems!(m, t.sub, tvars, tvals) })]
 		if !eq(t.name, "$tuple") && !eq(t.name, "$fn") then {
 			let [TupElem] none = []
-			out = [...out, TupElem({ name: subst_ty(t.name, tvars, tvals), sub: none })]
+			out = [...out, TupElem({ name: mangle_type!(m, t.name, tvars, tvals), sub: none })]
 		}
 		i = i + 1
 	}
@@ -451,13 +452,13 @@ const subst_telems = ([TupElem] tels, [Str] tvars, [Str] tvals): [TupElem] -> {
 # Substitute across a per-position tuple-type list (a record's `ftelems` / a union member's
 # `ptelems`, one `[TupElem]` per field/payload position), concretizing a `('T, Iarch)` tuple
 # field/payload when a generic record/union is cloned.
-const subst_telemss = ([[TupElem]] tlss, [Str] tvars, [Str] tvals): [[TupElem]] -> {
+const subst_telemss! = (*MonoCtx m, [[TupElem]] tlss, [Str] tvars, [Str] tvals): [[TupElem]] -> {
 	let [[TupElem]] out = []
 	let Iarch i = 0
 
 	loop {
 		if i >= Iarch(tlss.len) then break
-		out = [...out, subst_telems(tlss[i], tvars, tvals)]
+		out = [...out, subst_telems!(m, tlss[i], tvars, tvals)]
 		i = i + 1
 	}
 
@@ -506,7 +507,7 @@ const subst_slot! = (*MonoCtx m, Str name, Str elem, [TupElem] telems, [Str] tva
 		then return TySlot({ name: "$dyn", elem: mangle_type!(m, elem, tvars, tvals), telems: no_tel })
 	# a tuple slot `(...)` — substitute each position (leaves stay scalar; see the later-brick note)
 	if eq(name, "$tuple")
-		then return TySlot({ name: "$tuple", elem: elem, telems: subst_telems(telems, tvars, tvals) })
+		then return TySlot({ name: "$tuple", elem: elem, telems: subst_telems!(m, telems, tvars, tvals) })
 	# a bare name — a type variable here may expand to an ARRAY type
 	const Str bound = subst_ty(name, tvars, tvals)
 	if is_arr_enc(bound)
@@ -520,7 +521,7 @@ const subst_slot! = (*MonoCtx m, Str name, Str elem, [TupElem] telems, [Str] tva
 	return TySlot({
 		name: mangle_type!(m, name, tvars, tvals),
 		elem: subst_ty(elem, tvars, tvals),
-		telems: subst_telems(telems, tvars, tvals),
+		telems: subst_telems!(m, telems, tvars, tvals),
 	})
 }
 
@@ -1383,7 +1384,10 @@ const mono_func! = (*MonoCtx m, Func f, Str newname, [Str] tvars, [Str] tvals): 
 # argument's result type is knowable), a non-generic one passes through; type args on a
 # non-generic function are an error. Shared by an ordinary call and a `defer`-tap call.
 const mono_callee! = (*MonoCtx m, Str n, [Str] ta, [Expr] margs, MonoEnv env): Str -> {
-	const [Str] rty = subst_tys(ta, env.tvars, env.tvals)
+	# mangle (not just substitute) the explicit type arguments: an APPLICATION argument
+	# (`map[Iarch, Maybe[Iarch]]`) resolves to its registered instance name, so the fn instance's
+	# own mangled name stays bracket-free and its type values are concrete declared types
+	const [Str] rty = mangle_types!(m, ta, env.tvars, env.tvals)
 	const Iarch ti = find_template(m.templates, n)
 	if ti >= 0 then {
 		let [Str] fty = rty

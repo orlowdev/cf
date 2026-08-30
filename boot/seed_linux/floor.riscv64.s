@@ -1,6 +1,6 @@
-.globl f41
+.globl f42
 .p2align 2
-f41:
+f42:
 	addi sp, sp, -16
 	sd ra, 8(sp)
 	call _cf_qbe_run
@@ -8,9 +8,9 @@ f41:
 	addi sp, sp, 16
 	ret
 
-.globl f47
+.globl f48
 .p2align 2
-f47:
+f48:
 	mv a7, a0
 	mv a0, a1
 	mv a1, a2
