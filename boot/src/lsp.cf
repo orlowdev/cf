@@ -892,6 +892,107 @@ const union_members! = ([Str] scan, Str owner, Str srcf, Str base): [SymRow] -> 
 	return rows
 }
 
+# The (start, end) span of the trailing identifier in ln[lo..hi) — a record field's NAME,
+# written after its type. Trailing whitespace and `,` are skipped first; end <= start when
+# the tail is no identifier.
+const trail_ident = (Str ln, Iarch lo, Iarch hi): (Iarch, Iarch) -> {
+	let Iarch e = hi
+	if e > Iarch(ln.len) then e = Iarch(ln.len)
+
+	loop {
+		if e <= lo then break
+		const Iarch b = Iarch(ln[e - 1])
+		if b != 32 && b != 9 && b != 44 && b != 13 then break
+		e = e - 1
+	}
+
+	let Iarch s = e
+
+	loop {
+		if s <= lo then break
+		if !name_byte(Iarch(ln[s - 1])) then break
+		s = s - 1
+	}
+
+	return (s, e)
+}
+
+# Record FIELDS named `want` across the scan files — the goto/hover fallback for a
+# `base.field` read on a lowercase base: with no type information, every `data` record
+# declaring the field answers (the editor lists the candidates). A field line's name is its
+# LAST identifier (the type precedes it; an inline `#` comment is cut first); a single-line
+# body splits on top-level commas, parens tracked so a tuple field's inner commas don't.
+const rec_fields! = ([Str] scan, Str owner, Str srcf, Str want): [SymRow] -> {
+	let [SymRow] rows = []
+
+	for f in scan {
+		const [Str] lines = split("\n", src_of!(f, owner, srcf))
+		let Bool inrec = false
+		let Iarch l = 0
+
+		for ln in lines {
+			if inrec then {
+				const Iarch nw = first_nonws(ln)
+
+				if nw >= 0 && Iarch(ln[nw]) == 125 then inrec = false
+
+				if inrec && nw >= 0 && Iarch(ln[nw]) != 35 then {
+					let Iarch hi = index_of("#", ln)
+					if hi < 0 then hi = Iarch(ln.len)
+					const (fs, fe) = trail_ident(ln, nw, hi)
+
+					if fe > fs && eq(slice(fs, fe, ln), want) then {
+						rows = [...rows, SymRow({ sname: want, kind: 8, file: f, line: l, ns: fs, ne: fe })]
+					}
+				}
+			} else {
+				const DeclLine d = scan_decl(ln)
+
+				if d.kind == 23 then {
+					const Iarch ob = index_of("{", ln)
+					let Bool closed = false
+
+					if ob >= 0 then {
+						let Iarch i = ob + 1
+						let Iarch ss = ob + 1
+						let Iarch depth = 0
+
+						loop {
+							if i >= Iarch(ln.len) then break
+							const Iarch ch = Iarch(ln[i])
+							if ch == 40 then depth = depth + 1
+							if ch == 41 then depth = depth - 1
+
+							if depth == 0 && (ch == 44 || ch == 125) then {
+								const (fs, fe) = trail_ident(ln, ss, i)
+
+								if fe > fs && eq(slice(fs, fe, ln), want) then {
+									rows = [...rows, SymRow({ sname: want, kind: 8, file: f, line: l, ns: fs, ne: fe })]
+								}
+
+								ss = i + 1
+							}
+
+							if ch == 125 && depth == 0 then {
+								closed = true
+								break
+							}
+
+							i = i + 1
+						}
+					}
+
+					if !closed then inrec = true
+				}
+			}
+
+			l = l + 1
+		}
+	}
+
+	return rows
+}
+
 # Whether every hint segment appears in `file` as a path component (`/seg/`) or as the file
 # itself (`/seg.cf`) — how a qualified use (`str::eq`, `std::data::json::parse!`) narrows
 # same-named candidates. An alias hint that matches nothing leaves the caller's full set.
@@ -1098,7 +1199,9 @@ const local_def! = (Str argv0, [Str] env, Str path, Str overlay, [Str] lines, Ia
 # Resolve a decomposed token to its definitions: a `Type.` base tries the union's members
 # first; otherwise the top-level declarations of the name, hint-narrowed for a qualified use
 # (an alias hint matching nothing keeps the full set) and same-file-preferred for a bare one.
-const picked_defs! = (Str argv0, [Str] env, Str path, Str srcf, Str srcp, Str overlay, TokCtx t): DefOut -> {
+# `dotted` (the token directly follows a `.`) falls back to record FIELDS of the name when no
+# declaration matches — a `base.field` read jumps to its field declarations.
+const picked_defs! = (Str argv0, [Str] env, Str path, Str srcf, Str srcp, Str overlay, TokCtx t, Bool dotted): DefOut -> {
 	const [Str] mods = modules_of!(argv0, env, path, overlay)
 	const Str pwd = getenv!(env, "PWD")
 	const [Str] scan = scan_files!(mods, path, pwd)
@@ -1147,6 +1250,10 @@ const picked_defs! = (Str argv0, [Str] env, Str path, Str srcf, Str srcp, Str ov
 		if Iarch(local.len) > 0 then picked = local
 	}
 
+	# a field read with no declaration of the name: the record fields answer
+	if Iarch(picked.len) == 0 && dotted && eq(t.base, "") then
+		picked = rec_fields!(scan, owner, srcf, t.name)
+
 	return DefOut({ hits: picked, mods: mods })
 }
 
@@ -1186,7 +1293,8 @@ const goto_def! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, 
 	const SymRow lr = local_def!(argv0, env, path, overlay, lines, l0, t)
 	if lr.line >= 0 then return Json.Arr([location!(uri, path, path, lr.line, lr.ns, lr.ne)])
 
-	const DefOut o = picked_defs!(argv0, env, path, srcf, srcp, overlay, t)
+	const Bool dotted = t.ts > 0 && Iarch(lines[l0][t.ts - 1]) == 46
+	const DefOut o = picked_defs!(argv0, env, path, srcf, srcp, overlay, t, dotted)
 
 	if Iarch(o.hits.len) == 0 then {
 		# no declaration — perhaps the token is a module path (an import): jump to its file
@@ -1302,7 +1410,8 @@ const hover! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, Iar
 		])
 	}
 
-	const DefOut o = picked_defs!(argv0, env, path, srcf, srcp, overlay, t)
+	const Bool dotted = t.ts > 0 && Iarch(lines[l0][t.ts - 1]) == 46
+	const DefOut o = picked_defs!(argv0, env, path, srcf, srcp, overlay, t, dotted)
 	if Iarch(o.hits.len) == 0 then return Json.Null
 	let SymRow h = o.hits[0]
 
@@ -1311,12 +1420,12 @@ const hover! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, Iar
 	const Str sig = tidy_sig(dlines[h.line])
 
 	# the contiguous `#` comment block right above the declaration, as prose (a bare `#`
-	# line stays a paragraph break)
+	# line stays a paragraph break); lines TRIMMED first, so an indented field's doc counts
 	let Iarch k0 = h.line
 
 	loop {
 		if k0 <= 0 then break
-		if !starts_with("#", dlines[k0 - 1]) then break
+		if !starts_with("#", trim(dlines[k0 - 1])) then break
 		k0 = k0 - 1
 	}
 
@@ -1325,9 +1434,10 @@ const hover! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, Iar
 
 	loop {
 		if k >= h.line then break
+		const Str dl = trim(dlines[k])
 
-		if starts_with("# ", dlines[k]) then {
-			doc = "${doc}${slice(2, Iarch(dlines[k].len), dlines[k])}\n"
+		if starts_with("# ", dl) then {
+			doc = "${doc}${slice(2, Iarch(dl.len), dl)}\n"
 		} else {
 			doc = "${doc}\n"
 		}
