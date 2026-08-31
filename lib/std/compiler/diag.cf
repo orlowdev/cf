@@ -45,32 +45,41 @@ pub const die_at_lc = (Str file, Iarch line, Iarch col, Str msg): Never -> {
 	die(msg)
 }
 
-# One collected compile error: a source position (a declaration's stamp) and its message.
+# One collected compile error: a source position (a declaration's stamp), its message, and
+# optionally the OFFENDER's name (`what` — a type/variable name the message is about, carried
+# separately because recording is colorless and cannot interpolate; the printer composes it).
 # The typechecker returns these as VALUES at the pass boundary — nothing below the CLI edge
 # prints or exits (errors-as-values, the D1 diagnostics design).
-pub data Diag = { Str file, Iarch line, Iarch col, Str msg }
+pub data Diag = { Str file, Iarch line, Iarch col, Str msg, Str what }
 
 # The single-slot pending diagnostic a checking pass records into, threaded as a `*DiagBag`
 # alongside `Ctx`. One slot, first error wins (`hot`), so RECORDING is colorless — plain field
 # stores, no allocation — and any helper, `!` or not, may reject. The driving loop flushes the
 # slot into its `[Diag]` between declarations (one error per declaration).
-pub data DiagBag = { Bool hot, Str file, Iarch line, Iarch col, Str msg }
+pub data DiagBag = { Bool hot, Str file, Iarch line, Iarch col, Str msg, Str what }
 
-# Record a located rejection into the bag: latch the FIRST error and ignore the rest until
-# the driver flushes the slot. Colorless on purpose.
-pub const drec = (*DiagBag dg, Str file, Iarch line, Iarch col, Str msg): () -> {
+# Record a located rejection naming its offender (`what` — a 16-byte field store, so even a
+# colorless site can say WHICH name it rejected): latch the FIRST error and ignore the rest
+# until the driver flushes the slot.
+pub const drec_w = (*DiagBag dg, Str file, Iarch line, Iarch col, Str msg, Str what): () -> {
 	if dg.hot then return ()
 	dg.hot = true
 	dg.file = file
 	dg.line = line
 	dg.col = col
 	dg.msg = msg
+	dg.what = what
 }
+
+# Record a located rejection into the bag: latch the FIRST error and ignore the rest until
+# the driver flushes the slot. Colorless on purpose.
+pub const drec = (*DiagBag dg, Str file, Iarch line, Iarch col, Str msg): () ->
+	drec_w(dg, file, line, col, msg, "")
 
 # A fresh empty bag for a caller that hands one to a shared checking helper and copies any
 # latched rejection into its own collector afterwards (the monomorph pass's inference).
 pub const record_dg = (): DiagBag ->
-	DiagBag({ hot: false, file: "", line: 0, col: 0, msg: "" })
+	DiagBag({ hot: false, file: "", line: 0, col: 0, msg: "", what: "" })
 
 # Byte-lexicographic `<` over two strings (file paths grouping, for diagnostic order).
 const str_lt = (Str a, Str b): Bool -> {
@@ -134,12 +143,21 @@ pub const sort_diags = ([Diag] ds): [Diag] -> {
 	return out
 }
 
-# Print every collected diagnostic to stderr, `file:line:col: msg` each. The one place a
-# diagnostic becomes TEXT — called at the CLI edge, never inside a pass.
-pub const print_diags = ([Diag] ds): () -> {
+# Print every collected diagnostic to stderr, `file:line:col: msg` each — with the offender
+# composed in (` \`what\``) when the recorder named one. The one place a diagnostic becomes
+# TEXT — called at the CLI edge, never inside a pass (`!`: the newline trim is a fresh header).
+pub const print_diags! = ([Diag] ds): () -> {
 	for d in ds {
 		eprint_at_lc(d.file, d.line, d.col)
-		eprint(d.msg)
+		if Iarch(d.what.len) == 0 then {
+			eprint(d.msg)
+		} else {
+			# the message ends with its newline — print it without, name the offender, close
+			eprint(Str({ bytes: d.msg.bytes, len: Iarch(d.msg.len) - 1 }))
+			eprint(" `")
+			eprint(d.what)
+			eprint("`\n")
+		}
 	}
 }
 

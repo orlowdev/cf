@@ -16,7 +16,7 @@
 # The emitter runs only on programs this phase accepts.
 
 import std::io::console::{ die, eprint }
-import std::compiler::diag::{ Diag, DiagBag, drec, sort_diags }
+import std::compiler::diag::{ Diag, DiagBag, drec, drec_w, sort_diags }
 import std::data::str::{ eq }
 import std::compiler::ast::{
 	Expr,
@@ -166,14 +166,25 @@ const uerr = (UnionDecl u, *DiagBag dg, Str msg): () -> drec(dg, u.dfile, u.dlin
 const is_shape_marker = (Str n): Bool -> Iarch(n.len) > 0 && Iarch(n[0]) == 36
 
 # Pre-check a written type name where a declaration's stamp is at hand, so an unknown name
-# dies LOCATED — `named_ty` itself stays stamp-less (the monomorph pass shares it, and its
-# own die is the unlocated backstop). A shape marker passes through.
+# is recorded LOCATED — `named_ty` itself stays stamp-less (the monomorph pass shares it, and
+# its own die is the unlocated backstop). A shape marker passes through. A TYPE VARIABLE
+# records the same remedy message `sig_has_typevar` records at the declaration itself, so the
+# flush's dup scan collapses the two into one report; both branches NAME the offender.
 const known_ty_at = (Str tn, [RecDecl] recs, [UnionDecl] unions, Func f, *DiagBag dg): () -> {
 	if eq(tn, "") then return ()
 	if is_shape_marker(tn) then return ()
+	if name_is_typevar(tn) then {
+		drec_w(dg, f.dfile, f.dline, f.dcol, msg_undeclared_tyvar, tn)
+
+		return ()
+	}
 	if !is_known_typename(tn, recs, unions)
-		then ferr(f, dg, "cf: type: an undeclared type name\n")
+		then drec_w(dg, f.dfile, f.dline, f.dcol, "cf: type: an undeclared type name\n", tn)
 }
+
+# The one message two recorders share (the decl's own signature check and the callee-side
+# pre-check at a call), byte-identical so the flush's dup scan collapses them.
+const msg_undeclared_tyvar = "cf: type: an undeclared type variable in a function signature — a generic function declares its variables first: `= ['T]('T x): 'T -> ...`\n"
 
 # --- small helpers --------------------------------------------------------------------
 
@@ -1016,7 +1027,11 @@ const var_type = ([VarTy] env, Str name, Ctx ctx, *DiagBag dg): Ty -> {
 	if idx >= 0 then return env[idx].ty
 	# not a local — a top-level VALUE const (a nullary function) referenced bare, auto-called
 	const Iarch fidx = find_func(ctx.funcs, name)
-	if fidx < 0 then return terr(ctx, dg, "cf: type: reference to an undeclared name\n")
+	if fidx < 0 then {
+		drec_w(dg, ctx.dfile, ctx.dline, ctx.dcol, "cf: type: reference to an undeclared name\n", name)
+
+		return Ty.TNever
+	}
 	if Iarch(ctx.funcs[fidx].params.len) != 0
 		then return terr(ctx, dg, "cf: type: a function reference needs arguments\n")
 
@@ -4648,7 +4663,7 @@ const check_func! = (Func fn, Ctx ctx, *DiagBag dg): Iarch -> {
 	}
 	# a concrete function's signature may not mention a type variable (an undeclared `'T` in a
 	# non-generic function, or one the monomorph pass left unsubstituted)
-	if sig_has_typevar(fn) then return terr_i(ctx, dg, "cf: type: an undeclared type variable in a function signature — a generic function declares its variables first: `= ['T]('T x): 'T -> ...`\n")
+	if sig_has_typevar(fn) then return terr_i(ctx, dg, msg_undeclared_tyvar)
 	known_ty_at(fn.ret_name, ctx.recs, ctx.unions, fn, dg)
 	# a recorded unknown return-type name stops here — `func_ret_ty` would die unlocated on it
 	if dg.hot then return 0
@@ -4835,7 +4850,7 @@ const check_whole = (Program prog, Str entry, *DiagBag dg): [Diag] -> {
 		# flush the latched rejection — one error per record declaration
 		if dg.hot then {
 			dg.hot = false
-			diags = [...diags, Diag({ file: dg.file, line: dg.line, col: dg.col, msg: dg.msg })]
+			diags = [...diags, Diag({ file: dg.file, line: dg.line, col: dg.col, msg: dg.msg, what: dg.what })]
 		}
 		r = r + 1
 	}
@@ -4882,7 +4897,7 @@ const check_whole = (Program prog, Str entry, *DiagBag dg): [Diag] -> {
 		# flush — one error per union declaration
 		if dg.hot then {
 			dg.hot = false
-			diags = [...diags, Diag({ file: dg.file, line: dg.line, col: dg.col, msg: dg.msg })]
+			diags = [...diags, Diag({ file: dg.file, line: dg.line, col: dg.col, msg: dg.msg, what: dg.what })]
 		}
 		uw = uw + 1
 	}
@@ -4932,7 +4947,7 @@ const check_whole = (Program prog, Str entry, *DiagBag dg): [Diag] -> {
 		# flush — one error per function declaration's structure checks
 		if dg.hot then {
 			dg.hot = false
-			diags = [...diags, Diag({ file: dg.file, line: dg.line, col: dg.col, msg: dg.msg })]
+			diags = [...diags, Diag({ file: dg.file, line: dg.line, col: dg.col, msg: dg.msg, what: dg.what })]
 		}
 		i = i + 1
 	}
@@ -4945,6 +4960,7 @@ const check_whole = (Program prog, Str entry, *DiagBag dg): [Diag] -> {
 				line: 1,
 				col: 1,
 				msg: "cf: type: no `pub const main` entry point — a program starts at `pub const main = (): Iarch -> { ... }`\n",
+				what: "",
 			}),
 		]
 	}
@@ -4955,7 +4971,7 @@ const check_whole = (Program prog, Str entry, *DiagBag dg): [Diag] -> {
 # Typecheck the whole program: its structure, then every function. This phase is the
 # authority for all semantic validation; the emitter does no re-checking.
 pub const check_program! = (Program prog, Str entry): [Diag] -> {
-	let DiagBag bag = DiagBag({ hot: false, file: "", line: 0, col: 0, msg: "" })
+	let DiagBag bag = DiagBag({ hot: false, file: "", line: 0, col: 0, msg: "", what: "" })
 	let [Diag] diags = check_whole(prog, entry, &bag)
 	let Ctx ctx = Ctx({
 		funcs: prog.funcs,
@@ -4982,7 +4998,7 @@ pub const check_program! = (Program prog, Str entry): [Diag] -> {
 		if bag.hot then {
 			bag.hot = false
 			if !diag_dup(diags, bag.file, bag.line, bag.col, bag.msg)
-				then diags = [...diags, Diag({ file: bag.file, line: bag.line, col: bag.col, msg: bag.msg })]
+				then diags = [...diags, Diag({ file: bag.file, line: bag.line, col: bag.col, msg: bag.msg, what: bag.what })]
 		}
 		f = f + 1
 	}
@@ -4997,7 +5013,7 @@ pub const check_program! = (Program prog, Str entry): [Diag] -> {
 # dropped-to-kept calls resolve by their ORIGINAL names; these bodies never name minted twins).
 # Same collection discipline as `check_program!`: one error per declaration, first wins.
 pub const check_unreachable! = ([Func] extra, [Func] funcs, [RecDecl] recs, [UnionDecl] unions): [Diag] -> {
-	let DiagBag bag = DiagBag({ hot: false, file: "", line: 0, col: 0, msg: "" })
+	let DiagBag bag = DiagBag({ hot: false, file: "", line: 0, col: 0, msg: "", what: "" })
 	let [Diag] diags = []
 	let Ctx ctx = Ctx({
 		funcs: funcs,
@@ -5043,7 +5059,7 @@ pub const check_unreachable! = ([Func] extra, [Func] funcs, [RecDecl] recs, [Uni
 		if bag.hot then {
 			bag.hot = false
 			if !diag_dup(diags, bag.file, bag.line, bag.col, bag.msg)
-				then diags = [...diags, Diag({ file: bag.file, line: bag.line, col: bag.col, msg: bag.msg })]
+				then diags = [...diags, Diag({ file: bag.file, line: bag.line, col: bag.col, msg: bag.msg, what: bag.what })]
 		}
 		f = f + 1
 	}
