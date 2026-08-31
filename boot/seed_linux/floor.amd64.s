@@ -19,9 +19,9 @@ f52:
 	syscall
 	ret
 
-.globl f341
+.globl f335
 .p2align 2
-f341:
+f335:
 	movl $231, %eax
 	syscall
 	ret

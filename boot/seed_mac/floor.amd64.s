@@ -23,16 +23,16 @@ _f52:
 1:
 	ret
 
-.globl _f341
+.globl _f335
 .p2align 2
-_f341:
+_f335:
 	movq $0x2000001, %rax
 	syscall
 	ret
 
-.globl _f342
+.globl _f336
 .p2align 2
-_f342:
+_f336:
 	movq $0x2000002, %rax
 	syscall
 	jnc 1f
