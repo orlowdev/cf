@@ -27,9 +27,9 @@ f123:
 	li a0, 2
 	ret
 
-.globl f411
+.globl f423
 .p2align 2
-f411:
+f423:
 	mv a0, a0
 	li a7, 94
 	ecall
