@@ -107,7 +107,9 @@ pub data Parser = {
 # or CLOSE (kind 1) at a byte offset, or a binding of `name` — a parameter (2), a `let`/`const`
 # local (3), a `for` binder (4), or a match payload bind (5). Replayed in parse order with a
 # depth counter, the innermost binding of a name still in scope at a cursor offset is its
-# definition site.
+# definition site. Kind 6 is a USE — every source token the parser reads as a NAME reference
+# (a variable, a callee, an assignment target, a record pun/spread, an `in` geometry clause) —
+# so `cf lsp refs` can walk the same log and collect every reference bound to one binder.
 pub data BindEv = { Iarch off, Iarch kind, Str name }
 
 # Append a bind event for the token at `tokpos` (`ebase` rebases a hole sub-parse into its
@@ -398,6 +400,7 @@ const parse_pipe_target! = (*Parser p, Expr piped): Expr -> {
 		if dc >= 65 && dc <= 90
 			then perr(p, "cf: parse: a `|> defer` target must be a function, not a type\n")
 		const Str dn = cur_name!(p)
+		bev(p, p.pos, 6, dn)
 		p.pos = p.pos + 1
 		let [Expr] dargs = []
 		if is_lparen(peek(p)) then dargs = parse_args!(p)
@@ -409,6 +412,7 @@ const parse_pipe_target! = (*Parser p, Expr piped): Expr -> {
 	if c0 >= 65 && c0 <= 90 then perr(p, "cf: parse: a `|>` target must be a function, not a type\n")
 	const Iarch noff = p.ebase + p.toks[p.pos].start
 	const Str name = cur_name!(p)
+	bev(p, p.pos, 6, name)
 	p.pos = p.pos + 1
 	# a generic target with explicit type arguments — `x |> map[Iarch, Iarch](f)`
 	let [Str] tys = []
@@ -1244,6 +1248,7 @@ const parse_primary! = (*Parser p): Expr -> {
 		if is_lbrace(peek(p)) then perr(p, "cf: parse: `defer { ... }` is a statement, not a value\n")
 		if !is_ident(peek(p)) then perr(p, "cf: parse: `defer` as a value needs a call `defer f(x)`\n")
 		const Str dn = cur_name!(p)
+		bev(p, p.pos, 6, dn)
 		p.pos = p.pos + 1
 		if !is_lparen(peek(p)) then perr(p, "cf: parse: `defer` as a value needs a call `defer f(x)`\n")
 		const [Expr] dargs = parse_args!(p)
@@ -1277,6 +1282,7 @@ const parse_primary! = (*Parser p): Expr -> {
 	# followed by `.`, else a reference to a local binding / parameter.
 	if is_ident(peek(p)) then {
 		const Str name = cur_name!(p)
+		bev(p, p.pos, 6, name)
 		p.pos = p.pos + 1
 		if is_lparen(peek(p)) then {
 			# `Type({ ... })` — an explicit record construction (a PascalCase type name). A lowercase
@@ -1455,6 +1461,7 @@ const parse_record_lit! = (*Parser p, Str type_name): Expr -> {
 			if !is_ident(peek(p))
 				then perr(p, "cf: parse: expected a record variable after `...` in a data literal\n")
 			const Str src = cur_name!(p)
+			bev(p, p.pos, 6, src)
 			p.pos = p.pos + 1
 			inits = [...inits, FieldInit({ field: "$spread", value: Expr.Var(src) })]
 		} else {
@@ -1473,6 +1480,8 @@ const parse_record_lit! = (*Parser p, Str type_name): Expr -> {
 					inits = [...inits, FieldInit({ field: field, value: parse_expr!(p) })]
 				}
 			} else {
+				# a pun binds the field to the LIKE-NAMED local — the field token IS a reference
+				bev(p, p.pos - 1, 6, field)
 				inits = [...inits, FieldInit({ field: field, value: Expr.Var(field) })]
 			}
 		}
@@ -1627,6 +1636,7 @@ const parse_let! = (*Parser p, Bool mutable): Stmt -> {
 		&& is_ident(p.toks[p.pos + 2].kind) then {
 			p.pos = p.pos + 1 # `[`
 			const Str szname = cur_name!(p)
+			bev(p, p.pos, 6, szname)
 			p.pos = p.pos + 1 # size name
 			const Str felem2 = cur_name!(p)
 			p.pos = p.pos + 1 # element type
@@ -1919,6 +1929,7 @@ const in_clause_name! = (*Parser p): Str -> {
 	p.pos = p.pos + 1
 	if !is_ident(peek(p)) then perr(p, "cf: parse: expected a geometry name after `in`\n")
 	const Str g = cur_name!(p)
+	bev(p, p.pos, 6, g)
 	p.pos = p.pos + 1
 
 	return g
@@ -2010,6 +2021,7 @@ const parse_stmt! = (*Parser p): Stmt -> {
 			return Stmt.Do(geom_stamp(p, ge, in_clause_name!(p)))
 		}
 		const Str name = cur_name!(p)
+		bev(p, p.pos, 6, name)
 		p.pos = p.pos + 1
 		if is_dot(peek(p)) then {
 			# collect the dotted field chain `name.f0.f1...`; a single field is a plain `FieldAssign`,

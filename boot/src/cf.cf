@@ -289,20 +289,16 @@ const dec_of = (Str s): Iarch -> {
 	return v
 }
 
-# `cf lsp def <input.cf> <off> <name> [--src <buf>]`: the LOCAL binding of `name` visible at
-# byte offset `off` in the entry — a parameter, a `let`/`const` local, a `for` binder, or a
-# match payload bind — found by replaying the parser's bind-event log with a scope-depth
-# counter: a close drops its scope's binds, and the LAST surviving bind of the name is the
-# innermost one the cursor sees. Prints the binder's 1-based `line:col` when a local binds the
-# name, nothing otherwise — the LSP then falls back to its top-level declaration index. The
-# entry parses ALONE (no imports followed): locals live in the one file.
-const run_def! = (Str input, Str src, Iarch off, Str name): Iarch -> {
-	const Loaded ld = entry_binds!(input, src, os::target, host_arch())
+# The byte offset of the innermost binding of `name` still live at `off`, or -1 — the shared
+# replay of `cf lsp def` and `cf lsp refs`. Bind events (kinds 2..5 — never a kind-6 USE)
+# collect with their scope depth; a scope close drops its own binds; the LAST survivor is the
+# binding the cursor sees.
+const binder_at! = ([BindEv] evs, Iarch off, Str name): Iarch -> {
 	let Iarch depth = 0
 	let [Iarch] boffs = []
 	let [Iarch] bdeps = []
 
-	for ev in ld.evs {
+	for ev in evs {
 		if ev.off > off then break
 		if ev.kind == 0 then depth = depth + 1
 		if ev.kind == 1 then {
@@ -321,17 +317,81 @@ const run_def! = (Str input, Str src, Iarch off, Str name): Iarch -> {
 			bdeps = kd
 			depth = depth - 1
 		}
-		if ev.kind >= 2 && eq(ev.name, name) then {
+		if ev.kind >= 2 && ev.kind <= 5 && eq(ev.name, name) then {
 			boffs = [...boffs, ev.off]
 			bdeps = [...bdeps, depth]
 		}
 	}
 
-	if Iarch(boffs.len) == 0 then return 0
+	if Iarch(boffs.len) == 0 then return -1
+
+	return boffs[Iarch(boffs.len) - 1]
+}
+
+# `cf lsp def <input.cf> <off> <name> [--src <buf>]`: the LOCAL binding of `name` visible at
+# byte offset `off` in the entry — a parameter, a `let`/`const` local, a `for` binder, or a
+# match payload bind. Prints the binder's 1-based `line:col` when a local binds the name,
+# nothing otherwise — the LSP then falls back to its top-level declaration index. The entry
+# parses ALONE (no imports followed): locals live in the one file.
+const run_def! = (Str input, Str src, Iarch off, Str name): Iarch -> {
+	const Loaded ld = entry_binds!(input, src, os::target, host_arch())
+	const Iarch b = binder_at!(ld.evs, off, name)
+	if b < 0 then return 0
 	const [SrcMap] maps = [ld.map]
-	const LC lc = line_col_of(maps, input, boffs[Iarch(boffs.len) - 1])
+	const LC lc = line_col_of(maps, input, b)
 	if lc.line <= 0 then return 0
 	println("${lc.line}:${lc.col}")
+
+	return 0
+}
+
+# `cf lsp refs <input.cf> <off> <name> [--src <buf>]`: every reference to the LOCAL binding
+# of `name` visible at `off` — the binder line first, then each use bound to it, one 1-based
+# `line:col` per line. Nothing when the name is no local: a top-level name's references cross
+# module files, and a partial answer would make rename a code-breaking edit — refuse rather
+# than guess. A second replay walks the WHOLE log keeping the innermost live bind of the
+# name; a kind-6 use belongs to the sought binder exactly when that live bind is it.
+const run_refs! = (Str input, Str src, Iarch off, Str name): Iarch -> {
+	const Loaded ld = entry_binds!(input, src, os::target, host_arch())
+	const Iarch target = binder_at!(ld.evs, off, name)
+	if target < 0 then return 0
+	let [Iarch] refs = [target]
+	let Iarch depth = 0
+	let [Iarch] uoffs = []
+	let [Iarch] udeps = []
+
+	for ev in ld.evs {
+		if ev.kind == 0 then depth = depth + 1
+		if ev.kind == 1 then {
+			let [Iarch] ko = []
+			let [Iarch] kd = []
+
+			for (b, i) in uoffs {
+				if udeps[i] < depth then {
+					ko = [...ko, b]
+					kd = [...kd, udeps[i]]
+				}
+			}
+
+			uoffs = ko
+			udeps = kd
+			depth = depth - 1
+		}
+		if ev.kind >= 2 && ev.kind <= 5 && eq(ev.name, name) then {
+			uoffs = [...uoffs, ev.off]
+			udeps = [...udeps, depth]
+		}
+		if ev.kind == 6 && eq(ev.name, name) && Iarch(uoffs.len) > 0 then {
+			if uoffs[Iarch(uoffs.len) - 1] == target then refs = [...refs, ev.off]
+		}
+	}
+
+	const [SrcMap] maps = [ld.map]
+
+	for r in refs {
+		const LC lc = line_col_of(maps, input, r)
+		if lc.line > 0 then println("${lc.line}:${lc.col}")
+	}
 
 	return 0
 }
@@ -477,6 +537,16 @@ pub const main = ([Str] args, [Str] env) -> {
 			const da = growing_arena::of(16777216)
 
 			return run_def!(args[3], dsrc, dec_of(args[4]), args[5]) in da
+		}
+
+		# `cf lsp refs <input.cf> <off> <name> [--src <file>]` — every reference to the local
+		# binding at a byte offset (the binder first), one `line:col` per line.
+		if Iarch(args.len) >= 6 && eq(args[2], "refs") then {
+			let Str rsrc = ""
+			if Iarch(args.len) >= 8 && eq(args[6], "--src") then rsrc = args[7]
+			const ra = growing_arena::of(16777216)
+
+			return run_refs!(args[3], rsrc, dec_of(args[4]), args[5]) in ra
 		}
 
 		const sa = growing_arena::of(16777216)
