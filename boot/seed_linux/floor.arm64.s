@@ -25,9 +25,9 @@ f88:
 	mov x0, #0
 	ret
 
-.globl f389
+.globl f390
 .p2align 2
-f389:
+f390:
 	mov x0, x0
 	mov x8, #94
 	svc #0

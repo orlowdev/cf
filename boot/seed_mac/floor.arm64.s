@@ -28,17 +28,17 @@ _f88:
 	mov x0, #0
 	ret
 
-.globl _f389
+.globl _f390
 .p2align 2
-_f389:
+_f390:
 	mov x0, x0
 	mov x16, #1
 	svc #0x80
 	ret
 
-.globl _f390
+.globl _f391
 .p2align 2
-_f390:
+_f391:
 	mov x16, #2
 	svc #0x80
 	b.cc 1f
