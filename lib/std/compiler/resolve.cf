@@ -172,7 +172,9 @@ const us_join! = (Str base, Str seg): Str -> {
 # The pre-parse strip's result: the rewritten tokens, plus the module PATHS a full `::` path used
 # WITHOUT an import (`std::comptime::os::target`) refers to — the loader turns each into a synthetic
 # namespace import so the module is loaded (module_system §4: imports are optional).
-data StripResult = { [Token] toks, [Str] deps }
+# `doffs[i]` is the byte offset of `deps[i]`'s FIRST full-path use — the loader stamps the
+# synthetic import with its line/col, so a rejection (privilege, missing module) lands there.
+data StripResult = { [Token] toks, [Str] deps, [Iarch] doffs }
 
 # The first `nseg` segments of `segs` joined by `sep` (a byte): a full `::` path's module prefix is
 # all-but-the-last segment joined `/` (a load path), and its flat mangled name is all segments `_`.
@@ -274,9 +276,12 @@ const strip_import_namespaces! = (*[Uint8] src, [Token] toks): StripResult -> {
 	}
 
 	let [Str] nodeps = []
-	if Iarch(paliases.len) == 0 && !saw_ps then return StripResult({ toks: toks, deps: nodeps })
+	let [Iarch] nodoffs = []
+	if Iarch(paliases.len) == 0 && !saw_ps
+		then return StripResult({ toks: toks, deps: nodeps, doffs: nodoffs })
 	# --- pass 2: rewrite uses; leave import declarations untouched ---
 	let [Str] deps = []
+	let [Iarch] doffs = []
 	let [Token] out = []
 	let Iarch k = 0
 
@@ -392,7 +397,10 @@ const strip_import_namespaces! = (*[Uint8] src, [Token] toks): StripResult -> {
 
 			const Iarch ns = Iarch(segs.len)
 			const Str modpath = segs_join!(segs, ns - 1, 47) # all-but-last, `/`-joined — the load path
-			if !in_priv(deps, modpath) then deps = [...deps, modpath]
+			if !in_priv(deps, modpath) then {
+				deps = [...deps, modpath]
+				doffs = [...doffs, toks[k].start]
+			}
 
 			if is_lower_initial(segs[ns - 1]) then {
 				# value member — flat name matches the module's path-prefix-mangled definition
@@ -418,7 +426,7 @@ const strip_import_namespaces! = (*[Uint8] src, [Token] toks): StripResult -> {
 		}
 	}
 
-	return StripResult({ toks: out, deps: deps })
+	return StripResult({ toks: out, deps: deps, doffs: doffs })
 }
 
 # Join a namespace prefix and a value member into one identifier `<prefix>\x01member`.
@@ -594,11 +602,37 @@ const load_module! = (Str path, Str src, Str importer, Iarch iline, Iarch icol, 
 	if Iarch(sr.deps.len) == 0 then return prog
 	let [Import] imps = prog.imports
 	let Iarch di = 0
+	# first-use offsets arrive in scan order (deps dedup on first occurrence), so one forward
+	# pass over the source stamps each synthetic import's (line, col) — parse_program!'s scanner
+	let Iarch slo = 0
+	let Iarch sln = 1
+	let Iarch sls = 0
 
 	loop {
 		if di >= Iarch(sr.deps.len) then break
+		const Iarch doff = sr.doffs[di]
+
+		loop {
+			if slo >= doff then break
+			if Iarch(buf[slo]) == 10 then {
+				sln = sln + 1
+				sls = slo + 1
+			}
+			slo = slo + 1
+		}
+
 		const [Str] no_names = []
-		imps = [...imps, Import({ path: sr.deps[di], names: no_names, alias: "", wildcard: false, dline: 0, dcol: 0 })]
+		imps = [
+			...imps,
+			Import({
+				path: sr.deps[di],
+				names: no_names,
+				alias: "",
+				wildcard: false,
+				dline: sln,
+				dcol: doff - sls + 1,
+			}),
+		]
 		di = di + 1
 	}
 
