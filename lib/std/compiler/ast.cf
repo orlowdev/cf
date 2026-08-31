@@ -76,6 +76,12 @@ pub union Expr = {
 	# `const $tap = <last arg>; defer fn(..., $tap)` and replaces the expression with `$tap`, so no
 	# `DeferTap` reaches emit.
 	DeferTap(Str, [Expr]),
+	# `At(off, inner)` is a SOURCE SPAN wrapper (spans.cf): `off` is the expression's first
+	# byte in its declaring module. The parser wraps expressions so typecheck can point a
+	# rejection at the offending subexpression; `strip_program` removes every `At` right
+	# after typecheck, so the lowering passes and emit never see one. A pass that tests an
+	# expression's SHAPE through a wildcard must match on `unat(e)`.
+	At(Iarch, Expr),
 }
 
 # One segment of an interpolated string `"...${expr}..."`: a literal byte-run (`is_hole`
@@ -372,12 +378,18 @@ pub data Program = {
 
 # Read / re-apply the `in <geometry>` binding name on a call (Expr.Call's `geom` field). A pass that
 # rebuilds a call from a matched one wraps its result in `with_geom(..., g)` so the annotation survives
-# to emit; a non-call is returned unchanged.
-pub const call_geom = (Expr e): Str -> match e { Expr.Call(_, _, _, g) -> g, _ -> "" }
+# to emit; a non-call is returned unchanged. Both see through a span wrapper — the call under
+# an `Expr.At` is still the call.
+pub const call_geom = (Expr e): Str -> match e {
+	Expr.Call(_, _, _, g) -> g,
+	Expr.At(o, inner) -> call_geom(inner),
+	_ -> "",
+}
 
 # Re-apply an `in <geometry>` binding name `g` to a call, rebuilding the `Expr.Call` with `g` in
 # its `geom` field; a non-call is returned unchanged. The counterpart to `call_geom`.
 pub const with_geom = (Expr e, Str g): Expr -> match e {
 	Expr.Call(n, ta, args, _) -> Expr.Call(n, ta, args, g),
+	Expr.At(o, inner) -> Expr.At(o, with_geom(inner, g)),
 	_ -> e,
 }

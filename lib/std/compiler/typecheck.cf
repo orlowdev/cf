@@ -17,6 +17,7 @@
 
 import std::io::console::{ die, eprint }
 import std::compiler::diag::{ Diag, DiagBag, drec, drec_w, sort_diags }
+import std::compiler::spans::{ SrcMap, LC, line_col_of, unat }
 import std::data::str::{ eq }
 import std::compiler::ast::{
 	Expr,
@@ -95,7 +96,7 @@ pub data VarTy = {
 # check a value-yielding loop's body (which may itself `return`) without a separate parameter.
 # `dfile`/`dline`/`dcol` — the CURRENTLY-CHECKED declaration's source stamp (from its `Func`),
 # so any rejection deep in the checker reports the enclosing decl's `path:line:col`.
-pub data Ctx = { [Func] funcs, [RecDecl] recs, [UnionDecl] unions, Ty frt, Iarch frsize, Str dfile, Iarch dline, Iarch dcol }
+pub data Ctx = { [Func] funcs, [RecDecl] recs, [UnionDecl] unions, Ty frt, Iarch frsize, Str dfile, Iarch dline, Iarch dcol, [SrcMap] maps }
 
 # Record a rejection stamped with the CURRENTLY-CHECKED declaration's `path:line:col` (the Ctx
 # stamp) into the bag, and yield the poison `Never` — `ty_eq` accepts it against anything, so the
@@ -104,8 +105,40 @@ pub data Ctx = { [Func] funcs, [RecDecl] recs, [UnionDecl] unions, Ty frt, Iarch
 # after (`return terr(...)`), so no code that assumed the rejection diverged ever runs. The
 # variants differ only in the inert value the interrupted checker hands back. Colorless — a
 # rejection may fire from any fn, `!` or not.
-const terr = (Ctx ctx, *DiagBag dg, Str msg): Ty -> {
+# Record at the innermost expression SPAN when one is active (dg.eoff, set by type_of!'s
+# `At` walk), else at the declaration stamp. The lazy line/col conversion runs only here —
+# the error path.
+const trec = (Ctx ctx, *DiagBag dg, Str msg): () -> {
+	if dg.eoff >= 0 then {
+		const LC lc = line_col_of(ctx.maps, ctx.dfile, dg.eoff)
+
+		if lc.line > 0 then {
+			drec(dg, ctx.dfile, lc.line, lc.col, msg)
+
+			return ()
+		}
+	}
+
 	drec(dg, ctx.dfile, ctx.dline, ctx.dcol, msg)
+}
+
+# The offender-naming flavor (`what` composed at the CLI edge).
+const trec_w = (Ctx ctx, *DiagBag dg, Str msg, Str what): () -> {
+	if dg.eoff >= 0 then {
+		const LC lc = line_col_of(ctx.maps, ctx.dfile, dg.eoff)
+
+		if lc.line > 0 then {
+			drec_w(dg, ctx.dfile, lc.line, lc.col, msg, what)
+
+			return ()
+		}
+	}
+
+	drec_w(dg, ctx.dfile, ctx.dline, ctx.dcol, msg, what)
+}
+
+const terr = (Ctx ctx, *DiagBag dg, Str msg): Ty -> {
+	trec(ctx, dg, msg)
 
 	return Ty.TNever
 }
@@ -113,7 +146,7 @@ const terr = (Ctx ctx, *DiagBag dg, Str msg): Ty -> {
 # The statement/divergence-code flavor (`check_stmts!` and friends): 0 = "falls through" — inert,
 # and the enclosing body's own must-return check is latched away by the bag.
 const terr_i = (Ctx ctx, *DiagBag dg, Str msg): Iarch -> {
-	drec(dg, ctx.dfile, ctx.dline, ctx.dcol, msg)
+	trec(ctx, dg, msg)
 
 	return 0
 }
@@ -121,7 +154,7 @@ const terr_i = (Ctx ctx, *DiagBag dg, Str msg): Iarch -> {
 # The predicate flavor (`check_arm_guards!`): `true` = "looks fine", so the caller adds no
 # follow-up complaint on top of the recorded one.
 const terr_b = (Ctx ctx, *DiagBag dg, Str msg): Bool -> {
-	drec(dg, ctx.dfile, ctx.dline, ctx.dcol, msg)
+	trec(ctx, dg, msg)
 
 	return true
 }
@@ -129,7 +162,7 @@ const terr_b = (Ctx ctx, *DiagBag dg, Str msg): Bool -> {
 # The type-name flavor (`arraylit_elem!`): a well-known inert name, so downstream name lookups
 # resolve rather than trip a second, unlocated backstop die.
 const terr_s = (Ctx ctx, *DiagBag dg, Str msg): Str -> {
-	drec(dg, ctx.dfile, ctx.dline, ctx.dcol, msg)
+	trec(ctx, dg, msg)
 
 	return "Iarch"
 }
@@ -137,20 +170,20 @@ const terr_s = (Ctx ctx, *DiagBag dg, Str msg): Str -> {
 # The environment flavor (`check_destructure!`/`check_closure!`): hand back the caller's own
 # environment unchanged.
 const terr_env = (Ctx ctx, *DiagBag dg, Str msg, [VarTy] env): [VarTy] -> {
-	drec(dg, ctx.dfile, ctx.dline, ctx.dcol, msg)
+	trec(ctx, dg, msg)
 
 	return env
 }
 
 # The tuple-element flavor (`element_type_name!`): an inert scalar element.
 const terr_te = (Ctx ctx, *DiagBag dg, Str msg): TupElem -> {
-	drec(dg, ctx.dfile, ctx.dline, ctx.dcol, msg)
+	trec(ctx, dg, msg)
 
 	return TupElem({ name: "Iarch", sub: [] })
 }
 
 # The statement flavor (a unit match arm's rejection).
-const terr_u = (Ctx ctx, *DiagBag dg, Str msg): () -> drec(dg, ctx.dfile, ctx.dline, ctx.dcol, msg)
+const terr_u = (Ctx ctx, *DiagBag dg, Str msg): () -> trec(ctx, dg, msg)
 
 # Record with a specific declaration's stamp (program-structure checks that run before any Ctx
 # exists). Record-only: `check_whole`'s per-declaration checks are independent string checks, so
@@ -523,7 +556,7 @@ pub const tel_to_ty! = (TupElem te, Ctx ctx, *DiagBag dg): Ty -> {
 # (a bare name, a field read, an index) so the element cannot alias an owned value, AND it
 # keeps the element to a shape the emitter classifies the same way the type gate does (an
 # `if`/`match`-valued record element is a later brick).
-const is_fresh_record = (Expr e): Bool -> match e {
+const is_fresh_record = (Expr e): Bool -> match unat(e) {
 	Expr.Call(c, ta, a, _) -> true,
 	Expr.Record(n, fs) -> true,
 	Expr.UnionMk(t, m, args) -> true,
@@ -533,13 +566,13 @@ const is_fresh_record = (Expr e): Bool -> match e {
 # Whether an expression is a tuple literal or a call — the value forms a whole-tuple
 # binding may take (a literal `(a,b)` or a tuple-returning call `f(...)`). Aliasing a tuple
 # name or a tuple from a field/index is a later brick.
-const is_tuple_lit = (Expr e): Bool -> match e { Expr.Tuple(es) -> true, _ -> false }
+const is_tuple_lit = (Expr e): Bool -> match unat(e) { Expr.Tuple(es) -> true, _ -> false }
 
-const is_call_expr = (Expr e): Bool -> match e { Expr.Call(c, ta, a, _) -> true, _ -> false }
+const is_call_expr = (Expr e): Bool -> match unat(e) { Expr.Call(c, ta, a, _) -> true, _ -> false }
 
 # The value forms a whole-tuple binding may take — every form emit resolves telems for: a
 # literal, a call result, a bound tuple name, a tuple element/field (indexed or via `.field`).
-const is_tuple_bindable = (Expr e): Bool -> match e {
+const is_tuple_bindable = (Expr e): Bool -> match unat(e) {
 	Expr.Tuple(es) -> true,
 	Expr.Call(c, ta, a, _) -> true,
 	Expr.Var(n) -> true,
@@ -560,7 +593,7 @@ const is_tuple_bindable = (Expr e): Bool -> match e {
 # A freshly-constructed UNION value (not an alias): `Type.member(...)` (a payload construction) or a
 # bare `Type.Member` (a tag-only member — a `Field` whose base names a union type), or a call. Rules
 # out a bound union name / a union-typed record field read, which would put a borrowed value in the tuple.
-const is_fresh_union = (Expr e, Ctx ctx, *DiagBag dg): Bool -> match e {
+const is_fresh_union = (Expr e, Ctx ctx, *DiagBag dg): Bool -> match unat(e) {
 	Expr.UnionMk(t, m, args) -> true,
 	Expr.Call(c, ta, a, _) -> true,
 	Expr.Field(base, member) -> find_union(ctx.unions, base) >= 0,
@@ -598,7 +631,7 @@ const element_type_name! = (Ty t, Expr e, Ctx ctx, *DiagBag dg): TupElem -> {
 	# array literal or a call result), never an aliased array binding.
 	const Str aen = dyn_of(t)
 	if !eq(aen, "") then {
-		const Bool afresh = match e {
+		const Bool afresh = match unat(e) {
 			Expr.ArrayLit(h, s, el, et) -> true,
 			Expr.Call(c, ta, a, _) -> true,
 			_ -> false,
@@ -613,7 +646,7 @@ const element_type_name! = (Ty t, Expr e, Ctx ctx, *DiagBag dg): TupElem -> {
 }
 
 # The comptime literal value of an index expression, or -1 when it is not a bare literal.
-const lit_val = (Expr e): Iarch -> match e { Expr.Lit(v) -> v, _ -> -1 }
+const lit_val = (Expr e): Iarch -> match unat(e) { Expr.Lit(v) -> v, _ -> -1 }
 
 # Structural equality of two types (records/unions/arrays equal iff same name/element).
 const ty_eq = (Ty a, Ty b): Bool -> {
@@ -979,15 +1012,15 @@ const ipow2 = (Iarch k): Iarch -> {
 
 # A bare integer literal `v` or a negated one `-v` — the forms a fixed-width annotation ADOPTS
 # (type_system §3), range-checked against the target. `lit_signed_val` is its signed value.
-const is_adoptable_lit = (Expr e): Bool -> match e {
+const is_adoptable_lit = (Expr e): Bool -> match unat(e) {
 	Expr.Lit(v) -> true,
-	Expr.Neg(x) -> match x { Expr.Lit(v) -> true, _ -> false },
+	Expr.Neg(x) -> match unat(x) { Expr.Lit(v) -> true, _ -> false },
 	_ -> false,
 }
 
-const lit_signed_val = (Expr e): Iarch -> match e {
+const lit_signed_val = (Expr e): Iarch -> match unat(e) {
 	Expr.Lit(v) -> v,
-	Expr.Neg(x) -> match x { Expr.Lit(v) -> 0 - v, _ -> 0 },
+	Expr.Neg(x) -> match unat(x) { Expr.Lit(v) -> 0 - v, _ -> 0 },
 	_ -> 0,
 }
 
@@ -1031,7 +1064,7 @@ const var_type = ([VarTy] env, Str name, Ctx ctx, *DiagBag dg): Ty -> {
 	# not a local — a top-level VALUE const (a nullary function) referenced bare, auto-called
 	const Iarch fidx = find_func(ctx.funcs, name)
 	if fidx < 0 then {
-		drec_w(dg, ctx.dfile, ctx.dline, ctx.dcol, "cf: type: reference to an undeclared name\n", name)
+		trec_w(ctx, dg, "cf: type: reference to an undeclared name\n", name)
 
 		return Ty.TNever
 	}
@@ -1271,7 +1304,7 @@ const str_seal_type! = ([Expr] args, [VarTy] env, Ctx ctx, *DiagBag dg): Ty -> {
 # carries no live type arguments.
 # The name of a bare `Var` expression, or "" (used to recognize a function reference passed as
 # an argument — the only expression a function-type parameter accepts).
-const as_var_name = (Expr e): Str -> match e { Expr.Var(n) -> n, _ -> "" }
+const as_var_name = (Expr e): Str -> match unat(e) { Expr.Var(n) -> n, _ -> "" }
 
 # Whether an array-typed expression is a shape `emit_ptr_arg` can lower to its data pointer (data@0)
 # when passed to a `*[T]` raw pointer — exactly the forms emit's `init_agg_type` classifies as a
@@ -1280,7 +1313,7 @@ const as_var_name = (Expr e): Str -> match e { Expr.Var(n) -> n, _ -> "" }
 # but emit cannot classify its header, so it is rejected cleanly here rather than miscompiled. (A
 # field/index whose BASE is such a compound — `(if...).items` — cannot compile at all: cf already
 # crashes on an `if`/`match` that yields an aggregate, independent of this gate.)
-const is_ptr_arr_arg = (Expr e): Bool -> match e {
+const is_ptr_arr_arg = (Expr e): Bool -> match unat(e) {
 	Expr.ArrayLit(_, _, _, _) -> true,
 	Expr.Var(_) -> true,
 	Expr.Field(_, _) -> true,
@@ -1370,7 +1403,7 @@ const name_mutable = ([VarTy] env, Str n): Bool -> {
 	return env[i].mutable
 }
 
-const arg_root_mutable = (Expr e, [VarTy] env): Bool -> match e {
+const arg_root_mutable = (Expr e, [VarTy] env): Bool -> match unat(e) {
 	Expr.Var(n) -> name_mutable(env, n),
 	Expr.Addr(n) -> name_mutable(env, n),
 	Expr.Field(base, f) -> name_mutable(env, base),
@@ -1382,7 +1415,7 @@ const arg_root_mutable = (Expr e, [VarTy] env): Bool -> match e {
 }
 
 # The ROOT variable name of an lvalue chain (`t.top.a` → "t", `n.val` → "n"); "" if not name-rooted.
-const lvalue_root_name = (Expr e): Str -> match e {
+const lvalue_root_name = (Expr e): Str -> match unat(e) {
 	Expr.Var(n) -> n,
 	Expr.Field(base, f) -> base,
 	Expr.Index(base, ix) -> base,
@@ -1410,7 +1443,7 @@ const lvalue_root_writable = (Expr e, [VarTy] env): Bool -> {
 # naming an `is_ref` binding). A record VALUE — a `let`/`const` record, a `T({...})` construction —
 # needs `&` (memory_model §6: `*T` receives the address of a `let` aggregate, never a by-value
 # record). cf collapses `*Point`≡`Point` at the type level, so this is caught here.
-const is_addr_expr = (Expr e): Bool -> match e { Expr.Addr(n) -> true, _ -> false }
+const is_addr_expr = (Expr e): Bool -> match unat(e) { Expr.Addr(n) -> true, _ -> false }
 
 # Whether a binding's initializer makes it a REFERENCE into an existing aggregate — an explicit `&x`,
 # or a field READ whose result is a record/union (in cf's arena model every aggregate field is an
@@ -1420,7 +1453,7 @@ const is_addr_expr = (Expr e): Bool -> match e { Expr.Addr(n) -> true, _ -> fals
 const inits_ref! = (Expr e, [VarTy] env, Ctx ctx, *DiagBag dg): Bool -> {
 	if is_addr_expr(e) then return true
 
-	const Bool fr = match e { Expr.Field(b, f) -> true, Expr.FieldExpr(b, f) -> true, _ -> false }
+	const Bool fr = match unat(e) { Expr.Field(b, f) -> true, Expr.FieldExpr(b, f) -> true, _ -> false }
 
 	if !fr then return false
 	const Ty t = type_of!(e, env, ctx, dg)
@@ -1439,7 +1472,7 @@ const name_is_ref = ([VarTy] env, Str n): Bool -> {
 # non-reference binding (a `let`/`const` record, a by-value record param) and a `T({...})`/`({...})`
 # construction; those are rejected. Everything else — `&x`, a forwarded reference, or a call/field/`if`
 # yielding a pointer (whose `*Record`-vs-`Record` return cf collapses) — is allowed.
-const is_ref_arg = (Expr e, [VarTy] env): Bool -> match e {
+const is_ref_arg = (Expr e, [VarTy] env): Bool -> match unat(e) {
 	Expr.Var(n) -> name_is_ref(env, n),
 	Expr.Record(tn, inits) -> false,
 	_ -> true,
@@ -1601,7 +1634,7 @@ const call_type! = (Str callee, [Str] tyargs, [Expr] args, [VarTy] env, Ctx ctx,
 	if eq(callee, "std_comptime_embed") && callee_is_intrinsic_tc(ctx, dg, callee) then {
 		if Iarch(args.len) != 1 then return terr(ctx, dg, "cf: type: embed takes one string-literal path\n")
 
-		match args[0] {
+		match unat(args[0]) {
 			Expr.StrLit(_) -> {},
 			_ -> terr_u(ctx, dg, "cf: type: embed takes a string LITERAL path (read at compile time)\n"),
 		}
@@ -1611,7 +1644,7 @@ const call_type! = (Str callee, [Str] tyargs, [Expr] args, [VarTy] env, Ctx ctx,
 	if eq(callee, "std_comptime_embed_dir") && callee_is_intrinsic_tc(ctx, dg, callee) then {
 		if Iarch(args.len) != 1 then return terr(ctx, dg, "cf: type: embed_dir takes one string-literal directory path\n")
 
-		match args[0] {
+		match unat(args[0]) {
 			Expr.StrLit(_) -> {},
 			_ -> terr_u(ctx, dg, "cf: type: embed_dir takes a string LITERAL path (read at compile time)\n"),
 		}
@@ -1744,7 +1777,7 @@ const is_ptr_field_read = (Expr e, [VarTy] env, Ctx ctx, *DiagBag dg): Bool -> {
 	let Str base = ""
 	let Str fld = ""
 
-	match e {
+	match unat(e) {
 		Expr.Field(b, f) -> {
 			base = b
 			fld = f
@@ -1759,12 +1792,12 @@ const is_ptr_field_read = (Expr e, [VarTy] env, Ctx ctx, *DiagBag dg): Bool -> {
 
 # A bare `{ ... }` record literal (an inline NESTED literal) — a `Record` whose type_name is empty,
 # to be resolved from its FIELD's declared record type. `record_inits` reads its field inits.
-const is_bare_record = (Expr e): Bool -> match e { Expr.Record(tn, fs) -> eq(tn, ""), _ -> false }
+const is_bare_record = (Expr e): Bool -> match unat(e) { Expr.Record(tn, fs) -> eq(tn, ""), _ -> false }
 
 const record_inits = (Expr e): [FieldInit] -> {
 	let [FieldInit] r = []
 
-	match e {
+	match unat(e) {
 		Expr.Record(tn, fs) -> {
 			r = fs
 		},
@@ -2450,7 +2483,7 @@ const name_is_fixed = ([VarTy] env, Str n): Bool -> {
 	return env[i].fixed
 }
 
-const spread_src_fixed = (Expr src, [VarTy] env): Bool -> match src {
+const spread_src_fixed = (Expr src, [VarTy] env): Bool -> match unat(src) {
 	Expr.Var(n) -> name_is_fixed(env, n),
 	_ -> false,
 }
@@ -2490,14 +2523,14 @@ const arraylit_elem! = (
 
 # Is `e` an empty `[]` literal (no spread, no elements)? Such a reset adopts its target's
 # element type rather than the `Iarch` default `arraylit_type` would assign.
-const is_empty_arraylit = (Expr e): Bool -> match e {
+const is_empty_arraylit = (Expr e): Bool -> match unat(e) {
 	Expr.ArrayLit(hs, sn, elems, et) -> if hs then false else Iarch(elems.len) == 0,
 	_ -> false,
 }
 
 # A PLAIN array literal — non-spread and non-empty (`[1, 2, 3]`, not `[...src, e]` or `[]`). A
 # dynamic-array binding may not be reassigned from one (growth uses the spread form).
-const is_plain_arraylit_e = (Expr e): Bool -> match e {
+const is_plain_arraylit_e = (Expr e): Bool -> match unat(e) {
 	Expr.ArrayLit(hs, sn, elems, et) -> !hs && Iarch(elems.len) > 0,
 	_ -> false,
 }
@@ -2555,7 +2588,7 @@ const arraylit_ret_ty! = (Expr e, Str elem, [VarTy] env, Ctx ctx, *DiagBag dg): 
 	let Expr sn = Expr.Lit(0)
 	let [Expr] els = []
 
-	match e {
+	match unat(e) {
 		Expr.ArrayLit(h, s, es, et) -> {
 			hs = h
 			sn = s
@@ -2573,7 +2606,7 @@ const arraylit_ret_ty! = (Expr e, Str elem, [VarTy] env, Ctx ctx, *DiagBag dg): 
 # tuple-returning call, or a tuple literal. (A `match`/`if`-valued tuple source is a later
 # brick — the emit `init_telems` has no arm for it, so the type gate rejects it here rather
 # than letting emit silently copy zero slots.)
-const is_spreadable_src = (Expr e): Bool -> match e {
+const is_spreadable_src = (Expr e): Bool -> match unat(e) {
 	Expr.Var(n) -> true,
 	Expr.Call(c, ta, a, _) -> true,
 	Expr.Tuple(es) -> true,
@@ -3021,13 +3054,13 @@ const fix_ann_size = (Str a): Iarch -> {
 # The statically-known length of a fixed-array-valued expression, or -1 if unknown: a plain array
 # LITERAL's element count (a spread `[...src]` is unknown), an array-returning CALL's `ret_size`, or
 # a `Var` naming a FIXED binding's `fsize`. Used to length-check fixed-array returns/bindings/args.
-const arraylit_len = (Expr e): Iarch -> match e {
+const arraylit_len = (Expr e): Iarch -> match unat(e) {
 	Expr.ArrayLit(hs, sn, elems, et) -> if hs then -1 else Iarch(elems.len),
 	_ -> -1,
 }
 
 const call_ret_size = (Expr e, Ctx ctx, *DiagBag dg): Iarch -> {
-	const Str cn = match e { Expr.Call(n, ta, args, _) -> n, _ -> "" }
+	const Str cn = match unat(e) { Expr.Call(n, ta, args, _) -> n, _ -> "" }
 
 	if eq(cn, "") then return -1
 	const Iarch fi = find_func(ctx.funcs, cn)
@@ -3042,7 +3075,7 @@ const fixed_expr_len = (Expr e, [VarTy] env, Ctx ctx, *DiagBag dg): Iarch -> {
 	const Iarch lc = call_ret_size(e, ctx, dg)
 	if lc > 0 then return lc
 
-	const Str vn = match e { Expr.Var(n) -> n, _ -> "" }
+	const Str vn = match unat(e) { Expr.Var(n) -> n, _ -> "" }
 
 	if eq(vn, "") then return -1
 	const Iarch vi = env_index(env, vn)
@@ -3097,7 +3130,7 @@ pub const binding_ty! = (Str ann, Expr e, [VarTy] env, Ctx ctx, *DiagBag dg): Ty
 	# an array-literal binding must be annotated — the element type is NOT inferred from the elements
 	# (`const xs = [1, 2, 3]` is rejected; write `const [3 Iarch] xs = ...`). An annotated binding carries
 	# the element type in the literal's `elem_type` (the parser sets it for `let [Elem]`/`[N Elem]`).
-	match e {
+	match unat(e) {
 		Expr.ArrayLit(hs, sn, elems, et) -> {
 			if eq(et, "") then return terr(ctx, dg, "cf: type: an array literal binding needs a `[...]` annotation\n")
 		},
@@ -3261,7 +3294,19 @@ const loop_expr_type! = ([Stmt] body, [VarTy] env, Ctx ctx, *DiagBag dg): Ty -> 
 # The type of an expression `e` in environment `env` — the bottom-up typing entry point that
 # dispatches each `Expr` node to its typing helper. Validates operands as it goes (an ill-typed
 # subexpression dies), so a type it returns is also a proof the expression is well-formed.
+# Enter a span: remember the enclosing offset, expose this one to every recorder below,
+# restore on the way out — so a rejection lands on the INNERMOST wrapped expression.
+const at_type! = (Iarch off, Expr inner, [VarTy] env, Ctx ctx, *DiagBag dg): Ty -> {
+	const Iarch prev = dg.eoff
+	dg.eoff = off
+	const Ty t = type_of!(inner, env, ctx, dg)
+	dg.eoff = prev
+
+	return t
+}
+
 pub const type_of! = (Expr e, [VarTy] env, Ctx ctx, *DiagBag dg): Ty -> match e {
+	Expr.At(off, inner) -> at_type!(off, inner, env, ctx, dg),
 	Expr.Lit(v) -> lit_type(v, ctx, dg),
 	Expr.BoolLit(b) -> Ty.TBool,
 	Expr.StrLit(bytes) -> strlit_type(bytes),
@@ -3408,7 +3453,7 @@ const call_carries_local = (Str callee, [Expr] args, Str g, [VarTy] env, Ctx ctx
 	return false
 }
 
-const carries_local = (Expr e, [VarTy] env, Ctx ctx, *DiagBag dg): Bool -> match e {
+const carries_local = (Expr e, [VarTy] env, Ctx ctx, *DiagBag dg): Bool -> match unat(e) {
 	Expr.Addr(n) -> true,
 	Expr.Call(callee, tyargs, args, g) -> call_carries_local(callee, args, g, env, ctx, dg),
 	# a `$`-stack aggregate IS a dying local: its storage pops with the frame, so returning/rehoming
@@ -4032,7 +4077,7 @@ const exprs_have_defertap = ([Expr] es): Bool -> {
 	return false
 }
 
-const expr_has_defertap = (Expr e): Bool -> match e {
+const expr_has_defertap = (Expr e): Bool -> match unat(e) {
 	Expr.DeferTap(fn, args) -> true,
 	Expr.Call(n, ta, args, _) -> exprs_have_defertap(args),
 	Expr.UnionMk(t, m, args) -> exprs_have_defertap(args),
@@ -4129,7 +4174,7 @@ const exprs_defertap_hoistable = ([Expr] es): Bool -> {
 	return true
 }
 
-const defertap_hoistable = (Expr e): Bool -> match e {
+const defertap_hoistable = (Expr e): Bool -> match unat(e) {
 	Expr.DeferTap(fn, args) -> exprs_defertap_hoistable(args),
 	Expr.Call(n, ta, args, _) -> exprs_defertap_hoistable(args),
 	_ -> !expr_has_defertap(e),
@@ -4242,6 +4287,7 @@ const check_closure! = (Str nm, [Param] params, Str ret, [Stmt] body, [VarTy] en
 		dfile: ctx.dfile,
 		dline: ctx.dline,
 		dcol: ctx.dcol,
+		maps: ctx.maps,
 	})
 	let [VarTy] cenv = env
 	let Iarch pi = 0
@@ -4692,6 +4738,7 @@ const check_func! = (Func fn, Ctx ctx, *DiagBag dg): Iarch -> {
 		dfile: fn.dfile,
 		dline: fn.dline,
 		dcol: fn.dcol,
+		maps: ctx.maps,
 	})
 	let [VarTy] env = []
 	let Iarch pi = 0
@@ -4987,8 +5034,8 @@ const check_whole = (Program prog, Str entry, Bool require_main, *DiagBag dg): [
 # Typecheck the whole program: its structure, then every function. This phase is the
 # authority for all semantic validation; the emitter does no re-checking. `require_main`
 # gates the entry-point rejection: `compile!` demands one, `check!` (a module tree) does not.
-pub const check_program! = (Program prog, Str entry, Bool require_main): [Diag] -> {
-	let DiagBag bag = DiagBag({ hot: false, file: "", line: 0, col: 0, msg: "", what: "" })
+pub const check_program! = (Program prog, Str entry, Bool require_main, [SrcMap] maps): [Diag] -> {
+	let DiagBag bag = DiagBag({ hot: false, file: "", line: 0, col: 0, msg: "", what: "", eoff: -1 })
 	let [Diag] diags = check_whole(prog, entry, require_main, &bag)
 	let Ctx ctx = Ctx({
 		funcs: prog.funcs,
@@ -4999,6 +5046,7 @@ pub const check_program! = (Program prog, Str entry, Bool require_main): [Diag] 
 		dfile: "",
 		dline: 0,
 		dcol: 0,
+		maps: maps,
 	})
 	let Iarch f = 0
 
@@ -5029,8 +5077,8 @@ pub const check_program! = (Program prog, Str entry, Bool require_main): [Diag] 
 # PRE-materialize tables (`funcs` — the monomorphized originals — so dropped-to-dropped and
 # dropped-to-kept calls resolve by their ORIGINAL names; these bodies never name minted twins).
 # Same collection discipline as `check_program!`: one error per declaration, first wins.
-pub const check_unreachable! = ([Func] extra, [Func] funcs, [RecDecl] recs, [UnionDecl] unions): [Diag] -> {
-	let DiagBag bag = DiagBag({ hot: false, file: "", line: 0, col: 0, msg: "", what: "" })
+pub const check_unreachable! = ([Func] extra, [Func] funcs, [RecDecl] recs, [UnionDecl] unions, [SrcMap] maps): [Diag] -> {
+	let DiagBag bag = DiagBag({ hot: false, file: "", line: 0, col: 0, msg: "", what: "", eoff: -1 })
 	let [Diag] diags = []
 	let Ctx ctx = Ctx({
 		funcs: funcs,
@@ -5041,6 +5089,7 @@ pub const check_unreachable! = ([Func] extra, [Func] funcs, [RecDecl] recs, [Uni
 		dfile: "",
 		dline: 0,
 		dcol: 0,
+		maps: maps,
 	})
 	let Iarch f = 0
 

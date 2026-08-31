@@ -14,10 +14,11 @@ import std::io::fd::{ Fd, IoRrr }
 import std::sys::{ Os, Arch }
 import std::compiler::ast::{ Program }
 import std::compiler::diag::{ Diag, sort_diags }
-import std::compiler::resolve::{ resolve_program! }
+import std::compiler::resolve::{ resolve_program!, Resolved }
 import std::compiler::monomorph::{ mono_program!, MonoOut }
 import std::compiler::materialize::{ materialize_program!, Mat }
 import std::compiler::typecheck::{ check_program!, check_unreachable! }
+import std::compiler::spans::{ strip_program, strip_funcs }
 import std::compiler::alloc::{ check_alloc_program!, check_root_program! }
 import std::compiler::hoist_defertap::{ hoist_defertaps! }
 import std::compiler::defer::{ lower_defers! }
@@ -63,7 +64,8 @@ pub const compile! = (
 ): [Diag] -> {
 	# front end: resolve the entry module and its transitive imports (lexing and parsing
 	# each) into one flattened AST — module_system §8
-	const Program raw = resolve_program!(input, "", target_os, target_arch)
+	const Resolved rz = resolve_program!(input, "", target_os, target_arch)
+	const Program raw = rz.prog
 
 	# the `!` allocation algebra, checked both ways (memory_model §5) — UNCONDITIONAL: the whole
 	# tree (compiler + lib + corpus) is colored, so there is no flag. Run PRE-mono so the color is
@@ -110,20 +112,24 @@ pub const compile! = (
 	# returns the collected diagnostics; no output files are touched. The declarations
 	# Materialize pruned as unreachable are checked too, against the PRE-materialize tables:
 	# uncalled code is still written code, and its errors must not vanish with the pruning.
-	const [Diag] tdiags = check_program!(prog, input, true)
-	const [Diag] xdiags = check_unreachable!(mm.dropped, mono.funcs, mono.recs, mono.unions)
+	const [Diag] tdiags = check_program!(prog, input, true, rz.maps)
+	const [Diag] xdiags = check_unreachable!(mm.dropped, mono.funcs, mono.recs, mono.unions, rz.maps)
 	const [Diag] diags = sort_diags([...tdiags, ...xdiags])
 
 	if Iarch(diags.len) > 0 then return diags
 
 	# closures inside pruned declarations still validate their captures — the same fail-fast
 	# classification the real lift below applies to live code
-	check_dropped_captures!(mm.dropped, mono.recs, mono.funcs)
+	# spans end here: remove every `Expr.At` so the lowering passes and emit see the
+	# pre-spans shapes (the dropped decls' bodies carry them too — the capture check lifts)
+	const Program clean = strip_program(prog)
+
+	check_dropped_captures!(strip_funcs(mm.dropped), mono.recs, mono.funcs)
 
 	# lift `defer`-tap VALUES (`defer f(x)` / `|> defer f`) out of expression position into a
 	# snapshot binding + a scheduled `defer` statement (memory_model §6) — before lower_defers, so
 	# the emitted `Stmt.Defer`s are lowered like any other
-	const Program tapped = hoist_defertaps!(prog)
+	const Program tapped = hoist_defertaps!(clean)
 
 	# lower `defer` to explicit scope-exit code (memory_model §6): rewrite each `return e` in a
 	# defer-bearing function to snapshot the value, run the pending defers (LIFO), then return —
@@ -189,7 +195,8 @@ pub const check! = (
 	Arch target_arch,
 	Iarch root_size,
 ): [Diag] -> {
-	const Program raw = resolve_program!(input, src, target_os, target_arch)
+	const Resolved rz = resolve_program!(input, src, target_os, target_arch)
+	const Program raw = rz.prog
 	const [Diag] adiags = check_alloc_program!(raw)
 
 	const Bool zero_root = match target_os { Os.Bare -> root_size == 0, _ -> false }
@@ -206,15 +213,19 @@ pub const check! = (
 	const Program mono = mo.prog
 	const Mat mm = materialize_program!(mono, raw)
 	const Program prog = mm.prog
-	const [Diag] tdiags = check_program!(prog, input, false)
-	const [Diag] xdiags = check_unreachable!(mm.dropped, mono.funcs, mono.recs, mono.unions)
+	const [Diag] tdiags = check_program!(prog, input, false, rz.maps)
+	const [Diag] xdiags = check_unreachable!(mm.dropped, mono.funcs, mono.recs, mono.unions, rz.maps)
 	const [Diag] diags = sort_diags([...tdiags, ...xdiags])
 
 	if Iarch(diags.len) > 0 then return diags
 
-	check_dropped_captures!(mm.dropped, mono.recs, mono.funcs)
+	# spans end here: remove every `Expr.At` so the lowering passes and emit see the
+	# pre-spans shapes (the dropped decls' bodies carry them too — the capture check lifts)
+	const Program clean = strip_program(prog)
 
-	const Program tapped = hoist_defertaps!(prog)
+	check_dropped_captures!(strip_funcs(mm.dropped), mono.recs, mono.funcs)
+
+	const Program tapped = hoist_defertaps!(clean)
 	const Program deferred = lower_defers!(tapped)
 	const Program lowered = lift_program!(deferred)
 	const RouteInfo ri = routing_tables!(lowered)

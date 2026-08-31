@@ -37,6 +37,7 @@ import std::compiler::ast::{
 import std::data::str::{ eq }
 import std::io::console::{ die }
 import std::compiler::diag::{ Diag }
+import std::compiler::spans::{ unat }
 
 # A name carries the allocation marker iff it contains a `!` (byte 33). The marker rides directly
 # after the base name in the source (`alloc!`); monomorphization then appends an instance suffix
@@ -242,7 +243,7 @@ const exl_three = (Expr a, Expr b, Expr c): [Expr] -> {
 	return [...r, c]
 }
 
-const expr_children = (Expr e): [Expr] -> match e {
+const expr_children = (Expr e): [Expr] -> match unat(e) {
 	Expr.Record(_, inits) -> field_values(inits),
 	Expr.ArrayLit(_, sp, elems, _) -> cat_e(exl_one(sp), elems),
 	Expr.Tuple(elems) -> elems,
@@ -285,7 +286,7 @@ const expr_children = (Expr e): [Expr] -> match e {
 # Does `e` CONSTRUCT an aggregate at this node? Records, arrays, tuples, byte buffers, and
 # runtime-built (interpolated) strings always do; a union construction does iff its union is boxed.
 # A string LITERAL is static data, not residue.
-const is_construction = (ACtx cx, Expr e): Bool -> match e {
+const is_construction = (ACtx cx, Expr e): Bool -> match unat(e) {
 	Expr.Record(_, _) -> true,
 	Expr.ArrayLit(_, _, _, _) -> true,
 	Expr.Tuple(_) -> true,
@@ -313,7 +314,7 @@ const any_trapped! = (ACtx cx, [Expr] es): Bool -> {
 const scan_trapped! = (ACtx cx, Expr e): Bool -> {
 	if is_construction(cx, e) then return true
 
-	return match e {
+	return match unat(e) {
 		Expr.Loop(ss) -> body_traps!(cx, false, ss),
 		_ -> any_trapped!(cx, expr_children(e)),
 	}
@@ -335,7 +336,7 @@ const any_escaping! = (ACtx cx, [Expr] es): Bool -> {
 # `e` is in an ESCAPING position (its value is returned or rehomed): a construction HERE is not
 # residue, but a construction inside a call argument, a read base, or an if-condition IS. Returns
 # whether any trapped construction exists within.
-const scan_escaping! = (ACtx cx, Expr e): Bool -> match e {
+const scan_escaping! = (ACtx cx, Expr e): Bool -> match unat(e) {
 	Expr.Record(_, inits) -> any_escaping!(cx, field_values(inits)),
 	Expr.ArrayLit(_, sp, elems, _) -> scan_trapped!(cx, sp) || any_escaping!(cx, elems),
 	Expr.Tuple(elems) -> any_escaping!(cx, elems),
@@ -356,7 +357,7 @@ const scan_escaping! = (ACtx cx, Expr e): Bool -> match e {
 # construction (their emit paths never consult the flag) — and a value block's statements are
 # ordinary frame code. Scan for exactly those, descending the literal spine and call arguments
 # (which ride the flag too).
-const scan_stack_init! = (ACtx cx, Expr e): Bool -> match e {
+const scan_stack_init! = (ACtx cx, Expr e): Bool -> match unat(e) {
 	Expr.Record(_, inits) -> stack_scan_list!(cx, field_values(inits)),
 	Expr.ArrayLit(_, sp, elems, _) -> scan_stack_init!(cx, sp) || stack_scan_list!(cx, elems),
 	Expr.Buffer(sz) -> scan_stack_init!(cx, sz),
@@ -384,7 +385,7 @@ const stack_scan_list! = (ACtx cx, [Expr] es): Bool -> {
 # a scalar expression, a call, an if/match aggregate — takes emit's scalar/normal path where
 # the flag is never set, so every construction inside is ordinary node residue (this is what
 # made `const $n = "x${y}z".len` allocate invisibly — the old arm skipped the init entirely).
-const scan_stack_let! = (ACtx cx, Expr init): Bool -> match init {
+const scan_stack_let! = (ACtx cx, Expr init): Bool -> match unat(init) {
 	Expr.Record(_, _) -> scan_stack_init!(cx, init),
 	Expr.ArrayLit(_, _, _, _) -> scan_stack_init!(cx, init),
 	Expr.Buffer(_) -> scan_stack_init!(cx, init),
@@ -394,7 +395,7 @@ const scan_stack_let! = (ACtx cx, Expr init): Bool -> match init {
 # The root NAME of a chained lvalue's base (`a.b.c... = v` — the Var/name at the bottom of the
 # Field/Index chain), or "" when the base is not name-rooted (a non-name root is never a
 # parameter, so "" safely reads as non-escaping).
-const deep_root = (Expr e): Str -> match e {
+const deep_root = (Expr e): Str -> match unat(e) {
 	Expr.Var(n) -> n,
 	Expr.Field(b, _) -> b,
 	Expr.FieldExpr(b, _) -> deep_root(b),
@@ -513,7 +514,7 @@ const yield_vars = ([Stmt] ss): [Str] -> {
 	return r
 }
 
-const esc_vars = (Expr e): [Str] -> match e {
+const esc_vars = (Expr e): [Str] -> match unat(e) {
 	Expr.Var(n) -> [n],
 	Expr.Record(_, inits) -> vars_of(field_values(inits)),
 	# a spread `[...src, elems]` in escaping position carries its SOURCE out too (the source's
@@ -596,7 +597,7 @@ const stmt_exprs = (Stmt s): [Expr] -> match s {
 	_ -> no_exprs(),
 }
 
-const esc_roots_expr = ([Str] params, [Str] esc, Expr e): [Str] -> match e {
+const esc_roots_expr = ([Str] params, [Str] esc, Expr e): [Str] -> match unat(e) {
 	Expr.Loop(ss) -> esc_roots_body(params, esc, ss),
 	_ -> esc_roots_elist(params, esc, expr_children(e)),
 }
@@ -657,7 +658,7 @@ pub const compute_esc = ([Str] params, [Stmt] body): [Str] -> {
 	return esc
 }
 
-const var_refs_expr = (Expr e): [Str] -> match e {
+const var_refs_expr = (Expr e): [Str] -> match unat(e) {
 	Expr.Var(n) -> exl_one_s(n),
 	Expr.Loop(ss) -> var_refs_body(ss),
 	_ -> var_refs_list(expr_children(e)),
@@ -799,7 +800,7 @@ const named_fn_is_bang = ([Func] funcs, [Bool] bang, Str vn): Bool -> {
 	return bang[k]
 }
 
-const arg_is_bang_fnval = ([Func] funcs, [Bool] bang, Expr arg): Bool -> match arg {
+const arg_is_bang_fnval = ([Func] funcs, [Bool] bang, Expr arg): Bool -> match unat(arg) {
 	Expr.Var(vn) -> named_fn_is_bang(funcs, bang, vn),
 	_ -> false,
 }
@@ -838,7 +839,7 @@ const list_calls_bang = ([Func] funcs, [Bool] bang, [Str] params, [Expr] es): Bo
 }
 
 const expr_calls_bang = ([Func] funcs, [Bool] bang, [Str] params, Expr e): Bool -> {
-	const Bool here = match e {
+	const Bool here = match unat(e) {
 		Expr.Call(name, _, args, _) -> call_is_effectful(funcs, bang, params, name, args),
 		Expr.DeferTap(name, args) -> call_is_effectful(funcs, bang, params, name, args),
 		_ -> false,
@@ -846,7 +847,7 @@ const expr_calls_bang = ([Func] funcs, [Bool] bang, [Str] params, Expr e): Bool 
 
 	if here then return true
 
-	return match e {
+	return match unat(e) {
 		Expr.Loop(ss) -> body_calls_bang(funcs, bang, params, ss),
 		_ -> list_calls_bang(funcs, bang, params, expr_children(e)),
 	}
@@ -1002,7 +1003,7 @@ pub const check_alloc_program! = (Program prog): [Diag] -> {
 # functions that can run under the root is the closure of `main` over bare callees; if any of them
 # holds trapped residue, that residue would land on the root — a compile error. An `in`-grafted
 # call's ARGUMENTS still evaluate in the caller's ambient, so they keep propagating.
-const bare_calls_expr = (Expr e): [Str] -> match e {
+const bare_calls_expr = (Expr e): [Str] -> match unat(e) {
 	Expr.Call(n, _, args, g) -> if eq(g, "")
 		then cat_s(exl_one_s(n), bare_calls_list(args))
 		else bare_calls_list(args),

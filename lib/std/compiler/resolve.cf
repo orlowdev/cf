@@ -15,6 +15,7 @@ import std::data::str::{ eq, starts_with, contains }
 import std::sys::{ Os, Arch }
 import std::io::console::{ die, eprint }
 import std::compiler::diag::{ die_at_lc }
+import std::compiler::spans::{ SrcMap, src_map, unat }
 import std::io::file::{ open_read, read, close }
 import std::io::fd::{ Fd, IoRrr }
 import std::comptime::{ embed_dir, EmbeddedFile }
@@ -549,7 +550,11 @@ const embed_fallback! = (Str path, Str importer, Iarch iline, Iarch icol, *[Uint
 
 # `src` overrides where the BYTES come from (an editor's unsaved buffer written to a temp file)
 # while `path` stays the module's identity — diag stamps, edir, the dedup key. Empty = read `path`.
-const load_module! = (Str path, Str src, Str importer, Iarch iline, Iarch icol, Os target_os, Arch target_arch): Program -> {
+# One loaded module and its line table (spans.cf) — the source bytes are frame-local here,
+# so the table must be built before they go out of scope.
+pub data Loaded = { Program prog, SrcMap map }
+
+const load_module! = (Str path, Str src, Str importer, Iarch iline, Iarch icol, Os target_os, Arch target_arch): Loaded -> {
 	# One module's read buffer — large enough for cf's own sources (its largest module, emit.cf,
 	# crossed 256 KB; 1 MB leaves headroom). `buf.len` is the capacity handed to `read` (the
 	# buffer reports its own size now), and `read` returns the actual byte count `n`. A read that
@@ -599,7 +604,7 @@ const load_module! = (Str path, Str src, Str importer, Iarch iline, Iarch icol, 
 	# imports are optional (module_system §4): a full `::` path used without an import contributed its
 	# module PATH to `sr.deps` — turn each into a synthetic namespace import so the module is loaded
 	# (the flat use already resolves to its path-prefix-mangled definition; the loader dedups by path).
-	if Iarch(sr.deps.len) == 0 then return prog
+	if Iarch(sr.deps.len) == 0 then return Loaded({ prog: prog, map: src_map(path, buf, n) })
 	let [Import] imps = prog.imports
 	let Iarch di = 0
 	# first-use offsets arrive in scan order (deps dedup on first occurrence), so one forward
@@ -636,13 +641,15 @@ const load_module! = (Str path, Str src, Str importer, Iarch iline, Iarch icol, 
 		di = di + 1
 	}
 
-	return Program({
+	const Program lp = Program({
 		imports: imps,
 		recs: prog.recs,
 		unions: prog.unions,
 		funcs: prog.funcs,
 		groups: prog.groups,
 	})
+
+	return Loaded({ prog: lp, map: src_map(path, buf, n) })
 }
 
 # Append every element of `src` onto `dst` (cf has no two-spread merge, so grow one at a
@@ -903,6 +910,7 @@ const mangle_name = (Str n, [Bind] tbl, Rctx rc): Str -> {
 # name a function; every other node is rebuilt unchanged around its recursively rewritten
 # children.
 const mangle_expr = (Expr e, [Bind] tbl, Rctx rc): Expr -> match e {
+	Expr.At(o, inner) -> Expr.At(o, mangle_expr(inner, tbl, rc)),
 	Expr.Lit(v) -> Expr.Lit(v),
 	Expr.BoolLit(b) -> Expr.BoolLit(b),
 	# a bare name may REFERENCE a private function (passed by name to a higher-order function);
@@ -1196,6 +1204,7 @@ const lnames_stmts! = ([Stmt] ss): [Str] -> {
 }
 
 const lnames_expr! = (Expr e): [Str] -> match e {
+	Expr.At(o, inner) -> lnames_expr!(inner),
 	Expr.Lit(v) -> no_names(),
 	Expr.BoolLit(b) -> no_names(),
 	Expr.Var(n) -> no_names(),
@@ -2083,12 +2092,12 @@ const splat_params! = ([RecDecl] groups, [Param] params, Func ef): [Param] -> {
 
 # A bare `{ ... }` group-literal argument (a `Record` with an empty type_name) and its inits.
 const is_bare_record_r = (Expr e): Bool ->
-	match e { Expr.Record(tn, fs) -> eq(tn, ""), _ -> false }
+	match unat(e) { Expr.Record(tn, fs) -> eq(tn, ""), _ -> false }
 
 const record_inits_r = (Expr e): [FieldInit] -> {
 	let [FieldInit] r = []
 
-	match e {
+	match unat(e) {
 		Expr.Record(tn, fs) -> {
 			r = fs
 		},
@@ -2275,6 +2284,7 @@ const splat_segs = ([Seg] segs, [Func] funcs, [RecDecl] groups, Func ef): [Seg] 
 }
 
 const splat_expr = (Expr e, [Func] funcs, [RecDecl] groups, Func ef): Expr -> match e {
+	Expr.At(o, inner) -> Expr.At(o, splat_expr(inner, funcs, groups, ef)),
 	Expr.Lit(v) -> Expr.Lit(v),
 	Expr.BoolLit(b) -> Expr.BoolLit(b),
 	Expr.Var(n) -> Expr.Var(n),
@@ -2552,9 +2562,14 @@ const cat_src_n = ([Str] xs, Iarch n, Str s): [Str] -> {
 	return r
 }
 
-pub const resolve_program! = (Str entry, Str src, Os target_os, Arch target_arch): Program -> {
+# The resolved whole-program AST plus every module's line table (spans.cf).
+pub data Resolved = { Program prog, [SrcMap] maps }
+
+pub const resolve_program! = (Str entry, Str src, Os target_os, Arch target_arch): Resolved -> {
 	const Str edir = dir_of!(entry)
-	const Program root = load_module!(entry, src, "", 0, 0, target_os, target_arch)
+	const Loaded l0 = load_module!(entry, src, "", 0, 0, target_os, target_arch)
+	const Program root = l0.prog
+	let [SrcMap] maps = [l0.map]
 	# the entry is prefix-empty (its names stay bare — it fixes the naming frame)
 	let [Modu] mods = [Modu({ prefix: "", mpath: entry, is_geom: false, tag: "", prog: root })]
 	let [Import] work = []
@@ -2605,7 +2620,9 @@ pub const resolve_program! = (Str entry, Str src, Os target_os, Arch target_arch
 					geom = true
 					mtag = "pg"
 				}
-				const Program m0 = load_module!(mpath, "", wsrc[wi], work[wi].dline, work[wi].dcol, target_os, target_arch)
+				const Loaded lw = load_module!(mpath, "", wsrc[wi], work[wi].dline, work[wi].dcol, target_os, target_arch)
+				const Program m0 = lw.prog
+				maps = [...maps, lw.map]
 				const Program m = if is_floor_impl(im.path) then tag_floor_syms(m0) else m0
 				mods = [
 					...mods,
@@ -2686,5 +2703,7 @@ pub const resolve_program! = (Str entry, Str src, Os target_os, Arch target_arch
 	const [Func] gfuncs = splat_groups!(nfuncs, erecs, eunions, groups)
 	const [RecDecl] nogroups = []
 
-	return Program({ imports: none, recs: erecs, unions: eunions, funcs: gfuncs, groups: nogroups })
+	const Program rp = Program({ imports: none, recs: erecs, unions: eunions, funcs: gfuncs, groups: nogroups })
+
+	return Resolved({ prog: rp, maps: maps })
 }

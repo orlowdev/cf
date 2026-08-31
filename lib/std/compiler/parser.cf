@@ -9,6 +9,7 @@
 # (`acc = Expr.Add(acc, rhs)`) — one function per precedence level.
 
 import std::compiler::diag::{ die_at }
+import std::compiler::spans::{ unat }
 import std::data::str::{ eq }
 import std::sys::{ Os, Arch }
 import std::compiler::token::{
@@ -328,7 +329,14 @@ const parse_string! = (*Parser p, Iarch start, Iarch len): Expr -> {
 # an `Expr` accumulator (`acc = Expr.Add(acc, rhs)`). Comparison is NON-associative — a single
 # compare, no chaining.
 
-const parse_expr! = (*Parser p): Expr -> parse_pipe!(p)
+const parse_expr! = (*Parser p): Expr -> {
+	# the span wrapper (spans.cf): every full expression — a statement's top, a call
+	# argument, a condition, an index — remembers its first byte, rebased into the
+	# enclosing file for a hole sub-parse
+	const Iarch off = p.ebase + p.toks[p.pos].start
+
+	return Expr.At(off, parse_pipe!(p))
+}
 
 # `x |> f` / `x |> f(a, ...)` — the pipe threads the left value in as the callee's LAST
 # positional argument: `f(x)` / `f(a, ..., x)`. It is the LOOSEST operator (looser than
@@ -1462,24 +1470,25 @@ const dyn_elem_of = (Ty t): Str -> match t { Ty.TDyn(n) -> n, _ -> "" }
 # empty `[]` (which has no element to infer from) still carries its element layout.
 # Non-array initializers pass through unchanged.
 const set_arr_elem = (Expr e, Str elem): Expr -> match e {
+	Expr.At(o, inner) -> Expr.At(o, set_arr_elem(inner, elem)),
 	Expr.ArrayLit(hs, sn, elems, et) -> Expr.ArrayLit(hs, sn, elems, elem),
 	_ -> e,
 }
 
 # Whether a tuple element is a `...src` spread (which keeps a lone `(...t)` a tuple).
-const is_spread_p = (Expr e): Bool -> match e { Expr.Spread(x) -> true, _ -> false }
+const is_spread_p = (Expr e): Bool -> match unat(e) { Expr.Spread(x) -> true, _ -> false }
 
 # Whether an initializer is a plain (non-spread) array literal of exactly `n`
 # elements — the shape a `[N Elem]` fixed-array binding requires.
-const is_fixed_arraylit = (Expr e, Iarch n): Bool -> match e {
+const is_fixed_arraylit = (Expr e, Iarch n): Bool -> match unat(e) {
 	Expr.ArrayLit(hs, sn, elems, et) -> if hs then false else Iarch(elems.len) == n,
 	_ -> false,
 }
 
 const is_arraylit_e = (Expr e): Bool ->
-	match e { Expr.ArrayLit(hs, sn, elems, et) -> true, _ -> false }
+	match unat(e) { Expr.ArrayLit(hs, sn, elems, et) -> true, _ -> false }
 
-const is_call_e = (Expr e): Bool -> match e { Expr.Call(c, ta, args, _) -> true, _ -> false }
+const is_call_e = (Expr e): Bool -> match unat(e) { Expr.Call(c, ta, args, _) -> true, _ -> false }
 
 # Validate a destructure pattern token: a bare name binds a position; a `_`-led token is a
 # skip — `_` (one) or `_<digits>` (n) — and anything else (`_foo`) is rejected.
@@ -1613,7 +1622,7 @@ const parse_let! = (*Parser p, Bool mutable): Stmt -> {
 		p.pos = p.pos + 1
 		const Expr pinit = parse_init!(p, pointee)
 
-		const Bool is_addr = match pinit { Expr.Addr(_) -> true, _ -> false }
+		const Bool is_addr = match unat(pinit) { Expr.Addr(_) -> true, _ -> false }
 
 		if !is_addr then perr(p, "cf: parse: a `*` pointer binding's initializer must be an address (`&x`)\n")
 
@@ -1799,7 +1808,7 @@ const parse_for! = (*Parser p): Stmt -> {
 	}
 	# a bare-name iterable drives `ForIn` directly; any other expression is bound to a hidden
 	# temp first (a nested block, so the temp never leaks into the enclosing scope)
-	const Str arr = match it {
+	const Str arr = match unat(it) {
 		Expr.Var(n) -> n,
 		_ -> "",
 	}
@@ -1844,7 +1853,7 @@ const parse_defer! = (*Parser p): Stmt -> {
 	}
 	const Expr e = parse_expr!(p)
 
-	const Bool isc = match e { Expr.Call(cn, ct, ca, _) -> true, _ -> false }
+	const Bool isc = match unat(e) { Expr.Call(cn, ct, ca, _) -> true, _ -> false }
 
 	if !isc then perr(p, "cf: parse: `defer` schedules a call `f(...)` or a block `{ ... }`\n")
 	const [Stmt] one = [Stmt.Do(e)]
@@ -1872,7 +1881,7 @@ const in_clause_name! = (*Parser p): Str -> {
 const geom_stamp = (*Parser p, Expr e, Str g): Expr -> {
 	if eq(g, "") then return e
 
-	const Bool isc = match e { Expr.Call(_, _, _, _) -> true, _ -> false }
+	const Bool isc = match unat(e) { Expr.Call(_, _, _, _) -> true, _ -> false }
 
 	if !isc then perr(p, "cf: parse: `in <geometry>` governs a call `f(...)`; this value is not a call\n")
 
@@ -2841,7 +2850,7 @@ const parse_func! = (*Parser p): Func -> {
 		const [Stmt] vempty = []
 		const Expr vexpr = parse_expr!(p)
 
-		const Str vret = match vexpr { Expr.StrLit(_) -> "Str", Expr.BoolLit(_) -> "Bool", _ -> "" }
+		const Str vret = match unat(vexpr) { Expr.StrLit(_) -> "Str", Expr.BoolLit(_) -> "Bool", _ -> "" }
 
 		const [Stmt] vbody = [...vempty, Stmt.Return(vexpr)]
 		const [Seg] vnoasm = []

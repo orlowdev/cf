@@ -1,0 +1,267 @@
+# spans — expression source positions (the expr-spans arc).
+#
+# The parser wraps expressions in `Expr.At(off, inner)` — a byte offset into the declaring
+# module's source (hole sub-parses already rebase through `ebase`). Spans exist for ONE
+# consumer: typecheck, which records the innermost enclosing offset into its DiagBag so a
+# rejection points at the offending subexpression, not the whole declaration. Everything
+# here supports that flow:
+#
+# - `SrcMap`/`src_map`: a per-file table of line-start offsets, built once per loaded
+#   module; `line_col_of` converts an offset lazily — only on the error path.
+# - `unat`: see through the wrapper. Every pass that matches an Expr's SHAPE through a
+#   wildcard fallback (the `!` algebra's classifiers, monomorph's inference, materialize's
+#   constructor scan, typecheck's predicates) must look at `unat(e)` — a wildcard would
+#   otherwise silently misclassify a wrapped node.
+# - `strip_program`: remove every `At` right after typecheck, so the lowering passes and
+#   emit see exactly the shapes they always did.
+
+import std::compiler::ast::{
+	Program,
+	Func,
+	Expr,
+	Stmt,
+	Seg,
+	FieldInit,
+	MatchArm,
+	StmtArm,
+}
+import std::data::str::{ eq }
+
+# The empty table — a caller with no source in hand (monomorph) falls back to decl stamps.
+pub const no_maps = (): [SrcMap] -> []
+
+# One file's line table: `starts[i]` is the byte offset of line `i+1`'s first byte.
+pub data SrcMap = { Str file, [Iarch] starts }
+
+# A resolved position; `line` 0 means the offset could not be mapped (fall back to the
+# declaration stamp).
+pub data LC = { Iarch line, Iarch col }
+
+# Build the line table of one module's source.
+pub const src_map = (Str file, *[Uint8] src, Iarch n): SrcMap -> {
+	let [Iarch] starts = [0]
+	let Iarch i = 0
+
+	loop {
+		if i >= n then break
+		if Iarch(src[i]) == 10 then starts = [...starts, i + 1]
+		i = i + 1
+	}
+
+	return SrcMap({ file: file, starts: starts })
+}
+
+# The 1-based (line, col) of byte `off` in `file`, or line 0 when no table covers it.
+# Binary search over the line starts; columns are bytes (what editors take).
+pub const line_col_of = ([SrcMap] maps, Str file, Iarch off): LC -> {
+	for m in maps {
+		if eq(m.file, file) then {
+			let Iarch lo = 0
+			let Iarch hi = Iarch(m.starts.len) - 1
+
+			loop {
+				if lo >= hi then break
+				const Iarch mid = (lo + hi + 1) / 2
+				if m.starts[mid] <= off then lo = mid else hi = mid - 1
+			}
+
+			return LC({ line: lo + 1, col: off - m.starts[lo] + 1 })
+		}
+	}
+
+	return LC({ line: 0, col: 0 })
+}
+
+# The expression under its span wrappers — what a SHAPE test must match on.
+pub const unat = (Expr e): Expr -> match e {
+	Expr.At(o, inner) -> unat(inner),
+	_ -> e,
+}
+
+# --- the strip pass ---------------------------------------------------------------------------
+# Remove every `At` from a checked program, so hoist/defer/closures/routing/emit see the
+# pre-spans shapes unchanged. Mirrors materialize's rt_expr walker structure.
+
+const strip_exprs = ([Expr] es): [Expr] -> {
+	let [Expr] out = []
+
+	for e in es {
+		out = [...out, strip_expr(e)]
+	}
+
+	return out
+}
+
+const strip_fields = ([FieldInit] fs): [FieldInit] -> {
+	let [FieldInit] out = []
+
+	for f in fs {
+		out = [...out, FieldInit({ field: f.field, value: strip_expr(f.value) })]
+	}
+
+	return out
+}
+
+const strip_segs = ([Seg] segs): [Seg] -> {
+	let [Seg] out = []
+
+	for s in segs {
+		out = [...out, Seg({ is_hole: s.is_hole, lit: s.lit, name: s.name, expr: strip_expr(s.expr) })]
+	}
+
+	return out
+}
+
+const strip_arms = ([MatchArm] arms): [MatchArm] -> {
+	let [MatchArm] out = []
+
+	for a in arms {
+		out = [...out, MatchArm({
+			is_wild: a.is_wild,
+			type_name: a.type_name,
+			members: a.members,
+			binds: a.binds,
+			body: strip_expr(a.body),
+		})]
+	}
+
+	return out
+}
+
+const strip_stmt_arms = ([StmtArm] arms): [StmtArm] -> {
+	let [StmtArm] out = []
+
+	for a in arms {
+		out = [...out, StmtArm({
+			is_wild: a.is_wild,
+			type_name: a.type_name,
+			members: a.members,
+			binds: a.binds,
+			body: strip_stmts(a.body),
+		})]
+	}
+
+	return out
+}
+
+const strip_expr = (Expr e): Expr -> match e {
+	Expr.At(off, inner) -> strip_expr(inner),
+	Expr.Lit(v) -> Expr.Lit(v),
+	Expr.BoolLit(b) -> Expr.BoolLit(b),
+	Expr.Var(n) -> Expr.Var(n),
+	Expr.StrLit(bs) -> Expr.StrLit(bs),
+	Expr.FloatLit(t) -> Expr.FloatLit(t),
+	Expr.Record(n, fs) -> Expr.Record(n, strip_fields(fs)),
+	Expr.Field(b, f) -> Expr.Field(b, f),
+	Expr.FieldExpr(b, f) -> Expr.FieldExpr(strip_expr(b), f),
+	Expr.UnionMk(t, m, args) -> Expr.UnionMk(t, m, strip_exprs(args)),
+	Expr.Match(scrut, arms) -> Expr.Match(strip_expr(scrut), strip_arms(arms)),
+	Expr.ArrayLit(hs, sp, elems, et) -> Expr.ArrayLit(hs, strip_expr(sp), strip_exprs(elems), et),
+	Expr.Index(a, i) -> Expr.Index(a, strip_expr(i)),
+	Expr.IndexField(a, i, f) -> Expr.IndexField(a, strip_expr(i), f),
+	Expr.IndexExpr(b, i) -> Expr.IndexExpr(strip_expr(b), strip_expr(i)),
+	Expr.Interp(segs) -> Expr.Interp(strip_segs(segs)),
+	Expr.Tuple(elems) -> Expr.Tuple(strip_exprs(elems)),
+	Expr.Spread(x) -> Expr.Spread(strip_expr(x)),
+	Expr.Unit -> Expr.Unit,
+	Expr.Loop(ss) -> Expr.Loop(strip_stmts(ss)),
+	Expr.Buffer(sz) -> Expr.Buffer(strip_expr(sz)),
+	Expr.Addr(n) -> Expr.Addr(n),
+	Expr.Neg(x) -> Expr.Neg(strip_expr(x)),
+	Expr.Not(x) -> Expr.Not(strip_expr(x)),
+	Expr.BitNot(x) -> Expr.BitNot(strip_expr(x)),
+	Expr.Add(l, r) -> Expr.Add(strip_expr(l), strip_expr(r)),
+	Expr.Sub(l, r) -> Expr.Sub(strip_expr(l), strip_expr(r)),
+	Expr.Mul(l, r) -> Expr.Mul(strip_expr(l), strip_expr(r)),
+	Expr.Div(l, r) -> Expr.Div(strip_expr(l), strip_expr(r)),
+	Expr.Mod(l, r) -> Expr.Mod(strip_expr(l), strip_expr(r)),
+	Expr.BitAnd(l, r) -> Expr.BitAnd(strip_expr(l), strip_expr(r)),
+	Expr.BitOr(l, r) -> Expr.BitOr(strip_expr(l), strip_expr(r)),
+	Expr.BitXor(l, r) -> Expr.BitXor(strip_expr(l), strip_expr(r)),
+	Expr.Shl(l, r) -> Expr.Shl(strip_expr(l), strip_expr(r)),
+	Expr.Shr(l, r) -> Expr.Shr(strip_expr(l), strip_expr(r)),
+	Expr.CmpEq(l, r) -> Expr.CmpEq(strip_expr(l), strip_expr(r)),
+	Expr.CmpNe(l, r) -> Expr.CmpNe(strip_expr(l), strip_expr(r)),
+	Expr.CmpLt(l, r) -> Expr.CmpLt(strip_expr(l), strip_expr(r)),
+	Expr.CmpGt(l, r) -> Expr.CmpGt(strip_expr(l), strip_expr(r)),
+	Expr.CmpLe(l, r) -> Expr.CmpLe(strip_expr(l), strip_expr(r)),
+	Expr.CmpGe(l, r) -> Expr.CmpGe(strip_expr(l), strip_expr(r)),
+	Expr.And(l, r) -> Expr.And(strip_expr(l), strip_expr(r)),
+	Expr.Or(l, r) -> Expr.Or(strip_expr(l), strip_expr(r)),
+	Expr.If(c, t, el) -> Expr.If(strip_expr(c), strip_expr(t), strip_expr(el)),
+	Expr.Call(n, ta, args, g) -> Expr.Call(n, ta, strip_exprs(args), g),
+	Expr.DeferTap(fn, args) -> Expr.DeferTap(fn, strip_exprs(args)),
+}
+
+const strip_stmt = (Stmt s): Stmt -> match s {
+	Stmt.Let(n, m, ann, init) -> Stmt.Let(n, m, ann, strip_expr(init)),
+	Stmt.Assign(n, v) -> Stmt.Assign(n, strip_expr(v)),
+	Stmt.FieldAssign(b, f, v) -> Stmt.FieldAssign(b, f, strip_expr(v)),
+	Stmt.DeepFieldAssign(b, f, v) -> Stmt.DeepFieldAssign(strip_expr(b), f, strip_expr(v)),
+	Stmt.IndexAssign(n, i, v) -> Stmt.IndexAssign(n, strip_expr(i), strip_expr(v)),
+	Stmt.Return(v) -> Stmt.Return(strip_expr(v)),
+	Stmt.ForIn(v, arr, body) -> Stmt.ForIn(v, arr, strip_stmts(body)),
+	Stmt.Loop(lbl, body) -> Stmt.Loop(lbl, strip_stmts(body)),
+	Stmt.Break(lbl) -> Stmt.Break(lbl),
+	Stmt.Continue(lbl) -> Stmt.Continue(lbl),
+	Stmt.IfThen(c, st) -> Stmt.IfThen(strip_expr(c), strip_stmt(st)),
+	Stmt.IfElse(c, t, el) -> Stmt.IfElse(strip_expr(c), strip_stmt(t), strip_stmt(el)),
+	Stmt.Do(e) -> Stmt.Do(strip_expr(e)),
+	Stmt.Block(ss) -> Stmt.Block(strip_stmts(ss)),
+	Stmt.Match(scrut, arms) -> Stmt.Match(strip_expr(scrut), strip_stmt_arms(arms)),
+	Stmt.Destructure(ns, m, e) -> Stmt.Destructure(ns, m, strip_expr(e)),
+	Stmt.Yield(e) -> Stmt.Yield(strip_expr(e)),
+	Stmt.Closure(n, ps, rn, body) -> Stmt.Closure(n, ps, rn, strip_stmts(body)),
+	Stmt.Defer(body) -> Stmt.Defer(strip_stmts(body)),
+}
+
+const strip_stmts = ([Stmt] ss): [Stmt] -> {
+	let [Stmt] out = []
+
+	for s in ss {
+		out = [...out, strip_stmt(s)]
+	}
+
+	return out
+}
+
+# Strip one function's body (declared shapes carry no expressions).
+pub const strip_func = (Func f): Func -> Func({
+	name: f.name,
+	is_pub: f.is_pub,
+	ret_name: f.ret_name,
+	ret_elem: f.ret_elem,
+	params: f.params,
+	body: strip_stmts(f.body),
+	is_asm: f.is_asm,
+	asm_body: f.asm_body,
+	is_value: f.is_value,
+	ret_telems: f.ret_telems,
+	typarams: f.typarams,
+	tbounds: f.tbounds,
+	ret_size: f.ret_size,
+	is_intrinsic: f.is_intrinsic,
+	asm_sym: f.asm_sym,
+	dfile: f.dfile,
+	dline: f.dline,
+	dcol: f.dcol,
+})
+
+pub const strip_funcs = ([Func] fs): [Func] -> {
+	let [Func] out = []
+
+	for f in fs {
+		out = [...out, strip_func(f)]
+	}
+
+	return out
+}
+
+# The whole program without spans — run right after typecheck.
+pub const strip_program = (Program p): Program -> Program({
+	imports: p.imports,
+	recs: p.recs,
+	unions: p.unions,
+	funcs: strip_funcs(p.funcs),
+	groups: p.groups,
+})
