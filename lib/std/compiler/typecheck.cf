@@ -1331,6 +1331,7 @@ const is_ptr_arr_arg = (Expr e): Bool -> match unat(e) {
 # rejected: cf has no first-class function values beyond passing a name (closures are a later
 # brick).
 const check_fn_arg! = (Ty expected, Expr arg, [VarTy] env, Ctx ctx, *DiagBag dg): Iarch -> {
+	dg.eoff = arg_span(arg, dg.eoff)
 	const Str nm = as_var_name(arg)
 	if eq(nm, "") then return terr_i(ctx, dg, "cf: type: a function-type argument must be a function name\n")
 	const Iarch ei = env_index(env, nm)
@@ -1692,8 +1693,11 @@ const call_type! = (Str callee, [Str] tyargs, [Expr] args, [VarTy] env, Ctx ctx,
 			# a `*Record` parameter takes an explicit reference — `&x` or a forwarded pointer — never a
 			# bare record value (700): `*Point`≡`Point` in the type, so it is distinguished here
 			if param_is_recptr(ctx.funcs[fidx].params[i], ctx.recs) then {
-				if !is_ref_arg(args[i], env)
-					then return terr(ctx, dg, "cf: type: a `*Record` parameter needs an explicit reference `&x` (or a forwarded pointer), not a bare record value\n")
+				if !is_ref_arg(args[i], env) then {
+					dg.eoff = arg_span(args[i], dg.eoff)
+
+					return terr(ctx, dg, "cf: type: a `*Record` parameter needs an explicit reference `&x` (or a forwarded pointer), not a bare record value\n")
+				}
 			}
 			const Ty at = type_of!(args[i], env, ctx, dg)
 			# a byte pointer is a pointer-width address, acceptable where a register word is expected
@@ -1707,7 +1711,11 @@ const call_type! = (Str callee, [Str] tyargs, [Expr] args, [VarTy] env, Ctx ctx,
 				# onward), or a dynamic-/fixed-array expression `emit_ptr_arg` can lower to its element
 				# base (data@0) — a bare variable, or a field/index/call result (`is_ptr_arr_arg`). An
 				# array yielded opaquely by an `if`/`match` is rejected (emit cannot classify its header).
-						else if is_tptr(pt) && is_tptr(at) then { } else if is_tptr(pt) && !eq(dyn_of(at), "") && is_ptr_arr_arg(args[i]) then { } else { return terr(ctx, dg, "cf: type: a call argument's type does not match the parameter\n") }
+						else if is_tptr(pt) && is_tptr(at) then { } else if is_tptr(pt) && !eq(dyn_of(at), "") && is_ptr_arr_arg(args[i]) then { } else {
+						dg.eoff = arg_span(args[i], dg.eoff)
+
+						return terr(ctx, dg, "cf: type: a call argument's type does not match the parameter\n")
+					}
 			}
 			# a `[N T]` FIXED-array parameter — the argument's statically-known length must equal N (918);
 			# a wrong-width element is caught by the type check above (919). An unknown-length arg passes.
@@ -3294,6 +3302,14 @@ const loop_expr_type! = ([Stmt] body, [VarTy] env, Ctx ctx, *DiagBag dg): Ty -> 
 # The type of an expression `e` in environment `env` — the bottom-up typing entry point that
 # dispatches each `Expr` node to its typing helper. Validates operands as it goes (an ill-typed
 # subexpression dies), so a type it returns is also a proof the expression is well-formed.
+# The span offset a call ARGUMENT carries (its `Expr.At` wrapper), or `dflt` when unwrapped.
+# Set RIGHT BEFORE recording an argument-specific rejection, so it lands on the argument
+# itself, not the call — no restore needed: the bag latches first-error-wins.
+const arg_span = (Expr e, Iarch dflt): Iarch -> match e {
+	Expr.At(o, inner) -> o,
+	_ -> dflt,
+}
+
 # Enter a span: remember the enclosing offset, expose this one to every recorder below,
 # restore on the way out — so a rejection lands on the INNERMOST wrapped expression.
 const at_type! = (Iarch off, Expr inner, [VarTy] env, Ctx ctx, *DiagBag dg): Ty -> {
