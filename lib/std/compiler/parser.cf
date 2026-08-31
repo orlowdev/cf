@@ -1066,6 +1066,9 @@ const parse_arm_head! = (*Parser p): MatchArm -> {
 	let Str first = cur_name!(p)
 	bev(p, p.pos, 6, first)
 	p.pos = p.pos + 1
+	# the bare union name, kept for the member-composite events below — `first` may grow a
+	# `[...]` application, and a composite names the TEMPLATE (the written base segment)
+	const Str arm_base = first
 	# a match arm may qualify by the union's exact INSTANCE (`U[Iarch].Pair`), not only its base
 	# name (`U.Pair`); the bracketed application is kept as the arm's type name, which the
 	# monomorph pass mangles to the concrete union (and rejects a wrong instance at typecheck).
@@ -1074,7 +1077,11 @@ const parse_arm_head! = (*Parser p): MatchArm -> {
 		p.pos = p.pos + 1
 		if !is_ident(peek(p)) then perr(p, "cf: parse: expected a member name after `.`\n")
 		let [Str] members = []
-		members = [...members, cur_name!(p)]
+		const Str m0 = cur_name!(p)
+		# a `Type.member` COMPOSITE use for the LSP's union-member references, stamped on the
+		# member's own token (`p.track` gates the interpolation, not just the append)
+		if p.track then bev(p, p.pos, 6, "${arm_base}.${m0}")
+		members = [...members, m0]
 		p.pos = p.pos + 1
 		let [Str] binds = []
 
@@ -1108,6 +1115,7 @@ const parse_arm_head! = (*Parser p): MatchArm -> {
 						p.pos = p.pos + 1
 						if !is_ident(peek(p)) then perr(p, "cf: parse: expected a member name after `.`\n")
 						const Str gm = cur_name!(p)
+						if p.track then bev(p, p.pos, 6, "${nm}.${gm}")
 						p.pos = p.pos + 1
 						if is_lparen(peek(p)) then perr(p, "cf: parse: a nested sub-pattern is one level only\n")
 						binds = [...binds, "=${nm}.${gm}"]
@@ -1133,13 +1141,17 @@ const parse_arm_head! = (*Parser p): MatchArm -> {
 				p.pos = p.pos + 1
 				if !is_ident(peek(p)) then perr(p, "cf: parse: expected `Type.member` after `|`\n")
 				const Str q = cur_name!(p)
+				# each alternative re-writes the qualifier — a type-name USE of its own
+				bev(p, p.pos, 6, q)
 				p.pos = p.pos + 1
 				if !eq(q, first)
 					then perr(p, "cf: parse: or-pattern alternatives must share the union qualifier\n")
 				if !is_dot(peek(p)) then perr(p, "cf: parse: expected `.` in an or-pattern alternative\n")
 				p.pos = p.pos + 1
 				if !is_ident(peek(p)) then perr(p, "cf: parse: expected a member name after `.`\n")
-				members = [...members, cur_name!(p)]
+				const Str om = cur_name!(p)
+				if p.track then bev(p, p.pos, 6, "${arm_base}.${om}")
+				members = [...members, om]
 				p.pos = p.pos + 1
 			}
 		}
@@ -1360,6 +1372,9 @@ const parse_primary! = (*Parser p): Expr -> {
 			p.pos = p.pos + 1
 			if !is_ident(peek(p)) then perr(p, "cf: parse: expected a field name after `.`\n")
 			const Str field = cur_name!(p)
+			# a PascalCase base makes this a `Type.member` use (construction or tag word), not a
+			# field read — log the composite for the LSP's union-member references
+			if p.track && is_pascal_name(name) then bev(p, p.pos, 6, "${name}.${field}")
 			p.pos = p.pos + 1
 			# `Bool.True` / `Bool.False` — the explicit qualified form of the `true`/`false` literal
 			# sugar (§8.6: `Bool` is the union `{ False, True }`, which cf lowers to a 1-byte int).
@@ -1383,6 +1398,8 @@ const parse_primary! = (*Parser p): Expr -> {
 			p.pos = p.pos + 1
 			if !is_ident(peek(p)) then perr(p, "cf: parse: expected a union member name\n")
 			const Str member = cur_name!(p)
+			# the composite names the TEMPLATE (`name`, not the `tyapp` application)
+			if p.track then bev(p, p.pos, 6, "${name}.${member}")
 			p.pos = p.pos + 1
 			if is_lparen(peek(p)) then return postfix_chain!(p, parse_union_mk!(p, tyapp, member))
 			const [Expr] noargs = []
@@ -2903,12 +2920,29 @@ const parse_type_ref! = (*Parser p): Str -> {
 # COLLAPSE it to the union `Base` (before monomorph). Used only where a member type is accepted: a
 # parameter, a return type, and a binding annotation (not fields/payloads/generic args — a `.` there
 # stays a parse error, a later brick). Match-arm `Type.Member` patterns are parsed elsewhere.
+# The base name of a possibly-applied type reference — `Maybe[Iarch]` → `Maybe` (a
+# member-composite event names the TEMPLATE, matching a written use's base segment).
+const app_base! = (Str s): Str -> {
+	let [Uint8] out = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(s.len) then break
+		if Iarch(s[i]) == 91 then break
+		out = [...out, s[i]]
+		i = i + 1
+	}
+
+	return Str(out)
+}
+
 const parse_member_type! = (*Parser p): Str -> {
 	const Str base = parse_type_ref!(p)
 	if is_dot(peek(p)) then {
 		p.pos = p.pos + 1 # `.`
 		if !is_ident(peek(p)) then perr(p, "cf: parse: expected a member name after `.` in a type\n")
 		const Str member = cur_name!(p)
+		if p.track then bev(p, p.pos, 6, "${app_base!(base)}.${member}")
 		p.pos = p.pos + 1
 
 		return "${base}.${member}"

@@ -1514,8 +1514,12 @@ const local_def! = (Str argv0, [Str] env, Str path, Str overlay, [Str] lines, Ia
 # corrupt the program), so a nonzero child exit refuses rather than salvages.
 const local_refs! = (Str argv0, [Str] env, Str path, Str overlay, [Str] lines, Iarch l0, TokCtx t): [SymRow] -> {
 	let [SymRow] rows = []
-	if !bare_token(t) then return rows
-	const Iso iso = lsp_child_iso!(argv0, env, path, overlay, lines, l0, t.ts, "refs", t.name)
+	# a `Type.` base makes the token a union MEMBER use — the child answers the composite
+	const Bool memberq = Iarch(t.base.len) > 0
+	if !bare_token(t) && !memberq then return rows
+	let Str cname = t.name
+	if memberq then cname = "${t.base}.${t.name}"
+	const Iso iso = lsp_child_iso!(argv0, env, path, overlay, lines, l0, t.ts, "refs", cname)
 	if iso.co.rc != 0 then return rows
 	const [Str] outl = split("\n", iso.co.out)
 	const Bool is_top = Iarch(outl.len) > 0 && eq(outl[0], "top")
@@ -1529,7 +1533,31 @@ const local_refs! = (Str argv0, [Str] env, Str path, Str overlay, [Str] lines, I
 	# child cannot see a TYPE declaration's `pub` (the parser discards it), so a `pub` decl
 	# line is refused HERE; a `type` ALIAS (kind 5 without a `= {` group body) is refused
 	# too — its uses are token-erased before the parse, so the log cannot cover them.
-	if is_top then {
+	if is_top && memberq then {
+		# a union MEMBER: the owning union's decl line gates pub-ness (like a type), and the
+		# member's declaration rows come from the union body scan
+		for ln in lines {
+			const DeclLine d = scan_decl(ln)
+
+			if d.kind == 10 && eq(slice(d.ns, d.ne, ln), t.base) && starts_with("pub ", ln) then {
+				const [SymRow] none = []
+
+				return none
+			}
+		}
+
+		let Str owner = ""
+		if Iarch(overlay.len) > 0 then owner = path
+		const [Str] one = [path]
+
+		for m in union_members!(one, owner, overlay, t.base) {
+			if eq(m.sname, t.name) then rows = [...rows, m]
+		}
+
+		# no such member declared here — nothing to anchor a rename on
+		if Iarch(rows.len) == 0 then return rows
+	}
+	if is_top && !memberq then {
 		let Iarch li = 0
 
 		for ln in lines {
@@ -1588,6 +1616,29 @@ const local_refs! = (Str argv0, [Str] env, Str path, Str overlay, [Str] lines, I
 	}
 
 	return rows
+}
+
+# The union whose MEMBER declaration sits exactly at (l0, ts) in the checked buffer, or ""
+# — a cursor resting on `Line` inside `union Shape = { Dot, Line(Iarch) }` reads as a bare
+# token, but it asks about the member: the caller rebases the query onto `Base.member`.
+const member_decl_union! = (Str path, Str overlay, [Str] lines, Iarch l0, Iarch ts): Str -> {
+	let Str owner = ""
+	if Iarch(overlay.len) > 0 then owner = path
+	const [Str] one = [path]
+
+	for ln in lines {
+		const DeclLine d = scan_decl(ln)
+
+		if d.kind == 10 then {
+			const Str ub = slice(d.ns, d.ne, ln)
+
+			for m in union_members!(one, owner, overlay, ub) {
+				if m.line == l0 && m.ns == ts then return ub
+			}
+		}
+	}
+
+	return ""
 }
 
 # The `type Alias = ...Target...` lines of `lines` that name the UPPERCASE `name` in their
@@ -1837,10 +1888,12 @@ const rows_at! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, I
 # the whole cross-file answer must refuse; there is no chunk salvage across files).
 data UsesOut = { Bool ok, [SymRow] rows }
 
-# One `cf lsp uses` child run over `f`: the file's uses of the top-level `name`, VERIFIED —
-# the child's mangled-tail match is loose, so a position only survives when `name` sits at
-# its column as a whole token in the file's own text (the overlay stands in for the owner).
-const uses_rows! = (Str argv0, [Str] env, Str f, Str owner, Str srcf, Str name): UsesOut -> {
+# One `cf lsp uses` child run over `f`: the file's uses of `cname` — a plain top-level name
+# or a `Base.member` composite — VERIFIED: the child's mangled-tail match is loose, so a
+# position only survives when `vname` (the token the position points at — the member for a
+# composite) sits at its column as a whole token in the file's own text (the overlay stands
+# in for the owner).
+const uses_rows! = (Str argv0, [Str] env, Str f, Str owner, Str srcf, Str cname, Str vname): UsesOut -> {
 	const [SymRow] none = []
 
 	const Str sh = match find_executable!(env, "sh") {
@@ -1852,7 +1905,7 @@ const uses_rows! = (Str argv0, [Str] env, Str f, Str owner, Str srcf, Str name):
 	const Str tmp = "/tmp/cf-lsp-${getpid()}.uses"
 	let Str ov = ""
 	if eq(owner, f) then ov = " --src '${srcf}'"
-	const Str cmd = "'${argv0}' lsp uses '${f}' '${name}'${ov} > '${tmp}' 2> /dev/null"
+	const Str cmd = "'${argv0}' lsp uses '${f}' '${cname}'${ov} > '${tmp}' 2> /dev/null"
 	const Iarch rc = run!(sh, ["sh", "-c", cmd], env)
 
 	const Str got = match read_file!(tmp) {
@@ -1866,13 +1919,13 @@ const uses_rows! = (Str argv0, [Str] env, Str f, Str owner, Str srcf, Str name):
 	let [SymRow] rows = []
 
 	for lref in split("\n", got) {
-		const SymRow r = ref_row(lref, f, name)
+		const SymRow r = ref_row(lref, f, vname)
 
 		if r.line >= 0 && r.line < Iarch(flines.len) then {
 			const Str ln = flines[r.line]
 
 			if r.ne <= Iarch(ln.len)
-			&& eq(slice(r.ns, r.ne, ln), name)
+			&& eq(slice(r.ns, r.ne, ln), vname)
 			&& (r.ns == 0 || !name_byte(Iarch(ln[r.ns - 1])))
 			&& (r.ne >= Iarch(ln.len) || !name_byte(Iarch(ln[r.ne]))) then {
 				rows = [...rows, r]
@@ -1892,6 +1945,14 @@ const uses_rows! = (Str argv0, [Str] env, Str f, Str owner, Str srcf, Str name):
 const pub_rows! = (Str argv0, [Str] env, Str path, Str srcf, Str srcp, Str overlay, TokCtx t): [SymRow] -> {
 	const [SymRow] none = []
 	if eq(t.name, "main") then return none
+	# a `Type.` base: the token is a union MEMBER — the UNION's declaration anchors the
+	# uniqueness/pub gates, the member's own decl rows come from the union body scan, and
+	# the uses children match the `Base.member` composite the parser logs
+	const Bool memberq = Iarch(t.base.len) > 0
+	let Str dname = t.name
+	if memberq then dname = t.base
+	let Str cname = t.name
+	if memberq then cname = "${t.base}.${t.name}"
 	const [Str] mods = modules_of!(argv0, env, path, overlay)
 	const Str pwd = getenv!(env, "PWD")
 	const [Str] scan = scan_files!(mods, path, pwd)
@@ -1905,20 +1966,33 @@ const pub_rows! = (Str argv0, [Str] env, Str path, Str srcf, Str srcp, Str overl
 	let [SymRow] dhits = []
 
 	for d in decls {
-		if eq(d.sname, t.name) then dhits = [...dhits, d]
+		if eq(d.sname, dname) then dhits = [...dhits, d]
 	}
 
 	if Iarch(dhits.len) != 1 then return none
 	const SymRow dl = dhits[0]
+	# a member's base must be a UNION declaration
+	if memberq && dl.kind != 10 then return none
 	# an erased `type` alias has no events to walk; a group is never pub — kind 5 refuses whole
 	if dl.kind == 5 then return none
 	const [Str] dlines = split("\n", src_of!(dl.file, owner, srcf))
 	if dl.line >= Iarch(dlines.len) then return none
 	if !starts_with("pub ", dlines[dl.line]) then return none
-	let [SymRow] rows = [dl]
+	let [SymRow] rows = []
+
+	if memberq then {
+		for m in union_members!(scan, owner, srcf, t.base) {
+			if eq(m.sname, t.name) then rows = [...rows, m]
+		}
+
+		# the union declares no such member — nothing to anchor
+		if Iarch(rows.len) == 0 then return none
+	} else {
+		rows = [...rows, dl]
+	}
 
 	for f in scan {
-		const UsesOut u = uses_rows!(argv0, env, f, owner, srcf, t.name)
+		const UsesOut u = uses_rows!(argv0, env, f, owner, srcf, cname, t.name)
 		if !u.ok then return none
 
 		for r in u.rows {
@@ -1976,10 +2050,21 @@ const deep_rows! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0,
 	if l0 < 0 || l0 >= Iarch(lines.len) then return none
 	const TokCtx t = token_at(lines[l0], c0)
 	if !t.ok then return none
-	const [SymRow] lrows = local_refs!(argv0, env, path, overlay, lines, l0, t)
+	let TokCtx tq = t
+
+	# a bare PascalCase token may be a union member's own DECLARATION — rebase the query
+	# onto `Base.member` so refs/rename answer from the member's identity
+	if bare_token(t) && Iarch(t.name[0]) >= 65 && Iarch(t.name[0]) <= 90 then {
+		const Str ub = member_decl_union!(path, overlay, lines, l0, t.ts)
+
+		if Iarch(ub.len) > 0 then
+			tq = TokCtx({ ok: true, name: t.name, hints: t.hints, lead: t.lead, ts: t.ts, te: t.te, base: ub })
+	}
+
+	const [SymRow] lrows = local_refs!(argv0, env, path, overlay, lines, l0, tq)
 	if Iarch(lrows.len) > 0 then return lrows
 
-	return pub_rows!(argv0, env, path, srcf, srcp, overlay, t)
+	return pub_rows!(argv0, env, path, srcf, srcp, overlay, tq)
 }
 
 # Answer textDocument/references: every reference of the binding under the cursor — a
@@ -2076,8 +2161,18 @@ const prepare_rename! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarc
 	if l0 < 0 || l0 >= Iarch(lines.len) then return Json.Null
 	const TokCtx t = token_at(lines[l0], c0)
 	if !t.ok then return Json.Null
-	let [SymRow] rows = local_refs!(argv0, env, path, overlay, lines, l0, t)
-	if Iarch(rows.len) == 0 then rows = pub_rows!(argv0, env, path, srcf, srcp, overlay, t)
+	let TokCtx tq = t
+
+	# a bare PascalCase token on a union member's own declaration — same rebase as deep_rows!
+	if bare_token(t) && Iarch(t.name[0]) >= 65 && Iarch(t.name[0]) <= 90 then {
+		const Str ub = member_decl_union!(path, overlay, lines, l0, t.ts)
+
+		if Iarch(ub.len) > 0 then
+			tq = TokCtx({ ok: true, name: t.name, hints: t.hints, lead: t.lead, ts: t.ts, te: t.te, base: ub })
+	}
+
+	let [SymRow] rows = local_refs!(argv0, env, path, overlay, lines, l0, tq)
+	if Iarch(rows.len) == 0 then rows = pub_rows!(argv0, env, path, srcf, srcp, overlay, tq)
 	if Iarch(rows.len) == 0 then return Json.Null
 
 	# the SEGMENT under the cursor, not the whole qualified token — rename edits only it
