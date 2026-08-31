@@ -118,7 +118,6 @@ data Emit = {
 	[Bool] fmints,
 	[Str] slits,
 	Str mat_geom,
-	Iarch merge_depth,
 	Iarch local_slot,
 	Bool skip_embeds,
 	Str build_version,
@@ -3491,20 +3490,6 @@ const emit_agg_binding! = (*Emit ctx, Expr e, [Binding] env): Iarch -> match e {
 	_ -> copy_agg!(ctx, emit_expr!(e, ctx, env)),
 }
 
-# The address of merge-slot `d` in the `@start` pool (`%mpool + d*8`). `d` is the current
-# `if`/`&&`/`||` nesting depth, so nested expressions never reuse a live parent's slot; drawing
-# from the hoisted pool (rather than a fresh `alloc` here) is what keeps a value-`if`/`&&`/`||`
-# inside a loop from leaking the stack each iteration. Dies past the 64-slot pool.
-const emit_merge_slot! = (*Emit ctx): Str -> {
-	if ctx.merge_depth >= 64
-		then die("cf: emit: `if`/`&&`/`||` value nesting exceeds the 64-slot merge pool — flatten the expression\n")
-	const Iarch a = ctx.next
-	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${a} =l add %mpool, ${ctx.merge_depth * 8}\n")
-
-	return "%t${a}"
-}
-
 # Reserve the next local-slot INDEX in the `@start` `%lpool` and advance the live-local cursor. The
 # caller emits `%t${slot} =l add %lpool, ${k*8}` and uses `%t${slot}` as the cell's address exactly
 # as it used the old `alloc8` temp — the temp is function-scoped, so every later load/store still
@@ -3519,32 +3504,30 @@ const emit_local_slot = (*Emit ctx): Iarch -> {
 	return k
 }
 
-# Emit an `if <cond> then <a> else <b>` value. The branches merge through a stack slot (not a
-# phi): evaluate the condition, branch, each arm stores its value into the slot, and the join
-# block loads it. Robust under nesting; the slot comes from the hoisted `%mpool` (see
-# `emit_merge_slot!`) so a value-`if` in a loop does not leak.
+# Emit an `if <cond> then <a> else <b>` value. The branches merge through one shared
+# TEMPORARY assigned in both arms (`copy`) — QBE input is not SSA; its own ssa
+# construction turns the two assignments into a phi, so the merge lives in a register
+# with no stack traffic. (The old `%mpool` slot pool — stores and loads through an
+# address-computed slot QBE cannot promote — is retired; nesting needs no bound now,
+# each merge draws a fresh temp.)
 const emit_if! = (*Emit ctx, Expr cond, Expr then_e, Expr else_e, [Binding] env): Str -> {
-	const Str slot = emit_merge_slot!(ctx)
-	ctx.merge_depth = ctx.merge_depth + 1
 	const Str c = emit_expr!(cond, ctx, env)
-	# the merge slot stores/loads in the branches' QBE type (a float `if` value uses `d`/`s`)
+	# the merge temp copies in the branches' QBE type (a float `if` value uses `d`/`s`)
 	const Str qt = qtype_of!(ctx, env, then_e)
+	const Iarch rt = ctx.next
+	ctx.next = ctx.next + 1
 	const Iarch lid = ctx.label
 	ctx.label = ctx.label + 1
 	write_str(ctx.fd, "\tjnz ${c}, @then${lid}, @else${lid}\n")
 	write_str(ctx.fd, "@then${lid}\n")
 	const Str a = emit_expr!(then_e, ctx, env)
-	write_str(ctx.fd, "\tstore${qt} ${a}, ${slot}\n")
+	write_str(ctx.fd, "\t%t${rt} =${qt} copy ${a}\n")
 	write_str(ctx.fd, "\tjmp @end${lid}\n")
 	write_str(ctx.fd, "@else${lid}\n")
 	const Str b = emit_expr!(else_e, ctx, env)
-	write_str(ctx.fd, "\tstore${qt} ${b}, ${slot}\n")
+	write_str(ctx.fd, "\t%t${rt} =${qt} copy ${b}\n")
 	write_str(ctx.fd, "\tjmp @end${lid}\n")
 	write_str(ctx.fd, "@end${lid}\n")
-	ctx.merge_depth = ctx.merge_depth - 1
-	const Iarch rt = ctx.next
-	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${rt} =${qt} load${qt} ${slot}\n")
 
 	return "%t${rt}"
 }
@@ -3552,34 +3535,26 @@ const emit_if! = (*Emit ctx, Expr cond, Expr then_e, Expr else_e, [Binding] env)
 # Emit a short-circuit `&&`/`||`. The right operand is emitted in its own block,
 # reached only when the left operand does not already settle the result — so a
 # side-effecting or non-terminating RHS is genuinely skipped. The result (0/1)
-# merges through a slot, like `if`. For `&&`: a false lhs short-circuits to 0; for
-# `||`: a true lhs short-circuits to 1; otherwise the result is `rhs != 0`.
+# merges through one shared temporary assigned in both blocks, like `if`. For `&&`:
+# a false lhs short-circuits to 0; for `||`: a true lhs short-circuits to 1;
+# otherwise the result is `rhs != 0`.
 const emit_logical! = (*Emit ctx, Bool is_and, Expr l, Expr r, [Binding] env): Str -> {
-	# reserve this operator's slot at the current depth BEFORE emitting the operands, so a nested
-	# `&&`/`||`/`if` in either operand draws a deeper slot and cannot clobber this merge
-	const Str slot = emit_merge_slot!(ctx)
-	ctx.merge_depth = ctx.merge_depth + 1
 	const Str a = emit_expr!(l, ctx, env)
+	const Iarch rt = ctx.next
+	ctx.next = ctx.next + 1
 	const Iarch lid = ctx.label
 	ctx.label = ctx.label + 1
 	if is_and then write_str(ctx.fd, "\tjnz ${a}, @rhs${lid}, @sc${lid}\n")
 	if !is_and then write_str(ctx.fd, "\tjnz ${a}, @sc${lid}, @rhs${lid}\n")
 	write_str(ctx.fd, "@sc${lid}\n")
-	if is_and then write_str(ctx.fd, "\tstorel 0, ${slot}\n")
-	if !is_and then write_str(ctx.fd, "\tstorel 1, ${slot}\n")
+	if is_and then write_str(ctx.fd, "\t%t${rt} =l copy 0\n")
+	if !is_and then write_str(ctx.fd, "\t%t${rt} =l copy 1\n")
 	write_str(ctx.fd, "\tjmp @end${lid}\n")
 	write_str(ctx.fd, "@rhs${lid}\n")
 	const Str b = emit_expr!(r, ctx, env)
-	const Iarch bb = ctx.next
-	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${bb} =l cnel ${b}, 0\n")
-	write_str(ctx.fd, "\tstorel %t${bb}, ${slot}\n")
+	write_str(ctx.fd, "\t%t${rt} =l cnel ${b}, 0\n")
 	write_str(ctx.fd, "\tjmp @end${lid}\n")
 	write_str(ctx.fd, "@end${lid}\n")
-	ctx.merge_depth = ctx.merge_depth - 1
-	const Iarch rt = ctx.next
-	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${rt} =l loadl ${slot}\n")
 
 	return "%t${rt}"
 }
@@ -6623,15 +6598,9 @@ const emit_func! = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 		return 0
 	}
 	write_str(ctx.fd, "@start\n")
-	# The merge-slot POOL (one alloc, at @start where QBE demands allocs live). `if...then...else`,
-	# `&&` and `||` value-expressions merge their arms through a stack slot; drawing that slot from
-	# this pool (indexed by nesting depth, see `emit_if!`/`emit_logical!`) instead of a fresh
-	# `alloc` at the use site is what keeps them from leaking the stack every iteration of a loop —
-	# a per-site alloc inside a loop body emits a bare `sub sp` that is never restored. 64 slots is
-	# far past any real expression nesting; `emit_if!`/`emit_logical!` die if it is exceeded.
-	write_str(ctx.fd, "\t%mpool =l alloc8 512\n")
-	ctx.merge_depth = 0
-	# The LOCAL-slot POOL — same idea for named `let`/`const` locals. A word/pointer local's cell was
+	# (`if`/`&&`/`||` value merges need no pool: they merge through a shared TEMP assigned in each
+	# branch — see `emit_if!` — so nothing here is allocated for them.)
+	# The LOCAL-slot POOL. A word/pointer local's cell was
 	# `alloc8`'d at its declaration; when that declaration sits in a loop body the alloc is a per-
 	# iteration `sub sp` that never unwinds. Instead every local's cell is `%lpool + slot*8`, and
 	# `emit_block!` rewinds `ctx.local_slot` on scope exit so a loop body reuses the same slots each
@@ -7629,7 +7598,6 @@ pub const emit_program! = (
 				fmints: mts,
 				slits: slt,
 				mat_geom: mat_geom_of(mat_names, mat_geoms, prog.funcs[i].name),
-				merge_depth: 0,
 				local_slot: 0,
 				skip_embeds: skip_embeds,
 				build_version: build_version,
