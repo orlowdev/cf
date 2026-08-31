@@ -512,6 +512,7 @@ const init_result! = (): Json -> Json.Obj([
 			ent("save", Json.Bool(true)),
 		])),
 		ent("documentSymbolProvider", Json.Bool(true)),
+		ent("workspaceSymbolProvider", Json.Bool(true)),
 		ent("definitionProvider", Json.Bool(true)),
 		ent("hoverProvider", Json.Bool(true)),
 		ent("referencesProvider", Json.Bool(true)),
@@ -1852,9 +1853,13 @@ const case_matches = (Str old, Str nn): Bool -> {
 	return (ou && nu) || (!ou && !nu)
 }
 
-# The reference rows of the local binding under (uri, l0, c0) — the shared front of
-# references and rename. Empty when the position holds no local.
-const rows_at! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, Iarch c0): [SymRow] -> {
+# The highlight rows of the binding under (uri, l0, c0), all in the one file: a local's
+# rows when the local path answers, else the file's OWN occurrences of the name — one
+# `uses` child over just this file plus its decl-line/member rows. Highlighting is
+# read-only, so the pub/uniqueness/alias gates a rename needs do not apply: a pub name, an
+# imported one, and a qualified use all light up their same-document occurrences (a partial
+# view cannot corrupt anything). Empty on a broken buffer or an empty position.
+const hl_rows! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, Iarch c0): [SymRow] -> {
 	const [SymRow] none = []
 	if !starts_with("file://", uri) then return none
 	const Str path = uri_to_path!(uri)
@@ -1880,8 +1885,71 @@ const rows_at! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, I
 	if l0 < 0 || l0 >= Iarch(lines.len) then return none
 	const TokCtx t = token_at(lines[l0], c0)
 	if !t.ok then return none
+	let TokCtx tq = t
 
-	return local_refs!(argv0, env, path, overlay, lines, l0, t)
+	# a cursor on a union member's own declaration highlights the member (see deep_rows!)
+	if bare_token(t) && Iarch(t.name[0]) >= 65 && Iarch(t.name[0]) <= 90 then {
+		const Str ub = member_decl_union!(path, overlay, lines, l0, t.ts)
+
+		if Iarch(ub.len) > 0 then
+			tq = TokCtx({ ok: true, name: t.name, hints: t.hints, lead: t.lead, ts: t.ts, te: t.te, base: ub })
+	}
+
+	const [SymRow] lrows = local_refs!(argv0, env, path, overlay, lines, l0, tq)
+	if Iarch(lrows.len) > 0 then return lrows
+
+	# the own-occurrences fallback: decl rows first (no gates), then the file's verified uses
+	let [SymRow] rows = []
+	let Str cname = tq.name
+
+	if Iarch(tq.base.len) > 0 then {
+		cname = "${tq.base}.${tq.name}"
+		let Str mowner = ""
+		if Iarch(overlay.len) > 0 then mowner = path
+		const [Str] one = [path]
+
+		for m in union_members!(one, mowner, overlay, tq.base) {
+			if eq(m.sname, tq.name) then rows = [...rows, m]
+		}
+	} else {
+		let Iarch li = 0
+
+		for ln in lines {
+			const DeclLine d = scan_decl(ln)
+
+			if d.kind != 0 && eq(slice(d.ns, d.ne, ln), tq.name) then {
+				rows = [...rows, SymRow({
+					sname: tq.name,
+					kind: 13,
+					file: path,
+					line: li,
+					ns: d.ns,
+					ne: d.ne,
+				})]
+			}
+
+			li = li + 1
+		}
+
+		for ar in alias_target_rows(lines, path, tq.name) {
+			rows = [...rows, ar]
+		}
+	}
+
+	const UsesOut u = uses_file_rows!(argv0, env, path, owner, srcf, cname, tq.name)
+	if !u.ok then return none
+
+	for r in u.rows {
+		let Bool dup = false
+
+		for x in rows {
+			if x.line == r.line && x.ns == r.ns then dup = true
+		}
+
+		if !dup then rows = [...rows, r]
+	}
+
+	return rows
 }
 
 # A per-file `uses` child outcome: `ok` false when the file's parse died (a mid-edit break —
@@ -1948,10 +2016,11 @@ const ws_modules! = (Str argv0, [Str] env, Str w): WsMods -> {
 	return WsMods({ ok: true, mods: mods })
 }
 
-# One `cf lsp uses` child over a WORKSPACE file `f` — a file outside the checked file's
-# module tree, always read from disk (the overlay's owner is a tree file by construction).
-# Candidate positions verify against the file's own text, like `uses_all_rows!`.
-const uses_file_rows! = (Str argv0, [Str] env, Str f, Str cname, Str vname): UsesOut -> {
+# One `cf lsp uses` child over a single file `f` — a workspace file outside the checked
+# file's module tree (read from disk: `owner` empty), or the checked file itself (the
+# documentHighlight backend — `srcf` overlays when `owner` is `f`). Candidate positions
+# verify against the file's own text, like `uses_all_rows!`.
+const uses_file_rows! = (Str argv0, [Str] env, Str f, Str owner, Str srcf, Str cname, Str vname): UsesOut -> {
 	const [SymRow] none = []
 
 	const Str sh = match find_executable!(env, "sh") {
@@ -1961,7 +2030,9 @@ const uses_file_rows! = (Str argv0, [Str] env, Str f, Str cname, Str vname): Use
 
 	if eq(sh, "") then return UsesOut({ ok: false, rows: none })
 	const Str tmp = "/tmp/cf-lsp-${getpid()}.uses"
-	const Str cmd = "'${argv0}' lsp uses '${f}' '${cname}' > '${tmp}' 2> /dev/null"
+	let Str ov = ""
+	if eq(owner, f) then ov = " --src '${srcf}'"
+	const Str cmd = "'${argv0}' lsp uses '${f}' '${cname}'${ov} > '${tmp}' 2> /dev/null"
 	const Iarch rc = run!(sh, ["sh", "-c", cmd], env)
 
 	const Str got = match read_file!(tmp) {
@@ -1971,7 +2042,7 @@ const uses_file_rows! = (Str argv0, [Str] env, Str f, Str cname, Str vname): Use
 
 	remove(tmp)
 	if rc != 0 then return UsesOut({ ok: false, rows: none })
-	const [Str] flines = split("\n", src_of!(f, "", ""))
+	const [Str] flines = split("\n", src_of!(f, owner, srcf))
 	let [SymRow] rows = []
 
 	for lref in split("\n", got) {
@@ -2199,7 +2270,7 @@ const pub_rows! = (Str argv0, [Str] env, Str path, Str srcf, Str srcp, Str overl
 							}
 						}
 
-						const UsesOut wu = uses_file_rows!(argv0, env, w, cname, t.name)
+						const UsesOut wu = uses_file_rows!(argv0, env, w, "", "", cname, t.name)
 						if !wu.ok then return none
 
 						for r in wu.rows {
@@ -2397,11 +2468,12 @@ const prepare_rename! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarc
 	])
 }
 
-# Answer textDocument/documentHighlight: every reference of the binding under the cursor,
-# lit up in this one file — the binder as a Write highlight (kind 3), each use as a Read
-# (kind 2). The same rows references answers with; Null when the position holds none.
+# Answer textDocument/documentHighlight: every occurrence of the binding under the cursor,
+# lit up in this one file — the binder/declaration as a Write highlight (kind 3), each use
+# as a Read (kind 2). Locals answer from their event replay; anything else (a pub name, an
+# imported one, a qualified use) from the file's own uses scan. Null when nothing is there.
 const highlights! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, Iarch c0): Json -> {
-	const [SymRow] rows = rows_at!(argv0, env, uri, srcf, srcp, l0, c0)
+	const [SymRow] rows = hl_rows!(argv0, env, uri, srcf, srcp, l0, c0)
 	if Iarch(rows.len) == 0 then return Json.Null
 	let [Json] hs = []
 	let Iarch ri = 0
@@ -2700,6 +2772,84 @@ const completions! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l
 	return Json.Arr(items)
 }
 
+# ASCII case-insensitive `needle in hay` — the workspace/symbol query filter (pickers type
+# lowercase; declaration names are mixed-case). An empty needle matches everything.
+const contains_ci = (Str needle, Str hay): Bool -> {
+	if Iarch(needle.len) == 0 then return true
+	let Iarch i = 0
+
+	loop {
+		if i + Iarch(needle.len) > Iarch(hay.len) then break
+		let Bool okm = true
+		let Iarch j = 0
+
+		loop {
+			if j >= Iarch(needle.len) then break
+			let Iarch a = Iarch(hay[i + j])
+			let Iarch b = Iarch(needle[j])
+			if a >= 65 && a <= 90 then a = a + 32
+			if b >= 65 && b <= 90 then b = b + 32
+
+			if a != b then {
+				okm = false
+				break
+			}
+
+			j = j + 1
+		}
+
+		if okm then return true
+		i = i + 1
+	}
+
+	return false
+}
+
+# Answer workspace/symbol: every top-level declaration across the workspace whose name
+# matches the query (case-insensitive substring; empty lists all), capped at 200 — the
+# picker narrows with further keystrokes. The same decl-line scan the documentSymbol
+# outline trusts, over the $PWD walk.
+const ws_symbols! = ([Str] env, Str query): Json -> {
+	let [Json] items = []
+	const Str pwd = getenv!(env, "PWD")
+	if Iarch(pwd.len) == 0 then return Json.Arr(items)
+
+	for f in walk_cf!(czstr!(pwd)) {
+		if Iarch(items.len) < 200 then {
+			const Str text = match read_file!(f) {
+				Either.Right(s) -> s,
+				Either.Left(e) -> "",
+			}
+
+			const [Str] flines = split("\n", text)
+			let Iarch li = 0
+
+			for ln in flines {
+				const DeclLine d = scan_decl(ln)
+
+				if d.kind != 0 && Iarch(items.len) < 200 then {
+					const Str nm = slice(d.ns, d.ne, ln)
+
+					if contains_ci(query, nm) then {
+						items = [...items, Json.Obj([
+							ent("name", jstr(nm)),
+							ent("kind", jnum(d.kind)),
+							ent("location", Json.Obj([
+								ent("uri", jstr(path_uri!(f))),
+								ent("range", jrange!(li, d.ns, d.ne)),
+							])),
+						])]
+					}
+				}
+
+				li = li + 1
+			}
+		}
+	}
+
+	return Json.Arr(items)
+}
+
 # --- the loop ---------------------------------------------------------------------------------
 
 # Handle one frame; returns 1 to keep serving, 0 on EOF/exit.
@@ -2770,6 +2920,11 @@ const serve_one! = (Str argv0, [Str] env): Iarch -> {
 			write_file(srcp, uri_to_path!(uri))
 			check_and_publish!(argv0, env, uri, srcf)
 		}
+
+		return 1
+	}
+	if eq(method, "workspace/symbol") then {
+		respond!(id, ws_symbols!(env, jtext(jget("query", jget("params", req)))))
 
 		return 1
 	}
