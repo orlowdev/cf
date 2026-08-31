@@ -514,6 +514,8 @@ const init_result! = (): Json -> Json.Obj([
 		ent("documentSymbolProvider", Json.Bool(true)),
 		ent("definitionProvider", Json.Bool(true)),
 		ent("hoverProvider", Json.Bool(true)),
+		ent("referencesProvider", Json.Bool(true)),
+		ent("renameProvider", Json.Bool(true)),
 		ent("completionProvider", Json.Obj([
 			ent("triggerCharacters", Json.Arr([jstr(":"), jstr(".")])),
 		])),
@@ -1134,24 +1136,22 @@ const cprefix = (Str ln, Iarch c0): TokCtx -> {
 # list without a second child run).
 data DefOut = { [SymRow] hits, [Str] mods }
 
-# The LOCAL binding of the token under the cursor, via a `cf lsp def` child run: the parser's
-# bind-event log replayed at the cursor's byte offset resolves parameters, `let`/`const`
-# locals, `for` binders, and match payload binds to their binder token. `line` is -1 when no
-# local binds the name — the caller falls back to the top-level declaration index. Only a
-# bare lowercase token can be a local (a qualified or `Type.`-based one never is), so others
-# skip the child entirely.
-const local_def! = (Str argv0, [Str] env, Str path, Str overlay, [Str] lines, Iarch l0, TokCtx t): SymRow -> {
-	const SymRow miss = SymRow({ sname: "", kind: 0, file: "", line: -1, ns: 0, ne: 0 })
-	if Iarch(t.hints.len) > 0 || Iarch(t.base.len) > 0 then return miss
+# Run the `cf lsp <verb>` local-binding child (`def` or `refs`) for the token at the cursor
+# and return its raw stdout — "" when the token cannot be a local (qualified, `Type.`-based,
+# or uppercase), the child fails, or nothing binds. The parser's bind-event log replayed at
+# the cursor's byte offset resolves parameters, `let`/`const` locals, `for` binders, and
+# match payload binds; the shared front half of goto/hover and references/rename.
+const local_out! = (Str argv0, [Str] env, Str path, Str overlay, [Str] lines, Iarch l0, TokCtx t, Str verb): Str -> {
+	if Iarch(t.hints.len) > 0 || Iarch(t.base.len) > 0 then return ""
 	const Iarch b0 = Iarch(t.name[0])
-	if b0 >= 65 && b0 <= 90 then return miss
+	if b0 >= 65 && b0 <= 90 then return ""
 
 	const Str sh = match find_executable!(env, "sh") {
 		Either.Right(p) -> p,
 		Either.Left(e) -> "",
 	}
 
-	if eq(sh, "") then return miss
+	if eq(sh, "") then return ""
 	# the token's byte offset in the (possibly overlaid) buffer the lines came from
 	let Iarch off = t.ts
 	let Iarch li = 0
@@ -1163,9 +1163,9 @@ const local_def! = (Str argv0, [Str] env, Str path, Str overlay, [Str] lines, Ia
 	}
 
 	const Str tmp = "/tmp/cf-lsp-${getpid()}.def"
-	let Str cmd = "'${argv0}' lsp def '${path}' ${off} '${t.name}' > '${tmp}' 2> /dev/null"
+	let Str cmd = "'${argv0}' lsp ${verb} '${path}' ${off} '${t.name}' > '${tmp}' 2> /dev/null"
 	if Iarch(overlay.len) > 0
-		then cmd = "'${argv0}' lsp def '${path}' ${off} '${t.name}' --src '${overlay}' > '${tmp}' 2> /dev/null"
+		then cmd = "'${argv0}' lsp ${verb} '${path}' ${off} '${t.name}' --src '${overlay}' > '${tmp}' 2> /dev/null"
 	const Iarch rc = run!(sh, ["sh", "-c", cmd], env)
 
 	let Str got = ""
@@ -1178,22 +1178,52 @@ const local_def! = (Str argv0, [Str] env, Str path, Str overlay, [Str] lines, Ia
 	}
 
 	remove(tmp)
-	const Iarch nl = index_of("\n", got)
-	if nl > 0 then got = slice(0, nl, got)
-	const Iarch co = index_of(":", got)
+
+	return got
+}
+
+# One `line:col` output line as a reference row of the cursor's name in `path` (0-based, the
+# name's span), or line -1 on anything else.
+const ref_row = (Str lref, Str path, Str name): SymRow -> {
+	const SymRow miss = SymRow({ sname: "", kind: 0, file: "", line: -1, ns: 0, ne: 0 })
+	const Iarch co = index_of(":", lref)
 	if co <= 0 then return miss
-	const Iarch bl = to_int(slice(0, co, got))
-	const Iarch bc = to_int(slice(co + 1, Iarch(got.len), got))
+	const Iarch bl = to_int(slice(0, co, lref))
+	const Iarch bc = to_int(slice(co + 1, Iarch(lref.len), lref))
 	if bl <= 0 || bc <= 0 then return miss
 
 	return SymRow({
-		sname: t.name,
+		sname: name,
 		kind: 13,
 		file: path,
 		line: bl - 1,
 		ns: bc - 1,
-		ne: bc - 1 + Iarch(t.name.len),
+		ne: bc - 1 + Iarch(name.len),
 	})
+}
+
+# The LOCAL binding of the token under the cursor, via a `cf lsp def` child run. `line` is -1
+# when no local binds the name — the caller falls back to the top-level declaration index.
+const local_def! = (Str argv0, [Str] env, Str path, Str overlay, [Str] lines, Iarch l0, TokCtx t): SymRow -> {
+	let Str got = local_out!(argv0, env, path, overlay, lines, l0, t, "def")
+	const Iarch nl = index_of("\n", got)
+	if nl > 0 then got = slice(0, nl, got)
+
+	return ref_row(got, path, t.name)
+}
+
+# Every reference of the LOCAL binding under the cursor — the binder row FIRST (the child
+# prints it first), then each use in source order. Empty when the token is no local.
+const local_refs! = (Str argv0, [Str] env, Str path, Str overlay, [Str] lines, Iarch l0, TokCtx t): [SymRow] -> {
+	const Str got = local_out!(argv0, env, path, overlay, lines, l0, t, "refs")
+	let [SymRow] rows = []
+
+	for lref in split("\n", got) {
+		const SymRow r = ref_row(lref, path, t.name)
+		if r.line >= 0 then rows = [...rows, r]
+	}
+
+	return rows
 }
 
 # Resolve a decomposed token to its definitions: a `Type.` base tries the union's members
@@ -1319,6 +1349,98 @@ const goto_def! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, 
 	}
 
 	return Json.Arr(locs)
+}
+
+# A plain lowercase identifier — what a local may be renamed to: `[a-z_]` then
+# `[a-zA-Z0-9_]*`. No `!`/`'` — the alloc marker and a type variable's tick are not the
+# editor's to mint.
+const ident_ok = (Str s): Bool -> {
+	if Iarch(s.len) == 0 then return false
+	const Iarch b0 = Iarch(s[0])
+	if !((b0 >= 97 && b0 <= 122) || b0 == 95) then return false
+	let Iarch i = 1
+
+	loop {
+		if i >= Iarch(s.len) then break
+		const Iarch b = Iarch(s[i])
+		if !((b >= 97 && b <= 122) || (b >= 65 && b <= 90) || (b >= 48 && b <= 57) || b == 95)
+			then return false
+		i = i + 1
+	}
+
+	return true
+}
+
+# The reference rows of the local binding under (uri, l0, c0) — the shared front of
+# references and rename. Empty when the position holds no local.
+const rows_at! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, Iarch c0): [SymRow] -> {
+	const [SymRow] none = []
+	if !starts_with("file://", uri) then return none
+	const Str path = uri_to_path!(uri)
+
+	let Str from = path
+	let Str overlay = ""
+	const Str owner = match read_file!(srcp) {
+		Either.Right(s) -> s,
+		Either.Left(e) -> "",
+	}
+
+	if eq(owner, path) then {
+		from = srcf
+		overlay = srcf
+	}
+
+	const Str text = match read_file!(from) {
+		Either.Right(s) -> s,
+		Either.Left(e) -> "",
+	}
+
+	const [Str] lines = split("\n", text)
+	if l0 < 0 || l0 >= Iarch(lines.len) then return none
+	const TokCtx t = token_at(lines[l0], c0)
+	if !t.ok then return none
+
+	return local_refs!(argv0, env, path, overlay, lines, l0, t)
+}
+
+# Answer textDocument/references: every reference of the LOCAL binding under the cursor —
+# all in this one file. The binder row is the declaration; it is dropped when the client set
+# includeDeclaration off. Null for anything that is not a local: a top-level name's uses
+# cross module files, and a partial list would mislead.
+const references! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, Iarch c0, Bool incl): Json -> {
+	const [SymRow] rows = rows_at!(argv0, env, uri, srcf, srcp, l0, c0)
+	if Iarch(rows.len) == 0 then return Json.Null
+	const Str path = uri_to_path!(uri)
+	let [Json] locs = []
+	let Iarch ri = 0
+
+	for r in rows {
+		if incl || ri > 0 then locs = [...locs, location!(uri, path, r.file, r.line, r.ns, r.ne)]
+		ri = ri + 1
+	}
+
+	return Json.Arr(locs)
+}
+
+# Answer textDocument/rename: a WorkspaceEdit renaming every reference of the LOCAL binding
+# under the cursor to `nn`. Null when the position is no local (see references) or the new
+# name is no plain identifier — better no edit than a corrupting one. No conflict check
+# against a like-named binding in an overlapping scope: the resulting clash is cf's checker's
+# to report, and the editor previews the edits.
+const rename! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, Iarch c0, Str nn): Json -> {
+	if !ident_ok(nn) then return Json.Null
+	const [SymRow] rows = rows_at!(argv0, env, uri, srcf, srcp, l0, c0)
+	if Iarch(rows.len) == 0 then return Json.Null
+	let [Json] edits = []
+
+	for r in rows {
+		edits = [...edits, Json.Obj([
+			ent("range", jrange!(r.line, r.ns, r.ne)),
+			ent("newText", jstr(nn)),
+		])]
+	}
+
+	return Json.Obj([ent("changes", Json.Obj([ent(uri, Json.Arr(edits))]))])
 }
 
 # The LAST occurrence of `needle` in `s`, or -1.
@@ -1703,6 +1825,41 @@ const serve_one! = (Str argv0, [Str] env): Iarch -> {
 
 		if Iarch(uri.len) > 0 && pl >= 0 && pc >= 0 then {
 			respond!(id, completions!(argv0, env, uri, srcf, srcp, pl, pc))
+		} else {
+			respond!(id, Json.Null)
+		}
+
+		return 1
+	}
+	if eq(method, "textDocument/references") then {
+		const Str uri = jtext(jget("uri", jget("textDocument", jget("params", req))))
+		const Json pos = jget("position", jget("params", req))
+		const Iarch pl = jint(jget("line", pos))
+		const Iarch pc = jint(jget("character", pos))
+		# absent context.includeDeclaration means include (a reference list without its
+		# declaration is the rarer ask)
+		const Bool incl = match jget("includeDeclaration", jget("context", jget("params", req))) {
+			Json.Bool(b) -> b,
+			_ -> true,
+		}
+
+		if Iarch(uri.len) > 0 && pl >= 0 && pc >= 0 then {
+			respond!(id, references!(argv0, env, uri, srcf, srcp, pl, pc, incl))
+		} else {
+			respond!(id, Json.Null)
+		}
+
+		return 1
+	}
+	if eq(method, "textDocument/rename") then {
+		const Str uri = jtext(jget("uri", jget("textDocument", jget("params", req))))
+		const Json pos = jget("position", jget("params", req))
+		const Iarch pl = jint(jget("line", pos))
+		const Iarch pc = jint(jget("character", pos))
+		const Str nn = jtext(jget("newName", jget("params", req)))
+
+		if Iarch(uri.len) > 0 && pl >= 0 && pc >= 0 then {
+			respond!(id, rename!(argv0, env, uri, srcf, srcp, pl, pc, nn))
 		} else {
 			respond!(id, Json.Null)
 		}
