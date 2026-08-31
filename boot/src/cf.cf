@@ -18,7 +18,8 @@ import cli::{ Cli, cli_parse!, FmtCli, is_fmt_cmd, fmt_cli_parse, is_version_cmd
 import std::compiler::buildinfo::{ compiler_version }
 import fmt::{ format_file! }
 import docs::{ docs_run! }
-import std::compiler::{ compile! }
+import lsp::{ lsp_run! }
+import std::compiler::{ compile!, check! }
 import std::compiler::diag::{ Diag, print_diags! }
 import std::mem::arena::growing_arena
 import qbe::{ qbe_translate }
@@ -197,6 +198,19 @@ const link_linux! = (
 	return lr
 }
 
+# `cf check`: validate one module tree, print every located diagnostic, exit 1 on any.
+const run_check! = (Str input): Iarch -> {
+	const [Diag] ds = check!(input, Os.Darwin, Arch.Arm64, 1048576)
+
+	if Iarch(ds.len) > 0 then {
+		print_diags!(ds)
+
+		return 1
+	}
+
+	return 0
+}
+
 # The self-contained pipeline: compile the program to IL + floor (temp files), run the embedded QBE
 # on the IL, spawn the host toolchain to assemble+link, then clean up (unless `-P`). darwin links a
 # Mach-O with `cc`; `Bare` and `Linux` cross-assemble + link a freestanding ELF with `clang`/`ld.lld`
@@ -302,6 +316,21 @@ pub const main = ([Str] args, [Str] env) -> {
 		const FmtCli fc = fmt_cli_parse(args) in fa
 
 		return format_file!(fc.path, fc.check) in fa
+	}
+
+	# `cf check <input.cf>` — the full validation pipeline, no output: located diagnostics on
+	# stderr, exit 1 on any. The LSP server's per-request worker, and a fast editor loop.
+	if Iarch(args.len) >= 3 && eq(args[1], "check") then {
+		const ka = growing_arena::of(16777216)
+
+		return run_check!(args[2]) in ka
+	}
+
+	# `cf lsp` — the Language Server Protocol server over stdio (lsp.cf).
+	if Iarch(args.len) >= 2 && eq(args[1], "lsp") then {
+		const sa = growing_arena::of(16777216)
+
+		return lsp_run!(args, env) in sa
 	}
 
 	# `cf docs [<term>]` — browse the standard-library API interactively (docs.cf).

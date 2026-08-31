@@ -1,0 +1,281 @@
+# cf lsp — a Language Server Protocol server over stdio, M0: initialize/shutdown lifecycle
+# and diagnostics on open/save. Each check runs `cf check <file>` in a CHILD process (this
+# very binary re-invoked), so a fail-fast front-end die (a parse error mid-edit) never takes
+# the server down; the child's located `path:line:col: msg` lines come back on a captured
+# stderr and turn into `publishDiagnostics`. Positions are negotiated `positionEncoding:
+# "utf-8"` (cf's columns are bytes), lines/columns shift to LSP's 0-base. Each frame is
+# handled in its OWN arena, reclaimed wholesale — the server's memory stays flat.
+
+import std::data::str::{ eq, starts_with, slice, index_of, split }
+import std::data::{ Either, Maybe }
+import std::data::json::{ Json, JsonEntry, parse!, render!, get }
+import std::io::file::{ read, write_str, read_file! }
+import std::io::fd::{ Fd, stdin, stdout }
+import std::io::fs::{ remove }
+import std::process::{ run!, find_executable!, getpid, exit }
+import std::io::console::{ eprint }
+import std::mem::arena::growing_arena
+
+# --- transport --------------------------------------------------------------------------------
+
+# One byte off stdin, or -1 at EOF.
+const read_byte! = (): Iarch -> {
+	let [1 Uint8] b
+
+	return match read(stdin(), b, Uarch(1)) {
+		Either.Right(n) -> if n == 1 then Iarch(b[0]) else -1,
+		Either.Left(e) -> -1,
+	}
+}
+
+const to_int = (Str s): Iarch -> {
+	let Iarch v = 0
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(s.len) then break
+		const Iarch c = Iarch(s[i])
+		if c < 48 || c > 57 then break
+		v = v * 10 + (c - 48)
+		i = i + 1
+	}
+
+	return v
+}
+
+# Read the header block (bytes up to the blank line) and return the Content-Length, or -1 at
+# EOF. Headers are ASCII lines `Name: value\r\n`.
+const read_content_length! = (): Iarch -> {
+	let [Uint8] hdr = []
+	let Iarch run = 0
+
+	loop {
+		const Iarch c = read_byte!()
+		if c < 0 then return -1
+		hdr = [...hdr, Uint8(c)]
+		if c == 13 || c == 10 then run = run + 1 else run = 0
+		if run == 4 then break
+	}
+
+	const Str h = Str(hdr)
+	const Iarch at = index_of("Content-Length:", h)
+	if at < 0 then return -1
+
+	return to_int(slice(at + 15 + 1, Iarch(h.len), h))
+}
+
+# Read exactly `n` body bytes (looping over short reads).
+const read_body! = (Iarch n): Str -> {
+	let [Uint8] out = []
+	let [65536 Uint8] buf
+	let Iarch got = 0
+
+	loop {
+		if got >= n then break
+		let Uarch want = Uarch(65536)
+		if n - got < 65536 then want = Uarch(n - got)
+		const Iarch k = match read(stdin(), buf, want) {
+			Either.Right(kk) -> kk,
+			Either.Left(e) -> -1,
+		}
+
+		if k <= 0 then break
+		let Iarch i = 0
+
+		loop {
+			if i >= k then break
+			out = [...out, buf[i]]
+			i = i + 1
+		}
+
+		got = got + k
+	}
+
+	return Str(out)
+}
+
+# Send one message: the compact JSON body behind its Content-Length header.
+const send! = (Json msg): () -> {
+	const Str body = render!(msg)
+	const Iarch n = Iarch(body.len)
+
+	write_str(stdout(), "Content-Length: ${n}\r\n\r\n")
+	write_str(stdout(), body)
+}
+
+# --- json shorthands --------------------------------------------------------------------------
+
+const jstr = (Str s): Json -> Json.Str(s)
+
+const jnum = (Iarch n): Json -> Json.Num("${n}")
+
+const ent = (Str k, Json v): JsonEntry -> JsonEntry({ key: k, val: v })
+
+const jget = (Str k, Json j): Json -> match get(k, j) {
+	Maybe.Just(v) -> v,
+	Maybe.Nothing -> Json.Null,
+}
+
+const jtext = (Json j): Str -> match j { Json.Str(s) -> s, _ -> "" }
+
+# A response carrying `result` for request `id` (the id is echoed back as parsed).
+const respond! = (Json id, Json result): () ->
+	send!(Json.Obj([
+		ent("jsonrpc", jstr("2.0")),
+		ent("id", id),
+		ent("result", result),
+	]))
+
+const respond_err! = (Json id, Iarch code, Str msg): () ->
+	send!(Json.Obj([
+		ent("jsonrpc", jstr("2.0")),
+		ent("id", id),
+		ent("error", Json.Obj([ent("code", jnum(code)), ent("message", jstr(msg))])),
+	]))
+
+# --- diagnostics ------------------------------------------------------------------------------
+
+# One `path:line:col: msg` line into an LSP diagnostic at the (0-based) position; a line that
+# does not carry the checked file's prefix lands at 0:0 with its full text (nothing is lost).
+const diag_of! = (Str path, Str line): Json -> {
+	let Iarch l0 = 0
+	let Iarch c0 = 0
+	let Str msg = line
+
+	if starts_with("${path}:", line) then {
+		const Str rest = slice(Iarch(path.len) + 1, Iarch(line.len), line)
+		const [Str] parts = split(":", rest)
+
+		if Iarch(parts.len) >= 3 then {
+			l0 = to_int(parts[0]) - 1
+			c0 = to_int(parts[1]) - 1
+			if l0 < 0 then l0 = 0
+			if c0 < 0 then c0 = 0
+			const Iarch skip = Iarch(parts[0].len) + Iarch(parts[1].len) + 2
+			let Str m = slice(skip, Iarch(rest.len), rest)
+			if starts_with(" ", m) then m = slice(1, Iarch(m.len), m)
+			msg = m
+		}
+	}
+
+	return Json.Obj([
+		ent("range", Json.Obj([
+			ent("start", Json.Obj([ent("line", jnum(l0)), ent("character", jnum(c0))])),
+			ent("end", Json.Obj([ent("line", jnum(l0)), ent("character", jnum(c0 + 1))])),
+		])),
+		ent("severity", jnum(1)),
+		ent("source", jstr("cf")),
+		ent("message", jstr(msg)),
+	])
+}
+
+# Run `cf check` on the uri's file in a child (stderr captured to a temp file), publish the
+# resulting diagnostics — or an empty list, clearing earlier ones, when the check is clean.
+const check_and_publish! = (Str argv0, [Str] env, Str uri): () -> {
+	if !starts_with("file://", uri) then return ()
+	const Str path = slice(7, Iarch(uri.len), uri)
+	const Str tmp = "/tmp/cf-lsp-${getpid()}.diag"
+
+	const Str sh = match find_executable!(env, "sh") {
+		Either.Right(p) -> p,
+		Either.Left(e) -> {
+			eprint("cf lsp: no `sh` on PATH\n")
+
+			<- ""
+		},
+	}
+
+	if eq(sh, "") then return ()
+	const Str cmd = "'${argv0}' check '${path}' 2> '${tmp}'"
+	const Iarch rc = run!(sh, ["sh", "-c", cmd], env)
+	let [Json] diags = []
+
+	if rc != 0 then {
+		const Str captured = match read_file!(tmp) {
+			Either.Right(s) -> s,
+			Either.Left(e) -> "",
+		}
+
+		const [Str] lines = split("\n", captured)
+
+		for ln in lines {
+			if Iarch(ln.len) > 0 then diags = [...diags, diag_of!(path, ln)]
+		}
+	}
+
+	remove(tmp)
+	send!(Json.Obj([
+		ent("jsonrpc", jstr("2.0")),
+		ent("method", jstr("textDocument/publishDiagnostics")),
+		ent("params", Json.Obj([
+			ent("uri", jstr(uri)),
+			ent("diagnostics", Json.Arr(diags)),
+		])),
+	]))
+}
+
+const init_result! = (): Json -> Json.Obj([
+	ent("capabilities", Json.Obj([
+		ent("textDocumentSync", Json.Obj([
+			ent("openClose", Json.Bool(true)),
+			ent("change", jnum(0)),
+			ent("save", Json.Bool(true)),
+		])),
+		ent("positionEncoding", jstr("utf-8")),
+	])),
+	ent("serverInfo", Json.Obj([ent("name", jstr("cf lsp"))])),
+])
+
+# --- the loop ---------------------------------------------------------------------------------
+
+# Handle one frame; returns 1 to keep serving, 0 on EOF/exit.
+const serve_one! = (Str argv0, [Str] env): Iarch -> {
+	const Iarch n = read_content_length!()
+	if n < 0 then return 0
+	const Str body = read_body!(n)
+
+	const Json req = match parse!(body) {
+		Either.Right(v) -> v,
+		Either.Left(e) -> Json.Null,
+	}
+
+	const Str method = jtext(jget("method", req))
+	const Json id = jget("id", req)
+	const Bool is_request = match jget("id", req) { Json.Null -> false, _ -> true }
+
+	if eq(method, "initialize") then {
+		respond!(id, init_result!())
+
+		return 1
+	}
+	if eq(method, "shutdown") then {
+		respond!(id, Json.Null)
+
+		return 1
+	}
+	if eq(method, "exit") then return 0
+	if eq(method, "textDocument/didOpen") || eq(method, "textDocument/didSave") then {
+		const Str uri = jtext(jget("uri", jget("textDocument", jget("params", req))))
+
+		if Iarch(uri.len) > 0 then check_and_publish!(argv0, env, uri)
+
+		return 1
+	}
+	if is_request then respond_err!(id, 0 - 32601, "method not found")
+
+	return 1
+}
+
+# The server: one frame per iteration, each in its own arena reclaimed at once.
+pub const lsp_run! = ([Str] args, [Str] env): Iarch -> {
+	let Iarch alive = 1
+
+	loop {
+		if alive == 0 then break
+		const b = growing_arena::of(4194304)
+		defer growing_arena::destroy(b)
+		alive = serve_one!(args[0], env) in b
+	}
+
+	return 0
+}
