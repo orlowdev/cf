@@ -7,6 +7,8 @@
 ; ---- literals ----------------------------------------------------------------
 (integer) @number
 (float) @number
+; a char literal is an integer in disguise (`'A'` = 65)
+(char) @number
 (boolean) @boolean
 
 (string) @string
@@ -27,6 +29,15 @@
 ; ---- identifiers -------------------------------------------------------------
 (var_name) @variable
 
+; ---- namespaces ---------------------------------------------------------------
+; `::`-path segments — an import's module path, and the namespace prefix of a
+; qualified reference (`str::eq`, `growing_arena::of`) or type (`console::Key`).
+(module_path (var_name) @namespace)
+(module_path (type_name) @namespace)
+(qualified_name (var_name) @namespace . "::")
+(qualified_name (type_name) @namespace . "::")
+(named_type (var_name) @namespace . "::")
+
 ; parameters
 (param (var_name) @variable.parameter)
 (generic_param (var_name) @variable.parameter)
@@ -42,11 +53,13 @@
 (union_member (member_name (type_name) @constructor))
 
 ; ---- functions ---------------------------------------------------------------
-; a call's callee, whether a bare name or a `.`-path method
+; a call's callee, whether a bare name, a `.`-path method, or a `::`-path member
 (call_expression
   (var_name) @function)
 (call_expression
   (field_expression (var_name) @function .))
+(call_expression
+  (qualified_name (var_name) @function .))
 
 ; a PascalCase callee is a construction/cast (`Point(1, 2)`, `Uarch(fd)`)
 (call_expression
@@ -70,6 +83,7 @@
   "type"
   "union"
   "intrinsic"
+  "static"
   "import"
   "as"
   "pub"
@@ -106,7 +120,10 @@
 ] @operator
 
 [ "(" ")" "[" "]" "{" "}" ] @punctuation.bracket
-[ "," ":" ] @punctuation.delimiter
+[ "," ":" "::" ] @punctuation.delimiter
+
+; `import … as *` — the whole-surface wildcard
+(import_declaration "*" @operator)
 
 ; ---- pattern matching --------------------------------------------------------
 (wildcard_pattern) @variable.special

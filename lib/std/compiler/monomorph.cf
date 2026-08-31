@@ -15,8 +15,9 @@
 # variables, and union BOUNDS (`[Color 'T]`) are supported; STRUCTURAL inference (fixing `'T`
 # from INSIDE a `['T]`/tuple parameter) and a tuple-typed type variable are later bricks.
 
-import std::io::console::{ die }
-import std::str::{ eq }
+import std::compiler::diag::{ Diag, DiagBag, record_dg }
+import std::compiler::spans::{ no_maps, unat }
+import std::data::str::{ eq, ends_with }
 import std::compiler::ast::{
 	Expr,
 	Stmt,
@@ -47,6 +48,7 @@ import std::compiler::typecheck::{
 	named_ty,
 	param_ty!,
 	binding_ty!,
+	closure_tfn,
 	arm_bind_env,
 	check_destructure!,
 	dyn_of,
@@ -76,6 +78,20 @@ data MonoCtx = {
 	[RecDecl] crecs,
 	[UnionDecl] cunions,
 	Bool has_gen,
+	# the CURRENTLY-WALKED declaration's source stamp (retargeted as each template / concrete
+	# declaration is processed), so a rejection anywhere below names its enclosing decl
+	Str dfile,
+	Iarch dline,
+	Iarch dcol,
+	# the SINGLE-SLOT latched rejection (first error since the last flush wins — recording is
+	# colorless field stores through the ctx pointer) and the flushed collection the pass
+	# returns; the drivers flush between walk items, one error per declaration/instantiation
+	Bool mhot,
+	Str mefile,
+	Iarch meline,
+	Iarch mecol,
+	Str memsg,
+	[Diag] mdiags,
 }
 
 # The context threaded through a function body: the active type-variable substitution (when
@@ -83,6 +99,73 @@ data MonoCtx = {
 # extended by `let`/match/`for`/destructure binders) and the enclosing function's return type —
 # together everything the shared `type_of` needs to derive an argument's type for inference.
 data MonoEnv = { [Str] tvars, [Str] tvals, [VarTy] venv, Ty ret, [Str] vpnames, [Iarch] vpvals }
+
+# Latch a rejection stamped `path:line:col` at an explicit position (a template's own stamp),
+# first-wins until the driver flushes. Colorless — plain stores through the ctx pointer.
+const mrec_at = (*MonoCtx m, Str file, Iarch line, Iarch col, Str msg): () -> {
+	if m.mhot then return ()
+	m.mhot = true
+	m.mefile = file
+	m.meline = line
+	m.mecol = col
+	m.memsg = msg
+}
+
+# Latch a rejection at the currently-walked declaration (`m`'s stamp). Every recording site
+# RETURNS an inert value immediately after (the variants below), so no code that assumed the
+# old fail-fast divergence runs on — the pass stops after collection anyway (its output is
+# discarded when any diagnostic is present).
+const mrec = (*MonoCtx m, Str msg): () -> mrec_at(m, m.dfile, m.dline, m.dcol, msg)
+
+const mrec_i = (*MonoCtx m, Str msg): Iarch -> {
+	mrec(m, msg)
+
+	return 0
+}
+
+# the NAME flavor: hand back the caller-supplied inert name (an instance key, a callee)
+const mrec_s = (*MonoCtx m, Str msg, Str inert): Str -> {
+	mrec(m, msg)
+
+	return inert
+}
+
+# the EXPR flavor: hand back a caller-supplied in-scope expression
+const mrec_x = (*MonoCtx m, Str msg, Expr inert): Expr -> {
+	mrec(m, msg)
+
+	return inert
+}
+
+const mrec_ty = (*MonoCtx m, Str msg): Ty -> {
+	mrec(m, msg)
+
+	return Ty.TNever
+}
+
+# Move the latched rejection into the collected list, skipping an exact duplicate (a
+# template's error repeats per instantiation). Called by the drivers between walk items.
+const flush_mono = (*MonoCtx m): () -> {
+	if !m.mhot then return ()
+	m.mhot = false
+
+	for d in m.mdiags {
+		if eq(d.file, m.mefile) && d.line == m.meline && d.col == m.mecol && eq(d.msg, m.memsg)
+			then return ()
+	}
+
+	m.mdiags = [
+		...m.mdiags,
+		Diag({ file: m.mefile, line: m.meline, col: m.mecol, msg: m.memsg, what: "" }),
+	]
+}
+
+# Retarget `m`'s current-declaration stamp.
+const set_stamp = (*MonoCtx m, Str df, Iarch dl, Iarch dc): () -> {
+	m.dfile = df
+	m.dline = dl
+	m.dcol = dc
+}
 
 const find_template = ([Func] templates, Str n): Iarch -> {
 	let Iarch i = 0
@@ -161,10 +244,10 @@ const check_bound_list = (*MonoCtx m, [Str] typarams, [Str] tbounds): Iarch -> {
 		if !eq(tbounds[i], "") then {
 			# a TYPE parameter's bound must name a union; a VALUE parameter's type must be Iarch/Uarch
 			if is_tvar(typarams[i]) then {
-				if !is_union_name(m, tbounds[i]) then die("cf: type: a generic bound must name a union\n")
+				if !is_union_name(m, tbounds[i]) then mrec(m, "cf: type: a generic bound must name a union\n")
 			} else {
 				if !eq(tbounds[i], "Iarch") && !eq(tbounds[i], "Uarch")
-					then die("cf: type: a comptime value parameter must be typed Iarch or Uarch\n")
+					then return mrec_i(m, "cf: type: a comptime value parameter must be typed Iarch or Uarch\n")
 			}
 		}
 		i = i + 1
@@ -178,6 +261,7 @@ const check_template_bounds = (*MonoCtx m): Iarch -> {
 
 	loop {
 		if i >= Iarch(m.templates.len) then break
+		set_stamp(m, m.templates[i].dfile, m.templates[i].dline, m.templates[i].dcol)
 		check_bound_list(m, m.templates[i].typarams, m.templates[i].tbounds)
 		i = i + 1
 	}
@@ -186,6 +270,7 @@ const check_template_bounds = (*MonoCtx m): Iarch -> {
 
 	loop {
 		if j >= Iarch(m.rec_templates.len) then break
+		set_stamp(m, m.rec_templates[j].dfile, m.rec_templates[j].dline, m.rec_templates[j].dcol)
 		check_bound_list(m, m.rec_templates[j].typarams, m.rec_templates[j].tbounds)
 		j = j + 1
 	}
@@ -194,6 +279,7 @@ const check_template_bounds = (*MonoCtx m): Iarch -> {
 
 	loop {
 		if k >= Iarch(m.union_templates.len) then break
+		set_stamp(m, m.union_templates[k].dfile, m.union_templates[k].dline, m.union_templates[k].dcol)
 		check_bound_list(m, m.union_templates[k].typarams, m.union_templates[k].tbounds)
 		k = k + 1
 	}
@@ -201,25 +287,12 @@ const check_template_bounds = (*MonoCtx m): Iarch -> {
 	return 0
 }
 
-# Does `n` end with `suf`? (No stdlib string helpers below the compiler yet.)
-const ends_with = (Str n, Str suf): Bool -> {
-	if Iarch(n.len) < Iarch(suf.len) then return false
-	let Iarch i = 0
-
-	loop {
-		if i >= Iarch(suf.len) then break
-		if Iarch(n[Iarch(n.len) - Iarch(suf.len) + i]) != Iarch(suf[i]) then return false
-		i = i + 1
-	}
-
-	return true
-}
-
-# A std geometry module's private name (resolve's FIXED mangle tags "fb"/"fx"/"el"/"pg"): generic fns
+# A std geometry module's private name (resolve's FIXED mangle tags "fb"/"fx"/"el"/"pg"): generic
+# fns
 # under these tags are the value-hook templates the Materialize pass owns — see the template
 # split in mono_program!.
 const geom_hook_tmpl = (Str n): Bool ->
-	ends_with(n, "__fb") || ends_with(n, "__fx") || ends_with(n, "__el") || ends_with(n, "__pg")
+	ends_with("__fb", n) || ends_with("__fx", n) || ends_with("__el", n) || ends_with("__pg", n)
 
 # The member NAMES of a union named `uname` (concrete, or a generic template). Members are the
 # post-spread set (resolve.cf's `expand_unions` runs before this pass, so `...Other` is already
@@ -282,12 +355,14 @@ const str_in = (Str x, [Str] xs): Bool -> {
 #   - reflexive: `arg == b` (a union satisfies its own bound);
 #   - member→union: `arg` is a member of `b` (`Int8 <: Int` — a compose-over leaf);
 #   - union→superunion: `arg` is a union whose members are a SUBSET of `b`'s (`Int <: Number`).
-# Member identity is by NAME. A shared member reaches `b` either by `...spread` or, since compose-over
+# Member identity is by NAME. A shared member reaches `b` either by `...spread` or, since
+# compose-over
 # (§8.1, resolve.cf `compose_member`), by a bare member naming a record/union — the member→union
 # branch below correctly accepts such a compose-over arg (`Circle` satisfying `[Shape 'T]`). The
 # branch is guarded to a NON-union arg so a union named the same as one of `b`'s members routes
 # through the subset check instead, not the member shortcut. Residual laxity: two independently
-# -declared unions with identical member-NAME sets read as sub/supertypes though their inline members
+# -declared unions with identical member-NAME sets read as sub/supertypes though their inline
+# members
 # are (union,name)-scoped distinct — harmless (a bound is a comptime gate, §8.5).
 const bound_satisfied = (*MonoCtx m, Str arg, Str b): Bool -> {
 	if eq(arg, b) then return true
@@ -318,24 +393,26 @@ const check_params = (*MonoCtx m, [Str] typarams, [Str] tbounds, [Str] margs): I
 
 	loop {
 		if i >= Iarch(typarams.len) then break
-		if i >= Iarch(margs.len) then die("cf: type: a generic parameter has no argument\n")
+		if i >= Iarch(margs.len) then return mrec_i(m, "cf: type: a generic parameter has no argument\n")
 		const Str arg = margs[i]
 		if is_tvar(typarams[i]) then {
 			# a TYPE parameter — its argument must be a type (not a value), and satisfy any bound
-			if is_num_arg(arg) then die("cf: type: a comptime value was given where a type is expected\n")
+			if is_num_arg(arg)
+				then return mrec_i(m, "cf: type: a comptime value was given where a type is expected\n")
 			const Str b = tbounds[i]
 			if !eq(b, "") then {
-				if !is_union_name(m, b) then die("cf: type: a generic bound must name a union\n")
+				if !is_union_name(m, b) then return mrec_i(m, "cf: type: a generic bound must name a union\n")
 				if !bound_satisfied(m, arg, b)
-					then die("cf: type: a type argument does not satisfy its bound\n")
+					then return mrec_i(m, "cf: type: a type argument does not satisfy its bound\n")
 			}
 		}
 		if !is_tvar(typarams[i]) then {
 			# a comptime VALUE parameter — its type must be Iarch/Uarch and its argument a value
 			const Str vt = tbounds[i]
 			if !eq(vt, "Iarch") && !eq(vt, "Uarch")
-				then die("cf: type: a comptime value parameter must be typed Iarch or Uarch\n")
-			if !is_num_arg(arg) then die("cf: type: a type was given where a comptime value is expected\n")
+				then return mrec_i(m, "cf: type: a comptime value parameter must be typed Iarch or Uarch\n")
+			if !is_num_arg(arg)
+				then return mrec_i(m, "cf: type: a type was given where a comptime value is expected\n")
 		}
 		i = i + 1
 	}
@@ -346,9 +423,9 @@ const check_params = (*MonoCtx m, [Str] typarams, [Str] tbounds, [Str] margs): I
 # A bare or negated integer literal — a WEAK inference source: it fixes a type variable only
 # when no non-literal argument does, since an integer literal ADOPTS its context's width
 # (`hash(x, 0)` with `x : Uint8` infers `Uint8`, not `Iarch`, from `x`).
-const is_int_lit = (Expr e): Bool -> match e {
+const is_int_lit = (Expr e): Bool -> match unat(e) {
 	Expr.Lit(v) -> true,
-	Expr.Neg(x) -> match x { Expr.Lit(v) -> true, _ -> false },
+	Expr.Neg(x) -> match unat(x) { Expr.Lit(v) -> true, _ -> false },
 	_ -> false,
 }
 
@@ -438,8 +515,9 @@ const subst_tys = ([Str] names, [Str] tvars, [Str] tvals): [Str] -> {
 }
 
 # Substitute type variables inside a tuple's position list — a nested position recurses, a leaf
-# substitutes its name — so a `('T, Iarch)` param/return in a generic instance is concretized.
-const subst_telems = ([TupElem] tels, [Str] tvars, [Str] tvals): [TupElem] -> {
+# MANGLES its name — so a `('T, Iarch)` param/return in a generic instance is concretized, and an
+# APPLICATION leaf (`Maybe['B]` in a fn-type return position) resolves to its registered instance.
+const subst_telems! = (*MonoCtx m, [TupElem] tels, [Str] tvars, [Str] tvals): [TupElem] -> {
 	let [TupElem] out = []
 	let Iarch i = 0
 
@@ -449,12 +527,12 @@ const subst_telems = ([TupElem] tels, [Str] tvars, [Str] tvals): [TupElem] -> {
 		# a nested TUPLE or nested FUNCTION-TYPE position keeps its structure — recurse into `sub` so
 		# a `((A) -> B) -> R` function-type component survives monomorphization (a leaf drops `sub`)
 		if eq(t.name, "$tuple")
-			then out = [...out, TupElem({ name: "$tuple", sub: subst_telems(t.sub, tvars, tvals) })]
+			then out = [...out, TupElem({ name: "$tuple", sub: subst_telems!(m, t.sub, tvars, tvals) })]
 		if eq(t.name, "$fn")
-			then out = [...out, TupElem({ name: "$fn", sub: subst_telems(t.sub, tvars, tvals) })]
+			then out = [...out, TupElem({ name: "$fn", sub: subst_telems!(m, t.sub, tvars, tvals) })]
 		if !eq(t.name, "$tuple") && !eq(t.name, "$fn") then {
 			let [TupElem] none = []
-			out = [...out, TupElem({ name: subst_ty(t.name, tvars, tvals), sub: none })]
+			out = [...out, TupElem({ name: mangle_type!(m, t.name, tvars, tvals), sub: none })]
 		}
 		i = i + 1
 	}
@@ -465,13 +543,13 @@ const subst_telems = ([TupElem] tels, [Str] tvars, [Str] tvals): [TupElem] -> {
 # Substitute across a per-position tuple-type list (a record's `ftelems` / a union member's
 # `ptelems`, one `[TupElem]` per field/payload position), concretizing a `('T, Iarch)` tuple
 # field/payload when a generic record/union is cloned.
-const subst_telemss = ([[TupElem]] tlss, [Str] tvars, [Str] tvals): [[TupElem]] -> {
+const subst_telemss! = (*MonoCtx m, [[TupElem]] tlss, [Str] tvars, [Str] tvals): [[TupElem]] -> {
 	let [[TupElem]] out = []
 	let Iarch i = 0
 
 	loop {
 		if i >= Iarch(tlss.len) then break
-		out = [...out, subst_telems(tlss[i], tvars, tvals)]
+		out = [...out, subst_telems!(m, tlss[i], tvars, tvals)]
 		i = i + 1
 	}
 
@@ -520,7 +598,7 @@ const subst_slot! = (*MonoCtx m, Str name, Str elem, [TupElem] telems, [Str] tva
 		then return TySlot({ name: "$dyn", elem: mangle_type!(m, elem, tvars, tvals), telems: no_tel })
 	# a tuple slot `(...)` — substitute each position (leaves stay scalar; see the later-brick note)
 	if eq(name, "$tuple")
-		then return TySlot({ name: "$tuple", elem: elem, telems: subst_telems(telems, tvars, tvals) })
+		then return TySlot({ name: "$tuple", elem: elem, telems: subst_telems!(m, telems, tvars, tvals) })
 	# a bare name — a type variable here may expand to an ARRAY type
 	const Str bound = subst_ty(name, tvars, tvals)
 	if is_arr_enc(bound)
@@ -534,7 +612,7 @@ const subst_slot! = (*MonoCtx m, Str name, Str elem, [TupElem] telems, [Str] tva
 	return TySlot({
 		name: mangle_type!(m, name, tvars, tvals),
 		elem: subst_ty(elem, tvars, tvals),
-		telems: subst_telems(telems, tvars, tvals),
+		telems: subst_telems!(m, telems, tvars, tvals),
 	})
 }
 
@@ -733,7 +811,7 @@ const check_names_type_apps! = (*MonoCtx m, [Str] names): Iarch -> {
 	loop {
 		if i >= Iarch(names.len) then break
 		if !type_app_ok!(m, names[i])
-			then die("cf: type: a generic type application names a non-generic or undeclared type\n")
+			then mrec(m, "cf: type: a generic type application names a non-generic or undeclared type\n")
 		i = i + 1
 	}
 
@@ -748,6 +826,7 @@ const check_concrete_type_apps! = (*MonoCtx m): Iarch -> {
 
 	loop {
 		if r >= Iarch(m.crecs.len) then break
+		set_stamp(m, m.crecs[r].dfile, m.crecs[r].dline, m.crecs[r].dcol)
 		check_names_type_apps!(m, m.crecs[r].ftypes)
 		r = r + 1
 	}
@@ -756,6 +835,7 @@ const check_concrete_type_apps! = (*MonoCtx m): Iarch -> {
 
 	loop {
 		if u >= Iarch(m.cunions.len) then break
+		set_stamp(m, m.cunions[u].dfile, m.cunions[u].dline, m.cunions[u].dcol)
 		let Iarch mi = 0
 
 		loop {
@@ -771,17 +851,18 @@ const check_concrete_type_apps! = (*MonoCtx m): Iarch -> {
 
 	loop {
 		if f >= Iarch(m.cfuncs.len) then break
+		set_stamp(m, m.cfuncs[f].dfile, m.cfuncs[f].dline, m.cfuncs[f].dcol)
 		let Iarch pi = 0
 
 		loop {
 			if pi >= Iarch(m.cfuncs[f].params.len) then break
 			if !type_app_ok!(m, m.cfuncs[f].params[pi].type_name)
-				then die("cf: type: a generic type application names a non-generic or undeclared type\n")
+				then mrec(m, "cf: type: a generic type application names a non-generic or undeclared type\n")
 			pi = pi + 1
 		}
 
 		if !type_app_ok!(m, m.cfuncs[f].ret_name)
-			then die("cf: type: a generic type application names a non-generic or undeclared type\n")
+			then mrec(m, "cf: type: a generic type application names a non-generic or undeclared type\n")
 		f = f + 1
 	}
 
@@ -793,9 +874,12 @@ const ensure_type_instance! = (*MonoCtx m, Str base, [Str] margs): Str -> {
 	if find_rec_template(m.rec_templates, base) >= 0 then return ensure_rec_instance!(m, base, margs)
 	if find_union_template(m.union_templates, base) >= 0
 		then return ensure_union_instance!(m, base, margs)
-	die("cf: type: a generic type application names a non-generic or undeclared type\n")
 
-	return ""
+	return mrec_s(
+		m,
+		"cf: type: a generic type application names a non-generic or undeclared type\n",
+		base,
+	)
 }
 
 # Ensure the concrete union instance `base[margs]` exists (cloning the template, substituting
@@ -808,7 +892,7 @@ const ensure_union_instance! = (*MonoCtx m, Str base, [Str] margs): Str -> {
 	const Iarch ui = find_union_template(m.union_templates, base)
 	const UnionDecl tmpl = m.union_templates[ui]
 	if Iarch(tmpl.typarams.len) != Iarch(margs.len)
-		then die("cf: type: wrong number of type arguments for a generic type\n")
+		then return mrec_s(m, "cf: type: wrong number of type arguments for a generic type\n", mn)
 	check_params(m, tmpl.typarams, tmpl.tbounds, margs)
 	let [UnionMember] members = []
 	let Iarch mi = 0
@@ -827,7 +911,15 @@ const ensure_union_instance! = (*MonoCtx m, Str base, [Str] margs): Str -> {
 	const [Str] no_tp = []
 	m.union_instances = [
 		...m.union_instances,
-		UnionDecl({ name: mn, members: members, typarams: no_tp, tbounds: no_tp }),
+		UnionDecl({
+			name: mn,
+			members: members,
+			typarams: no_tp,
+			tbounds: no_tp,
+			dfile: tmpl.dfile,
+			dline: tmpl.dline,
+			dcol: tmpl.dcol,
+		}),
 	]
 
 	return mn
@@ -854,10 +946,15 @@ const ensure_rec_instance! = (*MonoCtx m, Str base, [Str] margs): Str -> {
 	if type_key_seen(m, mn) then return mn
 	m.type_keys = [...m.type_keys, mn]  # mark before recursing (a self-referential type terminates)
 	const Iarch ri = find_rec_template(m.rec_templates, base)
-	if ri < 0 then die("cf: type: a generic type application names a non-generic or undeclared type\n")
+	if ri < 0
+		then return mrec_s(
+		m,
+		"cf: type: a generic type application names a non-generic or undeclared type\n",
+		mn,
+	)
 	const RecDecl tmpl = m.rec_templates[ri]
 	if Iarch(tmpl.typarams.len) != Iarch(margs.len)
-		then die("cf: type: wrong number of type arguments for a generic type\n")
+		then return mrec_s(m, "cf: type: wrong number of type arguments for a generic type\n", mn)
 	check_params(m, tmpl.typarams, tmpl.tbounds, margs)
 	const SlotList fs = subst_slots!(m, tmpl.ftypes, tmpl.felems, tmpl.ftelems, tmpl.typarams, margs)
 	const [Str] no_tp = []
@@ -873,6 +970,9 @@ const ensure_rec_instance! = (*MonoCtx m, Str base, [Str] margs): Str -> {
 			typarams: no_tp,
 			tbounds: no_tp,
 			fsizes: tmpl.fsizes,
+			dfile: tmpl.dfile,
+			dline: tmpl.dline,
+			dcol: tmpl.dcol,
 		}),
 	]
 
@@ -961,6 +1061,14 @@ const build_ctx = (*MonoCtx m, Ty ret): Ctx -> Ctx({
 	unions: all_unions(m),
 	frt: ret,
 	frsize: 0,
+	# the CURRENT-DECL stamp rides along, so a shared-helper rejection during inference
+	# (latched via a recording bag) names the declaration being walked, not `:0:0`
+	dfile: m.dfile,
+	dline: m.dline,
+	dcol: m.dcol,
+	# no source tables here — a span offset cannot map, so inference rejections keep the
+	# declaration stamp (line_col_of returns line 0 on an empty table)
+	maps: no_maps(),
 })
 
 # The enclosing function's return type as a `Ty` (for `Ctx.frt`, which `type_of` consults for a
@@ -969,6 +1077,13 @@ const build_ctx = (*MonoCtx m, Ty ret): Ctx -> Ctx({
 const ret_ty = (*MonoCtx m, Str rn, Str re, [TupElem] rtel): Ty -> {
 	if Iarch(rtel.len) > 0 then return Ty.TTuple(rtel)
 	if Iarch(rn.len) == 0 then return Ty.TInt
+	# a `'T` surviving to here means inference could not pin it — say so at the declaration
+	# being walked instead of falling into `named_ty`'s unlocated backstop
+	if Iarch(rn.len) > 0 && Iarch(rn[0]) == 39
+		then return mrec_ty(
+		m,
+		"cf: type: a generic call's type argument could not be inferred — annotate the binding or pass the type argument explicitly\n",
+	)
 
 	return named_ty(rn, re, all_recs(m), all_unions(m))
 }
@@ -1018,6 +1133,9 @@ const mangle_func_sig! = (*MonoCtx m, Func f): Func -> {
 		ret_size: f.ret_size,
 		is_intrinsic: f.is_intrinsic,
 		asm_sym: f.asm_sym,
+		dfile: f.dfile,
+		dline: f.dline,
+		dcol: f.dcol,
 	})
 }
 
@@ -1034,6 +1152,9 @@ const mangle_rec_sig! = (*MonoCtx m, RecDecl r): RecDecl -> {
 		typarams: r.typarams,
 		tbounds: r.tbounds,
 		fsizes: r.fsizes,
+		dfile: r.dfile,
+		dline: r.dline,
+		dcol: r.dcol,
 	})
 }
 
@@ -1057,7 +1178,15 @@ const mangle_union_sig! = (*MonoCtx m, UnionDecl u): UnionDecl -> {
 		i = i + 1
 	}
 
-	return UnionDecl({ name: u.name, members: mem, typarams: u.typarams, tbounds: u.tbounds })
+	return UnionDecl({
+		name: u.name,
+		members: mem,
+		typarams: u.typarams,
+		tbounds: u.tbounds,
+		dfile: u.dfile,
+		dline: u.dline,
+		dcol: u.dcol,
+	})
 }
 
 # Replace the concrete declarations in `m` with their signature-mangled forms (§ above).
@@ -1128,15 +1257,19 @@ const env_bind = (MonoEnv e, Str name, Ty ty): MonoEnv -> MonoEnv({
 # pointer type (no type variable is inferred to one — that structural inference is a later brick).
 const arg_ty! = (*MonoCtx m, Expr e, MonoEnv env): Str -> {
 	if !m.has_gen then return ""
+	let DiagBag fdg = record_dg()
+	const Str r = ty_name(type_of!(e, env.venv, build_ctx(m, env.ret), &fdg))
+	if fdg.hot then mrec_at(m, fdg.file, fdg.line, fdg.col, fdg.msg)
 
-	return ty_name(type_of!(e, env.venv, build_ctx(m, env.ret)))
+	return r
 }
 
 # Infer a generic call's type arguments: for each type variable, a parameter whose declared
 # type IS that variable fixes it to the corresponding argument's type. A variable no parameter
 # mentions (or whose argument type is unknown) cannot be inferred — an error.
 # --- structural type-argument inference -----------------------------------------------------
-# Peel one `[...]` bracket level off a type-name STRING (`"[Iarch]"` → `"Iarch"`, `"[[X]]"` → `"[X]"`);
+# Peel one `[...]` bracket level off a type-name STRING (`"[Iarch]"` → `"Iarch"`, `"[[X]]"` →
+# `"[X]"`);
 # "" if the string does not name a bracketed array.
 const bracket_inner! = (Str s): Str -> {
 	const Iarch n = Iarch(s.len)
@@ -1155,7 +1288,8 @@ const bracket_inner! = (Str s): Str -> {
 	return Str(out)
 }
 
-# Match a `[...]` parameter element STRING `pe` (which mentions the type variable `tv`, possibly under
+# Match a `[...]` parameter element STRING `pe` (which mentions the type variable `tv`, possibly
+# under
 # more brackets) against an argument array's element STRING `ae`, returning what `tv` binds to — or
 # "" if `pe` does not mention `tv` or the array nesting does not line up.
 const infer_from_elem! = (Str tv, Str pe, Str ae): Str -> {
@@ -1231,7 +1365,9 @@ const infer_tyargs! = (*MonoCtx m, Func tmpl, [Expr] args, MonoEnv env): [Str] -
 			const Str pn = tmpl.params[p].type_name
 			const Bool shaped = eq(pn, tv) || eq(pn, "$dyn") || eq(pn, "$tuple")
 			if shaped && p < Iarch(args.len) then {
-				const Ty at = type_of!(args[p], env.venv, build_ctx(m, env.ret))
+				let DiagBag fdg = record_dg()
+				const Ty at = type_of!(args[p], env.venv, build_ctx(m, env.ret), &fdg)
+				if fdg.hot then mrec_at(m, fdg.file, fdg.line, fdg.col, fdg.msg)
 				const Str b = infer_from_param!(tv, tmpl.params[p], at)
 				if !eq(b, "") then {
 					# only a bare integer literal filling the WHOLE `'T` parameter is weak
@@ -1244,7 +1380,8 @@ const infer_tyargs! = (*MonoCtx m, Func tmpl, [Expr] args, MonoEnv env): [Str] -
 
 		let Str bound = strong
 		if eq(bound, "") then bound = weak
-		if eq(bound, "") then die("cf: type: cannot infer a type argument for a generic call\n")
+		if eq(bound, "")
+			then bound = mrec_s(m, "cf: type: cannot infer a type argument for a generic call\n", "Iarch")
 		tvals = [...tvals, bound]
 		t = t + 1
 	}
@@ -1263,7 +1400,7 @@ const ensure_instance! = (*MonoCtx m, Str gname, [Str] tyargs): Str -> {
 	const Iarch ti = find_template(m.templates, gname)
 	const Func tmpl = m.templates[ti]
 	if Iarch(tmpl.typarams.len) != Iarch(tyargs.len)
-		then die("cf: type: a generic call has the wrong number of type arguments\n")
+		then return mrec_s(m, "cf: type: a generic call has the wrong number of type arguments\n", mn)
 	check_params(m, tmpl.typarams, tmpl.tbounds, tyargs)
 	const Func clone = mono_func!(m, tmpl, mn, tmpl.typarams, tyargs)
 	m.instances = [...m.instances, clone]
@@ -1275,10 +1412,17 @@ const ensure_instance! = (*MonoCtx m, Str gname, [Str] tyargs): Str -> {
 # return, local annotations, nested generic call arguments) and its generic calls rewritten to
 # instances. `newname` is the (concrete) result name.
 const mono_func! = (*MonoCtx m, Func f, Str newname, [Str] tvars, [Str] tvals): Func -> {
+	if m.mhot then return f
 	# a declared INTRINSIC passes through untouched: its body is empty (nothing to rewrite) and
 	# its signature may be generic without the template machinery — the env-seeding below would
 	# choke resolving `'T` params it has no substitution for
 	if f.is_intrinsic then return f
+	# rejections below name this declaration (an instance names its template's decl); the
+	# caller's stamp is restored on exit — an instantiation fires mid-walk of another body
+	const Str odf = m.dfile
+	const Iarch odl = m.dline
+	const Iarch odc = m.dcol
+	set_stamp(m, f.dfile, f.dline, f.dcol)
 	# split the parameters: a TYPE parameter (`'T`) drives type substitution; a comptime VALUE
 	# parameter (`n`, its arg an int literal) is FOLDED to its literal in the body — so the two
 	# have distinct machineries (`subst_slot` vs a `Var → Lit` fold threaded on the env).
@@ -1372,6 +1516,7 @@ const mono_func! = (*MonoCtx m, Func f, Str newname, [Str] tvars, [Str] tvals): 
 	})
 	const [Stmt] body = mono_stmts!(m, f.body, env)
 	const [Str] no_tp = []
+	set_stamp(m, odf, odl, odc)
 
 	return Func({
 		name: newname,
@@ -1389,6 +1534,9 @@ const mono_func! = (*MonoCtx m, Func f, Str newname, [Str] tvars, [Str] tvals): 
 		ret_size: f.ret_size,
 		is_intrinsic: f.is_intrinsic,
 		asm_sym: f.asm_sym,
+		dfile: f.dfile,
+		dline: f.dline,
+		dcol: f.dcol,
 	})
 }
 
@@ -1397,7 +1545,10 @@ const mono_func! = (*MonoCtx m, Func f, Str newname, [Str] tvars, [Str] tvals): 
 # argument's result type is knowable), a non-generic one passes through; type args on a
 # non-generic function are an error. Shared by an ordinary call and a `defer`-tap call.
 const mono_callee! = (*MonoCtx m, Str n, [Str] ta, [Expr] margs, MonoEnv env): Str -> {
-	const [Str] rty = subst_tys(ta, env.tvars, env.tvals)
+	# mangle (not just substitute) the explicit type arguments: an APPLICATION argument
+	# (`map[Iarch, Maybe[Iarch]]`) resolves to its registered instance name, so the fn instance's
+	# own mangled name stays bracket-free and its type values are concrete declared types
+	const [Str] rty = mangle_types!(m, ta, env.tvars, env.tvals)
 	const Iarch ti = find_template(m.templates, n)
 	if ti >= 0 then {
 		let [Str] fty = rty
@@ -1405,7 +1556,8 @@ const mono_callee! = (*MonoCtx m, Str n, [Str] ta, [Expr] margs, MonoEnv env): S
 
 		return ensure_instance!(m, n, fty)
 	}
-	if Iarch(rty.len) > 0 then die("cf: type: type arguments on a non-generic function\n")
+	if Iarch(rty.len) > 0
+		then return mrec_s(m, "cf: type: type arguments on a non-generic function\n", n)
 
 	return n
 }
@@ -1444,7 +1596,8 @@ const infer_union_instance! = (*MonoCtx m, Str base, Str mem, [Expr] margs, Mono
 		k = k + 1
 	}
 
-	if mmi < 0 then die("cf: type: a generic union construction names an unknown member\n")
+	if mmi < 0
+		then return mrec_s(m, "cf: type: a generic union construction names an unknown member\n", base)
 	const UnionMember um = tmpl.members[mmi]
 	let [Str] targs = []
 	let Iarch ti = 0
@@ -1463,7 +1616,11 @@ const infer_union_instance! = (*MonoCtx m, Str base, Str mem, [Expr] margs, Mono
 		}
 
 		if eq(bound, "")
-			then die("cf: type: cannot infer a generic union's type argument from its construction\n")
+			then bound = mrec_s(
+			m,
+			"cf: type: cannot infer a generic union's type argument from its construction\n",
+			"Iarch",
+		)
 		targs = [...targs, bound]
 		ti = ti + 1
 	}
@@ -1481,6 +1638,7 @@ const mono_unionmk! = (*MonoCtx m, Str t, Str mem, [Expr] args, MonoEnv env): Ex
 }
 
 const mono_expr! = (*MonoCtx m, Expr e, MonoEnv env): Expr -> match e {
+	Expr.At(o, inner) -> Expr.At(o, mono_expr!(m, inner, env)),
 	Expr.Lit(v) -> Expr.Lit(v),
 	Expr.BoolLit(b) -> Expr.BoolLit(b),
 	Expr.Var(n) -> vp_fold(n, env),
@@ -1492,8 +1650,15 @@ const mono_expr! = (*MonoCtx m, Expr e, MonoEnv env): Expr -> match e {
 	Expr.FieldExpr(b, f) -> Expr.FieldExpr(mono_expr!(m, b, env), f),
 	Expr.UnionMk(t, mem, args) -> mono_unionmk!(m, t, mem, args, env),
 	Expr.Match(scrut, arms) -> mono_match!(m, scrut, arms, env),
+	# the element tag (a `let ['T] out = []` annotation pushed into the literal) substitutes like
+	# any type position — left raw, a generic clone's local array would keep a type-variable element
 	Expr.ArrayLit(hs, sn, elems, et) ->
-		Expr.ArrayLit(hs, mono_expr!(m, sn, env), mono_exprs!(m, elems, env), et),
+		Expr.ArrayLit(
+		hs,
+		mono_expr!(m, sn, env),
+		mono_exprs!(m, elems, env),
+		mangle_type!(m, et, env.tvars, env.tvals),
+	),
 	Expr.Index(a, i) -> Expr.Index(a, mono_expr!(m, i, env)),
 	Expr.IndexField(a, i, f) -> Expr.IndexField(a, mono_expr!(m, i, env), f),
 	Expr.IndexExpr(b, i) -> Expr.IndexExpr(mono_expr!(m, b, env), mono_expr!(m, i, env)),
@@ -1592,11 +1757,14 @@ const arm_env = (*MonoCtx m, Str tn, [Str] members, [Str] binds, MonoEnv env): M
 	if !m.has_gen then return env
 	if eq(tn, "") then return env
 	if Iarch(binds.len) == 0 then return env
+	let DiagBag fdg = record_dg()
+	const [VarTy] nv = arm_bind_env(tn, members, binds, env.venv, build_ctx(m, env.ret), &fdg)
+	if fdg.hot then mrec_at(m, fdg.file, fdg.line, fdg.col, fdg.msg)
 
 	return MonoEnv({
 		tvars: env.tvars,
 		tvals: env.tvals,
-		venv: arm_bind_env(tn, members, binds, env.venv, build_ctx(m, env.ret)),
+		venv: nv,
 		ret: env.ret,
 		vpnames: env.vpnames,
 		vpvals: env.vpvals,
@@ -1628,7 +1796,8 @@ const mono_arms! = (*MonoCtx m, [MatchArm] arms, MonoEnv env, Str scrut_ty): [Ma
 }
 
 # --- numeric type-switch (§8.3/§8.5) --------------------------------------------------------
-# A comptime match over a numeric-bounded `'T`: `match x { Int.Int8(v) -> ..., Int.Int16(v) -> ... }`.
+# A comptime match over a numeric-bounded `'T`: `match x { Int.Int8(v) -> ..., Int.Int16(v) -> ...
+# }`.
 # After the scrutinee monomorphizes to a concrete width, exactly one arm is live (the rest are
 # dead code), so it is RESOLVED here — before typecheck ever sees a match on a non-union scrutinee.
 # A type-switch is detected by an arm naming an intrinsic numeric union (Int/Uint/Number).
@@ -1657,7 +1826,7 @@ const resolve_numeric_typeswitch! = (*MonoCtx m, Expr ms, [MatchArm] arms, Str s
 		const MatchArm a = arms[i]
 		if !a.is_wild && Iarch(a.members.len) > 0 then {
 			if !str_in(a.members[0], numeric_union_members(a.type_name))
-				then die("cf: type: a numeric type-switch arm names a width outside its bound union\n")
+				then mrec(m, "cf: type: a numeric type-switch arm names a width outside its bound union\n")
 		}
 		i = i + 1
 	}
@@ -1679,7 +1848,11 @@ const resolve_numeric_typeswitch! = (*MonoCtx m, Expr ms, [MatchArm] arms, Str s
 	let Iarch sel = mi
 	if sel < 0 then sel = wi
 	if sel < 0
-		then die("cf: type: a numeric type-switch has no arm for the instantiated width and no `_`\n")
+		then return mrec_x(
+		m,
+		"cf: type: a numeric type-switch has no arm for the instantiated width and no `_`\n",
+		ms,
+	)
 	const MatchArm chosen = arms[sel]
 	let Expr body = chosen.body
 	if !chosen.is_wild && Iarch(chosen.binds.len) > 0 then {
@@ -1721,10 +1894,14 @@ const venv_ty = ([VarTy] venv, Str name): Ty -> {
 const for_env! = (*MonoCtx m, Str v, Str a, MonoEnv env): MonoEnv -> {
 	if !m.has_gen then return env
 	# bind the `for` variable at the array's ELEMENT type (matching typecheck's `check_for_body`), so a
-	# generic call on the binder resolves the right instance (`for w in [Str]` → `id(w)` picks `id[Str]`).
+	# generic call on the binder resolves the right instance (`for w in [Str]` → `id(w)` picks
+	# `id[Str]`).
 	const Str en = dyn_of(venv_ty(env.venv, a))
+	let DiagBag fdg = record_dg()
+	const Ty et = elem_ty!(en, build_ctx(m, env.ret), &fdg)
+	if fdg.hot then mrec_at(m, fdg.file, fdg.line, fdg.col, fdg.msg)
 
-	return env_bind(env, v, elem_ty!(en, build_ctx(m, env.ret)))
+	return env_bind(env, v, et)
 }
 
 const mono_stmt! = (*MonoCtx m, Stmt s, MonoEnv env): Stmt -> match s {
@@ -1739,9 +1916,9 @@ const mono_stmt! = (*MonoCtx m, Stmt s, MonoEnv env): Stmt -> match s {
 	Stmt.IndexAssign(a, i, v) -> Stmt.IndexAssign(a, mono_expr!(m, i, env), mono_expr!(m, v, env)),
 	Stmt.Return(e) -> Stmt.Return(mono_expr!(m, e, env)),
 	Stmt.ForIn(v, a, body) -> Stmt.ForIn(v, a, mono_stmts!(m, body, for_env!(m, v, a, env))),
-	Stmt.Loop(body) -> Stmt.Loop(mono_stmts!(m, body, env)),
-	Stmt.Break -> Stmt.Break,
-	Stmt.Continue -> Stmt.Continue,
+	Stmt.Loop(ll_, body) -> Stmt.Loop(ll_, mono_stmts!(m, body, env)),
+	Stmt.Break(bl_) -> Stmt.Break(bl_),
+	Stmt.Continue(bl_) -> Stmt.Continue(bl_),
 	Stmt.IfThen(c, st) -> Stmt.IfThen(mono_expr!(m, c, env), mono_stmt!(m, st, env)),
 	Stmt.IfElse(c, t, e) ->
 		Stmt.IfElse(mono_expr!(m, c, env), mono_stmt!(m, t, env), mono_stmt!(m, e, env)),
@@ -1785,25 +1962,43 @@ const mono_stmt_match! = (*MonoCtx m, Expr scrut, [StmtArm] arms, MonoEnv env): 
 
 # Extend the environment for the statements after a destructure — the tuple binders' types via
 # the typechecker's `check_destructure` over the (monomorphized) initializer.
-const destr_env! = (*MonoCtx m, [Str] pat, Bool mut, Expr e, MonoEnv env): MonoEnv -> MonoEnv({
-	tvars: env.tvars,
-	tvals: env.tvals,
-	venv: check_destructure!(pat, mut, e, env.venv, build_ctx(m, env.ret)),
-	ret: env.ret,
-	vpnames: env.vpnames,
-	vpvals: env.vpvals,
-})
+const destr_env! = (*MonoCtx m, [Str] pat, Bool mut, Expr e, MonoEnv env): MonoEnv -> {
+	let DiagBag fdg = record_dg()
+	const [VarTy] nv = check_destructure!(pat, mut, e, env.venv, build_ctx(m, env.ret), &fdg)
+	if fdg.hot then mrec_at(m, fdg.file, fdg.line, fdg.col, fdg.msg)
+
+	return MonoEnv({
+		tvars: env.tvars,
+		tvals: env.tvals,
+		venv: nv,
+		ret: env.ret,
+		vpnames: env.vpnames,
+		vpvals: env.vpvals,
+	})
+}
 
 # After a `let` / destructure, record the binding's type (via the typechecker's `binding_ty` /
 # `check_destructure` over the monomorphized statement) so a later generic call can infer from it.
 # Only under generics; a non-generic program never consults the environment, so this is skipped.
+# The `let` binder's type via the typechecker's `binding_ty` (a rejection latches into `m`).
+const let_env! = (*MonoCtx m, Str n, Str ann, Expr e, MonoEnv env): MonoEnv -> {
+	let DiagBag fdg = record_dg()
+	const Ty t = binding_ty!(ann, e, env.venv, build_ctx(m, env.ret), &fdg)
+	if fdg.hot then mrec_at(m, fdg.file, fdg.line, fdg.col, fdg.msg)
+
+	return env_bind(env, n, t)
+}
+
 const mono_extend! = (*MonoCtx m, Stmt s, MonoEnv env): MonoEnv -> {
 	if !m.has_gen then return env
 
 	return match s {
 		Stmt.Let(n, mut, ann, e) ->
-			env_bind(env, n, binding_ty!(ann, e, env.venv, build_ctx(m, env.ret))),
+			let_env!(m, n, ann, e, env),
 		Stmt.Destructure(pat, mut, e) -> destr_env!(m, pat, mut, e, env),
+		# a local closure enters the value env as its function type, so a later statement may
+		# pass it (or an anonymous lambda's hoisted name) to a generic function
+		Stmt.Closure(nm, params, ret, body) -> env_bind(env, nm, closure_tfn(ret, params)),
 		_ -> env,
 	}
 }
@@ -1864,10 +2059,17 @@ const check_rec_templates! = (*MonoCtx m): Iarch -> {
 		loop {
 			if f >= Iarch(r.ftypes.len) then break
 			if !typevar_declared!(r.ftypes[f], r.typarams)
-				then die("cf: type: an undeclared type variable in a generic record field\n")
+				then mrec_at(
+				m,
+				r.dfile,
+				r.dline,
+				r.dcol,
+				"cf: type: an undeclared type variable in a generic record field\n",
+			)
 			f = f + 1
 		}
 
+		flush_mono(m)
 		i = i + 1
 	}
 
@@ -1889,13 +2091,20 @@ const check_union_templates! = (*MonoCtx m): Iarch -> {
 			loop {
 				if pj >= Iarch(un.members[mi].payloads.len) then break
 				if !typevar_declared!(un.members[mi].payloads[pj], un.typarams)
-					then die("cf: type: an undeclared type variable in a generic union payload\n")
+					then mrec_at(
+					m,
+					un.dfile,
+					un.dline,
+					un.dcol,
+					"cf: type: an undeclared type variable in a generic union payload\n",
+				)
 				pj = pj + 1
 			}
 
 			mi = mi + 1
 		}
 
+		flush_mono(m)
 		i = i + 1
 	}
 
@@ -1905,7 +2114,13 @@ const check_union_templates! = (*MonoCtx m): Iarch -> {
 # Monomorphize the program: drop the generic templates, rewrite every concrete function's body
 # (registering the instances its generic calls need, transitively), then append all generated
 # concrete instances. The result has no generic functions.
-pub const mono_program! = (Program prog): Program -> {
+# The pass result: the monomorphized program plus the collected rejections. A non-empty
+# `diags` means instantiation failed somewhere — the OUTPUT PROGRAM IS NOT USABLE then (a
+# poisoned walk hands back inputs unsubstituted, and a failed instance is simply missing);
+# the caller stops after this pass rather than let typecheck cascade on absent functions.
+pub data MonoOut = { Program prog, [Diag] diags }
+
+pub const mono_program! = (Program prog): MonoOut -> {
 	let [Func] templates = []
 	let [Func] concrete = []
 	let Iarch i = 0
@@ -1962,6 +2177,7 @@ pub const mono_program! = (Program prog): Program -> {
 		vi = vi + 1
 	}
 
+	const [Diag] no_diags = []
 	let [Func] no_inst = []
 	let [Str] no_keys = []
 	let [RecDecl] no_recinst = []
@@ -1987,13 +2203,24 @@ pub const mono_program! = (Program prog): Program -> {
 		crecs: concrete_recs,
 		cunions: concrete_unions,
 		has_gen: has_gen,
+		dfile: "",
+		dline: 0,
+		dcol: 0,
+		mhot: false,
+		mefile: "",
+		meline: 0,
+		mecol: 0,
+		memsg: "",
+		mdiags: no_diags,
 	})
 	# reject a generic record/union template whose field/payload names an undeclared type variable
 	check_rec_templates!(&m)
 	check_union_templates!(&m)
 	check_template_bounds(&m)
+	flush_mono(&m)
 	# reject applying type arguments to a non-generic type in any concrete declaration (247)
 	check_concrete_type_apps!(&m)
+	flush_mono(&m)
 	# resolve any generic type NAMED in a concrete signature to its instance, so the shared
 	# `type_of` sees only concrete decls (skipped when there are no generics — the identity path)
 	if has_gen then mangle_concrete_sigs!(&m)
@@ -2004,6 +2231,9 @@ pub const mono_program! = (Program prog): Program -> {
 	loop {
 		if j >= Iarch(concrete.len) then break
 		out = [...out, mono_func!(&m, concrete[j], concrete[j].name, no_tv, no_tv)]
+		# one error per walked declaration (nested instantiations latch under the stamp that
+		# was current when they failed — the template's, by the save/restore discipline)
+		flush_mono(&m)
 		j = j + 1
 	}
 
@@ -2035,11 +2265,16 @@ pub const mono_program! = (Program prog): Program -> {
 		h = h + 1
 	}
 
-	return Program({
-		imports: prog.imports,
-		recs: out_recs,
-		unions: out_unions,
-		funcs: out,
-		groups: prog.groups,
+	flush_mono(&m)
+
+	return MonoOut({
+		prog: Program({
+			imports: prog.imports,
+			recs: out_recs,
+			unions: out_unions,
+			funcs: out,
+			groups: prog.groups,
+		}),
+		diags: m.mdiags,
 	})
 }

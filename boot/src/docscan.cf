@@ -1,61 +1,50 @@
 # docscan — extract the public API documentation from cf source, live.
 #
-# `cf docs` reads the standard-library `.cf` files as they are on disk (no cache, no index) and pulls
+# `cf docs` reads the standard-library `.cf` files as they are on disk (no cache, no index) and
+# pulls
 # out every `pub` definition together with the `#` comment block written directly above it. It is a
-# line-oriented text scan — cf-syntax-aware but not the full parser — so a definition's own signature
+# line-oriented text scan — cf-syntax-aware but not the full parser — so a definition's own
+# signature
 # line is its synopsis and the comment above it is its prose. Compiler-side (it knows what a
 # `pub const`/`data`/`union`/`intrinsic` is); the TUI that presents the result lives in `docs`.
 import std::io::file::{ read_file! }
 import std::io::fs::{ read_dir! }
 import std::io::fd::{ IoRrr, DirEntry, entry_is_dir }
-import std::str::{ starts_with, ends_with, eq }
+import std::data::str::{ starts_with, ends_with, eq, split, slice, replace, is_empty }
+import std::data::array
 import std::data::{ Either }
 
 # One documented public definition: its `name`, its `kind` (`const`/`data`/`union`/`intrinsic`), the
-# `sig` (the definition's own source line), the `doc` (the `#` comment block above, `#` stripped), and
+# `sig` (the definition's own source line), the `doc` (the `#` comment block above, `#` stripped),
+# and
 # the `module` it lives in (a `::` path derived from the file).
 pub data Def = { Str name, Str kind, Str sig, Str doc, Str module, [Member] members }
 
-# Split `s` into lines on `\n` (the newline dropped). A trailing line without a newline is kept. Each
-# line is a fresh owned Str — after a line is pushed, `cur` is rebound to a new empty vector, so the
-# pushed line's bytes are never grown over.
+# Split `s` into lines on `\n` (the newline dropped): `std::data::str::split` keeps a trailing empty
+# piece for a newline-terminated file, which would render as a phantom last line — drop it.
 pub const split_lines = (Str s): [Str] -> {
-	let [Str] out = []
-	let [Uint8] cur = []
-	let Iarch i = 0
+	const [Str] ls = s |> split("\n")
 
-	loop {
-		if i >= Iarch(s.len) then break
+	if Iarch(ls.len) > 0 && is_empty(ls[Iarch(ls.len) - 1])
+		then return array::slice[Str](0, Iarch(ls.len) - 1, ls)
 
-		const Iarch c = Iarch(s[i])
-
-		if c == 10 then {
-			out = [...out, Str({ bytes: cur, len: Iarch(cur.len) })]
-			cur = []
-		} else {
-			cur = [...cur, Uint8(c)]
-		}
-
-		i = i + 1
-	}
-
-	if Iarch(cur.len) > 0 then out = [...out, Str({ bytes: cur, len: Iarch(cur.len) })]
-
-	return out
+	return ls
 }
 
-# The kind of a `pub` definition line (`const`/`data`/`union`/`intrinsic`), or `""` if the line is not
+# The kind of a `pub` definition line (`const`/`data`/`union`/`intrinsic`), or `""` if the line is
+# not
 # a public definition.
 const def_kind = (Str line): Str -> {
-	if starts_with(line, "pub const ") then return "const"
-	if starts_with(line, "pub data ") then return "data"
-	if starts_with(line, "pub union ") then return "union"
-	if starts_with(line, "pub intrinsic ") then return "intrinsic"
+	if starts_with("pub const ", line) then return "const"
+	if starts_with("pub data ", line) then return "data"
+	if starts_with("pub union ", line) then return "union"
+	if starts_with("pub intrinsic ", line) then return "intrinsic"
 
 	return ""
 }
 
-# The definition name on a `pub <kind> NAME ...` line: the token after `pub <kind> ` (prefix length is
+# The definition name on a `pub <kind> NAME ...` line: the token after `pub <kind> ` (prefix length
+# is
 # `5 + kind.len`, i.e. `pub ` + kind + ` `), taken up to the first delimiter (space, `=`, `:`, `(`,
 # `[`). A trailing `!` on a name stays part of it (it precedes those delimiters).
 const def_name = (Str line, Str kind): Str -> {
@@ -96,7 +85,8 @@ const is_comment = (Str line): Bool -> {
 }
 
 # The comment block ending just above the definition at `defline`: walk up while the lines are
-# comments, then join them top-to-bottom, each stripped of its leading blanks + `#` + one space. Blank
+# comments, then join them top-to-bottom, each stripped of its leading blanks + `#` + one space.
+# Blank
 # (`""`) when there is no comment above. A block that reaches line 0 is the file's MODULE header (it
 # describes the module, not this definition), so it is not attributed here — the definition reads as
 # undocumented.
@@ -189,8 +179,10 @@ const trim_member = (Str s): Str -> {
 	return Str({ bytes: out, len: Iarch(out.len) })
 }
 
-# Split a single-line member list (`Iarch a, Left('L), ...`) on commas at paren/bracket depth 0, so a
-# payload like `Pair(Iarch, Str)` stays one member. Also the shared depth-0 splitter for a function's
+# Split a single-line member list (`Iarch a, Left('L), ...`) on commas at paren/bracket depth 0, so
+# a
+# payload like `Pair(Iarch, Str)` stays one member. Also the shared depth-0 splitter for a
+# function's
 # parameter list and a union variant's payload types in the docs synopsis.
 pub const split_members_line! = (Str inner): [Str] -> {
 	let [Str] out = []
@@ -223,7 +215,8 @@ pub const split_members_line! = (Str inner): [Str] -> {
 	return out
 }
 
-# The members of the `data`/`union` at `defline`: the fields/variants inside `{ ... }`, each with any
+# The members of the `data`/`union` at `defline`: the fields/variants inside `{ ... }`, each with
+# any
 # comment written directly above it (multi-line declarations only — a single-line body has none).
 const parse_members! = ([Str] lines, Iarch defline): [Member] -> {
 	let [Member] out = []
@@ -357,7 +350,8 @@ const has_arrow = (Str s): Bool -> {
 # A definition's full signature. A function whose header wraps across lines (the params on their own
 # lines, the `->` further down) is folded back into ONE line, so the synopsis is the whole signature
 # and not just its opening `pub const name = (`. A single-line def (the common case) and a
-# `data`/`union` (whose `= {` sits on the first line, members shown separately) are returned verbatim.
+# `data`/`union` (whose `= {` sits on the first line, members shown separately) are returned
+# verbatim.
 # The fold stops at the ` ->` line and aborts on a blank line, so a plain constant value — which has
 # no arrow — is never swallowed into the def below it.
 const join_sig = ([Str] lines, Iarch defline, Str kind): Str -> {
@@ -444,12 +438,8 @@ const join_sig = ([Str] lines, Iarch defline, Str kind): Str -> {
 const scan_content! = (Str content, Str module): [Def] -> {
 	const [Str] lines = split_lines(content)
 	let [Def] defs = []
-	let Iarch i = 0
 
-	loop {
-		if i >= Iarch(lines.len) then break
-
-		const Str line = lines[i]
+	for (line, i) in lines {
 		const Str kind = def_kind(line)
 
 		if !eq(kind, "") then {
@@ -471,8 +461,6 @@ const scan_content! = (Str content, Str module): [Def] -> {
 				}),
 			]
 		}
-
-		i = i + 1
 	}
 
 	return defs
@@ -483,31 +471,13 @@ const scan_content! = (Str content, Str module): [Def] -> {
 const path_to_module = (Str path): Str -> {
 	let Iarch start = 0
 
-	if starts_with(path, "lib/") then start = 4
+	if starts_with("lib/", path) then start = 4
 
 	let Iarch stop = Iarch(path.len)
 
-	if ends_with(path, ".cf") then stop = stop - 3
+	if ends_with(".cf", path) then stop = stop - 3
 
-	let [Uint8] out = []
-	let Iarch i = start
-
-	loop {
-		if i >= stop then break
-
-		const Iarch c = Iarch(path[i])
-
-		if c == 47 then {
-			out = [...out, Uint8(58)]
-			out = [...out, Uint8(58)]
-		} else {
-			out = [...out, Uint8(c)]
-		}
-
-		i = i + 1
-	}
-
-	return Str({ bytes: out, len: Iarch(out.len) })
+	return path |> slice(start, stop) |> replace("/", "::")
 }
 
 # Scan one `.cf` file at `path`. A read failure yields no definitions (the file is simply skipped).
@@ -518,11 +488,7 @@ const scan_file! = (Str path): [Def] -> {
 	match r {
 		Either.Left(e) -> {},
 		Either.Right(content) -> {
-			const [Def] ds = scan_content!(content, path_to_module(path))
-
-			for d in ds {
-				out = [...out, d]
-			}
+			out = [...out, ...scan_content!(content, path_to_module(path))]
 		},
 	}
 
@@ -543,17 +509,9 @@ const scan_dir! = (Str dir): [Def] -> {
 					const Str child = "${dir}/${e.name}"
 
 					if entry_is_dir(e) then {
-						const [Def] sub = scan_dir!(child)
-
-						for d in sub {
-							defs = [...defs, d]
-						}
-					} else if ends_with(e.name, ".cf") then {
-						const [Def] one = scan_file!(child)
-
-						for d in one {
-							defs = [...defs, d]
-						}
+						defs = [...defs, ...scan_dir!(child)]
+					} else if ends_with(".cf", e.name) then {
+						defs = [...defs, ...scan_file!(child)]
 					}
 				}
 			}

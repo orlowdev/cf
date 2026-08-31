@@ -34,8 +34,10 @@ import std::compiler::ast::{
 	Func,
 	Program,
 }
-import std::str::{ eq }
+import std::data::str::{ eq }
 import std::io::console::{ die }
+import std::compiler::diag::{ Diag }
+import std::compiler::spans::{ unat }
 
 # A name carries the allocation marker iff it contains a `!` (byte 33). The marker rides directly
 # after the base name in the source (`alloc!`); monomorphization then appends an instance suffix
@@ -54,7 +56,8 @@ const is_bang_name = (Str n): Bool -> {
 }
 
 # A binding whose name carries the leading `$` STACK marker (byte 36): its storage is on the machine
-# stack (freed at frame exit), so — like a scalar — it is NOT residue and does not color the function.
+# stack (freed at frame exit), so — like a scalar — it is NOT residue and does not color the
+# function.
 const is_stack_name = (Str n): Bool -> if Iarch(n.len) == 0 then false else Iarch(n[0]) == 36
 
 const has_name = ([Str] xs, Str s): Bool -> {
@@ -69,7 +72,8 @@ const has_name = ([Str] xs, Str s): Bool -> {
 	return false
 }
 
-# Typed empty lists — a bare `[]` in expression position defaults to `[Iarch]`, so a `[Str]`/`[Expr]`
+# Typed empty lists — a bare `[]` in expression position defaults to `[Iarch]`, so a
+# `[Str]`/`[Expr]`
 # result must be produced through an annotated binding.
 const no_strs = (): [Str] -> {
 	let [Str] e = []
@@ -221,7 +225,8 @@ const arm_bodies = ([MatchArm] arms): [Expr] -> {
 }
 
 # A single-element list `[a]` sets its element type from `a`; longer lists are grown by spread, so a
-# multi-element `[Expr]` of a union type is built through these rather than a plain `[a, b]` literal.
+# multi-element `[Expr]` of a union type is built through these rather than a plain `[a, b]`
+# literal.
 const exl_one = (Expr a): [Expr] -> {
 	let [Expr] r = [a]
 
@@ -241,7 +246,7 @@ const exl_three = (Expr a, Expr b, Expr c): [Expr] -> {
 	return [...r, c]
 }
 
-const expr_children = (Expr e): [Expr] -> match e {
+const expr_children = (Expr e): [Expr] -> match unat(e) {
 	Expr.Record(_, inits) -> field_values(inits),
 	Expr.ArrayLit(_, sp, elems, _) -> cat_e(exl_one(sp), elems),
 	Expr.Tuple(elems) -> elems,
@@ -284,7 +289,7 @@ const expr_children = (Expr e): [Expr] -> match e {
 # Does `e` CONSTRUCT an aggregate at this node? Records, arrays, tuples, byte buffers, and
 # runtime-built (interpolated) strings always do; a union construction does iff its union is boxed.
 # A string LITERAL is static data, not residue.
-const is_construction = (ACtx cx, Expr e): Bool -> match e {
+const is_construction = (ACtx cx, Expr e): Bool -> match unat(e) {
 	Expr.Record(_, _) -> true,
 	Expr.ArrayLit(_, _, _, _) -> true,
 	Expr.Tuple(_) -> true,
@@ -312,7 +317,7 @@ const any_trapped! = (ACtx cx, [Expr] es): Bool -> {
 const scan_trapped! = (ACtx cx, Expr e): Bool -> {
 	if is_construction(cx, e) then return true
 
-	return match e {
+	return match unat(e) {
 		Expr.Loop(ss) -> body_traps!(cx, false, ss),
 		_ -> any_trapped!(cx, expr_children(e)),
 	}
@@ -334,7 +339,7 @@ const any_escaping! = (ACtx cx, [Expr] es): Bool -> {
 # `e` is in an ESCAPING position (its value is returned or rehomed): a construction HERE is not
 # residue, but a construction inside a call argument, a read base, or an if-condition IS. Returns
 # whether any trapped construction exists within.
-const scan_escaping! = (ACtx cx, Expr e): Bool -> match e {
+const scan_escaping! = (ACtx cx, Expr e): Bool -> match unat(e) {
 	Expr.Record(_, inits) -> any_escaping!(cx, field_values(inits)),
 	Expr.ArrayLit(_, sp, elems, _) -> scan_trapped!(cx, sp) || any_escaping!(cx, elems),
 	Expr.Tuple(elems) -> any_escaping!(cx, elems),
@@ -355,7 +360,7 @@ const scan_escaping! = (ACtx cx, Expr e): Bool -> match e {
 # construction (their emit paths never consult the flag) — and a value block's statements are
 # ordinary frame code. Scan for exactly those, descending the literal spine and call arguments
 # (which ride the flag too).
-const scan_stack_init! = (ACtx cx, Expr e): Bool -> match e {
+const scan_stack_init! = (ACtx cx, Expr e): Bool -> match unat(e) {
 	Expr.Record(_, inits) -> stack_scan_list!(cx, field_values(inits)),
 	Expr.ArrayLit(_, sp, elems, _) -> scan_stack_init!(cx, sp) || stack_scan_list!(cx, elems),
 	Expr.Buffer(sz) -> scan_stack_init!(cx, sz),
@@ -383,7 +388,7 @@ const stack_scan_list! = (ACtx cx, [Expr] es): Bool -> {
 # a scalar expression, a call, an if/match aggregate — takes emit's scalar/normal path where
 # the flag is never set, so every construction inside is ordinary node residue (this is what
 # made `const $n = "x${y}z".len` allocate invisibly — the old arm skipped the init entirely).
-const scan_stack_let! = (ACtx cx, Expr init): Bool -> match init {
+const scan_stack_let! = (ACtx cx, Expr init): Bool -> match unat(init) {
 	Expr.Record(_, _) -> scan_stack_init!(cx, init),
 	Expr.ArrayLit(_, _, _, _) -> scan_stack_init!(cx, init),
 	Expr.Buffer(_) -> scan_stack_init!(cx, init),
@@ -393,7 +398,7 @@ const scan_stack_let! = (ACtx cx, Expr init): Bool -> match init {
 # The root NAME of a chained lvalue's base (`a.b.c... = v` — the Var/name at the bottom of the
 # Field/Index chain), or "" when the base is not name-rooted (a non-name root is never a
 # parameter, so "" safely reads as non-escaping).
-const deep_root = (Expr e): Str -> match e {
+const deep_root = (Expr e): Str -> match unat(e) {
 	Expr.Var(n) -> n,
 	Expr.Field(b, _) -> b,
 	Expr.FieldExpr(b, _) -> deep_root(b),
@@ -459,7 +464,7 @@ const stmt_traps! = (ACtx cx, Bool yesc, Stmt s): Bool -> match s {
 	Stmt.IfElse(c, t, el) ->
 		scan_trapped!(cx, c) || stmt_traps!(cx, yesc, t) || stmt_traps!(cx, yesc, el),
 	Stmt.Block(ss) -> body_traps!(cx, yesc, ss),
-	Stmt.Loop(ss) -> body_traps!(cx, yesc, ss),
+	Stmt.Loop(ll_, ss) -> body_traps!(cx, yesc, ss),
 	Stmt.ForIn(_, _, ss) -> body_traps!(cx, yesc, ss),
 	Stmt.Match(sc, arms) -> scan_trapped!(cx, sc) || stmtarms_traps!(cx, yesc, arms),
 	Stmt.Destructure(_, _, e) -> scan_trapped!(cx, e),
@@ -512,7 +517,7 @@ const yield_vars = ([Stmt] ss): [Str] -> {
 	return r
 }
 
-const esc_vars = (Expr e): [Str] -> match e {
+const esc_vars = (Expr e): [Str] -> match unat(e) {
 	Expr.Var(n) -> [n],
 	Expr.Record(_, inits) -> vars_of(field_values(inits)),
 	# a spread `[...src, elems]` in escaping position carries its SOURCE out too (the source's
@@ -570,7 +575,7 @@ const esc_roots_stmt = ([Str] params, [Str] esc, Stmt s): [Str] -> match s {
 	Stmt.IfThen(_, s2) -> esc_roots_stmt(params, esc, s2),
 	Stmt.IfElse(_, t, el) -> cat_s(esc_roots_stmt(params, esc, t), esc_roots_stmt(params, esc, el)),
 	Stmt.Block(ss) -> esc_roots_body(params, esc, ss),
-	Stmt.Loop(ss) -> esc_roots_body(params, esc, ss),
+	Stmt.Loop(ll_, ss) -> esc_roots_body(params, esc, ss),
 	Stmt.ForIn(_, _, ss) -> esc_roots_body(params, esc, ss),
 	Stmt.Match(_, arms) -> esc_roots_stmtarms(params, esc, arms),
 	# a `defer` body shares this frame's locals/params, so a rehome inside it escapes too
@@ -595,7 +600,7 @@ const stmt_exprs = (Stmt s): [Expr] -> match s {
 	_ -> no_exprs(),
 }
 
-const esc_roots_expr = ([Str] params, [Str] esc, Expr e): [Str] -> match e {
+const esc_roots_expr = ([Str] params, [Str] esc, Expr e): [Str] -> match unat(e) {
 	Expr.Loop(ss) -> esc_roots_body(params, esc, ss),
 	_ -> esc_roots_elist(params, esc, expr_children(e)),
 }
@@ -656,7 +661,7 @@ pub const compute_esc = ([Str] params, [Stmt] body): [Str] -> {
 	return esc
 }
 
-const var_refs_expr = (Expr e): [Str] -> match e {
+const var_refs_expr = (Expr e): [Str] -> match unat(e) {
 	Expr.Var(n) -> exl_one_s(n),
 	Expr.Loop(ss) -> var_refs_body(ss),
 	_ -> var_refs_list(expr_children(e)),
@@ -700,7 +705,7 @@ const var_refs_stmt = (Stmt s): [Str] -> match s {
 	Stmt.IfThen(c, s2) -> cat_s(var_refs_expr(c), var_refs_stmt(s2)),
 	Stmt.IfElse(c, t, el) -> cat_s(var_refs_expr(c), cat_s(var_refs_stmt(t), var_refs_stmt(el))),
 	Stmt.Block(ss) -> var_refs_body(ss),
-	Stmt.Loop(ss) -> var_refs_body(ss),
+	Stmt.Loop(ll_, ss) -> var_refs_body(ss),
 	Stmt.ForIn(_, _, ss) -> var_refs_body(ss),
 	Stmt.Match(sc, arms) -> cat_s(var_refs_expr(sc), var_refs_arms(arms)),
 	Stmt.Destructure(_, _, e) -> var_refs_expr(e),
@@ -722,10 +727,12 @@ const var_refs_body = ([Stmt] ss): [Str] -> {
 	return r
 }
 
-# The set of names used as a VALUE (an `Expr.Var`) anywhere in the program. A direct call's callee is
+# The set of names used as a VALUE (an `Expr.Var`) anywhere in the program. A direct call's callee
+# is
 # a bare Str in the AST, not a Var, so a FUNCTION name lands here ONLY when it is taken as a value
 # (passed to a HOF, bound, returned). Emit consults it: an address-taken function is reachable by an
-# indirect call, whose site cannot claim, so such a function must NOT reset (on_ret/on_alloc_ret pairs
+# indirect call, whose site cannot claim, so such a function must NOT reset (on_ret/on_alloc_ret
+# pairs
 # only at direct call sites in this step).
 pub const address_taken = (Program prog): [Str] -> {
 	let [Str] r = []
@@ -798,7 +805,7 @@ const named_fn_is_bang = ([Func] funcs, [Bool] bang, Str vn): Bool -> {
 	return bang[k]
 }
 
-const arg_is_bang_fnval = ([Func] funcs, [Bool] bang, Expr arg): Bool -> match arg {
+const arg_is_bang_fnval = ([Func] funcs, [Bool] bang, Expr arg): Bool -> match unat(arg) {
 	Expr.Var(vn) -> named_fn_is_bang(funcs, bang, vn),
 	_ -> false,
 }
@@ -837,7 +844,7 @@ const list_calls_bang = ([Func] funcs, [Bool] bang, [Str] params, [Expr] es): Bo
 }
 
 const expr_calls_bang = ([Func] funcs, [Bool] bang, [Str] params, Expr e): Bool -> {
-	const Bool here = match e {
+	const Bool here = match unat(e) {
 		Expr.Call(name, _, args, _) -> call_is_effectful(funcs, bang, params, name, args),
 		Expr.DeferTap(name, args) -> call_is_effectful(funcs, bang, params, name, args),
 		_ -> false,
@@ -845,7 +852,7 @@ const expr_calls_bang = ([Func] funcs, [Bool] bang, [Str] params, Expr e): Bool 
 
 	if here then return true
 
-	return match e {
+	return match unat(e) {
 		Expr.Loop(ss) -> body_calls_bang(funcs, bang, params, ss),
 		_ -> list_calls_bang(funcs, bang, params, expr_children(e)),
 	}
@@ -893,7 +900,7 @@ const stmt_calls_bang = ([Func] funcs, [Bool] bang, [Str] params, Stmt s): Bool 
 		stmt_calls_bang(funcs, bang, params, t) ||
 		stmt_calls_bang(funcs, bang, params, el),
 	Stmt.Block(ss) -> body_calls_bang(funcs, bang, params, ss),
-	Stmt.Loop(ss) -> body_calls_bang(funcs, bang, params, ss),
+	Stmt.Loop(ll_, ss) -> body_calls_bang(funcs, bang, params, ss),
 	Stmt.ForIn(_, _, ss) -> body_calls_bang(funcs, bang, params, ss),
 	Stmt.Match(sc, arms) ->
 		expr_calls_bang(funcs, bang, params, sc) || stmtarms_calls_bang(funcs, bang, params, arms),
@@ -952,10 +959,13 @@ const compute_bang! = (Program prog): [Bool] -> {
 }
 
 # Validate the declared `!` marker against the computed color, both ways. `main` is exempt; an
-# `asm`/intrinsic body trusts its own marker (it is not re-derived).
-pub const check_alloc_program! = (Program prog) -> {
+# `asm`/intrinsic body trusts its own marker (it is not re-derived). Rejections are COLLECTED —
+# the color is a per-fn classification already computed, so one run reports every mis-marked
+# declaration instead of dying at the first (each used to cost a full rebuild cycle).
+pub const check_alloc_program! = (Program prog): [Diag] -> {
 	const [Func] funcs = prog.funcs
 	const [Bool] bang = compute_bang!(prog)
+	let [Diag] diags = []
 	let Iarch j = 0
 
 	loop {
@@ -963,24 +973,43 @@ pub const check_alloc_program! = (Program prog) -> {
 		if !funcs[j].is_asm && !is_main(funcs[j]) then {
 			const Bool decl = is_bang_name(funcs[j].name)
 			if decl && !bang[j]
-				then die("cf: alloc: `${funcs[j].name}` is marked `!` but allocates no residue — drop the marker\n")
+				then diags = [
+				...diags,
+				Diag({
+					file: funcs[j].dfile,
+					line: funcs[j].dline,
+					col: funcs[j].dcol,
+					msg: "cf: alloc: `${funcs[j].name}` is marked `!` but allocates no residue — drop the marker\n",
+					what: "",
+				}),
+			]
 			if !decl && bang[j]
-				then die("cf: alloc: `${funcs[j].name}` allocates residue (or calls a `!` function) but is not marked `!`\n")
+				then diags = [
+				...diags,
+				Diag({
+					file: funcs[j].dfile,
+					line: funcs[j].dline,
+					col: funcs[j].dcol,
+					msg: "cf: alloc: `${funcs[j].name}` allocates residue (or calls a `!` function) but is not marked `!`\n",
+					what: "",
+				}),
+			]
 		}
 		j = j + 1
 	}
 
-	return 0
+	return diags
 }
 
 # ── Root-allocation check (memory_model §2) ────────────────────────────────────────────────────
 # `main` runs under the ROOT page, and the user cannot allocate there — a program must graft a
-# geometry (an `in <arena>` clause) before any residue is placed. The ambient node propagates down
+# geometry (an `in <geometry>` clause) before any residue is placed. The ambient node propagates
+# down
 # BARE calls (no `in`); an `in`-grafted call switches its subtree to the arena. So the set of
 # functions that can run under the root is the closure of `main` over bare callees; if any of them
 # holds trapped residue, that residue would land on the root — a compile error. An `in`-grafted
 # call's ARGUMENTS still evaluate in the caller's ambient, so they keep propagating.
-const bare_calls_expr = (Expr e): [Str] -> match e {
+const bare_calls_expr = (Expr e): [Str] -> match unat(e) {
 	Expr.Call(n, _, args, g) -> if eq(g, "")
 		then cat_s(exl_one_s(n), bare_calls_list(args))
 		else bare_calls_list(args),
@@ -1033,7 +1062,7 @@ const bare_calls_stmt = (Stmt s): [Str] -> match s {
 	Stmt.IfThen(c, s2) -> cat_s(bare_calls_expr(c), bare_calls_stmt(s2)),
 	Stmt.IfElse(c, t, el) -> cat_s(bare_calls_expr(c), cat_s(bare_calls_stmt(t), bare_calls_stmt(el))),
 	Stmt.Block(ss) -> bare_calls_body(ss),
-	Stmt.Loop(ss) -> bare_calls_body(ss),
+	Stmt.Loop(ll_, ss) -> bare_calls_body(ss),
 	Stmt.ForIn(_, _, ss) -> bare_calls_body(ss),
 	Stmt.Match(sc, arms) -> cat_s(bare_calls_expr(sc), bare_calls_arms(arms)),
 	Stmt.Destructure(_, _, e) -> bare_calls_expr(e),
@@ -1084,7 +1113,8 @@ const root_ambient_set! = (Program prog): [Str] -> {
 # (non-`in`) calls — residue must run under a grafted geometry, never on the root page. In
 # `zero_root` mode the root has no bytes, so it tightens to reject ANY page use: an arena graft or
 # a root-ambient function that constructs residue on the page.
-pub const check_root_program! = (Program prog, Bool zero_root) -> {
+pub const check_root_program! = (Program prog, Bool zero_root): [Diag] -> {
+	let [Diag] diags = []
 	const [Func] funcs = prog.funcs
 	const [Str] root = root_ambient_set!(prog)
 	# ZERO-ROOT mode (`--root-size 0` on `Bare`): the root page has no bytes, so NO page use is legal.
@@ -1104,15 +1134,33 @@ pub const check_root_program! = (Program prog, Bool zero_root) -> {
 		# calls (the root-ambient set closes over bare calls only; an `in` clause leaves the set). `main`
 		# is never `!`, so it is exempt and may open buffers/records directly on the root.
 		if fi >= 0 && !funcs[fi].is_asm && is_bang_name(funcs[fi].name)
-			then die("cf: root: `${funcs[fi].name}` is a `!` function reached without a geometry — call it `in <arena>` (root does not propagate into `!` functions)\n")
+			then diags = [
+			...diags,
+			Diag({
+				file: funcs[fi].dfile,
+				line: funcs[fi].dline,
+				col: funcs[fi].dcol,
+				msg: "cf: root: `${funcs[fi].name}` is a `!` function reached without a geometry — call it `in <geometry>` (root does not propagate into `!` functions)\n",
+				what: "",
+			}),
+		]
 		# In zero-root there is no page to spill onto, so `main`'s own exemption is revoked too: ANY
 		# root-ambient function that constructs a residue aggregate on the page is rejected. Legal
 		# storage (`$`, `static`, `fixed_buffer` allocations run `in fb`) never lands here — the first
 		# two aren't residue, and a `fixed_buffer` sink is reached `in fb`, off the root-ambient set.
 		if zero_root && fi >= 0 && !funcs[fi].is_asm && local_residue!(prog.unions, funcs[fi])
-			then die("cf: zero-root: `${funcs[fi].name}` allocates residue on the root page, but `--root-size 0` forbids it — use `$`-stack, `static`, or a `fixed_buffer` instead\n")
+			then diags = [
+			...diags,
+			Diag({
+				file: funcs[fi].dfile,
+				line: funcs[fi].dline,
+				col: funcs[fi].dcol,
+				msg: "cf: zero-root: `${funcs[fi].name}` allocates residue on the root page, but `--root-size 0` forbids it — use `$`-stack, `static`, or a `fixed_buffer` instead\n",
+				what: "",
+			}),
+		]
 		i = i + 1
 	}
 
-	return 0
+	return diags
 }

@@ -76,6 +76,12 @@ pub union Expr = {
 	# `const $tap = <last arg>; defer fn(..., $tap)` and replaces the expression with `$tap`, so no
 	# `DeferTap` reaches emit.
 	DeferTap(Str, [Expr]),
+	# `At(off, inner)` is a SOURCE SPAN wrapper (spans.cf): `off` is the expression's first
+	# byte in its declaring module. The parser wraps expressions so typecheck can point a
+	# rejection at the offending subexpression; `strip_program` removes every `At` right
+	# after typecheck, so the lowering passes and emit never see one. A pass that tests an
+	# expression's SHAPE through a wildcard must match on `unat(e)`.
+	At(Iarch, Expr),
 }
 
 # One segment of an interpolated string `"...${expr}..."`: a literal byte-run (`is_hole`
@@ -164,7 +170,8 @@ pub union Ty = {
 # list for every non-tuple field.
 # `fptrs` marks each field that was declared an aggregate POINTER `*Record`/`*Union` (a reference to
 # a referent, not an owned value) — the star cf otherwise elides from `ftypes` (a `*Inner` field and
-# a bare `Inner` field share ftype "Inner"). `false` for every value / scalar / array / `$ptr` field.
+# a bare `Inner` field share ftype "Inner"). `false` for every value / scalar / array / `$ptr`
+# field.
 # It lets typecheck tell a reference-field read (`o.p`, which binds `const` — no repointing) from a
 # value-field read; the parallel array stays in lockstep with `fields`/`ftypes`.
 # `typarams` are the declared type variables of a GENERIC record (`data Pair['A, 'B]` →
@@ -173,10 +180,13 @@ pub union Ty = {
 # `tbounds` are the per-type-parameter BOUNDS (`data Tagged[Color 'T]` → `["Color"]`; the empty
 # string for an unbounded parameter) — a bound names a union the type argument must satisfy.
 # `fsizes` marks each INLINE fixed-array field `[N Elem]` (ftype `"$fix"`) with its comptime length
-# `N` — the field occupies `align8(N × stride)` bytes IN the record body (not an 8-byte pointer slot),
+# `N` — the field occupies `align8(N × stride)` bytes IN the record body (not an 8-byte pointer
+# slot),
 # so `field_offset` becomes a running sum rather than `index × 8`. `0` for every ordinary field (an
 # 8-byte slot). `felems` still names the element type (its stride); reading such a field yields the
 # INLINE byte address (like a `*[Elem]` pointer whose pointee is the field's own storage).
+# `dfile`/`dline`/`dcol` locate the DECLARATION in its source (like a `Func`'s stamp) —
+# stamped by the parser; a spread-expanded or monomorphized clone inherits its source decl's.
 pub data RecDecl = {
 	Str name,
 	[Str] fields,
@@ -187,6 +197,9 @@ pub data RecDecl = {
 	[Str] typarams,
 	[Str] tbounds,
 	[Iarch] fsizes,
+	Str dfile,
+	Iarch dline,
+	Iarch dcol,
 }
 
 # A union member: its name and its payload field TYPE names (empty for a tag-only
@@ -203,7 +216,16 @@ pub data UnionMember = { Str name, [Str] payloads, [Str] pelems, [[TupElem]] pte
 # (a member's tag is its index). `typarams` are the declared type variables of a GENERIC union
 # (`union Opt['T]` → `["'T"]`; empty otherwise) and `tbounds` their per-parameter bounds; like a
 # generic record it is a template the monomorphization pass clones per type-argument set.
-pub data UnionDecl = { Str name, [UnionMember] members, [Str] typarams, [Str] tbounds }
+# `dfile`/`dline`/`dcol` locate the declaration in its source, like a record's stamp.
+pub data UnionDecl = {
+	Str name,
+	[UnionMember] members,
+	[Str] typarams,
+	[Str] tbounds,
+	Str dfile,
+	Iarch dline,
+	Iarch dcol,
+}
 
 # A statement in a block body. `Let(name, mutable, ann, init)` binds a local (`mutable`
 # distinguishes `let` from `const`; `ann` is the written type-name annotation or `""` — used
@@ -212,7 +234,8 @@ pub data UnionDecl = { Str name, [UnionMember] members, [Str] typarams, [Str] tb
 # value`), where `base` is a NAME. `DeepFieldAssign(baseExpr, field, value)` is the CHAINED lvalue
 # `a.b.c... = value` — `baseExpr` is the record-pointer expression (a `Field`/`FieldExpr` chain)
 # addressing the penultimate record and `field` its final member; in cf's arena model each hop is an
-# 8-byte pointer load, so a store into the last field mutates the original aggregate. `Return(value)`
+# 8-byte pointer load, so a store into the last field mutates the original aggregate.
+# `Return(value)`
 # yields the function's result. `IfThen(cond, stmt)` is a
 # statement-position `if cond then <stmt>` guard — it runs the single guarded
 # statement (an early `return`, an assignment, or a loop exit `break`/`continue`)
@@ -247,9 +270,12 @@ pub union Stmt = {
 	IndexAssign(Str, Expr, Expr),
 	Return(Expr),
 	ForIn(Str, Str, [Stmt]),
-	Loop([Stmt]),
-	Break,
-	Continue,
+	# `Loop(label, body)` — a statement loop with an optional LABEL (ebnf loop_expr: `loop outer
+	# { ... }`), "" when unlabeled. `Break(label)`/`Continue(label)` optionally name an enclosing
+	# labeled loop ("" targets the nearest one).
+	Loop(Str, [Stmt]),
+	Break(Str),
+	Continue(Str),
 	IfThen(Expr, Stmt),
 	IfElse(Expr, Stmt, Stmt),
 	Do(Expr),
@@ -298,6 +324,9 @@ pub data Param = { Str name, Bool is_ptr, Str type_name, Str elem, [TupElem] tel
 # `typarams` are the declared type variables (`['T]` → `["'T"]`) — empty for a non-generic
 # function. A generic function is a TEMPLATE: the monomorphization pass clones it per distinct
 # type-argument set (substituting each `'T`) into concrete instances before typecheck/emit.
+# `dfile`/`dline`/`dcol` locate the DECLARATION in its source (1-based line and byte column),
+# stamped by the parser; a synthesized function (a mono instance, a materialized geometry copy,
+# a lifted closure) inherits its template's stamp, so a rejection points at the source decl.
 pub data Func = {
 	Str name,
 	Bool is_pub,
@@ -314,6 +343,9 @@ pub data Func = {
 	Iarch ret_size,
 	Bool is_intrinsic,
 	Str asm_sym,
+	Str dfile,
+	Iarch dline,
+	Iarch dcol,
 }
 
 # A parsed return annotation: the type NAME (`"$dyn"` for a `[Elem]` array, `"$tuple"` for a
@@ -327,7 +359,10 @@ pub data RetSig = { Str name, Str elem, [TupElem] telems, Iarch size }
 # exported surface flat into this module — no nesting, no enumeration; module_system §5). The
 # resolver (§8) loads the named module and flattens its declarations. `alias` lets a NAMESPACE
 # REEXPORT (`pub import m as io`) be followed by name through a nested `foo::io::member` path.
-pub data Import = { Str path, [Str] names, Str alias, Bool wildcard }
+# `dline`/`dcol` are the statement's 1-based position in its module (parse_program!'s decl
+# scanner; 0 on a synthetic import), so resolve's rejections — a missing module, the
+# raw-privilege gate — land on the `import` line itself.
+pub data Import = { Str path, [Str] names, Str alias, Bool wildcard, Iarch dline, Iarch dcol }
 
 # The whole program: its imports (consumed and emptied by the resolver), record
 # declarations, union declarations, and functions — all visible whole-program (a type
@@ -345,13 +380,20 @@ pub data Program = {
 }
 
 # Read / re-apply the `in <geometry>` binding name on a call (Expr.Call's `geom` field). A pass that
-# rebuilds a call from a matched one wraps its result in `with_geom(..., g)` so the annotation survives
-# to emit; a non-call is returned unchanged.
-pub const call_geom = (Expr e): Str -> match e { Expr.Call(_, _, _, g) -> g, _ -> "" }
+# rebuilds a call from a matched one wraps its result in `with_geom(..., g)` so the annotation
+# survives
+# to emit; a non-call is returned unchanged. Both see through a span wrapper — the call under
+# an `Expr.At` is still the call.
+pub const call_geom = (Expr e): Str -> match e {
+	Expr.Call(_, _, _, g) -> g,
+	Expr.At(o, inner) -> call_geom(inner),
+	_ -> "",
+}
 
 # Re-apply an `in <geometry>` binding name `g` to a call, rebuilding the `Expr.Call` with `g` in
 # its `geom` field; a non-call is returned unchanged. The counterpart to `call_geom`.
 pub const with_geom = (Expr e, Str g): Expr -> match e {
 	Expr.Call(n, ta, args, _) -> Expr.Call(n, ta, args, g),
+	Expr.At(o, inner) -> Expr.At(o, with_geom(inner, g)),
 	_ -> e,
 }

@@ -71,6 +71,12 @@ module.exports = grammar({
     // `then x …` in a branch — a bare expression, or the target of an assignment
     // statement branch (`if c then x = 1`), forked by a following `assign_op`.
     [$.assignment_statement, $._expression],
+    // `name :: …` — a qualified_name path segment vs a named_type's namespace
+    // prefix; both read `var_name ::` and fork only at the final segment's case.
+    [$._path_seg, $.named_type],
+    // `import a::b :: …` — the path keeps absorbing segments, or the `::` opens
+    // the destructure list (`::{ x, Y }`); forked by the token after the `::`.
+    [$.module_path],
   ],
 
   rules: {
@@ -90,10 +96,24 @@ module.exports = grammar({
 
     // ---- identifiers -------------------------------------------------------
     // `_word` is the keyword-extraction token: the snake_case value-name shape.
-    _word: _ => /[a-z][a-z0-9_]*!?/,
+    // A leading `$` is the stack-storage marker and a trailing `!` the
+    // allocation marker — both are part of the one identifier token. A leading
+    // `_` is admitted for the privileged floor names (`_start`); a bare `_`/`_n`
+    // stays the higher-prec wildcard/skip token. The tail admits uppercase too
+    // (`rIdx`) — the compiler's lexer does, even though the EBNF spells
+    // snake_case; an editor grammar should not flag what compiles.
+    _word: _ => /\$?[a-z_][A-Za-z0-9_]*!?/,
     var_name: $ => $._word,
     type_name: _ => /[A-Z][A-Za-z0-9]*/,
     type_var: $ => seq("'", $.type_name),
+
+    // A `::`-path to a module member (`std::io::print`, `growing_arena::of`,
+    // `str::eq`) — resolved through the module graph. The last segment may be a
+    // value or a type; earlier segments are namespaces.
+    qualified_name: $ => prec.right(seq(
+      $._path_seg, repeat1(seq('::', $._path_seg)),
+    )),
+    _path_seg: $ => choice($.var_name, $.type_name),
 
     // ---- types -------------------------------------------------------------
     // No `&T` type — `&` is only the address-of operator on a value (see EBNF).
@@ -107,9 +127,12 @@ module.exports = grammar({
       $.func_type,
     ),
 
+    // A type may be reached through a `::` namespace path (`console::Key`,
+    // `either::Either`) — the leading segments are module namespaces.
     named_type: $ => prec.left(seq(
+      repeat(seq($.var_name, '::')),
       $.type_name,
-      optional(seq('[', commaSep1($._type_arg), ']')),
+      optional(seq('[', commaSepT($._type_arg), ']')),
     )),
 
     // A qualified member type/callee: `Maybe.Just`, `Maybe[Int32].Just`,
@@ -117,7 +140,7 @@ module.exports = grammar({
     // `type_pattern` head.
     member_access: $ => prec.left(seq(
       $.named_type, '.', $.type_name,
-      optional(seq('[', commaSep1($._type_arg), ']')),
+      optional(seq('[', commaSepT($._type_arg), ']')),
     )),
 
     pointer_type: $ => prec.right(seq('*', $._type)),
@@ -147,6 +170,7 @@ module.exports = grammar({
     _literal: $ => choice(
       $.float,
       $.integer,
+      $.char,
       $.string,
       $.boolean,
       $.aggregate,
@@ -154,13 +178,19 @@ module.exports = grammar({
       $.data_literal,
     ),
 
+    // `_` digit separators sit BETWEEN digits only; base prefixes are lowercase.
     integer: _ => token(choice(
-      /[0-9][0-9_]*/,
-      /0b[01][01_]*/,
-      /0o[0-7][0-7_]*/,
-      /0x[0-9a-fA-F][0-9a-fA-F_]*/,
+      /[0-9](_?[0-9])*/,
+      /0b[01](_?[01])*/,
+      /0o[0-7](_?[0-7])*/,
+      /0x[0-9a-fA-F](_?[0-9a-fA-F])*/,
     )),
-    float: _ => token(prec(1, /[0-9][0-9_]*\.[0-9][0-9_]*/)),
+    float: _ => token(prec(1, /[0-9](_?[0-9])*\.[0-9](_?[0-9])*/)),
+
+    // A character literal is one byte between apostrophes — an integer in
+    // disguise (`'A'` = 65). The closing apostrophe tells it from a `'T` type
+    // var; the escape set is its own (`\'` here, `\"`/`\$` in strings).
+    char: _ => token(seq("'", choice(/[^\\']/, /\\[ntr0\\']/), "'")),
 
     boolean: _ => choice('true', 'false'),
 
@@ -179,7 +209,7 @@ module.exports = grammar({
     escape_sequence: _ => token.immediate(/\\(u\{[0-9a-fA-F]+\}|.)/),
     interpolation: $ => seq(token.immediate('${'), $._expression, '}'),
 
-    aggregate: $ => seq('[', optional(commaSep1(choice($.spread_element, $._expression))), ']'),
+    aggregate: $ => seq('[', optional(commaSepT(choice($.spread_element, $._expression))), ']'),
     spread_element: $ => seq('...', $._expression),
 
     // A `tuple` value shares the parens of a group/arg list: `()` is unit, and
@@ -196,7 +226,7 @@ module.exports = grammar({
     ),
     _tuple_element: $ => choice($.spread_element, $._expression),
 
-    data_literal: $ => seq('{', optional(commaSep1($._field_entry)), '}'),
+    data_literal: $ => seq('{', optional(commaSepT($._field_entry)), '}'),
     _field_entry: $ => choice($.field_init, $.field_spread),
     field_init: $ => choice(
       seq($.var_name, ':', $._expression),
@@ -213,7 +243,13 @@ module.exports = grammar({
       $.const_declaration,
       $.destructure_declaration,
       $.intrinsic_declaration,
+      $.static_declaration,
     )),
+
+    // `static [4096 Uint8] pool` — a module-level BSS byte buffer,
+    // program-lifetime, off every geometry. Uint8-only and comptime-sized are
+    // semantic rules; the bracket reuses the fixed-array type spelling.
+    static_declaration: $ => seq('static', $.bracket_type, $.var_name),
 
     data_declaration: $ => seq('data', $.type_name, optional($.generic_params), '=', $._data_body),
     type_declaration: $ => seq('type', $.type_name, optional($.generic_params), '=', $._data_body),
@@ -253,11 +289,14 @@ module.exports = grammar({
 
     intrinsic_declaration: $ => choice(
       seq('intrinsic', $.var_name, '=', $.intrinsic_signature),
+      // `intrinsic target: Os` — a bodyless comptime VALUE (no params, no `=`)
+      seq('intrinsic', $.var_name, ':', $._type),
       // type-valued intrinsic + its constructor; nullary form omits the `=`
       seq('intrinsic', 'type', $.type_name, optional(seq('=', $.constructor_signature))),
     ),
-    intrinsic_signature: $ => seq(optional($.generic_params), $.param_list, '->', $._type),
-    constructor_signature: $ => seq($.param_list, '->', $._type),
+    // the signature stops at the lambda's `:` return — no `->`, no body
+    intrinsic_signature: $ => seq(optional($.generic_params), $.param_list, ':', $._type),
+    constructor_signature: $ => seq($.param_list, ':', $._type),
 
     // ---- functions ---------------------------------------------------------
     // A stated return type is set off with `:` between the params and the `->`.
@@ -269,14 +308,14 @@ module.exports = grammar({
       choice($.block, $.asm_block, $._expression),
     )),
 
-    generic_params: $ => seq('[', commaSep1($.generic_param), ']'),
+    generic_params: $ => seq('[', commaSepT($.generic_param), ']'),
     generic_param: $ => choice(
       $.type_var,
       seq($._type, $.type_var),
       seq($._type, $.var_name),
     ),
 
-    param_list: $ => seq('(', optional(commaSep1($.param)), ')'),
+    param_list: $ => seq('(', optional(commaSepT($.param)), ')'),
     param: $ => choice(
       seq($._type, $.record_pattern),
       seq($._type, $.var_name),
@@ -376,13 +415,15 @@ module.exports = grammar({
     call_expression: $ => prec.left(PREC.postfix, seq(
       $._postfix, optional($.type_args), $.arguments,
     )),
-    type_args: $ => seq('[', commaSep1($._type_arg), ']'),
-    arguments: $ => seq('(', optional(commaSep1($._expression)), ')'),
+    type_args: $ => seq('[', commaSepT($._type_arg), ']'),
+    arguments: $ => seq('(', optional(commaSepT($._expression)), ')'),
 
     // A `type_name`/`member_access` in value position is a construction callee
     // (`Point(1, 2)`, `Uarch(fd)`, `Maybe.Just(1)`) — the PascalCase casing tells
-    // a construction apart from an ordinary snake_case call.
+    // a construction apart from an ordinary snake_case call. A `qualified_name`
+    // is a `::`-path reference (`str::eq`, `growing_arena::of`).
     _primary: $ => choice(
+      $.qualified_name,
       $.var_name,
       $.type_name,
       $.member_access,
@@ -429,11 +470,16 @@ module.exports = grammar({
     // The head may be a bare named type or a qualified member (`Node.IntLit(v)`).
     type_pattern: $ => seq(
       choice($.named_type, $.member_access),
-      optional(seq('(', commaSep1($._match_pattern), ')')),
+      optional(seq('(', commaSepT($._match_pattern), ')')),
     ),
 
     loop_expression: $ => seq('loop', optional($.var_name), $.block),
-    for_expression: $ => seq('for', $.var_name, 'in', $._expression, $._branch),
+    // one binder (`for x in`), or element + zero-based index (`for (x, i) in`).
+    for_expression: $ => seq(
+      'for',
+      choice($.var_name, seq('(', $.var_name, ',', $.var_name, ')')),
+      'in', $._expression, $._branch,
+    ),
     // The EBNF gives `break`/`continue` an optional loop label. Because this
     // grammar treats newlines as insignificant, an optional trailing label would
     // greedily swallow the next statement's leading name (`break` <nl> `i = …`),
@@ -453,12 +499,26 @@ module.exports = grammar({
     tuple_pattern: $ => seq('(', commaSep1($._pattern_elem), optional(','), ')'),
 
     // ---- imports -----------------------------------------------------------
-    import_declaration: $ => seq(optional('pub'), 'import', $.string, 'as', $._import_alias),
-    _import_alias: $ => choice($.var_name, $.type_name, $.import_list),
-    import_list: $ => seq('{', commaSep1(choice($.var_name, $.type_name)), optional(','), '}'),
+    // `import a::b::c` binds the last segment; `::{ x, Y }` destructures
+    // members; `as n` renames the namespace; `as *` splices the whole exported
+    // surface flat. `pub import` is a reexport.
+    import_declaration: $ => seq(
+      optional('pub'), 'import', $.module_path,
+      optional(choice(
+        seq('::', $.import_list),
+        seq('as', choice($.var_name, '*')),
+      )),
+    ),
+    module_path: $ => seq($._path_seg, repeat(seq('::', $._path_seg))),
+    import_list: $ => seq('{', commaSepT(choice($.var_name, $.type_name)), '}'),
   },
 });
 
 function commaSep1(rule) {
   return seq(rule, repeat(seq(',', rule)));
+}
+
+// A comma-separated list with the optional trailing comma every cf list allows.
+function commaSepT(rule) {
+  return seq(rule, repeat(seq(',', rule)), optional(','));
 }

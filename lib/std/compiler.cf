@@ -7,20 +7,22 @@
 # for tools that need finer control.
 
 import std::data::{ Either }
-import std::str::{ eq }
+import std::data::str::{ eq }
 import std::io::console::{ die }
 import std::io::file::{ create, close }
 import std::io::fd::{ Fd, IoRrr }
 import std::sys::{ Os, Arch }
 import std::compiler::ast::{ Program }
-import std::compiler::resolve::{ resolve_program! }
-import std::compiler::monomorph::{ mono_program! }
+import std::compiler::diag::{ Diag, sort_diags }
+import std::compiler::resolve::{ resolve_program!, Resolved }
+import std::compiler::monomorph::{ mono_program!, MonoOut }
 import std::compiler::materialize::{ materialize_program!, Mat }
-import std::compiler::typecheck::{ check_program! }
+import std::compiler::typecheck::{ check_program!, check_unreachable! }
+import std::compiler::spans::{ strip_program, strip_funcs }
 import std::compiler::alloc::{ check_alloc_program!, check_root_program! }
 import std::compiler::hoist_defertap::{ hoist_defertaps! }
 import std::compiler::defer::{ lower_defers! }
-import std::compiler::closures::{ lift_program! }
+import std::compiler::closures::{ lift_program!, check_dropped_captures! }
 import std::compiler::routing::{
 	routing_tables!,
 	routing_check!,
@@ -42,8 +44,13 @@ import std::compiler::emit::{ emit_program! }
 # PRE-mono (so the color is per SOURCE function), monomorphize, Materialize the std-source
 # geometries, typecheck, hoist defer-taps, lower defers, lift closures, compute the routing tables
 # ONCE (feeding the oracle tripwire, `--dump-routing`, and emit's classification-at-birth), reject
-# unsound geometry teardown/escape, then emit. Compile errors `die` with a diagnostic; only the two
-# output-file opens surface as recoverable failures here (also via `die`).
+# unsound geometry teardown/escape, then emit.
+#
+# TYPE errors come back as VALUES: a non-empty `[Diag]` list (one located error per declaration,
+# collected across the whole program) means the program was rejected and nothing was emitted —
+# the caller (the CLI edge, an LSP) decides how to present them. An empty list is success.
+# Errors in the passes BEFORE typecheck (lexing, parsing, resolution, the `!` algebra, monomorph)
+# still `die` fail-fast, as do the two output-file opens.
 pub const compile! = (
 	Str input,
 	Str out_qbe,
@@ -54,15 +61,17 @@ pub const compile! = (
 	Bool dump_routing,
 	Bool skip_embeds,
 	Str build_version,
-): Iarch -> {
+): [Diag] -> {
 	# front end: resolve the entry module and its transitive imports (lexing and parsing
 	# each) into one flattened AST — module_system §8
-	const Program raw = resolve_program!(input, target_os, target_arch)
+	const Resolved rz = resolve_program!(input, "", target_os, target_arch)
+	const Program raw = rz.prog
 
 	# the `!` allocation algebra, checked both ways (memory_model §5) — UNCONDITIONAL: the whole
 	# tree (compiler + lib + corpus) is colored, so there is no flag. Run PRE-mono so the color is
 	# per SOURCE function (a generic that may allocate in any instantiation is `!` once).
-	check_alloc_program!(raw)
+	# COLLECTED (D2): every mis-colored declaration reports in one run.
+	const [Diag] adiags = check_alloc_program!(raw)
 
 	# root-allocation validation (memory_model §2): reject residue placed on the ROOT page —
 	# UNCONDITIONAL, no flag. Every program must run its allocating work `in` some arena; only the
@@ -71,11 +80,24 @@ pub const compile! = (
 	# grafts alike — so the binary provably never dynamically allocates.
 	const Bool zero_root = match target_os { Os.Bare -> root_size == 0, _ -> false }
 
-	check_root_program!(raw, zero_root)
+	const [Diag] rdiags = check_root_program!(raw, zero_root)
+	const [Diag] gdiags = sort_diags([...adiags, ...rdiags])
+
+	# a mis-colored program stops HERE, before monomorph: the passes below still die fail-fast
+	# on their own rejections, and a die with a pending collected report would MASK it (the
+	# known_ty_at lesson) — so gate diags return alone rather than merging with typecheck's
+	if Iarch(gdiags.len) > 0 then return gdiags
 
 	# monomorphize generic functions into concrete instances (type_system §8.1) — after this
-	# the program has no generic templates, only ordinary functions
-	const Program mono = mono_program!(raw)
+	# the program has no generic templates, only ordinary functions. COLLECTED (D2): every
+	# failed instantiation reports in one run; the pass's output is unusable then (missing
+	# instances), so its diags return ALONE — typecheck on the broken table would only add
+	# "undefined function" cascades on top.
+	const MonoOut mo = mono_program!(raw)
+
+	if Iarch(mo.diags.len) > 0 then return sort_diags(mo.diags)
+
+	const Program mono = mo.prog
 
 	# the Materialize substep of the Memory arc (geometry_lowering §2): duplicate per
 	# (fn × geometry) under the std-source geometries, retarget the `in b` seed calls, and
@@ -86,13 +108,28 @@ pub const compile! = (
 	const Mat mm = materialize_program!(mono, raw)
 	const Program prog = mm.prog
 
-	# middle: typecheck (rejects type errors before any output is produced)
-	check_program!(prog)
+	# middle: typecheck (rejects type errors before any output is produced) — a rejection
+	# returns the collected diagnostics; no output files are touched. The declarations
+	# Materialize pruned as unreachable are checked too, against the PRE-materialize tables:
+	# uncalled code is still written code, and its errors must not vanish with the pruning.
+	const [Diag] tdiags = check_program!(prog, input, true, rz.maps)
+	const [Diag] xdiags = check_unreachable!(mm.dropped, mono.funcs, mono.recs, mono.unions, rz.maps)
+	const [Diag] diags = sort_diags([...tdiags, ...xdiags])
+
+	if Iarch(diags.len) > 0 then return diags
+
+	# closures inside pruned declarations still validate their captures — the same fail-fast
+	# classification the real lift below applies to live code
+	# spans end here: remove every `Expr.At` so the lowering passes and emit see the
+	# pre-spans shapes (the dropped decls' bodies carry them too — the capture check lifts)
+	const Program clean = strip_program(prog)
+
+	check_dropped_captures!(strip_funcs(mm.dropped), mono.recs, mono.funcs)
 
 	# lift `defer`-tap VALUES (`defer f(x)` / `|> defer f`) out of expression position into a
 	# snapshot binding + a scheduled `defer` statement (memory_model §6) — before lower_defers, so
 	# the emitted `Stmt.Defer`s are lowered like any other
-	const Program tapped = hoist_defertaps!(prog)
+	const Program tapped = hoist_defertaps!(clean)
 
 	# lower `defer` to explicit scope-exit code (memory_model §6): rewrite each `return e` in a
 	# defer-bearing function to snapshot the value, run the pending defers (LIFO), then return —
@@ -138,7 +175,60 @@ pub const compile! = (
 	close(qf)
 	close(af)
 
-	return 0
+	return []
+}
+
+# Check one entry module WITHOUT emitting: the full validation pipeline — resolve, the `!`
+# and root gates, monomorph, materialize, typecheck (reachable AND pruned declarations),
+# the defer/closure lowerings and the routing rejections — returning every collected
+# diagnostic, tier by tier exactly as `compile!` would, with ONE relaxation: the input is
+# a MODULE TREE, not a program, so `pub const main` is optional (a `main` that is present
+# still validates its shape). No output file is touched. The
+# passes that still die fail-fast (lexing, parsing, module resolution) die here too, so a
+# caller that must survive them (an LSP server) runs this in a CHILD process (`cf check`).
+# A non-empty `src` names a file whose BYTES stand in for the entry's (an editor's unsaved
+# buffer); `input` remains the entry's identity — its diag stamps and import base.
+pub const check! = (Str input, Str src, Os target_os, Arch target_arch, Iarch root_size): [Diag] -> {
+	const Resolved rz = resolve_program!(input, src, target_os, target_arch)
+	const Program raw = rz.prog
+	const [Diag] adiags = check_alloc_program!(raw)
+
+	const Bool zero_root = match target_os { Os.Bare -> root_size == 0, _ -> false }
+
+	const [Diag] rdiags = check_root_program!(raw, zero_root)
+	const [Diag] gdiags = sort_diags([...adiags, ...rdiags])
+
+	if Iarch(gdiags.len) > 0 then return gdiags
+
+	const MonoOut mo = mono_program!(raw)
+
+	if Iarch(mo.diags.len) > 0 then return sort_diags(mo.diags)
+
+	const Program mono = mo.prog
+	const Mat mm = materialize_program!(mono, raw)
+	const Program prog = mm.prog
+	const [Diag] tdiags = check_program!(prog, input, false, rz.maps)
+	const [Diag] xdiags = check_unreachable!(mm.dropped, mono.funcs, mono.recs, mono.unions, rz.maps)
+	const [Diag] diags = sort_diags([...tdiags, ...xdiags])
+
+	if Iarch(diags.len) > 0 then return diags
+
+	# spans end here: remove every `Expr.At` so the lowering passes and emit see the
+	# pre-spans shapes (the dropped decls' bodies carry them too — the capture check lifts)
+	const Program clean = strip_program(prog)
+
+	check_dropped_captures!(strip_funcs(mm.dropped), mono.recs, mono.funcs)
+
+	const Program tapped = hoist_defertaps!(clean)
+	const Program deferred = lower_defers!(tapped)
+	const Program lowered = lift_program!(deferred)
+	const RouteInfo ri = routing_tables!(lowered)
+
+	routing_check!(lowered, ri)
+	check_destroy!(lowered, ri)
+	check_geom_escape!(lowered)
+
+	return []
 }
 
 # Extract the opened `Fd` from `create`'s outcome, or `die` with `msg` if it failed. `die` never

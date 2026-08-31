@@ -1,0 +1,211 @@
+# std::compiler::diag — located compile-error reporting. A rejection names its source position
+# as a `path:line:col: ` prefix (1-based line, 1-based byte column) so an error is searchable
+# and clickable. The line scan is lazy — it runs only on the error path, from the byte offset
+# the caller already holds. Everything here is COLORLESS on purpose: a rejection may fire from
+# any fn, `!` or not, so the location is printed piecewise (no interpolation, no residue).
+
+import std::io::console::{ eprint, die }
+import std::data::str::{ eq, slice }
+
+# Print one decimal digit to stderr as a literal write (the colorless integer print's leaf).
+const eput_digit = (Iarch d): () -> {
+	if d == 0 then eprint("0")
+	if d == 1 then eprint("1")
+	if d == 2 then eprint("2")
+	if d == 3 then eprint("3")
+	if d == 4 then eprint("4")
+	if d == 5 then eprint("5")
+	if d == 6 then eprint("6")
+	if d == 7 then eprint("7")
+	if d == 8 then eprint("8")
+	if d == 9 then eprint("9")
+}
+
+# Print a non-negative integer's decimal digits to stderr, high digit first.
+const eput_int = (Iarch n): () -> {
+	if n >= 10 then eput_int(n / 10)
+	eput_digit(n % 10)
+}
+
+# Print the `file:line:col: ` prefix of a located diagnostic to stderr (the shared leaf of
+# `die_at_lc` and `print_diags`).
+const eprint_at_lc = (Str file, Iarch line, Iarch col): () -> {
+	# a module path built for the open syscall carries its terminating NUL in `len`; the
+	# printed position must not (editors match on the clean `path:line:col:` prefix)
+	let Iarch n = Iarch(file.len)
+
+	loop {
+		if n <= 0 then break
+		if Iarch(file[n - 1]) != 0 then break
+		n = n - 1
+	}
+
+	eprint(slice(0, n, file))
+	eprint(":")
+	eput_int(line)
+	eprint(":")
+	eput_int(col)
+	eprint(": ")
+}
+
+# Die with `msg` prefixed by an already-computed `file:line:col: ` (a declaration's stamp, or
+# any position the caller has resolved).
+pub const die_at_lc = (Str file, Iarch line, Iarch col, Str msg): Never -> {
+	eprint_at_lc(file, line, col)
+	die(msg)
+}
+
+# One collected compile error: a source position (a declaration's stamp), its message, and
+# optionally the OFFENDER's name (`what` — a type/variable name the message is about, carried
+# separately because recording is colorless and cannot interpolate; the printer composes it).
+# The typechecker returns these as VALUES at the pass boundary — nothing below the CLI edge
+# prints or exits (errors-as-values, the D1 diagnostics design).
+pub data Diag = { Str file, Iarch line, Iarch col, Str msg, Str what }
+
+# The single-slot pending diagnostic a checking pass records into, threaded as a `*DiagBag`
+# alongside `Ctx`. One slot, first error wins (`hot`), so RECORDING is colorless — plain field
+# stores, no allocation — and any helper, `!` or not, may reject. The driving loop flushes the
+# slot into its `[Diag]` between declarations (one error per declaration).
+pub data DiagBag = { Bool hot, Str file, Iarch line, Iarch col, Str msg, Str what, Iarch eoff }
+
+# Record a located rejection naming its offender (`what` — a 16-byte field store, so even a
+# colorless site can say WHICH name it rejected): latch the FIRST error and ignore the rest
+# until the driver flushes the slot.
+pub const drec_w = (*DiagBag dg, Str file, Iarch line, Iarch col, Str msg, Str what): () -> {
+	if dg.hot then return ()
+	dg.hot = true
+	dg.file = file
+	dg.line = line
+	dg.col = col
+	dg.msg = msg
+	dg.what = what
+}
+
+# Record a located rejection into the bag: latch the FIRST error and ignore the rest until
+# the driver flushes the slot. Colorless on purpose.
+pub const drec = (*DiagBag dg, Str file, Iarch line, Iarch col, Str msg): () ->
+	drec_w(dg, file, line, col, msg, "")
+
+# A fresh empty bag for a caller that hands one to a shared checking helper and copies any
+# latched rejection into its own collector afterwards (the monomorph pass's inference).
+pub const record_dg = (): DiagBag ->
+	DiagBag({ hot: false, file: "", line: 0, col: 0, msg: "", what: "", eoff: -1 })
+
+# Byte-lexicographic `<` over two strings (file paths grouping, for diagnostic order).
+const str_lt = (Str a, Str b): Bool -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(a.len) || i >= Iarch(b.len) then break
+		if Iarch(a[i]) != Iarch(b[i]) then return Iarch(a[i]) < Iarch(b[i])
+		i = i + 1
+	}
+
+	return Iarch(a.len) < Iarch(b.len)
+}
+
+const diag_before = (Diag a, Diag b): Bool -> {
+	if !eq(a.file, b.file) then return str_lt(a.file, b.file)
+	if a.line != b.line then return a.line < b.line
+
+	return a.col < b.col
+}
+
+# The same report, byte for byte — a materialize per-geometry copy and its template, or a
+# reachable and a pruned checking pass, may each record the identical rejection; one suffices.
+const diag_same = (Diag a, Diag b): Bool ->
+	a.line == b.line && a.col == b.col && eq(a.file, b.file) && eq(a.msg, b.msg) && eq(a.what, b.what)
+
+# Order collected diagnostics by (file, line, col) — so a report reads top-to-bottom per
+# file regardless of the order the passes visited declarations — and DROP exact duplicates
+# (the same declaration checked through two paths reports once). Insertion by rebuild — n is
+# the ERROR count, so the quadratic rebuild is irrelevant.
+pub const sort_diags = ([Diag] ds): [Diag] -> {
+	let [Diag] out = []
+
+	for d in ds {
+		let Iarch pos = Iarch(out.len)
+		let Iarch i = 0
+		let Bool dup = false
+
+		loop {
+			if i >= Iarch(out.len) then break
+
+			if diag_same(d, out[i]) then {
+				dup = true
+				break
+			}
+
+			if diag_before(d, out[i]) then {
+				pos = i
+				break
+			}
+			i = i + 1
+		}
+
+		if dup then continue
+
+		let [Diag] nx = []
+		let Iarch j = 0
+
+		loop {
+			if j >= pos then break
+			nx = [...nx, out[j]]
+			j = j + 1
+		}
+
+		nx = [...nx, d]
+
+		loop {
+			if j >= Iarch(out.len) then break
+			nx = [...nx, out[j]]
+			j = j + 1
+		}
+
+		out = nx
+	}
+
+	return out
+}
+
+# Print every collected diagnostic to stderr, `file:line:col: msg` each — with the offender
+# composed in (` \`what\``) when the recorder named one. The one place a diagnostic becomes
+# TEXT — called at the CLI edge, never inside a pass (`!`: the newline trim is a fresh header).
+pub const print_diags! = ([Diag] ds): () -> {
+	for d in ds {
+		eprint_at_lc(d.file, d.line, d.col)
+
+		if Iarch(d.what.len) == 0 then {
+			eprint(d.msg)
+		} else {
+			# the message ends with its newline — print it without, name the offender, close
+			eprint(Str({ bytes: d.msg.bytes, len: Iarch(d.msg.len) - 1 }))
+			eprint(" `")
+			eprint(d.what)
+			eprint("`\n")
+		}
+	}
+}
+
+# Die with `msg` prefixed by `file:line:col: ` — the position of byte `off` in `src`. A tab
+# counts one column (columns are bytes, what editors' goto-position takes).
+pub const die_at = (Str file, *[Uint8] src, Iarch off, Str msg): Never -> {
+	let Iarch line = 1
+	let Iarch col = 1
+	let Iarch i = 0
+
+	loop {
+		if i >= off then break
+
+		if Iarch(src[i]) == 10 then {
+			line = line + 1
+			col = 1
+		} else {
+			col = col + 1
+		}
+
+		i = i + 1
+	}
+
+	die_at_lc(file, line, col, msg)
+}

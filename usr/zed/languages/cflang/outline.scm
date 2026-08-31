@@ -15,6 +15,10 @@
   "intrinsic" @context
   (var_name) @name) @item
 
+(static_declaration
+  "static" @context
+  (var_name) @name) @item
+
 ; a `const`/`let` bound to a lambda — a function definition
 (const_declaration
   "const" @context

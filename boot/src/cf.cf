@@ -12,13 +12,29 @@
 # argv/env discipline the environment is read here and threaded down explicitly (to resolve `cc` on
 # PATH), never accessed ambiently.
 
-import std::str::{ eq }
+import std::data::str::{ eq, slice }
 import std::sys::{ Os, Arch }
-import cli::{ Cli, cli_parse!, FmtCli, is_fmt_cmd, fmt_cli_parse, is_version_cmd, is_help_cmd }
+import std::comptime::os
+import cli::{
+	Cli,
+	cli_parse!,
+	FmtCli,
+	is_fmt_cmd,
+	fmt_cli_parse,
+	is_version_cmd,
+	is_help_cmd,
+	host_arch,
+}
 import std::compiler::buildinfo::{ compiler_version }
 import fmt::{ format_file! }
 import docs::{ docs_run! }
-import std::compiler::{ compile! }
+import lsp::{ lsp_run! }
+import std::compiler::{ compile!, check! }
+import std::compiler::ast::{ Program }
+import std::compiler::resolve::{ resolve_program!, Resolved, entry_binds!, Loaded }
+import std::compiler::parser::{ BindEv }
+import std::compiler::spans::{ line_col_of, LC, SrcMap }
+import std::compiler::diag::{ Diag, print_diags! }
 import std::mem::arena::growing_arena
 import qbe::{ qbe_translate }
 import std::process::{ run!, find_executable!, getpid, exit }
@@ -29,7 +45,8 @@ import std::io::console::{ eprint, print, println }
 
 # target_os/arch -> the embedded QBE's target id (see qbe_translate): darwin arm64_apple = 0,
 # arm64 ELF (bare metal / linux) = 1, amd64_apple = 2, amd64_sysv = 3, rv64 = 4. Linux-arm64 and
-# bare-arm64 share QBE's `T_arm64` (SysV ELF, no-underscore symbols); linux-riscv64 selects `T_rv64`;
+# bare-arm64 share QBE's `T_arm64` (SysV ELF, no-underscore symbols); linux-riscv64 selects
+# `T_rv64`;
 # the two amd64 targets select `T_amd64_apple`/`T_amd64_sysv`. Only the floor/link differ per arch.
 const target_id_of = (Cli c): Iarch -> match c.target_os {
 	Os.Bare -> 1,
@@ -52,7 +69,8 @@ const need_tool! = ([Str] env, Str name): Str -> match find_executable!(env, nam
 }
 
 # darwin link: one `cc` call assembles the floor + program asm and links a Mach-O with the floor's
-# own `_start` entry (no libc symbol used, but darwin needs -lSystem present for the loader). `-arch`
+# own `_start` entry (no libc symbol used, but darwin needs -lSystem present for the loader).
+# `-arch`
 # tracks the target arch (arm64 or x86_64), so an Apple-Silicon host can cross-assemble+link a
 # darwin-amd64 binary (runnable under Rosetta 2) and vice versa.
 const link_darwin! = ([Str] env, Str floor_s, Str prog_s, Str out, Arch arch): Iarch -> {
@@ -153,10 +171,12 @@ const link_bare! = ([Str] env, Str floor_s, Str prog_s, Str out, Iarch pid, Bool
 # linux link: assemble the floor + program as ELF objects with `clang`'s backend for the target arch
 # (works on any host — a darwin box cross-assembles a linux object just as it does a bare one), then
 # link a STATIC, freestanding executable with `ld.lld`. No linker script and no crt: the floor owns
-# `_start` and the program never touches libc, so `-static -e _start` over the two objects is the whole
+# `_start` and the program never touches libc, so `-static -e _start` over the two objects is the
+# whole
 # link. `-nostdlib` is implicit — nothing but our objects is fed to the linker. The `-target` triple
 # tracks `arch`: aarch64 or riscv64 (both `*-linux-gnu`). NOTE the resolved `clang` must support the
-# target arch — Apple's clang lacks a RISC-V backend, so cross-building riscv64 needs an LLVM `clang`
+# target arch — Apple's clang lacks a RISC-V backend, so cross-building riscv64 needs an LLVM
+# `clang`
 # ahead of it on PATH (a native riscv64 host's `cc` already qualifies).
 const link_linux! = (
 	[Str] env,
@@ -196,9 +216,477 @@ const link_linux! = (
 	return lr
 }
 
+# `cf check`: validate one module tree, print every located diagnostic, exit 1 on any. The
+# target defaults to the HOST (the target this compiler was built for, folded at comptime);
+# `src` (may be empty) stands in for the entry's bytes — an editor's unsaved buffer.
+const run_check! = (Str input, Str src): Iarch -> {
+	const [Diag] ds = check!(input, src, os::target, host_arch(), 1048576)
+
+	if Iarch(ds.len) > 0 then {
+		print_diags!(ds)
+
+		return 1
+	}
+
+	return 0
+}
+
+# A view of `s` without its trailing NULs — a module path built for the open syscall carries
+# its terminating NUL in `Str.len`, and a printed path must not (the diag printer's lesson).
+const trim_nul = (Str s): Str -> {
+	let Iarch n = Iarch(s.len)
+
+	loop {
+		if n <= 0 then break
+		if Iarch(s[n - 1]) != 0 then break
+		n = n - 1
+	}
+
+	return slice(0, n, s)
+}
+
+# Whether `s` is one of `xs`.
+const has_str = ([Str] xs, Str s): Bool -> {
+	for x in xs {
+		if eq(x, s) then return true
+	}
+
+	return false
+}
+
+# `cf lsp modules <input.cf> [--src <buf>]`: resolve the entry's module tree — the front end
+# only, no checking — and print each declaration-bearing source file once, one per line (the
+# entry first, its transitive imports after). The declaration stamps the resolver leaves on
+# every function/record/union name their defining file, so the distinct stamp set IS the module
+# list. The LSP's goto-definition index: it line-scans these files for top-level declarations.
+const run_modules! = (Str input, Str src): Iarch -> {
+	const Resolved rz = resolve_program!(input, src, os::target, host_arch())
+	const Program raw = rz.prog
+	let [Str] mods = []
+
+	for f in raw.funcs {
+		const Str p = trim_nul(f.dfile)
+		if Iarch(p.len) > 0 && !has_str(mods, p) then mods = [...mods, p]
+	}
+
+	for r in raw.recs {
+		const Str p = trim_nul(r.dfile)
+		if Iarch(p.len) > 0 && !has_str(mods, p) then mods = [...mods, p]
+	}
+
+	for u in raw.unions {
+		const Str p = trim_nul(u.dfile)
+		if Iarch(p.len) > 0 && !has_str(mods, p) then mods = [...mods, p]
+	}
+
+	for m in mods {
+		println(m)
+	}
+
+	return 0
+}
+
+# A decimal string as an Iarch (leading digits only — the `cf lsp def` offset argument).
+const dec_of = (Str s): Iarch -> {
+	let Iarch v = 0
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(s.len) then break
+		const Iarch d = Iarch(s[i]) - 48
+		if d < 0 || d > 9 then break
+		v = v * 10 + d
+		i = i + 1
+	}
+
+	return v
+}
+
+# The byte offset of the innermost binding of `name` still live at `off`, or -1 — the shared
+# replay of `cf lsp def` and `cf lsp refs`. Bind events (kinds 2..5 — never a kind-6 USE)
+# collect with their scope depth; a scope close drops its own binds; the LAST survivor is the
+# binding the cursor sees.
+const binder_at! = ([BindEv] evs, Iarch off, Str name): Iarch -> {
+	let Iarch depth = 0
+	let [Iarch] boffs = []
+	let [Iarch] bdeps = []
+
+	for ev in evs {
+		if ev.off > off then break
+		if ev.kind == 0 then depth = depth + 1
+		if ev.kind == 1 then {
+			# the scope closed before the cursor — its binds are out of sight
+			let [Iarch] ko = []
+			let [Iarch] kd = []
+
+			for (b, i) in boffs {
+				if bdeps[i] < depth then {
+					ko = [...ko, b]
+					kd = [...kd, bdeps[i]]
+				}
+			}
+
+			boffs = ko
+			bdeps = kd
+			depth = depth - 1
+		}
+		if ev.kind >= 2 && ev.kind <= 5 && eq(ev.name, name) then {
+			boffs = [...boffs, ev.off]
+			bdeps = [...bdeps, depth]
+		}
+	}
+
+	if Iarch(boffs.len) == 0 then return -1
+
+	return boffs[Iarch(boffs.len) - 1]
+}
+
+# `cf lsp def <input.cf> <off> <name> [--src <buf>]`: the LOCAL binding of `name` visible at
+# byte offset `off` in the entry — a parameter, a `let`/`const` local, a `for` binder, or a
+# match payload bind. Prints the binder's 1-based `line:col` when a local binds the name,
+# nothing otherwise — the LSP then falls back to its top-level declaration index. The entry
+# parses ALONE (no imports followed): locals live in the one file.
+const run_def! = (Str input, Str src, Iarch off, Str name): Iarch -> {
+	const Loaded ld = entry_binds!(input, src, os::target, host_arch())
+	const Iarch b = binder_at!(ld.evs, off, name)
+	if b < 0 then return 0
+	const [SrcMap] maps = [ld.map]
+	const LC lc = line_col_of(maps, input, b)
+	if lc.line <= 0 then return 0
+	println("${lc.line}:${lc.col}")
+
+	return 0
+}
+
+# `cf lsp refs <input.cf> <off> <name> [--src <buf>]`: every reference to the LOCAL binding
+# of `name` visible at `off` — the binder line first, then each use bound to it, one 1-based
+# `line:col` per line. Nothing when the name is no local: a top-level name's references cross
+# module files, and a partial answer would make rename a code-breaking edit — refuse rather
+# than guess. A second replay walks the WHOLE log keeping the innermost live bind of the
+# name; a kind-6 use belongs to the sought binder exactly when that live bind is it.
+# References of a TOP-LEVEL name in the entry — the `cf lsp refs` fallback when no local
+# binds it. Only a NON-pub declaration answers: a pub name's uses cross module files, so a
+# partial list would mislead and a rename built from one would corrupt. Prints `top` then
+# each use `line:col` — the kind-6 events with NO live local bind of the name (a local
+# shadow owns its uses). The declaration row itself is the server's to add: its line scan
+# already indexes decl-name spans. A TYPE name (a record or union declared in this file)
+# answers too — its uses in type positions log the same kind-6 events — but its `pub` is
+# discarded at parse ("a later brick"), so the SERVER gates a pub type from its own
+# decl-line scan before trusting the answer.
+const top_refs! = (Loaded ld, Str input, Str name): Iarch -> {
+	# a `Base.member` COMPOSITE names a union MEMBER — the parser logs member uses under
+	# the same composite, so the replay below collects them like any other name
+	let Iarch dot = -1
+	let Iarch di = 0
+
+	loop {
+		if di >= Iarch(name.len) then break
+
+		if Iarch(name[di]) == 46 then {
+			dot = di
+			break
+		}
+
+		di = di + 1
+	}
+
+	let Bool found = false
+
+	if dot > 0 then {
+		const Str base = slice(0, dot, name)
+		const Str member = slice(dot + 1, Iarch(name.len), name)
+
+		for u in ld.prog.unions {
+			if eq(u.name, base) then {
+				for m in u.members {
+					if eq(m.name, member) then found = true
+				}
+			}
+		}
+	} else {
+		for f in ld.prog.funcs {
+			if eq(f.name, name) then {
+				if f.is_pub then return 0
+				found = true
+			}
+		}
+
+		if !found then {
+			for r in ld.prog.recs {
+				if eq(r.name, name) then found = true
+			}
+		}
+
+		if !found then {
+			for u in ld.prog.unions {
+				if eq(u.name, name) then found = true
+			}
+		}
+	}
+
+	if !found then return 0
+	println("top")
+	let Iarch depth = 0
+	let [Iarch] loffs = []
+	let [Iarch] ldeps = []
+	const [SrcMap] maps = [ld.map]
+
+	for ev in ld.evs {
+		if ev.kind == 0 then depth = depth + 1
+		if ev.kind == 1 then {
+			let [Iarch] ko = []
+			let [Iarch] kd = []
+
+			for (b, i) in loffs {
+				if ldeps[i] < depth then {
+					ko = [...ko, b]
+					kd = [...kd, ldeps[i]]
+				}
+			}
+
+			loffs = ko
+			ldeps = kd
+			depth = depth - 1
+		}
+		if ev.kind >= 2 && ev.kind <= 5 && eq(ev.name, name) then {
+			loffs = [...loffs, ev.off]
+			ldeps = [...ldeps, depth]
+		}
+		if ev.kind == 6 && eq(ev.name, name) && Iarch(loffs.len) == 0 then {
+			const LC lc = line_col_of(maps, input, ev.off)
+			if lc.line > 0 then println("${lc.line}:${lc.col}")
+		}
+	}
+
+	return 0
+}
+
+const run_refs! = (Str input, Str src, Iarch off, Str name): Iarch -> {
+	const Loaded ld = entry_binds!(input, src, os::target, host_arch())
+	const Iarch target = binder_at!(ld.evs, off, name)
+	if target < 0 then return top_refs!(ld, input, name)
+	let [Iarch] refs = [target]
+	let Iarch depth = 0
+	let [Iarch] uoffs = []
+	let [Iarch] udeps = []
+
+	for ev in ld.evs {
+		if ev.kind == 0 then depth = depth + 1
+		if ev.kind == 1 then {
+			let [Iarch] ko = []
+			let [Iarch] kd = []
+
+			for (b, i) in uoffs {
+				if udeps[i] < depth then {
+					ko = [...ko, b]
+					kd = [...kd, udeps[i]]
+				}
+			}
+
+			uoffs = ko
+			udeps = kd
+			depth = depth - 1
+		}
+		if ev.kind >= 2 && ev.kind <= 5 && eq(ev.name, name) then {
+			uoffs = [...uoffs, ev.off]
+			udeps = [...udeps, depth]
+		}
+		if ev.kind == 6 && eq(ev.name, name) && Iarch(uoffs.len) > 0 then {
+			if uoffs[Iarch(uoffs.len) - 1] == target then refs = [...refs, ev.off]
+		}
+	}
+
+	const [SrcMap] maps = [ld.map]
+
+	for r in refs {
+		const LC lc = line_col_of(maps, input, r)
+		if lc.line > 0 then println("${lc.line}:${lc.col}")
+	}
+
+	return 0
+}
+
+# Whether `s` ends with `<sep><name>` — the tail test for a mangled qualified use: the strip
+# joins a namespace-alias use `str::eq` into `<prefix>\x01eq` and a full importless path
+# `std::data::str::eq` into `std_data_str_eq`, both synthesized ONTO the member's own token
+# (start/len), so a tail match finds the member and its event offset IS the member's position.
+const ends_with_sep = (Str s, Str name, Iarch sep): Bool -> {
+	const Iarch sl = Iarch(s.len)
+	const Iarch nl = Iarch(name.len)
+	if sl <= nl then return false
+	if Iarch(s[sl - nl - 1]) != sep then return false
+	let Iarch i = 0
+
+	loop {
+		if i >= nl then break
+		if Iarch(s[sl - nl + i]) != Iarch(name[i]) then return false
+		i = i + 1
+	}
+
+	return true
+}
+
+# The uses replay of one loaded module: print every use of the top-level `name` — bare uses
+# not owned by a live local shadow, namespace-alias and flat full-path uses (tail-matched
+# through the strip's manglings), and import-list members — one `line:col` per line, in
+# source order, each prefixed `pfx<TAB>` when `pfx` is non-empty. The `_`-tail match is
+# deliberately LOOSE (`do_eq` tails `_eq`) — the server verifies every position against the
+# line's actual text before trusting it.
+const print_uses! = (Loaded ld, Str input, Str name, Str pfx): () -> {
+	const [SrcMap] maps = [ld.map]
+	let Iarch depth = 0
+	let [Iarch] loffs = []
+	let [Iarch] ldeps = []
+
+	for ev in ld.evs {
+		if ev.kind == 0 then depth = depth + 1
+		if ev.kind == 1 then {
+			let [Iarch] ko = []
+			let [Iarch] kd = []
+
+			for (b, i) in loffs {
+				if ldeps[i] < depth then {
+					ko = [...ko, b]
+					kd = [...kd, ldeps[i]]
+				}
+			}
+
+			loffs = ko
+			ldeps = kd
+			depth = depth - 1
+		}
+		if ev.kind >= 2 && ev.kind <= 5 && eq(ev.name, name) then {
+			loffs = [...loffs, ev.off]
+			ldeps = [...ldeps, depth]
+		}
+		if ev.kind == 6 then {
+			let Bool hit = eq(ev.name, name) && Iarch(loffs.len) == 0
+			if !hit && ends_with_sep(ev.name, name, 1) then hit = true
+			if !hit && ends_with_sep(ev.name, name, 95) then hit = true
+
+			if hit then {
+				const LC lc = line_col_of(maps, input, ev.off)
+
+				if lc.line > 0 then {
+					if Iarch(pfx.len) > 0 then println("${pfx}\t${lc.line}:${lc.col}")
+					if Iarch(pfx.len) == 0 then println("${lc.line}:${lc.col}")
+				}
+			}
+		}
+	}
+}
+
+# `cf lsp uses <input.cf> <name> [--src <buf>]`: every use of the TOP-LEVEL name `name` in
+# THIS one file. The per-file cross-file-rename front end (`uses-all` batches a whole tree).
+const run_uses! = (Str input, Str src, Str name): Iarch -> {
+	const Loaded ld = entry_binds!(input, src, os::target, host_arch())
+	print_uses!(ld, input, name, "")
+
+	return 0
+}
+
+# `cf lsp uses-all <entry.cf> <name> [--src <buf>]`: the whole module tree's uses of the
+# top-level `name` in ONE run — resolve the tree (the same stamp walk as `cf lsp modules`),
+# then a tracked parse + replay per file, each row `path<TAB>line:col`. One process instead
+# of a child per file: the cross-file rename front end at tree scale. A parse-broken file
+# anywhere dies nonzero — the server discards the partial output rather than mis-rename.
+const run_uses_all! = (Str entry, Str src, Str name): Iarch -> {
+	const Resolved rz = resolve_program!(entry, src, os::target, host_arch())
+	const Program raw = rz.prog
+	let [Str] mods = []
+
+	for f in raw.funcs {
+		const Str p = trim_nul(f.dfile)
+		if Iarch(p.len) > 0 && !has_str(mods, p) then mods = [...mods, p]
+	}
+
+	for r in raw.recs {
+		const Str p = trim_nul(r.dfile)
+		if Iarch(p.len) > 0 && !has_str(mods, p) then mods = [...mods, p]
+	}
+
+	for u in raw.unions {
+		const Str p = trim_nul(u.dfile)
+		if Iarch(p.len) > 0 && !has_str(mods, p) then mods = [...mods, p]
+	}
+
+	for m in mods {
+		let Str msrc = ""
+		if eq(m, entry) then msrc = src
+		const Loaded ld = entry_binds!(m, msrc, os::target, host_arch())
+		print_uses!(ld, m, name, m)
+	}
+
+	return 0
+}
+
+# `cf lsp scope <input.cf> <off> [--src <buf>]`: every LOCAL binding visible at byte offset
+# `off` — one `line:col:kind:name` per line, INNERMOST FIRST, deduped by name (an inner
+# shadow hides its outer namesake). The completion source for locals: the replay collects
+# every live bind (any name) instead of one name's.
+const run_scope! = (Str input, Str src, Iarch off): Iarch -> {
+	const Loaded ld = entry_binds!(input, src, os::target, host_arch())
+	let Iarch depth = 0
+	let [Iarch] boffs = []
+	let [Iarch] bdeps = []
+	let [Iarch] bkinds = []
+	let [Str] bnames = []
+
+	for ev in ld.evs {
+		if ev.off > off then break
+		if ev.kind == 0 then depth = depth + 1
+		if ev.kind == 1 then {
+			let [Iarch] ko = []
+			let [Iarch] kd = []
+			let [Iarch] kk = []
+			let [Str] kn = []
+
+			for (b, i) in boffs {
+				if bdeps[i] < depth then {
+					ko = [...ko, b]
+					kd = [...kd, bdeps[i]]
+					kk = [...kk, bkinds[i]]
+					kn = [...kn, bnames[i]]
+				}
+			}
+
+			boffs = ko
+			bdeps = kd
+			bkinds = kk
+			bnames = kn
+			depth = depth - 1
+		}
+		if ev.kind >= 2 && ev.kind <= 5 then {
+			boffs = [...boffs, ev.off]
+			bdeps = [...bdeps, depth]
+			bkinds = [...bkinds, ev.kind]
+			bnames = [...bnames, ev.name]
+		}
+	}
+
+	const [SrcMap] maps = [ld.map]
+	let [Str] emitted = []
+	let Iarch i = Iarch(boffs.len) - 1
+
+	loop {
+		if i < 0 then break
+
+		if !has_str(emitted, bnames[i]) then {
+			emitted = [...emitted, bnames[i]]
+			const LC lc = line_col_of(maps, input, boffs[i])
+			if lc.line > 0 then println("${lc.line}:${lc.col}:${bkinds[i]}:${bnames[i]}")
+		}
+
+		i = i - 1
+	}
+
+	return 0
+}
+
 # The self-contained pipeline: compile the program to IL + floor (temp files), run the embedded QBE
 # on the IL, spawn the host toolchain to assemble+link, then clean up (unless `-P`). darwin links a
-# Mach-O with `cc`; `Bare` and `Linux` cross-assemble + link a freestanding ELF with `clang`/`ld.lld`
+# Mach-O with `cc`; `Bare` and `Linux` cross-assemble + link a freestanding ELF with
+# `clang`/`ld.lld`
 # (a bare flat image via a linker script, a linux static executable via `-static`).
 const run_full! = (Cli c, [Str] env): Iarch -> {
 	const Iarch pid = getpid()
@@ -206,7 +694,7 @@ const run_full! = (Cli c, [Str] env): Iarch -> {
 	const Str tfl = "/tmp/cf-${pid}.floor.s"
 	const Str tpr = "/tmp/cf-${pid}.prog.s"
 
-	compile!(
+	const [Diag] ds = compile!(
 		c.input,
 		til,
 		tfl,
@@ -217,6 +705,12 @@ const run_full! = (Cli c, [Str] env): Iarch -> {
 		c.skip_embeds,
 		c.build_version,
 	)
+
+	# type errors come back as values — the CLI edge is where they become text
+	if Iarch(ds.len) > 0 then {
+		print_diags!(ds)
+		exit(1)
+	}
 
 	const Iarch qr = qbe_translate(target_id_of(c), til, tpr)
 
@@ -248,8 +742,9 @@ const run_full! = (Cli c, [Str] env): Iarch -> {
 }
 
 # The help screen — the accurate command surface of THIS binary (reality), in the shape of
-# [[cf_cli.md]]. It lists only what cf implements today; the commands the spec defers (run/test/lint/
-# lsp) are named at the end as not-yet-implemented rather than advertised as working. Printed to stdout
+# [[cf_cli.md]]. It lists only what cf implements today; the commands the spec defers (run/test/
+# lint) are named at the end as not-yet-implemented rather than advertised as working. Printed to
+# stdout
 # for `cf`, `cf help`, `cf --help`, `cf -h`; the per-error usage lines (cli.cf) are the short form.
 const print_help = (): () -> {
 	println("cf — the C! compiler")
@@ -257,6 +752,8 @@ const print_help = (): () -> {
 	println("Usage:")
 	println("  cf [c|compile] <file.cf> -o <out> [options]   compile <file.cf> to a native binary")
 	println("  cf format <file|dir> [--check]                format C! source in place       (alias: f)")
+	println("  cf check <file.cf> [--src <buf>]              validate a module tree, no output")
+	println("  cf lsp                                        serve the Language Server Protocol on stdio")
 	println("  cf docs [<term>]                              browse the standard-library API")
 	println("  cf --version                                  print cf's own version          (alias: -V)")
 	println("  cf --help                                     show this help                  (alias: -h)")
@@ -271,7 +768,7 @@ const print_help = (): () -> {
 	println("  --skip-embeds                 emit without baking in std           (bootstrap seed only)")
 	println("  --dump-routing                print each function's escape/alias classification")
 	println("")
-	println("Specified but not yet implemented: run, test, lint, lsp (see root/specs/cf_cli.md).")
+	println("Specified but not yet implemented: run, test, lint (see root/specs/cf_cli.md).")
 }
 
 pub const main = ([Str] args, [Str] env) -> {
@@ -297,6 +794,85 @@ pub const main = ([Str] args, [Str] env) -> {
 		return format_file!(fc.path, fc.check) in fa
 	}
 
+	# `cf check <input.cf> [--src <file>]` — the full validation pipeline, no output: located
+	# diagnostics on stderr, exit 1 on any. The LSP server's per-request worker, and a fast
+	# editor loop. `--src` substitutes the entry's bytes (an unsaved buffer in a temp file).
+	if Iarch(args.len) >= 3 && eq(args[1], "check") then {
+		let Str csrc = ""
+		if Iarch(args.len) >= 5 && eq(args[3], "--src") then csrc = args[4]
+		const ka = growing_arena::of(16777216)
+
+		return run_check!(args[2], csrc) in ka
+	}
+
+	# `cf lsp` — the Language Server Protocol server over stdio (lsp.cf). Its plumbing rides
+	# under the same umbrella rather than spamming the top-level verb surface: `cf lsp modules
+	# <input.cf> [--src <file>]` prints the entry's resolved module tree one source file per
+	# line — the goto-definition index the server's child runs ask for.
+	if Iarch(args.len) >= 2 && eq(args[1], "lsp") then {
+		if Iarch(args.len) >= 4 && eq(args[2], "modules") then {
+			let Str msrc = ""
+			if Iarch(args.len) >= 6 && eq(args[4], "--src") then msrc = args[5]
+			const ma = growing_arena::of(16777216)
+
+			return run_modules!(args[3], msrc) in ma
+		}
+
+		# `cf lsp def <input.cf> <off> <name> [--src <file>]` — the local-binding definition
+		# of the name at a byte offset (parameters, locals, loop binders, match binds).
+		if Iarch(args.len) >= 6 && eq(args[2], "def") then {
+			let Str dsrc = ""
+			if Iarch(args.len) >= 8 && eq(args[6], "--src") then dsrc = args[7]
+			const da = growing_arena::of(16777216)
+
+			return run_def!(args[3], dsrc, dec_of(args[4]), args[5]) in da
+		}
+
+		# `cf lsp refs <input.cf> <off> <name> [--src <file>]` — every reference to the local
+		# binding at a byte offset (the binder first), one `line:col` per line.
+		if Iarch(args.len) >= 6 && eq(args[2], "refs") then {
+			let Str rsrc = ""
+			if Iarch(args.len) >= 8 && eq(args[6], "--src") then rsrc = args[7]
+			const ra = growing_arena::of(16777216)
+
+			return run_refs!(args[3], rsrc, dec_of(args[4]), args[5]) in ra
+		}
+
+		# `cf lsp uses <input.cf> <name> [--src <file>]` — every use of a top-level name in
+		# the one file (the cross-file rename front end), one `line:col` per line.
+		if Iarch(args.len) >= 5 && eq(args[2], "uses") then {
+			let Str usrc = ""
+			if Iarch(args.len) >= 7 && eq(args[5], "--src") then usrc = args[6]
+			const ua = growing_arena::of(16777216)
+
+			return run_uses!(args[3], usrc, args[4]) in ua
+		}
+
+		# `cf lsp uses-all <entry.cf> <name> [--src <file>]` — the whole module tree's uses
+		# of a top-level name in one run, `path<TAB>line:col` per row.
+		if Iarch(args.len) >= 5 && eq(args[2], "uses-all") then {
+			let Str uasrc = ""
+			if Iarch(args.len) >= 7 && eq(args[5], "--src") then uasrc = args[6]
+			const uaa = growing_arena::of(16777216)
+
+			return run_uses_all!(args[3], uasrc, args[4]) in uaa
+		}
+
+		# `cf lsp scope <input.cf> <off> [--src <file>]` — every local binding visible at a
+		# byte offset, innermost first, one `line:col:kind:name` per line.
+		if Iarch(args.len) >= 5 && eq(args[2], "scope") then {
+			let Str ssrc = ""
+			if Iarch(args.len) >= 7 && eq(args[5], "--src") then ssrc = args[6]
+			const sca = growing_arena::of(16777216)
+
+			return run_scope!(args[3], ssrc, dec_of(args[4])) in sca
+		}
+
+		const sa = growing_arena::of(16777216)
+
+		return lsp_run!(args, env) in sa
+	}
+
 	# `cf docs [<term>]` — browse the standard-library API interactively (docs.cf).
 	if Iarch(args.len) >= 2 && eq(args[1], "docs") then {
 		const doca = growing_arena::of(16777216)
@@ -311,7 +887,7 @@ pub const main = ([Str] args, [Str] env) -> {
 
 	# legacy emit-IL form (bootstrap): emit QBE IL + the asm floor to the two paths and stop.
 	if !c.full then {
-		return compile!(
+		const [Diag] ds = compile!(
 			c.input,
 			c.out_qbe,
 			c.out_asm,
@@ -322,6 +898,13 @@ pub const main = ([Str] args, [Str] env) -> {
 			c.skip_embeds,
 			c.build_version,
 		) in a
+
+		if Iarch(ds.len) > 0 then {
+			print_diags!(ds) in a
+			exit(1)
+		}
+
+		return 0
 	}
 
 	# self-contained form (`-o`): compile -> embedded QBE -> cc, all in this process.

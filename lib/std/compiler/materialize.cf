@@ -34,7 +34,8 @@
 # duplex node layout. Materialization is an optimization frontier, never a soundness one.
 
 import std::io::console::{ die }
-import std::str::{ eq }
+import std::data::str::{ eq }
+import std::compiler::spans::{ unat }
 import std::compiler::ast::{
 	Program,
 	Func,
@@ -52,9 +53,10 @@ import std::compiler::ast::{
 import std::compiler::routing::{ kids, stmt_exprs }
 
 # The pass result: the rewritten program plus the geometry copies — `names[i]` is a copy's
-# function name and `geoms[i]` its tag ("fb"/"fx"/"el"/"pg"); emit consults the pair to pick the hook
+# function name and `geoms[i]` its tag ("fb"/"fx"/"el"/"pg"); emit consults the pair to pick the
+# hook
 # lowering for exactly those bodies.
-pub data Mat = { Program prog, [Str] names, [Str] geoms }
+pub data Mat = { Program prog, [Str] names, [Str] geoms, [Func] dropped }
 
 # The ambient a reach tag names, as a parent geometry: the legacy/root (0) and page (4) tags are
 # both the page root; fb/fx/el are themselves. Used only to tell whether an arena is carved from the
@@ -153,7 +155,8 @@ const strip_pg = (Program prog): Program -> {
 
 # Strip the dormant page module but PRESERVE `reserve_ret__pg`: a `main([Str] args)` program that
 # materializes nothing still needs the ret reserve for the pre-main argv bridge (`cf_build_args`).
-# `reserve_ret__pg` is a leaf (only `mem::raw::*` + the floor grow/oom), so keeping it alone is closed.
+# `reserve_ret__pg` is a leaf (only `mem::raw::*` + the floor grow/oom), so keeping it alone is
+# closed.
 const strip_pg_keep_reserve = (Program prog): Program -> {
 	let [Func] kept = []
 	let Iarch i = 0
@@ -206,7 +209,7 @@ const union_boxed = ([UnionDecl] unions, Str name): Bool -> {
 }
 
 const alloc_expr = (Expr e, [UnionDecl] uns): Bool -> {
-	const Bool here = match e {
+	const Bool here = match unat(e) {
 		Expr.Record(_, _) -> true,
 		Expr.ArrayLit(_, _, _, _) -> true,
 		Expr.Tuple(_) -> true,
@@ -225,7 +228,7 @@ const alloc_expr = (Expr e, [UnionDecl] uns): Bool -> {
 
 	if here then return true
 
-	return match e { Expr.Loop(ss) -> alloc_body(ss, uns), _ -> alloc_list(kids(e), uns) }
+	return match unat(e) { Expr.Loop(ss) -> alloc_body(ss, uns), _ -> alloc_list(kids(e), uns) }
 }
 
 const alloc_list = ([Expr] es, [UnionDecl] uns): Bool -> {
@@ -247,7 +250,7 @@ const alloc_stmt = (Stmt s, [UnionDecl] uns): Bool -> {
 		Stmt.IfThen(_, b) -> alloc_stmt(b, uns),
 		Stmt.IfElse(_, t, el) -> alloc_stmt(t, uns) || alloc_stmt(el, uns),
 		Stmt.Block(ss) -> alloc_body(ss, uns),
-		Stmt.Loop(ss) -> alloc_body(ss, uns),
+		Stmt.Loop(ll_, ss) -> alloc_body(ss, uns),
 		Stmt.ForIn(_, _, ss) -> alloc_body(ss, uns),
 		Stmt.Match(_, arms) -> alloc_arms(arms, uns),
 		Stmt.Defer(ss) -> alloc_body(ss, uns),
@@ -290,7 +293,7 @@ const cs_expr! = (Expr e, Iarch fi, [CSite] acc): [CSite] -> {
 	# which on the compiler's biggest bodies alone costs hundreds of MB of survivor churn.
 	let [CSite] a1 = acc
 
-	match e {
+	match unat(e) {
 		Expr.Call(n, _, _, g) -> {
 			a1 = [...a1, CSite({ fnidx: fi, callee: n, geom: g, direct: true })]
 		},
@@ -316,8 +319,9 @@ const cs_expr! = (Expr e, Iarch fi, [CSite] acc): [CSite] -> {
 	# invokes under the CALL's ambient — so it flows like the callee to the call's geom (`g`),
 	# minting the geometry copy the retarget will point it at. (A non-fn Var arg resolves to no
 	# function and is skipped in the reach walk; other args recurse normally.) This is what closes
-	# the indirect-allocation gap: the callback allocates through the geometry, not the `cf_alloc` floor.
-	return match e {
+	# the indirect-allocation gap: the callback allocates through the geometry, not the `cf_alloc`
+	# floor.
+	return match unat(e) {
 		Expr.Call(_, _, cargs, g) -> cs_call_args!(cargs, fi, g, a1),
 		Expr.Loop(ss) -> cs_body!(ss, fi, a1),
 		_ -> cs_list!(kids(e), fi, a1),
@@ -331,7 +335,7 @@ const cs_call_args! = ([Expr] args, Iarch fi, Str g, [CSite] acc): [CSite] -> {
 	loop {
 		if i >= Iarch(args.len) then break
 
-		match args[i] {
+		match unat(args[i]) {
 			Expr.Var(vn) -> {
 				out = [...out, CSite({ fnidx: fi, callee: vn, geom: g, direct: true })]
 			},
@@ -366,7 +370,7 @@ const cs_stmt! = (Stmt s, Iarch fi, [CSite] acc): [CSite] -> {
 		Stmt.IfThen(_, b) -> cs_stmt!(b, fi, a1),
 		Stmt.IfElse(_, t, el) -> cs_stmt!(el, fi, cs_stmt!(t, fi, a1)),
 		Stmt.Block(ss) -> cs_body!(ss, fi, a1),
-		Stmt.Loop(ss) -> cs_body!(ss, fi, a1),
+		Stmt.Loop(ll_, ss) -> cs_body!(ss, fi, a1),
 		Stmt.ForIn(_, _, ss) -> cs_body!(ss, fi, a1),
 		Stmt.Match(_, arms) -> cs_arms!(arms, fi, a1),
 		Stmt.Defer(ss) -> cs_body!(ss, fi, a1),
@@ -403,7 +407,7 @@ const cs_body! = ([Stmt] ss, Iarch fi, [CSite] acc): [CSite] -> {
 
 # ── the geometry-binding sweep (`in x` handles must trace to a visible constructor) ──────
 
-const ctor_geom = (Expr e): Str -> match e {
+const ctor_geom = (Expr e): Str -> match unat(e) {
 	Expr.Call(n, _, _, _) -> if eq(n, "of__fb")
 		then "fb"
 		else if eq(n, "of__fx")
@@ -429,7 +433,7 @@ const gb_stmt = (Stmt s, Iarch fi, [GBind] acc): [GBind] -> {
 		Stmt.IfThen(_, b) -> gb_stmt(b, fi, a1),
 		Stmt.IfElse(_, t, el) -> gb_stmt(el, fi, gb_stmt(t, fi, a1)),
 		Stmt.Block(ss) -> gb_body(ss, fi, a1),
-		Stmt.Loop(ss) -> gb_body(ss, fi, a1),
+		Stmt.Loop(ll_, ss) -> gb_body(ss, fi, a1),
 		Stmt.ForIn(_, _, ss) -> gb_body(ss, fi, a1),
 		Stmt.Match(_, arms) -> gb_arms(arms, fi, a1),
 		Stmt.Defer(ss) -> gb_body(ss, fi, a1),
@@ -514,7 +518,7 @@ const cloret_stmt = (Stmt s, [Str] acc): [Str] -> {
 		Stmt.IfThen(_, b) -> cloret_stmt(b, a1),
 		Stmt.IfElse(_, t, el) -> cloret_stmt(el, cloret_stmt(t, a1)),
 		Stmt.Block(ss) -> cloret_body(ss, a1),
-		Stmt.Loop(ss) -> cloret_body(ss, a1),
+		Stmt.Loop(ll_, ss) -> cloret_body(ss, a1),
 		Stmt.ForIn(_, _, ss) -> cloret_body(ss, a1),
 		Stmt.Match(_, arms) -> cloret_arms(arms, a1),
 		Stmt.Defer(ss) -> cloret_body(ss, a1),
@@ -591,6 +595,7 @@ const rt_name = (Str n, Str g, Rt rc): Str -> {
 }
 
 const rt_expr = (Expr e, Rt rc): Expr -> match e {
+	Expr.At(o, inner) -> Expr.At(o, rt_expr(inner, rc)),
 	Expr.Lit(v) -> Expr.Lit(v),
 	Expr.BoolLit(b) -> Expr.BoolLit(b),
 	Expr.Var(n) -> Expr.Var(n),
@@ -640,7 +645,8 @@ const rt_expr = (Expr e, Rt rc): Expr -> match e {
 
 # Retarget a Call's arguments: a bare fn-NAME argument becomes the copy for the CALL's ambient
 # (`apply(sq!, x) in g` → `apply(sq!__el, x)`), so the HOF invokes the geometry-lowered callback;
-# a non-fn Var passes through `rt_name` unchanged (not in any copy set). Other args recurse normally.
+# a non-fn Var passes through `rt_name` unchanged (not in any copy set). Other args recurse
+# normally.
 const rt_call_args = ([Expr] args, Str g, Rt rc): [Expr] -> {
 	let [Expr] out = []
 	let Iarch i = 0
@@ -649,7 +655,7 @@ const rt_call_args = ([Expr] args, Str g, Rt rc): [Expr] -> {
 		if i >= Iarch(args.len) then break
 		out = [
 			...out,
-			match args[i] { Expr.Var(vn) -> Expr.Var(rt_name(vn, g, rc)), _ -> rt_expr(args[i], rc) },
+			match unat(args[i]) { Expr.Var(vn) -> Expr.Var(rt_name(vn, g, rc)), _ -> rt_expr(args[i], rc) },
 		]
 		i = i + 1
 	}
@@ -733,9 +739,9 @@ const rt_stmt = (Stmt s, Rt rc): Stmt -> match s {
 	Stmt.IndexAssign(a, i, v) -> Stmt.IndexAssign(a, rt_expr(i, rc), rt_expr(v, rc)),
 	Stmt.Return(e) -> Stmt.Return(rt_expr(e, rc)),
 	Stmt.ForIn(v, a, body) -> Stmt.ForIn(v, a, rt_stmts(body, rc)),
-	Stmt.Loop(body) -> Stmt.Loop(rt_stmts(body, rc)),
-	Stmt.Break -> Stmt.Break,
-	Stmt.Continue -> Stmt.Continue,
+	Stmt.Loop(ll_, body) -> Stmt.Loop(ll_, rt_stmts(body, rc)),
+	Stmt.Break(bl_) -> Stmt.Break(bl_),
+	Stmt.Continue(bl_) -> Stmt.Continue(bl_),
 	Stmt.IfThen(c, st) -> Stmt.IfThen(rt_expr(c, rc), rt_stmt(st, rc)),
 	Stmt.IfElse(c, t, e) -> Stmt.IfElse(rt_expr(c, rc), rt_stmt(t, rc), rt_stmt(e, rc)),
 	Stmt.Do(e) -> Stmt.Do(rt_expr(e, rc)),
@@ -831,6 +837,9 @@ const hook_instance = (Func tmpl, Str iname, Str t): Func -> {
 		ret_size: tmpl.ret_size,
 		is_intrinsic: tmpl.is_intrinsic,
 		asm_sym: tmpl.asm_sym,
+		dfile: tmpl.dfile,
+		dline: tmpl.dline,
+		dcol: tmpl.dcol,
 	})
 }
 
@@ -885,11 +894,11 @@ const tag_idx = (Str t): Iarch -> {
 # geometry ACTIVE (worth tagging main `pg` and keeping the page hooks). Arrays/strings/etc.
 # stay on the shared floor even in a pg body, so they do not count here.
 const rec_expr = (Expr e): Bool -> {
-	const Bool here = match e { Expr.Record(_, _) -> true, _ -> false }
+	const Bool here = match unat(e) { Expr.Record(_, _) -> true, _ -> false }
 
 	if here then return true
 
-	return match e { Expr.Loop(ss) -> rec_body(ss), _ -> rec_list(kids(e)) }
+	return match unat(e) { Expr.Loop(ss) -> rec_body(ss), _ -> rec_list(kids(e)) }
 }
 
 const rec_list = ([Expr] es): Bool -> {
@@ -911,7 +920,7 @@ const rec_stmt = (Stmt s): Bool -> {
 		Stmt.IfThen(_, b) -> rec_stmt(b),
 		Stmt.IfElse(_, t, el) -> rec_stmt(t) || rec_stmt(el),
 		Stmt.Block(ss) -> rec_body(ss),
-		Stmt.Loop(ss) -> rec_body(ss),
+		Stmt.Loop(ll_, ss) -> rec_body(ss),
 		Stmt.ForIn(_, _, ss) -> rec_body(ss),
 		Stmt.Match(_, arms) -> rec_arms(arms),
 		Stmt.Defer(ss) -> rec_body(ss),
@@ -947,13 +956,14 @@ const rec_body = ([Stmt] ss): Bool -> {
 # ── the pass ─────────────────────────────────────────────────────────────────────────────
 
 # Run the Materialize substep of the memory arc over `prog`: duplicate each function per geometry it
-# is used at, retarget its `in <arena>` seeds, and mint per-type value-hook instances from the
+# is used at, retarget its `in <geometry>` seeds, and mint per-type value-hook instances from the
 # pre-mono templates still held in `raw`. Returns the rewritten program together with the emit-side
 # name and geometry tables (`Mat`).
 pub const materialize_program! = (Program prog, Program raw): Mat -> {
 	const [Str] no_strs = []
+	const [Func] no_funcs = []
 	# The PAGE geometry is a first-class ambient: `main` runs under the root page, and any allocation
-	# in its root subtree (its own body, or a bare-called helper — an `in <arena>` graft leaves the
+	# in its root subtree (its own body, or a bare-called helper — an `in <geometry>` graft leaves the
 	# subtree) draws from the page's OWN reserve like every other geometry, not a runtime-dispatch
 	# floor. `main` is always seeded `pg`, so the reach walk flows root allocators to `__pg` copies;
 	# `page_active` below is set from that (or `main`'s own direct allocation). A program that
@@ -961,7 +971,8 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 	# the LATE bail (byte-identical to the pre-import table) — that decision is deferred to there now,
 	# so the walk always runs (cheap for a non-allocating program).
 	const Iarch mi = find_fn(prog.funcs, "main")
-	if mi < 0 then return Mat({ prog: strip_pg(prog), names: no_strs, geoms: no_strs })
+	if mi < 0
+		then return Mat({ prog: strip_pg(prog), names: no_strs, geoms: no_strs, dropped: no_funcs })
 	const Bool main_allocs = alloc_body(prog.funcs[mi].body, prog.unions)
 	# UNIFORM ENTRY ABI (std::rt::floor): the hosted `_start` ALWAYS builds argv+env before `main`, so
 	# `reserve_ret__pg` — the page reserve those pre-main bridges build the `[Str]`s through — must
@@ -1154,14 +1165,55 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 	# compiler, and every arena-grafting program whose main places nothing on the page), main
 	# stays legacy and the dormant page module is stripped, keeping such programs byte-identical.
 	const Bool page_active = Iarch(pgn.len) > 0 || main_allocs
-	# nothing materialized and the page is dormant: strip it back out (byte-identical passthrough).
-	# EXCEPT a `main([Str] args)` program keeps `reserve_ret__pg` alive for the pre-main argv bridge.
-	if Iarch(fbn.len) + Iarch(fxn.len) + Iarch(eln.len) + Iarch(pgn.len) == 0 &&
-		!page_active &&
-		main_argv
-			then return Mat({ prog: strip_pg_keep_reserve(prog), names: no_strs, geoms: no_strs })
-	if Iarch(fbn.len) + Iarch(fxn.len) + Iarch(eln.len) + Iarch(pgn.len) == 0 && !page_active
-		then return Mat({ prog: strip_pg(prog), names: no_strs, geoms: no_strs })
+	# nothing materialized and the page is dormant: strip it back out and PRUNE the unreached
+	# originals — the same reach filter the rebuild below applies (intrinsics, verbatim-symbol
+	# floor fns, and `main` survive unconditionally). A reachable-only program passes through
+	# byte-identical as before; a program carrying unused declarations stops EMITTING them (an
+	# unused aggregate-constructing fn has no geometry ambient here and would trip emit's
+	# retired-cf_alloc backstop). The pruned decls come back as `dropped` — typecheck still
+	# validates them (`check_unreachable!`), so their errors surface.
+	# A `main([Str] args)` program keeps `reserve_ret__pg` alive for the pre-main argv bridge.
+	if Iarch(fbn.len) + Iarch(fxn.len) + Iarch(eln.len) + Iarch(pgn.len) == 0 && !page_active then {
+		let [Func] bkeep = []
+		let [Func] bdrop = []
+		let Iarch bi = 0
+
+		loop {
+			if bi >= nf then break
+
+			# a page-module fn (`*__pg`) is NOT pruned here — the strip below owns its fate
+			# (`reserve_ret__pg` survives for the argv bridge), exactly as before this filter
+			if bi == mi ||
+				reach[bi * 5] ||
+				prog.funcs[bi].is_intrinsic ||
+				!eq(prog.funcs[bi].asm_sym, "") ||
+				name_ends_pg(prog.funcs[bi].name) then {
+				bkeep = [...bkeep, prog.funcs[bi]]
+			} else {
+				bdrop = [...bdrop, prog.funcs[bi]]
+			}
+
+			bi = bi + 1
+		}
+
+		const Program bprog = Program({
+			imports: prog.imports,
+			recs: prog.recs,
+			unions: prog.unions,
+			funcs: bkeep,
+			groups: prog.groups,
+		})
+
+		if main_argv
+			then return Mat({
+			prog: strip_pg_keep_reserve(bprog),
+			names: no_strs,
+			geoms: no_strs,
+			dropped: bdrop,
+		})
+
+		return Mat({ prog: strip_pg(bprog), names: no_strs, geoms: no_strs, dropped: bdrop })
+	}
 
 	# parent-axis: an arena's parent is a comptime fact of its CONSTRUCTION AMBIENT — the tag the
 	# function holding `of__fx`/`of__el` runs under. Each carve draws from its IMMEDIATE parent through
@@ -1196,6 +1248,9 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 	let [Func] out = []
 	let [Str] cnames = []
 	let [Str] cgeoms = []
+	# the originals the reach filter drops: never emitted, but still WRITTEN declarations —
+	# typecheck validates them after the pass (their errors must not vanish with the pruning)
+	let [Func] dropped = []
 	let Iarch fi = 0
 
 	loop {
@@ -1231,6 +1286,9 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 					ret_size: fm.ret_size,
 					is_intrinsic: fm.is_intrinsic,
 					asm_sym: fm.asm_sym,
+					dfile: fm.dfile,
+					dline: fm.dline,
+					dcol: fm.dcol,
 				}),
 			]
 			if page_active then {
@@ -1242,6 +1300,9 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 		# gate their token lowerings on resolving it (`is_intrinsic`), so it must stay in the table.
 		# A verbatim-symbol floor fn (`asm_sym` set) likewise survives unconditionally: it is reached
 		# only by fixed asm symbol (the entry, `raw::grow`/`raw::trap`), invisible to this cf-call walk.
+		if fi != mi &&
+			!reach[fi * 5] && !prog.funcs[fi].is_intrinsic && eq(prog.funcs[fi].asm_sym, "")
+				then dropped = [...dropped, prog.funcs[fi]]
 		if fi != mi &&
 			(reach[fi * 5] || prog.funcs[fi].is_intrinsic || !eq(prog.funcs[fi].asm_sym, "")) then {
 			const Func f = prog.funcs[fi]
@@ -1275,6 +1336,9 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 						ret_size: f.ret_size,
 						is_intrinsic: f.is_intrinsic,
 						asm_sym: f.asm_sym,
+						dfile: f.dfile,
+						dline: f.dline,
+						dcol: f.dcol,
 					}),
 				]
 			}
@@ -1316,6 +1380,9 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 					ret_size: f.ret_size,
 					is_intrinsic: f.is_intrinsic,
 					asm_sym: f.asm_sym,
+					dfile: f.dfile,
+					dline: f.dline,
+					dcol: f.dcol,
 				}),
 			]
 			cnames = [...cnames, cnf]
@@ -1358,6 +1425,9 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 					ret_size: f.ret_size,
 					is_intrinsic: f.is_intrinsic,
 					asm_sym: f.asm_sym,
+					dfile: f.dfile,
+					dline: f.dline,
+					dcol: f.dcol,
 				}),
 			]
 			cnames = [...cnames, cnx]
@@ -1400,6 +1470,9 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 					ret_size: f.ret_size,
 					is_intrinsic: f.is_intrinsic,
 					asm_sym: f.asm_sym,
+					dfile: f.dfile,
+					dline: f.dline,
+					dcol: f.dcol,
 				}),
 			]
 			cnames = [...cnames, cne]
@@ -1442,6 +1515,9 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 					ret_size: f.ret_size,
 					is_intrinsic: f.is_intrinsic,
 					asm_sym: f.asm_sym,
+					dfile: f.dfile,
+					dline: f.dline,
+					dcol: f.dcol,
 				}),
 			]
 			cnames = [...cnames, cnp]
@@ -1455,7 +1531,8 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 	# reached under the ROOT page (e.g. a `!` fn-value handed to a bare-from-main HOF, whose residue
 	# the retarget lowers to the page's own residue side, reclaimed through `on_scope_exit__pg` like an
 	# arena). Both are leaves (only `mem::raw::*`). Also kept when `main([Str] args)` takes argv
-	# (`main_argv`): the pre-main bridge (`cf_build_args`) builds its `[Str]` through `reserve_ret__pg`.
+	# (`main_argv`): the pre-main bridge (`cf_build_args`) builds its `[Str]` through
+	# `reserve_ret__pg`.
 	if page_active || needs_pg_reserve || main_argv then {
 		const Iarch rrp = find_fn(prog.funcs, "reserve_ret__pg")
 		if rrp < 0
@@ -1467,7 +1544,8 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 		out = [...out, prog.funcs[rap]]
 	}
 	# a `!` pg frame (page_active) rewinds its residue bracket through `on_scope_exit__pg`, so keep
-	# it too — a leaf (only `mem::raw::*`). Not needed for the argv/needs-reserve cases (no `!` pg frame).
+	# it too — a leaf (only `mem::raw::*`). Not needed for the argv/needs-reserve cases (no `!` pg
+	# frame).
 	if page_active then {
 		const Iarch xpg = find_fn(prog.funcs, "on_scope_exit__pg")
 		if xpg < 0
@@ -1585,5 +1663,5 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 		groups: prog.groups,
 	})
 
-	return Mat({ prog: p2, names: cnames, geoms: cgeoms })
+	return Mat({ prog: p2, names: cnames, geoms: cgeoms, dropped: dropped })
 }

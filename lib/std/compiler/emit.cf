@@ -18,7 +18,7 @@
 # not yet enforced (that is the typecheck brick).
 
 import std::io::console::{ die }
-import std::str::{ eq }
+import std::data::str::{ eq }
 import std::sys::{ Os, Arch }
 import std::data::{ Either }
 import std::io::file::{ write_str, read_file_into }
@@ -122,6 +122,12 @@ data Emit = {
 	Iarch local_slot,
 	Bool skip_embeds,
 	Str build_version,
+	Os target_os,
+	Arch target_arch,
+	# the open LABELED statement loops, innermost last — `break outer` resolves its jump target
+	# (`@lend<lid>`) through these parallel stacks (an unlabeled loop pushes nothing)
+	[Str] loop_labels,
+	[Iarch] loop_lids,
 }
 
 # A local/parameter in scope: its interned name, `slot`, its `rec_type` (a record/union
@@ -372,7 +378,8 @@ const find_union = ([UnionDecl] unions, Str name): Iarch -> {
 }
 
 const member_tag = ([UnionDecl] unions, Str type_name, Str member): Iarch -> {
-	# `Bool` is the primitive tag-only union `{ False, True }` (§8.6), not in the tables: True=1, False=0
+	# `Bool` is the primitive tag-only union `{ False, True }` (§8.6), not in the tables: True=1,
+	# False=0
 	if eq(type_name, "Bool") then {
 		if eq(member, "True") then return 1
 
@@ -767,12 +774,52 @@ const stmt_locals = (Stmt s): [Str] -> match s {
 	Stmt.Let(n, _, _, _) -> one_name(n),
 	Stmt.Destructure(ns, _, _) -> ns,
 	Stmt.ForIn(lv, _, ss) -> cat_names(one_name(lv), stmts_locals(ss)),
-	Stmt.Loop(ss) -> stmts_locals(ss),
+	Stmt.Loop(ll_, ss) -> stmts_locals(ss),
 	Stmt.Block(ss) -> stmts_locals(ss),
 	Stmt.IfThen(_, s2) -> stmt_locals(s2),
 	Stmt.IfElse(_, t, el) -> cat_names(stmt_locals(t), stmt_locals(el)),
 	Stmt.Match(_, arms) -> arms_locals(arms),
 	_ -> no_names(),
+}
+
+const no_lids = (): [Iarch] -> {
+	const [Iarch] r = []
+
+	return r
+}
+
+# Fresh copies without the last element — the label stacks pop by rebuild (a saved alias would
+# see an in-place growth, the array-aliasing hazard).
+const drop_last_s = ([Str] xs): [Str] -> {
+	let [Str] out = []
+
+	for (x, i) in xs if i < Iarch(xs.len) - 1 then out = [...out, x]
+
+	return out
+}
+
+const drop_last_i = ([Iarch] xs): [Iarch] -> {
+	let [Iarch] out = []
+
+	for (x, i) in xs if i < Iarch(xs.len) - 1 then out = [...out, x]
+
+	return out
+}
+
+# The loop id `@lend`/`@ltop` a LABELED `break`/`continue` targets — innermost open loop with
+# that label. Typecheck already rejected unknown labels; -1 here means a pass dropped one.
+const labeled_lid = (*Emit ctx, Str l): Iarch -> {
+	let Iarch i = Iarch(ctx.loop_labels.len)
+
+	loop {
+		if i <= 0 then break
+		i = i - 1
+		if eq(ctx.loop_labels[i], l) then return ctx.loop_lids[i]
+	}
+
+	die("cf: emit: a `break`/`continue` label names no enclosing loop\n")
+
+	return -1
 }
 
 const no_names = (): [Str] -> {
@@ -810,8 +857,10 @@ const arms_escape = (*Emit ctx, [Binding] env, [Str] locals, [StmtArm] arms): Bo
 const stmt_escapes = (*Emit ctx, [Binding] env, [Str] locals, Stmt s): Bool -> match s {
 	Stmt.Return(_) -> true,
 	Stmt.Yield(_) -> true,
-	Stmt.Break -> false,
-	Stmt.Continue -> false,
+	# a LABELED exit jumps past enclosing loops without their back-edge rewinds, so any loop
+	# containing one must not take marks (the labeled-break emission skips resets)
+	Stmt.Break(bl_) -> Iarch(bl_.len) > 0,
+	Stmt.Continue(bl_) -> Iarch(bl_.len) > 0,
 	Stmt.Let(_, _, _, init) -> expr_has_addr(ctx, init),
 	Stmt.Assign(n, val) -> (!has_str(locals, n) && binding_is_agg(env, n)) || expr_has_addr(ctx, val),
 	Stmt.FieldAssign(base, _, val) -> !has_str(locals, base) || expr_has_addr(ctx, val),
@@ -823,7 +872,7 @@ const stmt_escapes = (*Emit ctx, [Binding] env, [Str] locals, Stmt s): Bool -> m
 	Stmt.IfElse(c, t, el) ->
 		expr_has_addr(ctx, c) || stmt_escapes(ctx, env, locals, t) || stmt_escapes(ctx, env, locals, el),
 	Stmt.Block(ss) -> body_escapes(ctx, env, locals, ss),
-	Stmt.Loop(ss) -> body_escapes(ctx, env, locals, ss),
+	Stmt.Loop(ll_, ss) -> body_escapes(ctx, env, locals, ss),
 	Stmt.ForIn(_, _, ss) -> body_escapes(ctx, env, locals, ss),
 	Stmt.Match(sc, arms) -> expr_has_addr(ctx, sc) || arms_escape(ctx, env, locals, arms),
 	Stmt.Destructure(_, _, e) -> expr_has_addr(ctx, e),
@@ -898,7 +947,7 @@ const res_stmt_escapes = (*Emit ctx, [Binding] env, [Str] locals, Stmt s): Bool 
 	Stmt.IfElse(_, t, el) ->
 		res_stmt_escapes(ctx, env, locals, t) || res_stmt_escapes(ctx, env, locals, el),
 	Stmt.Block(ss) -> res_body_escapes(ctx, env, locals, ss),
-	Stmt.Loop(ss) -> res_body_escapes(ctx, env, locals, ss),
+	Stmt.Loop(ll_, ss) -> res_body_escapes(ctx, env, locals, ss),
 	Stmt.ForIn(_, _, ss) -> res_body_escapes(ctx, env, locals, ss),
 	Stmt.Match(_, arms) -> res_arms_escape(ctx, env, locals, arms),
 	Stmt.Let(_, _, _, _) -> false,
@@ -906,8 +955,9 @@ const res_stmt_escapes = (*Emit ctx, [Binding] env, [Str] locals, Stmt s): Bool 
 	Stmt.Do(_) -> false,
 	Stmt.Return(_) -> false,
 	Stmt.Yield(_) -> false,
-	Stmt.Break -> false,
-	Stmt.Continue -> false,
+	# a labeled exit skips enclosing back-edge rewinds — see stmt_escapes
+	Stmt.Break(bl_) -> Iarch(bl_.len) > 0,
+	Stmt.Continue(bl_) -> Iarch(bl_.len) > 0,
 	_ -> true,
 }
 
@@ -1023,7 +1073,7 @@ const hv_stmt = (Str n, Stmt s): Bool -> {
 		Stmt.IfThen(_, b) -> hv_stmt(n, b),
 		Stmt.IfElse(_, t, el) -> hv_stmt(n, t) || hv_stmt(n, el),
 		Stmt.Block(ss) -> hv_body(n, ss),
-		Stmt.Loop(ss) -> hv_body(n, ss),
+		Stmt.Loop(ll_, ss) -> hv_body(n, ss),
 		Stmt.ForIn(_, _, ss) -> hv_body(n, ss),
 		Stmt.Match(_, arms) -> hv_arms(n, arms),
 		Stmt.Defer(ss) -> hv_body(n, ss),
@@ -1198,13 +1248,13 @@ const gscan_stmt = (Str n, Stmt s, Iarch seen): Iarch -> match s {
 	Stmt.IfThen(c, b2) -> gscan_ifthen(n, c, b2, seen),
 	Stmt.IfElse(c, t, el) -> gscan_ifelse(n, c, t, el, seen),
 	Stmt.Block(ss) -> gscan_stmts(n, ss, seen),
-	Stmt.Loop(ss) -> gscan_loop(n, ss, seen),
+	Stmt.Loop(ll_, ss) -> gscan_loop(n, ss, seen),
 	Stmt.ForIn(_, _, ss) -> gscan_loop(n, ss, seen),
 	Stmt.Match(sc, arms) -> gscan_smatch(n, sc, arms, seen),
 	Stmt.Defer(ss) -> gscan_loop(n, ss, seen),
 	Stmt.Closure(_, _, _, cb) -> gscan_loop(n, cb, seen),
-	Stmt.Break -> seen,
-	Stmt.Continue -> seen,
+	Stmt.Break(bl_) -> seen,
+	Stmt.Continue(bl_) -> seen,
 	_ -> -1,
 }
 
@@ -1255,7 +1305,7 @@ const gcand_stmt = (Stmt s): [Str] -> match s {
 	Stmt.IfThen(_, b2) -> gcand_stmt(b2),
 	Stmt.IfElse(_, t, el) -> cat_names(gcand_stmt(t), gcand_stmt(el)),
 	Stmt.Block(ss) -> gcand_body(ss),
-	Stmt.Loop(ss) -> gcand_body(ss),
+	Stmt.Loop(ll_, ss) -> gcand_body(ss),
 	Stmt.ForIn(_, _, ss) -> gcand_body(ss),
 	Stmt.Match(_, arms) -> gcand_arms(arms),
 	Stmt.Defer(ss) -> gcand_body(ss),
@@ -1377,9 +1427,20 @@ const idxexpr_scalar! = (*Emit ctx, [Binding] env, Expr base, Expr idx): Str ->
 	scalar_only(telem_name(init_telems!(ctx, env, base), tuple_lit_index(idx)))
 
 const match_scalar! = (*Emit ctx, [Binding] env, [MatchArm] arms): Str -> {
-	if Iarch(arms.len) == 0 then return ""
+	let Iarch i = 0
 
-	return scalar_of!(ctx, env, arms[0].body)
+	loop {
+		if i >= Iarch(arms.len) then break
+		# any arm that NAMES a scalar decides (all arms agree, per typecheck). The first arm
+		# alone is not enough: its body may be a nested match over a payload BINDING this
+		# pre-scan cannot see (the bind env exists only at that arm's emit) — scanning on
+		# lets a sibling literal/cast arm supply the type (a float match stored `l` otherwise)
+		const Str f = scalar_of!(ctx, env, arms[i].body)
+		if !eq(f, "") then return f
+		i = i + 1
+	}
+
+	return ""
 }
 
 # The scalar type a value-yielding `loop` produces — the first `<- v`'s type (all yields agree,
@@ -1429,7 +1490,8 @@ const loop_yield_scalar_either! = (*Emit ctx, [Binding] env, Stmt a, Stmt b): St
 
 # The AGGREGATE type a value-yielding `loop` produces (a record/union/Str name / `$dyn` / `$tuple`,
 # else "") — the first `<- v` whose value is an aggregate. Mirrors `loop_yield_scalar_*` but reports
-# the aggregate marker (`init_agg_type`), so `let R r = loop { ... <- R({...}) }` binds `r` as its record.
+# the aggregate marker (`init_agg_type`), so `let R r = loop { ... <- R({...}) }` binds `r` as its
+# record.
 # A scalar yield is "" (not an aggregate) and the walk continues; since all yields share a type
 # (typecheck), the first aggregate found is the loop's type. A `match` arm's body is walked in that
 # arm's payload-binding env (`arm_bind_types`), so a `<- x` yielding a bound payload aggregate is
@@ -1799,8 +1861,10 @@ const slit_index = ([Str] tbl, [Uint8] b): Iarch -> {
 	return -1
 }
 
-# Emit a reference to an already-interned string `s` (a version stamp `slit_program!` appended to the
-# table): find its index and emit the same static `copy $sl<i>` an interned literal uses — zero runtime
+# Emit a reference to an already-interned string `s` (a version stamp `slit_program!` appended to
+# the
+# table): find its index and emit the same static `copy $sl<i>` an interned literal uses — zero
+# runtime
 # allocation, so it is valid anywhere, including a `main` with no geometry ambient.
 const emit_str_interned! = (*Emit ctx, Str s): Str -> {
 	let Iarch si = -1
@@ -1941,7 +2005,8 @@ const emit_reserve_fnval = (*Emit ctx): Str -> {
 }
 
 # Publish a freshly-carved node's OWN reserve entry into its `kind` slot (`hdr+32`): the address of
-# `reserve_ret__<geom>`, the "how to claim from me" function. A child that later draws from this node
+# `reserve_ret__<geom>`, the "how to claim from me" function. A child that later draws from this
+# node
 # as a parent reads `parent+32` and calls it (see the `raw::alloc` lowering) — so the parent's
 # geometry is followed as a pointer, never inspected. Replaces the kind int the carve wrote there;
 # the slot is free since page reserves stopped reading it (comptime target) and every other reserve
@@ -1963,7 +2028,8 @@ const emit_publish! = (*Emit ctx, Str hdr, Str geom): Iarch -> {
 
 # A grow-in-place push of one `esz`-stride slot onto the `[T]`/`[Uint8]` vector `hdr`, returning
 # the slot address. On a geometry the grow reserves through the geometry's bump half
-# (`cf_dyn_push_g` + the reserve pointer, base node `%node_0`); off it the shared floor `cf_dyn_push`.
+# (`cf_dyn_push_g` + the reserve pointer, base node `%node_0`); off it the shared floor
+# `cf_dyn_push`.
 const emit_dyn_push_call! = (*Emit ctx, Str hdr, Iarch esz): Str -> {
 	if eq(ctx.mat_geom, "") then {
 		const Iarch slot = ctx.next
@@ -2015,8 +2081,10 @@ const emit_lit_str! = (*Emit ctx, Str vh, Str s): Iarch -> {
 
 # Append the textual form of a value to the interpolation vector `vh`, recursively over its static
 # type. A scalar renders by value (a `Bool` as `true`/`false`, an integer via itoa); a `Str` inlines
-# its bytes; an aggregate renders structurally — a tuple `(e0, e1, ...)`, a record `Type({ f0: v0, ... })`,
-# a boxed union `Type.Member(p0, ...)`. `name` is the value's declared type name (a record/union name,
+# its bytes; an aggregate renders structurally — a tuple `(e0, e1, ...)`, a record `Type({ f0: v0,
+# ... })`,
+# a boxed union `Type.Member(p0, ...)`. `name` is the value's declared type name (a record/union
+# name,
 # `"$tuple"`, `"Str"`, `"Bool"`, or an integer leaf — a fixed-width name or `""` for a plain word);
 # `telems` supplies a tuple's positional element types; `op` is the value operand (a word for a
 # scalar, a base pointer for an aggregate / boxed-union box).
@@ -2074,7 +2142,8 @@ const emit_stringify! = (*Emit ctx, [Binding] env, Str vh, Str name, [TupElem] t
 	return 0
 }
 
-# Render a tuple `(e0, e1, ...)` — each position read from its 8-byte slot (a float slot as `d`/`s`, a
+# Render a tuple `(e0, e1, ...)` — each position read from its 8-byte slot (a float slot as `d`/`s`,
+# a
 # word/pointer slot as 8 bytes) and stringified by its element type; positions joined by `, `.
 const emit_stringify_tuple! = (*Emit ctx, [Binding] env, Str vh, [TupElem] telems, Str base): Iarch -> {
 	emit_lit_str!(ctx, vh, "(")
@@ -2134,7 +2203,8 @@ const emit_stringify_record! = (*Emit ctx, [Binding] env, Str vh, Str rt, Str ba
 # Render a union member `Type.Member` (a tag-only member) or `Type.Member(p0, p1)` (a payloaded
 # member) via a runtime tag dispatch: read the tag (a boxed value from its box@0, a tag-only value
 # is the word itself), then a compare-chain over the members — the matching arm writes its member
-# name and, for a payloaded member, each payload read from the box (`8 + p*8`) and stringified by its
+# name and, for a payloaded member, each payload read from the box (`8 + p*8`) and stringified by
+# its
 # type. Every arm jumps to the shared `@ue` join. A tag-only union nested in an aggregate rides here
 # too: its slot holds the bare tag, which `scrut_tag` returns unchanged.
 const emit_stringify_union! = (*Emit ctx, [Binding] env, Str vh, Str un, Str box): Iarch -> {
@@ -2336,7 +2406,8 @@ const emit_interp! = (*Emit ctx, [Seg] segs, [Binding] env): Str -> {
 	}
 
 	# NUL-terminate the built string like a string literal: push a 0 byte (which grows the backing so
-	# the slot exists), then roll the length back by one so the NUL is a terminator that `.len` does not
+	# the slot exists), then roll the length back by one so the NUL is a terminator that `.len` does
+	# not
 	# count. This lets an interpolated path (`"${dir}/${name}"`) feed `open` directly, the same as a
 	# literal path — the syscall reads a C string.
 	const Str nulslot = emit_dyn_push_call!(ctx, "%t${vh}", 1)
@@ -2416,7 +2487,8 @@ const record_inits_e = (Expr e): [FieldInit] -> {
 	return r
 }
 
-# Emit a data-literal field VALUE: a bare `{ ... }` nested literal is built as the field's OWN record
+# Emit a data-literal field VALUE: a bare `{ ... }` nested literal is built as the field's OWN
+# record
 # type (its base pointer stored like any record field); everything else emits as an ordinary expr.
 const emit_field_value! = (*Emit ctx, Str rt, Str fname, Expr val, [Binding] env): Str -> {
 	if is_bare_record_e(val) then {
@@ -2431,7 +2503,8 @@ const emit_field_value! = (*Emit ctx, Str rt, Str fname, Expr val, [Binding] env
 	return emit_expr!(val, ctx, env)
 }
 
-# The init index whose (non-spread) field is `fname`, or -1 — the override for a spread-copied field.
+# The init index whose (non-spread) field is `fname`, or -1 — the override for a spread-copied
+# field.
 const find_override = ([FieldInit] inits, Str fname): Iarch -> {
 	let Iarch i = 0
 
@@ -2446,7 +2519,8 @@ const find_override = ([FieldInit] inits, Str fname): Iarch -> {
 
 # Allocate `size` bytes for an aggregate and return its base temp. On the STACK (QBE `alloc8`,
 # reclaimed when the frame pops) when a `$`-marked binding is being built (`ctx.alloc_stack`), else
-# from the ambient geometry node (`cf_alloc`). The non-stack form is byte-identical to the old inline
+# from the ambient geometry node (`cf_alloc`). The non-stack form is byte-identical to the old
+# inline
 # `cf_alloc`, so cf's own (stack-free) source emits unchanged.
 const emit_agg_alloc! = (*Emit ctx, Iarch size): Iarch -> {
 	if ctx.alloc_stack then {
@@ -2515,7 +2589,8 @@ const emit_geom_reserve! = (*Emit ctx, Iarch size): Iarch -> {
 	return t
 }
 
-# The value expression of the init named `fname` (order-free lookup). Typecheck guarantees it exists.
+# The value expression of the init named `fname` (order-free lookup). Typecheck guarantees it
+# exists.
 const finit_value = ([FieldInit] inits, Str fname): Expr -> {
 	let Iarch i = 0
 
@@ -2795,7 +2870,8 @@ const index_pos_sub! = (*Emit ctx, [Binding] env, Expr base, Expr idx): [TupElem
 
 # A callee's declared dynamic-array element name — so a binding of a `[T]`/nested-array call result
 # (`const rs = build()`) carries its element for later `rs[i]` / `rs[i].len`; "" for a non-array or
-# unknown callee. An INDIRECT call through a `$fn` binding takes it from the return telem's `[Elem]`.
+# unknown callee. An INDIRECT call through a `$fn` binding takes it from the return telem's
+# `[Elem]`.
 const call_ret_elem! = (*Emit ctx, [Binding] env, Str callee): Str -> {
 	const Iarch bi = lookup_index(env, callee)
 	if bi >= 0 then {
@@ -2985,7 +3061,8 @@ const emit_destructure! = (*Emit ctx, [Binding] env, [Str] pat, Bool mutable, Ex
 			]
 		} else {
 			# a word or FLOAT position: copy the 8-byte slot into a fresh cell. A float records its
-			# scalar in `fixed` so `binding_ptr` reloads it with `loadd`/`loads` (the copy is bit-preserving).
+			# scalar in `fixed` so `binding_ptr` reloads it with `loadd`/`loads` (the copy is
+			# bit-preserving).
 			const Str pf = if is_float_name(ptype.name) then ptype.name else ""
 			const Iarch val = ctx.next
 			ctx.next = ctx.next + 1
@@ -3164,8 +3241,10 @@ const var_elem = ([Binding] env, Str name): Str -> {
 	return env[idx].elem
 }
 
-# The element type of a `$dyn` interpolation hole. `init_elem` covers a literal / field / index / call
-# but NOT a bare `Expr.Var` (the common `"${xs}"`), whose element rides on its binding — resolve that
+# The element type of a `$dyn` interpolation hole. `init_elem` covers a literal / field / index /
+# call
+# but NOT a bare `Expr.Var` (the common `"${xs}"`), whose element rides on its binding — resolve
+# that
 # here without disturbing `init_elem`'s other callers.
 const hole_elem! = (*Emit ctx, [Binding] env, Expr e): Str -> match e {
 	Expr.Var(n) -> var_elem(env, n),
@@ -3173,11 +3252,14 @@ const hole_elem! = (*Emit ctx, [Binding] env, Expr e): Str -> match e {
 }
 
 # The outer env AUGMENTED with an arm's payload binds as TYPE-ONLY bindings — the same rec_type/elem
-# assignment `arm_body_env` gives each bind (`payload_type`/`payload_elem`), but with a dummy slot and
+# assignment `arm_body_env` gives each bind (`payload_type`/`payload_elem`), but with a dummy slot
+# and
 # no emitted extraction, since it is used only to recover the aggregate TYPE of an arm body that
 # references a payload (`M.Some(x) -> x`). A `_` and a sub-pattern guard bind no name (skipped). The
-# bind is appended AFTER `env`, so with first-match `lookup_index` a name that collides with an outer
-# binding still resolves to the outer one — exactly as `arm_body_env` does, keeping the recovered type
+# bind is appended AFTER `env`, so with first-match `lookup_index` a name that collides with an
+# outer
+# binding still resolves to the outer one — exactly as `arm_body_env` does, keeping the recovered
+# type
 # in agreement with the value `emit_match` actually stores.
 const arm_bind_types = (*Emit ctx, [Binding] env, Str type_name, [Str] members, [Str] binds): [Binding] -> {
 	let [Binding] benv = []
@@ -3233,7 +3315,8 @@ const arm_bind_types = (*Emit ctx, [Binding] env, Str type_name, [Str] members, 
 # The aggregate type a `match` YIELDS, recovered from its first arm's body evaluated in that arm's
 # payload-binding env (via `arm_bind_types`) — so a payload-bound aggregate (`M.Some(x) -> x`) is
 # recovered as its member's payload type, not lost. The type-only env mirrors `arm_body_env`, so the
-# recovered type agrees with the value `emit_match` stores (no miscompile under a shadowed name). Every
+# recovered type agrees with the value `emit_match` stores (no miscompile under a shadowed name).
+# Every
 # arm shares the match's type (typecheck), so the first arm suffices.
 const match_agg_type! = (*Emit ctx, [Binding] env, [MatchArm] arms): Str -> {
 	const [Binding] aenv = arm_bind_types(ctx, env, arms[0].type_name, arms[0].members, arms[0].binds)
@@ -3691,7 +3774,8 @@ const callee_is_intrinsic = (*Emit ctx, Str n): Bool -> {
 }
 
 # ── compile-time file embedding (std::comptime::embed / embed_dir) ──────────────────────────────
-# The path of an embed intrinsic is a compile-time string LITERAL (typecheck rejected a non-literal),
+# The path of an embed intrinsic is a compile-time string LITERAL (typecheck rejected a
+# non-literal),
 # so `pathlit` already holds its exact bytes. Read the whole file NOW into a fixed buffer and hand
 # back its bytes as a `[Uint8]` the caller lays down as baked literal data. Dies (with the path) if
 # it cannot be read, or if it overflows the buffer. This runs at compile time, over the compiler's
@@ -3923,16 +4007,40 @@ const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env)
 
 		return pa
 	}
-	# `std::comptime::version::current` / `::compiler` — bake a version stamp as a string literal at the
+	# `std::comptime::version::current` / `::compiler` — bake a version stamp as a string literal at
+	# the
 	# call site. `current` is the program's version (from `--version`, threaded on the ctx); `compiler`
-	# is this cf binary's own version (the `buildinfo` const, stamped at the compiler's build). Both are
-	# bodyless value intrinsics — a bare reference auto-calls the nullary form, landing here with no args.
+	# is this cf binary's own version (the `buildinfo` const, stamped at the compiler's build). Both
+	# are
+	# bodyless value intrinsics — a bare reference auto-calls the nullary form, landing here with no
+	# args.
 	if eq(callee, "std_comptime_version_current") && callee_is_intrinsic(ctx, callee) then {
 		return emit_str_interned!(ctx, ctx.build_version)
 	}
 	if eq(callee, "std_comptime_version_compiler") && callee_is_intrinsic(ctx, callee) then {
 		return emit_str_interned!(ctx, compiler_version)
 	}
+	# `std::comptime::os::target` / `arch::target` in VALUE position — fold to the target's tag
+	# immediate (`Os`/`Arch` are tag-only unions, so a value IS its tag word). The numbers are the
+	# member ORDER in lib/std/sys.cf; a comptime `if` condition never reaches here (it folds at
+	# parse), so this is the runtime-value form: `let Os t = os::target`, `match arch::target …`.
+	if eq(callee, "std_comptime_os_target") && callee_is_intrinsic(ctx, callee) then {
+		return match ctx.target_os { Os.Darwin -> "0", Os.Linux -> "1", Os.Bare -> "2" }
+	}
+	if eq(callee, "std_comptime_arch_target") && callee_is_intrinsic(ctx, callee) then {
+		return match ctx.target_arch {
+			Arch.Arm64 -> "0",
+			Arch.Amd64 -> "1",
+			Arch.Riscv64 -> "2",
+			Arch.Wasm -> "3",
+		}
+	}
+	# `os::current` / `arch::current` (the platform the COMPILER runs on) have no value lowering
+	# yet — die honestly rather than emit a dangling reference.
+	if eq(callee, "std_comptime_os_current") && callee_is_intrinsic(ctx, callee)
+		then die("cf: emit: `os::current` has no value form yet — use `os::target`\n")
+	if eq(callee, "std_comptime_arch_current") && callee_is_intrinsic(ctx, callee)
+		then die("cf: emit: `arch::current` has no value form yet — use `arch::target`\n")
 	# `std::comptime::embed("path")` — read the file NOW (compile time) and emit its bytes as a
 	# string literal, so they ride in the binary. `emit_str_lit!` lays them down as static `data`
 	# when the pre-scan interned them, else materializes them inline — either way baked in, nothing
@@ -4588,6 +4696,36 @@ const emit_stmt_match! = (*Emit ctx, [Binding] env, Expr scrut, [StmtArm] arms):
 # is data=0, len=0, cap=0. Returns the header pointer.
 const emit_array_lit! = (*Emit ctx, [Expr] elems, Str elem_type, [Binding] env): Str -> {
 	const Iarch n = Iarch(elems.len)
+	# a literal holding a NON-leading spread (`[x, ...a]`) has a runtime length, so the pre-sized
+	# data block below cannot hold it — build an empty growable header and push through the
+	# append path (which splices spread elements) instead
+	let Bool any_spread = false
+	let Iarch si = 0
+
+	loop {
+		if si >= n then break
+		if is_spread(elems[si]) then any_spread = true
+		si = si + 1
+	}
+
+	if any_spread then {
+		const Str el0 = if !eq(elem_type, "") then elem_type
+			else if is_spread(elems[0]) then spread_src_elem!(ctx, env, spread_inner(elems[0]))
+				else scalar_of!(ctx, env, elems[0])
+		const Iarch ghdr = emit_agg_node!(ctx, 24)
+		write_str(ctx.fd, "\tstorel 0, %t${ghdr}\n")
+		const Iarch g8 = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${g8} =l add %t${ghdr}, 8\n")
+		write_str(ctx.fd, "\tstorel 0, %t${g8}\n")
+		const Iarch g16 = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${g16} =l add %t${ghdr}, 16\n")
+		write_str(ctx.fd, "\tstorel 0, %t${g16}\n")
+		emit_append!(ctx, env, "%t${ghdr}", elems, el0)
+
+		return "%t${ghdr}"
+	}
 	const Iarch hdr = emit_agg_alloc!(ctx, 24)
 
 	if n == 0 then {
@@ -4672,8 +4810,18 @@ const emit_arraylit_spread! = (*Emit ctx, Expr src, [Expr] elems, Str elem_type,
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${h16} =l add %t${hdr}, 16\n")
 	write_str(ctx.fd, "\tstorel 0, %t${h16}\n")
-	# runtime copy of the source array's live elements (0 .. src.len) — the source is any
-	# expression yielding a dynamic-array header (a name, a field read, a call result)
+	# runtime copy of the source array's live elements, then append the listed ones
+	emit_spread_copy!(ctx, env, "%t${hdr}", src, esz)
+	emit_append!(ctx, env, "%t${hdr}", elems, el)
+
+	return "%t${hdr}"
+}
+
+# Copy every live element of the dynamic array `src` (0 .. src.len) onto the header `hdr` via
+# the push path. The source is any expression yielding a dynamic-array header (a name, a field
+# read, a call result). Shared by the leading spread of `[...src, e...]` and a NON-leading
+# spread element (`[...a, x, ...b]` — the grammar admits a spread at any element position).
+const emit_spread_copy! = (*Emit ctx, [Binding] env, Str hdr, Expr src, Iarch esz): Iarch -> {
 	const Str shdr = emit_expr!(src, ctx, env)
 	const Iarch lid = ctx.label
 	ctx.label = ctx.label + 1
@@ -4709,7 +4857,7 @@ const emit_arraylit_spread! = (*Emit ctx, Expr src, [Expr] elems, Str elem_type,
 	ctx.next = ctx.next + 1
 	if esz == 1 then write_str(ctx.fd, "\t%t${sval} =l loadub %t${saddr}\n")
 	if esz != 1 then write_str(ctx.fd, "\t%t${sval} =l loadl %t${saddr}\n")
-	const Str slot = emit_dyn_push_call!(ctx, "%t${hdr}", esz)
+	const Str slot = emit_dyn_push_call!(ctx, hdr, esz)
 	if esz == 1 then write_str(ctx.fd, "\tstoreb %t${sval}, ${slot}\n")
 	if esz != 1 then write_str(ctx.fd, "\tstorel %t${sval}, ${slot}\n")
 	const Iarch iv2 = ctx.next
@@ -4721,10 +4869,8 @@ const emit_arraylit_spread! = (*Emit ctx, Expr src, [Expr] elems, Str elem_type,
 	write_str(ctx.fd, "\tstorel %t${iv3}, %t${ci}\n")
 	write_str(ctx.fd, "\tjmp @cptop${lid}\n")
 	write_str(ctx.fd, "@cpend${lid}\n")
-	# append the listed elements after the copied ones
-	emit_append!(ctx, env, "%t${hdr}", elems, el)
 
-	return "%t${hdr}"
+	return 0
 }
 
 # Allocate an N-byte buffer in the arena; the returned pointer is a byte pointer ("$ptr").
@@ -4831,7 +4977,8 @@ const emit_index! = (*Emit ctx, [Binding] env, Str arr, Expr idx): Str -> {
 	write_str(ctx.fd, "\t%t${slot} =l add %t${data}, %t${off}\n")
 	const Iarch val = ctx.next
 	ctx.next = ctx.next + 1
-	# a `[Uint8]` element is one byte (`loadub`); a float element `loadd`/`loads`; else an 8-byte `loadl`
+	# a `[Uint8]` element is one byte (`loadub`); a float element `loadd`/`loads`; else an 8-byte
+	# `loadl`
 	const Str eqt = if is_float_name(selem) then float_qt(selem) else "l"
 	if esz == 1 then write_str(ctx.fd, "\t%t${val} =l loadub %t${slot}\n")
 	if esz != 1 then write_str(ctx.fd, "\t%t${val} =${eqt} load${eqt} %t${slot}\n")
@@ -4857,7 +5004,8 @@ const emit_index_field! = (*Emit ctx, [Binding] env, Str arr, Expr idx, Str fiel
 		ctx.next = ctx.next + 1
 		write_str(ctx.fd, "\t%t${trecp} =l loadl %t${taddr}\n")
 		const Str tn = telem_name(env[ai].telems, tk)
-		# a `Str` or dynamic-array (`[Elem]`) element answers `.len` at +8; a record reads its field offset
+		# a `Str` or dynamic-array (`[Elem]`) element answers `.len` at +8; a record reads its field
+		# offset
 		let Iarch tfoff = 8
 		if !eq(tn, "Str") && !is_nested(tn) then tfoff = field_offset(ctx.recs, tn, field)
 		const Iarch tfaddr = ctx.next
@@ -4916,7 +5064,8 @@ const emit_index_expr! = (*Emit ctx, [Binding] env, Expr base, Expr idx): Str ->
 		return "%t${tval}"
 	}
 	# a raw pointer index `p[i]` reads the i-th element at pointer + i*stride (no header): a
-	# `*[Uint8]` byte pointer/buffer strides 1 (`loadub`), a `*[Iarch]` word pointer strides 8 (`loadl`).
+	# `*[Uint8]` byte pointer/buffer strides 1 (`loadub`), a `*[Iarch]` word pointer strides 8
+	# (`loadl`).
 	if eq(bt, "$ptr") then {
 		const Iarch pesz = ptr_stride(init_elem!(ctx, env, base))
 		const Str pv = emit_expr!(idx, ctx, env)
@@ -4982,11 +5131,19 @@ const emit_append! = (*Emit ctx, [Binding] env, Str hdr, [Expr] elems, Str elem)
 
 	loop {
 		if i >= Iarch(elems.len) then break
-		const Str v = emit_expr!(elems[i], ctx, env)
-		const Str slot = emit_dyn_push_call!(ctx, hdr, esz)
-		# a `[Uint8]` element is one byte (`storeb`); every other rides in an 8-byte slot (`storel`)
-		if esz == 1 then write_str(ctx.fd, "\tstoreb ${v}, ${slot}\n")
-		if esz != 1 then write_str(ctx.fd, "\tstorel ${v}, ${slot}\n")
+
+		# a SPREAD element splices its whole source array (a runtime copy loop); a plain
+		# element pushes one slot
+		if is_spread(elems[i]) then {
+			emit_spread_copy!(ctx, env, hdr, spread_inner(elems[i]), esz)
+		} else {
+			const Str v = emit_expr!(elems[i], ctx, env)
+			const Str slot = emit_dyn_push_call!(ctx, hdr, esz)
+			# a `[Uint8]` element is one byte (`storeb`); every other rides in an 8-byte slot (`storel`)
+			if esz == 1 then write_str(ctx.fd, "\tstoreb ${v}, ${slot}\n")
+			if esz != 1 then write_str(ctx.fd, "\tstorel ${v}, ${slot}\n")
+		}
+
 		i = i + 1
 	}
 
@@ -5011,6 +5168,7 @@ const is_named_var = (Expr e, Str name): Bool ->
 	match e { Expr.Var(n) -> eq(n, name), _ -> false }
 
 const emit_expr! = (Expr e, *Emit ctx, [Binding] env): Str -> match e {
+	Expr.At(o, inner) -> emit_expr!(inner, ctx, env),
 	Expr.Lit(v) -> "${v}",
 	Expr.BoolLit(b) -> if b then "1" else "0",
 	Expr.FloatLit(t) -> "d_${t}",
@@ -5247,7 +5405,7 @@ const emit_for_body! = (*Emit ctx, [Binding] env, Str lv, Str arr, [Stmt] body):
 # the nearest-loop target for break (`@lend`) and continue (`@ltop`); it is saved and
 # restored around the body so a nested loop targets itself. Called directly from
 # `emit_block`'s `Loop` arm, which binds the body.
-const emit_loop_body! = (*Emit ctx, [Binding] env, [Stmt] body): Iarch -> {
+const emit_loop_body! = (*Emit ctx, [Binding] env, Str lbl, [Stmt] body): Iarch -> {
 	const Iarch lid = ctx.label
 	ctx.label = ctx.label + 1
 	const Iarch saved = ctx.cur_loop
@@ -5255,6 +5413,11 @@ const emit_loop_body! = (*Emit ctx, [Binding] env, [Stmt] body): Iarch -> {
 	const Iarch saved_sur = ctx.loop_sur_mark
 	const Iarch saved_mkb = ctx.mk_env_base
 	ctx.cur_loop = lid
+	# a labeled loop opens a `break <label>` target for its whole body
+	if Iarch(lbl.len) > 0 then {
+		ctx.loop_labels = [...ctx.loop_labels, lbl]
+		ctx.loop_lids = [...ctx.loop_lids, lid]
+	}
 	# per-iteration reset (geometry_lowering §2): snapshot the node's triple at loop entry, rewind
 	# at every back-edge / break / continue, but only for a body whose residue can't escape the
 	# iteration.
@@ -5277,6 +5440,10 @@ const emit_loop_body! = (*Emit ctx, [Binding] env, [Stmt] body): Iarch -> {
 	if term == 0 && lsur >= 0 then emit_reset!(ctx, lsur, "%node_0")
 	if term == 0 then write_str(ctx.fd, "\tjmp @ltop${lid}\n")
 	write_str(ctx.fd, "@lend${lid}\n")
+	if Iarch(lbl.len) > 0 then {
+		ctx.loop_labels = drop_last_s(ctx.loop_labels)
+		ctx.loop_lids = drop_last_i(ctx.loop_lids)
+	}
 	ctx.cur_loop = saved
 	ctx.loop_mark = saved_mark
 	ctx.loop_sur_mark = saved_sur
@@ -5379,18 +5546,33 @@ const emit_simple_stmt! = (*Emit ctx, [Binding] env, Stmt s): Iarch -> {
 	let Iarch term = 0
 
 	match s {
-		Stmt.Break -> {
-			# a reset-safe loop rewinds the node on the way out too — the broken iteration's residue
-			# is dead (nothing escapes a reset-safe loop), and after the loop the node sits at entry.
-			if ctx.loop_mark >= 0 then emit_reset!(ctx, ctx.loop_mark, "%res_0")
-			if ctx.loop_sur_mark >= 0 then emit_reset!(ctx, ctx.loop_sur_mark, "%node_0")
-			write_str(ctx.fd, "\tjmp @lend${ctx.cur_loop}\n")
+		Stmt.Break(bl_) -> {
+			if Iarch(bl_.len) > 0 then {
+				# a LABELED break jumps to the labeled loop's end. No mark rewind: a body holding a
+				# labeled exit is never reset-safe (the safety scans refuse it), so every enclosing
+				# mark is -1 — the crossed iterations' residue lives to the frame's own rewind
+				# (leak-direction, never a dangle).
+				write_str(ctx.fd, "\tjmp @lend${labeled_lid(ctx, bl_)}\n")
+			} else {
+				# a reset-safe loop rewinds the node on the way out too — the broken iteration's residue
+				# is dead (nothing escapes a reset-safe loop), and after the loop the node sits at entry.
+				if ctx.loop_mark >= 0 then emit_reset!(ctx, ctx.loop_mark, "%res_0")
+				if ctx.loop_sur_mark >= 0 then emit_reset!(ctx, ctx.loop_sur_mark, "%node_0")
+				write_str(ctx.fd, "\tjmp @lend${ctx.cur_loop}\n")
+			}
+
 			term = 1
 		},
-		Stmt.Continue -> {
-			if ctx.loop_mark >= 0 then emit_reset!(ctx, ctx.loop_mark, "%res_0")
-			if ctx.loop_sur_mark >= 0 then emit_reset!(ctx, ctx.loop_sur_mark, "%node_0")
-			write_str(ctx.fd, "\tjmp @ltop${ctx.cur_loop}\n")
+		Stmt.Continue(bl_) -> {
+			if Iarch(bl_.len) > 0 then {
+				# a LABELED continue jumps to the labeled loop's back-edge (same no-rewind rule)
+				write_str(ctx.fd, "\tjmp @ltop${labeled_lid(ctx, bl_)}\n")
+			} else {
+				if ctx.loop_mark >= 0 then emit_reset!(ctx, ctx.loop_mark, "%res_0")
+				if ctx.loop_sur_mark >= 0 then emit_reset!(ctx, ctx.loop_sur_mark, "%node_0")
+				write_str(ctx.fd, "\tjmp @ltop${ctx.cur_loop}\n")
+			}
+
 			term = 1
 		},
 		Stmt.Yield(e) -> {
@@ -5570,8 +5752,8 @@ const emit_block! = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 		const Stmt s = stmts[i]
 
 		match s {
-			Stmt.Loop(bd) -> {
-				emit_loop_body!(ctx, env, bd)
+			Stmt.Loop(ll_, bd) -> {
+				emit_loop_body!(ctx, env, ll_, bd)
 			},
 			Stmt.ForIn(fv, fa, fbd) -> {
 				emit_for_body!(ctx, env, fv, fa, fbd)
@@ -5798,7 +5980,7 @@ const nfp_alloc_stmt = ([UnionDecl] unions, Stmt s): Bool -> {
 		Stmt.IfThen(_, b) -> nfp_alloc_stmt(unions, b),
 		Stmt.IfElse(_, t, el) -> nfp_alloc_stmt(unions, t) || nfp_alloc_stmt(unions, el),
 		Stmt.Block(ss) -> nfp_alloc_body(unions, ss),
-		Stmt.Loop(ss) -> nfp_alloc_body(unions, ss),
+		Stmt.Loop(ll_, ss) -> nfp_alloc_body(unions, ss),
 		Stmt.ForIn(_, _, ss) -> nfp_alloc_body(unions, ss),
 		Stmt.Match(_, arms) -> nfp_alloc_arms(unions, arms),
 		Stmt.Defer(ss) -> nfp_alloc_body(unions, ss),
@@ -5865,7 +6047,7 @@ const nfp_ind_stmt = ([Func] funcs, Stmt s): Bool -> {
 		Stmt.IfThen(_, b) -> nfp_ind_stmt(funcs, b),
 		Stmt.IfElse(_, t, el) -> nfp_ind_stmt(funcs, t) || nfp_ind_stmt(funcs, el),
 		Stmt.Block(ss) -> nfp_ind_body(funcs, ss),
-		Stmt.Loop(ss) -> nfp_ind_body(funcs, ss),
+		Stmt.Loop(ll_, ss) -> nfp_ind_body(funcs, ss),
 		Stmt.ForIn(_, _, ss) -> nfp_ind_body(funcs, ss),
 		Stmt.Match(_, arms) -> nfp_ind_arms(funcs, arms),
 		Stmt.Defer(ss) -> nfp_ind_body(funcs, ss),
@@ -5951,7 +6133,7 @@ const nfp_prop_stmt = ([Func] funcs, [Bool] sig, Stmt s): Bool -> {
 		Stmt.IfThen(_, b) -> nfp_prop_stmt(funcs, sig, b),
 		Stmt.IfElse(_, t, el) -> nfp_prop_stmt(funcs, sig, t) || nfp_prop_stmt(funcs, sig, el),
 		Stmt.Block(ss) -> nfp_prop_body(funcs, sig, ss),
-		Stmt.Loop(ss) -> nfp_prop_body(funcs, sig, ss),
+		Stmt.Loop(ll_, ss) -> nfp_prop_body(funcs, sig, ss),
 		Stmt.ForIn(_, _, ss) -> nfp_prop_body(funcs, sig, ss),
 		Stmt.Match(_, arms) -> nfp_prop_arms(funcs, sig, arms),
 		Stmt.Defer(ss) -> nfp_prop_body(funcs, sig, ss),
@@ -5990,9 +6172,11 @@ const nfp_prop_body = ([Func] funcs, [Bool] sig, [Stmt] ss): Bool -> {
 # emit_program! can lay each DISTINCT literal down once as static data. A source this walk
 # misses (a rare guard pattern) simply falls back to runtime materialization at its site.
 # The static bytes an `embed`/`embed_dir` call contributes to the intern table: a `Call` node needs
-# its embedded file(s) laid down as static `data` so `emit_str_lit!` renders each as a one-instruction
+# its embedded file(s) laid down as static `data` so `emit_str_lit!` renders each as a
+# one-instruction
 # `copy $sl` — a per-byte `storeb` materialization of a whole stdlib would blow QBE's per-function
-# instruction ceiling. The bytes are read HERE at compile time; the call site reads the same files and
+# instruction ceiling. The bytes are read HERE at compile time; the call site reads the same files
+# and
 # finds them already interned. `embed` interns one file's content; `embed_dir` interns every file's
 # content under the directory (their short paths stay non-static — a handful of bytes each).
 # `skip` is the `--skip-embeds` mode (bootstrap intermediates): when set, embedded file data is NOT
@@ -6087,7 +6271,7 @@ const slc_stmt! = (Stmt s, Bool skip): [Str] -> {
 		Stmt.IfThen(_, b) -> slc_stmt!(b, skip),
 		Stmt.IfElse(_, t, el) -> cat_names(slc_stmt!(t, skip), slc_stmt!(el, skip)),
 		Stmt.Block(ss) -> slc_body!(ss, skip),
-		Stmt.Loop(ss) -> slc_body!(ss, skip),
+		Stmt.Loop(ll_, ss) -> slc_body!(ss, skip),
 		Stmt.ForIn(_, _, ss) -> slc_body!(ss, skip),
 		Stmt.Match(_, arms) -> slc_sarms!(arms, skip),
 		Stmt.Defer(ss) -> slc_body!(ss, skip),
@@ -6130,7 +6314,8 @@ const slit_program! = (Program prog, Bool skip, Str build_version): [Str] -> {
 		i = i + 1
 	}
 
-	# The version stamps (`std::comptime::version::current`/`::compiler`) are interned like any literal,
+	# The version stamps (`std::comptime::version::current`/`::compiler`) are interned like any
+	# literal,
 	# so a reference emits a static `copy $sl<i>` — no runtime allocation, which matters since they may
 	# be read where no geometry ambient exists (e.g. a bare `main`). Interned ONLY when the program
 	# actually references the intrinsic (its bodyless decl survives pruning only if used): a program
@@ -6233,7 +6418,7 @@ const mint_stmt = (Stmt s): Bool -> {
 		Stmt.IfThen(_, b) -> mint_stmt(b),
 		Stmt.IfElse(_, t, el) -> mint_stmt(t) || mint_stmt(el),
 		Stmt.Block(ss) -> mint_body(ss),
-		Stmt.Loop(ss) -> mint_body(ss),
+		Stmt.Loop(ll_, ss) -> mint_body(ss),
 		Stmt.ForIn(_, _, ss) -> mint_body(ss),
 		Stmt.Match(_, arms) -> mint_arms(arms),
 		Stmt.Defer(ss) -> mint_body(ss),
@@ -6657,7 +6842,8 @@ const emit_func! = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 # The root page's QBE side (geometry_lowering §5, `page`): a global bump cursor over one
 # ELASTIC reserve-in-place mapping — `{cf_top, cf_committed, cf_limit}`. `cf_alloc(n)` lazily
 # mints the page on the first call (if cf_limit is 0, call the asm `cf_root_page_init`), 8-aligns
-# the request, bumps the cursor, commits more pages via `cf_root_page_grow` when it crosses the committed
+# the request, bumps the cursor, commits more pages via `cf_root_page_grow` when it crosses the
+# committed
 # watermark, and traps via `cf_oom` only at RESERVATION exhaustion. The reservation base never
 # moves, so returned pointers stay valid (memory_model §8). Records (which may escape via a
 # return) live here; scalars stay in stack slots. (Still the single ambient page — the per-node
@@ -6969,9 +7155,11 @@ const emit_dyn_helpers! = (Fd fd): Iarch -> {
 
 const emit_arena_qbe! = (Fd fd, Bool is_bare, Iarch root_size, Bool dyn_g, Iarch pgidx): Iarch -> {
 	# a `Bare` target's root is a fixed `root_size`-byte BSS block (`$cf_root`, default 1 MiB) — no
-	# mmap. cf_root_page_init seeds $cf_page over it as a two-ended block (survivor limit == residue top == base+root_size), so the page reserve bumps within it and
+	# mmap. cf_root_page_init seeds $cf_page over it as a two-ended block (survivor limit == residue
+	# top == base+root_size), so the page reserve bumps within it and
 	# traps (cf_oom) at the end. In zero-root mode (root_size 0) the usable region is empty (the floor
-	# sets limit==base), so any allocation traps — but the check rejects page use at compile time first;
+	# sets limit==base), so any allocation traps — but the check rejects page use at compile time
+	# first;
 	# the block still needs a non-zero size for a valid `data` symbol, so clamp the reservation to 16.
 	const Iarch dsz = if root_size < 16 then 16 else root_size
 	if is_bare then write_str(fd, "export data $cf_root = { z ${dsz} }\n")
@@ -7108,7 +7296,8 @@ const emit_argv_qbe! = (Fd fd, Iarch pgr): Iarch -> {
 # The env bridge, emitted alongside the argv bridge for `main([Str] args, [Str] env)`. Like
 # `cf_build_args` but walks the NUL-terminated `envp` with no count — stop at the first NULL
 # pointer — wrapping each "KEY=VALUE" C-string in a borrowed `{bytes,len}` Str and pushing onto a
-# fresh `[Str]` on the root page. Reuses `cf_strlen` (emitted by `emit_argv_qbe!`, always run first).
+# fresh `[Str]` on the root page. Reuses `cf_strlen` (emitted by `emit_argv_qbe!`, always run
+# first).
 const emit_env_qbe! = (Fd fd, Iarch pgr): Iarch -> {
 	write_str(fd, "export function l $cf_build_env(l %node, l %envp) {\n")
 	write_str(fd, "@start\n")
@@ -7145,17 +7334,22 @@ const emit_env_qbe! = (Fd fd, Iarch pgr): Iarch -> {
 }
 
 # The root page's asm side — the ELASTIC reserve-in-place bump (geometry_lowering §5, `page`).
-# `cf_root_page_init` reserves one large virtual range up front with PROT_NONE (SYS_mmap=197), commits
+# `cf_root_page_init` reserves one large virtual range up front with PROT_NONE (SYS_mmap=197),
+# commits
 # an initial 256 MiB chunk with mprotect (SYS_mprotect=74), and seeds the cursor {top, committed,
-# limit}. `cf_root_page_grow(target)` commits more pages (rounding up to a 256 MiB step) when the cursor
+# limit}. `cf_root_page_grow(target)` commits more pages (rounding up to a 256 MiB step) when the
+# cursor
 # crosses the committed watermark — the same base address throughout, so every outstanding pointer
 # stays valid (memory_model §8). `cf_oom` fires only at RESERVATION exhaustion; `cf_mmap_fail` on a
 # failed map/commit. All are leaf routines (no `bl`) touching only caller-saved regs (x0-x16).
 const emit_arena_floor! = (Fd fd, Bool is_bare, Iarch root_size): Iarch -> {
 	# BARE floor (ELF, no OS): `qbe -t arm64` emits SysV symbols with no leading `_`, and ELF uses
-	# `:lo12:` page-offset relocations (vs Mach-O `@PAGE`/`@PAGEOFF`). cf_root_page_init seeds $cf_page over
-	# the static 1 MiB $cf_root (survivor limit == residue top == base+root_size ⇒ the reserve bumps within it and traps at the end);
-	# cf_root_page_grow is a never-reached no-op (a fixed bare root never crosses its committed watermark,
+	# `:lo12:` page-offset relocations (vs Mach-O `@PAGE`/`@PAGEOFF`). cf_root_page_init seeds $cf_page
+	# over
+	# the static 1 MiB $cf_root (survivor limit == residue top == base+root_size ⇒ the reserve bumps
+	# within it and traps at the end);
+	# cf_root_page_grow is a never-reached no-op (a fixed bare root never crosses its committed
+	# watermark,
 	# but raw::grow still lowers to it); cf_oom halts (no kernel).
 	if is_bare then {
 		write_str(fd, ".globl cf_root_page_init\n")
@@ -7187,8 +7381,10 @@ const emit_arena_floor! = (Fd fd, Bool is_bare, Iarch root_size): Iarch -> {
 		return 0
 	}
 
-	# hosted floors (darwin / linux / riscv) come from `std::rt::floor` (auto-injected, comptime-fenced,
-	# emitted as verbatim-symbol asm fns) — the compiler emits nothing here for them; only `Bare` (no OS
+	# hosted floors (darwin / linux / riscv) come from `std::rt::floor` (auto-injected,
+	# comptime-fenced,
+	# emitted as verbatim-symbol asm fns) — the compiler emits nothing here for them; only `Bare` (no
+	# OS
 	# to mmap) still floors inline above.
 	return 0
 }
@@ -7211,8 +7407,10 @@ const param_index = ([Param] params, Str name): Iarch -> {
 # replaced by the argument register `x<index>` that parameter occupies (arm64 C ABI: param
 # i is in the arch's arg register i; the function is naked — no prologue — and supplies its own
 # `ret`). The symbol matches the positional name QBE-lowered callers reference (`$f<idx>`): Mach-O
-# keeps the leading underscore (`_f<idx>`), an ELF target (`is_elf`: bare / linux) drops it (`f<idx>`),
-# so the hand-written floor label lines up with QBE's per-target symbol convention. The arg register a
+# keeps the leading underscore (`_f<idx>`), an ELF target (`is_elf`: bare / linux) drops it
+# (`f<idx>`),
+# so the hand-written floor label lines up with QBE's per-target symbol convention. The arg register
+# a
 # `${param}` hole resolves to is arch-specific: arm64 passes param i in `x<i>`, riscv64 in `a<i>`.
 const emit_asm_func! = (Fd fd, Func fn, Iarch idx, Bool is_elf, Bool is_riscv): Iarch -> {
 	# A verbatim-symbol floor fn (`asm_sym` set by resolve for `std::rt::floor::*`) emits under its
@@ -7261,8 +7459,24 @@ const mat_geom_of = ([Str] names, [Str] geoms, Str n): Str -> {
 	# trailing tag (closures.cf mints it there, after materialize, so it is not in `names`). Gated
 	# strictly on the `__clo_` prefix so a geometry hook like `reserve_ret__pg` is never mis-tagged.
 	if starts_clo(n) then return clo_geom_tag(n)
+	# a HOF specialized for a capturing closure (`<hof>$w<cp>$<clo>[__tag]`, closures.cf) likewise
+	# carries its geometry as a re-appended trailing tag. `$` occurs only in compiler-minted names,
+	# and a name without the tag suffix falls through to "" — so the gate cannot mis-tag source fns.
+	if has_dollar(n) then return clo_geom_tag(n)
 
 	return ""
+}
+
+const has_dollar = (Str n): Bool -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(n.len) then break
+		if Iarch(n[i]) == 36 then return true
+		i = i + 1
+	}
+
+	return false
 }
 
 const starts_clo = (Str n): Bool -> {
@@ -7318,7 +7532,8 @@ pub const emit_program! = (
 	const Bool is_bare = match target_os { Os.Bare -> true, _ -> false }
 
 	# `is_elf` (bare OR linux) picks the no-underscore, `:lo12:` symbol form `qbe -t arm64`/`-t rv64`
-	# emit, vs darwin's Mach-O `_`/`@PAGEOFF`. Hosted floors (`_start` + arena) come from `std::rt::floor`;
+	# emit, vs darwin's Mach-O `_`/`@PAGEOFF`. Hosted floors (`_start` + arena) come from
+	# `std::rt::floor`;
 	# only `Bare` still floors inline here (no OS to mmap).
 	const Bool is_linux = match target_os { Os.Linux -> true, _ -> false }
 
@@ -7336,7 +7551,8 @@ pub const emit_program! = (
 	# neither (no OS, no kernel argv).
 	const Bool wants_args = !is_bare
 	const Bool dyn_g = Iarch(mat_names.len) > 0 || wants_args
-	# the root page publishes its own reserve entry (`$reserve_ret__pg`) into its `kind` slot statically
+	# the root page publishes its own reserve entry (`$reserve_ret__pg`) into its `kind` slot
+	# statically
 	# in the `$cf_page` data, so an arena grafted from the page follows the pointer like any other
 	# parent. Kept by materialize whenever a child draws from the page; -1 (absent) when nothing does.
 	const Iarch pgidx = find_func(prog.funcs, "reserve_ret__pg")
@@ -7417,6 +7633,10 @@ pub const emit_program! = (
 				local_slot: 0,
 				skip_embeds: skip_embeds,
 				build_version: build_version,
+				target_os: target_os,
+				target_arch: target_arch,
+				loop_labels: no_names(),
+				loop_lids: no_lids(),
 			})
 			emit_func!(&ctx, prog.funcs[i], i)
 		}
@@ -7425,7 +7645,8 @@ pub const emit_program! = (
 
 	# The freestanding entry. HOSTED (`Darwin`/`Linux`) `_start` lives in `std::rt::floor` (auto-
 	# injected, comptime-fenced): it seeds the root page, builds argv+env through the pre-main bridges
-	# (the uniform ABI), calls `main`, and exit-syscalls its return. Only `Bare` floors its entry inline
+	# (the uniform ABI), calls `main`, and exit-syscalls its return. Only `Bare` floors its entry
+	# inline
 	# here — no OS, no kernel argv, a QEMU-semihosting halt for exit.
 	if is_bare then {
 		# BARE entry: no kernel argv, no exit syscall. Seed the static root, pass &cf_page as main's
