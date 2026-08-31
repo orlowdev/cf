@@ -492,7 +492,7 @@ const path_eq_pre = (Str a, Str b, Iarch blen): Bool -> {
 # Called only when the on-disk `open` failed, so a repo/dev build (lib/std present) never builds the
 # table — it is materialized here, matched by path, and its bytes copied into `buf`. Returns the
 # module's byte length, or dies if the path is neither on disk nor embedded (a real missing import).
-const embed_fallback = (Str path, *[Uint8] buf, Iarch cap): Iarch -> {
+const embed_fallback! = (Str path, Str importer, *[Uint8] buf, Iarch cap): Iarch -> {
 	# drop `build_path!`'s trailing NUL before matching against the bare embedded path.
 	let Iarch plen = Iarch(path.len)
 
@@ -516,15 +516,24 @@ const embed_fallback = (Str path, *[Uint8] buf, Iarch cap): Iarch -> {
 	}
 
 	if n < 0 then {
-		eprint("cf: cannot open an imported module: ")
-		eprint(path)
+		# the ENTRY has no importer — a bad path on the command line is not a module problem
+		# (`Str({bytes,len})` in argument position: print WITHOUT `build_path!`'s trailing NUL)
+		if eq(importer, "") then {
+			eprint("cf: cannot open the input file: ")
+			eprint(Str({ bytes: path.bytes, len: plen }))
+			die("\n")
+		}
+		eprint("cf: cannot open the module `")
+		eprint(Str({ bytes: path.bytes, len: plen }))
+		eprint("` imported by ")
+		eprint(importer)
 		die("\n")
 	}
 
 	return n
 }
 
-const load_module! = (Str path, Os target_os, Arch target_arch): Program -> {
+const load_module! = (Str path, Str importer, Os target_os, Arch target_arch): Program -> {
 	# One module's read buffer — large enough for cf's own sources (its largest module, emit.cf,
 	# crossed 256 KB; 1 MB leaves headroom). `buf.len` is the capacity handed to `read` (the
 	# buffer reports its own size now), and `read` returns the actual byte count `n`. A read that
@@ -536,7 +545,7 @@ const load_module! = (Str path, Os target_os, Arch target_arch): Program -> {
 	# back to the copy baked into the binary — the same source, keyed on its path. A user import that
 	# is neither on disk nor embedded dies in `embed_fallback`.
 	const Iarch n = match open_read(path) {
-		Either.Left(e) -> embed_fallback(path, buf, Iarch(buf.len)),
+		Either.Left(e) -> embed_fallback!(path, importer, buf, Iarch(buf.len)),
 		Either.Right(fd) -> {
 			const Iarch k = match read(fd, buf, Uarch(buf.len)) {
 				Either.Left(e) -> die("cf: reading an imported module failed: ${path}\n"),
@@ -2485,19 +2494,37 @@ const tag_floor_syms = (Program p): Program -> {
 # UNMANGLED with its flat prefix. Pass 2 mangles every module's value members apart —
 # `<prefix>_<name>` keyed on its path — so two modules may export the same name, resolving each
 # cross-module reference through the module's imports (module_system §8).
+const cat_src_n = ([Str] xs, Iarch n, Str s): [Str] -> {
+	let [Str] r = [...xs]
+	let Iarch i = 0
+
+	loop {
+		if i >= n then break
+		r = [...r, s]
+		i = i + 1
+	}
+
+	return r
+}
+
 pub const resolve_program! = (Str entry, Os target_os, Arch target_arch): Program -> {
 	const Str edir = dir_of!(entry)
-	const Program root = load_module!(entry, target_os, target_arch)
+	const Program root = load_module!(entry, "", target_os, target_arch)
 	# the entry is prefix-empty (its names stay bare — it fixes the naming frame)
 	let [Modu] mods = [Modu({ prefix: "", mpath: entry, is_geom: false, tag: "", prog: root })]
 	let [Import] work = []
+	# `wsrc[k]` names the module whose import list contributed `work[k]` — a missing file
+	# then reports its importer, not just the unresolvable path
+	let [Str] wsrc = []
 	work = cat_imports(work, root.imports)
+	wsrc = cat_src_n(wsrc, Iarch(root.imports.len), entry)
 	# AUTO-INJECT the freestanding floor barrel (module_system): every program links the per-target
 	# arena runtime (`cf_root_page_init`/`grow`/`oom`) whether or not it names it — exactly as the
 	# compiler used to emit that floor unconditionally. The barrel's `comptime_if` (folded against this
 	# program's `--target`) loads the one platform impl; its verbatim-symbol asm fns define the floor.
 	const [Str] floor_none = []
 	work = [...work, Import({ path: "std/rt/floor", names: floor_none, alias: "", wildcard: false })]
+	wsrc = [...wsrc, entry]
 	let Iarch wi = 0
 
 	loop {
@@ -2533,13 +2560,14 @@ pub const resolve_program! = (Str entry, Os target_os, Arch target_arch): Progra
 					geom = true
 					mtag = "pg"
 				}
-				const Program m0 = load_module!(mpath, target_os, target_arch)
+				const Program m0 = load_module!(mpath, wsrc[wi], target_os, target_arch)
 				const Program m = if is_floor_impl(im.path) then tag_floor_syms(m0) else m0
 				mods = [
 					...mods,
 					Modu({ prefix: sanitize_prefix!(im.path), mpath: mpath, is_geom: geom, tag: mtag, prog: m }),
 				]
 				work = cat_imports(work, m.imports)
+				wsrc = cat_src_n(wsrc, Iarch(m.imports.len), mpath)
 			}
 			wi = wi + 1
 		}

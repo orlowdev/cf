@@ -76,6 +76,7 @@ import std::compiler::ast::{
 import std::data::str::{ eq }
 import std::compiler::alloc::{ compute_esc }
 import std::io::console::{ die, eprint }
+import std::compiler::diag::{ die_at_lc }
 
 const has_name = ([Str] xs, Str s): Bool -> {
 	let Iarch i = 0
@@ -2028,7 +2029,7 @@ const routing_run! = (Program prog, RouteInfo ri, Bool dump): Iarch -> {
 				loop {
 					if j >= Iarch(oracle.len) then break
 					if !has_name(esc, oracle[j])
-						then die("cf: routing: internal divergence in `${prog.funcs[i].name}`: `${oracle[j]}` escapes per the oracle but not per the shadow pass\n")
+						then die_at_lc(prog.funcs[i].dfile, prog.funcs[i].dline, prog.funcs[i].dcol, "cf: routing: internal divergence in `${prog.funcs[i].name}`: `${oracle[j]}` escapes per the oracle but not per the shadow pass\n")
 					j = j + 1
 				}
 			}
@@ -2049,10 +2050,10 @@ const routing_run! = (Program prog, RouteInfo ri, Bool dump): Iarch -> {
 const is_destroy_callee = (Str n): Bool ->
 	eq(n, "destroy__fx") || eq(n, "destroy__el") || eq(n, "destroy__fb")
 
-const cd_check_arg! = (Expr arg, [Str] sset): Iarch -> {
+const cd_check_arg! = (Expr arg, [Str] sset, Func ef): Iarch -> {
 	const Iarch r = match arg {
 		Expr.Var(bn) -> if has_name(sset, bn)
-			then die("cf: `destroy(${bn})` reclaims `${bn}`, but a value that lives in `${bn}` escapes this scope — it would dangle. Return only scalars from work run `in ${bn}`, or drop the `defer destroy(${bn})`.\n")
+			then die_at_lc(ef.dfile, ef.dline, ef.dcol, "cf: `destroy(${bn})` reclaims `${bn}`, but a value that lives in `${bn}` escapes this scope — it would dangle. Return only scalars from work run `in ${bn}`, or drop the `defer destroy(${bn})`.\n")
 			else 0,
 		_ -> 0,
 	}
@@ -2060,10 +2061,10 @@ const cd_check_arg! = (Expr arg, [Str] sset): Iarch -> {
 	return r
 }
 
-const cd_expr! = (Expr e, [Str] sset): Iarch -> {
+const cd_expr! = (Expr e, [Str] sset, Func ef): Iarch -> {
 	const Iarch hit = match e {
 		Expr.Call(n, _, args, _) -> if is_destroy_callee(n) && Iarch(args.len) > 0
-			then cd_check_arg!(args[0], sset)
+			then cd_check_arg!(args[0], sset, ef)
 			else 0,
 		_ -> 0,
 	}
@@ -2073,56 +2074,56 @@ const cd_expr! = (Expr e, [Str] sset): Iarch -> {
 
 	loop {
 		if i >= Iarch(ks.len) then break
-		cd_expr!(ks[i], sset)
+		cd_expr!(ks[i], sset, ef)
 		i = i + 1
 	}
 
 	return 0
 }
 
-const cd_arms! = ([StmtArm] arms, [Str] sset): Iarch -> {
+const cd_arms! = ([StmtArm] arms, [Str] sset, Func ef): Iarch -> {
 	let Iarch i = 0
 
 	loop {
 		if i >= Iarch(arms.len) then break
-		cd_stmts!(arms[i].body, sset)
+		cd_stmts!(arms[i].body, sset, ef)
 		i = i + 1
 	}
 
 	return 0
 }
 
-const cd_stmt! = (Stmt s, [Str] sset): Iarch -> {
+const cd_stmt! = (Stmt s, [Str] sset, Func ef): Iarch -> {
 	const [Expr] es = stmt_exprs(s)
 	let Iarch i = 0
 
 	loop {
 		if i >= Iarch(es.len) then break
-		cd_expr!(es[i], sset)
+		cd_expr!(es[i], sset, ef)
 		i = i + 1
 	}
 
 	const Iarch r = match s {
-		Stmt.IfThen(_, b) -> cd_stmt!(b, sset),
-		Stmt.IfElse(_, t, e) -> cd_stmt!(t, sset) + cd_stmt!(e, sset),
-		Stmt.Block(bs) -> cd_stmts!(bs, sset),
-		Stmt.Loop(ll_, bs) -> cd_stmts!(bs, sset),
-		Stmt.ForIn(_, _, bs) -> cd_stmts!(bs, sset),
-		Stmt.Match(_, arms) -> cd_arms!(arms, sset),
-		Stmt.Defer(bs) -> cd_stmts!(bs, sset),
-		Stmt.Closure(_, _, _, cb) -> cd_stmts!(cb, sset),
+		Stmt.IfThen(_, b) -> cd_stmt!(b, sset, ef),
+		Stmt.IfElse(_, t, e) -> cd_stmt!(t, sset, ef) + cd_stmt!(e, sset, ef),
+		Stmt.Block(bs) -> cd_stmts!(bs, sset, ef),
+		Stmt.Loop(ll_, bs) -> cd_stmts!(bs, sset, ef),
+		Stmt.ForIn(_, _, bs) -> cd_stmts!(bs, sset, ef),
+		Stmt.Match(_, arms) -> cd_arms!(arms, sset, ef),
+		Stmt.Defer(bs) -> cd_stmts!(bs, sset, ef),
+		Stmt.Closure(_, _, _, cb) -> cd_stmts!(cb, sset, ef),
 		_ -> 0,
 	}
 
 	return r
 }
 
-const cd_stmts! = ([Stmt] ss, [Str] sset): Iarch -> {
+const cd_stmts! = ([Stmt] ss, [Str] sset, Func ef): Iarch -> {
 	let Iarch i = 0
 
 	loop {
 		if i >= Iarch(ss.len) then break
-		cd_stmt!(ss[i], sset)
+		cd_stmt!(ss[i], sset, ef)
 		i = i + 1
 	}
 
@@ -2140,7 +2141,7 @@ pub const check_destroy! = (Program prog, RouteInfo ri): Iarch -> {
 		# the FULL escape set: a name that rides out via the RETURN lives in `rset`, one that escapes
 		# via a store/rehome in `sset` — either means the child handed something out (routing line 1670).
 		if !prog.funcs[i].is_asm
-			then cd_stmts!(prog.funcs[i].body, union_names(ri.sets[i].rset, ri.sets[i].sset))
+			then cd_stmts!(prog.funcs[i].body, union_names(ri.sets[i].rset, ri.sets[i].sset), prog.funcs[i])
 		i = i + 1
 	}
 
@@ -2270,16 +2271,16 @@ const ge_named = (Expr e, [Str] hs): Str -> {
 	return ""
 }
 
-const ge_die! = (Str h, Str sink): Iarch ->
-	die("cf: a geometry handle may not escape its constructing function: the `<geom>::of(...)` arena `${h}` is ${sink}. A geometry is a comptime ambient spent in place — run work `... in ${h}` and reclaim with `defer destroy(${h})`; do not return or forward the handle itself.\n")
+const ge_die! = (Str h, Func ef, Str sink): Iarch ->
+	die_at_lc(ef.dfile, ef.dline, ef.dcol, "cf: a geometry handle may not escape its constructing function: the `<geom>::of(...)` arena `${h}` is ${sink}. A geometry is a comptime ambient spent in place — run work `... in ${h}` and reclaim with `defer destroy(${h})`; do not return or forward the handle itself.\n")
 
 # scan an expression for a handle passed as a non-`destroy` call ARGUMENT (the ambient in `Call.geom`
 # is not an argument, so `f() in b` never trips this).
-const ge_scan_args! = (Expr e, [Str] hs): Iarch -> {
+const ge_scan_args! = (Expr e, [Str] hs, Func ef): Iarch -> {
 	const Iarch hit = match e {
 		Expr.Call(callee, _, args, _) -> if is_destroy_callee(callee)
 			then 0
-			else ge_scan_arglist!(args, hs, callee),
+			else ge_scan_arglist!(args, hs, callee, ef),
 		_ -> 0,
 	}
 
@@ -2288,72 +2289,72 @@ const ge_scan_args! = (Expr e, [Str] hs): Iarch -> {
 
 	loop {
 		if i >= Iarch(ks.len) then break
-		ge_scan_args!(ks[i], hs)
+		ge_scan_args!(ks[i], hs, ef)
 		i = i + 1
 	}
 
 	return 0
 }
 
-const ge_scan_arglist! = ([Expr] args, [Str] hs, Str callee): Iarch -> {
+const ge_scan_arglist! = ([Expr] args, [Str] hs, Str callee, Func ef): Iarch -> {
 	let Iarch i = 0
 
 	loop {
 		if i >= Iarch(args.len) then break
 		if ge_uses(args[i], hs)
-			then ge_die!(ge_named(args[i], hs), "passed as a value argument to `${callee}`")
+			then ge_die!(ge_named(args[i], hs), ef, "passed as a value argument to `${callee}`")
 		i = i + 1
 	}
 
 	return 0
 }
 
-const ge_scan_stmt! = (Stmt s, [Str] hs): Iarch -> {
+const ge_scan_stmt! = (Stmt s, [Str] hs, Func ef): Iarch -> {
 	const [Expr] es = stmt_exprs(s)
 	let Iarch i = 0
 
 	loop {
 		if i >= Iarch(es.len) then break
-		ge_scan_args!(es[i], hs)
+		ge_scan_args!(es[i], hs, ef)
 		i = i + 1
 	}
 
 	const Iarch r = match s {
 		Stmt.Return(e) -> if ge_uses(e, hs)
-			then ge_die!(ge_named(e, hs), "returned out of this frame")
+			then ge_die!(ge_named(e, hs), ef, "returned out of this frame")
 			else 0,
-		Stmt.IfThen(_, b) -> ge_scan_stmt!(b, hs),
-		Stmt.IfElse(_, t, e) -> ge_scan_stmt!(t, hs) + ge_scan_stmt!(e, hs),
-		Stmt.Block(bs) -> ge_scan_stmts!(bs, hs),
-		Stmt.Loop(ll_, bs) -> ge_scan_stmts!(bs, hs),
-		Stmt.ForIn(_, _, bs) -> ge_scan_stmts!(bs, hs),
-		Stmt.Match(_, arms) -> ge_scan_arms!(arms, hs),
-		Stmt.Defer(bs) -> ge_scan_stmts!(bs, hs),
-		Stmt.Closure(_, _, _, cb) -> ge_scan_stmts!(cb, hs),
+		Stmt.IfThen(_, b) -> ge_scan_stmt!(b, hs, ef),
+		Stmt.IfElse(_, t, e) -> ge_scan_stmt!(t, hs, ef) + ge_scan_stmt!(e, hs, ef),
+		Stmt.Block(bs) -> ge_scan_stmts!(bs, hs, ef),
+		Stmt.Loop(ll_, bs) -> ge_scan_stmts!(bs, hs, ef),
+		Stmt.ForIn(_, _, bs) -> ge_scan_stmts!(bs, hs, ef),
+		Stmt.Match(_, arms) -> ge_scan_arms!(arms, hs, ef),
+		Stmt.Defer(bs) -> ge_scan_stmts!(bs, hs, ef),
+		Stmt.Closure(_, _, _, cb) -> ge_scan_stmts!(cb, hs, ef),
 		_ -> 0,
 	}
 
 	return r
 }
 
-const ge_scan_stmts! = ([Stmt] ss, [Str] hs): Iarch -> {
+const ge_scan_stmts! = ([Stmt] ss, [Str] hs, Func ef): Iarch -> {
 	let Iarch i = 0
 
 	loop {
 		if i >= Iarch(ss.len) then break
-		ge_scan_stmt!(ss[i], hs)
+		ge_scan_stmt!(ss[i], hs, ef)
 		i = i + 1
 	}
 
 	return 0
 }
 
-const ge_scan_arms! = ([StmtArm] arms, [Str] hs): Iarch -> {
+const ge_scan_arms! = ([StmtArm] arms, [Str] hs, Func ef): Iarch -> {
 	let Iarch i = 0
 
 	loop {
 		if i >= Iarch(arms.len) then break
-		ge_scan_stmts!(arms[i].body, hs)
+		ge_scan_stmts!(arms[i].body, hs, ef)
 		i = i + 1
 	}
 
@@ -2370,7 +2371,7 @@ pub const check_geom_escape! = (Program prog): Iarch -> {
 		if i >= Iarch(prog.funcs.len) then break
 		if !prog.funcs[i].is_asm then {
 			const [Str] hs = ge_handle_set(prog.funcs[i].body)
-			if Iarch(hs.len) > 0 then ge_scan_stmts!(prog.funcs[i].body, hs)
+			if Iarch(hs.len) > 0 then ge_scan_stmts!(prog.funcs[i].body, hs, prog.funcs[i])
 		}
 		i = i + 1
 	}

@@ -1616,9 +1616,11 @@ const call_type! = (Str callee, [Str] tyargs, [Expr] args, [VarTy] env, Ctx ctx,
 
 	loop {
 		if i >= na then break
-		# a bad written type in the CALLEE's signature dies at the callee's decl, even when the
-		# caller's body reaches it first (funcs check in declaration order)
+		# a bad written type in the CALLEE's signature is recorded at the callee's decl, even when
+		# the caller's body reaches it first (funcs check in declaration order) — and STOPS this
+		# walk: `param_ty!` below would fall into `named_ty`'s unlocated die and mask the report
 		known_ty_at(ctx.funcs[fidx].params[i].type_name, ctx.recs, ctx.unions, ctx.funcs[fidx], dg)
+		if dg.hot then return Ty.TNever
 		const Ty pt = param_ty!(ctx.funcs[fidx].params[i], ctx.recs, ctx.unions)
 
 		# a function-type parameter takes a function reference (checked nominally), not a value
@@ -4646,8 +4648,10 @@ const check_func! = (Func fn, Ctx ctx, *DiagBag dg): Iarch -> {
 	}
 	# a concrete function's signature may not mention a type variable (an undeclared `'T` in a
 	# non-generic function, or one the monomorph pass left unsubstituted)
-	if sig_has_typevar(fn) then return terr_i(ctx, dg, "cf: type: an undeclared type variable in a function signature\n")
+	if sig_has_typevar(fn) then return terr_i(ctx, dg, "cf: type: an undeclared type variable in a function signature — a generic function declares its variables first: `= ['T]('T x): 'T -> ...`\n")
 	known_ty_at(fn.ret_name, ctx.recs, ctx.unions, fn, dg)
+	# a recorded unknown return-type name stops here — `func_ret_ty` would die unlocated on it
+	if dg.hot then return 0
 	const Ty frt = func_ret_ty(fn, ctx.recs, ctx.unions)
 	# thread this function's return type on the Ctx so `type_of` (a value-loop body) can reach it
 	const Ctx fctx = Ctx({
@@ -4670,6 +4674,8 @@ const check_func! = (Func fn, Ctx ctx, *DiagBag dg): Iarch -> {
 		# a `(A, ...) -> R` function-type parameter: arity cap + scalar components (679/680)
 		check_fn_param_sig!(fn.params[pi], ctx, dg)
 		known_ty_at(fn.params[pi].type_name, ctx.recs, ctx.unions, fn, dg)
+		# a recorded unknown param-type name stops here — `param_ty!` would die unlocated on it
+		if dg.hot then return 0
 		const Ty pty = param_ty!(fn.params[pi], ctx.recs, ctx.unions)
 		# a `*Record` pointer parameter is mutable — its fields are written through it
 		const Bool pmut = param_is_recptr(fn.params[pi], ctx.recs) || param_is_indexptr(fn.params[pi])
@@ -4757,7 +4763,7 @@ const diag_dup = ([Diag] ds, Str file, Iarch line, Iarch col, Str msg): Bool -> 
 # COLLECTED (one per declaration — the bag is flushed between declarations), not died on:
 # every check here is an independent name/string test, so the loops safely continue past a
 # recorded error.
-const check_whole = (Program prog, *DiagBag dg): [Diag] -> {
+const check_whole = (Program prog, Str entry, *DiagBag dg): [Diag] -> {
 	let [Diag] diags = []
 	let Iarch r = 0
 
@@ -4931,16 +4937,26 @@ const check_whole = (Program prog, *DiagBag dg): [Diag] -> {
 		i = i + 1
 	}
 
-	if mains == 0 then die("cf: type: no `pub const main` entry point\n")
+	if mains == 0 then {
+		diags = [
+			...diags,
+			Diag({
+				file: entry,
+				line: 1,
+				col: 1,
+				msg: "cf: type: no `pub const main` entry point — a program starts at `pub const main = (): Iarch -> { ... }`\n",
+			}),
+		]
+	}
 
 	return diags
 }
 
 # Typecheck the whole program: its structure, then every function. This phase is the
 # authority for all semantic validation; the emitter does no re-checking.
-pub const check_program! = (Program prog): [Diag] -> {
+pub const check_program! = (Program prog, Str entry): [Diag] -> {
 	let DiagBag bag = DiagBag({ fatal: false, hot: false, file: "", line: 0, col: 0, msg: "" })
-	let [Diag] diags = check_whole(prog, &bag)
+	let [Diag] diags = check_whole(prog, entry, &bag)
 	let Ctx ctx = Ctx({
 		funcs: prog.funcs,
 		recs: prog.recs,
