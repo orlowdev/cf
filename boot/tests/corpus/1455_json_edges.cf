@@ -1,0 +1,101 @@
+# std::data::json edge behavior: escape decoding incl. a surrogate pair, located parse
+# failures, the number grammar, the nesting depth cap, and as_int sign/overflow gates
+# expect: exit 0
+import std::mem::arena::growing_arena
+import std::data::{ Either }
+import std::data::json::{ Json, JsonErr, parse!, render!, as_int }
+import std::data::str::{ eq }
+import std::io::console::{ println }
+
+const is_left = (Either[JsonErr, Json] r): Bool -> match r { Either.Left(e) -> true, _ -> false }
+
+const checks! = (): Iarch -> {
+	# escapes: \n, \", \\, A (A), and the surrogate pair 😀 (a 4-byte emoji)
+	const Str esc = "\"a\\n\\\"\\\\\\u0041\\uD83D\\uDE00\""
+	const Str got = match parse!(esc) {
+		Either.Right(v) -> match v { Json.JStr(s) -> s, _ -> "" },
+		Either.Left(e) -> "",
+	}
+	# a(1) nl(1) quote(1) backslash(1) A(1) emoji(4) = 9 bytes
+	if Iarch(got.len) != 9 then return 1
+	if Iarch(got[4]) != 65 then return 2
+	if Iarch(got[5]) != 240 then return 3
+
+	# the re-render escapes control bytes back
+	const Str back = match parse!(esc) {
+		Either.Right(v) -> render!(v),
+		Either.Left(e) -> "",
+	}
+	# quote a \n \" \\ A + 4 raw emoji bytes + quote = 14 bytes; the emoji lead byte is 240
+	if Iarch(back.len) != 14 then return 4
+	if Iarch(back[9]) != 240 then return 4
+
+	# malformed: offset points at the failure
+	const Iarch off1 = match parse!("{\"a\":}") { Either.Left(e) -> e.off, Either.Right(v) -> -1 }
+	if off1 != 5 then return 5
+
+	# number grammar gates
+	if !is_left(parse!("01")) then return 6
+	if !is_left(parse!("1.")) then return 7
+	if !is_left(parse!("1e")) then return 8
+	if !is_left(parse!("-")) then return 9
+	if is_left(parse!("-0.5e+10")) then return 10
+
+	# lone surrogate + unknown escape + raw control byte
+	if !is_left(parse!("\"\\uD800x\"")) then return 11
+	if !is_left(parse!("\"\\q\"")) then return 12
+	if !is_left(parse!("\"a\nb\"")) then return 13
+
+	# trailing garbage
+	if !is_left(parse!("1 2")) then return 14
+
+	# depth limit: 200 nested arrays reject, 100 pass
+	let Str deep = ""
+	let Iarch i = 0
+
+	loop {
+		if i >= 200 then break
+		deep = "${deep}["
+		i = i + 1
+	}
+	if !is_left(parse!(deep)) then return 15
+
+	let Str ok100 = "1"
+	let Iarch k = 0
+
+	loop {
+		if k >= 100 then break
+		ok100 = "[${ok100}]"
+		k = k + 1
+	}
+	if is_left(parse!(ok100)) then return 16
+
+	# as_int: value, sign, overflow, non-integral
+	const Iarch n1 = match parse!("-42") {
+		Either.Right(v) -> match as_int(v) { Either.Right(n) -> n, Either.Left(e) -> -1 },
+		Either.Left(e) -> -1,
+	}
+	if n1 != -42 then return 17
+
+	const Bool over = match parse!("99999999999999999999") {
+		Either.Right(v) -> match as_int(v) { Either.Left(e) -> true, Either.Right(n) -> false },
+		Either.Left(e) -> false,
+	}
+	if !over then return 18
+
+	const Bool frac = match parse!("1.5") {
+		Either.Right(v) -> match as_int(v) { Either.Left(e) -> true, Either.Right(n) -> false },
+		Either.Left(e) -> false,
+	}
+	if !frac then return 19
+
+	println("all edge checks passed")
+
+	return 0
+}
+
+pub const main = (): Iarch -> {
+	const a = growing_arena::of(4194304)
+
+	return checks!() in a
+}

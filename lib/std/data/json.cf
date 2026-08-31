@@ -1,0 +1,565 @@
+# std::data::json — JSON as a value. `Json` is a union over the six JSON shapes; `parse!` reads
+# a document into it and `render!` writes it back out compactly. A number stays its RAW LEXEME
+# (`JNum` holds the validated but unconverted text), so a document round-trips losslessly no
+# matter how long or precise its numbers are — convert on demand (`as_int`) only where a value
+# is actually consumed as one. An object is an ENTRY LIST, not a map: order and duplicates are
+# preserved exactly as written, and `get!` finds a key by linear scan.
+
+import std::data::either::{ Either }
+import std::data::maybe::{ Maybe }
+import std::data::str::{ eq, slice, join, utf8_of! }
+
+# One object member: its key (escape-decoded) and its value.
+pub data JEntry = { Str key, Json val }
+
+# A JSON value: `null`, a boolean, a number (its raw lexeme), a string (escape-decoded UTF-8),
+# an array, or an object (an entry list).
+pub union Json = { Null, JBool(Bool), JNum(Str), JStr(Str), JArr([Json]), JObj([JEntry]) }
+
+# A parse (or conversion) failure: the byte offset it was noticed at and a plain description.
+pub data JsonErr = { Iarch off, Str msg }
+
+# Nesting deeper than this is rejected rather than recursed into — a depth cap, not a size cap
+# (a flat document of any length parses).
+const max_depth = 128
+
+# --- parser state ---------------------------------------------------------------------------
+
+# The cursor threaded through parsing: the source, the position, the container depth, and the
+# FIRST failure (later ones are ignored — after `bad` the walk unwinds).
+data Jp = { Str src, Iarch pos, Iarch depth, Bool bad, Iarch eoff, Str emsg }
+
+const jerr = (*Jp p, Str msg): () -> {
+	if p.bad then return ()
+	p.bad = true
+	p.eoff = p.pos
+	p.emsg = msg
+}
+
+# The byte at the cursor, or -1 at the end.
+const peek_b = (*Jp p): Iarch -> {
+	if p.pos >= Iarch(p.src.len) then return -1
+
+	return Iarch(p.src[p.pos])
+}
+
+const skip_ws = (*Jp p): () -> {
+	loop {
+		const Iarch c = peek_b(p)
+		if c != 32 && c != 9 && c != 10 && c != 13 then break
+		p.pos = p.pos + 1
+	}
+}
+
+# Advance over the literal `w` if the source carries it at the cursor.
+const eat_word = (*Jp p, Str w): Bool -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(w.len) then break
+		if p.pos + i >= Iarch(p.src.len) then return false
+		if Iarch(p.src[p.pos + i]) != Iarch(w[i]) then return false
+		i = i + 1
+	}
+
+	p.pos = p.pos + Iarch(w.len)
+
+	return true
+}
+
+const hex_val = (Iarch c): Iarch -> {
+	if c >= 48 && c <= 57 then return c - 48
+	if c >= 97 && c <= 102 then return c - 87
+	if c >= 65 && c <= 70 then return c - 55
+
+	return -1
+}
+
+# Read exactly four hex digits (a `\uXXXX` payload), or -1.
+const hex4 = (*Jp p): Iarch -> {
+	let Iarch v = 0
+	let Iarch i = 0
+
+	loop {
+		if i >= 4 then break
+		const Iarch d = hex_val(peek_b(p))
+		if d < 0 then return -1
+		v = v * 16 + d
+		p.pos = p.pos + 1
+		i = i + 1
+	}
+
+	return v
+}
+
+# --- the value grammar ----------------------------------------------------------------------
+
+# A string body after the opening `"`: plain bytes pass through, escapes decode (`\uXXXX`
+# becomes UTF-8, a surrogate PAIR combines into its supplementary code point), and a raw
+# control byte is rejected (JSON requires it escaped).
+const parse_string! = (*Jp p): Str -> {
+	p.pos = p.pos + 1
+	let [Uint8] out = []
+
+	loop {
+		const Iarch c = peek_b(p)
+
+		if c < 0 then {
+			jerr(p, "unterminated string")
+
+			return ""
+		}
+		if c == 34 then {
+			p.pos = p.pos + 1
+			break
+		}
+		if c == 92 then {
+			p.pos = p.pos + 1
+			const Iarch e = peek_b(p)
+			p.pos = p.pos + 1
+
+			if e == 34 then out = [...out, Uint8(34)]
+			if e == 92 then out = [...out, Uint8(92)]
+			if e == 47 then out = [...out, Uint8(47)]
+			if e == 98 then out = [...out, Uint8(8)]
+			if e == 102 then out = [...out, Uint8(12)]
+			if e == 110 then out = [...out, Uint8(10)]
+			if e == 114 then out = [...out, Uint8(13)]
+			if e == 116 then out = [...out, Uint8(9)]
+			if e == 117 then {
+				let Iarch cp = hex4(p)
+
+				if cp < 0 then {
+					jerr(p, "a `\\u` escape needs four hex digits")
+
+					return ""
+				}
+				# a HIGH surrogate must pair with a following `\uDC00`-`\uDFFF` low half;
+				# together they name one supplementary code point
+				if cp >= 55296 && cp <= 56319 then {
+					let Iarch low = -1
+					if eat_word(p, "\\u") then low = hex4(p)
+
+					if low < 56320 || low > 57343 then {
+						jerr(p, "a high surrogate needs a low surrogate after it")
+
+						return ""
+					}
+					cp = 65536 + (cp - 55296) * 1024 + (low - 56320)
+				}
+				# a LONE low surrogate names nothing
+				if cp >= 56320 && cp <= 57343 then {
+					jerr(p, "a lone low surrogate")
+
+					return ""
+				}
+				const Str enc = utf8_of!(cp)
+				let Iarch k = 0
+
+				loop {
+					if k >= Iarch(enc.len) then break
+					out = [...out, Uint8(enc[k])]
+					k = k + 1
+				}
+			}
+			if e != 34 && e != 92 && e != 47 && e != 98 && e != 102 && e != 110 && e != 114 &&
+				e != 116 &&
+				e != 117 then {
+				jerr(p, "an unknown escape")
+
+				return ""
+			}
+		} else {
+			if c < 32 then {
+				jerr(p, "a raw control byte in a string — escape it")
+
+				return ""
+			}
+			out = [...out, Uint8(c)]
+			p.pos = p.pos + 1
+		}
+	}
+
+	return Str(out)
+}
+
+# A number per the JSON grammar — `-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?` — kept as
+# its raw lexeme (a view into the source), never converted here.
+const parse_number = (*Jp p): Json -> {
+	const Iarch start = p.pos
+
+	if peek_b(p) == 45 then p.pos = p.pos + 1
+	const Iarch first = peek_b(p)
+
+	if first == 48 then {
+		p.pos = p.pos + 1
+	} else {
+		if first < 49 || first > 57 then {
+			jerr(p, "a number needs a digit after its sign")
+
+			return Json.Null
+		}
+
+		loop {
+			const Iarch c = peek_b(p)
+			if c < 48 || c > 57 then break
+			p.pos = p.pos + 1
+		}
+	}
+	if peek_b(p) == 46 then {
+		p.pos = p.pos + 1
+		const Iarch fd = peek_b(p)
+
+		if fd < 48 || fd > 57 then {
+			jerr(p, "a fraction needs at least one digit")
+
+			return Json.Null
+		}
+
+		loop {
+			const Iarch c = peek_b(p)
+			if c < 48 || c > 57 then break
+			p.pos = p.pos + 1
+		}
+	}
+	const Iarch ex = peek_b(p)
+
+	if ex == 101 || ex == 69 then {
+		p.pos = p.pos + 1
+		const Iarch sg = peek_b(p)
+		if sg == 43 || sg == 45 then p.pos = p.pos + 1
+		const Iarch ed = peek_b(p)
+
+		if ed < 48 || ed > 57 then {
+			jerr(p, "an exponent needs at least one digit")
+
+			return Json.Null
+		}
+
+		loop {
+			const Iarch c = peek_b(p)
+			if c < 48 || c > 57 then break
+			p.pos = p.pos + 1
+		}
+	}
+
+	return Json.JNum(slice(start, p.pos, p.src))
+}
+
+const parse_array! = (*Jp p): Json -> {
+	p.pos = p.pos + 1
+	p.depth = p.depth + 1
+
+	if p.depth > max_depth then {
+		jerr(p, "nesting deeper than the supported depth")
+
+		return Json.Null
+	}
+	let [Json] xs = []
+
+	skip_ws(p)
+	if peek_b(p) == 93 then {
+		p.pos = p.pos + 1
+		p.depth = p.depth - 1
+
+		return Json.JArr(xs)
+	}
+
+	loop {
+		const Json v = parse_value!(p)
+		if p.bad then return Json.Null
+		xs = [...xs, v]
+		skip_ws(p)
+		const Iarch c = peek_b(p)
+
+		if c == 93 then {
+			p.pos = p.pos + 1
+			break
+		}
+		if c != 44 then {
+			jerr(p, "expected `,` or `]` in an array")
+
+			return Json.Null
+		}
+		p.pos = p.pos + 1
+		skip_ws(p)
+	}
+
+	p.depth = p.depth - 1
+
+	return Json.JArr(xs)
+}
+
+const parse_object! = (*Jp p): Json -> {
+	p.pos = p.pos + 1
+	p.depth = p.depth + 1
+
+	if p.depth > max_depth then {
+		jerr(p, "nesting deeper than the supported depth")
+
+		return Json.Null
+	}
+	let [JEntry] es = []
+
+	skip_ws(p)
+	if peek_b(p) == 125 then {
+		p.pos = p.pos + 1
+		p.depth = p.depth - 1
+
+		return Json.JObj(es)
+	}
+
+	loop {
+		skip_ws(p)
+		if peek_b(p) != 34 then {
+			jerr(p, "expected a `\"` object key")
+
+			return Json.Null
+		}
+		const Str k = parse_string!(p)
+		if p.bad then return Json.Null
+		skip_ws(p)
+		if peek_b(p) != 58 then {
+			jerr(p, "expected `:` after an object key")
+
+			return Json.Null
+		}
+		p.pos = p.pos + 1
+		skip_ws(p)
+		const Json v = parse_value!(p)
+		if p.bad then return Json.Null
+		es = [...es, JEntry({ key: k, val: v })]
+		skip_ws(p)
+		const Iarch c = peek_b(p)
+
+		if c == 125 then {
+			p.pos = p.pos + 1
+			break
+		}
+		if c != 44 then {
+			jerr(p, "expected `,` or `}` in an object")
+
+			return Json.Null
+		}
+		p.pos = p.pos + 1
+	}
+
+	p.depth = p.depth - 1
+
+	return Json.JObj(es)
+}
+
+const parse_value! = (*Jp p): Json -> {
+	if p.bad then return Json.Null
+	const Iarch c = peek_b(p)
+
+	if c == 123 then return parse_object!(p)
+	if c == 91 then return parse_array!(p)
+	if c == 34 then return Json.JStr(parse_string!(p))
+	if c == 116 then {
+		if eat_word(p, "true") then return Json.JBool(true)
+		jerr(p, "expected a value")
+
+		return Json.Null
+	}
+	if c == 102 then {
+		if eat_word(p, "false") then return Json.JBool(false)
+		jerr(p, "expected a value")
+
+		return Json.Null
+	}
+	if c == 110 then {
+		if eat_word(p, "null") then return Json.Null
+		jerr(p, "expected a value")
+
+		return Json.Null
+	}
+	if c == 45 || (c >= 48 && c <= 57) then return parse_number(p)
+	jerr(p, "expected a value")
+
+	return Json.Null
+}
+
+# --- the public surface ---------------------------------------------------------------------
+
+# Parse one JSON document: exactly one value with nothing but whitespace around it. `Left`
+# carries the byte offset the failure was noticed at; `Right` the value. String values and
+# keys are escape-decoded; numbers keep their raw lexemes.
+pub const parse! = (Str src): Either[JsonErr, Json] -> {
+	let Jp p = Jp({ src: src, pos: 0, depth: 0, bad: false, eoff: 0, emsg: "" })
+
+	skip_ws(&p)
+	const Json v = parse_value!(&p)
+
+	skip_ws(&p)
+	if !p.bad && p.pos < Iarch(p.src.len) then jerr(&p, "trailing bytes after the value")
+	if p.bad then return Either[JsonErr, Json].Left(JsonErr({ off: p.eoff, msg: p.emsg }))
+
+	return Either[JsonErr, Json].Right(v)
+}
+
+# A string value quoted and escaped back to JSON text: `"`, `\`, and the named control bytes
+# short-escape; any other byte below 0x20 becomes `\u00XX`.
+const quote! = (Str s): Str -> {
+	let [Uint8] out = [Uint8(34)]
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(s.len) then break
+		const Iarch c = Iarch(s[i])
+
+		if c == 34 || c == 92 then {
+			out = [...out, Uint8(92)]
+			out = [...out, Uint8(c)]
+		} else {
+			if c == 10 then {
+				out = [...out, Uint8(92)]
+				out = [...out, Uint8(110)]
+			}
+			if c == 9 then {
+				out = [...out, Uint8(92)]
+				out = [...out, Uint8(116)]
+			}
+			if c == 13 then {
+				out = [...out, Uint8(92)]
+				out = [...out, Uint8(114)]
+			}
+			if c == 8 then {
+				out = [...out, Uint8(92)]
+				out = [...out, Uint8(98)]
+			}
+			if c == 12 then {
+				out = [...out, Uint8(92)]
+				out = [...out, Uint8(102)]
+			}
+			if c < 32 && c != 10 && c != 9 && c != 13 && c != 8 && c != 12 then {
+				out = [...out, Uint8(92)]
+				out = [...out, Uint8(117)]
+				out = [...out, Uint8(48)]
+				out = [...out, Uint8(48)]
+				const Iarch hi = c / 16
+				const Iarch lo = c % 16
+				if hi < 10 then out = [...out, Uint8(48 + hi)] else out = [...out, Uint8(87 + hi)]
+				if lo < 10 then out = [...out, Uint8(48 + lo)] else out = [...out, Uint8(87 + lo)]
+			}
+			if c >= 32 then out = [...out, Uint8(c)]
+		}
+		i = i + 1
+	}
+
+	out = [...out, Uint8(34)]
+
+	return Str(out)
+}
+
+# Write a value back to compact JSON text (no added whitespace). A parsed document
+# round-trips: numbers echo their lexemes, object order and duplicates are preserved.
+pub const render! = (Json j): Str -> match j {
+	Json.Null -> "null",
+	Json.JBool(b) -> if b then "true" else "false",
+	Json.JNum(n) -> n,
+	Json.JStr(s) -> quote!(s),
+	Json.JArr(xs) -> {
+		let [Str] parts = []
+
+		for x in xs {
+			parts = [...parts, render!(x)]
+		}
+
+		const Str body = join(",", parts)
+
+		<- "[${body}]"
+	},
+	Json.JObj(es) -> {
+		let [Str] parts = []
+
+		for e in es {
+			const Str k = quote!(e.key)
+			const Str v = render!(e.val)
+			parts = [...parts, "${k}:${v}"]
+		}
+
+		const Str body = join(",", parts)
+
+		<- "{${body}}"
+	},
+}
+
+# The value under `key` in an object — the FIRST match in entry order — or `Nothing` (also for
+# a non-object).
+pub const get = (Str key, Json j): Maybe[Json] -> {
+	match j {
+		Json.JObj(es) -> {
+			for e in es {
+				if eq(e.key, key) then return Maybe[Json].Just(e.val)
+			}
+		},
+		_ -> {},
+	}
+
+	return Maybe[Json].Nothing
+}
+
+# The element at `i` in an array, or `Nothing` (also for a non-array / out of range).
+pub const at = (Iarch i, Json j): Maybe[Json] -> {
+	match j {
+		Json.JArr(xs) -> {
+			if i >= 0 && i < Iarch(xs.len) then {
+				const Json v = xs[i]
+
+				return Maybe[Json].Just(v)
+			}
+		},
+		_ -> {},
+	}
+
+	return Maybe[Json].Nothing
+}
+
+# A number value as a machine integer: the lexeme must be integral (no fraction or exponent)
+# and fit an `Iarch` — overflow is a `Left`, not a wrap. (The most negative 64-bit value is
+# rejected with the overflow — the cap is symmetric at its magnitude minus one.)
+pub const as_int = (Json j): Either[JsonErr, Iarch] -> {
+	match j {
+		Json.JNum(n) -> {
+			let Iarch i = 0
+			let Iarch sign = 1
+
+			if Iarch(n.len) > 0 && Iarch(n[0]) == 45 then {
+				sign = -1
+				i = 1
+			}
+			# the largest Iarch, doubled up from the 32-bit literal cap (a literal cannot
+			# spell 2^63-1 directly)
+			let Iarch imax = 2147483647
+			let Iarch db = 0
+
+			loop {
+				if db >= 32 then break
+				imax = imax * 2 + 1
+				db = db + 1
+			}
+
+			let Iarch acc = 0
+
+			loop {
+				if i >= Iarch(n.len) then break
+				const Iarch c = Iarch(n[i])
+
+				if c < 48 || c > 57 then
+					return Either[JsonErr, Iarch].Left(JsonErr({ off: i, msg: "not an integral number" }))
+				const Iarch d = c - 48
+
+				if acc > (imax - d) / 10 then
+					return Either[JsonErr, Iarch].Left(JsonErr({ off: i, msg: "the number overflows an Iarch" }))
+				acc = acc * 10 + d
+				i = i + 1
+			}
+
+			return Either[JsonErr, Iarch].Right(sign * acc)
+		},
+		_ -> {},
+	}
+
+	return Either[JsonErr, Iarch].Left(JsonErr({ off: 0, msg: "not a number value" }))
+}
