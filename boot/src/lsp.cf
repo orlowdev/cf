@@ -1565,44 +1565,8 @@ const local_refs! = (Str argv0, [Str] env, Str path, Str overlay, [Str] lines, I
 		# no decl row to anchor — refuse rather than hand back a use list with no owner
 		if Iarch(rows.len) == 0 then return rows
 
-		# a `type` ALIAS line may name this type in its target (`type Alias = Point`) —
-		# those tokens are erased before the parse, so the event log cannot cover them: the
-		# line scan adds them (the dedup below folds the spliced duplicates the log carries)
-		if Iarch(t.name[0]) >= 65 && Iarch(t.name[0]) <= 90 then {
-			let Iarch al = 0
-
-			for ln in lines {
-				const DeclLine d = scan_decl(ln)
-
-				if d.kind == 5 && !contains("= {", ln) then {
-					let Iarch i = index_of("=", ln)
-
-					loop {
-						if i < 0 || i >= Iarch(ln.len) then break
-
-						if name_byte(Iarch(ln[i])) then {
-							const Iarch e = name_end(ln, i)
-
-							if e - i == Iarch(t.name.len) && eq(slice(i, e, ln), t.name) then {
-								rows = [...rows, SymRow({
-									sname: t.name,
-									kind: 13,
-									file: path,
-									line: al,
-									ns: i,
-									ne: e,
-								})]
-							}
-
-							i = e
-						} else {
-							i = i + 1
-						}
-					}
-				}
-
-				al = al + 1
-			}
+		for ar in alias_target_rows(lines, path, t.name) {
+			rows = [...rows, ar]
 		}
 	}
 
@@ -1621,6 +1585,51 @@ const local_refs! = (Str argv0, [Str] env, Str path, Str overlay, [Str] lines, I
 
 			if !dup then rows = [...rows, s]
 		}
+	}
+
+	return rows
+}
+
+# The `type Alias = ...Target...` lines of `lines` that name the UPPERCASE `name` in their
+# target (`type Alias = Point`) — those tokens are erased before the parse, so the event log
+# cannot cover them: the line scan supplies the rows (the caller's dedup folds the spliced
+# duplicates the log DOES carry for a used alias).
+const alias_target_rows = ([Str] lines, Str file, Str name): [SymRow] -> {
+	let [SymRow] rows = []
+	if Iarch(name[0]) < 65 || Iarch(name[0]) > 90 then return rows
+	let Iarch al = 0
+
+	for ln in lines {
+		const DeclLine d = scan_decl(ln)
+
+		if d.kind == 5 && !contains("= {", ln) then {
+			let Iarch i = index_of("=", ln)
+
+			loop {
+				if i < 0 || i >= Iarch(ln.len) then break
+
+				if name_byte(Iarch(ln[i])) then {
+					const Iarch e = name_end(ln, i)
+
+					if e - i == Iarch(name.len) && eq(slice(i, e, ln), name) then {
+						rows = [...rows, SymRow({
+							sname: name,
+							kind: 13,
+							file: file,
+							line: al,
+							ns: i,
+							ne: e,
+						})]
+					}
+
+					i = e
+				} else {
+					i = i + 1
+				}
+			}
+		}
+
+		al = al + 1
 	}
 
 	return rows
@@ -1824,12 +1833,161 @@ const rows_at! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, I
 	return local_refs!(argv0, env, path, overlay, lines, l0, t)
 }
 
-# Answer textDocument/references: every reference of the LOCAL binding under the cursor —
-# all in this one file. The binder row is the declaration; it is dropped when the client set
-# includeDeclaration off. Null for anything that is not a local: a top-level name's uses
-# cross module files, and a partial list would mislead.
+# A per-file `uses` child outcome: `ok` false when the file's parse died (a mid-edit break —
+# the whole cross-file answer must refuse; there is no chunk salvage across files).
+data UsesOut = { Bool ok, [SymRow] rows }
+
+# One `cf lsp uses` child run over `f`: the file's uses of the top-level `name`, VERIFIED —
+# the child's mangled-tail match is loose, so a position only survives when `name` sits at
+# its column as a whole token in the file's own text (the overlay stands in for the owner).
+const uses_rows! = (Str argv0, [Str] env, Str f, Str owner, Str srcf, Str name): UsesOut -> {
+	const [SymRow] none = []
+
+	const Str sh = match find_executable!(env, "sh") {
+		Either.Right(p) -> p,
+		Either.Left(e) -> "",
+	}
+
+	if eq(sh, "") then return UsesOut({ ok: false, rows: none })
+	const Str tmp = "/tmp/cf-lsp-${getpid()}.uses"
+	let Str ov = ""
+	if eq(owner, f) then ov = " --src '${srcf}'"
+	const Str cmd = "'${argv0}' lsp uses '${f}' '${name}'${ov} > '${tmp}' 2> /dev/null"
+	const Iarch rc = run!(sh, ["sh", "-c", cmd], env)
+
+	const Str got = match read_file!(tmp) {
+		Either.Right(s) -> s,
+		Either.Left(e) -> "",
+	}
+
+	remove(tmp)
+	if rc != 0 then return UsesOut({ ok: false, rows: none })
+	const [Str] flines = split("\n", src_of!(f, owner, srcf))
+	let [SymRow] rows = []
+
+	for lref in split("\n", got) {
+		const SymRow r = ref_row(lref, f, name)
+
+		if r.line >= 0 && r.line < Iarch(flines.len) then {
+			const Str ln = flines[r.line]
+
+			if r.ne <= Iarch(ln.len)
+			&& eq(slice(r.ns, r.ne, ln), name)
+			&& (r.ns == 0 || !name_byte(Iarch(ln[r.ns - 1])))
+			&& (r.ne >= Iarch(ln.len) || !name_byte(Iarch(ln[r.ne]))) then {
+				rows = [...rows, r]
+			}
+		}
+	}
+
+	return UsesOut({ ok: true, rows: rows })
+}
+
+# Cross-file rows for a PUB top-level name: the ONE declaration of the cursor's name across
+# the module tree, then every tree file's verified uses (import-list members included) and
+# alias-target mentions. Refused (empty) when the name is declared nowhere, more than once
+# (a same-named sibling makes per-file binding ambiguous — refuse rather than corrupt),
+# non-pub, an erased `type` alias, or `main` (the entry symbol is not renameable); and when
+# ANY file's parse dies — a cross-file edit built from a partial answer would corrupt.
+const pub_rows! = (Str argv0, [Str] env, Str path, Str srcf, Str srcp, Str overlay, TokCtx t): [SymRow] -> {
+	const [SymRow] none = []
+	if eq(t.name, "main") then return none
+	const [Str] mods = modules_of!(argv0, env, path, overlay)
+	const Str pwd = getenv!(env, "PWD")
+	const [Str] scan = scan_files!(mods, path, pwd)
+
+	const Str owner = match read_file!(srcp) {
+		Either.Right(s) -> s,
+		Either.Left(e) -> "",
+	}
+
+	const [SymRow] decls = all_decls!(scan, owner, srcf)
+	let [SymRow] dhits = []
+
+	for d in decls {
+		if eq(d.sname, t.name) then dhits = [...dhits, d]
+	}
+
+	if Iarch(dhits.len) != 1 then return none
+	const SymRow dl = dhits[0]
+	# an erased `type` alias has no events to walk; a group is never pub — kind 5 refuses whole
+	if dl.kind == 5 then return none
+	const [Str] dlines = split("\n", src_of!(dl.file, owner, srcf))
+	if dl.line >= Iarch(dlines.len) then return none
+	if !starts_with("pub ", dlines[dl.line]) then return none
+	let [SymRow] rows = [dl]
+
+	for f in scan {
+		const UsesOut u = uses_rows!(argv0, env, f, owner, srcf, t.name)
+		if !u.ok then return none
+
+		for r in u.rows {
+			let Bool dup = false
+
+			for x in rows {
+				if eq(x.file, r.file) && x.line == r.line && x.ns == r.ns then dup = true
+			}
+
+			if !dup then rows = [...rows, r]
+		}
+	}
+
+	for f in scan {
+		for ar in alias_target_rows(split("\n", src_of!(f, owner, srcf)), f, t.name) {
+			let Bool dup = false
+
+			for x in rows {
+				if eq(x.file, ar.file) && x.line == ar.line && x.ns == ar.ns then dup = true
+			}
+
+			if !dup then rows = [...rows, ar]
+		}
+	}
+
+	return rows
+}
+
+# The reference rows of the binding under (uri, l0, c0): the same-file rows (a local, or a
+# non-pub top-level name) when they answer, else the CROSS-FILE rows of a pub name. The
+# shared front of references and rename; empty when neither path answers.
+const deep_rows! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, Iarch c0): [SymRow] -> {
+	const [SymRow] none = []
+	if !starts_with("file://", uri) then return none
+	const Str path = uri_to_path!(uri)
+
+	let Str from = path
+	let Str overlay = ""
+	const Str owner = match read_file!(srcp) {
+		Either.Right(s) -> s,
+		Either.Left(e) -> "",
+	}
+
+	if eq(owner, path) then {
+		from = srcf
+		overlay = srcf
+	}
+
+	const Str text = match read_file!(from) {
+		Either.Right(s) -> s,
+		Either.Left(e) -> "",
+	}
+
+	const [Str] lines = split("\n", text)
+	if l0 < 0 || l0 >= Iarch(lines.len) then return none
+	const TokCtx t = token_at(lines[l0], c0)
+	if !t.ok then return none
+	const [SymRow] lrows = local_refs!(argv0, env, path, overlay, lines, l0, t)
+	if Iarch(lrows.len) > 0 then return lrows
+
+	return pub_rows!(argv0, env, path, srcf, srcp, overlay, t)
+}
+
+# Answer textDocument/references: every reference of the binding under the cursor — a
+# local's or a non-pub top-level name's within this file, a PUB name's across the whole
+# module tree. The first row is the declaration; it is dropped when the client set
+# includeDeclaration off. Null when both paths refuse (no token, ambiguity, a broken file).
 const references! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, Iarch c0, Bool incl): Json -> {
-	const [SymRow] rows = rows_at!(argv0, env, uri, srcf, srcp, l0, c0)
+	const [SymRow] rows = deep_rows!(argv0, env, uri, srcf, srcp, l0, c0)
 	if Iarch(rows.len) == 0 then return Json.Null
 	const Str path = uri_to_path!(uri)
 	let [Json] locs = []
@@ -1843,27 +2001,51 @@ const references! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0
 	return Json.Arr(locs)
 }
 
-# Answer textDocument/rename: a WorkspaceEdit renaming every reference of the LOCAL binding
-# under the cursor to `nn`. Null when the position is no local (see references) or the new
-# name is no plain identifier — better no edit than a corrupting one. No conflict check
-# against a like-named binding in an overlapping scope: the resulting clash is cf's checker's
-# to report, and the editor previews the edits.
+# Answer textDocument/rename: a WorkspaceEdit renaming every reference of the binding under
+# the cursor to `nn` — a local's or a non-pub top-level name's edits land in the one file, a
+# PUB name's group per file across the module tree. Null when the position answers nothing
+# (see references) or the new name is no plain identifier — better no edit than a corrupting
+# one. No conflict check against a like-named binding in an overlapping scope: the resulting
+# clash is cf's checker's to report, and the editor previews the edits.
 const rename! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, Iarch c0, Str nn): Json -> {
 	if !ident_ok(nn) then return Json.Null
-	const [SymRow] rows = rows_at!(argv0, env, uri, srcf, srcp, l0, c0)
+	const [SymRow] rows = deep_rows!(argv0, env, uri, srcf, srcp, l0, c0)
 	if Iarch(rows.len) == 0 then return Json.Null
 	if !bang_matches(rows[0].sname, nn) then return Json.Null
 	if !case_matches(rows[0].sname, nn) then return Json.Null
-	let [Json] edits = []
+	const Str path = uri_to_path!(uri)
+
+	# the distinct uris carrying edits, in first-seen order — the checked uri keeps its
+	# exact requested identity
+	let [Str] furis = []
 
 	for r in rows {
-		edits = [...edits, Json.Obj([
-			ent("range", jrange!(r.line, r.ns, r.ne)),
-			ent("newText", jstr(nn)),
-		])]
+		let Str u = ""
+		if eq(r.file, path) then u = uri else u = path_uri!(r.file)
+		if !in_list(u, furis) then furis = [...furis, u]
 	}
 
-	return Json.Obj([ent("changes", Json.Obj([ent(uri, Json.Arr(edits))]))])
+	let [JsonEntry] changes = []
+
+	for u in furis {
+		let [Json] edits = []
+
+		for r in rows {
+			let Str ru = ""
+			if eq(r.file, path) then ru = uri else ru = path_uri!(r.file)
+
+			if eq(ru, u) then {
+				edits = [...edits, Json.Obj([
+					ent("range", jrange!(r.line, r.ns, r.ne)),
+					ent("newText", jstr(nn)),
+				])]
+			}
+		}
+
+		changes = [...changes, ent(u, Json.Arr(edits))]
+	}
+
+	return Json.Obj([ent("changes", Json.Obj(changes))])
 }
 
 # Answer textDocument/prepareRename: the exact span rename would edit and its placeholder
@@ -1894,11 +2076,19 @@ const prepare_rename! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarc
 	if l0 < 0 || l0 >= Iarch(lines.len) then return Json.Null
 	const TokCtx t = token_at(lines[l0], c0)
 	if !t.ok then return Json.Null
-	const [SymRow] rows = local_refs!(argv0, env, path, overlay, lines, l0, t)
+	let [SymRow] rows = local_refs!(argv0, env, path, overlay, lines, l0, t)
+	if Iarch(rows.len) == 0 then rows = pub_rows!(argv0, env, path, srcf, srcp, overlay, t)
 	if Iarch(rows.len) == 0 then return Json.Null
 
+	# the SEGMENT under the cursor, not the whole qualified token — rename edits only it
+	let Iarch ss = t.ts
+
+	for h in t.hints {
+		ss = ss + Iarch(h.len) + 2
+	}
+
 	return Json.Obj([
-		ent("range", jrange!(l0, t.ts, t.te)),
+		ent("range", jrange!(l0, ss, ss + Iarch(t.name.len))),
 		ent("placeholder", jstr(t.name)),
 	])
 }

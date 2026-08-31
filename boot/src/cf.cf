@@ -464,6 +464,75 @@ const run_refs! = (Str input, Str src, Iarch off, Str name): Iarch -> {
 	return 0
 }
 
+# Whether `s` ends with `<sep><name>` — the tail test for a mangled qualified use: the strip
+# joins a namespace-alias use `str::eq` into `<prefix>\x01eq` and a full importless path
+# `std::data::str::eq` into `std_data_str_eq`, both synthesized ONTO the member's own token
+# (start/len), so a tail match finds the member and its event offset IS the member's position.
+const ends_with_sep = (Str s, Str name, Iarch sep): Bool -> {
+	const Iarch sl = Iarch(s.len)
+	const Iarch nl = Iarch(name.len)
+	if sl <= nl then return false
+	if Iarch(s[sl - nl - 1]) != sep then return false
+	let Iarch i = 0
+
+	loop {
+		if i >= nl then break
+		if Iarch(s[sl - nl + i]) != Iarch(name[i]) then return false
+		i = i + 1
+	}
+
+	return true
+}
+
+# `cf lsp uses <input.cf> <name> [--src <buf>]`: every use of the TOP-LEVEL name `name` in
+# THIS one file — bare uses not owned by a live local shadow, namespace-alias and flat
+# full-path uses (tail-matched through the strip's manglings), and import-list members. One
+# 1-based `line:col` per line, in source order. The cross-file rename front end: the server
+# runs one per module file. The `_`-tail match is deliberately LOOSE (`do_eq` tails `_eq`) —
+# the server verifies every position against the line's actual text before trusting it.
+const run_uses! = (Str input, Str src, Str name): Iarch -> {
+	const Loaded ld = entry_binds!(input, src, os::target, host_arch())
+	const [SrcMap] maps = [ld.map]
+	let Iarch depth = 0
+	let [Iarch] loffs = []
+	let [Iarch] ldeps = []
+
+	for ev in ld.evs {
+		if ev.kind == 0 then depth = depth + 1
+		if ev.kind == 1 then {
+			let [Iarch] ko = []
+			let [Iarch] kd = []
+
+			for (b, i) in loffs {
+				if ldeps[i] < depth then {
+					ko = [...ko, b]
+					kd = [...kd, ldeps[i]]
+				}
+			}
+
+			loffs = ko
+			ldeps = kd
+			depth = depth - 1
+		}
+		if ev.kind >= 2 && ev.kind <= 5 && eq(ev.name, name) then {
+			loffs = [...loffs, ev.off]
+			ldeps = [...ldeps, depth]
+		}
+		if ev.kind == 6 then {
+			let Bool hit = eq(ev.name, name) && Iarch(loffs.len) == 0
+			if !hit && ends_with_sep(ev.name, name, 1) then hit = true
+			if !hit && ends_with_sep(ev.name, name, 95) then hit = true
+
+			if hit then {
+				const LC lc = line_col_of(maps, input, ev.off)
+				if lc.line > 0 then println("${lc.line}:${lc.col}")
+			}
+		}
+	}
+
+	return 0
+}
+
 # `cf lsp scope <input.cf> <off> [--src <buf>]`: every LOCAL binding visible at byte offset
 # `off` — one `line:col:kind:name` per line, INNERMOST FIRST, deduped by name (an inner
 # shadow hides its outer namesake). The completion source for locals: the replay collects
@@ -678,6 +747,16 @@ pub const main = ([Str] args, [Str] env) -> {
 			const ra = growing_arena::of(16777216)
 
 			return run_refs!(args[3], rsrc, dec_of(args[4]), args[5]) in ra
+		}
+
+		# `cf lsp uses <input.cf> <name> [--src <file>]` — every use of a top-level name in
+		# the one file (the cross-file rename front end), one `line:col` per line.
+		if Iarch(args.len) >= 5 && eq(args[2], "uses") then {
+			let Str usrc = ""
+			if Iarch(args.len) >= 7 && eq(args[5], "--src") then usrc = args[6]
+			const ua = growing_arena::of(16777216)
+
+			return run_uses!(args[3], usrc, args[4]) in ua
 		}
 
 		# `cf lsp scope <input.cf> <off> [--src <file>]` — every local binding visible at a
