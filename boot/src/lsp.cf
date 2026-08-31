@@ -272,9 +272,51 @@ const jrange! = (Iarch l0, Iarch c0, Iarch c1): Json -> Json.Obj([
 	ent("end", Json.Obj([ent("line", jnum(l0)), ent("character", jnum(c1))])),
 ])
 
-# One LSP diagnostic at the 0-based position.
-const build_diag! = (Iarch l0, Iarch c0, Str msg): Json -> Json.Obj([
-	ent("range", jrange!(l0, c0, c0 + 1)),
+# A NUL-terminated copy of `s` (len excludes the NUL, argv-style) — a slice view is not
+# terminated, and the raw open syscall wants a C string.
+const czstr! = (Str s): Str -> {
+	let [Uint8] out = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(s.len) then break
+		out = [...out, s[i]]
+		i = i + 1
+	}
+
+	out = [...out, Uint8(0)]
+
+	return Str(out, Iarch(out.len) - 1)
+}
+
+# The end byte-col (exclusive) of the token at `c0` in `ln`: identifier bytes and `::`
+# separators, so a full path (`std::mem::raw::trap`) squiggles whole. At least one character.
+const token_end = (Str ln, Iarch c0): Iarch -> {
+	let Iarch i = c0
+
+	loop {
+		if i >= Iarch(ln.len) then break
+
+		if name_byte(Iarch(ln[i])) then {
+			i = i + 1
+			continue
+		}
+		if Iarch(ln[i]) == 58 && i + 1 < Iarch(ln.len) && Iarch(ln[i + 1]) == 58 then {
+			i = i + 2
+			continue
+		}
+
+		break
+	}
+
+	if i <= c0 then return c0 + 1
+
+	return i
+}
+
+# One LSP diagnostic at the 0-based position, underlining `c0..c1`.
+const build_diag! = (Iarch l0, Iarch c0, Iarch c1, Str msg): Json -> Json.Obj([
+	ent("range", jrange!(l0, c0, c1)),
 	ent("severity", jnum(1)),
 	ent("source", jstr("cf")),
 	ent("message", jstr(msg)),
@@ -340,6 +382,9 @@ const check_and_publish! = (Str argv0, [Str] env, Str uri, Str src): () -> {
 
 		const [Str] lines = split("\n", captured)
 		const Str pwd = getenv!(env, "PWD")
+		# diagnosed files read ONCE (their line texts widen each squiggle to the whole token)
+		let [Str] fpaths = []
+		let [Str] ftexts = []
 
 		for ln in lines {
 			if Iarch(ln.len) > 0 then {
@@ -347,6 +392,7 @@ const check_and_publish! = (Str argv0, [Str] env, Str uri, Str src): () -> {
 				let Str target = uri
 				let Iarch l0 = 0
 				let Iarch c0 = 0
+				let Iarch c1 = 1
 				let Str msg = ln
 
 				if lc.plen >= 0 then {
@@ -367,11 +413,46 @@ const check_and_publish! = (Str argv0, [Str] env, Str uri, Str src): () -> {
 						if l0 < 0 then l0 = 0
 						if c0 < 0 then c0 = 0
 						msg = slice(lc.moff, Iarch(ln.len), ln)
+
+						# widen the point stamp to the token under it, reading the diagnosed
+						# file (the live `--src` overlay stands in for the checked file)
+						let Str ftext = ""
+						let Bool seen = false
+						let Iarch fi = 0
+
+						loop {
+							if fi >= Iarch(fpaths.len) then break
+
+							if eq(fpaths[fi], fabs) then {
+								ftext = ftexts[fi]
+								seen = true
+								break
+							}
+
+							fi = fi + 1
+						}
+
+						if !seen then {
+							let Str rp = fabs
+							if eq(fabs, path) && Iarch(src.len) > 0 then rp = src
+
+							ftext = match read_file!(czstr!(rp)) {
+								Either.Right(fs) -> fs,
+								Either.Left(fe) -> "",
+							}
+
+							fpaths = [...fpaths, fabs]
+							ftexts = [...ftexts, ftext]
+						}
+
+						c1 = c0 + 1
+						const [Str] flines = split("\n", ftext)
+						if l0 < Iarch(flines.len) then c1 = token_end(flines[l0], c0)
 					}
 				}
 
 				duris = [...duris, target]
-				djson = [...djson, build_diag!(l0, c0, msg)]
+				djson = [...djson, build_diag!(l0, c0, c1, msg)]
 			}
 		}
 	}
