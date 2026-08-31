@@ -12,12 +12,12 @@
 # "utf-8"` (cf's columns are bytes), lines/columns shift to LSP's 0-base. Each frame is
 # handled in its OWN arena, reclaimed wholesale — the server's memory stays flat.
 
-import std::data::str::{ eq, starts_with, slice, index_of, split, contains, join, trim }
+import std::data::str::{ eq, starts_with, ends_with, slice, index_of, split, contains, join, trim }
 import std::data::{ Either, Maybe }
 import std::data::json::{ Json, JsonEntry, parse!, render!, get }
 import std::io::file::{ read, write_str, read_file!, write_file }
-import std::io::fd::{ Fd, stdin, stdout }
-import std::io::fs::{ remove, exists! }
+import std::io::fd::{ Fd, stdin, stdout, DirEntry, entry_is_dir }
+import std::io::fs::{ remove, exists!, read_dir! }
 import std::process::{ run!, find_executable!, getenv!, getpid, exit }
 import std::io::console::{ eprint }
 import std::mem::arena::growing_arena
@@ -1888,6 +1888,110 @@ const rows_at! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, I
 # the whole cross-file answer must refuse; there is no chunk salvage across files).
 data UsesOut = { Bool ok, [SymRow] rows }
 
+# Every `.cf` file under `dir`, recursively — dot-entries (`.git`, hidden dirs) skipped, an
+# unreadable directory contributes nothing. The workspace candidate set of the rename walk.
+const walk_cf! = (Str dir): [Str] -> {
+	let [Str] out = []
+
+	match read_dir!(dir) {
+		Either.Left(e) -> {},
+		Either.Right(entries) -> {
+			for e in entries {
+				if Iarch(e.name.len) > 0 && Iarch(e.name[0]) != 46 then {
+					const Str child = "${dir}/${e.name}"
+
+					if entry_is_dir(e) then {
+						for c in walk_cf!(child) {
+							out = [...out, c]
+						}
+					} else if ends_with(".cf", e.name) then {
+						out = [...out, child]
+					}
+				}
+			}
+		},
+	}
+
+	return out
+}
+
+# A workspace file's own module list via a `cf lsp modules` child — `ok` false when its
+# resolve fails. Uncached: each workspace candidate resolves once per query.
+data WsMods = { Bool ok, [Str] mods }
+
+const ws_modules! = (Str argv0, [Str] env, Str w): WsMods -> {
+	const [Str] none = []
+
+	const Str sh = match find_executable!(env, "sh") {
+		Either.Right(p) -> p,
+		Either.Left(e) -> "",
+	}
+
+	if eq(sh, "") then return WsMods({ ok: false, mods: none })
+	const Str tmp = "/tmp/cf-lsp-${getpid()}.wsm"
+	const Str cmd = "'${argv0}' lsp modules '${w}' > '${tmp}' 2> /dev/null"
+	const Iarch rc = run!(sh, ["sh", "-c", cmd], env)
+
+	const Str got = match read_file!(tmp) {
+		Either.Right(s) -> s,
+		Either.Left(e) -> "",
+	}
+
+	remove(tmp)
+	if rc != 0 then return WsMods({ ok: false, mods: none })
+	let [Str] mods = []
+
+	for m in split("\n", got) {
+		if Iarch(m.len) > 0 then mods = [...mods, m]
+	}
+
+	return WsMods({ ok: true, mods: mods })
+}
+
+# One `cf lsp uses` child over a WORKSPACE file `f` — a file outside the checked file's
+# module tree, always read from disk (the overlay's owner is a tree file by construction).
+# Candidate positions verify against the file's own text, like `uses_all_rows!`.
+const uses_file_rows! = (Str argv0, [Str] env, Str f, Str cname, Str vname): UsesOut -> {
+	const [SymRow] none = []
+
+	const Str sh = match find_executable!(env, "sh") {
+		Either.Right(p) -> p,
+		Either.Left(e) -> "",
+	}
+
+	if eq(sh, "") then return UsesOut({ ok: false, rows: none })
+	const Str tmp = "/tmp/cf-lsp-${getpid()}.uses"
+	const Str cmd = "'${argv0}' lsp uses '${f}' '${cname}' > '${tmp}' 2> /dev/null"
+	const Iarch rc = run!(sh, ["sh", "-c", cmd], env)
+
+	const Str got = match read_file!(tmp) {
+		Either.Right(s) -> s,
+		Either.Left(e) -> "",
+	}
+
+	remove(tmp)
+	if rc != 0 then return UsesOut({ ok: false, rows: none })
+	const [Str] flines = split("\n", src_of!(f, "", ""))
+	let [SymRow] rows = []
+
+	for lref in split("\n", got) {
+		const SymRow r = ref_row(lref, f, vname)
+
+		if r.line >= 0 && r.line < Iarch(flines.len) then {
+			const Str ln = flines[r.line]
+
+			if r.ne <= Iarch(ln.len)
+			&& eq(slice(r.ns, r.ne, ln), vname)
+			&& (r.ns == 0 || !name_byte(Iarch(ln[r.ns - 1])))
+			&& (r.ne >= Iarch(ln.len) || !name_byte(Iarch(ln[r.ne]))) then {
+				rows = [...rows, r]
+			}
+		}
+	}
+
+	return UsesOut({ ok: true, rows: rows })
+}
+
 # The whole tree's uses of `cname` — a plain top-level name or a `Base.member` composite —
 # via ONE `cf lsp uses-all` child (it resolves the entry's tree itself and replays every
 # file in-process; one spawn instead of one per file). Rows come back `path<TAB>line:col`
@@ -1973,11 +2077,14 @@ const uses_all_rows! = (Str argv0, [Str] env, Str path, Str overlay, Str owner, 
 }
 
 # Cross-file rows for a PUB top-level name: the ONE declaration of the cursor's name across
-# the module tree, then every tree file's verified uses (import-list members included) and
-# alias-target mentions. Refused (empty) when the name is declared nowhere, more than once
-# (a same-named sibling makes per-file binding ambiguous — refuse rather than corrupt),
-# non-pub, an erased `type` alias, or `main` (the entry symbol is not renameable); and when
-# ANY file's parse dies — a cross-file edit built from a partial answer would corrupt.
+# the module tree, every tree file's verified uses (import-list members included) and
+# alias-target mentions, then the WHOLE WORKSPACE's — every `.cf` under $PWD that mentions
+# the name, so a rename made from the declaring module also edits importers the checked
+# file's own tree cannot see. Refused (empty) when the name is declared nowhere, more than
+# once — in the tree or in a REACHING workspace file (a same-named sibling makes per-file
+# binding ambiguous — refuse rather than corrupt) — non-pub, an erased `type` alias, or
+# `main` (the entry symbol is not renameable); and when any TREE file's parse dies — an
+# edit built from a partial answer would corrupt.
 const pub_rows! = (Str argv0, [Str] env, Str path, Str srcf, Str srcp, Str overlay, TokCtx t): [SymRow] -> {
 	const [SymRow] none = []
 	if eq(t.name, "main") then return none
@@ -2049,6 +2156,74 @@ const pub_rows! = (Str argv0, [Str] env, Str path, Str srcf, Str srcp, Str overl
 			}
 
 			if !dup then rows = [...rows, ar]
+		}
+	}
+
+	# WORKSPACE extension: a file OUTSIDE the checked file's module tree may import the decl
+	# file and use the name — walk the workspace root ($PWD, the root the editor opened),
+	# cheap-filter to the files that MENTION the sought token at all, and gate MEMBERSHIP by
+	# RESOLUTION: a candidate's rows count only when its OWN module tree reaches the decl
+	# file (a file can only reference the target through its module). An unrelated project
+	# under the same root — a corpus test declaring its own like-named fn — resolves to a
+	# tree WITHOUT the decl file and is skipped silently, no refusal, no touch. A mentioning
+	# file whose resolve FAILS is skipped too: what cannot resolve cannot compile, so it is
+	# no live consumer (deliberately-broken test fixtures must not block every rename; a
+	# truly broken importer surfaces the stale name at its own next check). A REACHING file
+	# that also DECLARES the anchor name is a per-file shadow the log cannot split — refuse,
+	# the tree gate's discipline; a reaching file whose TRACKED parse fails refuses as well.
+	if Iarch(pwd.len) > 0 then {
+		# `pwd` is an env view — NUL-terminate it before the raw open syscall under read_dir!
+		for w in walk_cf!(czstr!(pwd)) {
+			if !in_list(w, scan) then {
+				const Str wtext = match read_file!(w) {
+					Either.Right(s) -> s,
+					Either.Left(e) -> "",
+				}
+
+				if index_of(t.name, wtext) >= 0 then {
+					const WsMods wm = ws_modules!(argv0, env, w)
+					let Bool reaches = false
+
+					for m in wm.mods {
+						if eq(abs_path!(pwd, m), dl.file) then reaches = true
+					}
+
+					if reaches then {
+						const [Str] wlines = split("\n", wtext)
+
+						for wl in wlines {
+							const DeclLine wd = scan_decl(wl)
+
+							if wd.kind != 0 && eq(slice(wd.ns, wd.ne, wl), dname) then {
+								return none
+							}
+						}
+
+						const UsesOut wu = uses_file_rows!(argv0, env, w, cname, t.name)
+						if !wu.ok then return none
+
+						for r in wu.rows {
+							let Bool dup = false
+
+							for x in rows {
+								if eq(x.file, r.file) && x.line == r.line && x.ns == r.ns then dup = true
+							}
+
+							if !dup then rows = [...rows, r]
+						}
+
+						for ar in alias_target_rows(wlines, w, t.name) {
+							let Bool dup = false
+
+							for x in rows {
+								if eq(x.file, ar.file) && x.line == ar.line && x.ns == ar.ns then dup = true
+							}
+
+							if !dup then rows = [...rows, ar]
+						}
+					}
+				}
+			}
 		}
 	}
 
