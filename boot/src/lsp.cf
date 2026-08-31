@@ -1187,6 +1187,76 @@ const lsp_child! = (Str argv0, [Str] env, Str path, Str overlay, [Str] lines, Ia
 	return ChildOut({ rc: rc, off: off, out: got })
 }
 
+# A child run with DECLARATION-CHUNK isolation applied: the outcome, whether it ran against
+# the cursor's chunk instead of the whole buffer, the line delta `dl` chunk answers shift by,
+# and the lines the child actually saw (`clines` — salvage offsets convert through them).
+data Iso = { ChildOut co, Bool chunked, Iarch dl, [Str] clines }
+
+# Try the FULL buffer first; when its parse dies, isolate the cursor's enclosing top-level
+# declaration (col-0 decl anchors — the same line scan everything else trusts) into a
+# mini-buffer of just those lines and retry. A break in ANOTHER declaration then cannot
+# poison this one's answers — and when the cursor's own declaration is the broken one, the
+# chunk's salvage dump still covers it up to the break. A chunk sees ONE declaration:
+# complete for LOCALS (a local cannot escape its declaration), but a `top` references
+# answer from one must be discarded by the caller (top-level uses span the whole file).
+const lsp_child_iso! = (Str argv0, [Str] env, Str path, Str overlay, [Str] lines, Iarch l0, Iarch ts, Str verb, Str name): Iso -> {
+	const ChildOut full = lsp_child!(argv0, env, path, overlay, lines, l0, ts, verb, name)
+	if full.rc == 0 then return Iso({ co: full, chunked: false, dl: 0, clines: lines })
+
+	# the chunk: from the nearest decl anchor at or above the cursor to the next one below
+	let Iarch ds = l0
+
+	loop {
+		if ds <= 0 then break
+		if scan_decl(lines[ds]).kind != 0 then break
+		ds = ds - 1
+	}
+
+	let Iarch de = l0 + 1
+
+	loop {
+		if de >= Iarch(lines.len) then break
+		if scan_decl(lines[de]).kind != 0 then break
+		de = de + 1
+	}
+
+	# the chunk IS the whole buffer: retrying buys nothing
+	if ds == 0 && de >= Iarch(lines.len)
+		then return Iso({ co: full, chunked: false, dl: 0, clines: lines })
+
+	let [Str] mlines = []
+	let Iarch i = ds
+
+	loop {
+		if i >= de then break
+		mlines = [...mlines, lines[i]]
+		i = i + 1
+	}
+
+	let Str mini = ""
+
+	for ml in mlines {
+		mini = "${mini}${ml}\n"
+	}
+
+	const Str part = "/tmp/cf-lsp-${getpid()}.part"
+	write_file(part, mini)
+	const ChildOut ch = lsp_child!(argv0, env, path, part, mlines, l0 - ds, ts, verb, name)
+	remove(part)
+
+	return Iso({ co: ch, chunked: true, dl: ds, clines: mlines })
+}
+
+# A reference row shifted back into whole-buffer line numbers (chunk answers carry `dl`).
+const row_shift = (SymRow r, Iarch dl): SymRow -> SymRow({
+	sname: r.sname,
+	kind: r.kind,
+	file: r.file,
+	line: r.line + dl,
+	ns: r.ns,
+	ne: r.ne,
+})
+
 # --- the salvage replay: a dying child's partial event log, replayed server-side ---------------
 
 # One salvage-dump line `off:kind:name` (kinds: 0 scope-open, 1 close, 2..5 binds, 6 use,
@@ -1337,7 +1407,8 @@ data LocalRow = { Str name, Iarch line }
 # or the salvage replay of the dying child's partial log on a broken one. No token gate: an
 # empty typed prefix still has a scope.
 const locals_at! = (Str argv0, [Str] env, Str path, Str overlay, [Str] lines, Iarch l0, Iarch ts): [LocalRow] -> {
-	const ChildOut co = lsp_child!(argv0, env, path, overlay, lines, l0, ts, "scope", "")
+	const Iso iso = lsp_child_iso!(argv0, env, path, overlay, lines, l0, ts, "scope", "")
+	const ChildOut co = iso.co
 	let [LocalRow] rows = []
 
 	if co.rc == 0 then {
@@ -1354,7 +1425,7 @@ const locals_at! = (Str argv0, [Str] env, Str path, Str overlay, [Str] lines, Ia
 			const Str nm = slice(c3 + 1, Iarch(rest2.len), rest2)
 			const Iarch bl = to_int(slice(0, c1, sl))
 			if bl <= 0 || Iarch(nm.len) == 0 then continue
-			rows = [...rows, LocalRow({ name: nm, line: bl - 1 })]
+			rows = [...rows, LocalRow({ name: nm, line: bl - 1 + iso.dl })]
 		}
 
 		return rows
@@ -1364,8 +1435,8 @@ const locals_at! = (Str argv0, [Str] env, Str path, Str overlay, [Str] lines, Ia
 	const [EvRow] live = salvage_scope!(parse_evs(co.out), co.off)
 
 	for r in live {
-		const (bl, bc) = lc_of(lines, r.off)
-		if bl >= 0 && Iarch(r.name.len) > 0 then rows = [...rows, LocalRow({ name: r.name, line: bl })]
+		const (bl, bc) = lc_of(iso.clines, r.off)
+		if bl >= 0 && Iarch(r.name.len) > 0 then rows = [...rows, LocalRow({ name: r.name, line: bl + iso.dl })]
 	}
 
 	return rows
@@ -1398,26 +1469,29 @@ const ref_row = (Str lref, Str path, Str name): SymRow -> {
 const local_def! = (Str argv0, [Str] env, Str path, Str overlay, [Str] lines, Iarch l0, TokCtx t): SymRow -> {
 	const SymRow miss = SymRow({ sname: "", kind: 0, file: "", line: -1, ns: 0, ne: 0 })
 	if !local_token(t) then return miss
-	const ChildOut co = lsp_child!(argv0, env, path, overlay, lines, l0, t.ts, "def", t.name)
+	const Iso iso = lsp_child_iso!(argv0, env, path, overlay, lines, l0, t.ts, "def", t.name)
+	const ChildOut co = iso.co
 
 	if co.rc == 0 then {
 		let Str got = co.out
 		const Iarch nl = index_of("\n", got)
 		if nl > 0 then got = slice(0, nl, got)
+		const SymRow r = ref_row(got, path, t.name)
+		if r.line < 0 then return r
 
-		return ref_row(got, path, t.name)
+		return row_shift(r, iso.dl)
 	}
 
 	const Iarch b = salvage_binder!(parse_evs(co.out), co.off, t.name)
 	if b < 0 then return miss
-	const (bl, bc) = lc_of(lines, b)
+	const (bl, bc) = lc_of(iso.clines, b)
 	if bl < 0 then return miss
 
 	return SymRow({
 		sname: t.name,
 		kind: 13,
 		file: path,
-		line: bl,
+		line: bl + iso.dl,
 		ns: bc,
 		ne: bc + Iarch(t.name.len),
 	})
@@ -1431,13 +1505,18 @@ const local_def! = (Str argv0, [Str] env, Str path, Str overlay, [Str] lines, Ia
 const local_refs! = (Str argv0, [Str] env, Str path, Str overlay, [Str] lines, Iarch l0, TokCtx t): [SymRow] -> {
 	let [SymRow] rows = []
 	if !local_token(t) then return rows
-	const ChildOut co = lsp_child!(argv0, env, path, overlay, lines, l0, t.ts, "refs", t.name)
-	if co.rc != 0 then return rows
-	const [Str] outl = split("\n", co.out)
+	const Iso iso = lsp_child_iso!(argv0, env, path, overlay, lines, l0, t.ts, "refs", t.name)
+	if iso.co.rc != 0 then return rows
+	const [Str] outl = split("\n", iso.co.out)
+	const Bool is_top = Iarch(outl.len) > 0 && eq(outl[0], "top")
+
+	# a chunk sees one declaration — a top-level name's uses span the whole file, so a `top`
+	# answer from a chunk is incomplete: refuse it
+	if is_top && iso.chunked then return rows
 
 	# a `top` first line: the child answered for a NON-pub TOP-LEVEL name (its uses cannot
 	# leave this file) — the declaration row comes from this file's own decl-line scan
-	if Iarch(outl.len) > 0 && eq(outl[0], "top") then {
+	if is_top then {
 		let Iarch li = 0
 
 		for ln in lines {
@@ -1460,7 +1539,7 @@ const local_refs! = (Str argv0, [Str] env, Str path, Str overlay, [Str] lines, I
 
 	for lref in outl {
 		const SymRow r = ref_row(lref, path, t.name)
-		if r.line >= 0 then rows = [...rows, r]
+		if r.line >= 0 then rows = [...rows, row_shift(r, iso.dl)]
 	}
 
 	return rows
