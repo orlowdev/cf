@@ -1,18 +1,22 @@
-# cf lsp — a Language Server Protocol server over stdio, M0: initialize/shutdown lifecycle
+# cf lsp — a Language Server Protocol server over stdio, M1: initialize/shutdown lifecycle
 # and diagnostics on open/save. Each check runs `cf check <file>` in a CHILD process (this
 # very binary re-invoked), so a fail-fast front-end die (a parse error mid-edit) never takes
 # the server down; the child's located `path:line:col: msg` lines come back on a captured
-# stderr and turn into `publishDiagnostics`. Positions are negotiated `positionEncoding:
+# stderr and turn into `publishDiagnostics` — each line published to ITS OWN file's uri
+# (an error in an imported module squiggles that module, not the saved file; relative std
+# paths absolutize against `$PWD`). The uris that carried diagnostics are remembered in a
+# tempfile so the next round can clear the ones that went quiet. Uris are percent-decoded
+# coming in and percent-encoded going out. Positions are negotiated `positionEncoding:
 # "utf-8"` (cf's columns are bytes), lines/columns shift to LSP's 0-base. Each frame is
 # handled in its OWN arena, reclaimed wholesale — the server's memory stays flat.
 
 import std::data::str::{ eq, starts_with, slice, index_of, split }
 import std::data::{ Either, Maybe }
 import std::data::json::{ Json, JsonEntry, parse!, render!, get }
-import std::io::file::{ read, write_str, read_file! }
+import std::io::file::{ read, write_str, read_file!, write_file }
 import std::io::fd::{ Fd, stdin, stdout }
-import std::io::fs::{ remove }
-import std::process::{ run!, find_executable!, getpid, exit }
+import std::io::fs::{ remove, exists! }
+import std::process::{ run!, find_executable!, getenv!, getpid, exit }
 import std::io::console::{ eprint }
 import std::mem::arena::growing_arena
 
@@ -133,48 +137,173 @@ const respond_err! = (Json id, Iarch code, Str msg): () ->
 		ent("error", Json.Obj([ent("code", jnum(code)), ent("message", jstr(msg))])),
 	]))
 
-# --- diagnostics ------------------------------------------------------------------------------
+# --- uris -------------------------------------------------------------------------------------
 
-# One `path:line:col: msg` line into an LSP diagnostic at the (0-based) position; a line that
-# does not carry the checked file's prefix lands at 0:0 with its full text (nothing is lost).
-const diag_of! = (Str path, Str line): Json -> {
-	let Iarch l0 = 0
-	let Iarch c0 = 0
-	let Str msg = line
+# The value of one hex digit byte, or -1.
+const hex_val = (Iarch c): Iarch -> {
+	if c >= 48 && c <= 57 then return c - 48
+	if c >= 65 && c <= 70 then return c - 55
+	if c >= 97 && c <= 102 then return c - 87
 
-	if starts_with("${path}:", line) then {
-		const Str rest = slice(Iarch(path.len) + 1, Iarch(line.len), line)
-		const [Str] parts = split(":", rest)
+	return -1
+}
 
-		if Iarch(parts.len) >= 3 then {
-			l0 = to_int(parts[0]) - 1
-			c0 = to_int(parts[1]) - 1
-			if l0 < 0 then l0 = 0
-			if c0 < 0 then c0 = 0
-			const Iarch skip = Iarch(parts[0].len) + Iarch(parts[1].len) + 2
-			let Str m = slice(skip, Iarch(rest.len), rest)
-			if starts_with(" ", m) then m = slice(1, Iarch(m.len), m)
-			msg = m
+# The hex digit byte of a value 0..15.
+const hex_chr = (Iarch v): Iarch -> if v < 10 then v + 48 else v + 55
+
+# A byte a uri carries verbatim: unreserved (RFC 3986) or the path separator.
+const uri_plain = (Iarch c): Bool ->
+	(c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) ||
+	c == 45 || c == 46 || c == 95 || c == 126 || c == 47
+
+# A `file://` uri to its filesystem path: strip the scheme, percent-decode (`%20` → space).
+# A malformed escape passes through verbatim (nothing is lost).
+const uri_to_path! = (Str uri): Str -> {
+	let Str p = uri
+	if starts_with("file://", p) then p = slice(7, Iarch(p.len), p)
+	let [Uint8] out = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(p.len) then break
+		const Iarch c = Iarch(p[i])
+
+		if c == 37 && i + 2 < Iarch(p.len) then {
+			const Iarch hi = hex_val(Iarch(p[i + 1]))
+			const Iarch lo = hex_val(Iarch(p[i + 2]))
+
+			if hi >= 0 && lo >= 0 then {
+				out = [...out, Uint8(hi * 16 + lo)]
+				i = i + 3
+			} else {
+				out = [...out, Uint8(c)]
+				i = i + 1
+			}
+		} else {
+			out = [...out, Uint8(c)]
+			i = i + 1
 		}
 	}
 
-	return Json.Obj([
-		ent("range", Json.Obj([
-			ent("start", Json.Obj([ent("line", jnum(l0)), ent("character", jnum(c0))])),
-			ent("end", Json.Obj([ent("line", jnum(l0)), ent("character", jnum(c0 + 1))])),
-		])),
-		ent("severity", jnum(1)),
-		ent("source", jstr("cf")),
-		ent("message", jstr(msg)),
-	])
+	return Str(out)
 }
 
-# Run `cf check` on the uri's file in a child (stderr captured to a temp file), publish the
-# resulting diagnostics — or an empty list, clearing earlier ones, when the check is clean.
+# A filesystem path to its `file://` uri, percent-encoding every reserved byte.
+const path_uri! = (Str path): Str -> {
+	let [Uint8] out = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(path.len) then break
+		const Iarch c = Iarch(path[i])
+
+		if uri_plain(c) then {
+			out = [...out, Uint8(c)]
+		} else {
+			out = [...out, Uint8(37)]
+			out = [...out, Uint8(hex_chr(c / 16))]
+			out = [...out, Uint8(hex_chr(c - c / 16 * 16))]
+		}
+
+		i = i + 1
+	}
+
+	return "file://${Str(out)}"
+}
+
+# --- diagnostics ------------------------------------------------------------------------------
+
+# A parsed `path:line:col:` prefix: `plen` the path's byte length (-1 when the line carries no
+# location), `ln`/`col` 1-based, `moff` the message's byte offset (past the separating space).
+data Loc = { Iarch plen, Iarch ln, Iarch col, Iarch moff }
+
+# Scan a diagnostic line for its leftmost `:<digits>:<digits>:` — the located-line signature
+# any file's diagnostic carries, not just the checked file's.
+const scan_loc = (Str s): Loc -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(s.len) then break
+
+		if Iarch(s[i]) == 58 then {
+			let Iarch j = i + 1
+
+			loop {
+				if j >= Iarch(s.len) || Iarch(s[j]) < 48 || Iarch(s[j]) > 57 then break
+				j = j + 1
+			}
+
+			if j > i + 1 && j < Iarch(s.len) && Iarch(s[j]) == 58 then {
+				let Iarch k = j + 1
+
+				loop {
+					if k >= Iarch(s.len) || Iarch(s[k]) < 48 || Iarch(s[k]) > 57 then break
+					k = k + 1
+				}
+
+				if k > j + 1 && k < Iarch(s.len) && Iarch(s[k]) == 58 then {
+					let Iarch m = k + 1
+					if m < Iarch(s.len) && Iarch(s[m]) == 32 then m = m + 1
+
+					return Loc({
+						plen: i,
+						ln: to_int(slice(i + 1, j, s)),
+						col: to_int(slice(j + 1, k, s)),
+						moff: m,
+					})
+				}
+			}
+		}
+
+		i = i + 1
+	}
+
+	return Loc({ plen: -1, ln: 0, col: 0, moff: 0 })
+}
+
+# One LSP diagnostic at the 0-based position.
+const build_diag! = (Iarch l0, Iarch c0, Str msg): Json -> Json.Obj([
+	ent("range", Json.Obj([
+		ent("start", Json.Obj([ent("line", jnum(l0)), ent("character", jnum(c0))])),
+		ent("end", Json.Obj([ent("line", jnum(l0)), ent("character", jnum(c0 + 1))])),
+	])),
+	ent("severity", jnum(1)),
+	ent("source", jstr("cf")),
+	ent("message", jstr(msg)),
+])
+
+# Whether `s` is one of `xs`.
+const in_list = (Str s, [Str] xs): Bool -> {
+	for x in xs {
+		if eq(x, s) then return true
+	}
+
+	return false
+}
+
+# Publish `diags` to one uri.
+const publish! = (Str uri, [Json] diags): () ->
+	send!(Json.Obj([
+		ent("jsonrpc", jstr("2.0")),
+		ent("method", jstr("textDocument/publishDiagnostics")),
+		ent("params", Json.Obj([
+			ent("uri", jstr(uri)),
+			ent("diagnostics", Json.Arr(diags)),
+		])),
+	]))
+
+# Run `cf check` on the uri's file in a child (stderr captured to a temp file) and publish the
+# diagnostics PER FILE: each located line goes to its own file's uri (relative paths absolutize
+# against `$PWD` when the file exists there; a line that resolves nowhere lands on the checked
+# file at 0:0 with its full text). The checked uri always gets a publish — an empty list clears
+# it when clean — and the uris that carried diagnostics last round but are quiet now are cleared
+# too (the set persists in `.pub` beside the capture file, so the state survives the per-frame
+# arena).
 const check_and_publish! = (Str argv0, [Str] env, Str uri): () -> {
 	if !starts_with("file://", uri) then return ()
-	const Str path = slice(7, Iarch(uri.len), uri)
+	const Str path = uri_to_path!(uri)
 	const Str tmp = "/tmp/cf-lsp-${getpid()}.diag"
+	const Str pubf = "/tmp/cf-lsp-${getpid()}.pub"
 
 	const Str sh = match find_executable!(env, "sh") {
 		Either.Right(p) -> p,
@@ -188,7 +317,10 @@ const check_and_publish! = (Str argv0, [Str] env, Str uri): () -> {
 	if eq(sh, "") then return ()
 	const Str cmd = "'${argv0}' check '${path}' 2> '${tmp}'"
 	const Iarch rc = run!(sh, ["sh", "-c", cmd], env)
-	let [Json] diags = []
+
+	# flat (uri, diagnostic) pairs — grouped per uri at publish time
+	let [Str] duris = []
+	let [Json] djson = []
 
 	if rc != 0 then {
 		const Str captured = match read_file!(tmp) {
@@ -197,21 +329,86 @@ const check_and_publish! = (Str argv0, [Str] env, Str uri): () -> {
 		}
 
 		const [Str] lines = split("\n", captured)
+		const Str pwd = getenv!(env, "PWD")
 
 		for ln in lines {
-			if Iarch(ln.len) > 0 then diags = [...diags, diag_of!(path, ln)]
+			if Iarch(ln.len) > 0 then {
+				const Loc lc = scan_loc(ln)
+				let Str target = uri
+				let Iarch l0 = 0
+				let Iarch c0 = 0
+				let Str msg = ln
+
+				if lc.plen >= 0 then {
+					const Str f = slice(0, lc.plen, ln)
+					let Str fabs = ""
+					if eq(f, path) then fabs = path
+					if Iarch(fabs.len) == 0 && starts_with("/", f) then fabs = f
+
+					if Iarch(fabs.len) == 0 && Iarch(pwd.len) > 0 then {
+						const Str cand = "${pwd}/${f}"
+						if exists!(cand) then fabs = cand
+					}
+
+					if Iarch(fabs.len) > 0 then {
+						if !eq(fabs, path) then target = path_uri!(fabs)
+						l0 = lc.ln - 1
+						c0 = lc.col - 1
+						if l0 < 0 then l0 = 0
+						if c0 < 0 then c0 = 0
+						msg = slice(lc.moff, Iarch(ln.len), ln)
+					}
+				}
+
+				duris = [...duris, target]
+				djson = [...djson, build_diag!(l0, c0, msg)]
+			}
 		}
 	}
 
 	remove(tmp)
-	send!(Json.Obj([
-		ent("jsonrpc", jstr("2.0")),
-		ent("method", jstr("textDocument/publishDiagnostics")),
-		ent("params", Json.Obj([
-			ent("uri", jstr(uri)),
-			ent("diagnostics", Json.Arr(diags)),
-		])),
-	]))
+
+	# last round's diag-bearing uris — cleared below when quiet this round
+	const Str prev = match read_file!(pubf) {
+		Either.Right(s) -> s,
+		Either.Left(e) -> "",
+	}
+
+	# this round's target uris, deduped; the checked uri is always among them
+	let [Str] cur = []
+
+	for u in duris {
+		if !in_list(u, cur) then cur = [...cur, u]
+	}
+
+	if !in_list(uri, cur) then cur = [...cur, uri]
+
+	for u in cur {
+		let [Json] group = []
+		let Iarch k = 0
+
+		loop {
+			if k >= Iarch(duris.len) then break
+			if eq(duris[k], u) then group = [...group, djson[k]]
+			k = k + 1
+		}
+
+		publish!(u, group)
+	}
+
+	const [Json] none = []
+
+	for p in split("\n", prev) {
+		if Iarch(p.len) > 0 && !in_list(p, cur) then publish!(p, none)
+	}
+
+	let Str persisted = ""
+
+	for u in cur {
+		persisted = "${persisted}${u}\n"
+	}
+
+	write_file(pubf, persisted)
 }
 
 const init_result! = (): Json -> Json.Obj([
@@ -266,7 +463,8 @@ const serve_one! = (Str argv0, [Str] env): Iarch -> {
 	return 1
 }
 
-# The server: one frame per iteration, each in its own arena reclaimed at once.
+# The server: one frame per iteration, each in its own arena reclaimed at once. The published-uri
+# set outlives the frames on disk; it is removed on exit.
 pub const lsp_run! = ([Str] args, [Str] env): Iarch -> {
 	let Iarch alive = 1
 
@@ -276,6 +474,8 @@ pub const lsp_run! = ([Str] args, [Str] env): Iarch -> {
 		defer growing_arena::destroy(b)
 		alive = serve_one!(args[0], env) in b
 	}
+
+	remove("/tmp/cf-lsp-${getpid()}.pub")
 
 	return 0
 }
