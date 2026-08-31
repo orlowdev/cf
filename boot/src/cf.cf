@@ -396,6 +396,69 @@ const run_refs! = (Str input, Str src, Iarch off, Str name): Iarch -> {
 	return 0
 }
 
+# `cf lsp scope <input.cf> <off> [--src <buf>]`: every LOCAL binding visible at byte offset
+# `off` — one `line:col:kind:name` per line, INNERMOST FIRST, deduped by name (an inner
+# shadow hides its outer namesake). The completion source for locals: the replay collects
+# every live bind (any name) instead of one name's.
+const run_scope! = (Str input, Str src, Iarch off): Iarch -> {
+	const Loaded ld = entry_binds!(input, src, os::target, host_arch())
+	let Iarch depth = 0
+	let [Iarch] boffs = []
+	let [Iarch] bdeps = []
+	let [Iarch] bkinds = []
+	let [Str] bnames = []
+
+	for ev in ld.evs {
+		if ev.off > off then break
+		if ev.kind == 0 then depth = depth + 1
+		if ev.kind == 1 then {
+			let [Iarch] ko = []
+			let [Iarch] kd = []
+			let [Iarch] kk = []
+			let [Str] kn = []
+
+			for (b, i) in boffs {
+				if bdeps[i] < depth then {
+					ko = [...ko, b]
+					kd = [...kd, bdeps[i]]
+					kk = [...kk, bkinds[i]]
+					kn = [...kn, bnames[i]]
+				}
+			}
+
+			boffs = ko
+			bdeps = kd
+			bkinds = kk
+			bnames = kn
+			depth = depth - 1
+		}
+		if ev.kind >= 2 && ev.kind <= 5 then {
+			boffs = [...boffs, ev.off]
+			bdeps = [...bdeps, depth]
+			bkinds = [...bkinds, ev.kind]
+			bnames = [...bnames, ev.name]
+		}
+	}
+
+	const [SrcMap] maps = [ld.map]
+	let [Str] emitted = []
+	let Iarch i = Iarch(boffs.len) - 1
+
+	loop {
+		if i < 0 then break
+
+		if !has_str(emitted, bnames[i]) then {
+			emitted = [...emitted, bnames[i]]
+			const LC lc = line_col_of(maps, input, boffs[i])
+			if lc.line > 0 then println("${lc.line}:${lc.col}:${bkinds[i]}:${bnames[i]}")
+		}
+
+		i = i - 1
+	}
+
+	return 0
+}
+
 # The self-contained pipeline: compile the program to IL + floor (temp files), run the embedded QBE
 # on the IL, spawn the host toolchain to assemble+link, then clean up (unless `-P`). darwin links a
 # Mach-O with `cc`; `Bare` and `Linux` cross-assemble + link a freestanding ELF with `clang`/`ld.lld`
@@ -547,6 +610,16 @@ pub const main = ([Str] args, [Str] env) -> {
 			const ra = growing_arena::of(16777216)
 
 			return run_refs!(args[3], rsrc, dec_of(args[4]), args[5]) in ra
+		}
+
+		# `cf lsp scope <input.cf> <off> [--src <file>]` — every local binding visible at a
+		# byte offset, innermost first, one `line:col:kind:name` per line.
+		if Iarch(args.len) >= 5 && eq(args[2], "scope") then {
+			let Str ssrc = ""
+			if Iarch(args.len) >= 7 && eq(args[5], "--src") then ssrc = args[6]
+			const sca = growing_arena::of(16777216)
+
+			return run_scope!(args[3], ssrc, dec_of(args[4])) in sca
 		}
 
 		const sa = growing_arena::of(16777216)

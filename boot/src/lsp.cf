@@ -1182,6 +1182,46 @@ const local_out! = (Str argv0, [Str] env, Str path, Str overlay, [Str] lines, Ia
 	return got
 }
 
+# The `cf lsp scope` child's raw output — every local binding visible at the byte offset of
+# line `l0` col `ts`, one `line:col:kind:name` per line, innermost first. "" when the buffer
+# does not parse (mid-edit) or nothing is in scope. The completion source for locals; unlike
+# `local_out!` it takes no token gate — an empty typed prefix still has a scope.
+const scope_out! = (Str argv0, [Str] env, Str path, Str overlay, [Str] lines, Iarch l0, Iarch ts): Str -> {
+	const Str sh = match find_executable!(env, "sh") {
+		Either.Right(p) -> p,
+		Either.Left(e) -> "",
+	}
+
+	if eq(sh, "") then return ""
+	let Iarch off = ts
+	let Iarch li = 0
+
+	for ln in lines {
+		if li >= l0 then break
+		off = off + Iarch(ln.len) + 1
+		li = li + 1
+	}
+
+	const Str tmp = "/tmp/cf-lsp-${getpid()}.def"
+	let Str cmd = "'${argv0}' lsp scope '${path}' ${off} > '${tmp}' 2> /dev/null"
+	if Iarch(overlay.len) > 0
+		then cmd = "'${argv0}' lsp scope '${path}' ${off} --src '${overlay}' > '${tmp}' 2> /dev/null"
+	const Iarch rc = run!(sh, ["sh", "-c", cmd], env)
+
+	let Str got = ""
+
+	if rc == 0 then {
+		got = match read_file!(tmp) {
+			Either.Right(s) -> s,
+			Either.Left(e) -> "",
+		}
+	}
+
+	remove(tmp)
+
+	return got
+}
+
 # One `line:col` output line as a reference row of the cursor's name in `path` (0-based, the
 # name's span), or line -1 on anything else.
 const ref_row = (Str lref, Str path, Str name): SymRow -> {
@@ -1681,8 +1721,37 @@ const completions! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l
 		return Json.Arr(items)
 	}
 
-	const [SymRow] decls = all_decls!(scan, owner, srcf)
 	let [Str] seen = []
+
+	# a bare prefix: the LOCALS visible at the cursor come first — kind 6 (Variable), the
+	# binder's own line as the detail. Seeding `seen` here makes an inner binding shadow a
+	# like-named top-level declaration below.
+	if Iarch(t.hints.len) == 0 then {
+		const Str sout = scope_out!(argv0, env, path, overlay, lines, l0, t.ts)
+
+		for sl in split("\n", sout) {
+			const Iarch c1 = index_of(":", sl)
+			if c1 <= 0 then continue
+			const Str rest1 = slice(c1 + 1, Iarch(sl.len), sl)
+			const Iarch c2 = index_of(":", rest1)
+			if c2 <= 0 then continue
+			const Str rest2 = slice(c2 + 1, Iarch(rest1.len), rest1)
+			const Iarch c3 = index_of(":", rest2)
+			if c3 <= 0 then continue
+			const Str nm = slice(c3 + 1, Iarch(rest2.len), rest2)
+			const Iarch bl = to_int(slice(0, c1, sl))
+			if bl <= 0 || Iarch(nm.len) == 0 then continue
+
+			if !in_list(nm, seen) then {
+				seen = [...seen, nm]
+				let Str det = ""
+				if bl - 1 < Iarch(lines.len) then det = tidy_sig(lines[bl - 1])
+				items = [...items, citem(nm, 6, det)]
+			}
+		}
+	}
+
+	const [SymRow] decls = all_decls!(scan, owner, srcf)
 
 	for d in decls {
 		let Bool keep = true
