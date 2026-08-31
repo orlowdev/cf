@@ -1,17 +1,34 @@
 # C! (cflang) — Zed extension
 
-Syntax highlighting, bracket matching, indentation, folding, and document
-outline for [C!](../../root/specs/ebnf.md) in the [Zed](https://zed.dev) editor.
+Syntax highlighting, bracket matching, indentation, folding, document outline,
+and **diagnostics** (via the `cf lsp` language server) for
+[C!](../../root/specs/ebnf.md) in the [Zed](https://zed.dev) editor.
 
 ## What's here
 
 ```
-extension.toml                   Zed manifest — registers the grammar + language
+extension.toml                   Zed manifest — grammar + language + language server
+src/lib.rs                       the wasm shim handing Zed the `cf lsp` command
 tree-sitter-cflang/grammar.js    the C! grammar, translated from root/specs/ebnf.md
 languages/cflang/config.toml     file suffix (.cf), comments (#), brackets, tabs
 languages/cflang/*.scm           tree-sitter queries: highlights, brackets,
                                  indents, folds, outline
 ```
+
+## Language server
+
+The server is the compiler itself: `cf lsp` speaks LSP over stdio and publishes
+located diagnostics on open and save (positions negotiated as `utf-8` byte
+columns). The extension resolves `cf` from the worktree's PATH; point it
+elsewhere with Zed settings:
+
+```json
+{ "lsp": { "cf-lsp": { "binary": { "path": "/path/to/cf" } } } }
+```
+
+Building the wasm shim needs the `wasm32-wasip1` Rust target
+(`rustup target add wasm32-wasip1`) — Zed compiles it automatically when the
+dev extension is (re)installed.
 
 Zed language support is built entirely on **Tree-sitter**: every query file runs
 against a parse tree, so the grammar in `tree-sitter-cflang/` is the foundation.
