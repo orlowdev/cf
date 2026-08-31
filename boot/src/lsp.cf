@@ -12,7 +12,7 @@
 # "utf-8"` (cf's columns are bytes), lines/columns shift to LSP's 0-base. Each frame is
 # handled in its OWN arena, reclaimed wholesale — the server's memory stays flat.
 
-import std::data::str::{ eq, starts_with, slice, index_of, split, contains }
+import std::data::str::{ eq, starts_with, slice, index_of, split, contains, join }
 import std::data::{ Either, Maybe }
 import std::data::json::{ Json, JsonEntry, parse!, render!, get }
 import std::io::file::{ read, write_str, read_file!, write_file }
@@ -512,6 +512,7 @@ const init_result! = (): Json -> Json.Obj([
 			ent("save", Json.Bool(true)),
 		])),
 		ent("documentSymbolProvider", Json.Bool(true)),
+		ent("definitionProvider", Json.Bool(true)),
 		ent("positionEncoding", jstr("utf-8")),
 	])),
 	ent("serverInfo", Json.Obj([ent("name", jstr("cf lsp"))])),
@@ -524,10 +525,14 @@ const name_byte = (Iarch c): Bool ->
 	(c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) ||
 	c == 95 || c == 33 || c == 39
 
-# One line's top-level declaration as a DocumentSymbol, or Null when the line opens none.
-# cf's formatter pins declarations to column 0, so a leading keyword IS top-level; the LSP
-# SymbolKinds: 12 Function, 14 Constant, 23 Struct, 10 Enum, 5 Class (a type alias).
-const sym_of_line! = (Str ln, Iarch l0): Json -> {
+# A scanned top-level declaration line: its LSP SymbolKind (0 when the line opens no
+# declaration) and the declared name's byte span `ns..ne`.
+data DeclLine = { Iarch kind, Iarch ns, Iarch ne }
+
+# Scan one line for a top-level declaration. cf's formatter pins declarations to column 0, so
+# a leading keyword IS top-level; the LSP SymbolKinds: 12 Function, 14 Constant, 23 Struct,
+# 10 Enum, 5 Class (a type alias). The shared leaf of documentSymbol and goto-definition.
+const scan_decl = (Str ln): DeclLine -> {
 	let Iarch koff = 0
 	if starts_with("pub ", ln) then koff = 4
 	const Str rest = slice(koff, Iarch(ln.len), ln)
@@ -554,7 +559,7 @@ const sym_of_line! = (Str ln, Iarch l0): Json -> {
 		klen = 5
 		kind = 5
 	}
-	if klen < 0 then return Json.Null
+	if klen < 0 then return DeclLine({ kind: 0, ns: 0, ne: 0 })
 	# a value that binds a `(...)` is a function — `const f = (…): T -> …` (intrinsics likewise)
 	if kind == 14 && contains("= (", ln) then kind = 12
 
@@ -566,13 +571,21 @@ const sym_of_line! = (Str ln, Iarch l0): Json -> {
 		ne = ne + 1
 	}
 
-	if ne == ns then return Json.Null
+	if ne == ns then return DeclLine({ kind: 0, ns: 0, ne: 0 })
+
+	return DeclLine({ kind: kind, ns: ns, ne: ne })
+}
+
+# One line's top-level declaration as a DocumentSymbol, or Null when the line opens none.
+const sym_of_line! = (Str ln, Iarch l0): Json -> {
+	const DeclLine d = scan_decl(ln)
+	if d.kind == 0 then return Json.Null
 
 	return Json.Obj([
-		ent("name", jstr(slice(ns, ne, ln))),
-		ent("kind", jnum(kind)),
+		ent("name", jstr(slice(d.ns, d.ne, ln))),
+		ent("kind", jnum(d.kind)),
 		ent("range", jrange!(l0, 0, Iarch(ln.len))),
-		ent("selectionRange", jrange!(l0, ns, ne)),
+		ent("selectionRange", jrange!(l0, d.ns, d.ne)),
 	])
 }
 
@@ -611,6 +624,295 @@ const doc_symbols! = (Str uri, Str srcf, Str srcp): Json -> {
 	}
 
 	return Json.Arr(scan_symbols!(src))
+}
+
+# --- goto definition --------------------------------------------------------------------------
+
+# A number payload as an integer (LSP positions), or -1 when the value is no number.
+const jint = (Json j): Iarch -> match j { Json.Num(s) -> to_int(s), _ -> -1 }
+
+# The start byte-col of the token covering `c` in `ln`: identifier bytes and `::` pairs scanned
+# backward — the mirror of `token_end`, so the two of them bracket a full qualified path.
+const token_start = (Str ln, Iarch c): Iarch -> {
+	let Iarch i = c
+
+	loop {
+		if i > 0 && name_byte(Iarch(ln[i - 1])) then {
+			i = i - 1
+			continue
+		}
+		if i > 1 && Iarch(ln[i - 1]) == 58 && Iarch(ln[i - 2]) == 58 then {
+			i = i - 2
+			continue
+		}
+
+		break
+	}
+
+	return i
+}
+
+# `f` as an absolute path: itself when already absolute, else resolved against `pwd` when it
+# exists there, else "" (not visible from this working directory).
+const abs_path! = (Str pwd, Str f): Str -> {
+	if starts_with("/", f) then return f
+
+	if Iarch(pwd.len) > 0 then {
+		const Str cand = "${pwd}/${f}"
+		if exists!(cand) then return cand
+	}
+
+	return ""
+}
+
+# One found definition: its absolute file, 0-based line, and the name's byte span.
+data DefHit = { Str file, Iarch line, Iarch ns, Iarch ne }
+
+# The resolved module tree of `path` — each declaration-bearing source file, the entry first —
+# via a child `cf modules` run: the same child-process discipline as diagnostics, so a
+# parse-broken buffer never takes the server down. A successful list is cached (first line =
+# the entry it belongs to); on failure the cache stands in when it is this entry's — goto
+# keeps working mid-edit from the last good resolve. A non-empty `src` is the overlay file
+# standing in for the entry's bytes.
+const modules_of! = (Str argv0, [Str] env, Str path, Str src): [Str] -> {
+	const Str tmp = "/tmp/cf-lsp-${getpid()}.mods"
+	const Str cache = "/tmp/cf-lsp-${getpid()}.modc"
+	const [Str] none = []
+
+	const Str sh = match find_executable!(env, "sh") {
+		Either.Right(p) -> p,
+		Either.Left(e) -> "",
+	}
+
+	if eq(sh, "") then return none
+	let Str cmd = "'${argv0}' lsp modules '${path}' > '${tmp}' 2> /dev/null"
+	if Iarch(src.len) > 0 then cmd = "'${argv0}' lsp modules '${path}' --src '${src}' > '${tmp}' 2> /dev/null"
+	const Iarch rc = run!(sh, ["sh", "-c", cmd], env)
+
+	let Str got = ""
+
+	if rc == 0 then {
+		got = match read_file!(tmp) {
+			Either.Right(s) -> s,
+			Either.Left(e) -> "",
+		}
+
+		write_file(cache, "${path}\n${got}")
+	} else {
+		# a failed resolve (mid-edit): the cached list, if it belongs to this entry
+		const Str prev = match read_file!(cache) {
+			Either.Right(s) -> s,
+			Either.Left(e) -> "",
+		}
+
+		const Iarch nl = index_of("\n", prev)
+
+		if nl > 0 && eq(slice(0, nl, prev), path) then
+			got = slice(nl + 1, Iarch(prev.len), prev)
+	}
+
+	remove(tmp)
+	let [Str] mods = []
+
+	for m in split("\n", got) {
+		if Iarch(m.len) > 0 then mods = [...mods, m]
+	}
+
+	return mods
+}
+
+# Every top-level declaration named `name` across the module files (the checked file `path`
+# always participates, even when the module list is stale or empty). Reads are overlay-aware:
+# the file the `--src` buffer owns is read from the buffer.
+const find_defs! = ([Str] mods, Str path, Str srcf, Str srcp, Str pwd, Str name): [DefHit] -> {
+	let [Str] scan = [path]
+
+	for m in mods {
+		const Str a = abs_path!(pwd, m)
+		if Iarch(a.len) > 0 && !in_list(a, scan) then scan = [...scan, a]
+	}
+
+	const Str owner = match read_file!(srcp) {
+		Either.Right(s) -> s,
+		Either.Left(e) -> "",
+	}
+
+	let [DefHit] hits = []
+
+	for f in scan {
+		let Str from = f
+		if eq(owner, f) then from = srcf
+
+		const Str text = match read_file!(czstr!(from)) {
+			Either.Right(s) -> s,
+			Either.Left(e) -> "",
+		}
+
+		const [Str] lines = split("\n", text)
+		let Iarch l = 0
+
+		for ln in lines {
+			const DeclLine d = scan_decl(ln)
+
+			if d.kind > 0 && eq(slice(d.ns, d.ne, ln), name) then {
+				hits = [...hits, DefHit({ file: f, line: l, ns: d.ns, ne: d.ne })]
+			}
+
+			l = l + 1
+		}
+	}
+
+	return hits
+}
+
+# Whether every hint segment appears in `file` as a path component (`/seg/`) or as the file
+# itself (`/seg.cf`) — how a qualified use (`str::eq`, `std::data::json::parse!`) narrows
+# same-named candidates. An alias hint that matches nothing leaves the caller's full set.
+const hint_ok! = ([Str] hints, Iarch n, Str file): Bool -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= n then break
+		const Str h = hints[i]
+		if !contains("/${h}/", file) && !contains("/${h}.cf", file) then return false
+		i = i + 1
+	}
+
+	return true
+}
+
+# An LSP Location in `file` (the request's own `uri` is echoed for the checked file itself, so
+# the client sees exactly the identity it asked about).
+const location! = (Str uri, Str path, Str file, Iarch l0, Iarch c0, Iarch c1): Json -> {
+	let Str u = ""
+	if eq(file, path) then u = uri else u = path_uri!(file)
+
+	return Json.Obj([ent("uri", jstr(u)), ent("range", jrange!(l0, c0, c1))])
+}
+
+# Answer textDocument/definition: the qualified token under the cursor, resolved to the
+# top-level declarations of that name across the checked file's module tree. The cursor's own
+# SEGMENT is the sought name and the segments before it narrow by module path — so goto works
+# on a bare use (`parse!`), a qualified one (`json::parse!`), and an import's member alike. A
+# name defined in the checked file itself wins for an unqualified use. A token that names no
+# declaration but ends a module path (`std::data::json` on its import) jumps to the module
+# file. No match is Null, never an error.
+const goto_def! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, Iarch c0): Json -> {
+	if !starts_with("file://", uri) then return Json.Null
+	const Str path = uri_to_path!(uri)
+
+	let Str from = path
+	let Str overlay = ""
+	const Str owner = match read_file!(srcp) {
+		Either.Right(s) -> s,
+		Either.Left(e) -> "",
+	}
+
+	if eq(owner, path) then {
+		from = srcf
+		overlay = srcf
+	}
+
+	const Str text = match read_file!(from) {
+		Either.Right(s) -> s,
+		Either.Left(e) -> "",
+	}
+
+	const [Str] lines = split("\n", text)
+	if l0 < 0 || l0 >= Iarch(lines.len) then return Json.Null
+	const Str ln = lines[l0]
+
+	# the token under (or just left of) the cursor
+	let Iarch c = c0
+	if c > Iarch(ln.len) then c = Iarch(ln.len)
+
+	if c >= Iarch(ln.len) || !name_byte(Iarch(ln[c])) then {
+		if c > 0 && name_byte(Iarch(ln[c - 1])) then c = c - 1
+	}
+
+	if c >= Iarch(ln.len) || !name_byte(Iarch(ln[c])) then return Json.Null
+	const Iarch ts = token_start(ln, c)
+	const Iarch te = token_end(ln, ts)
+	const Str tok = slice(ts, te, ln)
+	const [Str] segs = split("::", tok)
+
+	# the segment the cursor sits in: the sought name; the ones before it: path hints
+	const Iarch rel = c - ts
+	let Iarch csel = Iarch(segs.len) - 1
+	let Iarch acc = 0
+	let Iarch si = 0
+	let Bool found = false
+
+	for s in segs {
+		if !found && rel >= acc && rel <= acc + Iarch(s.len) then {
+			csel = si
+			found = true
+		}
+
+		acc = acc + Iarch(s.len) + 2
+		si = si + 1
+	}
+
+	let [Str] hints = []
+	let [Str] lead = []
+	let Iarch hi = 0
+
+	for s in segs {
+		if hi < csel then hints = [...hints, s]
+		if hi <= csel then lead = [...lead, s]
+		hi = hi + 1
+	}
+
+	const Str name = "${segs[csel]}"
+	if Iarch(name.len) == 0 then return Json.Null
+
+	const [Str] mods = modules_of!(argv0, env, path, overlay)
+	const Str pwd = getenv!(env, "PWD")
+	const [DefHit] all = find_defs!(mods, path, srcf, srcp, pwd, name)
+
+	let [DefHit] picked = []
+
+	if Iarch(hints.len) > 0 then {
+		for h in all {
+			if hint_ok!(hints, Iarch(hints.len), h.file) then picked = [...picked, h]
+		}
+	}
+
+	if Iarch(picked.len) == 0 then picked = all
+
+	# an unqualified name declared in the checked file itself wins (the nearest declaration)
+	if Iarch(hints.len) == 0 then {
+		let [DefHit] local = []
+
+		for h in picked {
+			if eq(h.file, path) then local = [...local, h]
+		}
+
+		if Iarch(local.len) > 0 then picked = local
+	}
+
+	if Iarch(picked.len) == 0 then {
+		# no declaration — perhaps the token is a module path (an import): jump to its file
+		const Str jp = join("/", lead)
+
+		for m in mods {
+			const Str a = abs_path!(pwd, m)
+
+			if Iarch(a.len) > 0 && contains("${jp}.cf", a) then {
+				return Json.Arr([location!(uri, path, a, 0, 0, 1)])
+			}
+		}
+
+		return Json.Null
+	}
+
+	let [Json] locs = []
+
+	for h in picked {
+		locs = [...locs, location!(uri, path, h.file, h.line, h.ns, h.ne)]
+	}
+
+	return Json.Arr(locs)
 }
 
 # --- the loop ---------------------------------------------------------------------------------
@@ -685,6 +987,20 @@ const serve_one! = (Str argv0, [Str] env): Iarch -> {
 		const Str uri = jtext(jget("uri", jget("textDocument", jget("params", req))))
 
 		respond!(id, doc_symbols!(uri, srcf, srcp))
+
+		return 1
+	}
+	if eq(method, "textDocument/definition") then {
+		const Str uri = jtext(jget("uri", jget("textDocument", jget("params", req))))
+		const Json pos = jget("position", jget("params", req))
+		const Iarch pl = jint(jget("line", pos))
+		const Iarch pc = jint(jget("character", pos))
+
+		if Iarch(uri.len) > 0 && pl >= 0 && pc >= 0 then {
+			respond!(id, goto_def!(argv0, env, uri, srcf, srcp, pl, pc))
+		} else {
+			respond!(id, Json.Null)
+		}
 
 		return 1
 	}
