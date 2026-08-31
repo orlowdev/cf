@@ -6,9 +6,9 @@ _f58:
 	addq $8, %rsp
 	ret
 
-.globl _f60
+.globl _f62
 .p2align 2
-_f60:
+_f62:
 	movq %rdi, %rax
 	orq $0x2000000, %rax
 	movq %rsi, %rdi
@@ -23,16 +23,22 @@ _f60:
 1:
 	ret
 
-.globl _f350
+.globl _f63
 .p2align 2
-_f350:
+_f63:
+	movq $1, %rax
+	ret
+
+.globl _f353
+.p2align 2
+_f353:
 	movq $0x2000001, %rax
 	syscall
 	ret
 
-.globl _f351
+.globl _f354
 .p2align 2
-_f351:
+_f354:
 	movq $0x2000002, %rax
 	syscall
 	jnc 1f

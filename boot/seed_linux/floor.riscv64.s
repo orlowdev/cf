@@ -8,9 +8,9 @@ f58:
 	addi sp, sp, 16
 	ret
 
-.globl f60
+.globl f62
 .p2align 2
-f60:
+f62:
 	mv a7, a0
 	mv a0, a1
 	mv a1, a2
@@ -21,9 +21,15 @@ f60:
 	ecall
 	ret
 
-.globl f350
+.globl f63
 .p2align 2
-f350:
+f63:
+	li a0, 2
+	ret
+
+.globl f353
+.p2align 2
+f353:
 	mv a0, a0
 	li a7, 94
 	ecall

@@ -6,9 +6,9 @@ f58:
 	ldp x29, x30, [sp], #16
 	ret
 
-.globl f60
+.globl f62
 .p2align 2
-f60:
+f62:
 	mov x8, x0
 	mov x0, x1
 	mov x1, x2
@@ -19,9 +19,15 @@ f60:
 	svc #0
 	ret
 
-.globl f350
+.globl f63
 .p2align 2
-f350:
+f63:
+	mov x0, #0
+	ret
+
+.globl f353
+.p2align 2
+f353:
 	mov x0, x0
 	mov x8, #94
 	svc #0
