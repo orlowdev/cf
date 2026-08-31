@@ -12,7 +12,7 @@
 # argv/env discipline the environment is read here and threaded down explicitly (to resolve `cc` on
 # PATH), never accessed ambiently.
 
-import std::data::str::{ eq }
+import std::data::str::{ eq, slice }
 import std::sys::{ Os, Arch }
 import std::comptime::os
 import cli::{ Cli, cli_parse!, FmtCli, is_fmt_cmd, fmt_cli_parse, is_version_cmd, is_help_cmd, host_arch }
@@ -21,6 +21,8 @@ import fmt::{ format_file! }
 import docs::{ docs_run! }
 import lsp::{ lsp_run! }
 import std::compiler::{ compile!, check! }
+import std::compiler::ast::{ Program }
+import std::compiler::resolve::{ resolve_program! }
 import std::compiler::diag::{ Diag, print_diags! }
 import std::mem::arena::growing_arena
 import qbe::{ qbe_translate }
@@ -214,6 +216,60 @@ const run_check! = (Str input, Str src): Iarch -> {
 	return 0
 }
 
+# A view of `s` without its trailing NULs — a module path built for the open syscall carries
+# its terminating NUL in `Str.len`, and a printed path must not (the diag printer's lesson).
+const trim_nul = (Str s): Str -> {
+	let Iarch n = Iarch(s.len)
+
+	loop {
+		if n <= 0 then break
+		if Iarch(s[n - 1]) != 0 then break
+		n = n - 1
+	}
+
+	return slice(0, n, s)
+}
+
+# Whether `s` is one of `xs`.
+const has_str = ([Str] xs, Str s): Bool -> {
+	for x in xs {
+		if eq(x, s) then return true
+	}
+
+	return false
+}
+
+# `cf lsp modules <input.cf> [--src <buf>]`: resolve the entry's module tree — the front end
+# only, no checking — and print each declaration-bearing source file once, one per line (the
+# entry first, its transitive imports after). The declaration stamps the resolver leaves on
+# every function/record/union name their defining file, so the distinct stamp set IS the module
+# list. The LSP's goto-definition index: it line-scans these files for top-level declarations.
+const run_modules! = (Str input, Str src): Iarch -> {
+	const Program raw = resolve_program!(input, src, os::target, host_arch())
+	let [Str] mods = []
+
+	for f in raw.funcs {
+		const Str p = trim_nul(f.dfile)
+		if Iarch(p.len) > 0 && !has_str(mods, p) then mods = [...mods, p]
+	}
+
+	for r in raw.recs {
+		const Str p = trim_nul(r.dfile)
+		if Iarch(p.len) > 0 && !has_str(mods, p) then mods = [...mods, p]
+	}
+
+	for u in raw.unions {
+		const Str p = trim_nul(u.dfile)
+		if Iarch(p.len) > 0 && !has_str(mods, p) then mods = [...mods, p]
+	}
+
+	for m in mods {
+		println(m)
+	}
+
+	return 0
+}
+
 # The self-contained pipeline: compile the program to IL + floor (temp files), run the embedded QBE
 # on the IL, spawn the host toolchain to assemble+link, then clean up (unless `-P`). darwin links a
 # Mach-O with `cc`; `Bare` and `Linux` cross-assemble + link a freestanding ELF with `clang`/`ld.lld`
@@ -334,8 +390,19 @@ pub const main = ([Str] args, [Str] env) -> {
 		return run_check!(args[2], csrc) in ka
 	}
 
-	# `cf lsp` — the Language Server Protocol server over stdio (lsp.cf).
+	# `cf lsp` — the Language Server Protocol server over stdio (lsp.cf). Its plumbing rides
+	# under the same umbrella rather than spamming the top-level verb surface: `cf lsp modules
+	# <input.cf> [--src <file>]` prints the entry's resolved module tree one source file per
+	# line — the goto-definition index the server's child runs ask for.
 	if Iarch(args.len) >= 2 && eq(args[1], "lsp") then {
+		if Iarch(args.len) >= 4 && eq(args[2], "modules") then {
+			let Str msrc = ""
+			if Iarch(args.len) >= 6 && eq(args[4], "--src") then msrc = args[5]
+			const ma = growing_arena::of(16777216)
+
+			return run_modules!(args[3], msrc) in ma
+		}
+
 		const sa = growing_arena::of(16777216)
 
 		return lsp_run!(args, env) in sa
