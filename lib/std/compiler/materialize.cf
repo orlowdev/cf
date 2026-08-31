@@ -54,7 +54,7 @@ import std::compiler::routing::{ kids, stmt_exprs }
 # The pass result: the rewritten program plus the geometry copies — `names[i]` is a copy's
 # function name and `geoms[i]` its tag ("fb"/"fx"/"el"/"pg"); emit consults the pair to pick the hook
 # lowering for exactly those bodies.
-pub data Mat = { Program prog, [Str] names, [Str] geoms }
+pub data Mat = { Program prog, [Str] names, [Str] geoms, [Func] dropped }
 
 # The ambient a reach tag names, as a parent geometry: the legacy/root (0) and page (4) tags are
 # both the page root; fb/fx/el are themselves. Used only to tell whether an arena is carved from the
@@ -955,6 +955,7 @@ const rec_body = ([Stmt] ss): Bool -> {
 # name and geometry tables (`Mat`).
 pub const materialize_program! = (Program prog, Program raw): Mat -> {
 	const [Str] no_strs = []
+	const [Func] no_funcs = []
 	# The PAGE geometry is a first-class ambient: `main` runs under the root page, and any allocation
 	# in its root subtree (its own body, or a bare-called helper — an `in <arena>` graft leaves the
 	# subtree) draws from the page's OWN reserve like every other geometry, not a runtime-dispatch
@@ -964,7 +965,7 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 	# the LATE bail (byte-identical to the pre-import table) — that decision is deferred to there now,
 	# so the walk always runs (cheap for a non-allocating program).
 	const Iarch mi = find_fn(prog.funcs, "main")
-	if mi < 0 then return Mat({ prog: strip_pg(prog), names: no_strs, geoms: no_strs })
+	if mi < 0 then return Mat({ prog: strip_pg(prog), names: no_strs, geoms: no_strs, dropped: no_funcs })
 	const Bool main_allocs = alloc_body(prog.funcs[mi].body, prog.unions)
 	# UNIFORM ENTRY ABI (std::rt::floor): the hosted `_start` ALWAYS builds argv+env before `main`, so
 	# `reserve_ret__pg` — the page reserve those pre-main bridges build the `[Str]`s through — must
@@ -1157,14 +1158,48 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 	# compiler, and every arena-grafting program whose main places nothing on the page), main
 	# stays legacy and the dormant page module is stripped, keeping such programs byte-identical.
 	const Bool page_active = Iarch(pgn.len) > 0 || main_allocs
-	# nothing materialized and the page is dormant: strip it back out (byte-identical passthrough).
-	# EXCEPT a `main([Str] args)` program keeps `reserve_ret__pg` alive for the pre-main argv bridge.
-	if Iarch(fbn.len) + Iarch(fxn.len) + Iarch(eln.len) + Iarch(pgn.len) == 0 &&
-		!page_active &&
-		main_argv
-			then return Mat({ prog: strip_pg_keep_reserve(prog), names: no_strs, geoms: no_strs })
-	if Iarch(fbn.len) + Iarch(fxn.len) + Iarch(eln.len) + Iarch(pgn.len) == 0 && !page_active
-		then return Mat({ prog: strip_pg(prog), names: no_strs, geoms: no_strs })
+	# nothing materialized and the page is dormant: strip it back out and PRUNE the unreached
+	# originals — the same reach filter the rebuild below applies (intrinsics, verbatim-symbol
+	# floor fns, and `main` survive unconditionally). A reachable-only program passes through
+	# byte-identical as before; a program carrying unused declarations stops EMITTING them (an
+	# unused aggregate-constructing fn has no geometry ambient here and would trip emit's
+	# retired-cf_alloc backstop). The pruned decls come back as `dropped` — typecheck still
+	# validates them (`check_unreachable!`), so their errors surface.
+	# A `main([Str] args)` program keeps `reserve_ret__pg` alive for the pre-main argv bridge.
+	if Iarch(fbn.len) + Iarch(fxn.len) + Iarch(eln.len) + Iarch(pgn.len) == 0 && !page_active then {
+		let [Func] bkeep = []
+		let [Func] bdrop = []
+		let Iarch bi = 0
+
+		loop {
+			if bi >= nf then break
+			# a page-module fn (`*__pg`) is NOT pruned here — the strip below owns its fate
+			# (`reserve_ret__pg` survives for the argv bridge), exactly as before this filter
+			if bi == mi ||
+				reach[bi * 5] ||
+				prog.funcs[bi].is_intrinsic ||
+				!eq(prog.funcs[bi].asm_sym, "") ||
+				name_ends_pg(prog.funcs[bi].name) then {
+				bkeep = [...bkeep, prog.funcs[bi]]
+			} else {
+				bdrop = [...bdrop, prog.funcs[bi]]
+			}
+			bi = bi + 1
+		}
+
+		const Program bprog = Program({
+			imports: prog.imports,
+			recs: prog.recs,
+			unions: prog.unions,
+			funcs: bkeep,
+			groups: prog.groups,
+		})
+
+		if main_argv
+			then return Mat({ prog: strip_pg_keep_reserve(bprog), names: no_strs, geoms: no_strs, dropped: bdrop })
+
+		return Mat({ prog: strip_pg(bprog), names: no_strs, geoms: no_strs, dropped: bdrop })
+	}
 
 	# parent-axis: an arena's parent is a comptime fact of its CONSTRUCTION AMBIENT — the tag the
 	# function holding `of__fx`/`of__el` runs under. Each carve draws from its IMMEDIATE parent through
@@ -1199,6 +1234,9 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 	let [Func] out = []
 	let [Str] cnames = []
 	let [Str] cgeoms = []
+	# the originals the reach filter drops: never emitted, but still WRITTEN declarations —
+	# typecheck validates them after the pass (their errors must not vanish with the pruning)
+	let [Func] dropped = []
 	let Iarch fi = 0
 
 	loop {
@@ -1248,6 +1286,9 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 		# gate their token lowerings on resolving it (`is_intrinsic`), so it must stay in the table.
 		# A verbatim-symbol floor fn (`asm_sym` set) likewise survives unconditionally: it is reached
 		# only by fixed asm symbol (the entry, `raw::grow`/`raw::trap`), invisible to this cf-call walk.
+		if fi != mi &&
+			!reach[fi * 5] && !prog.funcs[fi].is_intrinsic && eq(prog.funcs[fi].asm_sym, "")
+				then dropped = [...dropped, prog.funcs[fi]]
 		if fi != mi &&
 			(reach[fi * 5] || prog.funcs[fi].is_intrinsic || !eq(prog.funcs[fi].asm_sym, "")) then {
 			const Func f = prog.funcs[fi]
@@ -1606,5 +1647,5 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 		groups: prog.groups,
 	})
 
-	return Mat({ prog: p2, names: cnames, geoms: cgeoms })
+	return Mat({ prog: p2, names: cnames, geoms: cgeoms, dropped: dropped })
 }

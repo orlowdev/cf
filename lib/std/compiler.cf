@@ -13,15 +13,15 @@ import std::io::file::{ create, close }
 import std::io::fd::{ Fd, IoRrr }
 import std::sys::{ Os, Arch }
 import std::compiler::ast::{ Program }
-import std::compiler::diag::{ Diag }
+import std::compiler::diag::{ Diag, sort_diags }
 import std::compiler::resolve::{ resolve_program! }
 import std::compiler::monomorph::{ mono_program! }
 import std::compiler::materialize::{ materialize_program!, Mat }
-import std::compiler::typecheck::{ check_program! }
+import std::compiler::typecheck::{ check_program!, check_unreachable! }
 import std::compiler::alloc::{ check_alloc_program!, check_root_program! }
 import std::compiler::hoist_defertap::{ hoist_defertaps! }
 import std::compiler::defer::{ lower_defers! }
-import std::compiler::closures::{ lift_program! }
+import std::compiler::closures::{ lift_program!, check_dropped_captures! }
 import std::compiler::routing::{
 	routing_tables!,
 	routing_check!,
@@ -93,10 +93,18 @@ pub const compile! = (
 	const Program prog = mm.prog
 
 	# middle: typecheck (rejects type errors before any output is produced) — a rejection
-	# returns the collected diagnostics; no output files are touched
-	const [Diag] diags = check_program!(prog)
+	# returns the collected diagnostics; no output files are touched. The declarations
+	# Materialize pruned as unreachable are checked too, against the PRE-materialize tables:
+	# uncalled code is still written code, and its errors must not vanish with the pruning.
+	const [Diag] tdiags = check_program!(prog)
+	const [Diag] xdiags = check_unreachable!(mm.dropped, mono.funcs, mono.recs, mono.unions)
+	const [Diag] diags = sort_diags([...tdiags, ...xdiags])
 
 	if Iarch(diags.len) > 0 then return diags
+
+	# closures inside pruned declarations still validate their captures — the same fail-fast
+	# classification the real lift below applies to live code
+	check_dropped_captures!(mm.dropped, mono.recs, mono.funcs)
 
 	# lift `defer`-tap VALUES (`defer f(x)` / `|> defer f`) out of expression position into a
 	# snapshot binding + a scheduled `defer` statement (memory_model §6) — before lower_defers, so

@@ -15,7 +15,7 @@
 # return type, so forward references and recursion type without walking the callee.
 # The emitter runs only on programs this phase accepts.
 
-import std::io::console::{ die }
+import std::io::console::{ die, eprint }
 import std::compiler::diag::{ Diag, DiagBag, drec, sort_diags }
 import std::data::str::{ eq }
 import std::compiler::ast::{
@@ -631,6 +631,18 @@ const ty_eq = (Ty a, Ty b): Bool -> {
 
 # Byte-wise `Str` equality (name lookup).
 
+const param_named = ([Param] ps, Str n): Bool -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(ps.len) then break
+		if eq(ps[i].name, n) then return true
+		i = i + 1
+	}
+
+	return false
+}
+
 const find_func = ([Func] funcs, Str name): Iarch -> {
 	let Iarch i = 0
 
@@ -718,7 +730,11 @@ pub const named_ty = (Str type_name, Str elem, [RecDecl] recs, [UnionDecl] union
 	# any integer-family name (`Iarch`/`Int`/`Uarch`/`Uint8`/... — the same set a cast names)
 	# is one word: cf tracks every integer width as `TInt` (a genesis narrowing).
 	if is_cast_type(type_name) then return Ty.TInt
-	die("cf: type: an undeclared type name\n")
+	# the stamp-less backstop (the monomorph pass shares this fn, so no Ctx is at hand): at
+	# least NAME the offender, so the message is searchable even without a location
+	eprint("cf: type: an undeclared type name `")
+	eprint(type_name)
+	die("`\n")
 
 	return Ty.TInt
 }
@@ -4606,6 +4622,16 @@ const check_func! = (Func fn, Ctx ctx, *DiagBag dg): Iarch -> {
 		if Iarch(fn.params.len) > 8
 			then return terr_i(ctx, dg, "cf: type: an asm function takes at most 8 parameters (the arm64 argument registers)\n")
 		if eq(fn.ret_name, "") then return terr_i(ctx, dg, "cf: type: an asm function must declare its return type\n")
+		# every `${name}` interpolation hole must name a parameter (emit lowers a hole to that
+		# argument's register) — validated here so a never-called asm fn still rejects, located
+		let Iarch ah = 0
+
+		loop {
+			if ah >= Iarch(fn.asm_body.len) then break
+			if fn.asm_body[ah].is_hole && !param_named(fn.params, fn.asm_body[ah].name)
+				then return terr_i(ctx, dg, "cf: type: an asm interpolation hole must name a parameter\n")
+			ah = ah + 1
+		}
 
 		return 0
 	}
@@ -4946,4 +4972,65 @@ pub const check_program! = (Program prog): [Diag] -> {
 	}
 
 	return sort_diags(diags)
+}
+
+# Typecheck the declarations the Materialize pass PRUNED as unreachable: a written function's
+# errors must not vanish just because nothing calls it (an uncalled function's body is still
+# the user's code — and an LSP reports on everything written). Checked against the
+# PRE-materialize tables (`funcs` — the monomorphized originals — so dropped-to-dropped and
+# dropped-to-kept calls resolve by their ORIGINAL names; these bodies never name minted twins).
+# Same collection discipline as `check_program!`: one error per declaration, first wins.
+pub const check_unreachable! = ([Func] extra, [Func] funcs, [RecDecl] recs, [UnionDecl] unions): [Diag] -> {
+	let DiagBag bag = DiagBag({ fatal: false, hot: false, file: "", line: 0, col: 0, msg: "" })
+	let [Diag] diags = []
+	let Ctx ctx = Ctx({
+		funcs: funcs,
+		recs: recs,
+		unions: unions,
+		frt: Ty.TInt,
+		frsize: 0,
+		dfile: "",
+		dline: 0,
+		dcol: 0,
+	})
+	let Iarch f = 0
+
+	loop {
+		if f >= Iarch(extra.len) then break
+		const Func cfn = extra[f]
+		# structure checks the pruned declaration missed (check_whole's scan ran over the
+		# PRUNED table): the reserved `asm` name, and a name clash with ANY declaration —
+		# stamped on the LATER of the two like check_whole's scan; when both clash-mates are
+		# dropped the flush's dup scan collapses the double report
+		if eq(cfn.name, "asm")
+			then ferr(cfn, &bag, "cf: type: `asm` is a reserved keyword and cannot name a function\n")
+		let Iarch dj = 0
+
+		loop {
+			if dj >= Iarch(funcs.len) then break
+			const Func ofn = funcs[dj]
+			if eq(ofn.name, cfn.name) &&
+				!(eq(ofn.dfile, cfn.dfile) && ofn.dline == cfn.dline && ofn.dcol == cfn.dcol) then {
+				if eq(ofn.dfile, cfn.dfile) && ofn.dline > cfn.dline then {
+					ferr(ofn, &bag, "cf: type: two functions share a name\n")
+				} else {
+					ferr(cfn, &bag, "cf: type: two functions share a name\n")
+				}
+			}
+			dj = dj + 1
+		}
+
+		ctx.dfile = cfn.dfile
+		ctx.dline = cfn.dline
+		ctx.dcol = cfn.dcol
+		check_func!(cfn, ctx, &bag)
+		if bag.hot then {
+			bag.hot = false
+			if !diag_dup(diags, bag.file, bag.line, bag.col, bag.msg)
+				then diags = [...diags, Diag({ file: bag.file, line: bag.line, col: bag.col, msg: bag.msg })]
+		}
+		f = f + 1
+	}
+
+	return diags
 }
