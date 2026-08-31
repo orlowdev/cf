@@ -14,6 +14,8 @@
 
 import std::data::str::{ eq }
 import std::sys::{ Os, Arch }
+import std::comptime::os
+import std::comptime::arch
 import cli::{ Cli, cli_parse!, FmtCli, is_fmt_cmd, fmt_cli_parse, is_version_cmd, is_help_cmd }
 import std::compiler::buildinfo::{ compiler_version }
 import fmt::{ format_file! }
@@ -198,9 +200,11 @@ const link_linux! = (
 	return lr
 }
 
-# `cf check`: validate one module tree, print every located diagnostic, exit 1 on any.
-const run_check! = (Str input): Iarch -> {
-	const [Diag] ds = check!(input, Os.Darwin, Arch.Arm64, 1048576)
+# `cf check`: validate one module tree, print every located diagnostic, exit 1 on any. The
+# target defaults to the HOST (the target this compiler was built for, folded at comptime);
+# `src` (may be empty) stands in for the entry's bytes — an editor's unsaved buffer.
+const run_check! = (Str input, Str src): Iarch -> {
+	const [Diag] ds = check!(input, src, os::target, arch::target, 1048576)
 
 	if Iarch(ds.len) > 0 then {
 		print_diags!(ds)
@@ -269,8 +273,8 @@ const run_full! = (Cli c, [Str] env): Iarch -> {
 }
 
 # The help screen — the accurate command surface of THIS binary (reality), in the shape of
-# [[cf_cli.md]]. It lists only what cf implements today; the commands the spec defers (run/test/lint/
-# lsp) are named at the end as not-yet-implemented rather than advertised as working. Printed to stdout
+# [[cf_cli.md]]. It lists only what cf implements today; the commands the spec defers (run/test/
+# lint) are named at the end as not-yet-implemented rather than advertised as working. Printed to stdout
 # for `cf`, `cf help`, `cf --help`, `cf -h`; the per-error usage lines (cli.cf) are the short form.
 const print_help = (): () -> {
 	println("cf — the C! compiler")
@@ -278,6 +282,8 @@ const print_help = (): () -> {
 	println("Usage:")
 	println("  cf [c|compile] <file.cf> -o <out> [options]   compile <file.cf> to a native binary")
 	println("  cf format <file|dir> [--check]                format C! source in place       (alias: f)")
+	println("  cf check <file.cf> [--src <buf>]              validate a module tree, no output")
+	println("  cf lsp                                        serve the Language Server Protocol on stdio")
 	println("  cf docs [<term>]                              browse the standard-library API")
 	println("  cf --version                                  print cf's own version          (alias: -V)")
 	println("  cf --help                                     show this help                  (alias: -h)")
@@ -292,7 +298,7 @@ const print_help = (): () -> {
 	println("  --skip-embeds                 emit without baking in std           (bootstrap seed only)")
 	println("  --dump-routing                print each function's escape/alias classification")
 	println("")
-	println("Specified but not yet implemented: run, test, lint, lsp (see root/specs/cf_cli.md).")
+	println("Specified but not yet implemented: run, test, lint (see root/specs/cf_cli.md).")
 }
 
 pub const main = ([Str] args, [Str] env) -> {
@@ -318,12 +324,15 @@ pub const main = ([Str] args, [Str] env) -> {
 		return format_file!(fc.path, fc.check) in fa
 	}
 
-	# `cf check <input.cf>` — the full validation pipeline, no output: located diagnostics on
-	# stderr, exit 1 on any. The LSP server's per-request worker, and a fast editor loop.
+	# `cf check <input.cf> [--src <file>]` — the full validation pipeline, no output: located
+	# diagnostics on stderr, exit 1 on any. The LSP server's per-request worker, and a fast
+	# editor loop. `--src` substitutes the entry's bytes (an unsaved buffer in a temp file).
 	if Iarch(args.len) >= 3 && eq(args[1], "check") then {
+		let Str csrc = ""
+		if Iarch(args.len) >= 5 && eq(args[3], "--src") then csrc = args[4]
 		const ka = growing_arena::of(16777216)
 
-		return run_check!(args[2]) in ka
+		return run_check!(args[2], csrc) in ka
 	}
 
 	# `cf lsp` — the Language Server Protocol server over stdio (lsp.cf).
