@@ -10,6 +10,7 @@
 
 import std::compiler::diag::{ die_at }
 import std::compiler::spans::{ unat }
+import std::io::console::{ print }
 import std::data::str::{ eq }
 import std::sys::{ Os, Arch }
 import std::compiler::token::{
@@ -112,6 +113,43 @@ pub data Parser = {
 # so `cf lsp refs` can walk the same log and collect every reference bound to one binder.
 pub data BindEv = { Iarch off, Iarch kind, Str name }
 
+# Print one decimal digit to stdout as a literal write — the colorless integer print's leaf
+# (the salvage dump may fire from the die path of any fn; diag.cf's `eput_digit`, stdout-side).
+const put_digit = (Iarch d): () -> {
+	if d == 0 then print("0")
+	if d == 1 then print("1")
+	if d == 2 then print("2")
+	if d == 3 then print("3")
+	if d == 4 then print("4")
+	if d == 5 then print("5")
+	if d == 6 then print("6")
+	if d == 7 then print("7")
+	if d == 8 then print("8")
+	if d == 9 then print("9")
+}
+
+# Print a non-negative integer's decimal digits to stdout, high digit first.
+const put_int = (Iarch n): () -> {
+	if n >= 10 then put_int(n / 10)
+	put_digit(n % 10)
+}
+
+# SALVAGE dump: the bind-event log collected so far, to stdout as `off:kind:name` lines.
+# A tracked parse that dies mid-edit still hands its partial log to the LSP server through
+# the child's stdout — goto and completion replay events collected BEFORE the break (all
+# they need at a cursor above it); references/rename see the nonzero exit and refuse a
+# truncated log rather than miss an edit. Colorless piecewise printing, like diag.cf.
+const dump_evs = ([BindEv] evs): () -> {
+	for ev in evs {
+		put_int(ev.off)
+		print(":")
+		put_int(ev.kind)
+		print(":")
+		print(ev.name)
+		print("\n")
+	}
+}
+
 # Append a bind event for the token at `tokpos` (`ebase` rebases a hole sub-parse into its
 # enclosing file). Skipped when tracking is off, and for the `_` ignore and the `#`/`=`
 # sub-pattern guards, which bind nothing.
@@ -128,7 +166,20 @@ const peek = (*Parser p): TokKind -> p.toks[p.pos].kind
 
 # Die with `msg` prefixed by the `path:line:col: ` of byte offset `off` in this parse's file
 # (`ebase` rebases a hole sub-parse into its enclosing file). Colorless — callable from any fn.
-const perr_off = (*Parser p, Iarch off, Str msg): Never -> die_at(p.file, p.esrc, p.ebase + off, msg)
+# A TRACKED parse (an LSP child) salvages its bind-event log to stdout first.
+const perr_off = (*Parser p, Iarch off, Str msg): Never -> {
+	if p.track then {
+		dump_evs(p.evs)
+		# a final `off:7:` BREAK marker: the log covers the buffer only UP TO here. The
+		# salvage consumer answers queries before it and refuses queries past it — a
+		# truncated log leaves earlier scopes open, so an answer beyond the break could
+		# name a binder the cursor never sees.
+		put_int(p.ebase + off)
+		print(":7:\n")
+	}
+
+	return die_at(p.file, p.esrc, p.ebase + off, msg)
+}
 
 # Die located at the CURRENT token.
 const perr = (*Parser p, Str msg): Never -> perr_off(p, p.toks[p.pos].start, msg)
@@ -270,7 +321,9 @@ const parse_hole! = (*Parser p, Iarch hstart, Iarch hlen): Expr -> {
 
 	const [Token] toks = lex_hole(hbuf, hlen, p.file, p.esrc, p.ebase + hstart)
 	const [Stmt] nopend = []
-	const [BindEv] noevs = []
+	# the sub-parser starts from a fresh COPY of the enclosing log (never an alias), so a die
+	# INSIDE the hole salvage-dumps the whole prefix, not just the hole's own events
+	const [BindEv] noevs = [...p.evs]
 	let Parser hp = Parser({
 		toks: toks,
 		src: hbuf,
@@ -289,9 +342,9 @@ const parse_hole! = (*Parser p, Iarch hstart, Iarch hlen): Expr -> {
 	})
 	const Expr e = parse_expr!(&hp)
 	if !is_eof(peek(&hp)) then perr(&hp, "cf: parse: an interpolation hole must be a single expression\n")
-	# the sub-parser's bind events (an anonymous lambda in a hole) rejoin the enclosing log —
-	# `ebase` already rebased their offsets into this file
-	if p.track && Iarch(hp.evs.len) > 0 then p.evs = [...p.evs, ...hp.evs]
+	# the sub-parser's log IS prefix + hole events (an anonymous lambda in a hole binds);
+	# `ebase` already rebased their offsets into this file — adopt it wholesale
+	if p.track then p.evs = hp.evs
 
 	return e
 }

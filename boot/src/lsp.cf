@@ -1136,63 +1136,31 @@ const cprefix = (Str ln, Iarch c0): TokCtx -> {
 # list without a second child run).
 data DefOut = { [SymRow] hits, [Str] mods }
 
-# Run the `cf lsp <verb>` local-binding child (`def` or `refs`) for the token at the cursor
-# and return its raw stdout — "" when the token cannot be a local (qualified, `Type.`-based,
-# or uppercase), the child fails, or nothing binds. The parser's bind-event log replayed at
-# the cursor's byte offset resolves parameters, `let`/`const` locals, `for` binders, and
-# match payload binds; the shared front half of goto/hover and references/rename.
-const local_out! = (Str argv0, [Str] env, Str path, Str overlay, [Str] lines, Iarch l0, TokCtx t, Str verb): Str -> {
-	if Iarch(t.hints.len) > 0 || Iarch(t.base.len) > 0 then return ""
+# A `cf lsp` child run's outcome: its exit code, the byte offset the query was made at, and
+# the raw stdout capture. The capture is read REGARDLESS of the exit code — a tracked parse
+# that DIES on a mid-edit buffer salvage-dumps its partial bind-event log to stdout first
+# (parser.cf `dump_evs`), and the caller decides what a truncated log may answer: goto and
+# completion replay it (they only need events before the cursor), references/rename refuse it.
+data ChildOut = { Iarch rc, Iarch off, Str out }
+
+# Only a bare lowercase token can be a LOCAL — a qualified or `Type.`-based one never is.
+const local_token = (TokCtx t): Bool -> {
+	if Iarch(t.hints.len) > 0 || Iarch(t.base.len) > 0 then return false
 	const Iarch b0 = Iarch(t.name[0])
-	if b0 >= 65 && b0 <= 90 then return ""
 
-	const Str sh = match find_executable!(env, "sh") {
-		Either.Right(p) -> p,
-		Either.Left(e) -> "",
-	}
-
-	if eq(sh, "") then return ""
-	# the token's byte offset in the (possibly overlaid) buffer the lines came from
-	let Iarch off = t.ts
-	let Iarch li = 0
-
-	for ln in lines {
-		if li >= l0 then break
-		off = off + Iarch(ln.len) + 1
-		li = li + 1
-	}
-
-	const Str tmp = "/tmp/cf-lsp-${getpid()}.def"
-	let Str cmd = "'${argv0}' lsp ${verb} '${path}' ${off} '${t.name}' > '${tmp}' 2> /dev/null"
-	if Iarch(overlay.len) > 0
-		then cmd = "'${argv0}' lsp ${verb} '${path}' ${off} '${t.name}' --src '${overlay}' > '${tmp}' 2> /dev/null"
-	const Iarch rc = run!(sh, ["sh", "-c", cmd], env)
-
-	let Str got = ""
-
-	if rc == 0 then {
-		got = match read_file!(tmp) {
-			Either.Right(s) -> s,
-			Either.Left(e) -> "",
-		}
-	}
-
-	remove(tmp)
-
-	return got
+	return !(b0 >= 65 && b0 <= 90)
 }
 
-# The `cf lsp scope` child's raw output — every local binding visible at the byte offset of
-# line `l0` col `ts`, one `line:col:kind:name` per line, innermost first. "" when the buffer
-# does not parse (mid-edit) or nothing is in scope. The completion source for locals; unlike
-# `local_out!` it takes no token gate — an empty typed prefix still has a scope.
-const scope_out! = (Str argv0, [Str] env, Str path, Str overlay, [Str] lines, Iarch l0, Iarch ts): Str -> {
+# Run a `cf lsp <verb>` local-binding child at byte position (l0, ts) of the buffer `lines`
+# came from. An empty `name` omits the argument (the `scope` verb takes none).
+const lsp_child! = (Str argv0, [Str] env, Str path, Str overlay, [Str] lines, Iarch l0, Iarch ts, Str verb, Str name): ChildOut -> {
 	const Str sh = match find_executable!(env, "sh") {
 		Either.Right(p) -> p,
 		Either.Left(e) -> "",
 	}
 
-	if eq(sh, "") then return ""
+	if eq(sh, "") then return ChildOut({ rc: -1, off: 0, out: "" })
+	# the position's byte offset in the (possibly overlaid) buffer
 	let Iarch off = ts
 	let Iarch li = 0
 
@@ -1203,23 +1171,204 @@ const scope_out! = (Str argv0, [Str] env, Str path, Str overlay, [Str] lines, Ia
 	}
 
 	const Str tmp = "/tmp/cf-lsp-${getpid()}.def"
-	let Str cmd = "'${argv0}' lsp scope '${path}' ${off} > '${tmp}' 2> /dev/null"
-	if Iarch(overlay.len) > 0
-		then cmd = "'${argv0}' lsp scope '${path}' ${off} --src '${overlay}' > '${tmp}' 2> /dev/null"
+	let Str narg = ""
+	if Iarch(name.len) > 0 then narg = " '${name}'"
+	let Str ov = ""
+	if Iarch(overlay.len) > 0 then ov = " --src '${overlay}'"
+	const Str cmd = "'${argv0}' lsp ${verb} '${path}' ${off}${narg}${ov} > '${tmp}' 2> /dev/null"
 	const Iarch rc = run!(sh, ["sh", "-c", cmd], env)
-
-	let Str got = ""
-
-	if rc == 0 then {
-		got = match read_file!(tmp) {
-			Either.Right(s) -> s,
-			Either.Left(e) -> "",
-		}
+	const Str got = match read_file!(tmp) {
+		Either.Right(s) -> s,
+		Either.Left(e) -> "",
 	}
 
 	remove(tmp)
 
-	return got
+	return ChildOut({ rc: rc, off: off, out: got })
+}
+
+# --- the salvage replay: a dying child's partial event log, replayed server-side ---------------
+
+# One salvage-dump line `off:kind:name` (kinds: 0 scope-open, 1 close, 2..5 binds, 6 use,
+# 7 the BREAK marker a dying parse ends its dump with; the name is empty on open/close/break).
+# `off` -1 on anything else.
+data EvRow = { Iarch off, Iarch kind, Str name }
+
+const ev_row = (Str sl): EvRow -> {
+	const EvRow bad = EvRow({ off: -1, kind: 0, name: "" })
+	const Iarch c1 = index_of(":", sl)
+	if c1 <= 0 then return bad
+	const Str r1 = slice(c1 + 1, Iarch(sl.len), sl)
+	const Iarch c2 = index_of(":", r1)
+	if c2 <= 0 then return bad
+
+	return EvRow({
+		off: to_int(slice(0, c1, sl)),
+		kind: to_int(slice(0, c2, r1)),
+		name: slice(c2 + 1, Iarch(r1.len), r1),
+	})
+}
+
+const parse_evs = (Str out): [EvRow] -> {
+	let [EvRow] evs = []
+
+	for sl in split("\n", out) {
+		const EvRow r = ev_row(sl)
+		if r.off >= 0 then evs = [...evs, r]
+	}
+
+	return evs
+}
+
+# Byte offset -> (0-based line, byte col) in `lines`; (-1, -1) past the end.
+const lc_of = ([Str] lines, Iarch off): (Iarch, Iarch) -> {
+	let Iarch rem = off
+	let Iarch li = 0
+
+	for ln in lines {
+		if rem <= Iarch(ln.len) then return (li, rem)
+		rem = rem - Iarch(ln.len) - 1
+		li = li + 1
+	}
+
+	return (-1, -1)
+}
+
+# The byte offset of the innermost binding of `name` still live at `off`, or -1 — the
+# server-side port of cf.cf's `binder_at!` for salvaged logs (same replay: binds 2..5 collect
+# with their depth, a close drops its scope's binds, the last survivor wins).
+const salvage_binder! = ([EvRow] evs, Iarch off, Str name): Iarch -> {
+	let Iarch depth = 0
+	let [Iarch] boffs = []
+	let [Iarch] bdeps = []
+
+	for ev in evs {
+		if ev.off > off then break
+		# the parse broke BEFORE the cursor: the log does not cover it — a truncated log
+		# leaves earlier scopes open, so answering would name a binder the cursor never sees
+		if ev.kind == 7 then return -1
+		if ev.kind == 0 then depth = depth + 1
+		if ev.kind == 1 then {
+			let [Iarch] ko = []
+			let [Iarch] kd = []
+
+			for (b, i) in boffs {
+				if bdeps[i] < depth then {
+					ko = [...ko, b]
+					kd = [...kd, bdeps[i]]
+				}
+			}
+
+			boffs = ko
+			bdeps = kd
+			depth = depth - 1
+		}
+		if ev.kind >= 2 && ev.kind <= 5 && eq(ev.name, name) then {
+			boffs = [...boffs, ev.off]
+			bdeps = [...bdeps, depth]
+		}
+	}
+
+	if Iarch(boffs.len) == 0 then return -1
+
+	return boffs[Iarch(boffs.len) - 1]
+}
+
+# Every binding live at `off`, innermost first, deduped by name — the server-side port of
+# cf.cf's `run_scope!` core for salvaged logs.
+const salvage_scope! = ([EvRow] evs, Iarch off): [EvRow] -> {
+	let Iarch depth = 0
+	let [EvRow] live = []
+	let [Iarch] ldep = []
+
+	for ev in evs {
+		if ev.off > off then break
+		# the break sits before the cursor: the log does not cover it — offer nothing
+		if ev.kind == 7 then {
+			const [EvRow] none = []
+
+			return none
+		}
+		if ev.kind == 0 then depth = depth + 1
+		if ev.kind == 1 then {
+			let [EvRow] ko = []
+			let [Iarch] kd = []
+
+			for (b, i) in live {
+				if ldep[i] < depth then {
+					ko = [...ko, b]
+					kd = [...kd, ldep[i]]
+				}
+			}
+
+			live = ko
+			ldep = kd
+			depth = depth - 1
+		}
+		if ev.kind >= 2 && ev.kind <= 5 then {
+			live = [...live, ev]
+			ldep = [...ldep, depth]
+		}
+	}
+
+	let [EvRow] out = []
+	let [Str] seen = []
+	let Iarch i = Iarch(live.len) - 1
+
+	loop {
+		if i < 0 then break
+
+		if !in_list(live[i].name, seen) then {
+			seen = [...seen, live[i].name]
+			out = [...out, live[i]]
+		}
+
+		i = i - 1
+	}
+
+	return out
+}
+
+# One local visible at the completion cursor: its name and its binder's 0-based line (the
+# line's text becomes the completion detail).
+data LocalRow = { Str name, Iarch line }
+
+# The locals visible at (l0, ts), innermost first — via the `scope` child on a parsed buffer,
+# or the salvage replay of the dying child's partial log on a broken one. No token gate: an
+# empty typed prefix still has a scope.
+const locals_at! = (Str argv0, [Str] env, Str path, Str overlay, [Str] lines, Iarch l0, Iarch ts): [LocalRow] -> {
+	const ChildOut co = lsp_child!(argv0, env, path, overlay, lines, l0, ts, "scope", "")
+	let [LocalRow] rows = []
+
+	if co.rc == 0 then {
+		# `line:col:kind:name` per line, innermost first
+		for sl in split("\n", co.out) {
+			const Iarch c1 = index_of(":", sl)
+			if c1 <= 0 then continue
+			const Str rest1 = slice(c1 + 1, Iarch(sl.len), sl)
+			const Iarch c2 = index_of(":", rest1)
+			if c2 <= 0 then continue
+			const Str rest2 = slice(c2 + 1, Iarch(rest1.len), rest1)
+			const Iarch c3 = index_of(":", rest2)
+			if c3 <= 0 then continue
+			const Str nm = slice(c3 + 1, Iarch(rest2.len), rest2)
+			const Iarch bl = to_int(slice(0, c1, sl))
+			if bl <= 0 || Iarch(nm.len) == 0 then continue
+			rows = [...rows, LocalRow({ name: nm, line: bl - 1 })]
+		}
+
+		return rows
+	}
+
+	# broken buffer: replay whatever the parse collected before the break
+	const [EvRow] live = salvage_scope!(parse_evs(co.out), co.off)
+
+	for r in live {
+		const (bl, bc) = lc_of(lines, r.off)
+		if bl >= 0 && Iarch(r.name.len) > 0 then rows = [...rows, LocalRow({ name: r.name, line: bl })]
+	}
+
+	return rows
 }
 
 # One `line:col` output line as a reference row of the cursor's name in `path` (0-based, the
@@ -1243,22 +1392,49 @@ const ref_row = (Str lref, Str path, Str name): SymRow -> {
 }
 
 # The LOCAL binding of the token under the cursor, via a `cf lsp def` child run. `line` is -1
-# when no local binds the name — the caller falls back to the top-level declaration index.
+# when no local binds the name — the caller falls back to the top-level declaration index. On
+# a BROKEN buffer the dying child's salvaged log is replayed here: everything the parse
+# collected before the break, which covers any cursor above it.
 const local_def! = (Str argv0, [Str] env, Str path, Str overlay, [Str] lines, Iarch l0, TokCtx t): SymRow -> {
-	let Str got = local_out!(argv0, env, path, overlay, lines, l0, t, "def")
-	const Iarch nl = index_of("\n", got)
-	if nl > 0 then got = slice(0, nl, got)
+	const SymRow miss = SymRow({ sname: "", kind: 0, file: "", line: -1, ns: 0, ne: 0 })
+	if !local_token(t) then return miss
+	const ChildOut co = lsp_child!(argv0, env, path, overlay, lines, l0, t.ts, "def", t.name)
 
-	return ref_row(got, path, t.name)
+	if co.rc == 0 then {
+		let Str got = co.out
+		const Iarch nl = index_of("\n", got)
+		if nl > 0 then got = slice(0, nl, got)
+
+		return ref_row(got, path, t.name)
+	}
+
+	const Iarch b = salvage_binder!(parse_evs(co.out), co.off, t.name)
+	if b < 0 then return miss
+	const (bl, bc) = lc_of(lines, b)
+	if bl < 0 then return miss
+
+	return SymRow({
+		sname: t.name,
+		kind: 13,
+		file: path,
+		line: bl,
+		ns: bc,
+		ne: bc + Iarch(t.name.len),
+	})
 }
 
 # Every reference of the LOCAL binding under the cursor — the binder row FIRST (the child
-# prints it first), then each use in source order. Empty when the token is no local.
+# prints it first), then each use in source order. Empty when the token is no local, and
+# empty ON A BROKEN BUFFER too: references demand the COMPLETE use log (a rename built from a
+# truncated one would miss edits past the break and corrupt the program), so a nonzero child
+# exit refuses rather than salvages.
 const local_refs! = (Str argv0, [Str] env, Str path, Str overlay, [Str] lines, Iarch l0, TokCtx t): [SymRow] -> {
-	const Str got = local_out!(argv0, env, path, overlay, lines, l0, t, "refs")
 	let [SymRow] rows = []
+	if !local_token(t) then return rows
+	const ChildOut co = lsp_child!(argv0, env, path, overlay, lines, l0, t.ts, "refs", t.name)
+	if co.rc != 0 then return rows
 
-	for lref in split("\n", got) {
+	for lref in split("\n", co.out) {
 		const SymRow r = ref_row(lref, path, t.name)
 		if r.line >= 0 then rows = [...rows, r]
 	}
@@ -1725,28 +1901,17 @@ const completions! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l
 
 	# a bare prefix: the LOCALS visible at the cursor come first — kind 6 (Variable), the
 	# binder's own line as the detail. Seeding `seen` here makes an inner binding shadow a
-	# like-named top-level declaration below.
+	# like-named top-level declaration below. `locals_at!` survives a broken buffer (the
+	# salvage replay), so mid-edit completion still offers everything bound above the cursor.
 	if Iarch(t.hints.len) == 0 then {
-		const Str sout = scope_out!(argv0, env, path, overlay, lines, l0, t.ts)
+		const [LocalRow] locals = locals_at!(argv0, env, path, overlay, lines, l0, t.ts)
 
-		for sl in split("\n", sout) {
-			const Iarch c1 = index_of(":", sl)
-			if c1 <= 0 then continue
-			const Str rest1 = slice(c1 + 1, Iarch(sl.len), sl)
-			const Iarch c2 = index_of(":", rest1)
-			if c2 <= 0 then continue
-			const Str rest2 = slice(c2 + 1, Iarch(rest1.len), rest1)
-			const Iarch c3 = index_of(":", rest2)
-			if c3 <= 0 then continue
-			const Str nm = slice(c3 + 1, Iarch(rest2.len), rest2)
-			const Iarch bl = to_int(slice(0, c1, sl))
-			if bl <= 0 || Iarch(nm.len) == 0 then continue
-
-			if !in_list(nm, seen) then {
-				seen = [...seen, nm]
+		for lr in locals {
+			if !in_list(lr.name, seen) then {
+				seen = [...seen, lr.name]
 				let Str det = ""
-				if bl - 1 < Iarch(lines.len) then det = tidy_sig(lines[bl - 1])
-				items = [...items, citem(nm, 6, det)]
+				if lr.line < Iarch(lines.len) then det = tidy_sig(lines[lr.line])
+				items = [...items, citem(lr.name, 6, det)]
 			}
 		}
 	}
