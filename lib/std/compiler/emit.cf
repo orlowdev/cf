@@ -2374,7 +2374,7 @@ const emit_interp! = (*Emit ctx, [Seg] segs, [Binding] env): Str -> {
 				write_str(ctx.fd, "\t%t${bext} =l extsw ${hv}\n")
 				emit_append_call!(ctx, "cf_bool_append", "%t${vh}", "%t${bext}", "l")
 			} else if eq(aggt, "$dyn") then {
-				emit_stringify_array!(ctx, env, "%t${vh}", hole_elem!(ctx, env, sg.expr), hv)
+				emit_stringify_array!(ctx, env, "%t${vh}", init_elem!(ctx, env, sg.expr), hv)
 			} else if eq(aggt, "$tuple")
 			|| find_rec(ctx.recs, aggt) >= 0
 			|| (find_union(ctx.unions, aggt) >= 0 && union_is_boxed(ctx.unions, aggt)) then {
@@ -3240,16 +3240,6 @@ const var_elem = ([Binding] env, Str name): Str -> {
 	return env[idx].elem
 }
 
-# The element type of a `$dyn` interpolation hole. `init_elem` covers a literal / field / index /
-# call
-# but NOT a bare `Expr.Var` (the common `"${xs}"`), whose element rides on its binding — resolve
-# that
-# here without disturbing `init_elem`'s other callers.
-const hole_elem! = (*Emit ctx, [Binding] env, Expr e): Str -> match e {
-	Expr.Var(n) -> var_elem(env, n),
-	_ -> init_elem!(ctx, env, e),
-}
-
 # The outer env AUGMENTED with an arm's payload binds as TYPE-ONLY bindings — the same rec_type/elem
 # assignment `arm_body_env` gives each bind (`payload_type`/`payload_elem`), but with a dummy slot
 # and
@@ -3467,9 +3457,16 @@ const init_elem! = (*Emit ctx, [Binding] env, Expr e): Str -> match e {
 	Expr.IndexExpr(base, idx) -> indexexpr_elem!(ctx, env, base),
 	Expr.Call(callee, tyargs, args, _) -> call_ret_elem!(ctx, env, callee),
 	Expr.Buffer(sz) -> "Uint8",
-	# a bare NON-local name auto-calls a value-const; its element type is the callee's return element
-	# (a local Var keeps the prior default `""` — unchanged, so cf's own emit is byte-identical)
-	Expr.Var(n) -> if lookup_index(env, n) >= 0 then "" else call_ret_elem!(ctx, env, n),
+	# a LOCAL name propagates its binding's element — an array alias keeps its element
+	# typing and stride (`const [Point] qs = ps; qs[0].x` dispatches; a `[Uint8]` alias
+	# reads stride-1). A bare NON-local name auto-calls a value-const; its element type
+	# is the callee's return element.
+	Expr.Var(n) -> if lookup_index(env, n) >= 0
+		then var_elem(env, n)
+		else call_ret_elem!(ctx, env, n),
+	# a value-`if` yielding an array carries its `then` branch's element (both branches
+	# share a type by typecheck), mirroring `init_agg_type`'s arm
+	Expr.If(c, t, el) -> init_elem!(ctx, env, t),
 	_ -> "",
 }
 
