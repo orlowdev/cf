@@ -92,6 +92,8 @@ pub data Parser = {
 	Str file,
 	Os target_os,
 	Arch target_arch,
+	Bool build_debug,
+	Bool build_instrument,
 	Bool saw_fb,
 	Bool saw_fx,
 	Bool saw_el,
@@ -371,6 +373,8 @@ const parse_hole! = (*Parser p, Iarch hstart, Iarch hlen): Expr -> {
 		file: p.file,
 		target_os: Os.Darwin,
 		target_arch: Arch.Arm64,
+		build_debug: false,
+		build_instrument: false,
 		saw_fb: false,
 		saw_fx: false,
 		saw_el: false,
@@ -3885,6 +3889,28 @@ const comptime_tok_is = (Str t, Str nsprefix): Bool -> {
 	return str_tail_eq(t, n + 1, "target") || str_tail_eq(t, n + 1, "current")
 }
 
+# Does a strip-minted comptime token read `std_comptime_build<sep><fact>`? Returns the
+# fact name (`debug`/`instrument`) or "" — a build fact is a BARE Bool condition
+# (`if build::debug then ...`), no comparison operand.
+const comptime_build_fact = (Str t): Str -> {
+	const Str nsprefix = "std_comptime_build"
+	const Iarch n = Iarch(nsprefix.len)
+	if Iarch(t.len) <= n then return ""
+	let Iarch i = 0
+
+	loop {
+		if i >= n then break
+		if t[i] != nsprefix[i] then return ""
+		i = i + 1
+	}
+
+	if Iarch(t[n]) != 1 && Iarch(t[n]) != 95 then return "" # the ns-sep (0x01) or `_` (full path)
+	if str_tail_eq(t, n + 1, "debug") then return "debug"
+	if str_tail_eq(t, n + 1, "instrument") then return "instrument"
+
+	return ""
+}
+
 # Evaluate a comptime condition at PARSE TIME against the build target (module_system §6/§7):
 # `<os|arch>::<member> <op> <Enum>.<Variant>` — `member` is `target`/`current` (equal on a
 # non-cross build), `op` is `==`/`!=`, and `Enum` matches the namespace (`os`→`Os`, `arch`→`Arch`).
@@ -3896,6 +3922,10 @@ const parse_cond! = (*Parser p): Bool -> {
 		p,
 		"cf: parse: expected a comptime target (`os::target`) in a comptime condition\n",
 	)
+	# a build FACT (`build::debug` / `build::instrument`) is a bare Bool — no operand
+	const Str bfact = comptime_build_fact(head)
+	if eq(bfact, "debug") then return p.build_debug
+	if eq(bfact, "instrument") then return p.build_instrument
 	let Bool is_os = false
 	let Bool is_arch = false
 
