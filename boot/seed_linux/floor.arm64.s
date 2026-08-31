@@ -1,14 +1,14 @@
-.globl f115
+.globl f116
 .p2align 2
-f115:
+f116:
 	stp x29, x30, [sp, #-16]!
 	bl _cf_qbe_run
 	ldp x29, x30, [sp], #16
 	ret
 
-.globl f119
+.globl f120
 .p2align 2
-f119:
+f120:
 	mov x8, x0
 	mov x0, x1
 	mov x1, x2
@@ -19,15 +19,15 @@ f119:
 	svc #0
 	ret
 
-.globl f120
+.globl f121
 .p2align 2
-f120:
+f121:
 	mov x0, #0
 	ret
 
-.globl f408
+.globl f409
 .p2align 2
-f408:
+f409:
 	mov x0, x0
 	mov x8, #94
 	svc #0
