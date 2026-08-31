@@ -1033,6 +1033,68 @@ const cprefix = (Str ln, Iarch c0): TokCtx -> {
 # list without a second child run).
 data DefOut = { [SymRow] hits, [Str] mods }
 
+# The LOCAL binding of the token under the cursor, via a `cf lsp def` child run: the parser's
+# bind-event log replayed at the cursor's byte offset resolves parameters, `let`/`const`
+# locals, `for` binders, and match payload binds to their binder token. `line` is -1 when no
+# local binds the name — the caller falls back to the top-level declaration index. Only a
+# bare lowercase token can be a local (a qualified or `Type.`-based one never is), so others
+# skip the child entirely.
+const local_def! = (Str argv0, [Str] env, Str path, Str overlay, [Str] lines, Iarch l0, TokCtx t): SymRow -> {
+	const SymRow miss = SymRow({ sname: "", kind: 0, file: "", line: -1, ns: 0, ne: 0 })
+	if Iarch(t.hints.len) > 0 || Iarch(t.base.len) > 0 then return miss
+	const Iarch b0 = Iarch(t.name[0])
+	if b0 >= 65 && b0 <= 90 then return miss
+
+	const Str sh = match find_executable!(env, "sh") {
+		Either.Right(p) -> p,
+		Either.Left(e) -> "",
+	}
+
+	if eq(sh, "") then return miss
+	# the token's byte offset in the (possibly overlaid) buffer the lines came from
+	let Iarch off = t.ts
+	let Iarch li = 0
+
+	for ln in lines {
+		if li >= l0 then break
+		off = off + Iarch(ln.len) + 1
+		li = li + 1
+	}
+
+	const Str tmp = "/tmp/cf-lsp-${getpid()}.def"
+	let Str cmd = "'${argv0}' lsp def '${path}' ${off} '${t.name}' > '${tmp}' 2> /dev/null"
+	if Iarch(overlay.len) > 0
+		then cmd = "'${argv0}' lsp def '${path}' ${off} '${t.name}' --src '${overlay}' > '${tmp}' 2> /dev/null"
+	const Iarch rc = run!(sh, ["sh", "-c", cmd], env)
+
+	let Str got = ""
+
+	if rc == 0 then {
+		got = match read_file!(tmp) {
+			Either.Right(s) -> s,
+			Either.Left(e) -> "",
+		}
+	}
+
+	remove(tmp)
+	const Iarch nl = index_of("\n", got)
+	if nl > 0 then got = slice(0, nl, got)
+	const Iarch co = index_of(":", got)
+	if co <= 0 then return miss
+	const Iarch bl = to_int(slice(0, co, got))
+	const Iarch bc = to_int(slice(co + 1, Iarch(got.len), got))
+	if bl <= 0 || bc <= 0 then return miss
+
+	return SymRow({
+		sname: t.name,
+		kind: 13,
+		file: path,
+		line: bl - 1,
+		ns: bc - 1,
+		ne: bc - 1 + Iarch(t.name.len),
+	})
+}
+
 # Resolve a decomposed token to its definitions: a `Type.` base tries the union's members
 # first; otherwise the top-level declarations of the name, hint-narrowed for a qualified use
 # (an alias hint matching nothing keeps the full set) and same-file-preferred for a bare one.
@@ -1119,6 +1181,10 @@ const goto_def! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, 
 	if l0 < 0 || l0 >= Iarch(lines.len) then return Json.Null
 	const TokCtx t = token_at(lines[l0], c0)
 	if !t.ok then return Json.Null
+
+	# a local binding wins over any top-level declaration of the same name (shadowing)
+	const SymRow lr = local_def!(argv0, env, path, overlay, lines, l0, t)
+	if lr.line >= 0 then return Json.Arr([location!(uri, path, path, lr.line, lr.ns, lr.ne)])
 
 	const DefOut o = picked_defs!(argv0, env, path, srcf, srcp, overlay, t)
 
@@ -1223,6 +1289,18 @@ const hover! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, Iar
 	if l0 < 0 || l0 >= Iarch(lines.len) then return Json.Null
 	const TokCtx t = token_at(lines[l0], c0)
 	if !t.ok then return Json.Null
+
+	# a local binding: hover shows its binder line (same buffer — locals live in the one file)
+	const SymRow lh = local_def!(argv0, env, path, overlay, lines, l0, t)
+
+	if lh.line >= 0 && lh.line < Iarch(lines.len) then {
+		const Str lsig = tidy_sig(lines[lh.line])
+
+		return Json.Obj([
+			ent("contents", Json.Obj([ent("kind", jstr("markdown")), ent("value", jstr("```cf\n${lsig}\n```"))])),
+			ent("range", jrange!(l0, t.ts, t.te)),
+		])
+	}
 
 	const DefOut o = picked_defs!(argv0, env, path, srcf, srcp, overlay, t)
 	if Iarch(o.hits.len) == 0 then return Json.Null
