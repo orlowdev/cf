@@ -1888,12 +1888,14 @@ const rows_at! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, I
 # the whole cross-file answer must refuse; there is no chunk salvage across files).
 data UsesOut = { Bool ok, [SymRow] rows }
 
-# One `cf lsp uses` child run over `f`: the file's uses of `cname` — a plain top-level name
-# or a `Base.member` composite — VERIFIED: the child's mangled-tail match is loose, so a
-# position only survives when `vname` (the token the position points at — the member for a
-# composite) sits at its column as a whole token in the file's own text (the overlay stands
-# in for the owner).
-const uses_rows! = (Str argv0, [Str] env, Str f, Str owner, Str srcf, Str cname, Str vname): UsesOut -> {
+# The whole tree's uses of `cname` — a plain top-level name or a `Base.member` composite —
+# via ONE `cf lsp uses-all` child (it resolves the entry's tree itself and replays every
+# file in-process; one spawn instead of one per file). Rows come back `path<TAB>line:col`
+# with the resolver's own path stamps, absolutized here like the scan list. Every position
+# is VERIFIED: the child's mangled-tail match is loose, so a row only survives when `vname`
+# (the token the position points at — the member for a composite) sits at its column as a
+# whole token in the file's own text (the overlay stands in for the owner file).
+const uses_all_rows! = (Str argv0, [Str] env, Str path, Str overlay, Str owner, Str srcf, Str pwd, Str cname, Str vname): UsesOut -> {
 	const [SymRow] none = []
 
 	const Str sh = match find_executable!(env, "sh") {
@@ -1904,8 +1906,8 @@ const uses_rows! = (Str argv0, [Str] env, Str f, Str owner, Str srcf, Str cname,
 	if eq(sh, "") then return UsesOut({ ok: false, rows: none })
 	const Str tmp = "/tmp/cf-lsp-${getpid()}.uses"
 	let Str ov = ""
-	if eq(owner, f) then ov = " --src '${srcf}'"
-	const Str cmd = "'${argv0}' lsp uses '${f}' '${cname}'${ov} > '${tmp}' 2> /dev/null"
+	if Iarch(overlay.len) > 0 then ov = " --src '${overlay}'"
+	const Str cmd = "'${argv0}' lsp uses-all '${path}' '${cname}'${ov} > '${tmp}' 2> /dev/null"
 	const Iarch rc = run!(sh, ["sh", "-c", cmd], env)
 
 	const Str got = match read_file!(tmp) {
@@ -1915,20 +1917,54 @@ const uses_rows! = (Str argv0, [Str] env, Str f, Str owner, Str srcf, Str cname,
 
 	remove(tmp)
 	if rc != 0 then return UsesOut({ ok: false, rows: none })
-	const [Str] flines = split("\n", src_of!(f, owner, srcf))
+
+	# the raw (file, line:col) pairs, then per DISTINCT file: read it once, verify its rows
+	let [Str] rfiles = []
+	let [Str] rrefs = []
+
+	for row in split("\n", got) {
+		const Iarch tb = index_of("\t", row)
+
+		if tb > 0 then {
+			rfiles = [...rfiles, slice(0, tb, row)]
+			rrefs = [...rrefs, slice(tb + 1, Iarch(row.len), row)]
+		}
+	}
+
+	let [Str] dfs = []
+
+	for f in rfiles {
+		if !in_list(f, dfs) then dfs = [...dfs, f]
+	}
+
 	let [SymRow] rows = []
 
-	for lref in split("\n", got) {
-		const SymRow r = ref_row(lref, f, vname)
+	for f in dfs {
+		const Str fabs = abs_path!(pwd, f)
 
-		if r.line >= 0 && r.line < Iarch(flines.len) then {
-			const Str ln = flines[r.line]
+		if Iarch(fabs.len) > 0 then {
+			const [Str] flines = split("\n", src_of!(fabs, owner, srcf))
+			let Iarch i = 0
 
-			if r.ne <= Iarch(ln.len)
-			&& eq(slice(r.ns, r.ne, ln), vname)
-			&& (r.ns == 0 || !name_byte(Iarch(ln[r.ns - 1])))
-			&& (r.ne >= Iarch(ln.len) || !name_byte(Iarch(ln[r.ne]))) then {
-				rows = [...rows, r]
+			loop {
+				if i >= Iarch(rfiles.len) then break
+
+				if eq(rfiles[i], f) then {
+					const SymRow r = ref_row(rrefs[i], fabs, vname)
+
+					if r.line >= 0 && r.line < Iarch(flines.len) then {
+						const Str ln = flines[r.line]
+
+						if r.ne <= Iarch(ln.len)
+						&& eq(slice(r.ns, r.ne, ln), vname)
+						&& (r.ns == 0 || !name_byte(Iarch(ln[r.ns - 1])))
+						&& (r.ne >= Iarch(ln.len) || !name_byte(Iarch(ln[r.ne]))) then {
+							rows = [...rows, r]
+						}
+					}
+				}
+
+				i = i + 1
 			}
 		}
 	}
@@ -1991,19 +2027,17 @@ const pub_rows! = (Str argv0, [Str] env, Str path, Str srcf, Str srcp, Str overl
 		rows = [...rows, dl]
 	}
 
-	for f in scan {
-		const UsesOut u = uses_rows!(argv0, env, f, owner, srcf, cname, t.name)
-		if !u.ok then return none
+	const UsesOut u = uses_all_rows!(argv0, env, path, overlay, owner, srcf, pwd, cname, t.name)
+	if !u.ok then return none
 
-		for r in u.rows {
-			let Bool dup = false
+	for r in u.rows {
+		let Bool dup = false
 
-			for x in rows {
-				if eq(x.file, r.file) && x.line == r.line && x.ns == r.ns then dup = true
-			}
-
-			if !dup then rows = [...rows, r]
+		for x in rows {
+			if eq(x.file, r.file) && x.line == r.line && x.ns == r.ns then dup = true
 		}
+
+		if !dup then rows = [...rows, r]
 	}
 
 	for f in scan {

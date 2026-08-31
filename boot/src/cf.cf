@@ -513,14 +513,13 @@ const ends_with_sep = (Str s, Str name, Iarch sep): Bool -> {
 	return true
 }
 
-# `cf lsp uses <input.cf> <name> [--src <buf>]`: every use of the TOP-LEVEL name `name` in
-# THIS one file — bare uses not owned by a live local shadow, namespace-alias and flat
-# full-path uses (tail-matched through the strip's manglings), and import-list members. One
-# 1-based `line:col` per line, in source order. The cross-file rename front end: the server
-# runs one per module file. The `_`-tail match is deliberately LOOSE (`do_eq` tails `_eq`) —
-# the server verifies every position against the line's actual text before trusting it.
-const run_uses! = (Str input, Str src, Str name): Iarch -> {
-	const Loaded ld = entry_binds!(input, src, os::target, host_arch())
+# The uses replay of one loaded module: print every use of the top-level `name` — bare uses
+# not owned by a live local shadow, namespace-alias and flat full-path uses (tail-matched
+# through the strip's manglings), and import-list members — one `line:col` per line, in
+# source order, each prefixed `pfx<TAB>` when `pfx` is non-empty. The `_`-tail match is
+# deliberately LOOSE (`do_eq` tails `_eq`) — the server verifies every position against the
+# line's actual text before trusting it.
+const print_uses! = (Loaded ld, Str input, Str name, Str pfx): () -> {
 	const [SrcMap] maps = [ld.map]
 	let Iarch depth = 0
 	let [Iarch] loffs = []
@@ -554,9 +553,55 @@ const run_uses! = (Str input, Str src, Str name): Iarch -> {
 
 			if hit then {
 				const LC lc = line_col_of(maps, input, ev.off)
-				if lc.line > 0 then println("${lc.line}:${lc.col}")
+
+				if lc.line > 0 then {
+					if Iarch(pfx.len) > 0 then println("${pfx}\t${lc.line}:${lc.col}")
+					if Iarch(pfx.len) == 0 then println("${lc.line}:${lc.col}")
+				}
 			}
 		}
+	}
+}
+
+# `cf lsp uses <input.cf> <name> [--src <buf>]`: every use of the TOP-LEVEL name `name` in
+# THIS one file. The per-file cross-file-rename front end (`uses-all` batches a whole tree).
+const run_uses! = (Str input, Str src, Str name): Iarch -> {
+	const Loaded ld = entry_binds!(input, src, os::target, host_arch())
+	print_uses!(ld, input, name, "")
+
+	return 0
+}
+
+# `cf lsp uses-all <entry.cf> <name> [--src <buf>]`: the whole module tree's uses of the
+# top-level `name` in ONE run — resolve the tree (the same stamp walk as `cf lsp modules`),
+# then a tracked parse + replay per file, each row `path<TAB>line:col`. One process instead
+# of a child per file: the cross-file rename front end at tree scale. A parse-broken file
+# anywhere dies nonzero — the server discards the partial output rather than mis-rename.
+const run_uses_all! = (Str entry, Str src, Str name): Iarch -> {
+	const Resolved rz = resolve_program!(entry, src, os::target, host_arch())
+	const Program raw = rz.prog
+	let [Str] mods = []
+
+	for f in raw.funcs {
+		const Str p = trim_nul(f.dfile)
+		if Iarch(p.len) > 0 && !has_str(mods, p) then mods = [...mods, p]
+	}
+
+	for r in raw.recs {
+		const Str p = trim_nul(r.dfile)
+		if Iarch(p.len) > 0 && !has_str(mods, p) then mods = [...mods, p]
+	}
+
+	for u in raw.unions {
+		const Str p = trim_nul(u.dfile)
+		if Iarch(p.len) > 0 && !has_str(mods, p) then mods = [...mods, p]
+	}
+
+	for m in mods {
+		let Str msrc = ""
+		if eq(m, entry) then msrc = src
+		const Loaded ld = entry_binds!(m, msrc, os::target, host_arch())
+		print_uses!(ld, m, name, m)
 	}
 
 	return 0
@@ -786,6 +831,16 @@ pub const main = ([Str] args, [Str] env) -> {
 			const ua = growing_arena::of(16777216)
 
 			return run_uses!(args[3], usrc, args[4]) in ua
+		}
+
+		# `cf lsp uses-all <entry.cf> <name> [--src <file>]` — the whole module tree's uses
+		# of a top-level name in one run, `path<TAB>line:col` per row.
+		if Iarch(args.len) >= 5 && eq(args[2], "uses-all") then {
+			let Str uasrc = ""
+			if Iarch(args.len) >= 7 && eq(args[5], "--src") then uasrc = args[6]
+			const uaa = growing_arena::of(16777216)
+
+			return run_uses_all!(args[3], uasrc, args[4]) in uaa
 		}
 
 		# `cf lsp scope <input.cf> <off> [--src <file>]` — every local binding visible at a

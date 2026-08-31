@@ -99,10 +99,19 @@ pub data Parser = {
 	# `Stmt.Closure` spliced in just before the statement that referenced it (`flush_pending`)
 	[Stmt] pending,
 	# LSP bind-event log (`cf lsp def`): scope open/close + binding-name events in parse order,
-	# emitted only when `track` is on — the compile pipeline never pays for them
+	# emitted only when `track` is on — the compile pipeline never pays for them. The log is
+	# CHUNKED during the parse (`evs` is the current block; a full block moves into `evb`) so
+	# each append copies a bounded block, never the whole log — a big module logs tens of
+	# thousands of events, and whole-log self-appends made tracking quadratic. The blocks
+	# flatten back into `evs` when the parse completes (`flush_evb`), so every consumer still
+	# reads one flat log.
 	Bool track,
 	[BindEv] evs,
+	[[BindEv]] evb,
 }
+
+# The chunk bound of the bind-event log: a full `evs` block of this many events moves to `evb`.
+const ev_block = (): Iarch -> 128
 
 # One local-binding event for the LSP's goto-definition (`cf lsp def`): a scope OPEN (kind 0)
 # or CLOSE (kind 1) at a byte offset, or a binding of `name` — a parameter (2), a `let`/`const`
@@ -159,6 +168,27 @@ const bev = (*Parser p, Iarch tokpos, Iarch kind, Str name): () -> {
 	if Iarch(name.len) > 0 && (Iarch(name[0]) == 35 || Iarch(name[0]) == 61) then return ()
 
 	p.evs = [...p.evs, BindEv({ off: p.ebase + p.toks[tokpos].start, kind: kind, name: name })]
+
+	if Iarch(p.evs.len) >= ev_block() then {
+		p.evb = [...p.evb, p.evs]
+		p.evs = []
+	}
+}
+
+# Flatten the chunked log back into one flat `evs` (blocks first, the current tail last) —
+# called when a tracked parse completes, so consumers read the log as before the chunking.
+const flush_evb = (*Parser p): () -> {
+	if !p.track || Iarch(p.evb.len) == 0 then return ()
+	let [BindEv] flat = []
+
+	for blk in p.evb {
+		flat = [...flat, ...blk]
+	}
+
+	flat = [...flat, ...p.evs]
+	p.evs = flat
+	const [[BindEv]] noevb = []
+	p.evb = noevb
 }
 
 # The current token's kind.
@@ -169,6 +199,11 @@ const peek = (*Parser p): TokKind -> p.toks[p.pos].kind
 # A TRACKED parse (an LSP child) salvages its bind-event log to stdout first.
 const perr_off = (*Parser p, Iarch off, Str msg): Never -> {
 	if p.track then {
+		# closed blocks first, then the current tail — the whole log in parse order
+		for blk in p.evb {
+			dump_evs(blk)
+		}
+
 		dump_evs(p.evs)
 		# a final `off:7:` BREAK marker: the log covers the buffer only UP TO here. The
 		# salvage consumer answers queries before it and refuses queries past it — a
@@ -322,8 +357,10 @@ const parse_hole! = (*Parser p, Iarch hstart, Iarch hlen): Expr -> {
 	const [Token] toks = lex_hole(hbuf, hlen, p.file, p.esrc, p.ebase + hstart)
 	const [Stmt] nopend = []
 	# the sub-parser starts from a fresh COPY of the enclosing log (never an alias), so a die
-	# INSIDE the hole salvage-dumps the whole prefix, not just the hole's own events
+	# INSIDE the hole salvage-dumps the whole prefix, not just the hole's own events. The
+	# closed blocks copy at POINTER level — a closed block is never mutated again.
 	const [BindEv] noevs = [...p.evs]
+	const [[BindEv]] hoevb = [...p.evb]
 	let Parser hp = Parser({
 		toks: toks,
 		src: hbuf,
@@ -339,12 +376,16 @@ const parse_hole! = (*Parser p, Iarch hstart, Iarch hlen): Expr -> {
 		pending: nopend,
 		track: p.track,
 		evs: noevs,
+		evb: hoevb,
 	})
 	const Expr e = parse_expr!(&hp)
 	if !is_eof(peek(&hp)) then perr(&hp, "cf: parse: an interpolation hole must be a single expression\n")
 	# the sub-parser's log IS prefix + hole events (an anonymous lambda in a hole binds);
-	# `ebase` already rebased their offsets into this file — adopt it wholesale
-	if p.track then p.evs = hp.evs
+	# `ebase` already rebased their offsets into this file — adopt it wholesale, blocks too
+	if p.track then {
+		p.evs = hp.evs
+		p.evb = hp.evb
+	}
 
 	return e
 }
@@ -4100,6 +4141,9 @@ pub const parse_program! = (*Parser p): Program -> {
 			}),
 		)
 	}
+
+	# a completed tracked parse hands its log over FLAT — consumers replay one `evs` list
+	flush_evb(p)
 
 	return acc
 }
