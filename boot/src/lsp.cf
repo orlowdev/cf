@@ -1154,6 +1154,12 @@ const local_token = (TokCtx t): Bool -> {
 	return !(b0 >= 65 && b0 <= 90)
 }
 
+# A bare token (no path qualifier, no `Type.` base) — what the refs child can answer: a
+# lowercase one may be a local (or a non-pub function), an UPPERCASE one a type declared
+# in this very file. A qualified use names an import — cross-file, refused here.
+const bare_token = (TokCtx t): Bool ->
+	Iarch(t.hints.len) == 0 && Iarch(t.base.len) == 0
+
 # Run a `cf lsp <verb>` local-binding child at byte position (l0, ts) of the buffer `lines`
 # came from. An empty `name` omits the argument (the `scope` verb takes none).
 const lsp_child! = (Str argv0, [Str] env, Str path, Str overlay, [Str] lines, Iarch l0, Iarch ts, Str verb, Str name): ChildOut -> {
@@ -1500,14 +1506,15 @@ const local_def! = (Str argv0, [Str] env, Str path, Str overlay, [Str] lines, Ia
 	})
 }
 
-# Every reference of the LOCAL binding under the cursor — the binder row FIRST (the child
-# prints it first), then each use in source order. Empty when the token is no local, and
-# empty ON A BROKEN BUFFER too: references demand the COMPLETE use log (a rename built from a
-# truncated one would miss edits past the break and corrupt the program), so a nonzero child
-# exit refuses rather than salvages.
+# Every reference of the binding under the cursor: a LOCAL's binder row FIRST then each use,
+# or — when no local binds it — a NON-pub top-level name's decl rows (functions, records,
+# unions) then its uses. Empty when the token is qualified (cross-file), pub, an erased
+# `type` alias, or undeclared here; and empty ON A BROKEN BUFFER too: references demand the
+# COMPLETE use log (a rename built from a truncated one would miss edits past the break and
+# corrupt the program), so a nonzero child exit refuses rather than salvages.
 const local_refs! = (Str argv0, [Str] env, Str path, Str overlay, [Str] lines, Iarch l0, TokCtx t): [SymRow] -> {
 	let [SymRow] rows = []
-	if !local_token(t) then return rows
+	if !bare_token(t) then return rows
 	const Iso iso = lsp_child_iso!(argv0, env, path, overlay, lines, l0, t.ts, "refs", t.name)
 	if iso.co.rc != 0 then return rows
 	const [Str] outl = split("\n", iso.co.out)
@@ -1518,7 +1525,10 @@ const local_refs! = (Str argv0, [Str] env, Str path, Str overlay, [Str] lines, I
 	if is_top && iso.chunked then return rows
 
 	# a `top` first line: the child answered for a NON-pub TOP-LEVEL name (its uses cannot
-	# leave this file) — the declaration row comes from this file's own decl-line scan
+	# leave this file) — the declaration row comes from this file's own decl-line scan. The
+	# child cannot see a TYPE declaration's `pub` (the parser discards it), so a `pub` decl
+	# line is refused HERE; a `type` ALIAS (kind 5 without a `= {` group body) is refused
+	# too — its uses are token-erased before the parse, so the log cannot cover them.
 	if is_top then {
 		let Iarch li = 0
 
@@ -1526,6 +1536,18 @@ const local_refs! = (Str argv0, [Str] env, Str path, Str overlay, [Str] lines, I
 			const DeclLine d = scan_decl(ln)
 
 			if d.kind != 0 && eq(slice(d.ns, d.ne, ln), t.name) then {
+				if starts_with("pub ", ln) then {
+					const [SymRow] none = []
+
+					return none
+				}
+
+				if d.kind == 5 && !contains("= {", ln) then {
+					const [SymRow] none = []
+
+					return none
+				}
+
 				rows = [...rows, SymRow({
 					sname: t.name,
 					kind: 13,
@@ -1538,11 +1560,67 @@ const local_refs! = (Str argv0, [Str] env, Str path, Str overlay, [Str] lines, I
 
 			li = li + 1
 		}
+
+		# a type declared nowhere in this file (a builtin like `Str`, an imported type) has
+		# no decl row to anchor — refuse rather than hand back a use list with no owner
+		if Iarch(rows.len) == 0 then return rows
+
+		# a `type` ALIAS line may name this type in its target (`type Alias = Point`) —
+		# those tokens are erased before the parse, so the event log cannot cover them: the
+		# line scan adds them (the dedup below folds the spliced duplicates the log carries)
+		if Iarch(t.name[0]) >= 65 && Iarch(t.name[0]) <= 90 then {
+			let Iarch al = 0
+
+			for ln in lines {
+				const DeclLine d = scan_decl(ln)
+
+				if d.kind == 5 && !contains("= {", ln) then {
+					let Iarch i = index_of("=", ln)
+
+					loop {
+						if i < 0 || i >= Iarch(ln.len) then break
+
+						if name_byte(Iarch(ln[i])) then {
+							const Iarch e = name_end(ln, i)
+
+							if e - i == Iarch(t.name.len) && eq(slice(i, e, ln), t.name) then {
+								rows = [...rows, SymRow({
+									sname: t.name,
+									kind: 13,
+									file: path,
+									line: al,
+									ns: i,
+									ne: e,
+								})]
+							}
+
+							i = e
+						} else {
+							i = i + 1
+						}
+					}
+				}
+
+				al = al + 1
+			}
+		}
 	}
 
+	# uses, deduped by position: a `type P = Point` alias SPLICES its target tokens in for
+	# every use of `P`, so several events can land on the one spliced occurrence
 	for lref in outl {
 		const SymRow r = ref_row(lref, path, t.name)
-		if r.line >= 0 then rows = [...rows, row_shift(r, iso.dl)]
+
+		if r.line >= 0 then {
+			const SymRow s = row_shift(r, iso.dl)
+			let Bool dup = false
+
+			for x in rows {
+				if x.line == s.line && x.ns == s.ns then dup = true
+			}
+
+			if !dup then rows = [...rows, s]
+		}
 	}
 
 	return rows
@@ -1673,13 +1751,14 @@ const goto_def! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, 
 	return Json.Arr(locs)
 }
 
-# A plain lowercase identifier — what a binding may be renamed to: `[a-z_]` then
-# `[a-zA-Z0-9_]*`, optionally ONE trailing `!` (a function keeps its alloc marker across a
-# rename — `bang_matches` enforces that the suffix neither appears nor disappears).
+# A plain identifier — what a binding may be renamed to: `[a-zA-Z_]` then `[a-zA-Z0-9_]*`,
+# optionally ONE trailing `!` (a function keeps its alloc marker across a rename —
+# `bang_matches` enforces that the suffix neither appears nor disappears; `case_matches`
+# that a value name stays lowercase and a type name PascalCase).
 const ident_ok = (Str s): Bool -> {
 	if Iarch(s.len) == 0 then return false
 	const Iarch b0 = Iarch(s[0])
-	if !((b0 >= 97 && b0 <= 122) || b0 == 95) then return false
+	if !((b0 >= 97 && b0 <= 122) || (b0 >= 65 && b0 <= 90) || b0 == 95) then return false
 	let Iarch i = 1
 
 	loop {
@@ -1701,6 +1780,16 @@ const bang_matches = (Str old, Str nn): Bool -> {
 	const Bool nb = Iarch(nn.len) > 0 && Iarch(nn[Iarch(nn.len) - 1]) == 33
 
 	return (ob && nb) || (!ob && !nb)
+}
+
+# The first byte's CASE is the name's grammatical class (a PascalCase type vs a lowercase
+# value) — a rename may not cross it: `Point` -> `point` would turn a type reference into a
+# value read wherever it appears.
+const case_matches = (Str old, Str nn): Bool -> {
+	const Bool ou = Iarch(old.len) > 0 && Iarch(old[0]) >= 65 && Iarch(old[0]) <= 90
+	const Bool nu = Iarch(nn.len) > 0 && Iarch(nn[0]) >= 65 && Iarch(nn[0]) <= 90
+
+	return (ou && nu) || (!ou && !nu)
 }
 
 # The reference rows of the local binding under (uri, l0, c0) — the shared front of
@@ -1764,6 +1853,7 @@ const rename! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, Ia
 	const [SymRow] rows = rows_at!(argv0, env, uri, srcf, srcp, l0, c0)
 	if Iarch(rows.len) == 0 then return Json.Null
 	if !bang_matches(rows[0].sname, nn) then return Json.Null
+	if !case_matches(rows[0].sname, nn) then return Json.Null
 	let [Json] edits = []
 
 	for r in rows {
