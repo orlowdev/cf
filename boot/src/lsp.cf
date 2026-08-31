@@ -1,5 +1,7 @@
-# cf lsp — a Language Server Protocol server over stdio, M1: initialize/shutdown lifecycle
-# and diagnostics on open/save. Each check runs `cf check <file>` in a CHILD process (this
+# cf lsp — a Language Server Protocol server over stdio, M1: initialize/shutdown lifecycle,
+# diagnostics on open/save AND as-you-type (didChange full sync — the buffer stands in for the
+# file via `cf check --src`), and documentSymbol (the outline: top-level declarations scanned
+# by line). Each check runs `cf check <file>` in a CHILD process (this
 # very binary re-invoked), so a fail-fast front-end die (a parse error mid-edit) never takes
 # the server down; the child's located `path:line:col: msg` lines come back on a captured
 # stderr and turn into `publishDiagnostics` — each line published to ITS OWN file's uri
@@ -10,7 +12,7 @@
 # "utf-8"` (cf's columns are bytes), lines/columns shift to LSP's 0-base. Each frame is
 # handled in its OWN arena, reclaimed wholesale — the server's memory stays flat.
 
-import std::data::str::{ eq, starts_with, slice, index_of, split }
+import std::data::str::{ eq, starts_with, slice, index_of, split, contains }
 import std::data::{ Either, Maybe }
 import std::data::json::{ Json, JsonEntry, parse!, render!, get }
 import std::io::file::{ read, write_str, read_file!, write_file }
@@ -157,7 +159,8 @@ const uri_plain = (Iarch c): Bool ->
 	c == 45 || c == 46 || c == 95 || c == 126 || c == 47
 
 # A `file://` uri to its filesystem path: strip the scheme, percent-decode (`%20` → space).
-# A malformed escape passes through verbatim (nothing is lost).
+# A malformed escape passes through verbatim (nothing is lost). The bytes are NUL-terminated
+# past `len` (argv-style) so the path feeds `open` at the syscall boundary directly.
 const uri_to_path! = (Str uri): Str -> {
 	let Str p = uri
 	if starts_with("file://", p) then p = slice(7, Iarch(p.len), p)
@@ -185,7 +188,9 @@ const uri_to_path! = (Str uri): Str -> {
 		}
 	}
 
-	return Str(out)
+	out = [...out, Uint8(0)]
+
+	return Str(out, Iarch(out.len) - 1)
 }
 
 # A filesystem path to its `file://` uri, percent-encoding every reserved byte.
@@ -261,12 +266,15 @@ const scan_loc = (Str s): Loc -> {
 	return Loc({ plen: -1, ln: 0, col: 0, moff: 0 })
 }
 
+# An LSP range on one 0-based line, `c0` to `c1`.
+const jrange! = (Iarch l0, Iarch c0, Iarch c1): Json -> Json.Obj([
+	ent("start", Json.Obj([ent("line", jnum(l0)), ent("character", jnum(c0))])),
+	ent("end", Json.Obj([ent("line", jnum(l0)), ent("character", jnum(c1))])),
+])
+
 # One LSP diagnostic at the 0-based position.
 const build_diag! = (Iarch l0, Iarch c0, Str msg): Json -> Json.Obj([
-	ent("range", Json.Obj([
-		ent("start", Json.Obj([ent("line", jnum(l0)), ent("character", jnum(c0))])),
-		ent("end", Json.Obj([ent("line", jnum(l0)), ent("character", jnum(c0 + 1))])),
-	])),
+	ent("range", jrange!(l0, c0, c0 + 1)),
 	ent("severity", jnum(1)),
 	ent("source", jstr("cf")),
 	ent("message", jstr(msg)),
@@ -298,8 +306,9 @@ const publish! = (Str uri, [Json] diags): () ->
 # file at 0:0 with its full text). The checked uri always gets a publish — an empty list clears
 # it when clean — and the uris that carried diagnostics last round but are quiet now are cleared
 # too (the set persists in `.pub` beside the capture file, so the state survives the per-frame
-# arena).
-const check_and_publish! = (Str argv0, [Str] env, Str uri): () -> {
+# arena). A non-empty `src` is the overlay file standing in for the entry's bytes (didChange —
+# the unsaved buffer), forwarded as `cf check --src`.
+const check_and_publish! = (Str argv0, [Str] env, Str uri, Str src): () -> {
 	if !starts_with("file://", uri) then return ()
 	const Str path = uri_to_path!(uri)
 	const Str tmp = "/tmp/cf-lsp-${getpid()}.diag"
@@ -315,7 +324,8 @@ const check_and_publish! = (Str argv0, [Str] env, Str uri): () -> {
 	}
 
 	if eq(sh, "") then return ()
-	const Str cmd = "'${argv0}' check '${path}' 2> '${tmp}'"
+	let Str cmd = "'${argv0}' check '${path}' 2> '${tmp}'"
+	if Iarch(src.len) > 0 then cmd = "'${argv0}' check '${path}' --src '${src}' 2> '${tmp}'"
 	const Iarch rc = run!(sh, ["sh", "-c", cmd], env)
 
 	# flat (uri, diagnostic) pairs — grouped per uri at publish time
@@ -415,13 +425,112 @@ const init_result! = (): Json -> Json.Obj([
 	ent("capabilities", Json.Obj([
 		ent("textDocumentSync", Json.Obj([
 			ent("openClose", Json.Bool(true)),
-			ent("change", jnum(0)),
+			# 1 = FULL sync: every didChange carries the whole buffer, checked live via the
+			# `--src` overlay (a full check of the biggest std module is ~100 ms — no debounce)
+			ent("change", jnum(1)),
 			ent("save", Json.Bool(true)),
 		])),
+		ent("documentSymbolProvider", Json.Bool(true)),
 		ent("positionEncoding", jstr("utf-8")),
 	])),
 	ent("serverInfo", Json.Obj([ent("name", jstr("cf lsp"))])),
 ])
+
+# --- symbols ----------------------------------------------------------------------------------
+
+# A name byte: what a top-level declaration's name is made of (stops at ` `, `=`, `:`, `(`, …).
+const name_byte = (Iarch c): Bool ->
+	(c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) ||
+	c == 95 || c == 33 || c == 39
+
+# One line's top-level declaration as a DocumentSymbol, or Null when the line opens none.
+# cf's formatter pins declarations to column 0, so a leading keyword IS top-level; the LSP
+# SymbolKinds: 12 Function, 14 Constant, 23 Struct, 10 Enum, 5 Class (a type alias).
+const sym_of_line! = (Str ln, Iarch l0): Json -> {
+	let Iarch koff = 0
+	if starts_with("pub ", ln) then koff = 4
+	const Str rest = slice(koff, Iarch(ln.len), ln)
+	let Iarch klen = -1
+	let Iarch kind = 0
+
+	if starts_with("const ", rest) then {
+		klen = 6
+		kind = 14
+	}
+	if klen < 0 && starts_with("intrinsic ", rest) then {
+		klen = 10
+		kind = 14
+	}
+	if klen < 0 && starts_with("data ", rest) then {
+		klen = 5
+		kind = 23
+	}
+	if klen < 0 && starts_with("union ", rest) then {
+		klen = 6
+		kind = 10
+	}
+	if klen < 0 && starts_with("type ", rest) then {
+		klen = 5
+		kind = 5
+	}
+	if klen < 0 then return Json.Null
+	# a value that binds a `(...)` is a function — `const f = (…): T -> …` (intrinsics likewise)
+	if kind == 14 && contains("= (", ln) then kind = 12
+
+	const Iarch ns = koff + klen
+	let Iarch ne = ns
+
+	loop {
+		if ne >= Iarch(ln.len) || !name_byte(Iarch(ln[ne])) then break
+		ne = ne + 1
+	}
+
+	if ne == ns then return Json.Null
+
+	return Json.Obj([
+		ent("name", jstr(slice(ns, ne, ln))),
+		ent("kind", jnum(kind)),
+		ent("range", jrange!(l0, 0, Iarch(ln.len))),
+		ent("selectionRange", jrange!(l0, ns, ne)),
+	])
+}
+
+# Every top-level declaration of `src` as a flat DocumentSymbol list.
+const scan_symbols! = (Str src): [Json] -> {
+	const [Str] lines = split("\n", src)
+	let [Json] out = []
+	let Iarch i = 0
+
+	for ln in lines {
+		const Json s = sym_of_line!(ln, i)
+		const Bool keep = match s { Json.Null -> false, _ -> true }
+		if keep then out = [...out, s]
+		i = i + 1
+	}
+
+	return out
+}
+
+# Answer a documentSymbol request: read the uri's file — or the live `--src` overlay when one
+# is standing in for exactly this file — and scan its top-level declarations.
+const doc_symbols! = (Str uri, Str srcf, Str srcp): Json -> {
+	const Str path = uri_to_path!(uri)
+
+	let Str from = path
+	const Str owner = match read_file!(srcp) {
+		Either.Right(s) -> s,
+		Either.Left(e) -> "",
+	}
+
+	if eq(owner, path) then from = srcf
+
+	const Str src = match read_file!(from) {
+		Either.Right(s) -> s,
+		Either.Left(e) -> "",
+	}
+
+	return Json.Arr(scan_symbols!(src))
+}
 
 # --- the loop ---------------------------------------------------------------------------------
 
@@ -451,10 +560,50 @@ const serve_one! = (Str argv0, [Str] env): Iarch -> {
 		return 1
 	}
 	if eq(method, "exit") then return 0
+
+	const Str srcf = "/tmp/cf-lsp-${getpid()}.src"
+	const Str srcp = "/tmp/cf-lsp-${getpid()}.srcp"
+
 	if eq(method, "textDocument/didOpen") || eq(method, "textDocument/didSave") then {
 		const Str uri = jtext(jget("uri", jget("textDocument", jget("params", req))))
 
-		if Iarch(uri.len) > 0 then check_and_publish!(argv0, env, uri)
+		# the buffer now matches the disk — drop any overlay and check the real file
+		remove(srcf)
+		remove(srcp)
+
+		if Iarch(uri.len) > 0 then check_and_publish!(argv0, env, uri, "")
+
+		return 1
+	}
+	if eq(method, "textDocument/didChange") then {
+		const Str uri = jtext(jget("uri", jget("textDocument", jget("params", req))))
+
+		# FULL sync (capability `change: 1`): the last contentChange carries the whole buffer
+		let Json chg = Json.Null
+
+		match jget("contentChanges", jget("params", req)) {
+			Json.Arr(xs) -> {
+				for x in xs {
+					chg = x
+				}
+			},
+			_ -> {},
+		}
+
+		const Bool has = match chg { Json.Null -> false, _ -> true }
+
+		if Iarch(uri.len) > 0 && has then {
+			write_file(srcf, jtext(jget("text", chg)))
+			write_file(srcp, uri_to_path!(uri))
+			check_and_publish!(argv0, env, uri, srcf)
+		}
+
+		return 1
+	}
+	if eq(method, "textDocument/documentSymbol") then {
+		const Str uri = jtext(jget("uri", jget("textDocument", jget("params", req))))
+
+		respond!(id, doc_symbols!(uri, srcf, srcp))
 
 		return 1
 	}
@@ -476,6 +625,8 @@ pub const lsp_run! = ([Str] args, [Str] env): Iarch -> {
 	}
 
 	remove("/tmp/cf-lsp-${getpid()}.pub")
+	remove("/tmp/cf-lsp-${getpid()}.src")
+	remove("/tmp/cf-lsp-${getpid()}.srcp")
 
 	return 0
 }
