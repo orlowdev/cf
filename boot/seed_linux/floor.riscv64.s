@@ -1,6 +1,6 @@
-.globl f116
+.globl f117
 .p2align 2
-f116:
+f117:
 	addi sp, sp, -16
 	sd ra, 8(sp)
 	call _cf_qbe_run
@@ -8,9 +8,9 @@ f116:
 	addi sp, sp, 16
 	ret
 
-.globl f120
+.globl f121
 .p2align 2
-f120:
+f121:
 	mv a7, a0
 	mv a0, a1
 	mv a1, a2
@@ -21,15 +21,15 @@ f120:
 	ecall
 	ret
 
-.globl f121
+.globl f122
 .p2align 2
-f121:
+f122:
 	li a0, 2
 	ret
 
-.globl f409
+.globl f410
 .p2align 2
-f409:
+f410:
 	mv a0, a0
 	li a7, 94
 	ecall
