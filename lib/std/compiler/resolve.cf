@@ -492,7 +492,7 @@ const path_eq_pre = (Str a, Str b, Iarch blen): Bool -> {
 # Called only when the on-disk `open` failed, so a repo/dev build (lib/std present) never builds the
 # table — it is materialized here, matched by path, and its bytes copied into `buf`. Returns the
 # module's byte length, or dies if the path is neither on disk nor embedded (a real missing import).
-const embed_fallback! = (Str path, Str importer, *[Uint8] buf, Iarch cap): Iarch -> {
+const embed_fallback! = (Str path, Str importer, Iarch iline, Iarch icol, *[Uint8] buf, Iarch cap): Iarch -> {
 	# drop `build_path!`'s trailing NUL before matching against the bare embedded path.
 	let Iarch plen = Iarch(path.len)
 
@@ -523,6 +523,12 @@ const embed_fallback! = (Str path, Str importer, *[Uint8] buf, Iarch cap): Iarch
 			eprint(Str({ bytes: path.bytes, len: plen }))
 			die("\n")
 		}
+		# a parsed import carries its stamp — the rejection lands on the `import` line itself
+		# (a synthetic import, stamped 0, keeps the unlocated form)
+		if iline > 0 then {
+			const Str mp = Str({ bytes: path.bytes, len: plen })
+			die_at_lc(importer, iline, icol, "cf: resolve: cannot open the module `${mp}`\n")
+		}
 		eprint("cf: cannot open the module `")
 		eprint(Str({ bytes: path.bytes, len: plen }))
 		eprint("` imported by ")
@@ -535,7 +541,7 @@ const embed_fallback! = (Str path, Str importer, *[Uint8] buf, Iarch cap): Iarch
 
 # `src` overrides where the BYTES come from (an editor's unsaved buffer written to a temp file)
 # while `path` stays the module's identity — diag stamps, edir, the dedup key. Empty = read `path`.
-const load_module! = (Str path, Str src, Str importer, Os target_os, Arch target_arch): Program -> {
+const load_module! = (Str path, Str src, Str importer, Iarch iline, Iarch icol, Os target_os, Arch target_arch): Program -> {
 	# One module's read buffer — large enough for cf's own sources (its largest module, emit.cf,
 	# crossed 256 KB; 1 MB leaves headroom). `buf.len` is the capacity handed to `read` (the
 	# buffer reports its own size now), and `read` returns the actual byte count `n`. A read that
@@ -550,7 +556,7 @@ const load_module! = (Str path, Str src, Str importer, Os target_os, Arch target
 	if Iarch(src.len) > 0 then rpath = src
 
 	const Iarch n = match open_read(rpath) {
-		Either.Left(e) -> embed_fallback!(path, importer, buf, Iarch(buf.len)),
+		Either.Left(e) -> embed_fallback!(path, importer, iline, icol, buf, Iarch(buf.len)),
 		Either.Right(fd) -> {
 			const Iarch k = match read(fd, buf, Uarch(buf.len)) {
 				Either.Left(e) -> die("cf: reading an imported module failed: ${path}\n"),
@@ -592,7 +598,7 @@ const load_module! = (Str path, Str src, Str importer, Os target_os, Arch target
 	loop {
 		if di >= Iarch(sr.deps.len) then break
 		const [Str] no_names = []
-		imps = [...imps, Import({ path: sr.deps[di], names: no_names, alias: "", wildcard: false })]
+		imps = [...imps, Import({ path: sr.deps[di], names: no_names, alias: "", wildcard: false, dline: 0, dcol: 0 })]
 		di = di + 1
 	}
 
@@ -2514,7 +2520,7 @@ const cat_src_n = ([Str] xs, Iarch n, Str s): [Str] -> {
 
 pub const resolve_program! = (Str entry, Str src, Os target_os, Arch target_arch): Program -> {
 	const Str edir = dir_of!(entry)
-	const Program root = load_module!(entry, src, "", target_os, target_arch)
+	const Program root = load_module!(entry, src, "", 0, 0, target_os, target_arch)
 	# the entry is prefix-empty (its names stay bare — it fixes the naming frame)
 	let [Modu] mods = [Modu({ prefix: "", mpath: entry, is_geom: false, tag: "", prog: root })]
 	let [Import] work = []
@@ -2528,7 +2534,7 @@ pub const resolve_program! = (Str entry, Str src, Os target_os, Arch target_arch
 	# compiler used to emit that floor unconditionally. The barrel's `comptime_if` (folded against this
 	# program's `--target`) loads the one platform impl; its verbatim-symbol asm fns define the floor.
 	const [Str] floor_none = []
-	work = [...work, Import({ path: "std/rt/floor", names: floor_none, alias: "", wildcard: false })]
+	work = [...work, Import({ path: "std/rt/floor", names: floor_none, alias: "", wildcard: false, dline: 0, dcol: 0 })]
 	wsrc = [...wsrc, entry]
 	let Iarch wi = 0
 
@@ -2565,7 +2571,7 @@ pub const resolve_program! = (Str entry, Str src, Os target_os, Arch target_arch
 					geom = true
 					mtag = "pg"
 				}
-				const Program m0 = load_module!(mpath, "", wsrc[wi], target_os, target_arch)
+				const Program m0 = load_module!(mpath, "", wsrc[wi], work[wi].dline, work[wi].dcol, target_os, target_arch)
 				const Program m = if is_floor_impl(im.path) then tag_floor_syms(m0) else m0
 				mods = [
 					...mods,
@@ -2598,7 +2604,12 @@ pub const resolve_program! = (Str entry, Str src, Os target_os, Arch target_arch
 			if eq(mods[ti].prog.imports[ri].path, "std/mem/raw") &&
 				!has_prefix(mods[ti].mpath, "lib/std/mem/") &&
 				!contains("/lib/std/mem/", mods[ti].mpath)
-					then die("cf: resolve: `std/mem/raw` is privileged to the geometry modules under `std/mem/`: ${mods[ti].mpath}\n")
+					then die_at_lc(
+						mods[ti].mpath,
+						mods[ti].prog.imports[ri].dline,
+						mods[ti].prog.imports[ri].dcol,
+						"cf: resolve: `std/mem/raw` is privileged to the geometry modules under `std/mem/`\n",
+					)
 			let Iarch t = -1
 			if !is_pseudo_module(mods[ti].prog.imports[ri].path)
 				then t = find_mod(mods, mod_target_path!(edir, mods[ti].prog.imports[ri].path))
