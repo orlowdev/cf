@@ -36,7 +36,7 @@ import std::compiler::ast::{
 }
 import std::data::str::{ eq }
 import std::io::console::{ die }
-import std::compiler::diag::{ die_at_lc }
+import std::compiler::diag::{ Diag }
 
 # A name carries the allocation marker iff it contains a `!` (byte 33). The marker rides directly
 # after the base name in the source (`alloc!`); monomorphization then appends an instance suffix
@@ -953,10 +953,13 @@ const compute_bang! = (Program prog): [Bool] -> {
 }
 
 # Validate the declared `!` marker against the computed color, both ways. `main` is exempt; an
-# `asm`/intrinsic body trusts its own marker (it is not re-derived).
-pub const check_alloc_program! = (Program prog) -> {
+# `asm`/intrinsic body trusts its own marker (it is not re-derived). Rejections are COLLECTED —
+# the color is a per-fn classification already computed, so one run reports every mis-marked
+# declaration instead of dying at the first (each used to cost a full rebuild cycle).
+pub const check_alloc_program! = (Program prog): [Diag] -> {
 	const [Func] funcs = prog.funcs
 	const [Bool] bang = compute_bang!(prog)
+	let [Diag] diags = []
 	let Iarch j = 0
 
 	loop {
@@ -964,14 +967,30 @@ pub const check_alloc_program! = (Program prog) -> {
 		if !funcs[j].is_asm && !is_main(funcs[j]) then {
 			const Bool decl = is_bang_name(funcs[j].name)
 			if decl && !bang[j]
-				then die_at_lc(funcs[j].dfile, funcs[j].dline, funcs[j].dcol, "cf: alloc: `${funcs[j].name}` is marked `!` but allocates no residue — drop the marker\n")
+				then diags = [
+					...diags,
+					Diag({
+						file: funcs[j].dfile,
+						line: funcs[j].dline,
+						col: funcs[j].dcol,
+						msg: "cf: alloc: `${funcs[j].name}` is marked `!` but allocates no residue — drop the marker\n",
+					}),
+				]
 			if !decl && bang[j]
-				then die_at_lc(funcs[j].dfile, funcs[j].dline, funcs[j].dcol, "cf: alloc: `${funcs[j].name}` allocates residue (or calls a `!` function) but is not marked `!`\n")
+				then diags = [
+					...diags,
+					Diag({
+						file: funcs[j].dfile,
+						line: funcs[j].dline,
+						col: funcs[j].dcol,
+						msg: "cf: alloc: `${funcs[j].name}` allocates residue (or calls a `!` function) but is not marked `!`\n",
+					}),
+				]
 		}
 		j = j + 1
 	}
 
-	return 0
+	return diags
 }
 
 # ── Root-allocation check (memory_model §2) ────────────────────────────────────────────────────
@@ -1085,7 +1104,8 @@ const root_ambient_set! = (Program prog): [Str] -> {
 # (non-`in`) calls — residue must run under a grafted geometry, never on the root page. In
 # `zero_root` mode the root has no bytes, so it tightens to reject ANY page use: an arena graft or
 # a root-ambient function that constructs residue on the page.
-pub const check_root_program! = (Program prog, Bool zero_root) -> {
+pub const check_root_program! = (Program prog, Bool zero_root): [Diag] -> {
+	let [Diag] diags = []
 	const [Func] funcs = prog.funcs
 	const [Str] root = root_ambient_set!(prog)
 	# ZERO-ROOT mode (`--root-size 0` on `Bare`): the root page has no bytes, so NO page use is legal.
@@ -1105,15 +1125,31 @@ pub const check_root_program! = (Program prog, Bool zero_root) -> {
 		# calls (the root-ambient set closes over bare calls only; an `in` clause leaves the set). `main`
 		# is never `!`, so it is exempt and may open buffers/records directly on the root.
 		if fi >= 0 && !funcs[fi].is_asm && is_bang_name(funcs[fi].name)
-			then die_at_lc(funcs[fi].dfile, funcs[fi].dline, funcs[fi].dcol, "cf: root: `${funcs[fi].name}` is a `!` function reached without a geometry — call it `in <arena>` (root does not propagate into `!` functions)\n")
+			then diags = [
+				...diags,
+				Diag({
+					file: funcs[fi].dfile,
+					line: funcs[fi].dline,
+					col: funcs[fi].dcol,
+					msg: "cf: root: `${funcs[fi].name}` is a `!` function reached without a geometry — call it `in <arena>` (root does not propagate into `!` functions)\n",
+				}),
+			]
 		# In zero-root there is no page to spill onto, so `main`'s own exemption is revoked too: ANY
 		# root-ambient function that constructs a residue aggregate on the page is rejected. Legal
 		# storage (`$`, `static`, `fixed_buffer` allocations run `in fb`) never lands here — the first
 		# two aren't residue, and a `fixed_buffer` sink is reached `in fb`, off the root-ambient set.
 		if zero_root && fi >= 0 && !funcs[fi].is_asm && local_residue!(prog.unions, funcs[fi])
-			then die_at_lc(funcs[fi].dfile, funcs[fi].dline, funcs[fi].dcol, "cf: zero-root: `${funcs[fi].name}` allocates residue on the root page, but `--root-size 0` forbids it — use `$`-stack, `static`, or a `fixed_buffer` instead\n")
+			then diags = [
+				...diags,
+				Diag({
+					file: funcs[fi].dfile,
+					line: funcs[fi].dline,
+					col: funcs[fi].dcol,
+					msg: "cf: zero-root: `${funcs[fi].name}` allocates residue on the root page, but `--root-size 0` forbids it — use `$`-stack, `static`, or a `fixed_buffer` instead\n",
+				}),
+			]
 		i = i + 1
 	}
 
-	return 0
+	return diags
 }
