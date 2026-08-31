@@ -12,7 +12,7 @@
 # "utf-8"` (cf's columns are bytes), lines/columns shift to LSP's 0-base. Each frame is
 # handled in its OWN arena, reclaimed wholesale — the server's memory stays flat.
 
-import std::data::str::{ eq, starts_with, slice, index_of, split, contains, join }
+import std::data::str::{ eq, starts_with, slice, index_of, split, contains, join, trim }
 import std::data::{ Either, Maybe }
 import std::data::json::{ Json, JsonEntry, parse!, render!, get }
 import std::io::file::{ read, write_str, read_file!, write_file }
@@ -513,6 +513,10 @@ const init_result! = (): Json -> Json.Obj([
 		])),
 		ent("documentSymbolProvider", Json.Bool(true)),
 		ent("definitionProvider", Json.Bool(true)),
+		ent("hoverProvider", Json.Bool(true)),
+		ent("completionProvider", Json.Obj([
+			ent("triggerCharacters", Json.Arr([jstr(":"), jstr(".")])),
+		])),
 		ent("positionEncoding", jstr("utf-8")),
 	])),
 	ent("serverInfo", Json.Obj([ent("name", jstr("cf lsp"))])),
@@ -665,8 +669,10 @@ const abs_path! = (Str pwd, Str f): Str -> {
 	return ""
 }
 
-# One found definition: its absolute file, 0-based line, and the name's byte span.
-data DefHit = { Str file, Iarch line, Iarch ns, Iarch ne }
+# One indexed name — a top-level declaration, or a union member (kind 22, EnumMember): its
+# as-written name, its SymbolKind, its absolute file, 0-based line, and the name's byte span.
+# The shared currency of goto-definition, hover, and completion.
+data SymRow = { Str sname, Iarch kind, Str file, Iarch line, Iarch ns, Iarch ne }
 
 # The resolved module tree of `path` — each declaration-bearing source file, the entry first —
 # via a child `cf modules` run: the same child-process discipline as diagnostics, so a
@@ -721,10 +727,9 @@ const modules_of! = (Str argv0, [Str] env, Str path, Str src): [Str] -> {
 	return mods
 }
 
-# Every top-level declaration named `name` across the module files (the checked file `path`
-# always participates, even when the module list is stale or empty). Reads are overlay-aware:
-# the file the `--src` buffer owns is read from the buffer.
-const find_defs! = ([Str] mods, Str path, Str srcf, Str srcp, Str pwd, Str name): [DefHit] -> {
+# The absolute files to index: the checked file first (always — even when the module list is
+# stale or empty), then each module file that resolves from `pwd`.
+const scan_files! = ([Str] mods, Str path, Str pwd): [Str] -> {
 	let [Str] scan = [path]
 
 	for m in mods {
@@ -732,37 +737,159 @@ const find_defs! = ([Str] mods, Str path, Str srcf, Str srcp, Str pwd, Str name)
 		if Iarch(a.len) > 0 && !in_list(a, scan) then scan = [...scan, a]
 	}
 
-	const Str owner = match read_file!(srcp) {
+	return scan
+}
+
+# The bytes of `f` — from the `--src` overlay buffer when `f` is the file the overlay owns.
+const src_of! = (Str f, Str owner, Str srcf): Str -> {
+	let Str from = f
+	if eq(owner, f) then from = srcf
+
+	return match read_file!(czstr!(from)) {
 		Either.Right(s) -> s,
 		Either.Left(e) -> "",
 	}
+}
 
-	let [DefHit] hits = []
+# Every top-level declaration across the scan files, as indexed rows.
+const all_decls! = ([Str] scan, Str owner, Str srcf): [SymRow] -> {
+	let [SymRow] rows = []
 
 	for f in scan {
-		let Str from = f
-		if eq(owner, f) then from = srcf
-
-		const Str text = match read_file!(czstr!(from)) {
-			Either.Right(s) -> s,
-			Either.Left(e) -> "",
-		}
-
-		const [Str] lines = split("\n", text)
+		const [Str] lines = split("\n", src_of!(f, owner, srcf))
 		let Iarch l = 0
 
 		for ln in lines {
 			const DeclLine d = scan_decl(ln)
 
-			if d.kind > 0 && eq(slice(d.ns, d.ne, ln), name) then {
-				hits = [...hits, DefHit({ file: f, line: l, ns: d.ns, ne: d.ne })]
+			if d.kind > 0 then {
+				rows = [...rows, SymRow({
+					sname: slice(d.ns, d.ne, ln),
+					kind: d.kind,
+					file: f,
+					line: l,
+					ns: d.ns,
+					ne: d.ne,
+				})]
 			}
 
 			l = l + 1
 		}
 	}
 
-	return hits
+	return rows
+}
+
+# The first non-whitespace byte's index of `ln`, or -1 for an all-whitespace line.
+const first_nonws = (Str ln): Iarch -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(ln.len) then break
+		if Iarch(ln[i]) != 9 && Iarch(ln[i]) != 32 then return i
+		i = i + 1
+	}
+
+	return -1
+}
+
+# The end of the name run starting at `i` in `ln`.
+const name_end = (Str ln, Iarch i): Iarch -> {
+	let Iarch e = i
+
+	loop {
+		if e >= Iarch(ln.len) || !name_byte(Iarch(ln[e])) then break
+		e = e + 1
+	}
+
+	return e
+}
+
+# Every member of the union declared `base` across the scan files, as rows (kind 22,
+# EnumMember). A member is the LEADING name run of a body line (the formatter's shape — a
+# payload type like `Num(Str)`'s `Str` sits behind a paren and never leads), or, for a union
+# written on its declaration line, a run after the `{` or a paren-depth-0 `,`. Comment and
+# blank lines inside the body are skipped; the closing `}` ends it.
+const union_members! = ([Str] scan, Str owner, Str srcf, Str base): [SymRow] -> {
+	let [SymRow] rows = []
+
+	for f in scan {
+		const [Str] lines = split("\n", src_of!(f, owner, srcf))
+		let Bool inun = false
+		let Iarch l = 0
+
+		for ln in lines {
+			if inun then {
+				const Iarch nw = first_nonws(ln)
+
+				if nw >= 0 && Iarch(ln[nw]) == 125 then inun = false
+
+				if inun && nw >= 0 && name_byte(Iarch(ln[nw])) then {
+					const Iarch me = name_end(ln, nw)
+
+					rows = [...rows, SymRow({
+						sname: slice(nw, me, ln),
+						kind: 22,
+						file: f,
+						line: l,
+						ns: nw,
+						ne: me,
+					})]
+				}
+			} else {
+				const DeclLine d = scan_decl(ln)
+
+				if d.kind == 10 && eq(slice(d.ns, d.ne, ln), base) then {
+					const Iarch ob = index_of("{", ln)
+					let Bool closed = false
+
+					if ob >= 0 then {
+						let Iarch i = ob + 1
+						let Iarch depth = 0
+						let Bool expect = true
+
+						loop {
+							if i >= Iarch(ln.len) then break
+							const Iarch ch = Iarch(ln[i])
+							if ch == 40 then depth = depth + 1
+							if ch == 41 then depth = depth - 1
+
+							if ch == 125 && depth == 0 then {
+								closed = true
+								break
+							}
+
+							if depth == 0 && ch == 44 then expect = true
+
+							if depth == 0 && expect && name_byte(ch) then {
+								const Iarch me = name_end(ln, i)
+
+								rows = [...rows, SymRow({
+									sname: slice(i, me, ln),
+									kind: 22,
+									file: f,
+									line: l,
+									ns: i,
+									ne: me,
+								})]
+								expect = false
+								i = me
+								continue
+							}
+
+							i = i + 1
+						}
+					}
+
+					if !closed then inun = true
+				}
+			}
+
+			l = l + 1
+		}
+	}
+
+	return rows
 }
 
 # Whether every hint segment appears in `file` as a path component (`/seg/`) or as the file
@@ -790,47 +917,41 @@ const location! = (Str uri, Str path, Str file, Iarch l0, Iarch c0, Iarch c1): J
 	return Json.Obj([ent("uri", jstr(u)), ent("range", jrange!(l0, c0, c1))])
 }
 
-# Answer textDocument/definition: the qualified token under the cursor, resolved to the
-# top-level declarations of that name across the checked file's module tree. The cursor's own
-# SEGMENT is the sought name and the segments before it narrow by module path — so goto works
-# on a bare use (`parse!`), a qualified one (`json::parse!`), and an import's member alike. A
-# name defined in the checked file itself wins for an unqualified use. A token that names no
-# declaration but ends a module path (`std::data::json` on its import) jumps to the module
-# file. No match is Null, never an error.
-const goto_def! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, Iarch c0): Json -> {
-	if !starts_with("file://", uri) then return Json.Null
-	const Str path = uri_to_path!(uri)
+# The qualified token covering the cursor, decomposed for resolution: `ok` false when no
+# token sits there; `name` the segment the cursor is IN (the sought declaration); `hints` the
+# segments before it (path narrowing); `lead` the segments through it (a module path); `ts`/
+# `te` the whole token's byte span; and `base` — the `Type` of a directly preceding `Type.`
+# (uppercase first byte, a union-member use), else "".
+data TokCtx = { Bool ok, Str name, [Str] hints, [Str] lead, Iarch ts, Iarch te, Str base }
 
-	let Str from = path
-	let Str overlay = ""
-	const Str owner = match read_file!(srcp) {
-		Either.Right(s) -> s,
-		Either.Left(e) -> "",
-	}
+const no_tok = (): TokCtx -> {
+	const [Str] none = []
 
-	if eq(owner, path) then {
-		from = srcf
-		overlay = srcf
-	}
+	return TokCtx({ ok: false, name: "", hints: none, lead: none, ts: 0, te: 0, base: "" })
+}
 
-	const Str text = match read_file!(from) {
-		Either.Right(s) -> s,
-		Either.Left(e) -> "",
-	}
+# The `Type` of a `Type.` directly before the token starting at `ts`, else "" (a lowercase
+# base is a record variable — its fields are not scanned).
+const dot_base = (Str ln, Iarch ts): Str -> {
+	if ts <= 0 || Iarch(ln[ts - 1]) != 46 then return ""
+	const Iarch bs = token_start(ln, ts - 1)
+	if bs >= ts - 1 then return ""
+	if Iarch(ln[bs]) < 65 || Iarch(ln[bs]) > 90 then return ""
 
-	const [Str] lines = split("\n", text)
-	if l0 < 0 || l0 >= Iarch(lines.len) then return Json.Null
-	const Str ln = lines[l0]
+	return slice(bs, ts - 1, ln)
+}
 
-	# the token under (or just left of) the cursor
+# Decompose the token under (or just left of) the cursor at byte-col `c0` of `ln`.
+const token_at = (Str ln, Iarch c0): TokCtx -> {
 	let Iarch c = c0
+	if c < 0 then c = 0
 	if c > Iarch(ln.len) then c = Iarch(ln.len)
 
 	if c >= Iarch(ln.len) || !name_byte(Iarch(ln[c])) then {
 		if c > 0 && name_byte(Iarch(ln[c - 1])) then c = c - 1
 	}
 
-	if c >= Iarch(ln.len) || !name_byte(Iarch(ln[c])) then return Json.Null
+	if c >= Iarch(ln.len) || !name_byte(Iarch(ln[c])) then return no_tok()
 	const Iarch ts = token_start(ln, c)
 	const Iarch te = token_end(ln, ts)
 	const Str tok = slice(ts, te, ln)
@@ -864,25 +985,98 @@ const goto_def! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, 
 	}
 
 	const Str name = "${segs[csel]}"
-	if Iarch(name.len) == 0 then return Json.Null
+	if Iarch(name.len) == 0 then return no_tok()
 
+	return TokCtx({
+		ok: true,
+		name: name,
+		hints: hints,
+		lead: lead,
+		ts: ts,
+		te: te,
+		base: dot_base(ln, ts),
+	})
+}
+
+# The typed prefix LEFT of the cursor, decomposed like `token_at` but never looking right —
+# completion works on what is already typed. `name` is the partial last segment (may be
+# empty, right after a `::` or `.`); always `ok`.
+const cprefix = (Str ln, Iarch c0): TokCtx -> {
+	let Iarch c = c0
+	if c < 0 then c = 0
+	if c > Iarch(ln.len) then c = Iarch(ln.len)
+	const Iarch ts = token_start(ln, c)
+	const Str tok = slice(ts, c, ln)
+	const [Str] segs = split("::", tok)
+	const Iarch last = Iarch(segs.len) - 1
+
+	let [Str] hints = []
+	let Iarch hi = 0
+
+	for s in segs {
+		if hi < last then hints = [...hints, s]
+		hi = hi + 1
+	}
+
+	return TokCtx({
+		ok: true,
+		name: "${segs[last]}",
+		hints: hints,
+		lead: hints,
+		ts: ts,
+		te: c,
+		base: dot_base(ln, ts),
+	})
+}
+
+# The resolved hits and the module list behind them (goto's module-path fallback reuses the
+# list without a second child run).
+data DefOut = { [SymRow] hits, [Str] mods }
+
+# Resolve a decomposed token to its definitions: a `Type.` base tries the union's members
+# first; otherwise the top-level declarations of the name, hint-narrowed for a qualified use
+# (an alias hint matching nothing keeps the full set) and same-file-preferred for a bare one.
+const picked_defs! = (Str argv0, [Str] env, Str path, Str srcf, Str srcp, Str overlay, TokCtx t): DefOut -> {
 	const [Str] mods = modules_of!(argv0, env, path, overlay)
 	const Str pwd = getenv!(env, "PWD")
-	const [DefHit] all = find_defs!(mods, path, srcf, srcp, pwd, name)
+	const [Str] scan = scan_files!(mods, path, pwd)
 
-	let [DefHit] picked = []
+	const Str owner = match read_file!(srcp) {
+		Either.Right(s) -> s,
+		Either.Left(e) -> "",
+	}
 
-	if Iarch(hints.len) > 0 then {
+	if Iarch(t.base.len) > 0 then {
+		const [SymRow] mems = union_members!(scan, owner, srcf, t.base)
+		let [SymRow] mhits = []
+
+		for m in mems {
+			if eq(m.sname, t.name) then mhits = [...mhits, m]
+		}
+
+		if Iarch(mhits.len) > 0 then return DefOut({ hits: mhits, mods: mods })
+	}
+
+	const [SymRow] decls = all_decls!(scan, owner, srcf)
+	let [SymRow] all = []
+
+	for d in decls {
+		if eq(d.sname, t.name) then all = [...all, d]
+	}
+
+	let [SymRow] picked = []
+
+	if Iarch(t.hints.len) > 0 then {
 		for h in all {
-			if hint_ok!(hints, Iarch(hints.len), h.file) then picked = [...picked, h]
+			if hint_ok!(t.hints, Iarch(t.hints.len), h.file) then picked = [...picked, h]
 		}
 	}
 
 	if Iarch(picked.len) == 0 then picked = all
 
 	# an unqualified name declared in the checked file itself wins (the nearest declaration)
-	if Iarch(hints.len) == 0 then {
-		let [DefHit] local = []
+	if Iarch(t.hints.len) == 0 then {
+		let [SymRow] local = []
 
 		for h in picked {
 			if eq(h.file, path) then local = [...local, h]
@@ -891,11 +1085,49 @@ const goto_def! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, 
 		if Iarch(local.len) > 0 then picked = local
 	}
 
-	if Iarch(picked.len) == 0 then {
-		# no declaration — perhaps the token is a module path (an import): jump to its file
-		const Str jp = join("/", lead)
+	return DefOut({ hits: picked, mods: mods })
+}
 
-		for m in mods {
+# Answer textDocument/definition: the qualified token under the cursor, resolved to the
+# top-level declarations (or `Type.` union members) of that name across the checked file's
+# module tree. The cursor's own SEGMENT is the sought name and the segments before it narrow
+# by module path — so goto works on a bare use (`parse!`), a qualified one (`json::parse!`),
+# and an import's member alike. A token that names no declaration but ends a module path
+# (`std::data::json` on its import) jumps to the module file. No match is Null, never an error.
+const goto_def! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, Iarch c0): Json -> {
+	if !starts_with("file://", uri) then return Json.Null
+	const Str path = uri_to_path!(uri)
+
+	let Str from = path
+	let Str overlay = ""
+	const Str owner = match read_file!(srcp) {
+		Either.Right(s) -> s,
+		Either.Left(e) -> "",
+	}
+
+	if eq(owner, path) then {
+		from = srcf
+		overlay = srcf
+	}
+
+	const Str text = match read_file!(from) {
+		Either.Right(s) -> s,
+		Either.Left(e) -> "",
+	}
+
+	const [Str] lines = split("\n", text)
+	if l0 < 0 || l0 >= Iarch(lines.len) then return Json.Null
+	const TokCtx t = token_at(lines[l0], c0)
+	if !t.ok then return Json.Null
+
+	const DefOut o = picked_defs!(argv0, env, path, srcf, srcp, overlay, t)
+
+	if Iarch(o.hits.len) == 0 then {
+		# no declaration — perhaps the token is a module path (an import): jump to its file
+		const Str jp = join("/", t.lead)
+		const Str pwd = getenv!(env, "PWD")
+
+		for m in o.mods {
 			const Str a = abs_path!(pwd, m)
 
 			if Iarch(a.len) > 0 && contains("${jp}.cf", a) then {
@@ -908,11 +1140,231 @@ const goto_def! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, 
 
 	let [Json] locs = []
 
-	for h in picked {
+	for h in o.hits {
 		locs = [...locs, location!(uri, path, h.file, h.line, h.ns, h.ne)]
 	}
 
 	return Json.Arr(locs)
+}
+
+# A declaration line tidied for hover: surrounding whitespace, a trailing `{`, and a
+# member's trailing `,` dropped.
+const tidy_sig = (Str ln): Str -> {
+	let Str s = trim(ln)
+
+	if Iarch(s.len) > 0 && Iarch(s[Iarch(s.len) - 1]) == 123 then {
+		s = trim(slice(0, Iarch(s.len) - 1, s))
+	}
+
+	if Iarch(s.len) > 0 && Iarch(s[Iarch(s.len) - 1]) == 44 then {
+		s = slice(0, Iarch(s.len) - 1, s)
+	}
+
+	return s
+}
+
+# Answer textDocument/hover: the first definition of the token under the cursor, shown as its
+# tidied declaration line in a cf code block with the `#` comment block above it as prose. A
+# multi-definition name notes how many more there are. Null when nothing resolves.
+const hover! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, Iarch c0): Json -> {
+	if !starts_with("file://", uri) then return Json.Null
+	const Str path = uri_to_path!(uri)
+
+	let Str from = path
+	let Str overlay = ""
+	const Str owner = match read_file!(srcp) {
+		Either.Right(s) -> s,
+		Either.Left(e) -> "",
+	}
+
+	if eq(owner, path) then {
+		from = srcf
+		overlay = srcf
+	}
+
+	const Str text = match read_file!(from) {
+		Either.Right(s) -> s,
+		Either.Left(e) -> "",
+	}
+
+	const [Str] lines = split("\n", text)
+	if l0 < 0 || l0 >= Iarch(lines.len) then return Json.Null
+	const TokCtx t = token_at(lines[l0], c0)
+	if !t.ok then return Json.Null
+
+	const DefOut o = picked_defs!(argv0, env, path, srcf, srcp, overlay, t)
+	if Iarch(o.hits.len) == 0 then return Json.Null
+	let SymRow h = o.hits[0]
+
+	const [Str] dlines = split("\n", src_of!(h.file, owner, srcf))
+	if h.line >= Iarch(dlines.len) then return Json.Null
+	const Str sig = tidy_sig(dlines[h.line])
+
+	# the contiguous `#` comment block right above the declaration, as prose (a bare `#`
+	# line stays a paragraph break)
+	let Iarch k0 = h.line
+
+	loop {
+		if k0 <= 0 then break
+		if !starts_with("#", dlines[k0 - 1]) then break
+		k0 = k0 - 1
+	}
+
+	let Str doc = ""
+	let Iarch k = k0
+
+	loop {
+		if k >= h.line then break
+
+		if starts_with("# ", dlines[k]) then {
+			doc = "${doc}${slice(2, Iarch(dlines[k].len), dlines[k])}\n"
+		} else {
+			doc = "${doc}\n"
+		}
+
+		k = k + 1
+	}
+
+	let Str md = "```cf\n${sig}\n```"
+	if Iarch(doc.len) > 0 then md = "${md}\n\n${doc}"
+	if Iarch(o.hits.len) > 1 then md = "${md}\n\n_+${Iarch(o.hits.len) - 1} more definition(s)_"
+
+	return Json.Obj([
+		ent("contents", Json.Obj([ent("kind", jstr("markdown")), ent("value", jstr(md))])),
+		ent("range", jrange!(l0, t.ts, t.te)),
+	])
+}
+
+# The CompletionItemKind of an indexed row's SymbolKind: Function, Struct, Enum, Class,
+# EnumMember — everything else a Constant.
+const citem_kind = (Iarch k): Iarch -> {
+	if k == 12 then return 3
+	if k == 23 then return 22
+	if k == 10 then return 13
+	if k == 5 then return 7
+	if k == 22 then return 20
+
+	return 21
+}
+
+const citem = (Str label, Iarch kind, Str detail): Json -> Json.Obj([
+	ent("label", jstr(label)),
+	ent("kind", jnum(kind)),
+	ent("detail", jstr(detail)),
+])
+
+# The path segment of module `m` right after the contiguous `hints` run (`std::data` over
+# `lib/std/data/str.cf` -> `str`), or "" when the run does not appear. A `.cf` tail drops.
+const next_seg = (Str m, [Str] hints, Iarch n): Str -> {
+	const [Str] parts = split("/", m)
+	let Iarch i = 0
+
+	loop {
+		if i + n >= Iarch(parts.len) then break
+		let Bool okrun = true
+		let Iarch j = 0
+
+		loop {
+			if j >= n then break
+
+			if !eq(parts[i + j], hints[j]) then {
+				okrun = false
+				break
+			}
+
+			j = j + 1
+		}
+
+		if okrun then {
+			const Str nx = parts[i + n]
+			const Iarch pl = Iarch(nx.len)
+
+			if pl > 3 && Iarch(nx[pl - 3]) == 46 && Iarch(nx[pl - 2]) == 99 && Iarch(nx[pl - 1]) == 102 then {
+				return slice(0, pl - 3, nx)
+			}
+
+			return nx
+		}
+
+		i = i + 1
+	}
+
+	return ""
+}
+
+# Answer textDocument/completion: what the typed prefix could become. A `Type.` base offers
+# the union's members; a qualified prefix (`str::`) offers the hint-narrowed declarations
+# plus the NEXT path segment of each matching module (so `std::` walks the tree); a bare
+# prefix offers every declaration in scope, deduped by name. The client filters by the typed
+# word, so no server-side prefix filtering.
+const completions! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, Iarch c0): Json -> {
+	const [Json] nothing = []
+	if !starts_with("file://", uri) then return Json.Arr(nothing)
+	const Str path = uri_to_path!(uri)
+
+	let Str from = path
+	let Str overlay = ""
+	const Str owner = match read_file!(srcp) {
+		Either.Right(s) -> s,
+		Either.Left(e) -> "",
+	}
+
+	if eq(owner, path) then {
+		from = srcf
+		overlay = srcf
+	}
+
+	const Str text = match read_file!(from) {
+		Either.Right(s) -> s,
+		Either.Left(e) -> "",
+	}
+
+	const [Str] lines = split("\n", text)
+	if l0 < 0 || l0 >= Iarch(lines.len) then return Json.Arr(nothing)
+	const TokCtx t = cprefix(lines[l0], c0)
+
+	const [Str] mods = modules_of!(argv0, env, path, overlay)
+	const Str pwd = getenv!(env, "PWD")
+	const [Str] scan = scan_files!(mods, path, pwd)
+	let [Json] items = []
+
+	# `Type.` — the union's members, nothing else
+	if Iarch(t.base.len) > 0 then {
+		const [SymRow] mems = union_members!(scan, owner, srcf, t.base)
+
+		for m in mems {
+			items = [...items, citem(m.sname, 20, m.file)]
+		}
+
+		return Json.Arr(items)
+	}
+
+	const [SymRow] decls = all_decls!(scan, owner, srcf)
+	let [Str] seen = []
+
+	for d in decls {
+		let Bool keep = true
+		if Iarch(t.hints.len) > 0 then keep = hint_ok!(t.hints, Iarch(t.hints.len), d.file)
+
+		if keep && !in_list(d.sname, seen) then {
+			seen = [...seen, d.sname]
+			items = [...items, citem(d.sname, citem_kind(d.kind), d.file)]
+		}
+	}
+
+	# the next path segment of each module matching the hint run (`std::` -> `data`, `io`, …)
+	if Iarch(t.hints.len) > 0 then {
+		for m in mods {
+			const Str nx = next_seg(m, t.hints, Iarch(t.hints.len))
+
+			if Iarch(nx.len) > 0 && !in_list(nx, seen) then {
+				seen = [...seen, nx]
+				items = [...items, citem(nx, 9, m)]
+			}
+		}
+	}
+
+	return Json.Arr(items)
 }
 
 # --- the loop ---------------------------------------------------------------------------------
@@ -954,7 +1406,12 @@ const serve_one! = (Str argv0, [Str] env): Iarch -> {
 		remove(srcf)
 		remove(srcp)
 
-		if Iarch(uri.len) > 0 then check_and_publish!(argv0, env, uri, "")
+		if Iarch(uri.len) > 0 then {
+			check_and_publish!(argv0, env, uri, "")
+			# warm the module-list cache while the buffer parses, so completion/goto still
+			# have a tree to scan once the next keystrokes break it
+			const [Str] warm = modules_of!(argv0, env, uri_to_path!(uri), "")
+		}
 
 		return 1
 	}
@@ -1004,6 +1461,34 @@ const serve_one! = (Str argv0, [Str] env): Iarch -> {
 
 		return 1
 	}
+	if eq(method, "textDocument/hover") then {
+		const Str uri = jtext(jget("uri", jget("textDocument", jget("params", req))))
+		const Json pos = jget("position", jget("params", req))
+		const Iarch pl = jint(jget("line", pos))
+		const Iarch pc = jint(jget("character", pos))
+
+		if Iarch(uri.len) > 0 && pl >= 0 && pc >= 0 then {
+			respond!(id, hover!(argv0, env, uri, srcf, srcp, pl, pc))
+		} else {
+			respond!(id, Json.Null)
+		}
+
+		return 1
+	}
+	if eq(method, "textDocument/completion") then {
+		const Str uri = jtext(jget("uri", jget("textDocument", jget("params", req))))
+		const Json pos = jget("position", jget("params", req))
+		const Iarch pl = jint(jget("line", pos))
+		const Iarch pc = jint(jget("character", pos))
+
+		if Iarch(uri.len) > 0 && pl >= 0 && pc >= 0 then {
+			respond!(id, completions!(argv0, env, uri, srcf, srcp, pl, pc))
+		} else {
+			respond!(id, Json.Null)
+		}
+
+		return 1
+	}
 	if is_request then respond_err!(id, 0 - 32601, "method not found")
 
 	return 1
@@ -1024,6 +1509,7 @@ pub const lsp_run! = ([Str] args, [Str] env): Iarch -> {
 	remove("/tmp/cf-lsp-${getpid()}.pub")
 	remove("/tmp/cf-lsp-${getpid()}.src")
 	remove("/tmp/cf-lsp-${getpid()}.srcp")
+	remove("/tmp/cf-lsp-${getpid()}.modc")
 
 	return 0
 }
