@@ -188,7 +188,8 @@ const is_decl_kw = (*[Uint8] src, Token t): Bool -> {
 
 # Is the `{` at token `o` the opener of a STATEMENT block (a function/loop/if/arm body), as
 # opposed to a single-element import list `::{ x }`, a bare record `{ f: v }` or a one-arm
-# `match ... { A -> ... }` (all comma-less, so `cgroup` cannot tell them apart)? A statement block is
+# `match ... { A -> ... }` (all comma-less, so `cgroup` cannot tell them apart)? A statement block
+# is
 # always introduced by `->`, `then`, `else` or `loop`; nothing else opens one.
 const opens_stmt_block = (*[Uint8] src, [Token] toks, Iarch o): Bool -> {
 	if o <= 0 then return false
@@ -198,11 +199,15 @@ const opens_stmt_block = (*[Uint8] src, [Token] toks, Iarch o): Bool -> {
 }
 
 # If token `li` begins a statement-level if-chain that ACTUALLY BRANCHES (has at least one `else`
-# or `else if`) and whose EVERY branch body is a `{...}` BLOCK (`if C then {...} [else if C then {...}]*
-# [else {...}]`), return the index of the chain's final `}`; otherwise return -1. An `else if` extends
+# or `else if`) and whose EVERY branch body is a `{...}` BLOCK (`if C then {...} [else if C then
+# {...}]*
+# [else {...}]`), return the index of the chain's final `}`; otherwise return -1. An `else if`
+# extends
 # the SAME chain (not a new statement). A bare (unbraced) body anywhere — a one-line `if x then
-# break`, a value conditional `if a then b else c`, or a `then ...`/`else ...` without a `{` — aborts;
-# so does a LONE `if C then {...}` guard with no else, which reads better unfenced inside a tight body.
+# break`, a value conditional `if a then b else c`, or a `then ...`/`else ...` without a `{` —
+# aborts;
+# so does a LONE `if C then {...}` guard with no else, which reads better unfenced inside a tight
+# body.
 const if_chain_end = (*[Uint8] src, [Token] toks, Iarch li): Iarch -> {
 	const Iarch nt = Iarch(toks.len)
 	let Iarch j = li
@@ -274,8 +279,10 @@ const if_chain_end = (*[Uint8] src, [Token] toks, Iarch li): Iarch -> {
 	return end
 }
 
-# If token `li` is a `match`, return the index of its arms `{...}` block's closing `}`; otherwise -1.
-# The scrutinee may carry its own brackets (`match Foo(x) {...}`), so the arms `{` is the first `{` at
+# If token `li` is a `match`, return the index of its arms `{...}` block's closing `}`; otherwise
+# -1.
+# The scrutinee may carry its own brackets (`match Foo(x) {...}`), so the arms `{` is the first `{`
+# at
 # bracket-depth 0 after `match`. A match is fenced regardless of whether it renders on one line or
 # many: `reflow!` collapses a small match's arms AFTER the fence is placed, so gating on line count
 # would make the fencing depend on the input's line breaks rather than on the final shape.
@@ -417,7 +424,8 @@ pub const format_source! = (*[Uint8] src, Iarch n, Str file): [Uint8] -> {
 	# (unless the token after that `}` is the block's own `}`, i.e. it is the block's last statement):
 	#   • a `loop {...}` run for effect — fenced above and below;
 	#   • a `return` — fenced above only (nothing follows it in a block);
-	#   • a braced if-chain `if C then {...} [else if ...]* [else {...}]` — fenced above and below, `below`
+	#   • a braced if-chain `if C then {...} [else if ...]* [else {...}]` — fenced above and below,
+	# `below`
 	#     landing on the chain's FINAL `}` (an `else if` continues the same chain; `if_chain_end`
 	#     returns -1 for a bare-body / value if, which is then left alone).
 	# EXCLUDED everywhere: a `->`/`then`/`else`/`=` body or an `(`/`[`/`,` expression position (the
@@ -650,7 +658,8 @@ pub const format_source! = (*[Uint8] src, Iarch n, Str file): [Uint8] -> {
 		lx = lx + 1
 	}
 
-	# Blank lines around top-level FUNCTIONS: a function decl (`[pub] const NAME = ... -> ...`, told apart
+	# Blank lines around top-level FUNCTIONS: a function decl (`[pub] const NAME = ... -> ...`, told
+	# apart
 	# from a value/data/type/import by a `->` at bracket depth 0) is separated from its neighbours by a
 	# blank line — set before decl k's head when decl k OR decl k-1 is a function. The blank opens
 	# above a glued leading comment so it rides with its function; value/type/import runs stay tight.
@@ -1475,6 +1484,183 @@ const break_expr! = (*[Uint8] src, Iarch n, Str file): [Uint8] -> {
 }
 
 # Format one file. `check` selects the `--check` gate: it never writes, and returns 1 if the
+# Comment wrap (Phase E): a STANDALONE `#` comment line wider than `line_limit` wraps at
+# the last inter-word space that still fits; the tail continues below, under the same
+# indent, with its own `# ` lead — and re-wraps in turn when still wide. Only over-wide
+# lines split: short comment lines are never re-joined, so deliberate structure (lists,
+# code snippets in comments, `# expect:` directives) survives, and a single word longer
+# than the limit (a URL) stays whole on its own overlong line rather than break mid-word.
+# An INLINE comment (code before the `#`) is left alone — its width is the code line's
+# concern. A split never lands inside the `# ` lead (that would orphan a bare `#`).
+#
+# Widths here count CODEPOINTS, not bytes: comment prose is full of em-dashes and arrows
+# (three UTF-8 bytes, one column), and a byte measure would wrap a line that renders well
+# inside the limit, orphaning its last word onto a continuation.
+const cp_width = (*[Uint8] src, Iarch lo, Iarch hi): Iarch -> {
+	let Iarch w = 0
+	let Iarch k = lo
+
+	loop {
+		if k >= hi then break
+		if Iarch(src[k]) / 64 != 2 then w = w + 1
+		k = k + 1
+	}
+
+	return w
+}
+
+const wrap_comments = (*[Uint8] src, Iarch n, Str file): [Uint8] -> {
+	const [Token] toks = lex_fmt(src, n, file)
+	let [Uint8] out = []
+	let Iarch copied = 0
+	let Iarch i = 0
+
+	loop {
+		const Token t = toks[i]
+		if is_eof(t.kind) then break
+
+		if is_comment(t.kind) then {
+			# standalone: nothing but tabs between the line start and the `#`
+			let Iarch ls = t.start - 1
+			let Bool standalone = true
+
+			loop {
+				if ls < 0 then break
+				if Iarch(src[ls]) == 10 then break
+
+				if Iarch(src[ls]) != 9 then {
+					standalone = false
+					break
+				}
+
+				ls = ls - 1
+			}
+
+			const Iarch indent = t.start - ls - 1
+
+			if standalone && indent + cp_width(src, t.start, t.start + t.len) > line_limit then {
+				# emit everything before the comment verbatim
+				let Iarch c = copied
+
+				loop {
+					if c >= t.start then break
+					out = [...out, src[c]]
+					c = c + 1
+				}
+
+				# the `# ` lead: `#` plus the spaces glued to it (split points live past it)
+				let Iarch lead = 1
+
+				loop {
+					if lead >= t.len || Iarch(src[t.start + lead]) != 32 then break
+					lead = lead + 1
+				}
+
+				# wrap the comment bytes [ws..we): find the split space, emit, continue.
+				# `pfx` is the columns the rendered lead occupies BEYOND the copied bytes: 0
+				# on the first line (the source `# ` is inside [ws..we)), 2 on a continuation
+				# (its `# ` is synthesized); `skip` keeps split points out of the lead.
+				let Iarch ws = t.start
+				const Iarch we = t.start + t.len
+				let Iarch pfx = 0
+				let Iarch skip = lead
+
+				loop {
+					if indent + pfx + cp_width(src, ws, we) <= line_limit then break
+					# the byte position where the width window closes (a codepoint walk)...
+					const Iarch room = line_limit - indent - pfx
+					let Iarch fit = ws
+					let Iarch seen = 0
+
+					loop {
+						if fit >= we then break
+
+						if Iarch(src[fit]) / 64 != 2 then {
+							if seen >= room then break
+							seen = seen + 1
+						}
+
+						fit = fit + 1
+					}
+
+					# ...then the last space within it, past the lead...
+					let Iarch sp = -1
+					let Iarch k = ws + skip
+
+					loop {
+						if k >= we then break
+						if k > fit && sp >= 0 then break
+						if Iarch(src[k]) == 32 then sp = k
+						k = k + 1
+					}
+
+					# ...or the first one past it (an unbreakable overlong word); none = done
+					if sp < 0 then break
+					let Iarch e = sp
+					let Iarch b = ws
+
+					loop {
+						if b >= e then break
+						out = [...out, src[b]]
+						b = b + 1
+					}
+
+					out = [...out, Uint8(10)]
+					let Iarch tb = 0
+
+					loop {
+						if tb >= indent then break
+						out = [...out, Uint8(9)]
+						tb = tb + 1
+					}
+
+					out = [...out, Uint8(35)]
+					out = [...out, Uint8(32)]
+					# the continuation content starts past the split's whole space run
+					ws = sp
+
+					loop {
+						if ws >= we || Iarch(src[ws]) != 32 then break
+						ws = ws + 1
+					}
+
+					pfx = 2
+					skip = 1
+				}
+
+				let Iarch r = ws
+
+				loop {
+					if r >= we then break
+					out = [...out, src[r]]
+					r = r + 1
+				}
+
+				copied = we
+			}
+		}
+
+		i = i + 1
+	}
+
+	let Iarch c = copied
+
+	loop {
+		if c >= n then break
+		out = [...out, src[c]]
+		c = c + 1
+	}
+
+	return out
+}
+
+# One `wrap_comments` + re-canonicalise step; same reclaim discipline as the other passes.
+const wrap_and_format! = (*[Uint8] src, Iarch n, Str file): [Uint8] -> {
+	const [Uint8] wc = wrap_comments(src, n, file)
+
+	return format_source!(wc, Iarch(wc.len), file)
+}
+
 # One `break_expr!` + re-canonicalise step. Split into its own `!` frame so the intermediate
 # break buffer is reclaimed on return — only the formatted result survives, which keeps the
 # fixpoint loop's live survivor set small on a large file.
@@ -1523,6 +1709,10 @@ pub const format_file! = (Str path, Bool check): Iarch -> {
 	# stops changing. Every pass only rewrites structural newlines and the re-format is idempotent,
 	# so this converges; the guard caps a pathological input rather than any real one.
 	let [Uint8] out = format_source!(buf, n, path)
+	# comment wrap (Phase E) runs ONCE, after indentation canonicalises (widths measure at
+	# final columns) and before the code reflow (which never moves comment lines): wrapped
+	# output is all within the limit, so a second format finds nothing to split.
+	out = wrap_and_format!(out, Iarch(out.len), path)
 	let Iarch guard = 0
 
 	loop {
