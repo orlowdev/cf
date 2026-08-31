@@ -1,14 +1,14 @@
-.globl _f58
+.globl _f83
 .p2align 2
-_f58:
+_f83:
 	subq $8, %rsp
 	call _cf_qbe_run
 	addq $8, %rsp
 	ret
 
-.globl _f62
+.globl _f87
 .p2align 2
-_f62:
+_f87:
 	movq %rdi, %rax
 	orq $0x2000000, %rax
 	movq %rsi, %rdi
@@ -23,22 +23,22 @@ _f62:
 1:
 	ret
 
-.globl _f63
+.globl _f88
 .p2align 2
-_f63:
+_f88:
 	movq $1, %rax
 	ret
 
-.globl _f353
+.globl _f389
 .p2align 2
-_f353:
+_f389:
 	movq $0x2000001, %rax
 	syscall
 	ret
 
-.globl _f354
+.globl _f390
 .p2align 2
-_f354:
+_f390:
 	movq $0x2000002, %rax
 	syscall
 	jnc 1f
