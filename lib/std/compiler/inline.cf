@@ -101,11 +101,17 @@ const is_cast_type = (Str name): Bool -> {
 # and the declared return type name (gates the value-block path).
 data InlDef = { Str name, [Str] params, Expr body, Str ret }
 
-# The rewriter's state: the definition table and the gensym counter for value-block
+# A literal VALUE CONST (`const max_depth = 128`): emit models it as a nullary
+# function and AUTO-CALLS it at every bare reference — a runtime call per constant
+# read. Folding the reference to its literal erases the call; value consts are
+# literals-only (uniformly enforced), so the fold is total for this table.
+data ValDef = { Str name, Expr lit }
+
+# The rewriter's state: the definition tables and the gensym counter for value-block
 # temporaries. Spliced blocks bypass typecheck's shadowing rules and emit's env
 # lookup is first-match, so temp names must be globally unique; `#` cannot begin a
 # source identifier, so `#iN` can never collide with or capture a user local.
-data InlSt = { [InlDef] defs, Iarch gen }
+data InlSt = { [InlDef] defs, [ValDef] vals, Iarch gen }
 
 const fresh = (*InlSt st): Str -> {
 	st.gen = st.gen + 1
@@ -272,6 +278,51 @@ const inl_defs = (Program prog): [InlDef] -> {
 	}
 
 	return defs
+}
+
+const is_literal = (Expr e): Bool -> match e {
+	Expr.Lit(_) -> true,
+	Expr.BoolLit(_) -> true,
+	Expr.FloatLit(_) -> true,
+	Expr.StrLit(_) -> true,
+	_ -> false,
+}
+
+const inl_vals = (Program prog): [ValDef] -> {
+	let [ValDef] vals = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(prog.funcs.len) then break
+		const Func f = prog.funcs[i]
+		if f.is_value && !f.is_asm && Iarch(f.body.len) == 1 then {
+			match f.body[0] {
+				Stmt.Return(e) -> {
+					if is_literal(e) then vals = [...vals, ValDef({ name: f.name, lit: e })]
+				},
+				_ -> {},
+			}
+		}
+		i = i + 1
+	}
+
+	return vals
+}
+
+# Fold a bare reference to a literal value const — unless a LOCAL binder of the
+# same name is in scope (value-const names survive the flatten un-mangled, so a
+# like-named local shadows the const; the threaded scope decides).
+const fold_val = (*InlSt st, [Str] scope, Str n, Expr orig): Expr -> {
+	if has_name(scope, n) then return orig
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(st.vals.len) then break
+		if eq(st.vals[i].name, n) then return st.vals[i].lit
+		i = i + 1
+	}
+
+	return orig
 }
 
 const find_def = ([InlDef] defs, Str name): Iarch -> {
@@ -547,76 +598,78 @@ const try_inline! = (*InlSt st, Str name, [Str] ta, [Expr] args, Str g): Expr ->
 	return Expr.Loop([...lets, Stmt.Yield(yv)])
 }
 
-const rw_expr! = (*InlSt st, Expr e): Expr -> match e {
-	Expr.Record(n, inits) -> Expr.Record(n, rw_fields!(st, inits)),
-	Expr.FieldExpr(b, f) -> Expr.FieldExpr(rw_expr!(st, b), f),
-	Expr.UnionMk(u, m, args) -> Expr.UnionMk(u, m, rw_list!(st, args)),
-	Expr.Match(s, arms) -> Expr.Match(rw_expr!(st, s), rw_arms!(st, arms)),
+const rw_expr! = (*InlSt st, [Str] scope, Expr e): Expr -> match e {
+	Expr.Record(n, inits) -> Expr.Record(n, rw_fields!(st, scope, inits)),
+	Expr.FieldExpr(b, f) -> Expr.FieldExpr(rw_expr!(st, scope, b), f),
+	Expr.UnionMk(u, m, args) -> Expr.UnionMk(u, m, rw_list!(st, scope, args)),
+	Expr.Match(s, arms) -> Expr.Match(rw_expr!(st, scope, s), rw_arms!(st, scope, arms)),
 	Expr.ArrayLit(hs, sp, elems, en) ->
-		Expr.ArrayLit(hs, rw_expr!(st, sp), rw_list!(st, elems), en),
-	Expr.Index(b, i) -> Expr.Index(b, rw_expr!(st, i)),
-	Expr.IndexField(b, i, f) -> Expr.IndexField(b, rw_expr!(st, i), f),
-	Expr.IndexExpr(b, i) -> Expr.IndexExpr(rw_expr!(st, b), rw_expr!(st, i)),
-	Expr.Interp(segs) -> Expr.Interp(rw_segs!(st, segs)),
-	Expr.Tuple(elems) -> Expr.Tuple(rw_list!(st, elems)),
-	Expr.Spread(x) -> Expr.Spread(rw_expr!(st, x)),
-	Expr.Loop(ss) -> Expr.Loop(rw_body!(st, ss)),
-	Expr.Buffer(sz) -> Expr.Buffer(rw_expr!(st, sz)),
-	Expr.Neg(x) -> Expr.Neg(rw_expr!(st, x)),
-	Expr.Not(x) -> Expr.Not(rw_expr!(st, x)),
-	Expr.BitNot(x) -> Expr.BitNot(rw_expr!(st, x)),
-	Expr.Add(a, b) -> Expr.Add(rw_expr!(st, a), rw_expr!(st, b)),
-	Expr.Sub(a, b) -> Expr.Sub(rw_expr!(st, a), rw_expr!(st, b)),
-	Expr.Mul(a, b) -> Expr.Mul(rw_expr!(st, a), rw_expr!(st, b)),
-	Expr.Div(a, b) -> Expr.Div(rw_expr!(st, a), rw_expr!(st, b)),
-	Expr.Mod(a, b) -> Expr.Mod(rw_expr!(st, a), rw_expr!(st, b)),
-	Expr.BitAnd(a, b) -> Expr.BitAnd(rw_expr!(st, a), rw_expr!(st, b)),
-	Expr.BitOr(a, b) -> Expr.BitOr(rw_expr!(st, a), rw_expr!(st, b)),
-	Expr.BitXor(a, b) -> Expr.BitXor(rw_expr!(st, a), rw_expr!(st, b)),
-	Expr.Shl(a, b) -> Expr.Shl(rw_expr!(st, a), rw_expr!(st, b)),
-	Expr.Shr(a, b) -> Expr.Shr(rw_expr!(st, a), rw_expr!(st, b)),
-	Expr.CmpEq(a, b) -> Expr.CmpEq(rw_expr!(st, a), rw_expr!(st, b)),
-	Expr.CmpNe(a, b) -> Expr.CmpNe(rw_expr!(st, a), rw_expr!(st, b)),
-	Expr.CmpLt(a, b) -> Expr.CmpLt(rw_expr!(st, a), rw_expr!(st, b)),
-	Expr.CmpGt(a, b) -> Expr.CmpGt(rw_expr!(st, a), rw_expr!(st, b)),
-	Expr.CmpLe(a, b) -> Expr.CmpLe(rw_expr!(st, a), rw_expr!(st, b)),
-	Expr.CmpGe(a, b) -> Expr.CmpGe(rw_expr!(st, a), rw_expr!(st, b)),
-	Expr.And(a, b) -> Expr.And(rw_expr!(st, a), rw_expr!(st, b)),
-	Expr.Or(a, b) -> Expr.Or(rw_expr!(st, a), rw_expr!(st, b)),
-	Expr.If(c, t, el) -> Expr.If(rw_expr!(st, c), rw_expr!(st, t), rw_expr!(st, el)),
-	Expr.Call(n, ta, args, g) -> try_inline!(st, n, ta, rw_list!(st, args), g),
-	Expr.DeferTap(n, args) -> Expr.DeferTap(n, rw_list!(st, args)),
-	Expr.At(o, inner) -> rw_expr!(st, inner),
+		Expr.ArrayLit(hs, rw_expr!(st, scope, sp), rw_list!(st, scope, elems), en),
+	Expr.Index(b, i) -> Expr.Index(b, rw_expr!(st, scope, i)),
+	Expr.IndexField(b, i, f) -> Expr.IndexField(b, rw_expr!(st, scope, i), f),
+	Expr.IndexExpr(b, i) -> Expr.IndexExpr(rw_expr!(st, scope, b), rw_expr!(st, scope, i)),
+	Expr.Interp(segs) -> Expr.Interp(rw_segs!(st, scope, segs)),
+	Expr.Tuple(elems) -> Expr.Tuple(rw_list!(st, scope, elems)),
+	Expr.Spread(x) -> Expr.Spread(rw_expr!(st, scope, x)),
+	Expr.Loop(ss) -> Expr.Loop(rw_body!(st, scope, ss)),
+	Expr.Buffer(sz) -> Expr.Buffer(rw_expr!(st, scope, sz)),
+	Expr.Neg(x) -> Expr.Neg(rw_expr!(st, scope, x)),
+	Expr.Not(x) -> Expr.Not(rw_expr!(st, scope, x)),
+	Expr.BitNot(x) -> Expr.BitNot(rw_expr!(st, scope, x)),
+	Expr.Add(a, b) -> Expr.Add(rw_expr!(st, scope, a), rw_expr!(st, scope, b)),
+	Expr.Sub(a, b) -> Expr.Sub(rw_expr!(st, scope, a), rw_expr!(st, scope, b)),
+	Expr.Mul(a, b) -> Expr.Mul(rw_expr!(st, scope, a), rw_expr!(st, scope, b)),
+	Expr.Div(a, b) -> Expr.Div(rw_expr!(st, scope, a), rw_expr!(st, scope, b)),
+	Expr.Mod(a, b) -> Expr.Mod(rw_expr!(st, scope, a), rw_expr!(st, scope, b)),
+	Expr.BitAnd(a, b) -> Expr.BitAnd(rw_expr!(st, scope, a), rw_expr!(st, scope, b)),
+	Expr.BitOr(a, b) -> Expr.BitOr(rw_expr!(st, scope, a), rw_expr!(st, scope, b)),
+	Expr.BitXor(a, b) -> Expr.BitXor(rw_expr!(st, scope, a), rw_expr!(st, scope, b)),
+	Expr.Shl(a, b) -> Expr.Shl(rw_expr!(st, scope, a), rw_expr!(st, scope, b)),
+	Expr.Shr(a, b) -> Expr.Shr(rw_expr!(st, scope, a), rw_expr!(st, scope, b)),
+	Expr.CmpEq(a, b) -> Expr.CmpEq(rw_expr!(st, scope, a), rw_expr!(st, scope, b)),
+	Expr.CmpNe(a, b) -> Expr.CmpNe(rw_expr!(st, scope, a), rw_expr!(st, scope, b)),
+	Expr.CmpLt(a, b) -> Expr.CmpLt(rw_expr!(st, scope, a), rw_expr!(st, scope, b)),
+	Expr.CmpGt(a, b) -> Expr.CmpGt(rw_expr!(st, scope, a), rw_expr!(st, scope, b)),
+	Expr.CmpLe(a, b) -> Expr.CmpLe(rw_expr!(st, scope, a), rw_expr!(st, scope, b)),
+	Expr.CmpGe(a, b) -> Expr.CmpGe(rw_expr!(st, scope, a), rw_expr!(st, scope, b)),
+	Expr.And(a, b) -> Expr.And(rw_expr!(st, scope, a), rw_expr!(st, scope, b)),
+	Expr.Or(a, b) -> Expr.Or(rw_expr!(st, scope, a), rw_expr!(st, scope, b)),
+	Expr.If(c, t, el) ->
+		Expr.If(rw_expr!(st, scope, c), rw_expr!(st, scope, t), rw_expr!(st, scope, el)),
+	Expr.Call(n, ta, args, g) -> try_inline!(st, n, ta, rw_list!(st, scope, args), g),
+	Expr.DeferTap(n, args) -> Expr.DeferTap(n, rw_list!(st, scope, args)),
+	Expr.At(o, inner) -> rw_expr!(st, scope, inner),
+	Expr.Var(n) -> fold_val(st, scope, n, e),
 	_ -> e,
 }
 
-const rw_list! = (*InlSt st, [Expr] es): [Expr] -> {
+const rw_list! = (*InlSt st, [Str] scope, [Expr] es): [Expr] -> {
 	let [Expr] r = []
 	let Iarch i = 0
 
 	loop {
 		if i >= Iarch(es.len) then break
-		r = [...r, rw_expr!(st, es[i])]
+		r = [...r, rw_expr!(st, scope, es[i])]
 		i = i + 1
 	}
 
 	return r
 }
 
-const rw_fields! = (*InlSt st, [FieldInit] fs): [FieldInit] -> {
+const rw_fields! = (*InlSt st, [Str] scope, [FieldInit] fs): [FieldInit] -> {
 	let [FieldInit] r = []
 	let Iarch i = 0
 
 	loop {
 		if i >= Iarch(fs.len) then break
-		r = [...r, FieldInit({ field: fs[i].field, value: rw_expr!(st, fs[i].value) })]
+		r = [...r, FieldInit({ field: fs[i].field, value: rw_expr!(st, scope, fs[i].value) })]
 		i = i + 1
 	}
 
 	return r
 }
 
-const rw_segs! = (*InlSt st, [Seg] segs): [Seg] -> {
+const rw_segs! = (*InlSt st, [Str] scope, [Seg] segs): [Seg] -> {
 	let [Seg] r = []
 	let Iarch i = 0
 
@@ -628,7 +681,7 @@ const rw_segs! = (*InlSt st, [Seg] segs): [Seg] -> {
 				is_hole: segs[i].is_hole,
 				lit: segs[i].lit,
 				name: segs[i].name,
-				expr: if segs[i].is_hole then rw_expr!(st, segs[i].expr) else segs[i].expr,
+				expr: if segs[i].is_hole then rw_expr!(st, scope, segs[i].expr) else segs[i].expr,
 			}),
 		]
 		i = i + 1
@@ -637,7 +690,7 @@ const rw_segs! = (*InlSt st, [Seg] segs): [Seg] -> {
 	return r
 }
 
-const rw_arms! = (*InlSt st, [MatchArm] arms): [MatchArm] -> {
+const rw_arms! = (*InlSt st, [Str] scope, [MatchArm] arms): [MatchArm] -> {
 	let [MatchArm] r = []
 	let Iarch i = 0
 
@@ -650,7 +703,7 @@ const rw_arms! = (*InlSt st, [MatchArm] arms): [MatchArm] -> {
 				type_name: arms[i].type_name,
 				members: arms[i].members,
 				binds: arms[i].binds,
-				body: rw_expr!(st, arms[i].body),
+				body: rw_expr!(st, cat_s(scope, arms[i].binds), arms[i].body),
 			}),
 		]
 		i = i + 1
@@ -659,7 +712,7 @@ const rw_arms! = (*InlSt st, [MatchArm] arms): [MatchArm] -> {
 	return r
 }
 
-const rw_stmtarms! = (*InlSt st, [StmtArm] arms): [StmtArm] -> {
+const rw_stmtarms! = (*InlSt st, [Str] scope, [StmtArm] arms): [StmtArm] -> {
 	let [StmtArm] r = []
 	let Iarch i = 0
 
@@ -672,7 +725,7 @@ const rw_stmtarms! = (*InlSt st, [StmtArm] arms): [StmtArm] -> {
 				type_name: arms[i].type_name,
 				members: arms[i].members,
 				binds: arms[i].binds,
-				body: rw_body!(st, arms[i].body),
+				body: rw_body!(st, cat_s(scope, arms[i].binds), arms[i].body),
 			}),
 		]
 		i = i + 1
@@ -681,36 +734,102 @@ const rw_stmtarms! = (*InlSt st, [StmtArm] arms): [StmtArm] -> {
 	return r
 }
 
-const rw_stmt! = (*InlSt st, Stmt s): Stmt -> match s {
-	Stmt.Let(n, m, ann, init) -> Stmt.Let(n, m, ann, rw_expr!(st, init)),
-	Stmt.Assign(n, v) -> Stmt.Assign(n, rw_expr!(st, v)),
-	Stmt.FieldAssign(b, f, v) -> Stmt.FieldAssign(b, f, rw_expr!(st, v)),
+const rw_stmt! = (*InlSt st, [Str] scope, Stmt s): Stmt -> match s {
+	Stmt.Let(n, m, ann, init) -> Stmt.Let(n, m, ann, rw_expr!(st, scope, init)),
+	Stmt.Assign(n, v) -> Stmt.Assign(n, rw_expr!(st, scope, v)),
+	Stmt.FieldAssign(b, f, v) -> Stmt.FieldAssign(b, f, rw_expr!(st, scope, v)),
 	Stmt.DeepFieldAssign(be, f, v) ->
-		Stmt.DeepFieldAssign(rw_expr!(st, be), f, rw_expr!(st, v)),
-	Stmt.IndexAssign(b, i, v) -> Stmt.IndexAssign(b, rw_expr!(st, i), rw_expr!(st, v)),
-	Stmt.Return(e) -> Stmt.Return(rw_expr!(st, e)),
-	Stmt.ForIn(lv, iv, ss) -> Stmt.ForIn(lv, iv, rw_body!(st, ss)),
-	Stmt.Loop(lb, ss) -> Stmt.Loop(lb, rw_body!(st, ss)),
-	Stmt.IfThen(c, s2) -> Stmt.IfThen(rw_expr!(st, c), rw_stmt!(st, s2)),
+		Stmt.DeepFieldAssign(rw_expr!(st, scope, be), f, rw_expr!(st, scope, v)),
+	Stmt.IndexAssign(b, i, v) -> Stmt.IndexAssign(b, rw_expr!(st, scope, i), rw_expr!(st, scope, v)),
+	Stmt.Return(e) -> Stmt.Return(rw_expr!(st, scope, e)),
+	Stmt.ForIn(lv, iv, ss) ->
+		Stmt.ForIn(lv, iv, rw_body!(st, cat_s(scope, two_s(lv, iv)), ss)),
+	Stmt.Loop(lb, ss) -> Stmt.Loop(lb, rw_body!(st, scope, ss)),
+	Stmt.IfThen(c, s2) -> Stmt.IfThen(rw_expr!(st, scope, c), rw_stmt!(st, scope, s2)),
 	Stmt.IfElse(c, t, el) ->
-		Stmt.IfElse(rw_expr!(st, c), rw_stmt!(st, t), rw_stmt!(st, el)),
-	Stmt.Do(e) -> Stmt.Do(rw_expr!(st, e)),
-	Stmt.Block(ss) -> Stmt.Block(rw_body!(st, ss)),
-	Stmt.Match(sc, arms) -> Stmt.Match(rw_expr!(st, sc), rw_stmtarms!(st, arms)),
-	Stmt.Destructure(ns, m, e) -> Stmt.Destructure(ns, m, rw_expr!(st, e)),
-	Stmt.Yield(e) -> Stmt.Yield(rw_expr!(st, e)),
-	Stmt.Closure(n, cps, rn, cbody) -> Stmt.Closure(n, cps, rn, rw_body!(st, cbody)),
-	Stmt.Defer(ss) -> Stmt.Defer(rw_body!(st, ss)),
+		Stmt.IfElse(rw_expr!(st, scope, c), rw_stmt!(st, scope, t), rw_stmt!(st, scope, el)),
+	Stmt.Do(e) -> Stmt.Do(rw_expr!(st, scope, e)),
+	Stmt.Block(ss) -> Stmt.Block(rw_body!(st, scope, ss)),
+	Stmt.Match(sc, arms) -> Stmt.Match(rw_expr!(st, scope, sc), rw_stmtarms!(st, scope, arms)),
+	Stmt.Destructure(ns, m, e) -> Stmt.Destructure(ns, m, rw_expr!(st, scope, e)),
+	Stmt.Yield(e) -> Stmt.Yield(rw_expr!(st, scope, e)),
+	Stmt.Closure(n, cps, rn, cbody) ->
+		Stmt.Closure(n, cps, rn, rw_body!(st, cat_s(scope, plist_names(cps)), cbody)),
+	Stmt.Defer(ss) -> Stmt.Defer(rw_body!(st, scope, ss)),
 	_ -> s,
 }
 
-const rw_body! = (*InlSt st, [Stmt] ss): [Stmt] -> {
+# The walk accumulates binders in statement order (a `let` scopes from its own
+# statement onward; its initializer still sees the OUTER scope), so a like-named
+# local below shadows a value const only below.
+const rw_body! = (*InlSt st, [Str] scope, [Stmt] ss): [Stmt] -> {
+	let [Str] sc = cat_s(scope, no_strs())
 	let [Stmt] r = []
 	let Iarch i = 0
 
 	loop {
 		if i >= Iarch(ss.len) then break
-		r = [...r, rw_stmt!(st, ss[i])]
+		r = [...r, rw_stmt!(st, sc, ss[i])]
+
+		match ss[i] {
+			Stmt.Let(n, _, _, _) -> {
+				sc = [...sc, n]
+			},
+			Stmt.Destructure(ns, _, _) -> {
+				sc = cat_s(sc, ns)
+			},
+			Stmt.Closure(n, _, _, _) -> {
+				sc = [...sc, n]
+			},
+			_ -> {},
+		}
+
+		i = i + 1
+	}
+
+	return r
+}
+
+const no_strs = (): [Str] -> {
+	let [Str] e = []
+
+	return e
+}
+
+const two_s = (Str a, Str b): [Str] -> {
+	let [Str] r = [a]
+
+	return [...r, b]
+}
+
+const cat_s = ([Str] a, [Str] b): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(a.len) then break
+		r = [...r, a[i]]
+		i = i + 1
+	}
+
+	let Iarch j = 0
+
+	loop {
+		if j >= Iarch(b.len) then break
+		r = [...r, b[j]]
+		j = j + 1
+	}
+
+	return r
+}
+
+const plist_names = ([Param] ps): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(ps.len) then break
+		r = [...r, ps[i].name]
 		i = i + 1
 	}
 
@@ -723,7 +842,7 @@ const rw_func! = (*InlSt st, Func f): Func -> Func({
 	ret_name: f.ret_name,
 	ret_elem: f.ret_elem,
 	params: f.params,
-	body: rw_body!(st, f.body),
+	body: rw_body!(st, param_names(f), f.body),
 	is_asm: f.is_asm,
 	asm_body: f.asm_body,
 	is_value: f.is_value,
@@ -742,9 +861,10 @@ const rw_func! = (*InlSt st, Func f): Func -> Func({
 # untouched — emit's index-based linkage and the materialize tables stay valid.
 pub const inline_program! = (Program prog): Program -> {
 	const [InlDef] defs = inl_defs(prog)
-	if Iarch(defs.len) == 0 then return prog
+	const [ValDef] vals = inl_vals(prog)
+	if Iarch(defs.len) == 0 && Iarch(vals.len) == 0 then return prog
 
-	let InlSt stv = InlSt({ defs: defs, gen: 0 })
+	let InlSt stv = InlSt({ defs: defs, vals: vals, gen: 0 })
 	let [Func] funcs = []
 	let Iarch i = 0
 
