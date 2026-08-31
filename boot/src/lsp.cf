@@ -515,7 +515,10 @@ const init_result! = (): Json -> Json.Obj([
 		ent("definitionProvider", Json.Bool(true)),
 		ent("hoverProvider", Json.Bool(true)),
 		ent("referencesProvider", Json.Bool(true)),
-		ent("renameProvider", Json.Bool(true)),
+		# prepareRename lets the editor validate the position (and show the right placeholder)
+		# before prompting — the same renameability check rename itself makes
+		ent("renameProvider", Json.Obj([ent("prepareProvider", Json.Bool(true))])),
+		ent("documentHighlightProvider", Json.Bool(true)),
 		ent("completionProvider", Json.Obj([
 			ent("triggerCharacters", Json.Arr([jstr(":"), jstr(".")])),
 		])),
@@ -1773,6 +1776,62 @@ const rename! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, Ia
 	return Json.Obj([ent("changes", Json.Obj([ent(uri, Json.Arr(edits))]))])
 }
 
+# Answer textDocument/prepareRename: the exact span rename would edit and its placeholder
+# text, or Null when rename would refuse here (no token, not a local — the editor then never
+# opens the prompt). The same renameability check rename makes, made BEFORE the user types.
+const prepare_rename! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, Iarch c0): Json -> {
+	if !starts_with("file://", uri) then return Json.Null
+	const Str path = uri_to_path!(uri)
+
+	let Str from = path
+	let Str overlay = ""
+	const Str owner = match read_file!(srcp) {
+		Either.Right(s) -> s,
+		Either.Left(e) -> "",
+	}
+
+	if eq(owner, path) then {
+		from = srcf
+		overlay = srcf
+	}
+
+	const Str text = match read_file!(from) {
+		Either.Right(s) -> s,
+		Either.Left(e) -> "",
+	}
+
+	const [Str] lines = split("\n", text)
+	if l0 < 0 || l0 >= Iarch(lines.len) then return Json.Null
+	const TokCtx t = token_at(lines[l0], c0)
+	if !t.ok then return Json.Null
+	const [SymRow] rows = local_refs!(argv0, env, path, overlay, lines, l0, t)
+	if Iarch(rows.len) == 0 then return Json.Null
+
+	return Json.Obj([
+		ent("range", jrange!(l0, t.ts, t.te)),
+		ent("placeholder", jstr(t.name)),
+	])
+}
+
+# Answer textDocument/documentHighlight: every reference of the binding under the cursor,
+# lit up in this one file — the binder as a Write highlight (kind 3), each use as a Read
+# (kind 2). The same rows references answers with; Null when the position holds none.
+const highlights! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, Iarch c0): Json -> {
+	const [SymRow] rows = rows_at!(argv0, env, uri, srcf, srcp, l0, c0)
+	if Iarch(rows.len) == 0 then return Json.Null
+	let [Json] hs = []
+	let Iarch ri = 0
+
+	for r in rows {
+		let Iarch k = 2
+		if ri == 0 then k = 3
+		hs = [...hs, Json.Obj([ent("range", jrange!(r.line, r.ns, r.ne)), ent("kind", jnum(k))])]
+		ri = ri + 1
+	}
+
+	return Json.Arr(hs)
+}
+
 # The LAST occurrence of `needle` in `s`, or -1.
 const last_index_of = (Str needle, Str s): Iarch -> {
 	let Iarch at = -1
@@ -2193,6 +2252,34 @@ const serve_one! = (Str argv0, [Str] env): Iarch -> {
 
 		if Iarch(uri.len) > 0 && pl >= 0 && pc >= 0 then {
 			respond!(id, references!(argv0, env, uri, srcf, srcp, pl, pc, incl))
+		} else {
+			respond!(id, Json.Null)
+		}
+
+		return 1
+	}
+	if eq(method, "textDocument/prepareRename") then {
+		const Str uri = jtext(jget("uri", jget("textDocument", jget("params", req))))
+		const Json pos = jget("position", jget("params", req))
+		const Iarch pl = jint(jget("line", pos))
+		const Iarch pc = jint(jget("character", pos))
+
+		if Iarch(uri.len) > 0 && pl >= 0 && pc >= 0 then {
+			respond!(id, prepare_rename!(argv0, env, uri, srcf, srcp, pl, pc))
+		} else {
+			respond!(id, Json.Null)
+		}
+
+		return 1
+	}
+	if eq(method, "textDocument/documentHighlight") then {
+		const Str uri = jtext(jget("uri", jget("textDocument", jget("params", req))))
+		const Json pos = jget("position", jget("params", req))
+		const Iarch pl = jint(jget("line", pos))
+		const Iarch pc = jint(jget("character", pos))
+
+		if Iarch(uri.len) > 0 && pl >= 0 && pc >= 0 then {
+			respond!(id, highlights!(argv0, env, uri, srcf, srcp, pl, pc))
 		} else {
 			respond!(id, Json.Null)
 		}
