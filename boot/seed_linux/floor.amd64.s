@@ -1,14 +1,14 @@
-.globl f114
+.globl f115
 .p2align 2
-f114:
+f115:
 	subq $8, %rsp
 	call _cf_qbe_run
 	addq $8, %rsp
 	ret
 
-.globl f118
+.globl f119
 .p2align 2
-f118:
+f119:
 	movq %rdi, %rax
 	movq %rsi, %rdi
 	movq %rdx, %rsi
@@ -19,15 +19,15 @@ f118:
 	syscall
 	ret
 
-.globl f119
+.globl f120
 .p2align 2
-f119:
+f120:
 	movq $1, %rax
 	ret
 
-.globl f407
+.globl f408
 .p2align 2
-f407:
+f408:
 	movl $231, %eax
 	syscall
 	ret
