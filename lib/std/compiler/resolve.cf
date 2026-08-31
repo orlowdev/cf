@@ -39,7 +39,7 @@ import std::compiler::ast::{
 }
 import std::compiler::lexer::{ lex }
 import std::compiler::typealias::{ strip_type_aliases! }
-import std::compiler::parser::{ Parser, parse_program! }
+import std::compiler::parser::{ Parser, BindEv, parse_program! }
 
 # Byte-wise Str equality (used to dedup already-loaded module paths).
 
@@ -551,10 +551,11 @@ const embed_fallback! = (Str path, Str importer, Iarch iline, Iarch icol, *[Uint
 # `src` overrides where the BYTES come from (an editor's unsaved buffer written to a temp file)
 # while `path` stays the module's identity — diag stamps, edir, the dedup key. Empty = read `path`.
 # One loaded module and its line table (spans.cf) — the source bytes are frame-local here,
-# so the table must be built before they go out of scope.
-pub data Loaded = { Program prog, SrcMap map }
+# so the table must be built before they go out of scope. `evs` is the parser's bind-event
+# log (empty unless the load tracked binds — the `cf lsp def` path).
+pub data Loaded = { Program prog, SrcMap map, [BindEv] evs }
 
-const load_module! = (Str path, Str src, Str importer, Iarch iline, Iarch icol, Os target_os, Arch target_arch): Loaded -> {
+const load_module! = (Str path, Str src, Str importer, Iarch iline, Iarch icol, Os target_os, Arch target_arch, Bool track): Loaded -> {
 	# One module's read buffer — large enough for cf's own sources (its largest module, emit.cf,
 	# crossed 256 KB; 1 MB leaves headroom). `buf.len` is the capacity handed to `read` (the
 	# buffer reports its own size now), and `read` returns the actual byte count `n`. A read that
@@ -586,6 +587,7 @@ const load_module! = (Str path, Str src, Str importer, Iarch iline, Iarch icol, 
 		then die("cf: an imported module exceeds the read buffer — grow it in resolve.cf: ${path}\n")
 	const StripResult sr = strip_import_namespaces!(buf, strip_type_aliases!(buf, lex(buf, n, path)))
 	const [Stmt] nopend = []
+	const [BindEv] noevs = []
 	let Parser p = Parser({
 		toks: sr.toks,
 		src: buf,
@@ -599,12 +601,14 @@ const load_module! = (Str path, Str src, Str importer, Iarch iline, Iarch icol, 
 		saw_fx: false,
 		saw_el: false,
 		pending: nopend,
+		track: track,
+		evs: noevs,
 	})
 	const Program prog = parse_program!(&p)
 	# imports are optional (module_system §4): a full `::` path used without an import contributed its
 	# module PATH to `sr.deps` — turn each into a synthetic namespace import so the module is loaded
 	# (the flat use already resolves to its path-prefix-mangled definition; the loader dedups by path).
-	if Iarch(sr.deps.len) == 0 then return Loaded({ prog: prog, map: src_map(path, buf, n) })
+	if Iarch(sr.deps.len) == 0 then return Loaded({ prog: prog, map: src_map(path, buf, n), evs: p.evs })
 	let [Import] imps = prog.imports
 	let Iarch di = 0
 	# first-use offsets arrive in scan order (deps dedup on first occurrence), so one forward
@@ -649,8 +653,14 @@ const load_module! = (Str path, Str src, Str importer, Iarch iline, Iarch icol, 
 		groups: prog.groups,
 	})
 
-	return Loaded({ prog: lp, map: src_map(path, buf, n) })
+	return Loaded({ prog: lp, map: src_map(path, buf, n), evs: p.evs })
 }
+
+# Parse the ENTRY module alone with the bind-event log on — the `cf lsp def` front end. No
+# imports are followed: local bindings live in the one file, so the entry's own parse is the
+# whole index (`src` overlays the bytes like `--src` everywhere else).
+pub const entry_binds! = (Str path, Str src, Os target_os, Arch target_arch): Loaded ->
+	load_module!(path, src, "", 0, 0, target_os, target_arch, true)
 
 # Append every element of `src` onto `dst` (cf has no two-spread merge, so grow one at a
 # time). One helper per declaration list — the payload types differ.
@@ -2567,7 +2577,7 @@ pub data Resolved = { Program prog, [SrcMap] maps }
 
 pub const resolve_program! = (Str entry, Str src, Os target_os, Arch target_arch): Resolved -> {
 	const Str edir = dir_of!(entry)
-	const Loaded l0 = load_module!(entry, src, "", 0, 0, target_os, target_arch)
+	const Loaded l0 = load_module!(entry, src, "", 0, 0, target_os, target_arch, false)
 	const Program root = l0.prog
 	let [SrcMap] maps = [l0.map]
 	# the entry is prefix-empty (its names stay bare — it fixes the naming frame)
@@ -2620,7 +2630,7 @@ pub const resolve_program! = (Str entry, Str src, Os target_os, Arch target_arch
 					geom = true
 					mtag = "pg"
 				}
-				const Loaded lw = load_module!(mpath, "", wsrc[wi], work[wi].dline, work[wi].dcol, target_os, target_arch)
+				const Loaded lw = load_module!(mpath, "", wsrc[wi], work[wi].dline, work[wi].dcol, target_os, target_arch, false)
 				const Program m0 = lw.prog
 				maps = [...maps, lw.map]
 				const Program m = if is_floor_impl(im.path) then tag_floor_syms(m0) else m0

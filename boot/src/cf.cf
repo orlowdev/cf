@@ -22,7 +22,9 @@ import docs::{ docs_run! }
 import lsp::{ lsp_run! }
 import std::compiler::{ compile!, check! }
 import std::compiler::ast::{ Program }
-import std::compiler::resolve::{ resolve_program!, Resolved }
+import std::compiler::resolve::{ resolve_program!, Resolved, entry_binds!, Loaded }
+import std::compiler::parser::{ BindEv }
+import std::compiler::spans::{ line_col_of, LC, SrcMap }
 import std::compiler::diag::{ Diag, print_diags! }
 import std::mem::arena::growing_arena
 import qbe::{ qbe_translate }
@@ -271,6 +273,69 @@ const run_modules! = (Str input, Str src): Iarch -> {
 	return 0
 }
 
+# A decimal string as an Iarch (leading digits only — the `cf lsp def` offset argument).
+const dec_of = (Str s): Iarch -> {
+	let Iarch v = 0
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(s.len) then break
+		const Iarch d = Iarch(s[i]) - 48
+		if d < 0 || d > 9 then break
+		v = v * 10 + d
+		i = i + 1
+	}
+
+	return v
+}
+
+# `cf lsp def <input.cf> <off> <name> [--src <buf>]`: the LOCAL binding of `name` visible at
+# byte offset `off` in the entry — a parameter, a `let`/`const` local, a `for` binder, or a
+# match payload bind — found by replaying the parser's bind-event log with a scope-depth
+# counter: a close drops its scope's binds, and the LAST surviving bind of the name is the
+# innermost one the cursor sees. Prints the binder's 1-based `line:col` when a local binds the
+# name, nothing otherwise — the LSP then falls back to its top-level declaration index. The
+# entry parses ALONE (no imports followed): locals live in the one file.
+const run_def! = (Str input, Str src, Iarch off, Str name): Iarch -> {
+	const Loaded ld = entry_binds!(input, src, os::target, host_arch())
+	let Iarch depth = 0
+	let [Iarch] boffs = []
+	let [Iarch] bdeps = []
+
+	for ev in ld.evs {
+		if ev.off > off then break
+		if ev.kind == 0 then depth = depth + 1
+		if ev.kind == 1 then {
+			# the scope closed before the cursor — its binds are out of sight
+			let [Iarch] ko = []
+			let [Iarch] kd = []
+
+			for (b, i) in boffs {
+				if bdeps[i] < depth then {
+					ko = [...ko, b]
+					kd = [...kd, bdeps[i]]
+				}
+			}
+
+			boffs = ko
+			bdeps = kd
+			depth = depth - 1
+		}
+		if ev.kind >= 2 && eq(ev.name, name) then {
+			boffs = [...boffs, ev.off]
+			bdeps = [...bdeps, depth]
+		}
+	}
+
+	if Iarch(boffs.len) == 0 then return 0
+	const [SrcMap] maps = [ld.map]
+	const LC lc = line_col_of(maps, input, boffs[Iarch(boffs.len) - 1])
+	if lc.line <= 0 then return 0
+	println("${lc.line}:${lc.col}")
+
+	return 0
+}
+
 # The self-contained pipeline: compile the program to IL + floor (temp files), run the embedded QBE
 # on the IL, spawn the host toolchain to assemble+link, then clean up (unless `-P`). darwin links a
 # Mach-O with `cc`; `Bare` and `Linux` cross-assemble + link a freestanding ELF with `clang`/`ld.lld`
@@ -402,6 +467,16 @@ pub const main = ([Str] args, [Str] env) -> {
 			const ma = growing_arena::of(16777216)
 
 			return run_modules!(args[3], msrc) in ma
+		}
+
+		# `cf lsp def <input.cf> <off> <name> [--src <file>]` — the local-binding definition
+		# of the name at a byte offset (parameters, locals, loop binders, match binds).
+		if Iarch(args.len) >= 6 && eq(args[2], "def") then {
+			let Str dsrc = ""
+			if Iarch(args.len) >= 8 && eq(args[6], "--src") then dsrc = args[7]
+			const da = growing_arena::of(16777216)
+
+			return run_def!(args[3], dsrc, dec_of(args[4]), args[5]) in da
 		}
 
 		const sa = growing_arena::of(16777216)
