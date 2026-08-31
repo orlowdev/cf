@@ -1433,8 +1433,32 @@ const local_refs! = (Str argv0, [Str] env, Str path, Str overlay, [Str] lines, I
 	if !local_token(t) then return rows
 	const ChildOut co = lsp_child!(argv0, env, path, overlay, lines, l0, t.ts, "refs", t.name)
 	if co.rc != 0 then return rows
+	const [Str] outl = split("\n", co.out)
 
-	for lref in split("\n", co.out) {
+	# a `top` first line: the child answered for a NON-pub TOP-LEVEL name (its uses cannot
+	# leave this file) — the declaration row comes from this file's own decl-line scan
+	if Iarch(outl.len) > 0 && eq(outl[0], "top") then {
+		let Iarch li = 0
+
+		for ln in lines {
+			const DeclLine d = scan_decl(ln)
+
+			if d.kind != 0 && eq(slice(d.ns, d.ne, ln), t.name) then {
+				rows = [...rows, SymRow({
+					sname: t.name,
+					kind: 13,
+					file: path,
+					line: li,
+					ns: d.ns,
+					ne: d.ne,
+				})]
+			}
+
+			li = li + 1
+		}
+	}
+
+	for lref in outl {
 		const SymRow r = ref_row(lref, path, t.name)
 		if r.line >= 0 then rows = [...rows, r]
 	}
@@ -1567,9 +1591,9 @@ const goto_def! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, 
 	return Json.Arr(locs)
 }
 
-# A plain lowercase identifier — what a local may be renamed to: `[a-z_]` then
-# `[a-zA-Z0-9_]*`. No `!`/`'` — the alloc marker and a type variable's tick are not the
-# editor's to mint.
+# A plain lowercase identifier — what a binding may be renamed to: `[a-z_]` then
+# `[a-zA-Z0-9_]*`, optionally ONE trailing `!` (a function keeps its alloc marker across a
+# rename — `bang_matches` enforces that the suffix neither appears nor disappears).
 const ident_ok = (Str s): Bool -> {
 	if Iarch(s.len) == 0 then return false
 	const Iarch b0 = Iarch(s[0])
@@ -1579,12 +1603,22 @@ const ident_ok = (Str s): Bool -> {
 	loop {
 		if i >= Iarch(s.len) then break
 		const Iarch b = Iarch(s[i])
+		if b == 33 then return i == Iarch(s.len) - 1
 		if !((b >= 97 && b <= 122) || (b >= 65 && b <= 90) || (b >= 48 && b <= 57) || b == 95)
 			then return false
 		i = i + 1
 	}
 
 	return true
+}
+
+# The `!` alloc marker is SEMANTIC (the alloc gate checks it) — a rename must carry it over
+# exactly: old and new name either both end with `!` or neither does.
+const bang_matches = (Str old, Str nn): Bool -> {
+	const Bool ob = Iarch(old.len) > 0 && Iarch(old[Iarch(old.len) - 1]) == 33
+	const Bool nb = Iarch(nn.len) > 0 && Iarch(nn[Iarch(nn.len) - 1]) == 33
+
+	return (ob && nb) || (!ob && !nb)
 }
 
 # The reference rows of the local binding under (uri, l0, c0) — the shared front of
@@ -1647,6 +1681,7 @@ const rename! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, Ia
 	if !ident_ok(nn) then return Json.Null
 	const [SymRow] rows = rows_at!(argv0, env, uri, srcf, srcp, l0, c0)
 	if Iarch(rows.len) == 0 then return Json.Null
+	if !bang_matches(rows[0].sname, nn) then return Json.Null
 	let [Json] edits = []
 
 	for r in rows {

@@ -351,10 +351,63 @@ const run_def! = (Str input, Str src, Iarch off, Str name): Iarch -> {
 # module files, and a partial answer would make rename a code-breaking edit — refuse rather
 # than guess. A second replay walks the WHOLE log keeping the innermost live bind of the
 # name; a kind-6 use belongs to the sought binder exactly when that live bind is it.
+# References of a TOP-LEVEL name in the entry — the `cf lsp refs` fallback when no local
+# binds it. Only a NON-pub declaration answers: a pub name's uses cross module files, so a
+# partial list would mislead and a rename built from one would corrupt. Prints `top` then
+# each use `line:col` — the kind-6 events with NO live local bind of the name (a local
+# shadow owns its uses). The declaration row itself is the server's to add: its line scan
+# already indexes decl-name spans.
+const top_refs! = (Loaded ld, Str input, Str name): Iarch -> {
+	let Bool found = false
+
+	for f in ld.prog.funcs {
+		if eq(f.name, name) then {
+			if f.is_pub then return 0
+			found = true
+		}
+	}
+
+	if !found then return 0
+	println("top")
+	let Iarch depth = 0
+	let [Iarch] loffs = []
+	let [Iarch] ldeps = []
+	const [SrcMap] maps = [ld.map]
+
+	for ev in ld.evs {
+		if ev.kind == 0 then depth = depth + 1
+		if ev.kind == 1 then {
+			let [Iarch] ko = []
+			let [Iarch] kd = []
+
+			for (b, i) in loffs {
+				if ldeps[i] < depth then {
+					ko = [...ko, b]
+					kd = [...kd, ldeps[i]]
+				}
+			}
+
+			loffs = ko
+			ldeps = kd
+			depth = depth - 1
+		}
+		if ev.kind >= 2 && ev.kind <= 5 && eq(ev.name, name) then {
+			loffs = [...loffs, ev.off]
+			ldeps = [...ldeps, depth]
+		}
+		if ev.kind == 6 && eq(ev.name, name) && Iarch(loffs.len) == 0 then {
+			const LC lc = line_col_of(maps, input, ev.off)
+			if lc.line > 0 then println("${lc.line}:${lc.col}")
+		}
+	}
+
+	return 0
+}
+
 const run_refs! = (Str input, Str src, Iarch off, Str name): Iarch -> {
 	const Loaded ld = entry_binds!(input, src, os::target, host_arch())
 	const Iarch target = binder_at!(ld.evs, off, name)
-	if target < 0 then return 0
+	if target < 0 then return top_refs!(ld, input, name)
 	let [Iarch] refs = [target]
 	let Iarch depth = 0
 	let [Iarch] uoffs = []
