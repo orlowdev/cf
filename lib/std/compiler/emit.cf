@@ -122,6 +122,8 @@ data Emit = {
 	Iarch local_slot,
 	Bool skip_embeds,
 	Str build_version,
+	Os target_os,
+	Arch target_arch,
 	# the open LABELED statement loops, innermost last — `break outer` resolves its jump target
 	# (`@lend<lid>`) through these parallel stacks (an unlabeled loop pushes nothing)
 	[Str] loop_labels,
@@ -3991,6 +3993,31 @@ const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env)
 	if eq(callee, "std_comptime_version_compiler") && callee_is_intrinsic(ctx, callee) then {
 		return emit_str_interned!(ctx, compiler_version)
 	}
+	# `std::comptime::os::target` / `arch::target` in VALUE position — fold to the target's tag
+	# immediate (`Os`/`Arch` are tag-only unions, so a value IS its tag word). The numbers are the
+	# member ORDER in lib/std/sys.cf; a comptime `if` condition never reaches here (it folds at
+	# parse), so this is the runtime-value form: `let Os t = os::target`, `match arch::target …`.
+	if eq(callee, "std_comptime_os_target") && callee_is_intrinsic(ctx, callee) then {
+		return match ctx.target_os {
+			Os.Darwin -> "0",
+			Os.Linux -> "1",
+			Os.Bare -> "2",
+		}
+	}
+	if eq(callee, "std_comptime_arch_target") && callee_is_intrinsic(ctx, callee) then {
+		return match ctx.target_arch {
+			Arch.Arm64 -> "0",
+			Arch.Amd64 -> "1",
+			Arch.Riscv64 -> "2",
+			Arch.Wasm -> "3",
+		}
+	}
+	# `os::current` / `arch::current` (the platform the COMPILER runs on) have no value lowering
+	# yet — die honestly rather than emit a dangling reference.
+	if eq(callee, "std_comptime_os_current") && callee_is_intrinsic(ctx, callee)
+		then die("cf: emit: `os::current` has no value form yet — use `os::target`\n")
+	if eq(callee, "std_comptime_arch_current") && callee_is_intrinsic(ctx, callee)
+		then die("cf: emit: `arch::current` has no value form yet — use `arch::target`\n")
 	# `std::comptime::embed("path")` — read the file NOW (compile time) and emit its bytes as a
 	# string literal, so they ride in the binary. `emit_str_lit!` lays them down as static `data`
 	# when the pre-scan interned them, else materializes them inline — either way baked in, nothing
@@ -7557,6 +7584,8 @@ pub const emit_program! = (
 				local_slot: 0,
 				skip_embeds: skip_embeds,
 				build_version: build_version,
+				target_os: target_os,
+				target_arch: target_arch,
 				loop_labels: no_names(),
 				loop_lids: no_lids(),
 			})
