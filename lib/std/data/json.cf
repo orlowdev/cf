@@ -516,6 +516,129 @@ pub const at = (Iarch i, Json j): Maybe[Json] -> {
 	return Maybe[Json].Nothing
 }
 
+# Ten to a small non-negative power, built by repeated multiplication — every power up to
+# 10^22 is exactly representable in a Float64, and each step's product is one of them, so the
+# loop is exact all the way.
+const pow10 = (Iarch e): Float64 -> {
+	let Float64 p = 1.0
+	let Iarch i = 0
+
+	loop {
+		if i >= e then break
+		p = p * 10.0
+		i = i + 1
+	}
+
+	return p
+}
+
+# A number value as a `Float64`, via the EXACT fast path only: at most 15 significant digits
+# as written, scaled by a decimal power within 10^-22..10^22, converts with ONE multiply or
+# divide — IEEE rounds that single operation correctly, so the result is the nearest double,
+# guaranteed. A number outside the window comes back `Left` (it needs the full
+# correctly-rounded parser, a later brick) — a restriction, never an approximation.
+pub const as_float = (Json j): Either[JsonRrr, Float64] -> {
+	match j {
+		Json.Num(n) -> {
+			let Iarch i = 0
+			let Float64 sign = 1.0
+
+			if Iarch(n.len) > 0 && Iarch(n[0]) == 45 then {
+				sign = 0.0 - 1.0
+				i = 1
+			}
+			let Iarch mant = 0
+			let Iarch sig = 0
+			let Iarch e10 = 0
+			let Bool nonzero = false
+			let Bool any = false
+
+			loop {
+				if i >= Iarch(n.len) then break
+				const Iarch c = Iarch(n[i])
+
+				if c < 48 || c > 57 then break
+				any = true
+				if c != 48 then nonzero = true
+				if nonzero then sig = sig + 1
+				if sig > 15 then
+					return Either[JsonRrr, Float64].Left(JsonRrr({
+						off: i,
+						msg: "beyond the exact conversion window (more than 15 significant digits)",
+					}))
+				mant = mant * 10 + (c - 48)
+				i = i + 1
+			}
+			if i < Iarch(n.len) && Iarch(n[i]) == 46 then {
+				i = i + 1
+
+				loop {
+					if i >= Iarch(n.len) then break
+					const Iarch c = Iarch(n[i])
+
+					if c < 48 || c > 57 then break
+					any = true
+					if c != 48 then nonzero = true
+					if nonzero then sig = sig + 1
+					if sig > 15 then
+						return Either[JsonRrr, Float64].Left(JsonRrr({
+							off: i,
+							msg: "beyond the exact conversion window (more than 15 significant digits)",
+						}))
+					mant = mant * 10 + (c - 48)
+					e10 = e10 - 1
+					i = i + 1
+				}
+			}
+			if !any then
+				return Either[JsonRrr, Float64].Left(JsonRrr({ off: i, msg: "not a number lexeme" }))
+			if i < Iarch(n.len) && (Iarch(n[i]) == 101 || Iarch(n[i]) == 69) then {
+				i = i + 1
+				let Iarch esign = 1
+
+				if i < Iarch(n.len) && Iarch(n[i]) == 43 then i = i + 1
+				if i < Iarch(n.len) && Iarch(n[i]) == 45 then {
+					esign = -1
+					i = i + 1
+				}
+				let Iarch ee = 0
+				let Bool eany = false
+
+				loop {
+					if i >= Iarch(n.len) then break
+					const Iarch c = Iarch(n[i])
+
+					if c < 48 || c > 57 then break
+					eany = true
+					if ee < 1000 then ee = ee * 10 + (c - 48)
+					i = i + 1
+				}
+
+				if !eany then
+					return Either[JsonRrr, Float64].Left(JsonRrr({ off: i, msg: "not a number lexeme" }))
+				e10 = e10 + esign * ee
+			}
+			if i < Iarch(n.len) then
+				return Either[JsonRrr, Float64].Left(JsonRrr({ off: i, msg: "not a number lexeme" }))
+			if e10 > 22 || e10 < -22 then
+				return Either[JsonRrr, Float64].Left(JsonRrr({
+					off: 0,
+					msg: "beyond the exact conversion window (a power of ten outside 1e-22..1e22)",
+				}))
+			const Float64 fm = Float64(mant)
+			let Float64 v = fm
+
+			if e10 > 0 then v = fm * pow10(e10)
+			if e10 < 0 then v = fm / pow10(0 - e10)
+
+			return Either[JsonRrr, Float64].Right(sign * v)
+		},
+		_ -> {},
+	}
+
+	return Either[JsonRrr, Float64].Left(JsonRrr({ off: 0, msg: "not a number value" }))
+}
+
 # A number value as a machine integer: the lexeme must be integral (no fraction or exponent)
 # and fit an `Iarch` — overflow is a `Left`, not a wrap. (The most negative 64-bit value is
 # rejected with the overflow — the cap is symmetric at its magnitude minus one.)
