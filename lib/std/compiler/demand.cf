@@ -1,0 +1,622 @@
+# demand — the context demand algebra (context.md §4), the read-only `const`-context checker.
+#
+# A function's DEMAND SET is the set of context types it needs threaded from above: its own
+# `consume(T)`s unioned with its callees' demands, MINUS the types it provides in its own scope.
+# The set is computed bottom-up over the whole call tree to a fixpoint, by the same shape of
+# monotone walk that colors `!` (alloc.cf) — a provide DISCHARGES a demand, subtracting it from
+# the residual, and a provide of a record that declares `...Src` discharges a `uses Src` demand
+# too (the spread is the nominal opt-in, context.md §5). At a module boundary the demand is the
+# CONTRACT: a `pub` function's declared `uses` clause is what its callers see and what this pass
+# validates its body against, both ways (an undeclared demand and a redundant declaration are each
+# rejected), exactly as the `!` marker is validated both ways.
+#
+# UNCONDITIONAL, pre-monomorphization, alongside the `!` and root gates: the demand is per SOURCE
+# function. This is the read-only half of the arc — every provide is `const`, every consume a read.
+# The mutation rules (a `let` provide, an in-place write, a mutating demand against a `const`
+# provide) land with their codegen in the ABI milestone; the fn-free-field requirement (§3) is
+# already guaranteed by the record grammar (a field type is a name or an array, never a `(A) -> B`),
+# so it needs no check here.
+#
+# The rejections this pass raises: an undischarged demand at `main` (§4); an undeclared or a
+# redundant demand on a `pub` function (§4); a demand-carrying function used as a VALUE (§4, fn
+# values are demand-free — an indirect call site cannot supply the hidden arguments); an ambiguous
+# discharge — two provides in one scope that can each discharge one demand (§5).
+
+import std::compiler::ast::{ Program, Func, RecDecl, Param, Stmt, Expr, StmtArm, MatchArm }
+import std::compiler::routing::{ kids, stmt_exprs }
+import std::compiler::spans::{ unat, SrcMap }
+import std::compiler::diag::{ Diag }
+import std::compiler::alloc::{ address_taken }
+import std::data::str::{ eq }
+
+# The resolved intrinsic callees (module_system §8 flattens `std::mem::ctx::provide` to this flat
+# name). Matched by name exactly as the `!` and typecheck passes match `of__el` / `std_mem_raw_*`.
+const consume_fn = "std_mem_ctx_consume"
+const provide_fn = "std_mem_ctx_provide"
+
+# ── small list utilities (a monotone string-set algebra) ─────────────────────────────────────────
+
+const no_s = (): [Str] -> {
+	let [Str] e = []
+
+	return e
+}
+
+const one_s = (Str a): [Str] -> {
+	let [Str] r = [a]
+
+	return r
+}
+
+const has_s = ([Str] xs, Str s): Bool -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(xs.len) then break
+		if eq(xs[i], s) then return true
+		i = i + 1
+	}
+
+	return false
+}
+
+const cat_s = ([Str] a, [Str] b): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(a.len) then break
+		r = [...r, a[i]]
+		i = i + 1
+	}
+
+	let Iarch j = 0
+
+	loop {
+		if j >= Iarch(b.len) then break
+		r = [...r, b[j]]
+		j = j + 1
+	}
+
+	return r
+}
+
+# The set union of `a` and `b`, each element once (empties dropped — an indeterminable provide type
+# or a malformed consume name never enters a set).
+const union_s = ([Str] a, [Str] b): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(a.len) then break
+		if Iarch(a[i].len) > 0 && !has_s(r, a[i]) then r = [...r, a[i]]
+		i = i + 1
+	}
+
+	let Iarch j = 0
+
+	loop {
+		if j >= Iarch(b.len) then break
+		if Iarch(b[j].len) > 0 && !has_s(r, b[j]) then r = [...r, b[j]]
+		j = j + 1
+	}
+
+	return r
+}
+
+# `a` with every element of `b` removed — a provide subtracts the types it discharges.
+const minus_s = ([Str] a, [Str] b): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(a.len) then break
+		if Iarch(a[i].len) > 0 && !has_s(b, a[i]) then r = [...r, a[i]]
+		i = i + 1
+	}
+
+	return r
+}
+
+const find_func = ([Func] fs, Str n): Iarch -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(fs.len) then break
+		if eq(fs[i].name, n) then return i
+		i = i + 1
+	}
+
+	return -1
+}
+
+const find_rec = ([RecDecl] rs, Str n): Iarch -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(rs.len) then break
+		if eq(rs[i].name, n) then return i
+		i = i + 1
+	}
+
+	return -1
+}
+
+# ── spread expansion (the nominal discharge closure, context.md §5) ──────────────────────────────
+# The set of types a provide of `name` discharges: `name` itself plus every type its record declares
+# by `...Src`, transitively. The depth guard turns an accidental spread cycle into a bounded set
+# rather than a hang (resolve already rejects a real cycle at declaration time).
+const expand_spread = ([RecDecl] recs, Str name, Iarch depth): [Str] -> {
+	if depth > 64 then return one_s(name)
+	const Iarch ri = find_rec(recs, name)
+	if ri < 0 then return one_s(name)
+	let [Str] r = one_s(name)
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(recs[ri].spreads.len) then break
+		r = union_s(r, expand_spread(recs, recs[ri].spreads[i], depth + 1))
+		i = i + 1
+	}
+
+	return r
+}
+
+# Every type discharged by the provide list `provs` — the union of each provided type's spread
+# closure. This is subtracted from a function's raw demand to leave its residual.
+const discharged = ([RecDecl] recs, [Str] provs): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(provs.len) then break
+		r = union_s(r, expand_spread(recs, provs[i], 0))
+		i = i + 1
+	}
+
+	return r
+}
+
+# How many provides in `provs` can discharge a demand for `T` — `T` matches a provide `P` when it is
+# `P` itself or a type `P` declares by spread. Two or more is an ambiguous context (context.md §5).
+const disch_count = ([RecDecl] recs, [Str] provs, Str t): Iarch -> {
+	let Iarch n = 0
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(provs.len) then break
+		if has_s(expand_spread(recs, provs[i], 0), t) then n = n + 1
+		i = i + 1
+	}
+
+	return n
+}
+
+# ── per-function collection: the consumed types, the provided types, the concrete callees ────────
+# The value-type environment a provide's argument resolves against: parameter and `let`/`const`
+# annotation (name, type) pairs. A `provide(x)` names its type from a record literal directly, or
+# from `x`'s annotated binding — an indeterminable provide (an unannotated inferred binding) is
+# skipped, and surfaces as an undischarged demand rather than silently discharging the wrong type.
+data Ann = { [Str] names, [Str] tys }
+
+const ann_lookup = (Ann an, Str n): Str -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(an.names.len) then break
+		if eq(an.names[i], n) then return an.tys[i]
+		i = i + 1
+	}
+
+	return ""
+}
+
+const param_ann = ([Param] ps): Ann -> {
+	let [Str] ns = []
+	let [Str] ts = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(ps.len) then break
+		ns = [...ns, ps[i].name]
+		ts = [...ts, ps[i].type_name]
+		i = i + 1
+	}
+
+	return Ann({ names: ns, tys: ts })
+}
+
+# Grow the annotation environment with every `let`/`const` binding that carries a written type name,
+# walked over the whole body (a provide may sit inside any nesting). The pairs are append-only.
+const anns_body = (Ann an, [Stmt] ss): Ann -> {
+	let Ann a = an
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(ss.len) then break
+		a = anns_stmt(a, ss[i])
+		i = i + 1
+	}
+
+	return a
+}
+
+const anns_arms = (Ann an, [StmtArm] arms): Ann -> {
+	let Ann a = an
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(arms.len) then break
+		a = anns_body(a, arms[i].body)
+		i = i + 1
+	}
+
+	return a
+}
+
+const let_ann_name = (Stmt s): Str -> match s { Stmt.Let(n, _, _, _) -> n, _ -> "" }
+
+const let_ann_ty = (Stmt s): Str -> match s { Stmt.Let(_, _, ann, _) -> ann, _ -> "" }
+
+const anns_stmt = (Ann an, Stmt s): Ann -> {
+	let Ann a = an
+	const Str lt = let_ann_ty(s)
+	if Iarch(lt.len) > 0 then a = Ann({ names: [...a.names, let_ann_name(s)], tys: [...a.tys, lt] })
+
+	return match s {
+		Stmt.IfThen(_, b) -> anns_stmt(a, b),
+		Stmt.IfElse(_, t, el) -> anns_stmt(anns_stmt(a, t), el),
+		Stmt.Block(ss) -> anns_body(a, ss),
+		Stmt.Loop(_, ss) -> anns_body(a, ss),
+		Stmt.ForIn(_, _, ss) -> anns_body(a, ss),
+		Stmt.Match(_, arms) -> anns_arms(a, arms),
+		Stmt.Defer(ss) -> anns_body(a, ss),
+		Stmt.Closure(_, _, _, cb) -> anns_body(a, cb),
+		_ -> a,
+	}
+}
+
+const var_name = (Expr e): Str -> match unat(e) { Expr.Var(n) -> n, _ -> "" }
+
+# The type a `provide(arg)` provides: a record literal names it directly (`provide(Cfg({...}))`); a
+# bare name resolves through the annotation environment; anything else is indeterminable ("").
+const provide_ty = (Ann an, Expr arg): Str -> match unat(arg) {
+	Expr.Record(tn, _) -> tn,
+	Expr.Var(n) -> ann_lookup(an, n),
+	_ -> "",
+}
+
+# The three site sets a function's body yields, threaded through one walk.
+data Scan = { [Str] cons, [Str] provs, [Str] calls }
+
+const scan_empty = (): Scan -> Scan({ cons: no_s(), provs: no_s(), calls: no_s() })
+
+const scan_cat = (Scan a, Scan b): Scan -> Scan({
+	cons: cat_s(a.cons, b.cons),
+	provs: cat_s(a.provs, b.provs),
+	calls: cat_s(a.calls, b.calls),
+})
+
+const scan_l! = (Ann an, [Str] params, [Expr] es): Scan -> {
+	let Scan r = scan_empty()
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(es.len) then break
+		r = scan_cat(r, scan_e!(an, params, es[i]))
+		i = i + 1
+	}
+
+	return r
+}
+
+const scan_e! = (Ann an, [Str] params, Expr e): Scan -> {
+	let Scan h = scan_empty()
+
+	match unat(e) {
+		Expr.Call(n, _, a, _) -> {
+			if eq(n, consume_fn) && Iarch(a.len) >= 1 then h = Scan({ cons: one_s(var_name(a[0])), provs: no_s(), calls: no_s() })
+			if eq(n, provide_fn) && Iarch(a.len) >= 1 then h = Scan({ cons: no_s(), provs: one_s(provide_ty(an, a[0])), calls: no_s() })
+			if !eq(n, consume_fn) && !eq(n, provide_fn) && !has_s(params, n)
+				then h = Scan({ cons: no_s(), provs: no_s(), calls: one_s(n) })
+		},
+		Expr.DeferTap(f, _) -> {
+			if !has_s(params, f) then h = Scan({ cons: no_s(), provs: no_s(), calls: one_s(f) })
+		},
+		_ -> { },
+	}
+
+	const Scan sub = match unat(e) {
+		Expr.Loop(ss) -> scan_b!(an, params, ss),
+		_ -> scan_l!(an, params, kids(e)),
+	}
+
+	return scan_cat(h, sub)
+}
+
+const scan_arms! = (Ann an, [Str] params, [StmtArm] arms): Scan -> {
+	let Scan r = scan_empty()
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(arms.len) then break
+		r = scan_cat(r, scan_b!(an, params, arms[i].body))
+		i = i + 1
+	}
+
+	return r
+}
+
+const scan_stmt! = (Ann an, [Str] params, Stmt s): Scan -> {
+	let Scan a = scan_l!(an, params, stmt_exprs(s))
+
+	return scan_cat(a, match s {
+		Stmt.IfThen(_, b) -> scan_stmt!(an, params, b),
+		Stmt.IfElse(_, t, el) -> scan_cat(scan_stmt!(an, params, t), scan_stmt!(an, params, el)),
+		Stmt.Block(ss) -> scan_b!(an, params, ss),
+		Stmt.Loop(_, ss) -> scan_b!(an, params, ss),
+		Stmt.ForIn(_, _, ss) -> scan_b!(an, params, ss),
+		Stmt.Match(_, arms) -> scan_arms!(an, params, arms),
+		Stmt.Defer(ss) -> scan_b!(an, params, ss),
+		Stmt.Closure(_, _, _, cb) -> scan_b!(an, params, cb),
+		_ -> scan_empty(),
+	})
+}
+
+const scan_b! = (Ann an, [Str] params, [Stmt] ss): Scan -> {
+	let Scan r = scan_empty()
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(ss.len) then break
+		r = scan_cat(r, scan_stmt!(an, params, ss[i]))
+		i = i + 1
+	}
+
+	return r
+}
+
+const param_names = ([Param] ps): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(ps.len) then break
+		r = [...r, ps[i].name]
+		i = i + 1
+	}
+
+	return r
+}
+
+# ── the fixpoint: residual demand per function ───────────────────────────────────────────────────
+# `cd(name)` — a callee's demand as SEEN by its caller: a `pub` function contributes its DECLARED
+# `uses` (the ABI contract); any other function contributes its currently-inferred residual (so the
+# whole-program inference closes over the call graph). An unknown/intrinsic callee contributes
+# nothing.
+const cd = ([Func] funcs, [[Str]] residual, Str name): [Str] -> {
+	const Iarch j = find_func(funcs, name)
+	if j < 0 then return no_s()
+	if funcs[j].is_pub then return funcs[j].uses
+
+	return residual[j]
+}
+
+# The raw demand a function's own consumes plus its callees' demands amount to, before its own
+# provides discharge anything.
+const raw_demand = ([Func] funcs, [[Str]] residual, [Str] cons, [Str] calls): [Str] -> {
+	let [Str] r = cons
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(calls.len) then break
+		r = union_s(r, cd(funcs, residual, calls[i]))
+		i = i + 1
+	}
+
+	return r
+}
+
+# ── evidence: locate a consume of `t` in a body, for a precise diagnostic anchor ─────────────────
+
+const at_off = (Expr e): Iarch -> match e { Expr.At(o, _) -> o, _ -> -1 }
+
+# ── the pass ─────────────────────────────────────────────────────────────────────────────────────
+
+# Validate the context demand algebra over `prog`. Returns one located diagnostic per violation,
+# COLLECTED across the whole program (like the `!` checker) so one run reports every one.
+pub const check_demand_program! = (Program prog, [SrcMap] maps): [Diag] -> {
+	const [Func] funcs = prog.funcs
+	const [RecDecl] recs = prog.recs
+	const Iarch n = Iarch(funcs.len)
+
+	# collect each function's consumed types, provided types (discharge closure applied later), and
+	# concrete callees — once
+	let [[Str]] cons = []
+	let [[Str]] provs = []
+	let [[Str]] calls = []
+	let [[Str]] disch = []
+	let Iarch i = 0
+
+	loop {
+		if i >= n then break
+		if funcs[i].is_asm || funcs[i].is_intrinsic then {
+			cons = [...cons, no_s()]
+			provs = [...provs, no_s()]
+			calls = [...calls, no_s()]
+			disch = [...disch, no_s()]
+		} else {
+			const Ann an = param_ann(funcs[i].params)
+			const Ann an2 = anns_body(an, funcs[i].body)
+			const [Str] params = param_names(funcs[i].params)
+			const Scan sc = scan_b!(an2, params, funcs[i].body)
+			cons = [...cons, union_s(sc.cons, no_s())]
+			provs = [...provs, union_s(sc.provs, no_s())]
+			calls = [...calls, sc.calls]
+			disch = [...disch, discharged(recs, sc.provs)]
+		}
+		i = i + 1
+	}
+
+	# residual fixpoint: residual[i] = (own consumes ∪ callees' demands) − discharged(provides).
+	# Monotone increasing (the union grows, the discharge set is fixed per function), so it settles.
+	let [[Str]] residual = []
+	let Iarch z = 0
+
+	loop {
+		if z >= n then break
+		residual = [...residual, no_s()]
+		z = z + 1
+	}
+
+	loop {
+		let Bool changed = false
+		let Iarch k = 0
+
+		loop {
+			if k >= n then break
+			const [Str] raw = raw_demand(funcs, residual, cons[k], calls[k])
+			const [Str] res = minus_s(raw, disch[k])
+			if Iarch(res.len) != Iarch(residual[k].len) then {
+				residual[k] = res
+				changed = true
+			}
+			k = k + 1
+		}
+
+		if !changed then break
+	}
+
+	let [Diag] diags = []
+	const [Str] taken = address_taken(prog)
+
+	# main must discharge every demand it carries — nothing provides context to the entry (§4).
+	const Iarch mi = find_func(funcs, "main")
+	if mi >= 0 then {
+		const [Str] rm = residual[mi]
+		const Func mf = funcs[mi]
+		let Iarch t = 0
+
+		loop {
+			if t >= Iarch(rm.len) then break
+			diags = [
+				...diags,
+				Diag({
+					file: mf.dfile,
+					line: mf.dline,
+					col: mf.dcol,
+					msg: "cf: ctx: `main` reaches a `consume(${rm[t]})` with no `provide` in scope — provide it on an arena in `main`\n",
+					what: "",
+				}),
+			]
+			t = t + 1
+		}
+	}
+
+	let Iarch f = 0
+
+	loop {
+		if f >= n then break
+		const Func ff = funcs[f]
+		if ff.is_asm || ff.is_intrinsic then {
+			f = f + 1
+			continue
+		}
+
+		const [Str] resf = residual[f]
+
+		# a `pub` function's declared `uses` is its ABI: it must match its inferred residual demand
+		# exactly, both ways (an undeclared demand and a redundant declaration each rejected, §4).
+		# `main` is exempt — it is the entry, not a `uses`-bearing contract (its own undischarged
+		# demands are caught above); the ambiguity check below still applies to it.
+		if ff.is_pub && !eq(ff.name, "main") then {
+			let Iarch a = 0
+
+			loop {
+				if a >= Iarch(resf.len) then break
+				if !has_s(ff.uses, resf[a])
+					then diags = [
+					...diags,
+					Diag({
+						file: ff.dfile,
+						line: ff.dline,
+						col: ff.dcol,
+						msg: "cf: ctx: `${ff.name}` demands `${resf[a]}` but does not declare it — add `uses ${resf[a]}`\n",
+						what: "",
+					}),
+				]
+				a = a + 1
+			}
+
+			let Iarch u = 0
+
+			loop {
+				if u >= Iarch(ff.uses.len) then break
+				if !has_s(resf, ff.uses[u])
+					then diags = [
+					...diags,
+					Diag({
+						file: ff.dfile,
+						line: ff.dline,
+						col: ff.dcol,
+						msg: "cf: ctx: `${ff.name}` declares `uses ${ff.uses[u]}` but has no such demand — drop it\n",
+						what: "",
+					}),
+				]
+				u = u + 1
+			}
+		}
+
+		# an ambiguous discharge: a demand this function's provides can satisfy in more than one way
+		# (two provides of the same type, or a direct provide next to one that embeds it by spread, §5)
+		const [Str] pf = provs[f]
+		const [Str] seen = union_s(cons[f], raw_demand(funcs, residual, cons[f], calls[f]))
+		let Iarch d = 0
+
+		loop {
+			if d >= Iarch(seen.len) then break
+			if disch_count(recs, pf, seen[d]) >= 2
+				then diags = [
+				...diags,
+				Diag({
+					file: ff.dfile,
+					line: ff.dline,
+					col: ff.dcol,
+					msg: "cf: ctx: `${ff.name}` provides `${seen[d]}` two ways — an ambiguous context (drop one provide)\n",
+					what: "",
+				}),
+			]
+			d = d + 1
+		}
+
+		f = f + 1
+	}
+
+	# a demand-carrying function cannot be taken as a VALUE: its ABI differs by its demands, so an
+	# indirect call site cannot supply the hidden pointers (§4). Its demand is its declared `uses`
+	# when `pub`, else its inferred residual.
+	let Iarch v = 0
+
+	loop {
+		if v >= Iarch(taken.len) then break
+		const Iarch j = find_func(funcs, taken[v])
+		if j >= 0 && !funcs[j].is_asm && !funcs[j].is_intrinsic then {
+			const Func jf = funcs[j]
+			const [Str] dem = if jf.is_pub then jf.uses else residual[j]
+			if Iarch(dem.len) > 0
+				then diags = [
+				...diags,
+				Diag({
+					file: jf.dfile,
+					line: jf.dline,
+					col: jf.dcol,
+					msg: "cf: ctx: `${jf.name}` carries context demands (`${dem[0]}`) and cannot be used as a value — take it as an explicit parameter\n",
+					what: "",
+				}),
+			]
+		}
+		v = v + 1
+	}
+
+	return diags
+}

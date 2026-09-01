@@ -11,12 +11,24 @@ hidden argument to exactly the functions that demand it. Nothing here is a
 runtime registry; provision, discharge, and routing are all compile-time, and
 the only runtime artifact is a pointer in a register.
 
-Status: design **ratified, not implemented**. It is scheduled with the
-concurrency arc — the demand analysis below (§4) shares its checker machinery
-with the spawn gates, and context inheritance across tasks (§7) is that arc's
-concern. The `uses` clause is a pending [[ebnf.md]] addition; `provide` and
+Status: the **read-only `const`-context surface and its demand checker are
+implemented** (M-A); the hidden-argument ABI, the `let`-provide mutation rules,
+and context-across-tasks are not. What lands now: the `std::mem::ctx` module
+(`provide`/`consume` as bodyless intrinsics), the `uses` clause (§4), and the
+`demand` pass — computing each function's demand set and raising the §4/§5
+rejections it can decide without codegen (an undischarged demand, an undeclared
+or redundant `pub` demand, a demand-carrying function used as a value, an
+ambiguous discharge). Because the pointer is not yet threaded, a demand-sound
+program is *accepted* but not yet *run*: emit lowering of `provide`/`consume`,
+the canonical-sorted hidden signature, the interior-pointer spread discharge,
+and dead-provide elimination are the ABI milestone (M-B). The `let`-provide
+mutation rules of §3 (in-place-only, no repointing) land with that milestone's
+stores; context-across-tasks (§7) stays with the concurrency arc. The fn-free
+requirement of §3 needs no check — a record field type is a name or an array,
+never a `(A) -> B`, so a provided type is fn-free by grammar. `provide` and
 `consume` are ordinary bodyless intrinsics in the style of the geometry
-constructors ([[geometry_lowering.md]] §1) and need no grammar of their own.
+constructors ([[geometry_lowering.md]] §1); the `uses` clause is in
+[[ebnf.md]].
 
 ## 1. The model
 

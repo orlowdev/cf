@@ -2873,6 +2873,25 @@ const parse_ret_name! = (*Parser p): RetSig -> {
 	return RetSig({ name: n, elem: "", telems: [], size: 0 })
 }
 
+# Parse an optional `uses T1, T2, ...` context-demand clause (context.md §4) — the declared hidden
+# `T` demands, written between the return type and the `->`. `uses` is a contextual keyword: it can
+# only appear in this signature position, so it never shadows a like-named binding elsewhere. Each
+# demand is a nominal type name (a plain record, or a generic application kept as a bracketed
+# string for the monomorph pass). The `uses` token is already confirmed by the caller.
+const parse_uses! = (*Parser p): [Str] -> {
+	p.pos = p.pos + 1 # `uses`
+	let [Str] r = []
+
+	loop {
+		if !is_ident(peek(p)) then perr(p, "cf: parse: expected a type name in a `uses` clause\n")
+		r = [...r, parse_type_ref!(p)]
+		if !is_comma(peek(p)) then break
+		p.pos = p.pos + 1
+	}
+
+	return r
+}
+
 # Split an `asm "..."` body string into segments — literal runs and `${param}` holes —
 # VERBATIM (no escape decoding; the assembler wants the raw bytes). A hole names a
 # parameter, resolved to its argument register at emit. Mirrors `parse_string`'s segment
@@ -3112,6 +3131,7 @@ const parse_func! = (*Parser p): Func -> {
 			ret_elem: vrs.elem,
 			params: vnoparams,
 			body: vibody,
+			uses: vintp,
 			is_asm: false,
 			asm_body: vinoasm,
 			is_value: true,
@@ -3171,6 +3191,7 @@ const parse_func! = (*Parser p): Func -> {
 			ret_elem: "",
 			params: noparams,
 			body: vbody,
+			uses: no_tp,
 			is_asm: false,
 			asm_body: vnoasm,
 			is_value: true,
@@ -3191,6 +3212,11 @@ const parse_func! = (*Parser p): Func -> {
 	if !is_rparen(peek(p)) then perr(p, "cf: parse: expected `)`\n")
 	p.pos = p.pos + 1
 	const RetSig rs = parse_ret_name!(p)
+	# an optional `uses T1, T2, ...` context-demand clause (context.md §4), between the return type
+	# and the `->`. Only a real function bears one; an `intrinsic` stops at its signature (its demand
+	# surface is fixed by the compiler), so the clause is not read for one.
+	let [Str] uses_cl = []
+	if !is_intrin && kw(p, "uses") then uses_cl = parse_uses!(p)
 	# an `intrinsic` stops at its signature — no `->`, no body; the compiler supplies it.
 	if is_intrin then {
 		if is_arrow(peek(p))
@@ -3206,6 +3232,7 @@ const parse_func! = (*Parser p): Func -> {
 			ret_elem: rs.elem,
 			params: params,
 			body: ibody,
+			uses: uses_cl,
 			is_asm: false,
 			asm_body: inoasm,
 			is_value: false,
@@ -3240,6 +3267,7 @@ const parse_func! = (*Parser p): Func -> {
 			ret_elem: rs.elem,
 			params: params,
 			body: nobody,
+			uses: uses_cl,
 			is_asm: true,
 			asm_body: segs,
 			is_value: false,
@@ -3266,6 +3294,7 @@ const parse_func! = (*Parser p): Func -> {
 			ret_elem: rs.elem,
 			params: params,
 			body: body,
+			uses: uses_cl,
 			is_asm: false,
 			asm_body: noasm,
 			is_value: false,
@@ -3293,6 +3322,7 @@ const parse_func! = (*Parser p): Func -> {
 		ret_elem: rs.elem,
 		params: params,
 		body: one,
+		uses: uses_cl,
 		is_asm: false,
 		asm_body: noasm,
 		is_value: false,
@@ -3343,6 +3373,10 @@ const parse_record_body! = (*Parser p, Str name, [Str] typarams, [Str] tbounds):
 	let [[TupElem]] ftelems = []
 	let [Bool] fptrs = []
 	let [Iarch] fsizes = []
+	# the NOMINAL declaration-spread sources (context.md §5): each `...Src` source name, kept
+	# alongside the flattened fields so the demand pass can discharge a `uses Src` through a provide
+	# of a record that declares `...Src`. Resolve carries this list through the field flatten.
+	let [Str] spreads = []
 	const [TupElem] no_tel = []
 
 	loop {
@@ -3366,6 +3400,7 @@ const parse_record_body! = (*Parser p, Str name, [Str] typarams, [Str] tbounds):
 				then perr(p, "cf: parse: cannot spread a generic type application in a declaration\n")
 			fields = [...fields, src]
 			ftypes = [...ftypes, "$spread"]
+			spreads = [...spreads, src]
 			felems = [...felems, ""]
 			ftelems = [...ftelems, no_tel]
 			fptrs = [...fptrs, false]
@@ -3476,6 +3511,7 @@ const parse_record_body! = (*Parser p, Str name, [Str] typarams, [Str] tbounds):
 		dfile: "",
 		dline: 0,
 		dcol: 0,
+		spreads: spreads,
 	})
 }
 
@@ -4141,6 +4177,7 @@ const parse_static! = (*Parser p): Func -> {
 		ret_elem: "Uint8",
 		params: noparams,
 		body: body,
+		uses: no_tp,
 		is_asm: false,
 		asm_body: noasm,
 		is_value: true,

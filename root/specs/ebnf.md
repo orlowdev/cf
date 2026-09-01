@@ -904,7 +904,8 @@ allocation-effect marker (see Identifiers and the memory model), part of the
 binding's name — not of the lambda.
 
 ```ebnf
-function       = [ generic_params ] , param_list , [ ":" , type ] , "->" , ( block | expression | asm_block ) ;   (* ":" return set off from the "->" body; asm_block: see Assembly *)
+function       = [ generic_params ] , param_list , [ ":" , type ] , [ uses_clause ] , "->" , ( block | expression | asm_block ) ;   (* ":" return set off from the "->" body; asm_block: see Assembly *)
+uses_clause    = "uses" , type , { "," , type } ;   (* declared context demands — the hidden T pointers this fn needs; see context.md §4 *)
 
 generic_params = "[" , generic_param , { "," , generic_param } , "]" ;   (* ['T] | ['K, 'V] | [Uarch n, 'T] | [NonNegativeInteger 'V] *)
 generic_param  = type_var                                          (* 'T                    — unbounded type variable *)
@@ -957,6 +958,12 @@ Points:
   (`(Int32 x): Int32 -> ...`). Omit it (`(Int32 x) -> ...`) to infer it from the body —
   or for a function that returns nothing. The `->` always immediately precedes the
   body; the `:` return keeps it from colliding with the function *type*'s `->`.
+- **A `uses` clause declares the function's context demands** — the provided
+  types it (transitively) consumes, set between the return type and the `->`
+  (`(Str s): () uses AppConfig -> ...`; [[context.md]] §4). It is `uses` = the
+  hidden `T` pointers, the dual of the `!` that ends a name (which needs the
+  ambient node). Mandatory on a `pub` function, inferred within a module; a
+  contextual keyword, valid only in this signature position.
 - **The body is a `block` or a single `expression`.** `-> a + b` is a
   single-line body whose value is the implicit return; `-> { ... }` is a braced
   block that returns via `return`. So `(Int32 a, Int32 b) -> a + b` and
