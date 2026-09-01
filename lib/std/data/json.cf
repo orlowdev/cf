@@ -7,7 +7,8 @@
 
 import std::data::either::{ Either }
 import std::data::maybe::{ Maybe }
-import std::data::str::{ eq, slice, join, utf8_of! }
+import std::data::str::{ eq, join, utf8_of! }
+import std::mem::bytes
 
 # One object member: its key (escape-decoded) and its value.
 pub data JsonEntry = { Str key, Json val }
@@ -99,6 +100,31 @@ const hex4 = (*Jp p): Iarch -> {
 # control byte is rejected (JSON requires it escaped).
 const parse_string! = (*Jp p): Str -> {
 	p.pos = p.pos + 1
+	# FAST PATH: most strings carry no escape — scan to the closing quote, and a clean
+	# run becomes a zero-copy VIEW into the source (the Num-lexeme discipline; the view
+	# lives exactly as long as the document, which owns the whole parse). A backslash or
+	# a control byte falls through to the decoding loop; so does end-of-input (the loop
+	# reports the unterminated string).
+	const Iarch vstart = p.pos
+	let Iarch vi = p.pos
+	let Iarch vend = -1
+
+	loop {
+		if vi >= Iarch(p.src.len) then break
+		const Iarch vb = Iarch(p.src[vi])
+		if vb == 34 then {
+			vend = vi
+			break
+		}
+		if vb == 92 || vb < 32 then break
+		vi = vi + 1
+	}
+
+	if vend >= 0 then {
+		p.pos = vend + 1
+
+		return bytes::view(vstart, vend, p.src)
+	}
 	let [Uint8] out = []
 
 	loop {
@@ -245,7 +271,7 @@ const parse_number = (*Jp p): Json -> {
 		}
 	}
 
-	return Json.Num(slice(start, p.pos, p.src))
+	return Json.Num(bytes::view(start, p.pos, p.src))
 }
 
 const parse_array! = (*Jp p): Json -> {
