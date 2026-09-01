@@ -135,9 +135,9 @@ data Emit = {
 	# the current function's locals that a lifted closure captures BY ADDRESS (`$capref`):
 	# they must stay addressable cells; every other scalar local promotes to a re-assigned temp
 	[Str] cap_cells,
-	# does the current geometry's `on_scope_exit` have exactly the bump-family rewind body?
-	# then each `!` return emits the rewind INLINE instead of calling the hook (`emit_reset!`)
-	Bool bump_exit,
+	# the current geometry's `on_scope_exit` function index when its body is spliceable at
+	# `!` returns (`hook_spliceable` — emit transcribes the hook body inline), else -1 (call)
+	Iarch exit_hook,
 }
 
 # A local/parameter in scope: its interned name, `slot`, its `rec_type` (a record/union
@@ -5402,79 +5402,157 @@ const emit_mark! = (*Emit ctx, Str nodeop): Iarch -> {
 	return mk
 }
 
-# Does geometry hook `fi` carry EXACTLY the bump-family rewind body —
-#   if raw::load(node + 48) == lim then raw::store(node + 40, top)
-#   return 0
-# — over its three parameters? Then `emit_reset!` emits the rewind INLINE at every `!`
-# return (identical ops to the survivor-mark path — `%res_0` IS `node+40`, so `%res_0+8`
-# is the limit at `node+48`), skipping a call per return in every bracketed frame. A
-# geometry whose exit does anything else (a compacting or `rc` hook) keeps the pluggable
-# call — the contract is matched, not assumed.
-const hook_is_bump_exit = ([Func] funcs, Iarch fi): Bool -> {
-	if fi < 0 then return false
-	const Func fn = funcs[fi]
+# ── inlining the scope-exit hook by TRANSCRIPTION ────────────────────────────────────────
+# A geometry's `on_scope_exit` inlines at each `!` return by emitting the hook's OWN BODY at
+# the site, its parameters bound over the site's operands — the hook content (user-visible
+# std source) is the sole authority on exit behavior; emit never substitutes an encoding of
+# its own. Edit the hook and the splice follows, or stops qualifying and the call returns.
+# Only bodies inside the leaf subset emit can splice qualify: raw loads/stores, arithmetic/
+# compares/logic over the parameters, `if` guards, and ONE final `return` of a pure value
+# (discarded — the call's result was too). Anything else — an early return, another call, a
+# loop, an allocation — keeps the pluggable CALL, so a compacting or `rc` geometry whose
+# exit does real work is unaffected.
+
+# Is `e` a pure leaf over the hook's parameters — raw loads/stores, arithmetic, compares,
+# logic, literals? (`Div`/`Mod` are excluded: they carry the trap guard.)
+const hexpr_ok = ([Str] ps, Expr e): Bool -> match e {
+	Expr.Lit(_) -> true,
+	Expr.BoolLit(_) -> true,
+	Expr.Var(n) -> has_str(ps, n),
+	Expr.Call(callee, _, args, g) -> eq(g, "") &&
+		(eq(callee, "std_mem_raw_load") || eq(callee, "std_mem_raw_store")) &&
+		hexprs_ok(ps, args),
+	Expr.Neg(x) -> hexpr_ok(ps, x),
+	Expr.Not(x) -> hexpr_ok(ps, x),
+	Expr.BitNot(x) -> hexpr_ok(ps, x),
+	Expr.Add(l, r) -> hexpr_ok(ps, l) && hexpr_ok(ps, r),
+	Expr.Sub(l, r) -> hexpr_ok(ps, l) && hexpr_ok(ps, r),
+	Expr.Mul(l, r) -> hexpr_ok(ps, l) && hexpr_ok(ps, r),
+	Expr.BitAnd(l, r) -> hexpr_ok(ps, l) && hexpr_ok(ps, r),
+	Expr.BitOr(l, r) -> hexpr_ok(ps, l) && hexpr_ok(ps, r),
+	Expr.BitXor(l, r) -> hexpr_ok(ps, l) && hexpr_ok(ps, r),
+	Expr.Shl(l, r) -> hexpr_ok(ps, l) && hexpr_ok(ps, r),
+	Expr.Shr(l, r) -> hexpr_ok(ps, l) && hexpr_ok(ps, r),
+	Expr.CmpEq(l, r) -> hexpr_ok(ps, l) && hexpr_ok(ps, r),
+	Expr.CmpNe(l, r) -> hexpr_ok(ps, l) && hexpr_ok(ps, r),
+	Expr.CmpLt(l, r) -> hexpr_ok(ps, l) && hexpr_ok(ps, r),
+	Expr.CmpGt(l, r) -> hexpr_ok(ps, l) && hexpr_ok(ps, r),
+	Expr.CmpLe(l, r) -> hexpr_ok(ps, l) && hexpr_ok(ps, r),
+	Expr.CmpGe(l, r) -> hexpr_ok(ps, l) && hexpr_ok(ps, r),
+	Expr.And(l, r) -> hexpr_ok(ps, l) && hexpr_ok(ps, r),
+	Expr.Or(l, r) -> hexpr_ok(ps, l) && hexpr_ok(ps, r),
+	_ -> false,
+}
+
+const hexprs_ok = ([Str] ps, [Expr] es): Bool -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(es.len) then break
+		if !hexpr_ok(ps, es[i]) then return false
+		i = i + 1
+	}
+
+	return true
+}
+
+# A spliceable hook statement: an effect (`Do`) or an `if` guard over spliceable parts.
+# `Return` is NOT here — an early return would need its own control flow; only the single
+# final `return` (handled by `hook_spliceable!`) qualifies, and it is skipped at the site.
+const hstmt_ok = ([Str] ps, Stmt s): Bool -> match s {
+	Stmt.Do(e) -> hexpr_ok(ps, e),
+	Stmt.IfThen(c, b) -> hexpr_ok(ps, c) && hstmt_ok(ps, b),
+	_ -> false,
+}
+
+const hook_spliceable! = (Func fn): Bool -> {
 	if Iarch(fn.params.len) != 3 then return false
-	if Iarch(fn.body.len) != 2 then return false
-	const Str p0 = fn.params[0].name
-	const Str p1 = fn.params[1].name
-	const Str p2 = fn.params[2].name
-	const Bool guard_ok = match fn.body[0] {
-		Stmt.IfThen(c, b) -> exit_cond_ok(p0, p2, c) && exit_store_ok(p0, p1, b),
+	const Iarch n = Iarch(fn.body.len)
+	if n < 1 then return false
+	let [Str] ps = []
+	let Iarch pi = 0
+
+	loop {
+		if pi >= 3 then break
+		if fn.params[pi].is_ptr then return false
+		ps = [...ps, fn.params[pi].name]
+		pi = pi + 1
+	}
+
+	let Iarch i = 0
+
+	loop {
+		if i >= n - 1 then break
+		if !hstmt_ok(ps, fn.body[i]) then return false
+		i = i + 1
+	}
+
+	return match fn.body[n - 1] {
+		Stmt.Return(e) -> hexpr_ok(ps, e),
 		_ -> false,
 	}
-	if !guard_ok then return false
+}
 
-	return match fn.body[1] {
-		Stmt.Return(e) -> expr_is_lit(0, e),
-		_ -> false,
+# Land the hook's body at the site: bind its parameters over `(node, top, lim)` as promoted
+# scalar bindings (plain copies QBE's copy elimination folds away), then emit each statement
+# through the ordinary statement emitter — the same lowering the hook's own function body
+# gets. The final `return` is skipped: its pure value was discarded at the call form too.
+const emit_hook_splice! = (*Emit ctx, Func fn, Str nodeop, Iarch mk): Iarch -> {
+	let [Binding] env = []
+	let Iarch pi = 0
+
+	loop {
+		if pi >= 3 then break
+		const Str op = if pi == 0 then nodeop else "%t${mk + pi - 1}"
+		const Iarch t = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${t} =l copy ${op}\n")
+		env = [
+			...env,
+			Binding({
+				name: fn.params[pi].name,
+				slot: t,
+				rec_type: "",
+				elem: "",
+				is_cell: false,
+				telems: [],
+				fixed: "",
+			}),
+		]
+		pi = pi + 1
 	}
+
+	const Iarch n = Iarch(fn.body.len)
+	let Iarch i = 0
+
+	loop {
+		if i >= n - 1 then break
+		emit_simple_stmt!(ctx, env, fn.body[i])
+		i = i + 1
+	}
+
+	return 0
 }
-
-const exit_cond_ok = (Str p0, Str p2, Expr c): Bool -> match c {
-	Expr.CmpEq(l, r) -> exit_load_ok(p0, l) && expr_is_var(p2, r),
-	_ -> false,
-}
-
-const exit_load_ok = (Str p0, Expr e): Bool -> match e {
-	Expr.Call(callee, _, args, _) -> eq(callee, "std_mem_raw_load") &&
-		Iarch(args.len) == 1 &&
-		exit_addr_ok(p0, 48, args[0]),
-	_ -> false,
-}
-
-const exit_store_ok = (Str p0, Str p1, Stmt s): Bool -> match s {
-	Stmt.Do(e) -> match e {
-		Expr.Call(callee, _, args, _) -> eq(callee, "std_mem_raw_store") &&
-			Iarch(args.len) == 2 &&
-			exit_addr_ok(p0, 40, args[0]) &&
-			expr_is_var(p1, args[1]),
-		_ -> false,
-	},
-	_ -> false,
-}
-
-const exit_addr_ok = (Str p0, Iarch off, Expr e): Bool -> match e {
-	Expr.Add(l, r) -> expr_is_var(p0, l) && expr_is_lit(off, r),
-	_ -> false,
-}
-
-const expr_is_var = (Str n, Expr e): Bool -> match e { Expr.Var(v) -> eq(v, n), _ -> false }
-
-const expr_is_lit = (Iarch v, Expr e): Bool -> match e { Expr.Lit(x) -> x == v, _ -> false }
 
 # Rewind the ambient subnode to a saved `{top, limit}` mark, reclaiming the scope's scratch in
-# bulk (geometry_lowering §2). The RESIDUE bracket (`%res_0`) is the geometry CONTRACT: place
+# bulk (geometry_lowering §2). The RESIDUE bracket (`%res_0`) is the geometry CONTRACT: run
 # the geometry's own `on_scope_exit(node, top, limit)` — the pluggable reclamation hook (a
-# compacting or `rc` geometry acts differently here), replacing the retired floor `cf_reset` —
-# INLINED when the hook body is exactly the bump-family rewind (`hook_is_bump_exit`, cached in
-# `ctx.bump_exit`), since the inline path below IS that body over `%res_0`.
+# compacting or `rc` geometry acts differently here), replacing the retired floor `cf_reset`.
+# A spliceable hook body TRANSCRIBES inline at the site (`emit_hook_splice!`, cached in
+# `ctx.exit_hook`) — same behavior, no call; anything else stays a call.
 # The SURVIVOR-scope mark (`%node_0`) is an emit-internal optimization gate, not a contract
-# hook (a frame from which nothing escapes frees its survivors too), so it is rewound INLINE.
-# Both do the same bump-family fold: restore the top only when the subnode's limit is unchanged
+# hook (a frame from which nothing escapes frees its survivors too), so it is rewound INLINE
+# below with the bump-family fold: restore the top only when the subnode's limit is unchanged
 # since the mark (no elastic pull relocated its block), else skip — leaking the marked interval
 # once, reclaimed at the node's own teardown, never dangling.
 const emit_reset! = (*Emit ctx, Iarch mk, Str nodeop): Iarch -> {
-	if eq(nodeop, "%res_0") && !eq(ctx.mat_geom, "") && !ctx.bump_exit then {
+	if eq(nodeop, "%res_0") && !eq(ctx.mat_geom, "") && ctx.exit_hook >= 0 then {
+		emit_hook_splice!(ctx, ctx.funcs[ctx.exit_hook], "%node_0", mk)
+
+		return 0
+	}
+
+	if eq(nodeop, "%res_0") && !eq(ctx.mat_geom, "") then {
 		const Iarch xi = find_func(ctx.funcs, "on_scope_exit__${ctx.mat_geom}")
 		if xi < 0
 			then die("cf: emit: the `${ctx.mat_geom}` geometry module is missing `on_scope_exit` — stale std source?\n")
@@ -6875,10 +6953,13 @@ const emit_func! = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 	# route a carve residue-side, so unbracketed frames skip the scan
 	if fn_brackets(fn) then ctx.growok = growok_names(ctx.funcs, idx)
 	if !fn_brackets(fn) then ctx.growok = no_names()
-	# a bump-family `on_scope_exit` inlines at every `!` return (see `hook_is_bump_exit`)
-	ctx.bump_exit = false
-	if !eq(ctx.mat_geom, "") && fn_brackets(fn)
-		then ctx.bump_exit = hook_is_bump_exit(ctx.funcs, find_func(ctx.funcs, "on_scope_exit__${ctx.mat_geom}"))
+	# a spliceable `on_scope_exit` transcribes inline at every `!` return (`emit_hook_splice!`)
+	ctx.exit_hook = -1
+
+	if !eq(ctx.mat_geom, "") && fn_brackets(fn) then {
+		const Iarch xf = find_func(ctx.funcs, "on_scope_exit__${ctx.mat_geom}")
+		if xf >= 0 && hook_spliceable!(ctx.funcs[xf]) then ctx.exit_hook = xf
+	}
 	# `--debug`: the declaration's file and line, as QBE debug directives — `dbgfile`
 	# before the function, `dbgloc` as the body's first instruction — become `.loc`
 	# lines and a DWARF line table, so tools attribute frames to source.
@@ -8065,7 +8146,7 @@ pub const emit_program! = (
 				loop_labels: no_names(),
 				loop_lids: no_lids(),
 				cap_cells: capref_names!(clofns, i),
-				bump_exit: false,
+				exit_hook: -1,
 			})
 			emit_func!(&ctx, prog.funcs[i], i)
 		}
