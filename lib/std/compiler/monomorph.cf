@@ -10,10 +10,12 @@
 #
 # Type arguments are given EXPLICITLY (`id[Iarch](x)`) or INFERRED (`id(x)`). Inference derives
 # each argument's type with the typechecker's own `type_of` over a threaded value environment
-# (parameters + `let`/match/`for`/destructure binders), so a parameter whose declared type IS a
-# type variable fixes it to the argument's type. Generic DATA/UNION types, array-typed type
-# variables, and union BOUNDS (`[Color 'T]`) are supported; STRUCTURAL inference (fixing `'T`
-# from INSIDE a `['T]`/tuple parameter) and a tuple-typed type variable are later bricks.
+# (parameters + `let`/match/`for`/destructure binders) and reads each type variable out of the
+# parameter's SHAPE — the whole type, a `['T]` array element, a tuple position, or a function
+# signature position (`('A) -> 'B` fixed by a lambda's / a named function's declared types, so a
+# HOF call like `map(f, xs)` needs no brackets). Generic DATA/UNION types, array-typed type
+# variables, and union BOUNDS (`[Color 'T]`) are supported; a tuple-typed type variable is a
+# later brick.
 
 import std::compiler::diag::{ Diag, DiagBag, record_dg }
 import std::compiler::spans::{ no_maps, unat }
@@ -49,6 +51,7 @@ import std::compiler::typecheck::{
 	param_ty!,
 	binding_ty!,
 	closure_tfn,
+	fn_ty_of_func!,
 	arm_bind_env,
 	check_destructure!,
 	dyn_of,
@@ -1302,17 +1305,26 @@ const infer_from_elem! = (Str tv, Str pe, Str ae): Str -> {
 	return infer_from_elem!(tv, pin, ain)
 }
 
-# Match a tuple parameter's element list `ptel` against an argument tuple's `atel`, returning what
-# `tv` binds to at the first position that mentions it (or "").
+# A signature-position name a type variable may bind to: a concrete component name — not the
+# empty name and not a `$`-marker leaf (`$dyn`/`$tuple`, which a closure binding carries for an
+# aggregate parameter and which names no nominal type).
+const bindable_name = (Str n): Bool -> {
+	if Iarch(n.len) == 0 then return false
+
+	return Iarch(n[0]) != 36
+}
+
+# Match a tuple (or function-signature) parameter's element list `ptel` against an argument's
+# `atel`, returning what `tv` binds to at the first position that mentions it (or "").
 const infer_from_telems! = (Str tv, [TupElem] ptel, [TupElem] atel): Str -> {
 	let Iarch i = 0
 
 	loop {
 		if i >= Iarch(ptel.len) then break
 		if i < Iarch(atel.len) then {
-			if eq(ptel[i].name, tv) then return atel[i].name
+			if eq(ptel[i].name, tv) && bindable_name(atel[i].name) then return atel[i].name
 
-			if eq(ptel[i].name, "$tuple") then {
+			if eq(ptel[i].name, "$tuple") || eq(ptel[i].name, "$fn") then {
 				const Str b = infer_from_telems!(tv, ptel[i].sub, atel[i].sub)
 				if !eq(b, "") then return b
 			} else {
@@ -1342,6 +1354,41 @@ const infer_from_param! = (Str tv, Param p, Ty at): Str -> {
 	return ""
 }
 
+# The signature telems (`[args..., ret]`) a function-VALUE argument carries, for `$fn`-parameter
+# inference: a hoisted lambda / forwarded function parameter is a `TFn` binding in the value
+# environment (newest-first, shadowing), and a bare top-level function name contributes its
+# declared signature. Any other argument carries none (the parameter then fixes no variable).
+const fn_arg_sig! = (*MonoCtx m, Expr e, MonoEnv env): [TupElem] -> {
+	let [TupElem] sig = []
+	const Str nm = match unat(e) { Expr.Var(n) -> n, _ -> "" }
+	if eq(nm, "") then return sig
+	let Iarch i = Iarch(env.venv.len) - 1
+
+	loop {
+		if i < 0 then break
+		if eq(env.venv[i].name, nm) then {
+			match env.venv[i].ty { Ty.TFn(s) -> { sig = s }, _ -> {} }
+
+			return sig
+		}
+		i = i - 1
+	}
+
+	let Iarch f = 0
+
+	loop {
+		if f >= Iarch(m.cfuncs.len) then break
+		if eq(m.cfuncs[f].name, nm) then {
+			match fn_ty_of_func!(m.cfuncs[f]) { Ty.TFn(s) -> { sig = s }, _ -> {} }
+
+			return sig
+		}
+		f = f + 1
+	}
+
+	return sig
+}
+
 const infer_tyargs! = (*MonoCtx m, Func tmpl, [Expr] args, MonoEnv env): [Str] -> {
 	let [Str] tvals = []
 	let Iarch t = 0
@@ -1359,10 +1406,16 @@ const infer_tyargs! = (*MonoCtx m, Func tmpl, [Expr] args, MonoEnv env): [Str] -
 
 		loop {
 			if p >= Iarch(tmpl.params.len) then break
-			# a binding can only come from a parameter whose type is the variable itself, or an array
-			# / tuple that could nest it — skip every other parameter WITHOUT typing its argument (a
-			# function-value argument is a bare name that `type_of` rejects, and it can carry no `'T`)
+			# a binding can only come from a parameter whose type is the variable itself, an array /
+			# tuple that could nest it, or a FUNCTION type mentioning it (`('A) -> 'B`) — skip every
+			# other parameter WITHOUT typing its argument. A function-value argument is a bare name
+			# `type_of` rejects, so its signature is read directly (a lambda's declared types, a
+			# named function's) and matched structurally like a tuple's positions.
 			const Str pn = tmpl.params[p].type_name
+			if eq(pn, "$fn") && p < Iarch(args.len) then {
+				const Str fb = infer_from_telems!(tv, tmpl.params[p].telems, fn_arg_sig!(m, args[p], env))
+				if !eq(fb, "") then strong = fb
+			}
 			const Bool shaped = eq(pn, tv) || eq(pn, "$dyn") || eq(pn, "$tuple")
 			if shaped && p < Iarch(args.len) then {
 				let DiagBag fdg = record_dg()
