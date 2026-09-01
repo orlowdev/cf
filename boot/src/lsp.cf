@@ -2478,6 +2478,18 @@ const tidy_sig = (Str ln): Str -> {
 	return s
 }
 
+# A LOCAL binder line tidied for the hover fallback: cut at its `=` — the initializer is the
+# very code sitting under the cursor, not information (the type child answers when it can; this
+# fires only when it cannot, e.g. a mid-edit buffer). A closure binding (`= (`) keeps its
+# parameter list and falls to `tidy_sig`'s arrow cut instead.
+const tidy_binder = (Str ln): Str -> {
+	const Str s = trim(ln)
+	const Iarch cut = index_of(" = ", s)
+	if cut > 0 && !contains("= (", s) then return trim(slice(0, cut, s))
+
+	return tidy_sig(ln)
+}
+
 # Answer textDocument/hover: the first definition of the token under the cursor, shown as its
 # tidied declaration line in a cf code block with the `#` comment block above it as prose. A
 # multi-definition name notes how many more there are. Null when nothing resolves.
@@ -2502,11 +2514,22 @@ const hover! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, Iar
 	const TokCtx t = token_at(lines[l0], c0)
 	if !t.ok then return Json.Null
 
-	# a local binding: hover shows its binder line (same buffer — locals live in the one file)
+	# a local binding: hover shows its DEDUCED type (`cf lsp type` — a logged typecheck in a
+	# child), falling back to the binder line when the tree doesn't answer (mid-edit breaks)
 	const SymRow lh = local_def!(argv0, env, path, overlay, lines, l0, t)
 
 	if lh.line >= 0 && lh.line < Iarch(lines.len) then {
-		const Str lsig = tidy_sig(lines[lh.line])
+		const ChildOut tco = lsp_child!(argv0, env, path, overlay, lines, l0, t.ts, "type", t.name)
+		let Str lty = ""
+
+		if tco.rc == 0 then {
+			lty = tco.out
+			const Iarch tnl = index_of("\n", lty)
+			if tnl >= 0 then lty = slice(0, tnl, lty)
+		}
+
+		let Str lsig = tidy_binder(lines[lh.line])
+		if Iarch(lty.len) > 0 then lsig = "${t.name}: ${lty}"
 
 		return Json.Obj([
 				ent(

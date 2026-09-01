@@ -62,11 +62,32 @@ pub const die_at_lc = (Str file, Iarch line, Iarch col, Str msg): Never -> {
 # prints or exits (errors-as-values, the D1 diagnostics design).
 pub data Diag = { Str file, Iarch line, Iarch col, Str msg, Str what }
 
+# One deduced-type row of the LSP hover's type log: a LOCAL binding the typechecker typed,
+# as (anchor, decl line, name, rendered type). `anchor` is the byte offset of an expression
+# KNOWN to sit between this binding and the next same-named one (a `let`'s initializer, a
+# `for`/match arm's first body expression) — the replay disambiguates same-named sibling-scope
+# binds by it; -1 when the site has no expression to anchor on (a parameter, unique per
+# function anyway). `dline` is the enclosing DECLARATION's stamp line, the coarse key.
+pub data TyRow = { Iarch anchor, Iarch dline, Str name, Str ty }
+
 # The single-slot pending diagnostic a checking pass records into, threaded as a `*DiagBag`
 # alongside `Ctx`. One slot, first error wins (`hot`), so RECORDING is colorless — plain field
 # stores, no allocation — and any helper, `!` or not, may reject. The driving loop flushes the
 # slot into its `[Diag]` between declarations (one error per declaration).
-pub data DiagBag = { Bool hot, Str file, Iarch line, Iarch col, Str msg, Str what, Iarch eoff }
+# `tlog`/`trows` — the hover type log (`cf lsp type`): when `tlog` is on, the binding sites
+# append a `TyRow` per typed LOCAL bind. Off everywhere but the LSP's `check_types!` driver,
+# so the compile pipeline never pays for it (and the append sites stay `!`-colored callers).
+pub data DiagBag = {
+	Bool hot,
+	Str file,
+	Iarch line,
+	Iarch col,
+	Str msg,
+	Str what,
+	Iarch eoff,
+	Bool tlog,
+	[TyRow] trows,
+}
 
 # Record a located rejection naming its offender (`what` — a 16-byte field store, so even a
 # colorless site can say WHICH name it rejected): latch the FIRST error and ignore the rest
@@ -88,8 +109,21 @@ pub const drec = (*DiagBag dg, Str file, Iarch line, Iarch col, Str msg): () ->
 
 # A fresh empty bag for a caller that hands one to a shared checking helper and copies any
 # latched rejection into its own collector afterwards (the monomorph pass's inference).
-pub const record_dg = (): DiagBag ->
-	DiagBag({ hot: false, file: "", line: 0, col: 0, msg: "", what: "", eoff: -1 })
+pub const record_dg = (): DiagBag -> {
+	let [TyRow] norows = []
+
+	return DiagBag({
+		hot: false,
+		file: "",
+		line: 0,
+		col: 0,
+		msg: "",
+		what: "",
+		eoff: -1,
+		tlog: false,
+		trows: norows,
+	})
+}
 
 # Byte-lexicographic `<` over two strings (file paths grouping, for diagnostic order).
 const str_lt = (Str a, Str b): Bool -> {

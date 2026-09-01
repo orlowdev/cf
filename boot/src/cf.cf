@@ -29,12 +29,12 @@ import std::compiler::buildinfo::{ compiler_version }
 import fmt::{ format_file! }
 import docs::{ docs_run! }
 import lsp::{ lsp_run! }
-import std::compiler::{ compile!, check! }
+import std::compiler::{ compile!, check!, type_rows! }
 import std::compiler::ast::{ Program }
 import std::compiler::resolve::{ resolve_program!, Resolved, entry_binds!, Loaded }
 import std::compiler::parser::{ BindEv }
 import std::compiler::spans::{ line_col_of, LC, SrcMap }
-import std::compiler::diag::{ Diag, print_diags! }
+import std::compiler::diag::{ Diag, TyRow, print_diags! }
 import std::mem::arena::growing_arena
 import qbe::{ qbe_translate }
 import std::process::{ run!, find_executable!, getpid, exit }
@@ -354,6 +354,74 @@ const run_def! = (Str input, Str src, Iarch off, Str name): Iarch -> {
 	const LC lc = line_col_of(maps, input, b)
 	if lc.line <= 0 then return 0
 	println("${lc.line}:${lc.col}")
+
+	return 0
+}
+
+# `cf lsp type <input.cf> <off> <name> [--src <buf>]`: the DEDUCED type of the LOCAL binding
+# of `name` visible at byte offset `off` — one line, the rendered type. Prints nothing when
+# no local binds the name (the server falls back to its declaration-line hover). The binder
+# comes from the tracked entry parse (the same replay as `def`); the types from a logged
+# whole-tree typecheck (`type_rows!`). A row correlates back to THIS binder by the enclosing
+# declaration's stamp line plus the nearest expression ANCHOR at or after the binder — cf
+# rejects shadowing, so two binds of one name in one declaration are sibling-scope binds and
+# the anchor (a `let`'s initializer, a `for`/arm body's first expression, always between a
+# binder and the next same-named one) picks the right sibling. An anchorless row (a
+# parameter, a closure name — unique per declaration) matches by name alone. A generic's
+# instances log one row each off the same anchor; the distinct renderings join as `A | B`.
+const run_type! = (Str input, Str src, Iarch off, Str name): Iarch -> {
+	const Loaded ld = entry_binds!(input, src, os::target, host_arch())
+	const Iarch b = binder_at!(ld.evs, off, name)
+	if b < 0 then return 0
+	const [SrcMap] maps = [ld.map]
+	const LC blc = line_col_of(maps, input, b)
+	if blc.line <= 0 then return 0
+	# the enclosing declaration: the nearest function stamp at or above the binder's line
+	let Iarch dline = -1
+
+	for fn in ld.prog.funcs {
+		if fn.dline <= blc.line && fn.dline > dline then dline = fn.dline
+	}
+
+	if dline < 0 then return 0
+	const [TyRow] rows = type_rows!(input, src, os::target, host_arch())
+	# this declaration's binds of the name
+	let [TyRow] cand = []
+
+	for r in rows {
+		if r.dline == dline && eq(r.name, name) then cand = [...cand, r]
+	}
+
+	if Iarch(cand.len) == 0 then return 0
+	# the nearest anchor at/after the binder wins; anchorless rows only when none lands
+	let Iarch best = -1
+
+	for (r, i) in cand {
+		if r.anchor >= b then {
+			if best < 0 || r.anchor < cand[best].anchor then best = i
+		}
+	}
+
+	let [Str] tys = []
+
+	for r in cand {
+		let Bool take = false
+		if best >= 0 then take = r.anchor == cand[best].anchor
+		if best < 0 then take = r.anchor < 0
+		if take && !has_str(tys, r.ty) then tys = [...tys, r.ty]
+	}
+
+	if Iarch(tys.len) == 0 then return 0
+	let Str out = tys[0]
+	let Iarch ti = 1
+
+	loop {
+		if ti >= Iarch(tys.len) then break
+		out = "${out} | ${tys[ti]}"
+		ti = ti + 1
+	}
+
+	println(out)
 
 	return 0
 }
@@ -829,6 +897,16 @@ pub const main = ([Str] args, [Str] env) -> {
 			const da = growing_arena::of(16777216)
 
 			return run_def!(args[3], dsrc, dec_of(args[4]), args[5]) in da
+		}
+
+		# `cf lsp type <input.cf> <off> <name> [--src <file>]` — the DEDUCED type of the local
+		# binding at a byte offset, one line (the hover's type oracle).
+		if Iarch(args.len) >= 6 && eq(args[2], "type") then {
+			let Str tsrc = ""
+			if Iarch(args.len) >= 8 && eq(args[6], "--src") then tsrc = args[7]
+			const ta = growing_arena::of(16777216)
+
+			return run_type!(args[3], tsrc, dec_of(args[4]), args[5]) in ta
 		}
 
 		# `cf lsp refs <input.cf> <off> <name> [--src <file>]` — every reference to the local

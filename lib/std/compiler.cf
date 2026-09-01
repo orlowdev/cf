@@ -13,12 +13,12 @@ import std::io::file::{ create, close }
 import std::io::fd::{ Fd, IoRrr }
 import std::sys::{ Os, Arch }
 import std::compiler::ast::{ Program }
-import std::compiler::diag::{ Diag, sort_diags }
+import std::compiler::diag::{ Diag, TyRow, sort_diags }
 import std::compiler::resolve::{ resolve_program!, Resolved }
 import std::compiler::monomorph::{ mono_program!, MonoOut, MonoSeed, no_mono_seed, mono_seed_of }
 import std::compiler::retfill::{ retfill_program!, graft_rets, Grafted }
 import std::compiler::materialize::{ materialize_program!, Mat }
-import std::compiler::typecheck::{ check_program!, check_unreachable! }
+import std::compiler::typecheck::{ check_program!, check_unreachable!, check_types! }
 import std::compiler::spans::{ strip_program, strip_funcs }
 import std::compiler::alloc::{ check_alloc_program!, check_root_program! }
 import std::compiler::inline::{ inline_program! }
@@ -244,6 +244,35 @@ pub const check! = (Str input, Str src, Os target_os, Arch target_arch, Iarch ro
 	check_geom_escape!(lowered)
 
 	return []
+}
+
+# The deduced-type rows of every LOCAL binding in `input`'s own declarations — the LSP
+# hover's type oracle (the `cf lsp type` child). The front half of `check!` (resolve,
+# monomorph + return fill, materialize) followed by a LOGGED typecheck of the entry's
+# functions — the live (materialized) table AND the declarations Materialize pruned as
+# unreachable, so an uncalled function still answers hover. No diagnostics are collected:
+# a mid-edit tree yields whatever rows the checker reached, and the caller falls back when
+# the queried binding finds none. The passes before typecheck still die fail-fast — the
+# child process boundary absorbs that, exactly like `cf check`.
+pub const type_rows! = (Str input, Str src, Os target_os, Arch target_arch): [TyRow] -> {
+	const Resolved rz = resolve_program!(input, src, target_os, target_arch, false, false)
+	const Program raw = rz.prog
+	const MonoFill mf = mono_and_fill!(raw)
+	const Program mono = mf.prog
+	const Mat mm = materialize_program!(mono, raw)
+	const Program prog = mm.prog
+	const [TyRow] live = check_types!(prog.funcs, prog.funcs, prog.recs, prog.unions, rz.maps, input)
+
+	const [TyRow] pruned = check_types!(
+		mm.dropped,
+		mono.funcs,
+		mono.recs,
+		mono.unions,
+		rz.maps,
+		input,
+	)
+
+	return [...live, ...pruned]
 }
 
 data MonoFill = { Program prog, [Diag] diags }
