@@ -632,7 +632,8 @@ const fill_name! = (Ty t): Str -> {
 	const Str n = match t {
 		Ty.TNever -> "",
 		Ty.TUnit -> "",
-		Ty.TDyn(en) -> "",
+		# a closure's array return rides bracket-encoded in its bare name slot
+		Ty.TDyn(en) -> "[${en}]",
 		Ty.TTuple(tel) -> "",
 		_ -> ty_name(t),
 	}
@@ -923,6 +924,69 @@ const post_index = (Program post, Str nm): Iarch -> {
 
 	return -1
 }
+
+# The clone-time derivation entry the MONOMORPH pass calls for a template with an omitted
+# return: right after an instance's body walk everything in it is concrete, so the same
+# first-return derivation applies — and callers minting the instance on demand then read the
+# filled signature within the same round (a `match` on the call resolves its arms, a generic
+# argument pins). `has: false` when the body yields nothing derivable (the caller keeps the
+# blank; the post-mono fill pass retries with the full program).
+pub data DerivedRet = { Bool has, Str name, Str elem, [TupElem] telems }
+
+const no_derived = (): DerivedRet -> {
+	const [TupElem] nt = []
+
+	return DerivedRet({ has: false, name: "", elem: "", telems: nt })
+}
+
+pub const derive_ret! = (
+	[Func] funcs,
+	[RecDecl] recs,
+	[UnionDecl] unions,
+	[Param] ps,
+	[Stmt] body,
+): DerivedRet -> {
+	let RfCtx c = RfCtx({
+		funcs: funcs,
+		recs: recs,
+		unions: unions,
+		changed: false,
+		rfound: false,
+		rhot: false,
+		rty: Ty.TNever,
+		lam_names: fresh_names(),
+		lam_sigs: fresh_sigs(),
+	})
+	scan_stmts!(&c, body)
+
+	const [Stmt] discard = walk_stmts!(&c, body, param_env!(&c, ps, no_env()))
+
+	if !c.rfound then return no_derived()
+	if c.rhot then return no_derived()
+	const Ty dt = c.rty
+	const [TupElem] nt = []
+	let DerivedRet out = no_derived()
+
+	match dt {
+		Ty.TDyn(en) -> {
+			if !dr_template(&c, en)
+				then out = DerivedRet({ has: true, name: "$dyn", elem: en, telems: nt })
+		},
+		Ty.TTuple(tel) -> {
+			if telems_filled(tel)
+				then out = DerivedRet({ has: true, name: "$tuple", elem: "", telems: tel })
+		},
+		_ -> {
+			const Str fname = fill_name!(dt)
+			if !eq(fname, "") && !dr_template(&c, fname)
+				then out = DerivedRet({ has: true, name: fname, elem: "", telems: nt })
+		},
+	}
+
+	return out
+}
+
+const dr_template = (*RfCtx c, Str n): Bool -> names_template(c, n)
 
 # Fill every omitted return type derivable from the program as it stands — to a fixpoint, since
 # one fill can unlock another (`const g = () -> "s"` then `const h = () -> g()`). Blanks that

@@ -59,6 +59,7 @@ import std::compiler::typecheck::{
 	elem_ty!,
 }
 import std::compiler::closures::{ Subst, subst_expr }
+import std::compiler::retfill::{ derive_ret!, DerivedRet }
 
 # The accumulating state, threaded by pointer: the generic FUNCTION templates + their instance
 # clones (with a dedup key set); the generic RECORD/UNION templates + their instance clones (with
@@ -1801,9 +1802,9 @@ const mono_func! = (*MonoCtx m, Func f, Str newname, [Str] tvars, [Str] tvals): 
 	}
 
 	const TySlot rst = subst_slot!(m, f.ret_name, f.ret_elem, f.ret_telems, tvars_t, tvals_t)
-	const Str rn = rst.name
-	const Str re = rst.elem
-	const [TupElem] rtel = rst.telems
+	let Str rn = rst.name
+	let Str re = rst.elem
+	let [TupElem] rtel = rst.telems
 	# seed the local value env with the (substituted) parameter types, so a generic call in the
 	# body can infer from a parameter reference. Only under generics: a non-generic function has
 	# nothing to instantiate, so the env stays empty and `type_of` is never invoked on it.
@@ -1853,6 +1854,19 @@ const mono_func! = (*MonoCtx m, Func f, Str newname, [Str] tvars, [Str] tvals): 
 	const [Stmt] body = mono_stmts!(m, f.body, env)
 	m.lam_names = slnames
 	m.lam_decls = sldecls
+	# an OMITTED return derives at clone time: the walked body is concrete here, so a caller
+	# minting this instance on demand reads a filled signature within the same round (its
+	# `match` arms resolve, its generic arguments pin). Only under generics — the template-free
+	# path stays the byte-identity — and a failed derivation keeps the blank for the post-mono
+	# fill pass (which also covers the walk-order cases the graft iteration retries).
+	if m.has_gen && eq(rn, "") && Iarch(rtel.len) == 0 && !f.is_asm && !f.is_intrinsic then {
+		const DerivedRet dr = derive_ret!(cat_funcs(m.cfuncs, m.instances), all_recs(m), all_unions(m), ps, body)
+		if dr.has then {
+			rn = dr.name
+			re = dr.elem
+			rtel = dr.telems
+		}
+	}
 	const [Str] no_tp = []
 	set_stamp(m, odf, odl, odc)
 
