@@ -2608,6 +2608,25 @@ const field_type_of = (Str ln, Iarch ns): Str -> {
 	return trim(slice(seg, ns, ln))
 }
 
+# A union MEMBER's own segment of its declaration line: from the member name at `ns` to the
+# next `,` or `}` at paren/bracket depth 0 — `Bool(Bool)` out of a single-line union body,
+# the member sans trailing comma out of a multi-line one.
+const member_seg_of = (Str ln, Iarch ns): Str -> {
+	let Iarch depth = 0
+	let Iarch i = ns
+
+	loop {
+		if i >= Iarch(ln.len) then break
+		const Iarch c = Iarch(ln[i])
+		if c == 40 || c == 91 then depth = depth + 1
+		if c == 41 || c == 93 then depth = depth - 1
+		if depth == 0 && (c == 44 || c == 125) then break
+		i = i + 1
+	}
+
+	return trim(slice(ns, i, ln))
+}
+
 # A `union`/`data` declaration reshaped for hover: `pub union Either['L, 'R] = { ... }` →
 # `union Either['L, 'R]` — the `pub`, the `=`, and the whole body drop (the doc prose below
 # the code block describes the type; the members are one goto away). Empty when the line is
@@ -2684,6 +2703,17 @@ const hover! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, Iar
 	}
 
 	const Bool dotted = t.ts > 0 && Iarch(lines[l0][t.ts - 1]) == 46
+	let TokCtx tq = t
+
+	# a bare PascalCase token may be a union member's own DECLARATION (`Bool` in `union Json
+	# = { ..., Bool(Bool), ... }`) — rebase onto `Base.member` BEFORE the builtin table, or a
+	# member shadowing a builtin type name would hover as the builtin
+	if bare_token(t) && Iarch(t.name[0]) >= 65 && Iarch(t.name[0]) <= 90 then {
+		const Str ub = member_decl_union!(path, overlay, lines, l0, t.ts)
+
+		if Iarch(ub.len) > 0 then
+		tq = TokCtx({ ok: true, name: t.name, hints: t.hints, lead: t.lead, ts: t.ts, te: t.te, base: ub })
+	}
 
 	# the BUILTIN pseudo-fields — `.len` on an array/string, `.bytes` on a string — have no
 	# declaration to index; typed here directly (answered before the field-index fallback:
@@ -2711,7 +2741,7 @@ const hover! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, Iar
 
 	# a BUILTIN type name (`Str`, `Iarch`, `Bool`, ...) or truth literal — no declaration
 	# exists to index, so the table answers (a cast `Iarch(x)` hovers the same token)
-	if Iarch(t.hints.len) == 0 && Iarch(t.base.len) == 0 then {
+	if Iarch(tq.hints.len) == 0 && Iarch(tq.base.len) == 0 then {
 		const Str bd = builtin_type_doc(t.name)
 
 		if Iarch(bd.len) > 0 then {
@@ -2728,7 +2758,7 @@ const hover! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, Iar
 		}
 	}
 
-	const DefOut o = picked_defs!(argv0, env, path, srcf, srcp, overlay, t, dotted)
+	const DefOut o = picked_defs!(argv0, env, path, srcf, srcp, overlay, tq, dotted)
 	if Iarch(o.hits.len) == 0 then return Json.Null
 	let SymRow h = o.hits[0]
 
@@ -2741,6 +2771,17 @@ const hover! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, Iar
 	if h.kind == 8 then {
 		const Str ft = field_type_of(dlines[h.line], h.ns)
 		if Iarch(ft.len) > 0 then sig = "${h.sname}: ${ft}"
+	}
+
+	# a union MEMBER hover reads `Base.Member(payloads)` — the member's own segment of its
+	# declaration (a single-line union's member row otherwise echoed the whole declaration)
+	if h.kind == 22 then {
+		const Str ms = member_seg_of(dlines[h.line], h.ns)
+
+		if Iarch(ms.len) > 0 then {
+			sig = ms
+			if Iarch(tq.base.len) > 0 then sig = "${tq.base}.${ms}"
+		}
 	}
 
 	# a UNION/DATA hover reads `union Name['T]` / `data Name` — the `pub`, the `=`, and the
