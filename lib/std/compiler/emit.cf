@@ -138,7 +138,19 @@ data Emit = {
 	# the current geometry's `on_scope_exit` function index when its body is spliceable at
 	# `!` returns (`hook_spliceable` — emit transcribes the hook body inline), else -1 (call)
 	Iarch exit_hook,
+	# the context pointers available in the CURRENT function's scope (context.md §4), parallel:
+	# `ctx_tys[k]` a provided type, `ctx_ops[k]` the QBE operand holding a pointer to it. Seeded at
+	# function entry from the hidden ctx params (`%cxp<k>` per `fn.uses[k]`) and grown by each
+	# `provide` the body emits. Since the demand checker forbids two providers of one type in a
+	# function, per-function accumulation (no popping) is sound; a `consume`/call-site resolves a
+	# demanded type against this — directly, or an interior pointer into a record that spreads it.
+	[Str] ctx_tys,
+	[Str] ctx_ops,
 }
+
+# The resolved intrinsic callees for context (module_system §8 flattens the module path).
+const ctx_provide_fn = "std_mem_ctx_provide"
+const ctx_consume_fn = "std_mem_ctx_consume"
 
 # A local/parameter in scope: its interned name, `slot`, its `rec_type` (a record/union
 # type name, `"$dyn"`, `"$ptr"`, or `"Str"` — `""` for a word), and `elem` (a dynamic
@@ -3419,10 +3431,14 @@ const init_agg_type! = (*Emit ctx, [Binding] env, Expr e): Str -> match e {
 	Expr.UnionMk(tn, mem, args) -> tn,
 	Expr.Field(base, f) -> field_agg_type(ctx, env, base, f),
 	# `raw::place(a, v)` yields v's own type at the destination (the identity law), so a
-	# bound place result carries its record type; every other call reads its declared return.
+	# bound place result carries its record type; `ctx::consume(T)` yields the record `T` it names
+	# (a `const c = consume(Cfg)` binds `c` as a `Cfg` so `c.field` dispatches); every other call
+	# reads its declared return.
 	Expr.Call(callee, tyargs, args, _) -> if eq(callee, "std_mem_raw_place")
 		then init_agg_type!(ctx, env, args[1])
-		else call_agg_type(ctx, env, callee),
+		else if eq(callee, ctx_consume_fn)
+			then consume_arg_ty(args)
+			else call_agg_type(ctx, env, callee),
 	Expr.ArrayLit(hs, sn, elems, et) -> "$dyn",
 	Expr.StrLit(bytes) -> "Str",
 	Expr.Interp(id) -> "Str",
@@ -3971,6 +3987,108 @@ const embed_walk! = (Str dir): [Str] -> {
 	return out
 }
 
+# ── context (std::mem::ctx) — the hidden ctx-pointer ABI (context.md §4) ─────────────────────────
+
+# The record type a provided value denotes: a record literal names it; a bound name reads its
+# binding's record type. Anything else is "" (the demand checker required a determinable type).
+const var_rec_type = ([Binding] env, Str v): Str -> {
+	const Iarch i = lookup_index(env, v)
+	if i < 0 then return ""
+
+	return env[i].rec_type
+}
+
+const ctx_value_type = ([Binding] env, Expr e): Str -> match e {
+	Expr.Record(n, _) -> n,
+	Expr.Var(v) -> var_rec_type(env, v),
+	_ -> "",
+}
+
+# The record type `consume(T)` names — its first argument (a bare type name).
+const consume_arg_ty = ([Expr] args): Str -> if Iarch(args.len) >= 1
+	then match args[0] { Expr.Var(n) -> n, _ -> "" }
+	else ""
+
+# Does record `p` declare `...d` transitively (context.md §5)? The nominal spread relation, read off
+# `RecDecl.spreads`; depth-guarded against an accidental cycle (resolve rejects a real one).
+const rec_has_spread = ([RecDecl] recs, Str p, Str d, Iarch depth): Bool -> {
+	if depth > 64 then return false
+	const Iarch ri = find_rec(recs, p)
+	if ri < 0 then return false
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(recs[ri].spreads.len) then break
+		if eq(recs[ri].spreads[i], d) then return true
+		if rec_has_spread(recs, recs[ri].spreads[i], d, depth + 1) then return true
+		i = i + 1
+	}
+
+	return false
+}
+
+# The byte offset of the embedded `d` block within `p` — the interior pointer's displacement. A
+# spread splices `d`'s fields flat and in order, so `d`'s first field names the splice point; the
+# layout aligns it so the block's internal offsets equal `d`'s standalone layout (context.md §5).
+const ctx_spread_offset = ([RecDecl] recs, Str p, Str d): Iarch -> {
+	if eq(p, d) then return 0
+	const Iarch di = find_rec(recs, d)
+	if di < 0 then return 0
+	if Iarch(recs[di].fields.len) == 0 then return 0
+
+	return field_offset(recs, p, recs[di].fields[0])
+}
+
+# Resolve the demanded context type `d` to a pointer operand in the current scope: a direct provide
+# of `d` yields its operand; a provide of a record that SPREADS `d` yields an interior pointer
+# (`base + offset`). The demand checker guarantees exactly one candidate, so the first match wins.
+const ctx_resolve! = (*Emit ctx, Str d): Str -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(ctx.ctx_tys.len) then break
+		if eq(ctx.ctx_tys[i], d) then return ctx.ctx_ops[i]
+		i = i + 1
+	}
+
+	let Iarch j = 0
+
+	loop {
+		if j >= Iarch(ctx.ctx_tys.len) then break
+		if rec_has_spread(ctx.recs, ctx.ctx_tys[j], d, 0) then {
+			const Iarch off = ctx_spread_offset(ctx.recs, ctx.ctx_tys[j], d)
+			if off == 0 then return ctx.ctx_ops[j]
+			const Iarch t = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${t} =l add ${ctx.ctx_ops[j]}, ${off}\n")
+
+			return "%t${t}"
+		}
+		j = j + 1
+	}
+
+	die("cf: emit: internal — no context pointer for `${d}` in scope (the demand checker should have rejected this)\n")
+
+	return "0"
+}
+
+# The hidden context-pointer operands for a call to `fidx`: one per `callee.uses` type, resolved in
+# the caller's scope. Resolved into a list HERE — before the `call` line is written — because an
+# interior-pointer discharge emits an `add` instruction, which must not land inside the arg list.
+const ctx_arg_ops! = (*Emit ctx, Iarch fidx): [Str] -> {
+	let [Str] ops = []
+	const [Str] u = ctx.funcs[fidx].uses
+	let Iarch k = 0
+
+	loop {
+		if k >= Iarch(u.len) then break
+		ops = [...ops, ctx_resolve!(ctx, u[k])]
+		k = k + 1
+	}
+
+	return ops
+}
+
 const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env): Str -> {
 	# The geometry constructor INTRINSICS (honest-intrinsics Stage C): each geometry module
 	# declares `pub intrinsic of = (<user args>): Uarch` — a bodyless token, not a function. The
@@ -4046,6 +4164,26 @@ const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env)
 		write_str(ctx.fd, "\tstorel ${bn}, %t${par}\n")
 
 		return ""
+	}
+	# `ctx::provide(value, node)` (context.md §2): register a pointer to `value` as the scope's
+	# provider of its type, and thread the node on so the construction pipe continues to `defer
+	# destroy`. No arena copy — the demand checker guarantees the provider's frame lexically outlives
+	# every consumer, so the value's own storage stays valid for every read (the arena-placement
+	# refinement is a later step). The node arg is evaluated (carving the arena) and returned.
+	if eq(callee, ctx_provide_fn) && callee_is_intrinsic(ctx, callee) then {
+		const Str valop = emit_expr!(args[0], ctx, env)
+		const Str nodeop = emit_expr!(args[1], ctx, env)
+		ctx.ctx_tys = [...ctx.ctx_tys, ctx_value_type(env, args[0])]
+		ctx.ctx_ops = [...ctx.ctx_ops, valop]
+
+		return nodeop
+	}
+	# `ctx::consume(T)` (context.md §4): a comptime binder — no runtime call. Resolve the demanded
+	# type to its scope pointer (direct, or an interior pointer into a record that spreads it).
+	if eq(callee, ctx_consume_fn) && callee_is_intrinsic(ctx, callee) then {
+		const Str d = match args[0] { Expr.Var(n) -> n, _ -> "" }
+
+		return ctx_resolve!(ctx, d)
 	}
 	# the raw-memory intrinsics (`raw::*` / `size_of`) — the substrate the std geometry
 	# modules are written in (parser-gated to `std/mem/...`). An aggregate's emitted value IS
@@ -4347,6 +4485,10 @@ const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env)
 	# whose handle we load here (a MemoryNode is a pointer-sized value in the binding's slot).
 	let Str node_op = "%node_0"
 	if !eq(geom, "") then node_op = emit_expr!(Expr.Var(geom), ctx, env)
+	# the hidden context-pointer operands (context.md §4): resolved BEFORE the `call` line, since an
+	# interior-pointer discharge emits an `add` that must not land inside the arg list. Empty for an
+	# asm callee (its `uses` is empty) and for any function on no demand chain — pay-per-demand.
+	const [Str] ctxops = ctx_arg_ops!(ctx, fidx)
 	const Iarch rt = ctx.next
 	ctx.next = ctx.next + 1
 	const Bool is_main = eq(ctx.funcs[fidx].name, "main")
@@ -4360,11 +4502,23 @@ const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env)
 	# binding). An asm intrinsic (syscall wrapper) is below the algebra — no node.
 	const Bool node_first = !ctx.funcs[fidx].is_asm && ctx.nodesig[fidx]
 	if node_first then write_str(ctx.fd, "l ${node_op}")
+	# the resolved context pointers, between the node and the user args
+	let Bool hidden_written = node_first
+	let Iarch ck = 0
+
+	loop {
+		if ck >= Iarch(ctxops.len) then break
+		if hidden_written then write_str(ctx.fd, ", ")
+		hidden_written = true
+		write_str(ctx.fd, "l ${ctxops[ck]}")
+		ck = ck + 1
+	}
+
 	let Iarch j = 0
 
 	loop {
 		if j >= Iarch(aops.len) then break
-		if j > 0 || node_first then write_str(ctx.fd, ", ")
+		if j > 0 || hidden_written then write_str(ctx.fd, ", ")
 		const Iarch tj = aops[j].temp
 		write_str(ctx.fd, "${aops[j].qt} %t${tj}")
 		j = j + 1
@@ -7001,6 +7155,20 @@ const emit_func! = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 	# the current function's return type — supplied to a bare `({...})` record literal returned from
 	# this function (its type_name is empty; the return annotation names its record type)
 	ctx.cur_ret = fn.ret_name
+	# seed the context scope (context.md §4) from the hidden ctx params: each demanded type in
+	# `fn.uses` arrives as `%cxp<k>`, available for a `consume` or a downstream call. `provide`s in
+	# the body append to this as they emit.
+	ctx.ctx_tys = fn.uses
+	let [Str] cops = []
+	let Iarch cxi = 0
+
+	loop {
+		if cxi >= Iarch(fn.uses.len) then break
+		cops = [...cops, "%cxp${cxi}"]
+		cxi = cxi + 1
+	}
+
+	ctx.ctx_ops = cops
 	# elastic residue-carve eligibility (the interlock section): only a bracketed frame can
 	# route a carve residue-side, so unbracketed frames skip the scan
 	if fn_brackets(fn) then ctx.growok = growok_names(ctx.funcs, idx)
@@ -7034,6 +7202,18 @@ const emit_func! = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 		write_str(ctx.fd, "l %node_0")
 		sep = true
 	}
+	# the hidden context-pointer params (context.md §4): one `l %cxp<k>` per demanded type in
+	# `fn.uses`, after the node and before the user params — the ABI every call site mirrors.
+	let Iarch cpi = 0
+
+	loop {
+		if cpi >= Iarch(fn.uses.len) then break
+		if sep then write_str(ctx.fd, ", ")
+		sep = true
+		write_str(ctx.fd, "l %cxp${cpi}")
+		cpi = cpi + 1
+	}
+
 	let Iarch si = 0
 
 	loop {
@@ -8199,6 +8379,8 @@ pub const emit_program! = (
 				loop_lids: no_lids(),
 				cap_cells: capref_names!(clofns, i),
 				exit_hook: -1,
+				ctx_tys: no_names(),
+				ctx_ops: no_names(),
 			})
 			emit_func!(&ctx, prog.funcs[i], i)
 		}

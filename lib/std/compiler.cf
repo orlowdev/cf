@@ -21,7 +21,7 @@ import std::compiler::materialize::{ materialize_program!, Mat }
 import std::compiler::typecheck::{ check_program!, check_unreachable!, check_types!, ret_hover! }
 import std::compiler::spans::{ strip_program, strip_funcs }
 import std::compiler::alloc::{ check_alloc_program!, check_root_program! }
-import std::compiler::demand::{ check_demand_program! }
+import std::compiler::demand::{ check_demand_program!, stamp_demands! }
 import std::compiler::inline::{ inline_program! }
 import std::compiler::hoist_defertap::{ hoist_defertaps! }
 import std::compiler::defer::{ lower_defers! }
@@ -98,6 +98,11 @@ pub const compile! = (
 	# known_ty_at lesson) — so gate diags return alone rather than merging with typecheck's
 	if Iarch(gdiags.len) > 0 then return gdiags
 
+	# stamp each function's RESOLVED context demand set onto its `uses` field (context.md §4) — the
+	# hidden ctx-pointer signature emit threads. Done AFTER the demand check (so its both-ways `pub`
+	# validation saw the user's declared clause) and BEFORE mono, so every clone carries it.
+	const Program raw2 = stamp_demands!(raw)
+
 	# monomorphize generic functions into concrete instances (type_system §8.1) — after this
 	# the program has no generic templates, only ordinary functions — then fill omitted
 	# return types from the bodies (type_system §5.1), iterating when a fill is MATERIAL
@@ -105,7 +110,7 @@ pub const compile! = (
 	# reports in one run; a diag-carrying round's output is unusable (missing instances),
 	# so the FINAL round's diags return ALONE — typecheck on the broken table would only
 	# add "undefined function" cascades on top.
-	const MonoFill mf = mono_and_fill!(raw)
+	const MonoFill mf = mono_and_fill!(raw2)
 
 	if Iarch(mf.diags.len) > 0 then return sort_diags(mf.diags)
 
@@ -113,11 +118,11 @@ pub const compile! = (
 
 	# the Materialize substep of the Memory arc (geometry_lowering §2): duplicate per
 	# (fn × geometry) under the std-source geometries, retarget the `in b` seed calls, and
-	# mint per-type value-hook instances from the PRE-mono templates (`raw` still holds
+	# mint per-type value-hook instances from the PRE-mono templates (`raw2` still holds
 	# them). Runs before typecheck so every minted body is checked, lowered, and routed
 	# like hand-written source. A program that touches no std-source geometry passes
 	# through untouched (one name scan).
-	const Mat mm = materialize_program!(mono, raw)
+	const Mat mm = materialize_program!(mono, raw2)
 	const Program prog = mm.prog
 
 	# middle: typecheck (rejects type errors before any output is produced) — a rejection

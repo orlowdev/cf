@@ -24,7 +24,7 @@
 
 import std::compiler::ast::{ Program, Func, RecDecl, Param, Stmt, Expr, StmtArm, MatchArm }
 import std::compiler::routing::{ kids, stmt_exprs }
-import std::compiler::spans::{ unat, SrcMap }
+import std::compiler::spans::{ unat, SrcMap, line_col_of, LC }
 import std::compiler::diag::{ Diag }
 import std::compiler::alloc::{ address_taken }
 import std::data::str::{ eq }
@@ -44,6 +44,39 @@ const no_s = (): [Str] -> {
 
 const one_s = (Str a): [Str] -> {
 	let [Str] r = [a]
+
+	return r
+}
+
+const no_i = (): [Iarch] -> {
+	let [Iarch] e = []
+
+	return e
+}
+
+const one_i = (Iarch a): [Iarch] -> {
+	let [Iarch] r = [a]
+
+	return r
+}
+
+const cat_i = ([Iarch] a, [Iarch] b): [Iarch] -> {
+	let [Iarch] r = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(a.len) then break
+		r = [...r, a[i]]
+		i = i + 1
+	}
+
+	let Iarch j = 0
+
+	loop {
+		if j >= Iarch(b.len) then break
+		r = [...r, b[j]]
+		j = j + 1
+	}
 
 	return r
 }
@@ -258,9 +291,19 @@ const let_ann_name = (Stmt s): Str -> match s { Stmt.Let(n, _, _, _) -> n, _ -> 
 
 const let_ann_ty = (Stmt s): Str -> match s { Stmt.Let(_, _, ann, _) -> ann, _ -> "" }
 
+# The type a `let`/`const` binding's RHS names WITHOUT an annotation: a record LITERAL
+# (`const cfg = Cfg({...})`) names its own type. An inferred call RHS (`const cfg = make_cfg()`)
+# is not visible this early (returns are filled post-mono), so it stays "" — the indeterminable
+# case the checker reports explicitly.
+const let_rhs_ty = (Stmt s): Str -> match s {
+	Stmt.Let(_, _, _, init) -> match unat(init) { Expr.Record(tn, _) -> tn, _ -> "" },
+	_ -> "",
+}
+
 const anns_stmt = (Ann an, Stmt s): Ann -> {
 	let Ann a = an
-	const Str lt = let_ann_ty(s)
+	const Str la = let_ann_ty(s)
+	const Str lt = if Iarch(la.len) > 0 then la else let_rhs_ty(s)
 	if Iarch(lt.len) > 0 then a = Ann({ names: [...a.names, let_ann_name(s)], tys: [...a.tys, lt] })
 
 	return match s {
@@ -286,14 +329,17 @@ const provide_ty = (Ann an, Expr arg): Str -> match unat(arg) {
 	_ -> "",
 }
 
-# The three site sets a function's body yields, threaded through one walk.
-data Scan = { [Str] cons, [Str] provs, [Str] calls }
+# The site sets a function's body yields, threaded through one walk. `provs`/`provoffs` are RAW and
+# parallel (one entry per provide site, `provoffs` the site's source offset for a located
+# diagnostic) — an indeterminable provide keeps its `""` here so the check can report it precisely.
+data Scan = { [Str] cons, [Str] provs, [Iarch] provoffs, [Str] calls }
 
-const scan_empty = (): Scan -> Scan({ cons: no_s(), provs: no_s(), calls: no_s() })
+const scan_empty = (): Scan -> Scan({ cons: no_s(), provs: no_s(), provoffs: no_i(), calls: no_s() })
 
 const scan_cat = (Scan a, Scan b): Scan -> Scan({
 	cons: cat_s(a.cons, b.cons),
 	provs: cat_s(a.provs, b.provs),
+	provoffs: cat_i(a.provoffs, b.provoffs),
 	calls: cat_s(a.calls, b.calls),
 })
 
@@ -312,23 +358,26 @@ const scan_l! = (Ann an, [Str] params, [Expr] es): Scan -> {
 
 const scan_e! = (Ann an, [Str] params, Expr e): Scan -> {
 	let Scan h = scan_empty()
+	const Iarch off = at_off(e)
 
 	match unat(e) {
 		Expr.Call(n, _, a, _) -> {
-			if eq(n, consume_fn) && Iarch(a.len) >= 1 then h = Scan({ cons: one_s(var_name(a[0])), provs: no_s(), calls: no_s() })
-			if eq(n, provide_fn) && Iarch(a.len) >= 1 then h = Scan({ cons: no_s(), provs: one_s(provide_ty(an, a[0])), calls: no_s() })
+			if eq(n, consume_fn) && Iarch(a.len) >= 1 then h = Scan({ cons: one_s(var_name(a[0])), provs: no_s(), provoffs: no_i(), calls: no_s() })
+			if eq(n, provide_fn) && Iarch(a.len) >= 1 then h = Scan({ cons: no_s(), provs: one_s(provide_ty(an, a[0])), provoffs: one_i(off), calls: no_s() })
 			if !eq(n, consume_fn) && !eq(n, provide_fn) && !has_s(params, n)
-				then h = Scan({ cons: no_s(), provs: no_s(), calls: one_s(n) })
+				then h = Scan({ cons: no_s(), provs: no_s(), provoffs: no_i(), calls: one_s(n) })
 		},
 		Expr.DeferTap(f, _) -> {
-			if !has_s(params, f) then h = Scan({ cons: no_s(), provs: no_s(), calls: one_s(f) })
+			if !has_s(params, f) then h = Scan({ cons: no_s(), provs: no_s(), provoffs: no_i(), calls: one_s(f) })
 		},
 		_ -> { },
 	}
 
+	# recurse over the children of the UNWRAPPED node: `kids` of an `At` wrapper re-yields the node
+	# itself, which would re-scan (and double-count) this very call — so descend through `unat(e)`.
 	const Scan sub = match unat(e) {
 		Expr.Loop(ss) -> scan_b!(an, params, ss),
-		_ -> scan_l!(an, params, kids(e)),
+		_ -> scan_l!(an, params, kids(unat(e))),
 	}
 
 	return scan_cat(h, sub)
@@ -417,23 +466,35 @@ const raw_demand = ([Func] funcs, [[Str]] residual, [Str] cons, [Str] calls): [S
 	return r
 }
 
-# ── evidence: locate a consume of `t` in a body, for a precise diagnostic anchor ─────────────────
+# ── evidence: locate a provide/consume in a body, for a precise diagnostic anchor ────────────────
 
 const at_off = (Expr e): Iarch -> match e { Expr.At(o, _) -> o, _ -> -1 }
 
-# ── the pass ─────────────────────────────────────────────────────────────────────────────────────
+# A diagnostic at `off` when it maps into `f`'s file, else at the declaration stamp (mirrors
+# alloc.cf's `gate_diag`).
+const dg_at = (Func f, [SrcMap] maps, Iarch off, Str msg): Diag -> {
+	if off >= 0 then {
+		const LC lc = line_col_of(maps, f.dfile, off)
+		if lc.line > 0 then return Diag({ file: f.dfile, line: lc.line, col: lc.col, msg: msg, what: "" })
+	}
 
-# Validate the context demand algebra over `prog`. Returns one located diagnostic per violation,
-# COLLECTED across the whole program (like the `!` checker) so one run reports every one.
-pub const check_demand_program! = (Program prog, [SrcMap] maps): [Diag] -> {
+	return Diag({ file: f.dfile, line: f.dline, col: f.dcol, msg: msg, what: "" })
+}
+
+# ── the resolved demand of every function ────────────────────────────────────────────────────────
+# The per-function collection and the residual fixpoint, shared by the CHECK (which validates it)
+# and the STAMP (which writes it onto `Func.uses` for emit). `provs`/`provoffs` stay RAW and
+# parallel — one entry per provide site — so the check can flag an indeterminable one precisely and
+# count same-type sites for ambiguity.
+data Demands = { [[Str]] residual, [[Str]] cons, [[Str]] provs, [[Iarch]] provoffs, [[Str]] calls }
+
+pub const resolve_demands! = (Program prog): Demands -> {
 	const [Func] funcs = prog.funcs
 	const [RecDecl] recs = prog.recs
 	const Iarch n = Iarch(funcs.len)
-
-	# collect each function's consumed types, provided types (discharge closure applied later), and
-	# concrete callees — once
 	let [[Str]] cons = []
 	let [[Str]] provs = []
+	let [[Iarch]] provoffs = []
 	let [[Str]] calls = []
 	let [[Str]] disch = []
 	let Iarch i = 0
@@ -443,6 +504,7 @@ pub const check_demand_program! = (Program prog, [SrcMap] maps): [Diag] -> {
 		if funcs[i].is_asm || funcs[i].is_intrinsic then {
 			cons = [...cons, no_s()]
 			provs = [...provs, no_s()]
+			provoffs = [...provoffs, no_i()]
 			calls = [...calls, no_s()]
 			disch = [...disch, no_s()]
 		} else {
@@ -451,7 +513,8 @@ pub const check_demand_program! = (Program prog, [SrcMap] maps): [Diag] -> {
 			const [Str] params = param_names(funcs[i].params)
 			const Scan sc = scan_b!(an2, params, funcs[i].body)
 			cons = [...cons, union_s(sc.cons, no_s())]
-			provs = [...provs, union_s(sc.provs, no_s())]
+			provs = [...provs, sc.provs]
+			provoffs = [...provoffs, sc.provoffs]
 			calls = [...calls, sc.calls]
 			disch = [...disch, discharged(recs, sc.provs)]
 		}
@@ -487,6 +550,78 @@ pub const check_demand_program! = (Program prog, [SrcMap] maps): [Diag] -> {
 		if !changed then break
 	}
 
+	return Demands({
+		residual: residual,
+		cons: cons,
+		provs: provs,
+		provoffs: provoffs,
+		calls: calls,
+	})
+}
+
+# Rebuild `f` with its context demands stamped onto `uses` — its resolved hidden signature.
+const with_uses = (Func f, [Str] u): Func -> Func({
+	name: f.name,
+	is_pub: f.is_pub,
+	ret_name: f.ret_name,
+	ret_elem: f.ret_elem,
+	params: f.params,
+	body: f.body,
+	is_asm: f.is_asm,
+	asm_body: f.asm_body,
+	is_value: f.is_value,
+	ret_telems: f.ret_telems,
+	typarams: f.typarams,
+	tbounds: f.tbounds,
+	ret_size: f.ret_size,
+	is_intrinsic: f.is_intrinsic,
+	asm_sym: f.asm_sym,
+	dfile: f.dfile,
+	dline: f.dline,
+	dcol: f.dcol,
+	uses: u,
+})
+
+# Stamp each function's RESOLVED demand set onto its `uses` field, so the hidden ctx signature
+# survives monomorphization to emit. Run AFTER the demand check passes (so the both-ways `pub`
+# validation still sees the user's DECLARED clause), and BEFORE mono. For a `pub` function the
+# residual equals the declared clause (the check enforced it); for the rest it fills the inferred
+# set. Order is self-consistent per function — the definition and every call site read the same
+# `callee.uses` — so the ABI needs no separate canonical sort.
+pub const stamp_demands! = (Program prog): Program -> {
+	const Demands dm = resolve_demands!(prog)
+	let [Func] out = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(prog.funcs.len) then break
+		out = [...out, with_uses(prog.funcs[i], dm.residual[i])]
+		i = i + 1
+	}
+
+	return Program({
+		imports: prog.imports,
+		recs: prog.recs,
+		unions: prog.unions,
+		funcs: out,
+		groups: prog.groups,
+	})
+}
+
+# ── the check ──────────────────────────────────────────────────────────────────────────────────
+
+# Validate the context demand algebra over `prog`. Returns one located diagnostic per violation,
+# COLLECTED across the whole program (like the `!` checker) so one run reports every one.
+pub const check_demand_program! = (Program prog, [SrcMap] maps): [Diag] -> {
+	const [Func] funcs = prog.funcs
+	const [RecDecl] recs = prog.recs
+	const Iarch n = Iarch(funcs.len)
+	const Demands dm = resolve_demands!(prog)
+	const [[Str]] cons = dm.cons
+	const [[Str]] provs = dm.provs
+	const [[Iarch]] provoffs = dm.provoffs
+	const [[Str]] calls = dm.calls
+	const [[Str]] residual = dm.residual
 	let [Diag] diags = []
 	const [Str] taken = address_taken(prog)
 
@@ -567,9 +702,31 @@ pub const check_demand_program! = (Program prog, [SrcMap] maps): [Diag] -> {
 			}
 		}
 
+		# an indeterminable provide (§3, and the pre-mono limitation): its value's type could not be
+		# read from a record literal or an annotated binding — reject explicitly rather than let it
+		# degrade into an undischarged-demand error downstream. (A call-RHS with an inferred return is
+		# not visible this early — annotate it.)
+		const [Str] pf = provs[f]
+		const [Iarch] pof = provoffs[f]
+		let Iarch pk = 0
+
+		loop {
+			if pk >= Iarch(pf.len) then break
+			if Iarch(pf[pk].len) == 0
+				then diags = [
+				...diags,
+				dg_at(
+					ff,
+					maps,
+					pof[pk],
+					"cf: ctx: `${ff.name}` provides a value whose type cannot be determined here — annotate the binding (`const T x = ...`) or construct it inline\n",
+				),
+			]
+			pk = pk + 1
+		}
+
 		# an ambiguous discharge: a demand this function's provides can satisfy in more than one way
 		# (two provides of the same type, or a direct provide next to one that embeds it by spread, §5)
-		const [Str] pf = provs[f]
 		const [Str] seen = union_s(cons[f], raw_demand(funcs, residual, cons[f], calls[f]))
 		let Iarch d = 0
 

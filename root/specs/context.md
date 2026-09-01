@@ -11,24 +11,36 @@ hidden argument to exactly the functions that demand it. Nothing here is a
 runtime registry; provision, discharge, and routing are all compile-time, and
 the only runtime artifact is a pointer in a register.
 
-Status: the **read-only `const`-context surface and its demand checker are
-implemented** (M-A); the hidden-argument ABI, the `let`-provide mutation rules,
-and context-across-tasks are not. What lands now: the `std::mem::ctx` module
-(`provide`/`consume` as bodyless intrinsics), the `uses` clause (§4), and the
-`demand` pass — computing each function's demand set and raising the §4/§5
-rejections it can decide without codegen (an undischarged demand, an undeclared
-or redundant `pub` demand, a demand-carrying function used as a value, an
-ambiguous discharge). Because the pointer is not yet threaded, a demand-sound
-program is *accepted* but not yet *run*: emit lowering of `provide`/`consume`,
-the canonical-sorted hidden signature, the interior-pointer spread discharge,
-and dead-provide elimination are the ABI milestone (M-B). The `let`-provide
-mutation rules of §3 (in-place-only, no repointing) land with that milestone's
-stores; context-across-tasks (§7) stays with the concurrency arc. The fn-free
+Status: the **read-only `const`-context path runs end-to-end** (M-A surface +
+demand checker, M-B hidden-argument ABI). The `let`-provide mutation rules and
+context-across-tasks are not yet implemented. What lands:
+
+- **Surface + checker** (M-A): the `std::mem::ctx` module (`provide`/`consume`
+  as bodyless intrinsics), the `uses` clause (§4, [[ebnf.md]]), and the demand
+  pass — each function's demand set and the §4/§5 rejections (undischarged;
+  undeclared/redundant `pub`; a demand-carrying function used as a value;
+  ambiguous discharge; and an indeterminable provided type, rejected explicitly).
+- **ABI** (M-B): each demanded type is one hidden pointer argument, emitted
+  after the ambient node and before the user parameters (`%cxp<k>` per
+  `uses` type); a call site resolves each of the callee's demands in the
+  caller's scope and threads the pointer, forwarding its own hidden params or a
+  provide-site pointer. `consume(T)` is a comptime binder — it compiles to the
+  resolved pointer, no call. Spread discharge is an interior pointer (`base +
+  offset`) into the provided record. A `!` consumer receives both the node and
+  its context pointers and materializes under its geometry normally.
+
+Deliberate M-B simplifications, both sound under the checker's guarantees:
+`provide` registers a pointer to the value *where the provider already built
+it* — no arena copy — because the provider's frame lexically outlives every
+consumer; and the hidden signature is stamped in the demand pass's own
+deterministic order rather than a canonical type-name sort (each callee's
+definition and every call site read the same `uses` list, so the ABI is
+self-consistent whole-program). The arena-placement refinement (so the value is
+reclaimed with the arena) and a canonical sort are later polish. The `let`-provide
+mutation rules of §3 (in-place-only, no repointing) land with their stores next;
+context-across-tasks (§7) stays with the concurrency arc. The fn-free
 requirement of §3 needs no check — a record field type is a name or an array,
-never a `(A) -> B`, so a provided type is fn-free by grammar. `provide` and
-`consume` are ordinary bodyless intrinsics in the style of the geometry
-constructors ([[geometry_lowering.md]] §1); the `uses` clause is in
-[[ebnf.md]].
+never a `(A) -> B`, so a provided type is fn-free by grammar.
 
 ## 1. The model
 
