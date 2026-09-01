@@ -1,0 +1,870 @@
+# std::compiler::retfill — fill OMITTED return types from the body (type_system §5.1: "Function
+# return types are inferred from the body and so may be omitted" — universal, named functions and
+# closures alike; the old genesis default of the register word was a deviation this pass retires).
+#
+# The pass walks every concrete function whose return annotation is empty (and every function
+# holding an empty-return closure), threads the same value environment the typechecker uses
+# (parameters + `let`/match/`for`/destructure binders), and types the FIRST `return e` it reaches
+# — that type is written into the declaration (`ret_name`/`ret_elem`/`ret_telems`). Later returns
+# are not consulted: the uniform-returns rule means typecheck validates them against the filled
+# type, so a disagreeing body still rejects at its own line.
+#
+# A derivation that cannot complete THIS round (a call to a still-unfilled function) records
+# into a bag and simply leaves the blank — no error escapes. The driver runs the pass to a
+# FIXPOINT (each round fills at least one blank or stops). The pipeline runs it POST-monomorph
+# only: pre-mono bodies reach template declarations whose type variables the shared `named_ty`
+# dies on, while post-mono every body is concrete (instances minted, constructions mangled).
+# The one edge this order leaves: during the monomorph pass's own type-argument inference an
+# unannotated function's result still reads as the old word default — a non-`Iarch` result
+# feeding a generic call may pin a wrong instance, which typecheck then REJECTS at the call
+# (fail-closed; annotate that one return). A blank that survives the pass keeps the old
+# default downstream — the typecheck mismatch it may cause lands on the offending `return`.
+#
+# What never fills: templates (their bodies mention type variables — their INSTANCES fill),
+# asm/intrinsic declarations (no body; the return annotation is mandatory), returnless bodies
+# (the `()` fall-through / `Never` synthesis paths own those), and a body whose first return
+# types to a form with no written spelling (a pointer, a function value, `Never`, the unit).
+# A closure's return slot is a bare NAME (no array-element / tuple carriers), so a closure
+# fills scalar/record/union/Str returns only — an aggregate-returning closure keeps its blank.
+
+import std::compiler::ast::{
+	Program,
+	Func,
+	Param,
+	Stmt,
+	StmtArm,
+	MatchArm,
+	Expr,
+	TupElem,
+	Ty,
+	RecDecl,
+	UnionDecl,
+	Seg,
+	FieldInit,
+}
+import std::compiler::diag::{ DiagBag, record_dg }
+import std::compiler::spans::{ no_maps, unat }
+import std::compiler::typecheck::{
+	type_of!,
+	ty_name,
+	Ctx,
+	VarTy,
+	param_ty!,
+	binding_ty!,
+	closure_tfn,
+	arm_bind_env,
+	check_destructure!,
+	dyn_of,
+	elem_ty!,
+}
+import std::data::str::{ eq }
+
+# The threaded pass state: the program's tables (for the typing `Ctx`) plus the per-function
+# first-return latch. `changed` accumulates across one whole round.
+data RfCtx = {
+	[Func] funcs,
+	[RecDecl] recs,
+	[UnionDecl] unions,
+	Bool changed,
+	# the latch: whether a first return was seen, whether its typing failed, and the type
+	Bool rfound,
+	Bool rhot,
+	Ty rty,
+	# the walked function's lambda-consumption notes: for each locally-declared closure
+	# passed to a function-type parameter, the consuming parameter's `[args..., ret]`
+	# signature telems (wrapped in one `$fn` telem) — a bare lambda parameter fills from
+	# its position here (type_system §5.2). First consumer wins.
+	[Str] lam_names,
+	[TupElem] lam_sigs,
+}
+
+const build_rf_ctx = (*RfCtx c): Ctx -> Ctx({
+	funcs: c.funcs,
+	recs: c.recs,
+	unions: c.unions,
+	# the return type is exactly what is being derived — the `Never` poison satisfies any
+	# `return`-inside-a-value-loop check without pinning anything
+	frt: Ty.TNever,
+	frsize: 0,
+	dfile: "",
+	dline: 0,
+	dcol: 0,
+	maps: no_maps(),
+})
+
+const bind_var = ([VarTy] env, Str name, Ty t): [VarTy] -> [
+	...env,
+	VarTy({
+		name: name,
+		ty: t,
+		mutable: false,
+		esc: false,
+		outer: false,
+		fixed: false,
+		is_ref: false,
+		fsize: 0,
+		elem: "",
+	}),
+]
+
+# The parameter environment a body is typed under — mirrors typecheck's own seeding.
+const param_env! = (*RfCtx c, [Param] ps, [VarTy] env0): [VarTy] -> {
+	let [VarTy] env = env0
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(ps.len) then break
+		env = [
+			...env,
+			VarTy({
+				name: ps[i].name,
+				ty: param_ty!(ps[i], c.recs, c.unions),
+				mutable: false,
+				esc: false,
+				outer: ps[i].is_ptr,
+				fixed: false,
+				is_ref: ps[i].is_ptr,
+				fsize: 0,
+				elem: ps[i].elem,
+			}),
+		]
+		i = i + 1
+	}
+
+	return env
+}
+
+# Latch the first `return e`'s type. A typing failure this round poisons the latch — the
+# function keeps its blank and a later round (or the post-monomorph run) retries.
+const latch_return! = (*RfCtx c, Expr e, [VarTy] env): () -> {
+	if c.rfound then return ()
+	c.rfound = true
+	let DiagBag bag = record_dg()
+	const Ty t = type_of!(e, env, build_rf_ctx(c), &bag)
+	if bag.hot then {
+		c.rhot = true
+
+		return ()
+	}
+	c.rty = t
+
+	return ()
+}
+
+const let_env! = (*RfCtx c, Str n, Str ann, Expr e, [VarTy] env): [VarTy] -> {
+	let DiagBag bag = record_dg()
+	const Ty t = binding_ty!(ann, e, env, build_rf_ctx(c), &bag)
+
+	return bind_var(env, n, t)
+}
+
+const destr_env! = (*RfCtx c, [Str] pat, Bool mut, Expr e, [VarTy] env): [VarTy] -> {
+	let DiagBag bag = record_dg()
+
+	return check_destructure!(pat, mut, e, env, build_rf_ctx(c), &bag)
+}
+
+const for_env! = (*RfCtx c, Str v, Str a, [VarTy] env): [VarTy] -> {
+	let Iarch i = Iarch(env.len) - 1
+	let Str en = ""
+
+	loop {
+		if i < 0 then break
+		if eq(env[i].name, a) then {
+			en = dyn_of(env[i].ty)
+
+			break
+		}
+		i = i - 1
+	}
+
+	let DiagBag bag = record_dg()
+	const Ty et = elem_ty!(en, build_rf_ctx(c), &bag)
+
+	return bind_var(env, v, et)
+}
+
+const arm_env! = (*RfCtx c, Expr scrut, StmtArm a, [VarTy] env): [VarTy] -> {
+	if a.is_wild then return env
+	let DiagBag bag = record_dg()
+	let Str tn = a.type_name
+	if eq(tn, "") then tn = ty_name(type_of!(scrut, env, build_rf_ctx(c), &bag))
+
+	let DiagBag abag = record_dg()
+
+	return arm_bind_env(tn, a.members, a.binds, env, build_rf_ctx(c), &abag)
+}
+
+# --- the consumption scan ------------------------------------------------------------------
+
+const note_lam = (*RfCtx c, Str nm, [TupElem] sig): () -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(c.lam_names.len) then break
+		if eq(c.lam_names[i], nm) then return ()
+		i = i + 1
+	}
+
+	c.lam_names = [...c.lam_names, nm]
+	c.lam_sigs = [...c.lam_sigs, TupElem({ name: "$fn", sub: sig })]
+
+	return ()
+}
+
+const fn_index = (*RfCtx c, Str nm): Iarch -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(c.funcs.len) then break
+		if eq(c.funcs[i].name, nm) then return i
+		i = i + 1
+	}
+
+	return -1
+}
+
+# A call whose callee takes function-type parameters notes each lambda argument's expected
+# signature — the source a bare lambda parameter fills from.
+const scan_call = (*RfCtx c, Str callee, [Expr] args): () -> {
+	const Iarch fi = fn_index(c, callee)
+	if fi < 0 then return ()
+	let Iarch p = 0
+
+	loop {
+		if p >= Iarch(args.len) then break
+		if p < Iarch(c.funcs[fi].params.len) then {
+			if eq(c.funcs[fi].params[p].type_name, "$fn") then {
+				const Str nm = match unat(args[p]) { Expr.Var(vn) -> vn, _ -> "" }
+				if !eq(nm, "") then note_lam(c, nm, c.funcs[fi].params[p].telems)
+			}
+		}
+		p = p + 1
+	}
+
+	return ()
+}
+
+const scan_exprs! = (*RfCtx c, [Expr] es): () -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(es.len) then break
+		scan_expr!(c, es[i])
+		i = i + 1
+	}
+
+	return ()
+}
+
+const scan_expr! = (*RfCtx c, Expr e): () -> {
+	match e {
+		Expr.Record(rn, fis) -> {
+			let Iarch i = 0
+
+			loop {
+				if i >= Iarch(fis.len) then break
+				scan_expr!(c, fis[i].value)
+				i = i + 1
+			}
+		},
+		Expr.FieldExpr(b, f) -> scan_expr!(c, b),
+		Expr.UnionMk(t, mm, args) -> scan_exprs!(c, args),
+		Expr.Match(scrut, arms) -> {
+			scan_expr!(c, scrut)
+			let Iarch i = 0
+
+			loop {
+				if i >= Iarch(arms.len) then break
+				scan_expr!(c, arms[i].body)
+				i = i + 1
+			}
+		},
+		Expr.ArrayLit(sp, src, elems, et) -> {
+			scan_expr!(c, src)
+			scan_exprs!(c, elems)
+		},
+		Expr.Index(a, ix) -> scan_expr!(c, ix),
+		Expr.IndexField(a, ix, f) -> scan_expr!(c, ix),
+		Expr.IndexExpr(b, ix) -> {
+			scan_expr!(c, b)
+			scan_expr!(c, ix)
+		},
+		Expr.Interp(segs) -> {
+			let Iarch i = 0
+
+			loop {
+				if i >= Iarch(segs.len) then break
+				if segs[i].is_hole then scan_expr!(c, segs[i].expr)
+				i = i + 1
+			}
+		},
+		Expr.Tuple(es) -> scan_exprs!(c, es),
+		Expr.Spread(x) -> scan_expr!(c, x),
+		Expr.Loop(body) -> scan_stmts!(c, body),
+		Expr.Buffer(x) -> scan_expr!(c, x),
+		Expr.Neg(x) -> scan_expr!(c, x),
+		Expr.Not(x) -> scan_expr!(c, x),
+		Expr.BitNot(x) -> scan_expr!(c, x),
+		Expr.Add(a, b) -> scan_two!(c, a, b),
+		Expr.Sub(a, b) -> scan_two!(c, a, b),
+		Expr.Mul(a, b) -> scan_two!(c, a, b),
+		Expr.Div(a, b) -> scan_two!(c, a, b),
+		Expr.Mod(a, b) -> scan_two!(c, a, b),
+		Expr.BitAnd(a, b) -> scan_two!(c, a, b),
+		Expr.BitOr(a, b) -> scan_two!(c, a, b),
+		Expr.BitXor(a, b) -> scan_two!(c, a, b),
+		Expr.Shl(a, b) -> scan_two!(c, a, b),
+		Expr.Shr(a, b) -> scan_two!(c, a, b),
+		Expr.CmpEq(a, b) -> scan_two!(c, a, b),
+		Expr.CmpNe(a, b) -> scan_two!(c, a, b),
+		Expr.CmpLt(a, b) -> scan_two!(c, a, b),
+		Expr.CmpGt(a, b) -> scan_two!(c, a, b),
+		Expr.CmpLe(a, b) -> scan_two!(c, a, b),
+		Expr.CmpGe(a, b) -> scan_two!(c, a, b),
+		Expr.And(a, b) -> scan_two!(c, a, b),
+		Expr.Or(a, b) -> scan_two!(c, a, b),
+		Expr.If(cond, t, el) -> {
+			scan_expr!(c, cond)
+			scan_expr!(c, t)
+			scan_expr!(c, el)
+		},
+		Expr.Call(callee, ta, args, g) -> {
+			scan_call(c, callee, args)
+			scan_exprs!(c, args)
+		},
+		Expr.DeferTap(fn, args) -> scan_exprs!(c, args),
+		Expr.At(off, inner) -> scan_expr!(c, inner),
+		_ -> {},
+	}
+
+	return ()
+}
+
+const scan_two! = (*RfCtx c, Expr a, Expr b): () -> {
+	scan_expr!(c, a)
+	scan_expr!(c, b)
+
+	return ()
+}
+
+const scan_stmts! = (*RfCtx c, [Stmt] ss): () -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(ss.len) then break
+
+		match ss[i] {
+			Stmt.Let(n, mut, ann, e) -> scan_expr!(c, e),
+			Stmt.Assign(n, e) -> scan_expr!(c, e),
+			Stmt.FieldAssign(n, f, e) -> scan_expr!(c, e),
+			Stmt.DeepFieldAssign(b, f, e) -> scan_two!(c, b, e),
+			Stmt.IndexAssign(n, ix, e) -> scan_two!(c, ix, e),
+			Stmt.Return(e) -> scan_expr!(c, e),
+			Stmt.ForIn(v, a, body) -> scan_stmts!(c, body),
+			Stmt.Loop(ll, body) -> scan_stmts!(c, body),
+			Stmt.IfThen(cond, st) -> {
+				scan_expr!(c, cond)
+				scan_stmt!(c, st)
+			},
+			Stmt.IfElse(cond, t, e) -> {
+				scan_expr!(c, cond)
+				scan_stmt!(c, t)
+				scan_stmt!(c, e)
+			},
+			Stmt.Do(e) -> scan_expr!(c, e),
+			Stmt.Block(stmts) -> scan_stmts!(c, stmts),
+			Stmt.Match(scrut, arms) -> {
+				scan_expr!(c, scrut)
+				let Iarch a2 = 0
+
+				loop {
+					if a2 >= Iarch(arms.len) then break
+					scan_stmts!(c, arms[a2].body)
+					a2 = a2 + 1
+				}
+			},
+			Stmt.Destructure(pat, mut, e) -> scan_expr!(c, e),
+			Stmt.Yield(e) -> scan_expr!(c, e),
+			Stmt.Closure(nm, params, ret, body) -> scan_stmts!(c, body),
+			Stmt.Defer(body) -> scan_stmts!(c, body),
+			_ -> {},
+		}
+		i = i + 1
+	}
+
+	return ()
+}
+
+const scan_stmt! = (*RfCtx c, Stmt s): () -> {
+	let [Stmt] one = []
+	one = [...one, s]
+	scan_stmts!(c, one)
+
+	return ()
+}
+
+# --- the parameter fill --------------------------------------------------------------------
+
+const params_blank = ([Param] ps): Bool -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(ps.len) then break
+		if eq(ps[i].type_name, "") then return true
+		i = i + 1
+	}
+
+	return false
+}
+
+const lam_index = (*RfCtx c, Str nm): Iarch -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(c.lam_names.len) then break
+		if eq(c.lam_names[i], nm) then return i
+		i = i + 1
+	}
+
+	return -1
+}
+
+const bracket_elem! = (Str s): Str -> {
+	const Iarch n = Iarch(s.len)
+	if n < 2 then return ""
+	if Iarch(s[0]) != 91 then return ""
+	let [Uint8] out = []
+	let Iarch i = 1
+
+	loop {
+		if i >= n - 1 then break
+		out = [...out, s[i]]
+		i = i + 1
+	}
+
+	return Str(out)
+}
+
+# Fill each BARE parameter from its position in the consuming signature (`[args..., ret]`);
+# an annotated one keeps its own type. Arity mismatch fills nothing (typecheck rejects it).
+const fill_params! = (*RfCtx c, [Param] ps, [TupElem] sig): [Param] -> {
+	if Iarch(sig.len) - 1 != Iarch(ps.len) then return ps
+	let [Param] out = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(ps.len) then break
+		if !eq(ps[i].type_name, "") then {
+			out = [...out, ps[i]]
+		} else {
+			const TupElem te = sig[i]
+			let Str tn = te.name
+			let Str el = ""
+			let [TupElem] tel = te.sub
+			if Iarch(te.name.len) > 1 && Iarch(te.name[0]) == 91 then {
+				tn = "$dyn"
+				el = bracket_elem!(te.name)
+			}
+			if eq(tn, "") then {
+				out = [...out, ps[i]]
+			} else {
+				c.changed = true
+				out = [
+					...out,
+					Param({ name: ps[i].name, is_ptr: false, type_name: tn, elem: el, telems: tel, size: 0 }),
+				]
+			}
+		}
+		i = i + 1
+	}
+
+	return out
+}
+
+# --- the walk ------------------------------------------------------------------------------
+
+# Walk one statement list in source order, threading the environment and latching the first
+# return; a closure statement fills ITS blank return in place (its own latch, saved/restored
+# around the descent) and binds under its function type for the statements after it.
+const walk_stmts! = (*RfCtx c, [Stmt] ss, [VarTy] env0): [Stmt] -> {
+	let [VarTy] env = env0
+	let [Stmt] out = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(ss.len) then break
+		const Stmt ws = walk_stmt!(c, ss[i], env)
+		out = [...out, ws]
+
+		match ws {
+			Stmt.Let(n, mut, ann, e) -> {
+				env = let_env!(c, n, ann, e, env)
+			},
+			Stmt.Destructure(pat, mut, e) -> {
+				env = destr_env!(c, pat, mut, e, env)
+			},
+			Stmt.Closure(nm, params, ret, body) -> {
+				env = bind_var(env, nm, closure_tfn(ret, params))
+			},
+			_ -> {},
+		}
+		i = i + 1
+	}
+
+	return out
+}
+
+const walk_arms! = (*RfCtx c, Expr scrut, [StmtArm] arms, [VarTy] env): [StmtArm] -> {
+	let [StmtArm] out = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(arms.len) then break
+		const StmtArm a = arms[i]
+		out = [
+			...out,
+			StmtArm({
+				is_wild: a.is_wild,
+				type_name: a.type_name,
+				members: a.members,
+				binds: a.binds,
+				body: walk_stmts!(c, a.body, arm_env!(c, scrut, a, env)),
+			}),
+		]
+		i = i + 1
+	}
+
+	return out
+}
+
+const walk_closure! = (
+	*RfCtx c,
+	Str nm,
+	[Param] params,
+	Str ret,
+	[Stmt] body,
+	[VarTy] env,
+): Stmt -> {
+	# a bare parameter fills from the consuming call's function-type parameter (the scan
+	# noted it before this walk); its body then types under the filled environment
+	let [Param] wparams = params
+	if params_blank(params) then {
+		const Iarch li = lam_index(c, nm)
+		if li >= 0 then wparams = fill_params!(c, params, c.lam_sigs[li].sub)
+	}
+	# the closure derives under its OWN latch; the enclosing function's is saved around it
+	const Bool sfound = c.rfound
+	const Bool shot = c.rhot
+	const Ty sty = c.rty
+	c.rfound = false
+	c.rhot = false
+
+	const [Stmt] wbody = walk_stmts!(c, body, param_env!(c, wparams, env))
+
+	let Str wret = ret
+	if eq(ret, "") && c.rfound && !c.rhot then {
+		const Ty dt = c.rty
+		const Str rn = fill_name!(dt)
+		if !eq(rn, "") && !names_template(c, rn) then {
+			wret = rn
+			c.changed = true
+		}
+	}
+	c.rfound = sfound
+	c.rhot = shot
+	c.rty = sty
+
+	return Stmt.Closure(nm, wparams, wret, wbody)
+}
+
+const walk_stmt! = (*RfCtx c, Stmt s, [VarTy] env): Stmt -> match s {
+	Stmt.Return(e) -> {
+		latch_return!(c, e, env)
+
+		<- s
+	},
+	Stmt.ForIn(v, a, body) -> Stmt.ForIn(v, a, walk_stmts!(c, body, for_env!(c, v, a, env))),
+	Stmt.Loop(ll, body) -> Stmt.Loop(ll, walk_stmts!(c, body, env)),
+	Stmt.IfThen(cond, st) -> Stmt.IfThen(cond, walk_stmt!(c, st, env)),
+	Stmt.IfElse(cond, t, e) -> Stmt.IfElse(cond, walk_stmt!(c, t, env), walk_stmt!(c, e, env)),
+	Stmt.Block(stmts) -> Stmt.Block(walk_stmts!(c, stmts, env)),
+	Stmt.Match(scrut, arms) -> Stmt.Match(scrut, walk_arms!(c, scrut, arms, env)),
+	Stmt.Closure(nm, params, ret, body) -> walk_closure!(c, nm, params, ret, body, env),
+	Stmt.Defer(body) -> Stmt.Defer(walk_stmts!(c, body, env)),
+	_ -> s,
+}
+
+# --- the fill ------------------------------------------------------------------------------
+
+# A name that resolves to a still-GENERIC declaration cannot fill: pre-mono, a derived
+# `Maybe.Just(1)` types under the TEMPLATE union's bare name, and writing that into a
+# signature leaks its type variables. The post-mono run sees the minted instance name
+# (`Maybe$Iarch`) and fills then.
+const names_template = (*RfCtx c, Str n): Bool -> {
+	let Iarch u = 0
+
+	loop {
+		if u >= Iarch(c.unions.len) then break
+		if eq(c.unions[u].name, n) then return Iarch(c.unions[u].typarams.len) > 0
+		u = u + 1
+	}
+
+	let Iarch r = 0
+
+	loop {
+		if r >= Iarch(c.recs.len) then break
+		if eq(c.recs[r].name, n) then return Iarch(c.recs[r].typarams.len) > 0
+		r = r + 1
+	}
+
+	return false
+}
+
+# The written spelling of a derived SCALAR/named return type — "" when the type has no
+# spelling that fits a bare name slot (a pointer, a function value, an array, a tuple,
+# `Never`, the unit). A precise union-member type (`Maybe$Iarch.Just`) widens to its base
+# union: the member refines, the declaration states the union.
+const fill_name! = (Ty t): Str -> {
+	const Str n = match t {
+		Ty.TNever -> "",
+		Ty.TUnit -> "",
+		Ty.TDyn(en) -> "",
+		Ty.TTuple(tel) -> "",
+		_ -> ty_name(t),
+	}
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(n.len) then break
+		if Iarch(n[i]) == 46 then return base_of!(n, i)
+		i = i + 1
+	}
+
+	return n
+}
+
+const base_of! = (Str n, Iarch stop): Str -> {
+	let [Uint8] out = []
+	let Iarch i = 0
+
+	loop {
+		if i >= stop then break
+		out = [...out, n[i]]
+		i = i + 1
+	}
+
+	return Str(out)
+}
+
+# Whether a statement list contains any `return` (directly or nested) — a returnless body
+# keeps its blank (the `()` fall-through and `Never` synthesis paths own it).
+const has_return = ([Stmt] ss): Bool -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(ss.len) then break
+		if stmt_has_return(ss[i]) then return true
+		i = i + 1
+	}
+
+	return false
+}
+
+const stmt_has_return = (Stmt s): Bool -> match s {
+	Stmt.Return(e) -> true,
+	Stmt.ForIn(v, a, body) -> has_return(body),
+	Stmt.Loop(ll, body) -> has_return(body),
+	Stmt.IfThen(cond, st) -> stmt_has_return(st),
+	Stmt.IfElse(cond, t, e) -> stmt_has_return(t) || stmt_has_return(e),
+	Stmt.Block(stmts) -> has_return(stmts),
+	Stmt.Match(scrut, arms) -> arms_have_return(arms),
+	_ -> false,
+}
+
+const arms_have_return = ([StmtArm] arms): Bool -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(arms.len) then break
+		if has_return(arms[i].body) then return true
+		i = i + 1
+	}
+
+	return false
+}
+
+# Whether a statement list holds a closure with a blank return type (so an otherwise-annotated
+# function still gets walked for ITS closures' fills). A closure body never holds another
+# closure (v1 forbids nesting), but the walk stays total anyway.
+const has_blank_closure = ([Stmt] ss): Bool -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(ss.len) then break
+		if stmt_has_blank_closure(ss[i]) then return true
+		i = i + 1
+	}
+
+	return false
+}
+
+const stmt_has_blank_closure = (Stmt s): Bool -> match s {
+	Stmt.Closure(nm, params, ret, body) -> eq(ret, "") || params_blank(params) || has_blank_closure(body),
+	Stmt.ForIn(v, a, body) -> has_blank_closure(body),
+	Stmt.Loop(ll, body) -> has_blank_closure(body),
+	Stmt.IfThen(cond, st) -> stmt_has_blank_closure(st),
+	Stmt.IfElse(cond, t, e) -> stmt_has_blank_closure(t) || stmt_has_blank_closure(e),
+	Stmt.Block(stmts) -> has_blank_closure(stmts),
+	Stmt.Match(scrut, arms) -> arms_have_blank_closure(arms),
+	Stmt.Defer(body) -> has_blank_closure(body),
+	_ -> false,
+}
+
+const arms_have_blank_closure = ([StmtArm] arms): Bool -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(arms.len) then break
+		if has_blank_closure(arms[i].body) then return true
+		i = i + 1
+	}
+
+	return false
+}
+
+# A tuple-position telem list carrying no blank leaf — a derived tuple return only fills when
+# every position has a written spelling.
+const telems_filled = ([TupElem] tel): Bool -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(tel.len) then break
+		if eq(tel[i].name, "") then return false
+		i = i + 1
+	}
+
+	return true
+}
+
+const no_env = (): [VarTy] -> []
+
+const fresh_names = (): [Str] -> []
+
+const fresh_sigs = (): [TupElem] -> []
+
+const refill_func! = (*RfCtx c, Func f): Func -> {
+	const Bool wants_ret = eq(f.ret_name, "") && Iarch(f.ret_telems.len) == 0 && has_return(f.body)
+	if !wants_ret && !has_blank_closure(f.body) then return f
+	c.rfound = false
+	c.rhot = false
+	c.lam_names = fresh_names()
+	c.lam_sigs = fresh_sigs()
+	scan_stmts!(c, f.body)
+
+	const [Stmt] body = walk_stmts!(c, f.body, param_env!(c, f.params, no_env()))
+
+	let Str rn = f.ret_name
+	let Str re = f.ret_elem
+	let [TupElem] rtel = f.ret_telems
+	if wants_ret && c.rfound && !c.rhot then {
+		const Ty dt = c.rty
+
+		match dt {
+			Ty.TDyn(en) -> {
+				if !names_template(c, en) then {
+					rn = "$dyn"
+					re = en
+					c.changed = true
+				}
+			},
+			Ty.TTuple(tel) -> {
+				if telems_filled(tel) then {
+					rn = "$tuple"
+					rtel = tel
+					c.changed = true
+				}
+			},
+			_ -> {
+				const Str fname = fill_name!(dt)
+				if !eq(fname, "") && !names_template(c, fname) then {
+					rn = fname
+					c.changed = true
+				}
+			},
+		}
+	}
+
+	return Func({
+		name: f.name,
+		is_pub: f.is_pub,
+		ret_name: rn,
+		ret_elem: re,
+		params: f.params,
+		body: body,
+		is_asm: f.is_asm,
+		asm_body: f.asm_body,
+		is_value: f.is_value,
+		ret_telems: rtel,
+		typarams: f.typarams,
+		tbounds: f.tbounds,
+		ret_size: f.ret_size,
+		is_intrinsic: f.is_intrinsic,
+		asm_sym: f.asm_sym,
+		dfile: f.dfile,
+		dline: f.dline,
+		dcol: f.dcol,
+	})
+}
+
+# One round over every fillable function. Templates, asm, and intrinsics pass through — a
+# template's body mentions type variables (its instances fill post-monomorph), and a bodyless
+# declaration's return annotation is mandatory.
+const fill_round! = (*RfCtx c, [Func] funcs): [Func] -> {
+	let [Func] out = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(funcs.len) then break
+		const Func f = funcs[i]
+		if Iarch(f.typarams.len) > 0 || f.is_asm || f.is_intrinsic then {
+			out = [...out, f]
+		} else {
+			out = [...out, refill_func!(c, f)]
+		}
+		i = i + 1
+	}
+
+	return out
+}
+
+# Fill every omitted return type derivable from the program as it stands — to a fixpoint, since
+# one fill can unlock another (`const g = () -> "s"` then `const h = () -> g()`). Blanks that
+# survive are left for a later run (or for typecheck's own rejection at the offending return).
+pub const retfill_program! = (Program p): Program -> {
+	let [Func] funcs = p.funcs
+
+	loop {
+		let RfCtx c = RfCtx({
+			funcs: funcs,
+			recs: p.recs,
+			unions: p.unions,
+			changed: false,
+			rfound: false,
+			rhot: false,
+			rty: Ty.TNever,
+			lam_names: fresh_names(),
+			lam_sigs: fresh_sigs(),
+		})
+		funcs = fill_round!(&c, funcs)
+		if !c.changed then break
+	}
+
+	return Program({
+		imports: p.imports,
+		recs: p.recs,
+		unions: p.unions,
+		funcs: funcs,
+		groups: p.groups,
+	})
+}

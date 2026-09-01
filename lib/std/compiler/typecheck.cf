@@ -706,9 +706,35 @@ const ty_eq = (Ty a, Ty b): Bool -> {
 			match b { Ty.TFixed(bb, bsg) -> ab == bb && (if asg then bsg else !bsg), _ -> false },
 		Ty.TFloat(ab) -> match b { Ty.TFloat(bb) -> ab == bb, _ -> false },
 		Ty.TTuple(ae) -> match b { Ty.TTuple(be) -> tuple_elems_eq(ae, be), _ -> false },
-		Ty.TFn(asig) -> match b { Ty.TFn(bsig) -> tuple_elems_eq(asig, bsig), _ -> false },
+		Ty.TFn(asig) -> match b { Ty.TFn(bsig) -> fn_sigs_eq(asig, bsig), _ -> false },
 		Ty.TNever -> true,
 	}
+}
+
+# Two function signatures match position-for-position — with an UNKNOWN leaf (the empty
+# name: an unfilled lambda slot the fill passes complete before the final check) matching
+# anything. The monomorph pass types calls through here BEFORE those passes have run, so
+# the wildcard keeps a pending lambda from rejecting; the post-fill check is strict again
+# (every name concrete by then, or the closure gate has already rejected).
+const fn_sigs_eq = ([TupElem] a, [TupElem] b): Bool -> {
+	if Iarch(a.len) != Iarch(b.len) then return false
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(a.len) then break
+		if !fn_sig_leaf_eq(a[i], b[i]) then return false
+		i = i + 1
+	}
+
+	return true
+}
+
+const fn_sig_leaf_eq = (TupElem x, TupElem y): Bool -> {
+	if Iarch(x.name.len) == 0 then return true
+	if Iarch(y.name.len) == 0 then return true
+	if !eq(x.name, y.name) then return false
+
+	return fn_sigs_eq(x.sub, y.sub)
 }
 
 # Byte-wise `Str` equality (name lookup).
@@ -797,6 +823,10 @@ const union_member_index = ([UnionMember] members, Str name): Iarch -> {
 # record/union, or a builtin scalar (`Bool`/`Str`/`Iarch`/`Int`). Shared by parameters,
 # record fields, and union payloads.
 pub const named_ty = (Str type_name, Str elem, [RecDecl] recs, [UnionDecl] unions): Ty -> {
+	# the EMPTY name — an UNFILLED slot (a bare lambda parameter or an omitted closure return
+	# the fill passes have not reached yet): the Never poison types on without cascading; the
+	# owning declaration either fills later or rejects with its own located message
+	if eq(type_name, "") then return Ty.TNever
 	if eq(type_name, "$dyn") then return Ty.TDyn(elem)
 	if eq(type_name, "$ptr") then return Ty.TPtr
 	if find_rec(recs, type_name) >= 0 then return Ty.TRec(type_name)
@@ -4382,17 +4412,26 @@ const closure_ret_ty = (Str ret, Ctx ctx, *DiagBag dg): Ty -> {
 	return named_ty(ret, "", ctx.recs, ctx.unions)
 }
 
+# A closure's signature leaf: an UNFILLED slot (a bare lambda parameter, an omitted return the
+# fill passes have not reached yet) stays the EMPTY name — an unknown that binds no type
+# variable and satisfies no match until filled; everything else canonicalizes like a function's.
+const cl_sig_name = (Str n): Str -> {
+	if eq(n, "") then return ""
+
+	return fn_sig_name(n)
+}
+
 pub const closure_tfn = (Str ret, [Param] params): Ty -> {
 	let [TupElem] sig = []
 	let Iarch i = 0
 
 	loop {
 		if i >= Iarch(params.len) then break
-		sig = [...sig, tel_leaf(fn_sig_name(params[i].type_name))]
+		sig = [...sig, tel_leaf(cl_sig_name(params[i].type_name))]
 		i = i + 1
 	}
 
-	sig = [...sig, tel_leaf(fn_sig_name(ret))]
+	sig = [...sig, tel_leaf(cl_sig_name(ret))]
 
 	return Ty.TFn(sig)
 }
@@ -4858,6 +4897,23 @@ const check_closure! = (
 		then return terr_env(ctx, dg, "cf: type: a binding cannot shadow an existing name\n", env)
 	if body_has_closure(body)
 		then return terr_env(ctx, dg, "cf: type: a closure cannot be nested in another closure\n", env)
+	# a BARE parameter (`(n) -> ...`) types from the consuming call's function-type parameter
+	# (type_system §5.2, filled before this pass runs) — one still blank here had no such
+	# context to fill from
+	let Iarch bp = 0
+
+	loop {
+		if bp >= Iarch(params.len) then break
+		if eq(params[bp].type_name, "")
+			then return terr_env(
+			ctx,
+			dg,
+			"cf: type: a lambda parameter's type could not be derived from the consuming call — annotate it\n",
+			env,
+		)
+		bp = bp + 1
+	}
+
 	const Ty crt = closure_ret_ty(ret, ctx, dg)
 	const Ctx cctx = Ctx({
 		funcs: ctx.funcs,

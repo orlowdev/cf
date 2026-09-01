@@ -2569,7 +2569,22 @@ const parse_fixed_elem! = (*Parser p): Str -> {
 # A single parameter: `<type> <name>`. A pointer type (`*[Elem]`/`[Elem]`) becomes a
 # pointer parameter (no type name); a bare type-name identifier (`Iarch`, `Bool`, or
 # a record type) is kept in `type_name` for the typecheck phase to resolve.
-const parse_param! = (*Parser p): Param -> {
+const parse_param! = (*Parser p, Bool bare): Param -> {
+	# a BARE lowercase name (no type) — a lambda parameter typed by its surrounding context
+	# (type_system §5.1/§5.2: the expected function type gives the params their types; the
+	# consuming call's function-type parameter supplies it after the monomorph pass). Only a
+	# closure parses these — a top-level function types its parameters. An uppercase single
+	# ident still reads as a type missing its name and rejects below.
+	if bare
+	&& is_ident(peek(p))
+	&& (is_comma(p.toks[p.pos + 1].kind) || is_rparen(p.toks[p.pos + 1].kind))
+	&& !(Iarch(cur_name!(p)[0]) >= 65 && Iarch(cur_name!(p)[0]) <= 90) then {
+		const Str bname = cur_name!(p)
+		bev(p, p.pos, 2, bname)
+		p.pos = p.pos + 1
+
+		return Param({ name: bname, is_ptr: false, type_name: "", elem: "", telems: [], size: 0 })
+	}
 	if is_star(peek(p)) then {
 		p.pos = p.pos + 1 # `*`
 		# `*[Elem]` is a byte pointer (`$ptr`); `*Record` is a mutable record pointer whose
@@ -2749,7 +2764,7 @@ const lambda_ahead = (*Parser p): Bool -> {
 const parse_closure! = (*Parser p, Str name): Stmt -> {
 	bev(p, p.pos, 0, "") # the closure's scope opens at its `(` — parameters bind into it
 	p.pos = p.pos + 1 # `(`
-	const [Param] params = parse_params!(p)
+	const [Param] params = parse_params!(p, true)
 	if !is_rparen(peek(p)) then perr(p, "cf: parse: expected `)` in a closure\n")
 	p.pos = p.pos + 1
 	const RetSig rs = parse_ret_name!(p)
@@ -2778,12 +2793,12 @@ const parse_closure! = (*Parser p, Str name): Stmt -> {
 
 # The parenthesised parameter list; a repeated name is rejected. Any arity is
 # accepted here — `main`'s ≤3 cap is a whole-program rule checked at resolve time.
-const parse_params! = (*Parser p): [Param] -> {
+const parse_params! = (*Parser p, Bool bare): [Param] -> {
 	let [Param] params = []
 	if is_rparen(peek(p)) then return params
 
 	loop {
-		const Param pm = parse_param!(p)
+		const Param pm = parse_param!(p, bare)
 		if params_has(params, pm.name) then perr(p, "cf: parse: duplicate parameter name\n")
 		params = [...params, pm]
 		if !is_comma(peek(p)) then break
@@ -3162,7 +3177,7 @@ const parse_func! = (*Parser p): Func -> {
 	}
 	bev(p, p.pos, 0, "") # the function's scope opens at its `(` — parameters bind into it
 	p.pos = p.pos + 1
-	const [Param] params = parse_params!(p)
+	const [Param] params = parse_params!(p, false)
 	if !is_rparen(peek(p)) then perr(p, "cf: parse: expected `)`\n")
 	p.pos = p.pos + 1
 	const RetSig rs = parse_ret_name!(p)
