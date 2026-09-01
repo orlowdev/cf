@@ -584,45 +584,52 @@ pub const format_source! = (*[Uint8] src, Iarch n, Str file): [Uint8] -> {
 		dz = dz + 1
 	}
 
-	let [Iarch] elstk = [0]
+	# open if-chains as a STACK of home levels (`ist[0 .. itop-1]`), not a per-depth counter: an
+	# `else` binds to — and POPS — the innermost open `if`. Every cf `if` carries a mandatory `else`,
+	# so any if opened inside a branch body is closed before its parent's `else`, and the top of the
+	# stack is always the `if` an incoming `then`/`else` belongs to.
+	let [Iarch] ist = []
+	let Iarch itop = 0
 	let Iarch lbd = 0
 	# top-level decl-starts, collected on this same walk (a separate per-token loop would be redundant
 	# work); `prev_hi` tracks the previous token's end so a line-leading test needs no fresh Token copy
 	let [Iarch] decls = []
 	let Iarch prev_hi = 0
+	# the ladder level (relative to bracket depth) of the token LEADING the current line; an inline
+	# `if` (one that follows a `->`/`then`/`else`/`=` on its line) roots its home here, so a nested
+	# bare chain sinks under the clause that introduced it and unwinds when that clause's `else` pops
+	let Iarch lead_rel = 0
 	let Iarch lx = 0
 
 	loop {
 		if lx >= Iarch(toks.len) then break
 		const Token lt = toks[lx]
 		const TokKind ltk = lt.kind
+		const Bool lead_line = lx == 0 || count_nl(src, prev_hi, lt.start) > 0
 		# a top-level decl-start: a line-leading declaration keyword at bracket depth 0 (a `const`
 		# inside a body is a local at depth > 0). `lbd` is the depth entering `lt`; a decl keyword is
 		# not a bracket, so it is unchanged here
-		if lbd == 0 then {
-			let Bool lead = lx == 0
-			if lx > 0 && count_nl(src, prev_hi, lt.start) > 0 then lead = true
-			if lead then {
-				if is_decl_kw(src, lt) then decls = [...decls, lx]
-			}
+		if lbd == 0 && lead_line then {
+			if is_decl_kw(src, lt) then decls = [...decls, lx]
 		}
 
 		prev_hi = lt.start + lt.len
 
 		if is_opener(ltk) then {
 			lbd = lbd + 1
-			if lbd >= Iarch(elstk.len) then elstk = [...elstk, 0]
-			elstk[lbd] = 0
+			if lead_line then lead_rel = 0
 		} else if is_closer(ltk) then {
 			if lbd > 0 then lbd = lbd - 1
+			if lead_line then lead_rel = 0
 		} else if tok_is_if(src, lt) then {
-			# a fresh chain resets its depth's ladder — but its `then`/`else` nest ONE STOP DEEPER
-			# (base 1 → ladder 2) whenever the `if` HEADER spans more than one line, so the clauses read
-			# distinctly below it: either an arrow-DROPPED `if` (a `->` + newline precede it) OR an `if`
-			# whose CONDITION was split across lines (a newline falls between `if` and its `then`, past
-			# the clause break itself). An `if` sharing its opener's line with a one-line condition keeps
-			# the plain 0 base.
-			if (lx == 0 || !tok_is_else(src, toks[lx - 1])) && lbd < Iarch(elstk.len) then {
+			# home (relative to bracket depth): a line-leading `if` roots at 0; an inline `if` inherits
+			# its line-leader's level. A multi-line HEADER — an arrow-DROPPED `if` (a `->` + newline
+			# precede it) or one whose CONDITION splits across lines — sinks the chain ONE STOP DEEPER
+			# so its clauses read distinctly below it. An `else if` never re-tests deep (its `if`
+			# follows an `else` on the same line) — it just re-pushes at the home the `else` sat on.
+			let Iarch home = if lead_line then 0 else lead_rel
+
+			if lx == 0 || !tok_is_else(src, toks[lx - 1]) then {
 				let Bool deep = false
 
 				if lx > 0 && is_arrow(toks[lx - 1].kind) && count_nl(src, src_hi(toks[lx - 1]), src_lo(lt)) > 0
@@ -644,15 +651,23 @@ pub const format_source! = (*[Uint8] src, Iarch n, Str file): [Uint8] -> {
 				if jt > lx + 1 && jt < Iarch(toks.len) && count_nl(src, src_lo(lt), src_lo(toks[jt - 1])) > 0
 					then deep = true
 
-				if deep then elstk[lbd] = 1 else elstk[lbd] = 0
+				if deep then home = home + 1
 			}
+
+			if itop < Iarch(ist.len) then ist[itop] = home else ist = [...ist, home]
+			itop = itop + 1
+			if lead_line then lead_rel = home
 		} else if tok_is_then(src, lt) then {
-			if lbd < Iarch(elstk.len) then ladder[lx] = elstk[lbd] + 1 else ladder[lx] = 1
+			const Iarch home = if itop > 0 then ist[itop - 1] else 0
+			ladder[lx] = home + 1
+			if lead_line then lead_rel = home + 1
 		} else if tok_is_else(src, lt) then {
-			if lbd < Iarch(elstk.len) then {
-				elstk[lbd] = elstk[lbd] + 1
-				ladder[lx] = elstk[lbd]
-			} else ladder[lx] = 1
+			const Iarch home = if itop > 0 then ist[itop - 1] else 0
+			ladder[lx] = home
+			if itop > 0 then itop = itop - 1
+			if lead_line then lead_rel = home
+		} else {
+			if lead_line then lead_rel = 0
 		}
 
 		lx = lx + 1
