@@ -7,7 +7,7 @@
 # for tools that need finer control.
 
 import std::data::{ Either }
-import std::data::str::{ eq }
+import std::data::str::{ eq, slice }
 import std::io::console::{ die }
 import std::io::file::{ create, close }
 import std::io::fd::{ Fd, IoRrr }
@@ -18,7 +18,7 @@ import std::compiler::resolve::{ resolve_program!, Resolved }
 import std::compiler::monomorph::{ mono_program!, MonoOut, MonoSeed, no_mono_seed, mono_seed_of }
 import std::compiler::retfill::{ retfill_program!, graft_rets, Grafted }
 import std::compiler::materialize::{ materialize_program!, Mat }
-import std::compiler::typecheck::{ check_program!, check_unreachable!, check_types! }
+import std::compiler::typecheck::{ check_program!, check_unreachable!, check_types!, ret_hover! }
 import std::compiler::spans::{ strip_program, strip_funcs }
 import std::compiler::alloc::{ check_alloc_program!, check_root_program! }
 import std::compiler::inline::{ inline_program! }
@@ -273,6 +273,114 @@ pub const type_rows! = (Str input, Str src, Os target_os, Arch target_arch): [Ty
 	)
 
 	return [...live, ...pruned]
+}
+
+# The DEDUCED return spelling of the function `name` declared in `input` — the hover
+# signature's tail when the written declaration omits it (`cf lsp type`'s function branch).
+# Resolve + monomorph/fill, then: a CONCRETE function fills in place under its own name
+# (`ret_hover!` renders the slot). A generic TEMPLATE is gone post-mono, so its return is
+# read back off its INSTANCES: each `name$A$B...` instance's filled return compares against
+# its own type arguments — a position that matches across every instance names the template's
+# type parameter (`twice$Iarch: Iarch` + `twice$Str: Str` → `'A`); otherwise a return every
+# instance agrees on is itself the answer; disagreement (or no instances — an uncalled
+# template) yields "". Empty on any miss — the caller just shows the signature bare.
+pub const fn_ret_hover! = (Str input, Str src, Os target_os, Arch target_arch, Str name): Str -> {
+	const Resolved rz = resolve_program!(input, src, target_os, target_arch, false, false)
+	const Program raw = rz.prog
+	const MonoFill mf = mono_and_fill!(raw)
+
+	for f in mf.prog.funcs {
+		if eq(f.name, name) then return ret_hover!(f)
+	}
+
+	# the template's type parameters (`'A`, `'B`) — gone from the mono table, read from raw
+	let [Str] typarams = []
+	let Bool found = false
+
+	for f in raw.funcs {
+		if eq(f.name, name) && Iarch(f.typarams.len) > 0 then {
+			typarams = [...typarams, ...f.typarams]
+			found = true
+		}
+	}
+
+	if !found then return ""
+	const Iarch np = Iarch(typarams.len)
+	# walk the instances: `live[k]` — typaram k still matches every instance's return
+	let [Bool] live = []
+	let Iarch k0 = 0
+
+	loop {
+		if k0 >= np then break
+		live = [...live, true]
+		k0 = k0 + 1
+	}
+
+	let Str uniform = ""
+	let Bool same = true
+	let Iarch seen = 0
+
+	for f in mf.prog.funcs {
+		const [Str] tyargs = inst_tyargs(f.name, name)
+		if Iarch(tyargs.len) != np then continue
+		const Str r = ret_hover!(f)
+		if Iarch(r.len) == 0 then continue
+		seen = seen + 1
+		if seen == 1 then uniform = r
+		if !eq(r, uniform) then same = false
+		let [Bool] nl = []
+
+		for (was, k) in live {
+			nl = [...nl, was && eq(r, tyargs[k])]
+		}
+
+		live = nl
+	}
+
+	if seen == 0 then return ""
+	let Iarch hit = -1
+
+	for (ok, k) in live {
+		if ok && hit < 0 then hit = k
+	}
+
+	if hit >= 0 then return typarams[hit]
+	if same then return uniform
+
+	return ""
+}
+
+# The `$`-joined type arguments of the instance name `iname` minted from the template
+# `base` (`twice$Iarch` → ["Iarch"]), or the empty list when `iname` is no such instance.
+const inst_tyargs = (Str iname, Str base): [Str] -> {
+	let [Str] none = []
+	const Iarch bn = Iarch(base.len)
+	if Iarch(iname.len) < bn + 2 then return none
+	let Iarch i = 0
+
+	loop {
+		if i >= bn then break
+		if Iarch(iname[i]) != Iarch(base[i]) then return none
+		i = i + 1
+	}
+
+	if Iarch(iname[bn]) != 36 then return none
+	let [Str] args = []
+	let Iarch a0 = bn + 1
+	let Iarch j = a0
+
+	loop {
+		if j > Iarch(iname.len) then break
+
+		if j == Iarch(iname.len) || Iarch(iname[j]) == 36 then {
+			args = [...args, slice(a0, j, iname)]
+			a0 = j + 1
+		}
+
+		j = j + 1
+	}
+
+	return args
 }
 
 data MonoFill = { Program prog, [Diag] diags }

@@ -29,7 +29,7 @@ import std::compiler::buildinfo::{ compiler_version }
 import fmt::{ format_file! }
 import docs::{ docs_run! }
 import lsp::{ lsp_run! }
-import std::compiler::{ compile!, check!, type_rows! }
+import std::compiler::{ compile!, check!, type_rows!, fn_ret_hover! }
 import std::compiler::ast::{ Program }
 import std::compiler::resolve::{ resolve_program!, Resolved, entry_binds!, Loaded }
 import std::compiler::parser::{ BindEv }
@@ -359,8 +359,9 @@ const run_def! = (Str input, Str src, Iarch off, Str name): Iarch -> {
 }
 
 # `cf lsp type <input.cf> <off> <name> [--src <buf>]`: the DEDUCED type of the LOCAL binding
-# of `name` visible at byte offset `off` — one line, the rendered type. Prints nothing when
-# no local binds the name (the server falls back to its declaration-line hover). The binder
+# of `name` visible at byte offset `off` — one display line, `let`/`const` + name + type (a
+# parameter prints bare). When NO local binds the name, a same-file function's deduced RETURN
+# prints instead (see the fallback in the body); otherwise nothing. The binder
 # comes from the tracked entry parse (the same replay as `def`); the types from a logged
 # whole-tree typecheck (`type_rows!`). A row correlates back to THIS binder by the enclosing
 # declaration's stamp line plus the nearest expression ANCHOR at or after the binder — cf
@@ -372,7 +373,31 @@ const run_def! = (Str input, Str src, Iarch off, Str name): Iarch -> {
 const run_type! = (Str input, Str src, Iarch off, Str name): Iarch -> {
 	const Loaded ld = entry_binds!(input, src, os::target, host_arch())
 	const Iarch b = binder_at!(ld.evs, off, name)
-	if b < 0 then return 0
+
+	# no local binds the name: a same-file FUNCTION answers with its deduced RETURN spelling
+	# alone (the server composes the signature from the declaration line and appends it)
+	if b < 0 then {
+		let Bool isfn = false
+
+		for fn in ld.prog.funcs {
+			if eq(fn.name, name) then isfn = true
+		}
+
+		if !isfn then return 0
+		const Str fr = fn_ret_hover!(input, src, os::target, host_arch(), name)
+		if Iarch(fr.len) > 0 then println(fr)
+
+		return 0
+	}
+
+	# the binder's KIND (2 param / 3 local / 4 for / 5 match bind) — a parameter reads like a
+	# signature fragment (no prefix); every other bind carries its `let`/`const` nature
+	let Iarch bkind = 3
+
+	for ev in ld.evs {
+		if ev.off == b && ev.kind >= 2 && ev.kind <= 5 && eq(ev.name, name) then bkind = ev.kind
+	}
+
 	const [SrcMap] maps = [ld.map]
 	const LC blc = line_col_of(maps, input, b)
 	if blc.line <= 0 then return 0
@@ -403,12 +428,17 @@ const run_type! = (Str input, Str src, Iarch off, Str name): Iarch -> {
 	}
 
 	let [Str] tys = []
+	let Bool mut = false
 
 	for r in cand {
 		let Bool take = false
 		if best >= 0 then take = r.anchor == cand[best].anchor
 		if best < 0 then take = r.anchor < 0
-		if take && !has_str(tys, r.ty) then tys = [...tys, r.ty]
+
+		if take && !has_str(tys, r.ty) then {
+			tys = [...tys, r.ty]
+			if r.mut then mut = true
+		}
 	}
 
 	if Iarch(tys.len) == 0 then return 0
@@ -421,7 +451,9 @@ const run_type! = (Str input, Str src, Iarch off, Str name): Iarch -> {
 		ti = ti + 1
 	}
 
-	println(out)
+	let Str prefix = if mut then "let " else "const "
+	if bkind == 2 then prefix = ""
+	println("${prefix}${name}: ${out}")
 
 	return 0
 }

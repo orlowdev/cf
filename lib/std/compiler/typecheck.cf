@@ -984,6 +984,16 @@ pub const ty_hover! = (Ty t): Str -> match t {
 	_ -> demangle_ty!(ty_name(t)),
 }
 
+# A function's RETURN slot as its written spelling — the hover signature's tail. Empty when
+# the slot is blank (an omitted return the caller must deduce elsewhere).
+pub const ret_hover! = (Func fn): Str -> {
+	if eq(fn.ret_name, "$tuple") then return tels_paren!(fn.ret_telems)
+	if eq(fn.ret_name, "$dyn") then return "[${fn.ret_elem}]"
+	if eq(fn.ret_name, "") then return ""
+
+	return demangle_ty!(fn.ret_name)
+}
+
 # A parameter's hover display: the declared pointer-ness composed back on (`*Point`,
 # `*[Uint8]`) — `param_ty!` collapses it into the pointee's `Ty`.
 const param_hover! = (Param p, Ty pty): Str -> {
@@ -1002,10 +1012,14 @@ const param_hover! = (Param p, Ty pty): Str -> {
 
 # Append one deduced-type row when the log is on (`check_types!` — the `cf lsp type` child).
 # Rendering runs only under the flag, so the compile pipeline never pays for it.
-const tylog = (*DiagBag dg, Ctx ctx, Iarch anchor, Str name, Str ty): () -> {
+const tylog = (*DiagBag dg, Ctx ctx, Iarch anchor, Str name, Str ty, Bool mut): () -> {
 	if !dg.tlog then return ()
 	if Iarch(ty.len) == 0 then return ()
-	dg.trows = [...dg.trows, TyRow({ anchor: anchor, dline: ctx.dline, name: name, ty: ty })]
+
+	dg.trows = [
+		...dg.trows,
+		TyRow({ anchor: anchor, dline: ctx.dline, name: name, ty: ty, mut: mut }),
+	]
 }
 
 # Log a match arm's payload binds: each bound name rides at the TAIL of the arm's extended
@@ -1021,7 +1035,7 @@ const tylog_binds! = (*DiagBag dg, Ctx ctx, Iarch anchor, [Str] binds, [VarTy] b
 			if i < 0 then break
 
 			if eq(benv[i].name, b) then {
-				tylog(dg, ctx, anchor, b, ty_hover!(benv[i].ty))
+				tylog(dg, ctx, anchor, b, ty_hover!(benv[i].ty), false)
 				break
 			}
 
@@ -3306,7 +3320,7 @@ pub const check_destructure! = (
 			}),
 		]
 		# the hover type log: anchored on the tuple initializer (right after the pattern)
-		if dg.tlog then tylog(dg, ctx, arg_span(rhs, -1), tok, ty_hover!(pty))
+		if dg.tlog then tylog(dg, ctx, arg_span(rhs, -1), tok, ty_hover!(pty), mutable)
 		pos = pos + 1
 		pi = pi + 1
 	}
@@ -4031,7 +4045,7 @@ const check_for_body! = (Str lv, Str arr, [Stmt] body, [VarTy] env, Ctx ctx, *Di
 	]
 
 	# the hover type log: anchored on the body's first expression (inside the binder's scope)
-	if dg.tlog then tylog(dg, ctx, stmts_anchor(body), lv, ty_hover!(lvt))
+	if dg.tlog then tylog(dg, ctx, stmts_anchor(body), lv, ty_hover!(lvt), false)
 
 	return check_stmts!(body, benv, ctx, dg, lk_for)
 }
@@ -5129,13 +5143,13 @@ const check_closure! = (
 		]
 		# the hover type log: anchored on the closure body's first expression (the param's scope)
 		if dg.tlog
-			then tylog(dg, ctx, stmts_anchor(body), params[pi].name, param_hover!(params[pi], cpty))
+			then tylog(dg, ctx, stmts_anchor(body), params[pi].name, param_hover!(params[pi], cpty), false)
 		pi = pi + 1
 	}
 
 	# the closure NAME binds a function value in the enclosing scope — anchorless (no shadowing
 	# means no same-named sibling to disambiguate from)
-	if dg.tlog then tylog(dg, ctx, -1, nm, ty_hover!(closure_tfn(ret, params)))
+	if dg.tlog then tylog(dg, ctx, -1, nm, ty_hover!(closure_tfn(ret, params)), false)
 
 	const Iarch dr = check_stmts!(body, cenv, cctx, dg, lk_none)
 	# a closure body must return or diverge (`dr >= 2`) — a `()` closure may fall through to unit
@@ -5243,7 +5257,7 @@ const check_stmts! = ([Stmt] stmts, [VarTy] env0, Ctx ctx, *DiagBag dg, Iarch lo
 					}),
 				]
 				# the hover type log: anchored on the initializer (right after the binder name)
-				if dg.tlog then tylog(dg, ctx, arg_span(e, -1), n, ty_hover!(ty))
+				if dg.tlog then tylog(dg, ctx, arg_span(e, -1), n, ty_hover!(ty), m)
 			},
 			Stmt.Destructure(pat, m, e) -> {
 				env = check_destructure!(pat, m, e, env, ctx, dg)
@@ -5658,7 +5672,7 @@ const check_func! = (Func fn, Ctx ctx, *DiagBag dg): Iarch -> {
 		]
 		# the hover type log: a parameter is anchorless — its name is unique in the function
 		# (a local shadowing it is rejected), so the replay matches it by name alone
-		if dg.tlog then tylog(dg, fctx, -1, fn.params[pi].name, param_hover!(fn.params[pi], pty))
+		if dg.tlog then tylog(dg, fctx, -1, fn.params[pi].name, param_hover!(fn.params[pi], pty), false)
 		pi = pi + 1
 	}
 

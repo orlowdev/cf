@@ -559,8 +559,12 @@ const scan_decl = (Str ln): DeclLine -> {
 		kind = 5
 	}
 	if klen < 0 then return DeclLine({ kind: 0, ns: 0, ne: 0 })
-	# a value that binds a `(...)` is a function — `const f = (…): T -> …` (intrinsics likewise)
+	# a value that binds a `(...)` is a function — `const f = (…): T -> …` (intrinsics
+	# likewise); a GENERIC one opens its type parameters first — `const f = ['A](…) -> …` —
+	# so a `= [` whose bracket group closes onto a `(` counts too (an array-literal value
+	# const `= [1, 2]` has no `](`)
 	if kind == 14 && contains("= (", ln) then kind = 12
+	if kind == 14 && contains("= [", ln) && contains("](", ln) then kind = 12
 
 	const Iarch ns = koff + klen
 	let Iarch ne = ns
@@ -2478,6 +2482,68 @@ const tidy_sig = (Str ln): Str -> {
 	return s
 }
 
+# A function declaration line recast as a hover signature: `pub const name = ['A](params):
+# Ret -> body` → `name: ['A](params): Ret`. The scan is DEPTH-AWARE — the body arrow is the
+# first ` ->` at paren/bracket depth 0, so a function-TYPE parameter's arrow (inside the param
+# parens) never cuts the signature short (the flat `tidy_sig` heuristic missed the generic
+# `= ['A](` form entirely and leaked the body). `has_ret` — a `: Ret` follows the param group
+# (an omitted return leaves it false; the caller may append a DEDUCED one). `sig` empty when
+# the line doesn't carry the whole signature (a wrapped declaration, a bodyless intrinsic) —
+# the caller falls back to the tidied line.
+data FnSig = { Str sig, Bool has_ret }
+
+const fn_sig_of = (Str name, Str ln): FnSig -> {
+	const FnSig miss = FnSig({ sig: "", has_ret: false })
+	const Str s = trim(ln)
+	const Iarch eqi = index_of(" = ", s)
+	if eqi < 0 then return miss
+	const Iarch a0 = eqi + 3
+	let Iarch depth = 0
+	let Iarch pend = -1
+	let Iarch cut = -1
+	let Iarch i = a0
+
+	loop {
+		if i >= Iarch(s.len) then break
+		const Iarch c = Iarch(s[i])
+		if c == 40 || c == 91 then depth = depth + 1
+
+		if c == 41 || c == 93 then {
+			depth = depth - 1
+			if depth == 0 && c == 41 && pend < 0 then pend = i + 1
+		}
+
+		if depth == 0 && c == 32 && i + 2 < Iarch(s.len) then {
+			if Iarch(s[i + 1]) == 45 && Iarch(s[i + 2]) == 62 then {
+				cut = i
+				break
+			}
+		}
+
+		i = i + 1
+	}
+
+	if cut < 0 || pend < 0 || pend > cut then return miss
+	const Str sig = trim(slice(a0, cut, s))
+	# the return is written iff a `:` directly follows the param group's close
+	let Bool hr = false
+	let Iarch j = pend
+
+	loop {
+		if j >= cut then break
+
+		if Iarch(s[j]) == 58 then {
+			hr = true
+			break
+		}
+
+		if Iarch(s[j]) != 32 then break
+		j = j + 1
+	}
+
+	return FnSig({ sig: "${name}: ${sig}", has_ret: hr })
+}
+
 # A LOCAL binder line tidied for the hover fallback: cut at its `=` — the initializer is the
 # very code sitting under the cursor, not information (the type child answers when it can; this
 # fires only when it cannot, e.g. a mid-edit buffer). A closure binding (`= (`) keeps its
@@ -2529,7 +2595,7 @@ const hover! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, Iar
 		}
 
 		let Str lsig = tidy_binder(lines[lh.line])
-		if Iarch(lty.len) > 0 then lsig = "${t.name}: ${lty}"
+		if Iarch(lty.len) > 0 then lsig = lty
 
 		return Json.Obj([
 				ent(
@@ -2547,7 +2613,28 @@ const hover! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, Iar
 
 	const [Str] dlines = split("\n", src_of!(h.file, owner, srcf))
 	if h.line >= Iarch(dlines.len) then return Json.Null
-	const Str sig = tidy_sig(dlines[h.line])
+	let Str sig = tidy_sig(dlines[h.line])
+
+	# a FUNCTION hover reads `name: [tyargs](params): Ret` — the depth-aware recast; when the
+	# declaration omits its return AND lives in the checked file, the type child deduces it
+	if h.kind == 12 then {
+		const FnSig fs = fn_sig_of(h.sname, dlines[h.line])
+
+		if Iarch(fs.sig.len) > 0 then {
+			sig = fs.sig
+
+			if !fs.has_ret && eq(h.file, path) then {
+				const ChildOut rco = lsp_child!(argv0, env, path, overlay, lines, l0, t.ts, "type", h.sname)
+
+				if rco.rc == 0 then {
+					let Str fr = rco.out
+					const Iarch rnl = index_of("\n", fr)
+					if rnl >= 0 then fr = slice(0, rnl, fr)
+					if Iarch(fr.len) > 0 then sig = "${sig}: ${fr}"
+				}
+			}
+		}
+	}
 
 	# the contiguous `#` comment block right above the declaration, as prose (a bare `#`
 	# line stays a paragraph break); lines TRIMMED first, so an indented field's doc counts
