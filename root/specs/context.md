@@ -41,14 +41,21 @@ mutation). Context-across-tasks (§7) is not yet implemented. What lands:
   whole-program, so a `uses let T` contract spelling is unneeded for now (a note
   for a future separate-compilation story).
 
-Deliberate M-B simplifications, both sound under the checker's guarantees:
-`provide` registers a pointer to the value *where the provider already built
-it* — no arena copy — because the provider's frame lexically outlives every
-consumer; and the hidden signature is stamped in the demand pass's own
-deterministic order rather than a canonical type-name sort (each callee's
-definition and every call site read the same `uses` list, so the ABI is
-self-consistent whole-program). The arena-placement refinement (so the value is
-reclaimed with the arena) and a canonical sort are later polish.
+**Placement is by ALIAS, not copy** (ratified M-D): `provide(x)` registers a
+pointer to the value *where the provider already built it* — no arena copy. The
+demand checker guarantees the provider's frame lexically outlives every
+consumer, so the pointer is always valid; and because the provided value and
+the context are the *same* storage, a `let` provide has a single source of
+truth — a mutation through `consume` and a read of the original binding never
+diverge. Copying the value survivor-side into the arena (so it reclaimed with
+`destroy`) was considered and rejected: for a `let` provide it splits the value
+into a frame original and an arena copy that silently diverge under mutation,
+which would demand move semantics to make safe — a worse trade than the slight
+over-retention (the aliased value reclaims with the provider's frame, not at an
+early `destroy`). The hidden signature is stamped in the demand pass's own
+deterministic whole-program order; a canonical type-name sort would only matter
+for separate compilation (each definition and every call site already read the
+same `uses` list, so the ABI is self-consistent), so it is left unspelled.
 Context-across-tasks (§7) stays with the concurrency arc. The fn-free
 requirement of §3 needs no check — a record field type is a name or an array,
 never a `(A) -> B`, so a provided type is fn-free by grammar.

@@ -572,6 +572,37 @@ const cat_d = ([Diag] a, [Diag] b): [Diag] -> {
 	return r
 }
 
+# The type of field `f` in record `t` when it is itself a record (else ""), for walking a nested
+# lvalue chain.
+const field_of = ([RecDecl] recs, Str t, Str f): Str -> {
+	if Iarch(t.len) == 0 then return ""
+	const Str ft = rec_field_ftype(recs, t, f)
+	if find_rec(recs, ft) >= 0 then return ft
+
+	return ""
+}
+
+# The record type a nested lvalue base resolves to, STARTING from a mutable consume binding — `s.a`
+# → the record type of `s`'s field `a`, `s.a.b` → that record's field `b`, and so on. Returns ""
+# when the chain does not root in a mutable consume binding (so a non-context write is never flagged).
+const chain_rec_type = ([RecDecl] recs, MB mb, Expr e): Str -> match unat(e) {
+	Expr.Var(n) -> mb_ty(mb, n),
+	Expr.Field(b, f) -> field_of(recs, mb_ty(mb, b), f),
+	Expr.FieldExpr(inner, f) -> field_of(recs, chain_rec_type(recs, mb, inner), f),
+	_ -> "",
+}
+
+# The repointing offsets of a nested `s.a...field = <fresh>` write: the penultimate record's type is
+# resolved by walking the chain from the consume-binding root; if the final field is a pointer slot
+# and the RHS is a fresh construction, it is a repointing (§3).
+const deep_repoint_off = ([RecDecl] recs, MB mb, Expr be, Str field, Expr val): [Iarch] -> {
+	const Str rt = chain_rec_type(recs, mb, be)
+	if Iarch(rt.len) > 0 && is_ptr_ftype(recs, rec_field_ftype(recs, rt, field)) && is_fresh_agg(val)
+		then return one_i(at_off(val))
+
+	return no_i()
+}
+
 const repoint_off_arms = (MB mb, [RecDecl] recs, [StmtArm] arms): [Iarch] -> {
 	let [Iarch] r = []
 	let Iarch i = 0
@@ -592,6 +623,8 @@ const repoint_off_stmt = (MB mb, [RecDecl] recs, Stmt s): [Iarch] -> {
 			is_fresh_agg(val)
 				then one_i(at_off(val))
 				else no_i(),
+		# a nested lvalue `s.a.b = <fresh>` — resolve the chain's record type from the consume root
+		Stmt.DeepFieldAssign(be, field, val) -> deep_repoint_off(recs, mb, be, field, val),
 		_ -> no_i(),
 	}
 
