@@ -2444,14 +2444,27 @@ const emit_interp! = (*Emit ctx, [Seg] segs, [Binding] env): Str -> {
 				emit_append_call!(ctx, "cf_int_append", "%t${vh}", "%t${ext}", "l")
 			}
 		} else {
-			let Iarch bj = 0
+			# a multi-byte literal segment appends as ONE interned-static `cf_str_append` (the
+			# pre-scan interned it; the bulk helper word-copies) instead of a push call per
+			# byte; a 1-byte segment (or a miss) keeps the single push
+			const Iarch sn = Iarch(sg.lit.len)
+			const Iarch sidx = if sn >= 2 then slit_index(ctx.slits, sg.lit) else -1
 
-			loop {
-				if bj >= Iarch(sg.lit.len) then break
-				const Iarch b = Iarch(sg.lit[bj])
-				const Str slot = emit_dyn_push_call!(ctx, "%t${vh}", 1)
-				write_str(ctx.fd, "\tstoreb ${b}, ${slot}\n")
-				bj = bj + 1
+			if sidx >= 0 then {
+				const Iarch st = ctx.next
+				ctx.next = ctx.next + 1
+				write_str(ctx.fd, "\t%t${st} =l copy $sl${sidx}\n")
+				emit_append_call!(ctx, "cf_str_append", "%t${vh}", "%t${st}", "l")
+			} else {
+				let Iarch bj = 0
+
+				loop {
+					if bj >= sn then break
+					const Iarch b = Iarch(sg.lit[bj])
+					const Str slot = emit_dyn_push_call!(ctx, "%t${vh}", 1)
+					write_str(ctx.fd, "\tstoreb ${b}, ${slot}\n")
+					bj = bj + 1
+				}
 			}
 		}
 
@@ -6435,7 +6448,30 @@ const slc_expr! = (Expr e, Bool skip): [Str] -> match e {
 	Expr.Match(sc, arms) -> cat_names(slc_expr!(sc, skip), slc_marms!(arms, skip)),
 	Expr.Loop(ss) -> slc_body!(ss, skip),
 	Expr.Call(callee, ta, args, g) -> cat_names(slc_embed!(callee, args, skip), slc_list!(args, skip)),
+	Expr.Interp(segs) -> slc_segs!(segs, skip),
 	_ -> slc_list!(kids(e), skip),
+}
+
+# An interpolation's LITERAL segments intern like string literals, so `emit_interp` appends
+# each as ONE static-`Str` `cf_str_append` call instead of a `cf_dyn_push` call per byte
+# (a 1-byte segment stays a single push — same cost, no table entry). Holes recurse.
+const slc_segs! = ([Seg] segs, Bool skip): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(segs.len) then break
+
+		if segs[i].is_hole then {
+			r = cat_names(r, slc_expr!(segs[i].expr, skip))
+		} else if Iarch(segs[i].lit.len) >= 2 then {
+			r = cat_names(r, one_name(Str(segs[i].lit, Iarch(segs[i].lit.len))))
+		}
+
+		i = i + 1
+	}
+
+	return r
 }
 
 const slc_list! = ([Expr] es, Bool skip): [Str] -> {
@@ -7047,16 +7083,28 @@ const emit_func! = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 const emit_dyn_helpers! = (Fd fd, Bool instrument, Str obsym, Bool obs_amb): Iarch -> {
 	const Str sfx = "_g"
 	const Str rf = ", l %reservefn"
+	# The push slot's byte offset is `len*es` on BOTH paths (it doubles as the grow copy's
+	# byte count), so it is computed once before the branch; the fast path is then two loads,
+	# a mul/add pair, the length store, and a direct `ret`. The grow copy runs WORD-at-a-time
+	# (the old data block is 8-aligned; a byte tail covers a non-multiple length) — element
+	# pushes copy 8× fewer iterations than the old per-byte loop. The copy counter is a
+	# re-assigned temp, not a cell.
 	write_str(fd, "function l $cf_dyn_push${sfx}(l %node, l %hdr, w %esize${rf}) {\n")
 	write_str(fd, "@start\n")
-	write_str(fd, "\t%ip =l alloc8 8\n")
 	write_str(fd, "\t%es =l extuw %esize\n")
 	write_str(fd, "\t%hlen =l add %hdr, 8\n")
 	write_str(fd, "\t%hcap =l add %hdr, 16\n")
 	write_str(fd, "\t%len =l loadl %hlen\n")
 	write_str(fd, "\t%cap =l loadl %hcap\n")
+	write_str(fd, "\t%soff =l mul %len, %es\n")
+	write_str(fd, "\t%len1 =l add %len, 1\n")
 	write_str(fd, "\t%full =w ceql %len, %cap\n")
-	write_str(fd, "\tjnz %full, @grow, @store\n")
+	write_str(fd, "\tjnz %full, @grow, @fast\n")
+	write_str(fd, "@fast\n")
+	write_str(fd, "\t%data =l loadl %hdr\n")
+	write_str(fd, "\t%slot =l add %data, %soff\n")
+	write_str(fd, "\tstorel %len1, %hlen\n")
+	write_str(fd, "\tret %slot\n")
 	write_str(fd, "@grow\n")
 	write_str(fd, "\t%dbl =l mul %cap, 2\n")
 	write_str(fd, "\t%z =w ceql %cap, 0\n")
@@ -7073,32 +7121,34 @@ const emit_dyn_helpers! = (Fd fd, Bool instrument, Str obsym, Bool obs_amb): Iar
 			else write_str(fd, "\tcall $${obsym}(l %node, l %nbytes)\n")
 	}
 	write_str(fd, "\t%odata =l loadl %hdr\n")
-	write_str(fd, "\t%obytes =l mul %len, %es\n")
-	write_str(fd, "\tstorel 0, %ip\n")
-	write_str(fd, "@copytop\n")
-	write_str(fd, "\t%ci =l loadl %ip\n")
-	write_str(fd, "\t%cdone =w cugel %ci, %obytes\n")
-	write_str(fd, "\tjnz %cdone, @copydone, @copybody\n")
-	write_str(fd, "@copybody\n")
-	write_str(fd, "\t%src =l add %odata, %ci\n")
-	write_str(fd, "\t%dst =l add %ndata, %ci\n")
-	write_str(fd, "\t%cb =w loadub %src\n")
-	write_str(fd, "\tstoreb %cb, %dst\n")
-	write_str(fd, "\t%ci1 =l add %ci, 1\n")
-	write_str(fd, "\tstorel %ci1, %ip\n")
-	write_str(fd, "\tjmp @copytop\n")
+	write_str(fd, "\t%ci =l copy 0\n")
+	write_str(fd, "@cwtop\n")
+	write_str(fd, "\t%ci8 =l add %ci, 8\n")
+	write_str(fd, "\t%wok =w culel %ci8, %soff\n")
+	write_str(fd, "\tjnz %wok, @cwbody, @cbtop\n")
+	write_str(fd, "@cwbody\n")
+	write_str(fd, "\t%wsrc =l add %odata, %ci\n")
+	write_str(fd, "\t%wdst =l add %ndata, %ci\n")
+	write_str(fd, "\t%cw =l loadl %wsrc\n")
+	write_str(fd, "\tstorel %cw, %wdst\n")
+	write_str(fd, "\t%ci =l copy %ci8\n")
+	write_str(fd, "\tjmp @cwtop\n")
+	write_str(fd, "@cbtop\n")
+	write_str(fd, "\t%bdone =w cugel %ci, %soff\n")
+	write_str(fd, "\tjnz %bdone, @copydone, @cbbody\n")
+	write_str(fd, "@cbbody\n")
+	write_str(fd, "\t%bsrc =l add %odata, %ci\n")
+	write_str(fd, "\t%bdst =l add %ndata, %ci\n")
+	write_str(fd, "\t%cb =w loadub %bsrc\n")
+	write_str(fd, "\tstoreb %cb, %bdst\n")
+	write_str(fd, "\t%ci =l add %ci, 1\n")
+	write_str(fd, "\tjmp @cbtop\n")
 	write_str(fd, "@copydone\n")
 	write_str(fd, "\tstorel %ndata, %hdr\n")
 	write_str(fd, "\tstorel %ncap, %hcap\n")
-	write_str(fd, "\tjmp @store\n")
-	write_str(fd, "@store\n")
-	write_str(fd, "\t%data =l loadl %hdr\n")
-	write_str(fd, "\t%len2 =l loadl %hlen\n")
-	write_str(fd, "\t%soff =l mul %len2, %es\n")
-	write_str(fd, "\t%slot =l add %data, %soff\n")
-	write_str(fd, "\t%len3 =l add %len2, 1\n")
-	write_str(fd, "\tstorel %len3, %hlen\n")
-	write_str(fd, "\tret %slot\n")
+	write_str(fd, "\tstorel %len1, %hlen\n")
+	write_str(fd, "\t%gslot =l add %ndata, %soff\n")
+	write_str(fd, "\tret %gslot\n")
 	write_str(fd, "}\n")
 	# Interpolation append helpers — push a value's TEXT onto a `[Uint8]` vector (via
 	# cf_dyn_push, stride 1). cf_uint_append: unsigned itoa (two-pass extract-then-reverse
@@ -7323,45 +7373,102 @@ const emit_dyn_helpers! = (Fd fd, Bool instrument, Str obsym, Bool obs_amb): Iar
 	write_str(fd, "@edone\n")
 	write_str(fd, "\tret\n")
 	write_str(fd, "}\n")
+	# BULK append — the old body ran the whole push fast path PER BYTE (two header loads, a
+	# compare, a bounds branch, a counter round-trip for every byte). This one sizes the
+	# capacity ONCE (doubling until the whole string fits, mirroring the push grow policy),
+	# then copies word-at-a-time with a byte tail. Word loads never cross `len` (the tail
+	# covers the remainder), so a short/view source is never over-read. One-time emission —
+	# this body is the hottest loop in interp-heavy code (every emitted IL line runs it).
 	write_str(fd, "function $cf_str_append${sfx}(l %node, l %vhdr, l %str${rf}) {\n")
 	write_str(fd, "@start\n")
 	write_str(fd, "\t%bytes =l loadl %str\n")
 	write_str(fd, "\t%la =l add %str, 8\n")
 	write_str(fd, "\t%lenw =w loadw %la\n")
 	write_str(fd, "\t%len =l extuw %lenw\n")
-	write_str(fd, "\t%ip =l alloc8 8\n")
-	write_str(fd, "\tstorel 0, %ip\n")
-	write_str(fd, "@sloop\n")
-	write_str(fd, "\t%i =l loadl %ip\n")
-	write_str(fd, "\t%d =w cugel %i, %len\n")
-	write_str(fd, "\tjnz %d, @sdone, @sstep\n")
-	write_str(fd, "@sstep\n")
-	write_str(fd, "\t%ba =l add %bytes, %i\n")
-	write_str(fd, "\t%b =w loadub %ba\n")
-	# the per-byte push FAST PATH inline (len < cap: slot = data+len, bump — no call);
-	# the helper call remains the grow path. One-time emission — this body is the
-	# hottest loop in interp-heavy code (every emitted IL line runs it byte-wise).
+	write_str(fd, "\t%z =w ceql %len, 0\n")
+	write_str(fd, "\tjnz %z, @sdone, @scap\n")
+	write_str(fd, "@scap\n")
 	write_str(fd, "\t%vla =l add %vhdr, 8\n")
-	write_str(fd, "\t%vl =l loadl %vla\n")
 	write_str(fd, "\t%vca =l add %vhdr, 16\n")
+	write_str(fd, "\t%vl =l loadl %vla\n")
 	write_str(fd, "\t%vc =l loadl %vca\n")
-	write_str(fd, "\t%sf =w cultl %vl, %vc\n")
-	write_str(fd, "\tjnz %sf, @sfast, @sslow\n")
-	write_str(fd, "@sfast\n")
+	write_str(fd, "\t%need =l add %vl, %len\n")
+	write_str(fd, "\t%fits =w culel %need, %vc\n")
+	write_str(fd, "\tjnz %fits, @scopy, @sgrow\n")
+	write_str(fd, "@sgrow\n")
+	write_str(fd, "\t%nc =l copy %vc\n")
+	write_str(fd, "@sgtop\n")
+	write_str(fd, "\t%ncd =l mul %nc, 2\n")
+	write_str(fd, "\t%gz =w ceql %nc, 0\n")
+	write_str(fd, "\t%gzl =l extuw %gz\n")
+	write_str(fd, "\t%gz4 =l mul %gzl, 4\n")
+	write_str(fd, "\t%nc =l add %ncd, %gz4\n")
+	write_str(fd, "\t%gok =w culel %need, %nc\n")
+	write_str(fd, "\tjnz %gok, @sgres, @sgtop\n")
+	write_str(fd, "@sgres\n")
+	write_str(fd, "\t%ndata =l call %reservefn(l %node, l %nc)\n")
+	# `--instrument`: the bulk grow reserves directly (it no longer routes through
+	# `cf_dyn_push_g`), so it observes its own reserve
+	if instrument then {
+		if obs_amb
+			then write_str(fd, "\tcall $${obsym}(l %node, l %node, l %nc)\n")
+			else write_str(fd, "\tcall $${obsym}(l %node, l %nc)\n")
+	}
+	write_str(fd, "\t%odata =l loadl %vhdr\n")
+	write_str(fd, "\t%gi =l copy 0\n")
+	write_str(fd, "@sgwtop\n")
+	write_str(fd, "\t%gi8 =l add %gi, 8\n")
+	write_str(fd, "\t%gwok =w culel %gi8, %vl\n")
+	write_str(fd, "\tjnz %gwok, @sgwbody, @sgbtop\n")
+	write_str(fd, "@sgwbody\n")
+	write_str(fd, "\t%gws =l add %odata, %gi\n")
+	write_str(fd, "\t%gwd =l add %ndata, %gi\n")
+	write_str(fd, "\t%gw =l loadl %gws\n")
+	write_str(fd, "\tstorel %gw, %gwd\n")
+	write_str(fd, "\t%gi =l copy %gi8\n")
+	write_str(fd, "\tjmp @sgwtop\n")
+	write_str(fd, "@sgbtop\n")
+	write_str(fd, "\t%gbd =w cugel %gi, %vl\n")
+	write_str(fd, "\tjnz %gbd, @sgdone, @sgbbody\n")
+	write_str(fd, "@sgbbody\n")
+	write_str(fd, "\t%gbs =l add %odata, %gi\n")
+	write_str(fd, "\t%gbdst =l add %ndata, %gi\n")
+	write_str(fd, "\t%gb =w loadub %gbs\n")
+	write_str(fd, "\tstoreb %gb, %gbdst\n")
+	write_str(fd, "\t%gi =l add %gi, 1\n")
+	write_str(fd, "\tjmp @sgbtop\n")
+	write_str(fd, "@sgdone\n")
+	write_str(fd, "\tstorel %ndata, %vhdr\n")
+	write_str(fd, "\tstorel %nc, %vca\n")
+	write_str(fd, "\tjmp @scopy\n")
+	write_str(fd, "@scopy\n")
 	write_str(fd, "\t%vd =l loadl %vhdr\n")
-	write_str(fd, "\t%sl0 =l add %vd, %vl\n")
-	write_str(fd, "\t%vl1 =l add %vl, 1\n")
-	write_str(fd, "\tstorel %vl1, %vla\n")
-	write_str(fd, "\t%sl =l copy %sl0\n")
-	write_str(fd, "\tjmp @spush\n")
-	write_str(fd, "@sslow\n")
-	write_str(fd, "\t%sl =l call $cf_dyn_push${sfx}(l %node, l %vhdr, w 1${rf})\n")
-	write_str(fd, "\tjmp @spush\n")
-	write_str(fd, "@spush\n")
-	write_str(fd, "\tstoreb %b, %sl\n")
-	write_str(fd, "\t%i1 =l add %i, 1\n")
-	write_str(fd, "\tstorel %i1, %ip\n")
-	write_str(fd, "\tjmp @sloop\n")
+	write_str(fd, "\t%dst0 =l add %vd, %vl\n")
+	write_str(fd, "\t%si =l copy 0\n")
+	write_str(fd, "@swtop\n")
+	write_str(fd, "\t%si8 =l add %si, 8\n")
+	write_str(fd, "\t%swok =w culel %si8, %len\n")
+	write_str(fd, "\tjnz %swok, @swbody, @sbtop\n")
+	write_str(fd, "@swbody\n")
+	write_str(fd, "\t%sws =l add %bytes, %si\n")
+	write_str(fd, "\t%swd =l add %dst0, %si\n")
+	write_str(fd, "\t%sw =l loadl %sws\n")
+	write_str(fd, "\tstorel %sw, %swd\n")
+	write_str(fd, "\t%si =l copy %si8\n")
+	write_str(fd, "\tjmp @swtop\n")
+	write_str(fd, "@sbtop\n")
+	write_str(fd, "\t%sbd =w cugel %si, %len\n")
+	write_str(fd, "\tjnz %sbd, @scdone, @sbbody\n")
+	write_str(fd, "@sbbody\n")
+	write_str(fd, "\t%sbs =l add %bytes, %si\n")
+	write_str(fd, "\t%sbdst =l add %dst0, %si\n")
+	write_str(fd, "\t%sb =w loadub %sbs\n")
+	write_str(fd, "\tstoreb %sb, %sbdst\n")
+	write_str(fd, "\t%si =l add %si, 1\n")
+	write_str(fd, "\tjmp @sbtop\n")
+	write_str(fd, "@scdone\n")
+	write_str(fd, "\tstorel %need, %vla\n")
+	write_str(fd, "\tret\n")
 	write_str(fd, "@sdone\n")
 	write_str(fd, "\tret\n")
 	write_str(fd, "}\n")
