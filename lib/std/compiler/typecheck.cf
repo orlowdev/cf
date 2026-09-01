@@ -16,9 +16,9 @@
 # The emitter runs only on programs this phase accepts.
 
 import std::io::console::{ die, eprint }
-import std::compiler::diag::{ Diag, DiagBag, drec, drec_w, sort_diags }
+import std::compiler::diag::{ Diag, DiagBag, TyRow, drec, drec_w, sort_diags, record_dg }
 import std::compiler::spans::{ SrcMap, LC, line_col_of, unat }
-import std::data::str::{ eq }
+import std::data::str::{ eq, slice }
 import std::compiler::ast::{
 	Expr,
 	Stmt,
@@ -517,7 +517,7 @@ const func_ret_telem! = (Func fn): TupElem -> {
 
 # The `TFn` of a top-level FUNCTION referenced by name (to match against a function-type parameter):
 # each parameter's signature position, then the return position.
-const fn_ty_of_func! = (Func fn): Ty -> {
+pub const fn_ty_of_func! = (Func fn): Ty -> {
 	let [TupElem] sig = []
 	let Iarch i = 0
 
@@ -706,9 +706,35 @@ const ty_eq = (Ty a, Ty b): Bool -> {
 			match b { Ty.TFixed(bb, bsg) -> ab == bb && (if asg then bsg else !bsg), _ -> false },
 		Ty.TFloat(ab) -> match b { Ty.TFloat(bb) -> ab == bb, _ -> false },
 		Ty.TTuple(ae) -> match b { Ty.TTuple(be) -> tuple_elems_eq(ae, be), _ -> false },
-		Ty.TFn(asig) -> match b { Ty.TFn(bsig) -> tuple_elems_eq(asig, bsig), _ -> false },
+		Ty.TFn(asig) -> match b { Ty.TFn(bsig) -> fn_sigs_eq(asig, bsig), _ -> false },
 		Ty.TNever -> true,
 	}
+}
+
+# Two function signatures match position-for-position — with an UNKNOWN leaf (the empty
+# name: an unfilled lambda slot the fill passes complete before the final check) matching
+# anything. The monomorph pass types calls through here BEFORE those passes have run, so
+# the wildcard keeps a pending lambda from rejecting; the post-fill check is strict again
+# (every name concrete by then, or the closure gate has already rejected).
+const fn_sigs_eq = ([TupElem] a, [TupElem] b): Bool -> {
+	if Iarch(a.len) != Iarch(b.len) then return false
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(a.len) then break
+		if !fn_sig_leaf_eq(a[i], b[i]) then return false
+		i = i + 1
+	}
+
+	return true
+}
+
+const fn_sig_leaf_eq = (TupElem x, TupElem y): Bool -> {
+	if Iarch(x.name.len) == 0 then return true
+	if Iarch(y.name.len) == 0 then return true
+	if !eq(x.name, y.name) then return false
+
+	return fn_sigs_eq(x.sub, y.sub)
 }
 
 # Byte-wise `Str` equality (name lookup).
@@ -797,6 +823,14 @@ const union_member_index = ([UnionMember] members, Str name): Iarch -> {
 # record/union, or a builtin scalar (`Bool`/`Str`/`Iarch`/`Int`). Shared by parameters,
 # record fields, and union payloads.
 pub const named_ty = (Str type_name, Str elem, [RecDecl] recs, [UnionDecl] unions): Ty -> {
+	# the EMPTY name — an UNFILLED slot (a bare lambda parameter or an omitted closure return
+	# the fill passes have not reached yet): the Never poison types on without cascading; the
+	# owning declaration either fills later or rejects with its own located message
+	if eq(type_name, "") then return Ty.TNever
+	# a TYPE-VARIABLE name (`'T`) reaching resolution — a template's payload/arm typed before
+	# its instance exists (the retfill pass walks a diag-carrying monomorph round): the same
+	# poison; the explicit `sig_has_typevar` gate still rejects a leaked variable in a signature
+	if Iarch(type_name.len) > 0 && Iarch(type_name[0]) == 39 then return Ty.TNever
 	if eq(type_name, "$dyn") then return Ty.TDyn(elem)
 	if eq(type_name, "$ptr") then return Ty.TPtr
 	if find_rec(recs, type_name) >= 0 then return Ty.TRec(type_name)
@@ -859,6 +893,189 @@ pub const ty_name = (Ty t): Str -> match t {
 	Ty.TTuple(e) -> "",
 	Ty.TFn(s) -> "",
 	Ty.TNever -> "Never",
+}
+
+# --- the hover type log (`cf lsp type`) -------------------------------------------------------
+# A monomorphized instance name back in source spelling: `Maybe$Iarch` → `Maybe[Iarch]`. The
+# `$`-joined arguments flatten into one bracket (a NESTED instance argument loses its own
+# brackets — an accepted imprecision of the display, not of the type).
+const demangle_ty! = (Str n): Str -> {
+	let Iarch d0 = -1
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(n.len) then break
+
+		if Iarch(n[i]) == 36 then {
+			d0 = i
+			break
+		}
+
+		i = i + 1
+	}
+
+	if d0 <= 0 then return n
+	let Str s = "${slice(0, d0, n)}["
+	let Iarch a0 = d0 + 1
+	let Iarch j = a0
+
+	loop {
+		if j > Iarch(n.len) then break
+
+		if j == Iarch(n.len) || Iarch(n[j]) == 36 then {
+			if a0 > d0 + 1 then s = "${s}, "
+			s = "${s}${slice(a0, j, n)}"
+			a0 = j + 1
+		}
+
+		j = j + 1
+	}
+
+	return "${s}]"
+}
+
+# One tuple/signature position as hover text: a nested tuple parenthesizes, a nested
+# function type renders as its own signature, the canonical blank word reads `Iarch`.
+const tel_str! = (TupElem te): Str -> {
+	if tel_is_nest(te) then return tels_paren!(te.sub)
+	if tel_is_fn(te) then return fnsig_str!(te.sub)
+	if eq(te.name, "") then return "Iarch"
+
+	return demangle_ty!(te.name)
+}
+
+const tels_paren! = ([TupElem] tels): Str -> {
+	let Str s = "("
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(tels.len) then break
+		if i > 0 then s = "${s}, "
+		s = "${s}${tel_str!(tels[i])}"
+		i = i + 1
+	}
+
+	return "${s})"
+}
+
+# A `TFn` signature (positions 0..n-2 the arguments, the last the return) as `(A, B) -> R`.
+const fnsig_str! = ([TupElem] sig): Str -> {
+	if Iarch(sig.len) == 0 then return "() -> ()"
+	let Str s = "("
+	let Iarch i = 0
+
+	loop {
+		if i + 1 >= Iarch(sig.len) then break
+		if i > 0 then s = "${s}, "
+		s = "${s}${tel_str!(sig[i])}"
+		i = i + 1
+	}
+
+	return "${s}) -> ${tel_str!(sig[Iarch(sig.len) - 1])}"
+}
+
+# A `Ty` as the hover display string — `ty_name` for the scalar leaves (demangled back to
+# source spelling), structural renderings for the tuple/function/pointer shapes `ty_name`
+# has no bare name for.
+pub const ty_hover! = (Ty t): Str -> match t {
+	Ty.TTuple(es) -> tels_paren!(es),
+	Ty.TFn(sig) -> fnsig_str!(sig),
+	Ty.TPtr -> "*[Uint8]",
+	_ -> demangle_ty!(ty_name(t)),
+}
+
+# A function's RETURN slot as its written spelling — the hover signature's tail. Empty when
+# the slot is blank (an omitted return the caller must deduce elsewhere).
+pub const ret_hover! = (Func fn): Str -> {
+	if eq(fn.ret_name, "$tuple") then return tels_paren!(fn.ret_telems)
+	if eq(fn.ret_name, "$dyn") then return "[${fn.ret_elem}]"
+	if eq(fn.ret_name, "") then return ""
+
+	return demangle_ty!(fn.ret_name)
+}
+
+# A parameter's hover display: the declared pointer-ness composed back on (`*Point`,
+# `*[Uint8]`) — `param_ty!` collapses it into the pointee's `Ty`.
+const param_hover! = (Param p, Ty pty): Str -> {
+	if p.is_ptr then {
+		if eq(p.type_name, "$ptr") then {
+			if Iarch(p.elem.len) > 0 then return "*[${p.elem}]"
+
+			return "*[Uint8]"
+		}
+
+		return "*${ty_hover!(pty)}"
+	}
+
+	return ty_hover!(pty)
+}
+
+# Append one deduced-type row when the log is on (`check_types!` — the `cf lsp type` child).
+# Rendering runs only under the flag, so the compile pipeline never pays for it.
+const tylog = (*DiagBag dg, Ctx ctx, Iarch anchor, Str name, Str ty, Bool mut): () -> {
+	if !dg.tlog then return ()
+	if Iarch(ty.len) == 0 then return ()
+
+	dg.trows = [
+		...dg.trows,
+		TyRow({ anchor: anchor, dline: ctx.dline, name: name, ty: ty, mut: mut }),
+	]
+}
+
+# Log a match arm's payload binds: each bound name rides at the TAIL of the arm's extended
+# environment — searched back to front so the arm's bind wins over an outer namesake.
+const tylog_binds! = (*DiagBag dg, Ctx ctx, Iarch anchor, [Str] binds, [VarTy] benv): () -> {
+	if !dg.tlog then return ()
+
+	for b in binds {
+		if eq(b, "_") || is_pat_guard(b) then continue
+		let Iarch i = Iarch(benv.len) - 1
+
+		loop {
+			if i < 0 then break
+
+			if eq(benv[i].name, b) then {
+				tylog(dg, ctx, anchor, b, ty_hover!(benv[i].ty), false)
+				break
+			}
+
+			i = i - 1
+		}
+	}
+}
+
+# The byte offset a statement list's FIRST expression carries (its `Expr.At` wrapper), or -1 —
+# the anchor for a binding whose own statement holds no expression (a `for` loop variable, a
+# match arm's payload bind): any offset inside the bind's scope is at/after the binder and
+# before the next same-named sibling-scope bind, which is all the replay needs.
+const stmt_anchor = (Stmt s): Iarch -> match s {
+	Stmt.Let(n, m, a, e) -> arg_span(e, -1),
+	Stmt.Assign(n, e) -> arg_span(e, -1),
+	Stmt.FieldAssign(n, f, e) -> arg_span(e, -1),
+	Stmt.DeepFieldAssign(b, f, e) -> arg_span(b, -1),
+	Stmt.IndexAssign(n, i, e) -> arg_span(i, -1),
+	Stmt.Return(e) -> arg_span(e, -1),
+	Stmt.Do(e) -> arg_span(e, -1),
+	Stmt.Yield(e) -> arg_span(e, -1),
+	Stmt.IfThen(c, b) -> arg_span(c, -1),
+	Stmt.IfElse(c, tb, eb) -> arg_span(c, -1),
+	Stmt.Match(e, arms) -> arg_span(e, -1),
+	Stmt.Destructure(p, m, e) -> arg_span(e, -1),
+	Stmt.ForIn(v, a, body) -> stmts_anchor(body),
+	Stmt.Loop(l, body) -> stmts_anchor(body),
+	Stmt.Block(ss) -> stmts_anchor(ss),
+	Stmt.Defer(ss) -> stmts_anchor(ss),
+	Stmt.Closure(nm, ps, r, body) -> stmts_anchor(body),
+	_ -> -1,
+}
+
+const stmts_anchor = ([Stmt] ss): Iarch -> {
+	for s in ss {
+		const Iarch a = stmt_anchor(s)
+		if a >= 0 then return a
+	}
+
+	return -1
 }
 
 # Resolve a parameter's declared type to a `Ty`: a `*[Uint8]` byte pointer (`TPtr`) or a
@@ -2311,12 +2528,12 @@ pub const arm_bind_env = (
 
 # Type an arm's body, extending the environment with the arm's payload bindings.
 const type_arm_body! = (MatchArm arm, [VarTy] env, Ctx ctx, *DiagBag dg): Ty -> {
-	return type_of!(
-		arm.body,
-		arm_bind_env(arm.type_name, arm.members, arm.binds, env, ctx, dg),
-		ctx,
-		dg,
-	)
+	const [VarTy] benv = arm_bind_env(arm.type_name, arm.members, arm.binds, env, ctx, dg)
+
+	# the hover type log: an arm's payload binds, anchored on the arm's body expression
+	if dg.tlog then tylog_binds!(dg, ctx, arg_span(arm.body, -1), arm.binds, benv)
+
+	return type_of!(arm.body, benv, ctx, dg)
 }
 
 # The members of the builtin `Bool` union `{ False, True }` (§8.6, tag 0/1) — Bool is the primitive
@@ -3102,6 +3319,8 @@ pub const check_destructure! = (
 				elem: "",
 			}),
 		]
+		# the hover type log: anchored on the tuple initializer (right after the pattern)
+		if dg.tlog then tylog(dg, ctx, arg_span(rhs, -1), tok, ty_hover!(pty), mutable)
 		pos = pos + 1
 		pi = pi + 1
 	}
@@ -3825,6 +4044,9 @@ const check_for_body! = (Str lv, Str arr, [Stmt] body, [VarTy] env, Ctx ctx, *Di
 		}),
 	]
 
+	# the hover type log: anchored on the body's first expression (inside the binder's scope)
+	if dg.tlog then tylog(dg, ctx, stmts_anchor(body), lv, ty_hover!(lvt), false)
+
 	return check_stmts!(body, benv, ctx, dg, lk_for)
 }
 
@@ -4376,10 +4598,21 @@ const check_simple_stmt! = (Stmt s, [VarTy] env, Ctx ctx, *DiagBag dg, Iarch loo
 # value function), and its nominal function-value signature (its parameter types then its
 # return) — bound in the environment so a call `f(x)` typechecks (via `indirect_call_type`) and
 # using it as a plain value is rejected (`use(f)` where an `Iarch` is expected).
-const closure_ret_ty = (Str ret, Ctx ctx, *DiagBag dg): Ty -> {
+const closure_ret_ty! = (Str ret, Ctx ctx, *DiagBag dg): Ty -> {
 	if eq(ret, "") then return Ty.TInt
+	# the bracket-encoded array return (`[Iarch]` — a closure's ret slot is a bare name)
+	if is_nested(ret) then return Ty.TDyn(nested_inner!(ret))
 
 	return named_ty(ret, "", ctx.recs, ctx.unions)
+}
+
+# A closure's signature leaf: an UNFILLED slot (a bare lambda parameter, an omitted return the
+# fill passes have not reached yet) stays the EMPTY name — an unknown that binds no type
+# variable and satisfies no match until filled; everything else canonicalizes like a function's.
+const cl_sig_name = (Str n): Str -> {
+	if eq(n, "") then return ""
+
+	return fn_sig_name(n)
 }
 
 pub const closure_tfn = (Str ret, [Param] params): Ty -> {
@@ -4388,11 +4621,11 @@ pub const closure_tfn = (Str ret, [Param] params): Ty -> {
 
 	loop {
 		if i >= Iarch(params.len) then break
-		sig = [...sig, tel_leaf(fn_sig_name(params[i].type_name))]
+		sig = [...sig, tel_leaf(cl_sig_name(params[i].type_name))]
 		i = i + 1
 	}
 
-	sig = [...sig, tel_leaf(fn_sig_name(ret))]
+	sig = [...sig, tel_leaf(cl_sig_name(ret))]
 
 	return Ty.TFn(sig)
 }
@@ -4858,7 +5091,24 @@ const check_closure! = (
 		then return terr_env(ctx, dg, "cf: type: a binding cannot shadow an existing name\n", env)
 	if body_has_closure(body)
 		then return terr_env(ctx, dg, "cf: type: a closure cannot be nested in another closure\n", env)
-	const Ty crt = closure_ret_ty(ret, ctx, dg)
+	# a BARE parameter (`(n) -> ...`) types from the consuming call's function-type parameter
+	# (type_system §5.2, filled before this pass runs) — one still blank here had no such
+	# context to fill from
+	let Iarch bp = 0
+
+	loop {
+		if bp >= Iarch(params.len) then break
+		if eq(params[bp].type_name, "")
+			then return terr_env(
+			ctx,
+			dg,
+			"cf: type: a lambda parameter's type could not be derived from the consuming call — annotate it\n",
+			env,
+		)
+		bp = bp + 1
+	}
+
+	const Ty crt = closure_ret_ty!(ret, ctx, dg)
 	const Ctx cctx = Ctx({
 		funcs: ctx.funcs,
 		recs: ctx.recs,
@@ -4876,11 +5126,12 @@ const check_closure! = (
 	loop {
 		if pi >= Iarch(params.len) then break
 		check_ptr_pointee(params[pi], ctx.recs, ctx.unions, ctx, dg)
+		const Ty cpty = param_ty!(params[pi], ctx.recs, ctx.unions)
 		cenv = [
 			...cenv,
 			VarTy({
 				name: params[pi].name,
-				ty: param_ty!(params[pi], ctx.recs, ctx.unions),
+				ty: cpty,
 				mutable: false,
 				esc: false,
 				outer: false,
@@ -4890,8 +5141,15 @@ const check_closure! = (
 				elem: params[pi].elem,
 			}),
 		]
+		# the hover type log: anchored on the closure body's first expression (the param's scope)
+		if dg.tlog
+			then tylog(dg, ctx, stmts_anchor(body), params[pi].name, param_hover!(params[pi], cpty), false)
 		pi = pi + 1
 	}
+
+	# the closure NAME binds a function value in the enclosing scope — anchorless (no shadowing
+	# means no same-named sibling to disambiguate from)
+	if dg.tlog then tylog(dg, ctx, -1, nm, ty_hover!(closure_tfn(ret, params)), false)
 
 	const Iarch dr = check_stmts!(body, cenv, cctx, dg, lk_none)
 	# a closure body must return or diverge (`dr >= 2`) — a `()` closure may fall through to unit
@@ -4998,6 +5256,8 @@ const check_stmts! = ([Stmt] stmts, [VarTy] env0, Ctx ctx, *DiagBag dg, Iarch lo
 						elem: "",
 					}),
 				]
+				# the hover type log: anchored on the initializer (right after the binder name)
+				if dg.tlog then tylog(dg, ctx, arg_span(e, -1), n, ty_hover!(ty), m)
 			},
 			Stmt.Destructure(pat, m, e) -> {
 				env = check_destructure!(pat, m, e, env, ctx, dg)
@@ -5228,6 +5488,10 @@ const check_stmt_match! = (
 		}
 
 		const [VarTy] benv = arm_bind_env(arms[i].type_name, arms[i].members, arms[i].binds, env, ctx, dg)
+
+		# the hover type log: a statement arm's payload binds, anchored on the body's first expression
+		if dg.tlog then tylog_binds!(dg, ctx, stmts_anchor(arms[i].body), arms[i].binds, benv)
+
 		check_stmts!(arms[i].body, benv, ctx, dg, loop_kind)
 		i = i + 1
 	}
@@ -5406,6 +5670,9 @@ const check_func! = (Func fn, Ctx ctx, *DiagBag dg): Iarch -> {
 				elem: fn.params[pi].elem,
 			}),
 		]
+		# the hover type log: a parameter is anchorless — its name is unique in the function
+		# (a local shadowing it is rejected), so the replay matches it by name alone
+		if dg.tlog then tylog(dg, fctx, -1, fn.params[pi].name, param_hover!(fn.params[pi], pty), false)
 		pi = pi + 1
 	}
 
@@ -5709,7 +5976,7 @@ const check_whole = (Program prog, Str entry, Bool require_main, *DiagBag dg): [
 # authority for all semantic validation; the emitter does no re-checking. `require_main`
 # gates the entry-point rejection: `compile!` demands one, `check!` (a module tree) does not.
 pub const check_program! = (Program prog, Str entry, Bool require_main, [SrcMap] maps): [Diag] -> {
-	let DiagBag bag = DiagBag({ hot: false, file: "", line: 0, col: 0, msg: "", what: "", eoff: -1 })
+	let DiagBag bag = record_dg()
 	let [Diag] diags = check_whole(prog, entry, require_main, &bag)
 	let Ctx ctx = Ctx({
 		funcs: prog.funcs,
@@ -5761,7 +6028,7 @@ pub const check_unreachable! = (
 	[UnionDecl] unions,
 	[SrcMap] maps,
 ): [Diag] -> {
-	let DiagBag bag = DiagBag({ hot: false, file: "", line: 0, col: 0, msg: "", what: "", eoff: -1 })
+	let DiagBag bag = record_dg()
 	let [Diag] diags = []
 	let Ctx ctx = Ctx({
 		funcs: funcs,
@@ -5817,4 +6084,88 @@ pub const check_unreachable! = (
 	}
 
 	return diags
+}
+
+# Trailing-NUL-insensitive path equality: a declaration's `dfile` stamp may carry the open
+# syscall's terminating NUL in its `len`; the entry path from the CLI never does.
+const file_eq_nul = (Str a, Str b): Bool -> {
+	let Iarch an = Iarch(a.len)
+
+	loop {
+		if an <= 0 then break
+		if Iarch(a[an - 1]) != 0 then break
+		an = an - 1
+	}
+
+	let Iarch bn = Iarch(b.len)
+
+	loop {
+		if bn <= 0 then break
+		if Iarch(b[bn - 1]) != 0 then break
+		bn = bn - 1
+	}
+
+	if an != bn then return false
+	let Iarch i = 0
+
+	loop {
+		if i >= an then break
+		if Iarch(a[i]) != Iarch(b[i]) then return false
+		i = i + 1
+	}
+
+	return true
+}
+
+# The LSP hover's type oracle (`cf lsp type`): walk the functions of `check` DECLARED IN
+# `entry` through the ordinary function checker with the bind-type log on, and hand back the
+# collected rows — one per typed local binding (a parameter, a `let`/`const`, a `for` loop
+# variable, a destructure position, a match arm's payload bind, a closure). Diagnostics are
+# DISCARDED: a mid-edit tree still yields rows for everything each declaration typed before
+# its first error. `table` is the call-resolution table — the checked program's own functions
+# for the live walk, the PRE-materialize table for the pruned declarations (the same split
+# `check_unreachable!` uses). A generic template's instances share its stamp, so one written
+# binding may log once per instantiation; the replay dedupes the rendered types.
+pub const check_types! = (
+	[Func] check,
+	[Func] table,
+	[RecDecl] recs,
+	[UnionDecl] unions,
+	[SrcMap] maps,
+	Str entry,
+): [TyRow] -> {
+	let DiagBag bag = record_dg()
+	bag.tlog = true
+	let Ctx ctx = Ctx({
+		funcs: table,
+		recs: recs,
+		unions: unions,
+		frt: Ty.TInt,
+		frsize: 0,
+		dfile: "",
+		dline: 0,
+		dcol: 0,
+		maps: maps,
+	})
+	let Iarch f = 0
+
+	loop {
+		if f >= Iarch(check.len) then break
+		const Func cfn = check[f]
+
+		if !file_eq_nul(cfn.dfile, entry) then {
+			f = f + 1
+			continue
+		}
+
+		ctx.dfile = cfn.dfile
+		ctx.dline = cfn.dline
+		ctx.dcol = cfn.dcol
+		check_func!(cfn, ctx, &bag)
+		# a rejection poisons only its own declaration's walk — flush and move on
+		bag.hot = false
+		f = f + 1
+	}
+
+	return bag.trows
 }

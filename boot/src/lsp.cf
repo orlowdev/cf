@@ -559,8 +559,12 @@ const scan_decl = (Str ln): DeclLine -> {
 		kind = 5
 	}
 	if klen < 0 then return DeclLine({ kind: 0, ns: 0, ne: 0 })
-	# a value that binds a `(...)` is a function — `const f = (…): T -> …` (intrinsics likewise)
+	# a value that binds a `(...)` is a function — `const f = (…): T -> …` (intrinsics
+	# likewise); a GENERIC one opens its type parameters first — `const f = ['A](…) -> …` —
+	# so a `= [` whose bracket group closes onto a `(` counts too (an array-literal value
+	# const `= [1, 2]` has no `](`)
 	if kind == 14 && contains("= (", ln) then kind = 12
+	if kind == 14 && contains("= [", ln) && contains("](", ln) then kind = 12
 
 	const Iarch ns = koff + klen
 	let Iarch ne = ns
@@ -2478,6 +2482,176 @@ const tidy_sig = (Str ln): Str -> {
 	return s
 }
 
+# A function declaration line recast as a hover signature: `pub const name = ['A](params):
+# Ret -> body` → `name: ['A](params): Ret`. The scan is DEPTH-AWARE — the body arrow is the
+# first ` ->` at paren/bracket depth 0, so a function-TYPE parameter's arrow (inside the param
+# parens) never cuts the signature short (the flat `tidy_sig` heuristic missed the generic
+# `= ['A](` form entirely and leaked the body). `has_ret` — a `: Ret` follows the param group
+# (an omitted return leaves it false; the caller may append a DEDUCED one). `sig` empty when
+# the line doesn't carry the whole signature (a wrapped declaration, a bodyless intrinsic) —
+# the caller falls back to the tidied line.
+data FnSig = { Str sig, Bool has_ret }
+
+const fn_sig_of = (Str name, Str ln): FnSig -> {
+	const FnSig miss = FnSig({ sig: "", has_ret: false })
+	const Str s = trim(ln)
+	const Iarch eqi = index_of(" = ", s)
+	if eqi < 0 then return miss
+	const Iarch a0 = eqi + 3
+	let Iarch depth = 0
+	let Iarch pend = -1
+	let Iarch cut = -1
+	let Iarch i = a0
+
+	loop {
+		if i >= Iarch(s.len) then break
+		const Iarch c = Iarch(s[i])
+		if c == 40 || c == 91 then depth = depth + 1
+
+		if c == 41 || c == 93 then {
+			depth = depth - 1
+			if depth == 0 && c == 41 && pend < 0 then pend = i + 1
+		}
+
+		if depth == 0 && c == 32 && i + 2 < Iarch(s.len) then {
+			if Iarch(s[i + 1]) == 45 && Iarch(s[i + 2]) == 62 then {
+				cut = i
+				break
+			}
+		}
+
+		i = i + 1
+	}
+
+	if cut < 0 || pend < 0 || pend > cut then return miss
+	const Str sig = trim(slice(a0, cut, s))
+	# the return is written iff a `:` directly follows the param group's close
+	let Bool hr = false
+	let Iarch j = pend
+
+	loop {
+		if j >= cut then break
+
+		if Iarch(s[j]) == 58 then {
+			hr = true
+			break
+		}
+
+		if Iarch(s[j]) != 32 then break
+		j = j + 1
+	}
+
+	return FnSig({ sig: "${name}: ${sig}", has_ret: hr })
+}
+
+# The BUILTIN types' hover docs. These names have no declaration anywhere — resolve REJECTS
+# redeclaring them — so the hover answers from this table (the structural forms `[Elem]`,
+# `[N Elem]`, `*T`, `(A, B)`, and `(A) -> R` have no name token to hover). "" = not a builtin.
+const builtin_type_doc = (Str n): Str -> {
+	if eq(n, "Iarch")
+		then return "The signed machine word — cf's default integer type. Register-width (64-bit on every current target): arithmetic, comparisons, array indexing, and `.len` all speak it. `Iarch(x)` casts into it."
+	if eq(n, "Uarch")
+		then return "The unsigned machine word. Sizes, raw addresses, and bit patterns; its comparisons are unsigned. `Uarch(x)` casts into it."
+	if eq(n, "Int")
+		then return "The genesis spelling of the signed machine word — the same type as `Iarch`."
+	if eq(n, "Int8")
+		then return "A signed 8-bit integer. The width and signedness ride in the type — range-checked literals, wrapping arithmetic — and only an explicit cast (`Int8(x)`) moves between widths."
+	if eq(n, "Int16")
+		then return "A signed 16-bit integer. The width and signedness ride in the type — range-checked literals, wrapping arithmetic — and only an explicit cast (`Int16(x)`) moves between widths."
+	if eq(n, "Int32")
+		then return "A signed 32-bit integer. The width and signedness ride in the type — range-checked literals, wrapping arithmetic — and only an explicit cast (`Int32(x)`) moves between widths."
+	if eq(n, "Int64")
+		then return "A signed 64-bit integer. The width and signedness ride in the type — range-checked literals, wrapping arithmetic — and only an explicit cast (`Int64(x)`) moves between widths."
+	if eq(n, "Uint8")
+		then return "An unsigned 8-bit integer — the byte. Buffers, file contents, and a `Str`'s storage are `[Uint8]`. Only an explicit cast (`Uint8(x)`) moves between widths."
+	if eq(n, "Uint16")
+		then return "An unsigned 16-bit integer. The width rides in the type — range-checked literals, wrapping arithmetic — and only an explicit cast (`Uint16(x)`) moves between widths."
+	if eq(n, "Uint32")
+		then return "An unsigned 32-bit integer. The width rides in the type — range-checked literals, wrapping arithmetic — and only an explicit cast (`Uint32(x)`) moves between widths."
+	if eq(n, "Uint64")
+		then return "An unsigned 64-bit integer. The width rides in the type — range-checked literals, wrapping arithmetic — and only an explicit cast (`Uint64(x)`) moves between widths."
+	if eq(n, "Float32")
+		then return "An IEEE-754 single-precision floating-point number. `Float32(x)` casts into it; a float literal is `Float64`."
+	if eq(n, "Float64")
+		then return "An IEEE-754 double-precision floating-point number — the type of float literals."
+	if eq(n, "Bool")
+		then return "The two-valued truth type — a builtin union `{ False, True }` (tags 0 and 1). A condition demands a `Bool`: cf has no truthiness."
+	if eq(n, "Str")
+		then return "A 16-byte string header: `bytes` — a pointer to the UTF-8 bytes — and `len` — the byte count. A view over storage it does not own: slicing yields new headers over the same bytes. Construct with a literal, interpolation, or `Str({ bytes, len })`."
+	if eq(n, "Unit")
+		then return "The unit type `()` — the value of a function called only for its effect; a `()` body may fall through without a `return`."
+	if eq(n, "Never")
+		then return "The bottom type — the type of an expression that never yields (a `die`, an `exit`, a diverging tail). It satisfies any expected type, so a diverging arm mixes with the others."
+	if eq(n, "true") then return "The `Bool` truth literal."
+	if eq(n, "false") then return "The `Bool` falsehood literal."
+
+	return ""
+}
+
+# A record FIELD's declared type: the text of the field's own segment left of its name at
+# `ns` — the segment opens at the nearest depth-0 `{` or `,` (parens/brackets tracked, so a
+# tuple field's inner commas don't cut it). Exact because a field is always annotated.
+const field_type_of = (Str ln, Iarch ns): Str -> {
+	let Iarch depth = 0
+	let Iarch seg = 0
+	let Iarch i = 0
+
+	loop {
+		if i >= ns || i >= Iarch(ln.len) then break
+		const Iarch c = Iarch(ln[i])
+		if c == 40 || c == 91 then depth = depth + 1
+		if c == 41 || c == 93 then depth = depth - 1
+		if depth == 0 && (c == 123 || c == 44) then seg = i + 1
+		i = i + 1
+	}
+
+	return trim(slice(seg, ns, ln))
+}
+
+# A union MEMBER's own segment of its declaration line: from the member name at `ns` to the
+# next `,` or `}` at paren/bracket depth 0 — `Bool(Bool)` out of a single-line union body,
+# the member sans trailing comma out of a multi-line one.
+const member_seg_of = (Str ln, Iarch ns): Str -> {
+	let Iarch depth = 0
+	let Iarch i = ns
+
+	loop {
+		if i >= Iarch(ln.len) then break
+		const Iarch c = Iarch(ln[i])
+		if c == 40 || c == 91 then depth = depth + 1
+		if c == 41 || c == 93 then depth = depth - 1
+		if depth == 0 && (c == 44 || c == 125) then break
+		i = i + 1
+	}
+
+	return trim(slice(ns, i, ln))
+}
+
+# A `union`/`data` declaration reshaped for hover: `pub union Either['L, 'R] = { ... }` →
+# `union Either['L, 'R]` — the `pub`, the `=`, and the whole body drop (the doc prose below
+# the code block describes the type; the members are one goto away). Empty when the line is
+# no such declaration — the caller keeps its tidied fallback.
+const type_decl_hover = ([Str] dlines, Iarch l0): Str -> {
+	let Str head = trim(dlines[l0])
+	if starts_with("pub ", head) then head = slice(4, Iarch(head.len), head)
+	const Iarch eqi = index_of(" = ", head)
+	if eqi < 0 then return ""
+
+	return slice(0, eqi, head)
+}
+
+# A LOCAL binder line tidied for the hover fallback: cut at its `=` — the initializer is the
+# very code sitting under the cursor, not information (the type child answers when it can; this
+# fires only when it cannot, e.g. a mid-edit buffer). A closure binding (`= (`) keeps its
+# parameter list and falls to `tidy_sig`'s arrow cut instead.
+const tidy_binder = (Str ln): Str -> {
+	const Str s = trim(ln)
+	const Iarch cut = index_of(" = ", s)
+	if cut > 0 && !contains("= (", s) then return trim(slice(0, cut, s))
+
+	return tidy_sig(ln)
+}
+
 # Answer textDocument/hover: the first definition of the token under the cursor, shown as its
 # tidied declaration line in a cf code block with the `#` comment block above it as prose. A
 # multi-definition name notes how many more there are. Null when nothing resolves.
@@ -2502,11 +2676,22 @@ const hover! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, Iar
 	const TokCtx t = token_at(lines[l0], c0)
 	if !t.ok then return Json.Null
 
-	# a local binding: hover shows its binder line (same buffer — locals live in the one file)
+	# a local binding: hover shows its DEDUCED type (`cf lsp type` — a logged typecheck in a
+	# child), falling back to the binder line when the tree doesn't answer (mid-edit breaks)
 	const SymRow lh = local_def!(argv0, env, path, overlay, lines, l0, t)
 
 	if lh.line >= 0 && lh.line < Iarch(lines.len) then {
-		const Str lsig = tidy_sig(lines[lh.line])
+		const ChildOut tco = lsp_child!(argv0, env, path, overlay, lines, l0, t.ts, "type", t.name)
+		let Str lty = ""
+
+		if tco.rc == 0 then {
+			lty = tco.out
+			const Iarch tnl = index_of("\n", lty)
+			if tnl >= 0 then lty = slice(0, tnl, lty)
+		}
+
+		let Str lsig = tidy_binder(lines[lh.line])
+		if Iarch(lty.len) > 0 then lsig = lty
 
 		return Json.Obj([
 				ent(
@@ -2518,13 +2703,114 @@ const hover! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, Iar
 	}
 
 	const Bool dotted = t.ts > 0 && Iarch(lines[l0][t.ts - 1]) == 46
-	const DefOut o = picked_defs!(argv0, env, path, srcf, srcp, overlay, t, dotted)
+	let TokCtx tq = t
+
+	# a bare PascalCase token may be a union member's own DECLARATION (`Bool` in `union Json
+	# = { ..., Bool(Bool), ... }`) — rebase onto `Base.member` BEFORE the builtin table, or a
+	# member shadowing a builtin type name would hover as the builtin
+	if bare_token(t) && Iarch(t.name[0]) >= 65 && Iarch(t.name[0]) <= 90 then {
+		const Str ub = member_decl_union!(path, overlay, lines, l0, t.ts)
+
+		if Iarch(ub.len) > 0 then
+		tq = TokCtx({ ok: true, name: t.name, hints: t.hints, lead: t.lead, ts: t.ts, te: t.te, base: ub })
+	}
+
+	# the BUILTIN pseudo-fields — `.len` on an array/string, `.bytes` on a string — have no
+	# declaration to index; typed here directly (answered before the field-index fallback:
+	# a coincidental record field spelled `len` would win otherwise, with foreign doc prose)
+	if dotted && Iarch(t.base.len) == 0 && (eq(t.name, "len") || eq(t.name, "bytes")) then {
+		let Str bsig = "len: Iarch"
+		let Str bdoc = "The element count of an array, or the byte length of a `Str`."
+
+		if eq(t.name, "bytes") then {
+			bsig = "bytes: *[Uint8]"
+			bdoc = "A `Str`'s underlying byte pointer."
+		}
+
+		return Json.Obj([
+				ent(
+					"contents",
+					Json.Obj([
+							ent("kind", jstr("markdown")),
+							ent("value", jstr("```cf\n${bsig}\n```\n\n${bdoc}")),
+						]),
+				),
+				ent("range", jrange!(l0, t.ts, t.te)),
+			])
+	}
+
+	# a BUILTIN type name (`Str`, `Iarch`, `Bool`, ...) or truth literal — no declaration
+	# exists to index, so the table answers (a cast `Iarch(x)` hovers the same token)
+	if Iarch(tq.hints.len) == 0 && Iarch(tq.base.len) == 0 then {
+		const Str bd = builtin_type_doc(t.name)
+
+		if Iarch(bd.len) > 0 then {
+			let Str bs = t.name
+			if eq(t.name, "true") || eq(t.name, "false") then bs = "${t.name}: Bool"
+
+			return Json.Obj([
+					ent(
+						"contents",
+						Json.Obj([ent("kind", jstr("markdown")), ent("value", jstr("```cf\n${bs}\n```\n\n${bd}"))]),
+					),
+					ent("range", jrange!(l0, t.ts, t.te)),
+				])
+		}
+	}
+
+	const DefOut o = picked_defs!(argv0, env, path, srcf, srcp, overlay, tq, dotted)
 	if Iarch(o.hits.len) == 0 then return Json.Null
 	let SymRow h = o.hits[0]
 
 	const [Str] dlines = split("\n", src_of!(h.file, owner, srcf))
 	if h.line >= Iarch(dlines.len) then return Json.Null
-	const Str sig = tidy_sig(dlines[h.line])
+	let Str sig = tidy_sig(dlines[h.line])
+
+	# a record FIELD hover reads `name: Type` — its declared type extracted from the field's
+	# own segment (a single-line record's field row otherwise echoed the whole declaration)
+	if h.kind == 8 then {
+		const Str ft = field_type_of(dlines[h.line], h.ns)
+		if Iarch(ft.len) > 0 then sig = "${h.sname}: ${ft}"
+	}
+
+	# a union MEMBER hover reads `Base.Member(payloads)` — the member's own segment of its
+	# declaration (a single-line union's member row otherwise echoed the whole declaration)
+	if h.kind == 22 then {
+		const Str ms = member_seg_of(dlines[h.line], h.ns)
+
+		if Iarch(ms.len) > 0 then {
+			sig = ms
+			if Iarch(tq.base.len) > 0 then sig = "${tq.base}.${ms}"
+		}
+	}
+
+	# a UNION/DATA hover reads `union Name['T]` / `data Name` — the `pub`, the `=`, and the
+	# body all drop (the doc prose below describes the type)
+	if h.kind == 10 || h.kind == 23 then {
+		const Str td = type_decl_hover(dlines, h.line)
+		if Iarch(td.len) > 0 then sig = td
+	}
+
+	# a FUNCTION hover reads `name: [tyargs](params): Ret` — the depth-aware recast; when the
+	# declaration omits its return AND lives in the checked file, the type child deduces it
+	if h.kind == 12 then {
+		const FnSig fs = fn_sig_of(h.sname, dlines[h.line])
+
+		if Iarch(fs.sig.len) > 0 then {
+			sig = fs.sig
+
+			if !fs.has_ret && eq(h.file, path) then {
+				const ChildOut rco = lsp_child!(argv0, env, path, overlay, lines, l0, t.ts, "type", h.sname)
+
+				if rco.rc == 0 then {
+					let Str fr = rco.out
+					const Iarch rnl = index_of("\n", fr)
+					if rnl >= 0 then fr = slice(0, rnl, fr)
+					if Iarch(fr.len) > 0 then sig = "${sig}: ${fr}"
+				}
+			}
+		}
+	}
 
 	# the contiguous `#` comment block right above the declaration, as prose (a bare `#`
 	# line stays a paragraph break); lines TRIMMED first, so an indented field's doc counts

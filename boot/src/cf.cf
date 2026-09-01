@@ -29,12 +29,12 @@ import std::compiler::buildinfo::{ compiler_version }
 import fmt::{ format_file! }
 import docs::{ docs_run! }
 import lsp::{ lsp_run! }
-import std::compiler::{ compile!, check! }
+import std::compiler::{ compile!, check!, type_rows!, fn_ret_hover! }
 import std::compiler::ast::{ Program }
 import std::compiler::resolve::{ resolve_program!, Resolved, entry_binds!, Loaded }
 import std::compiler::parser::{ BindEv }
 import std::compiler::spans::{ line_col_of, LC, SrcMap }
-import std::compiler::diag::{ Diag, print_diags! }
+import std::compiler::diag::{ Diag, TyRow, print_diags! }
 import std::mem::arena::growing_arena
 import qbe::{ qbe_translate }
 import std::process::{ run!, find_executable!, getpid, exit }
@@ -260,7 +260,7 @@ const has_str = ([Str] xs, Str s): Bool -> {
 # every function/record/union name their defining file, so the distinct stamp set IS the module
 # list. The LSP's goto-definition index: it line-scans these files for top-level declarations.
 const run_modules! = (Str input, Str src): Iarch -> {
-	const Resolved rz = resolve_program!(input, src, os::target, host_arch())
+	const Resolved rz = resolve_program!(input, src, os::target, host_arch(), false, false)
 	const Program raw = rz.prog
 	let [Str] mods = []
 
@@ -354,6 +354,106 @@ const run_def! = (Str input, Str src, Iarch off, Str name): Iarch -> {
 	const LC lc = line_col_of(maps, input, b)
 	if lc.line <= 0 then return 0
 	println("${lc.line}:${lc.col}")
+
+	return 0
+}
+
+# `cf lsp type <input.cf> <off> <name> [--src <buf>]`: the DEDUCED type of the LOCAL binding
+# of `name` visible at byte offset `off` — one display line, `let`/`const` + name + type (a
+# parameter prints bare). When NO local binds the name, a same-file function's deduced RETURN
+# prints instead (see the fallback in the body); otherwise nothing. The binder
+# comes from the tracked entry parse (the same replay as `def`); the types from a logged
+# whole-tree typecheck (`type_rows!`). A row correlates back to THIS binder by the enclosing
+# declaration's stamp line plus the nearest expression ANCHOR at or after the binder — cf
+# rejects shadowing, so two binds of one name in one declaration are sibling-scope binds and
+# the anchor (a `let`'s initializer, a `for`/arm body's first expression, always between a
+# binder and the next same-named one) picks the right sibling. An anchorless row (a
+# parameter, a closure name — unique per declaration) matches by name alone. A generic's
+# instances log one row each off the same anchor; the distinct renderings join as `A | B`.
+const run_type! = (Str input, Str src, Iarch off, Str name): Iarch -> {
+	const Loaded ld = entry_binds!(input, src, os::target, host_arch())
+	const Iarch b = binder_at!(ld.evs, off, name)
+
+	# no local binds the name: a same-file FUNCTION answers with its deduced RETURN spelling
+	# alone (the server composes the signature from the declaration line and appends it)
+	if b < 0 then {
+		let Bool isfn = false
+
+		for fn in ld.prog.funcs {
+			if eq(fn.name, name) then isfn = true
+		}
+
+		if !isfn then return 0
+		const Str fr = fn_ret_hover!(input, src, os::target, host_arch(), name)
+		if Iarch(fr.len) > 0 then println(fr)
+
+		return 0
+	}
+
+	# the binder's KIND (2 param / 3 local / 4 for / 5 match bind) — a parameter reads like a
+	# signature fragment (no prefix); every other bind carries its `let`/`const` nature
+	let Iarch bkind = 3
+
+	for ev in ld.evs {
+		if ev.off == b && ev.kind >= 2 && ev.kind <= 5 && eq(ev.name, name) then bkind = ev.kind
+	}
+
+	const [SrcMap] maps = [ld.map]
+	const LC blc = line_col_of(maps, input, b)
+	if blc.line <= 0 then return 0
+	# the enclosing declaration: the nearest function stamp at or above the binder's line
+	let Iarch dline = -1
+
+	for fn in ld.prog.funcs {
+		if fn.dline <= blc.line && fn.dline > dline then dline = fn.dline
+	}
+
+	if dline < 0 then return 0
+	const [TyRow] rows = type_rows!(input, src, os::target, host_arch())
+	# this declaration's binds of the name
+	let [TyRow] cand = []
+
+	for r in rows {
+		if r.dline == dline && eq(r.name, name) then cand = [...cand, r]
+	}
+
+	if Iarch(cand.len) == 0 then return 0
+	# the nearest anchor at/after the binder wins; anchorless rows only when none lands
+	let Iarch best = -1
+
+	for (r, i) in cand {
+		if r.anchor >= b then {
+			if best < 0 || r.anchor < cand[best].anchor then best = i
+		}
+	}
+
+	let [Str] tys = []
+	let Bool mut = false
+
+	for r in cand {
+		let Bool take = false
+		if best >= 0 then take = r.anchor == cand[best].anchor
+		if best < 0 then take = r.anchor < 0
+
+		if take && !has_str(tys, r.ty) then {
+			tys = [...tys, r.ty]
+			if r.mut then mut = true
+		}
+	}
+
+	if Iarch(tys.len) == 0 then return 0
+	let Str out = tys[0]
+	let Iarch ti = 1
+
+	loop {
+		if ti >= Iarch(tys.len) then break
+		out = "${out} | ${tys[ti]}"
+		ti = ti + 1
+	}
+
+	let Str prefix = if mut then "let " else "const "
+	if bkind == 2 then prefix = ""
+	println("${prefix}${name}: ${out}")
 
 	return 0
 }
@@ -591,7 +691,7 @@ const run_uses! = (Str input, Str src, Str name): Iarch -> {
 # of a child per file: the cross-file rename front end at tree scale. A parse-broken file
 # anywhere dies nonzero — the server discards the partial output rather than mis-rename.
 const run_uses_all! = (Str entry, Str src, Str name): Iarch -> {
-	const Resolved rz = resolve_program!(entry, src, os::target, host_arch())
+	const Resolved rz = resolve_program!(entry, src, os::target, host_arch(), false, false)
 	const Program raw = rz.prog
 	let [Str] mods = []
 
@@ -702,8 +802,11 @@ const run_full! = (Cli c, [Str] env): Iarch -> {
 		c.target_arch,
 		c.root_size,
 		c.dump_routing,
+		c.no_inline,
 		c.skip_embeds,
 		c.build_version,
+		c.debug,
+		c.instrument,
 	)
 
 	# type errors come back as values — the CLI edge is where they become text
@@ -828,6 +931,16 @@ pub const main = ([Str] args, [Str] env) -> {
 			return run_def!(args[3], dsrc, dec_of(args[4]), args[5]) in da
 		}
 
+		# `cf lsp type <input.cf> <off> <name> [--src <file>]` — the DEDUCED type of the local
+		# binding at a byte offset, one line (the hover's type oracle).
+		if Iarch(args.len) >= 6 && eq(args[2], "type") then {
+			let Str tsrc = ""
+			if Iarch(args.len) >= 8 && eq(args[6], "--src") then tsrc = args[7]
+			const ta = growing_arena::of(16777216)
+
+			return run_type!(args[3], tsrc, dec_of(args[4]), args[5]) in ta
+		}
+
 		# `cf lsp refs <input.cf> <off> <name> [--src <file>]` — every reference to the local
 		# binding at a byte offset (the binder first), one `line:col` per line.
 		if Iarch(args.len) >= 6 && eq(args[2], "refs") then {
@@ -895,8 +1008,11 @@ pub const main = ([Str] args, [Str] env) -> {
 			c.target_arch,
 			c.root_size,
 			c.dump_routing,
+			c.no_inline,
 			c.skip_embeds,
 			c.build_version,
+			c.debug,
+			c.instrument,
 		) in a
 
 		if Iarch(ds.len) > 0 then {

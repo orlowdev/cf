@@ -2061,6 +2061,25 @@ const routing_run! = (Program prog, RouteInfo ri, Bool dump): Iarch -> {
 const is_destroy_callee = (Str n): Bool ->
 	eq(n, "destroy__fx") || eq(n, "destroy__el") || eq(n, "destroy__fb")
 
+# `std::mem::observe::node(a)` is the other legal handle CONSUMER (the debug arc's
+# accounting query): a read-only observer in the privileged mem namespace — it loads
+# counters off the header and forwards nothing, so the handle does not escape through
+# it. Matched by base name; materialize may suffix a geometry tag (`__pg`, `__el`).
+const is_stats_callee = (Str n): Bool -> {
+	const Str base = "std_mem_observe_node"
+	const Iarch bn = Iarch(base.len)
+	if Iarch(n.len) < bn then return false
+	let Iarch i = 0
+
+	loop {
+		if i >= bn then break
+		if n[i] != base[i] then return false
+		i = i + 1
+	}
+
+	return true
+}
+
 const cd_check_arg! = (Expr arg, [Str] sset, Func ef): Iarch -> {
 	const Iarch r = match arg {
 		Expr.Var(bn) -> if has_name(sset, bn)
@@ -2296,12 +2315,12 @@ const ge_die! = (Str h, Func ef, Str sink): Iarch ->
 	"cf: a geometry handle may not escape its constructing function: the `<geom>::of(...)` arena `${h}` is ${sink}. A geometry is a comptime ambient spent in place — run work `... in ${h}` and reclaim with `defer destroy(${h})`; do not return or forward the handle itself.\n",
 )
 
-# scan an expression for a handle passed as a non-`destroy` call ARGUMENT (the ambient in
-# `Call.geom`
+# scan an expression for a handle passed as a call ARGUMENT — `destroy` and the
+# read-only stats query are the two legal consumers (the ambient in `Call.geom`
 # is not an argument, so `f() in b` never trips this).
 const ge_scan_args! = (Expr e, [Str] hs, Func ef): Iarch -> {
 	const Iarch hit = match e {
-		Expr.Call(callee, _, args, _) -> if is_destroy_callee(callee)
+		Expr.Call(callee, _, args, _) -> if is_destroy_callee(callee) || is_stats_callee(callee)
 			then 0
 			else ge_scan_arglist!(args, hs, callee, ef),
 		_ -> 0,

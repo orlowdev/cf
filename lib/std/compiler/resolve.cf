@@ -567,6 +567,8 @@ const load_module! = (
 	Iarch icol,
 	Os target_os,
 	Arch target_arch,
+	Bool bdebug,
+	Bool binstr,
 	Bool track,
 ): Loaded -> {
 	# One module's read buffer — large enough for cf's own sources (its largest module, emit.cf,
@@ -611,6 +613,8 @@ const load_module! = (
 		file: path,
 		target_os: target_os,
 		target_arch: target_arch,
+		build_debug: bdebug,
+		build_instrument: binstr,
 		saw_fb: false,
 		saw_fx: false,
 		saw_el: false,
@@ -676,7 +680,7 @@ const load_module! = (
 # imports are followed: local bindings live in the one file, so the entry's own parse is the
 # whole index (`src` overlays the bytes like `--src` everywhere else).
 pub const entry_binds! = (Str path, Str src, Os target_os, Arch target_arch): Loaded ->
-	load_module!(path, src, "", 0, 0, target_os, target_arch, true)
+	load_module!(path, src, "", 0, 0, target_os, target_arch, false, false, true)
 
 # Append every element of `src` onto `dst` (cf has no two-spread merge, so grow one at a
 # time). One helper per declaration list — the payload types differ.
@@ -2716,9 +2720,16 @@ const cat_src_n = ([Str] xs, Iarch n, Str s): [Str] -> {
 # The resolved whole-program AST plus every module's line table (spans.cf).
 pub data Resolved = { Program prog, [SrcMap] maps }
 
-pub const resolve_program! = (Str entry, Str src, Os target_os, Arch target_arch): Resolved -> {
+pub const resolve_program! = (
+	Str entry,
+	Str src,
+	Os target_os,
+	Arch target_arch,
+	Bool bdebug,
+	Bool binstr,
+): Resolved -> {
 	const Str edir = dir_of!(entry)
-	const Loaded l0 = load_module!(entry, src, "", 0, 0, target_os, target_arch, false)
+	const Loaded l0 = load_module!(entry, src, "", 0, 0, target_os, target_arch, bdebug, binstr, false)
 	const Program root = l0.prog
 	let [SrcMap] maps = [l0.map]
 	# the entry is prefix-empty (its names stay bare — it fixes the naming frame)
@@ -2739,6 +2750,22 @@ pub const resolve_program! = (Str entry, Str src, Os target_os, Arch target_arch
 		Import({ path: "std/rt/floor", names: floor_none, alias: "", wildcard: false, dline: 0, dcol: 0 }),
 	]
 	wsrc = [...wsrc, entry]
+	# `--instrument`: load the observer runtime unconditionally — emit injects calls to
+	# `std::mem::observe::on_reserve` that no source reaches (the sanitizer model)
+	if binstr then {
+		work = [
+			...work,
+			Import({
+				path: "std/mem/observe",
+				names: floor_none,
+				alias: "",
+				wildcard: false,
+				dline: 0,
+				dcol: 0,
+			}),
+		]
+		wsrc = [...wsrc, entry]
+	}
 	let Iarch wi = 0
 
 	loop {
@@ -2782,6 +2809,8 @@ pub const resolve_program! = (Str entry, Str src, Os target_os, Arch target_arch
 					work[wi].dcol,
 					target_os,
 					target_arch,
+					bdebug,
+					binstr,
 					false,
 				)
 				const Program m0 = lw.prog

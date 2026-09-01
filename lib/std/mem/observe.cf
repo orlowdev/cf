@@ -1,0 +1,67 @@
+# std/mem/observe — the instrumented build's observer runtime (the debug arc).
+#
+# The sanitizer model: under `--instrument` the COMPILER injects a call to
+# `on_reserve(node, sz)` after every geometry reserve it emits — the fold-lite
+# construction reserves and the dynamic-growth helpers — so every geometry is
+# observed without carrying instrumentation in its own source. The injection
+# points are the compiler's contract; WHAT instrumentation does is this readable
+# module. Accounting lives in a static side table keyed by the duplex node
+# address (no geometry or header changes); `node(a)` reads a row back:
+# (reservations, bytes reserved). Capacity 64 live arenas; past it the observer
+# traps loudly rather than dropping rows. At runtime only the memory NODE exists —
+# the geometry is a comptime shape — so the query is named for the node it reads.
+import std::mem::raw
+import std::comptime::build
+
+# 64 rows of {node@0, count@8, bytes@16} — 24 bytes each, zeroed BSS.
+static [1536 Uint8] obs_tbl
+
+# The row for `node`, claiming the first empty row on a miss.
+const row_of = (Uarch node): Uarch -> {
+	const Uarch base = raw::load(raw::addr(obs_tbl))
+	let Uarch i = 0
+
+	loop {
+		if i >= 64 then break
+		const Uarch r = base + i * 24
+		const Uarch k = raw::load(r)
+		if k == node then return r
+		if k == 0 then {
+			raw::store(r, node)
+
+			return r
+		}
+		i = i + 1
+	}
+
+	raw::trap()
+
+	return 0
+}
+
+# The compiler-injected observation: one geometry reserve of `sz` bytes on `node`.
+pub const on_reserve = (Uarch node, Uarch sz): () -> {
+	const Uarch r = row_of(node)
+	raw::store(r + 8, raw::load(r + 8) + 1)
+	raw::store(r + 16, raw::load(r + 16) + sz)
+}
+
+if build::instrument then {
+	# (reservations, bytes reserved) observed for the memory node behind the handle
+	pub const node = (Uarch node): (Iarch, Iarch) -> {
+		const Uarch base = raw::load(raw::addr(obs_tbl))
+		let Uarch i = 0
+
+		loop {
+			if i >= 64 then break
+			const Uarch r = base + i * 24
+			if raw::load(r) == node
+				then return (Iarch(raw::load(r + 8)), Iarch(raw::load(r + 16)))
+			i = i + 1
+		}
+
+		return (0, 0)
+	}
+} else {
+	pub const node = (Uarch node): (Iarch, Iarch) -> (0, 0)
+}

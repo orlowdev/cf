@@ -1,0 +1,885 @@
+# inline — the pre-emit inliner (M0: scalar leaf functions, effect-free arguments).
+#
+# QBE has no inliner, so every call to a tiny helper — a per-byte peek, a hex digit
+# map, a flag test — pays the full call protocol: argument moves, the call, the
+# return. This pass splices such callees into their call sites before routing/emit,
+# so QBE's own local passes (copy propagation, ssa, cse) see through the boundary.
+#
+# It runs AFTER the lowerings (mono, materialize, strip, defer, closure lift): the
+# tree holds only concrete functions and plain calls, and whatever it splices is
+# what routing classifies and emit lowers — the passes stay consistent by
+# construction. The original functions are never removed (an address-taken helper
+# keeps working as a value; only its direct call sites are spliced).
+#
+# M0 keeps both sides restricted enough that splicing is PURE SUBSTITUTION — no
+# temps, no renaming, no evaluation-order hazard:
+#
+# A callee is inlinable when its body is a single `return <expr>` whose expression
+# references NOTHING but its own parameters — literals, parameter reads, field and
+# index loads off parameters, arithmetic, comparisons, numeric casts. No calls, no
+# constructions, no `match`, no value blocks, no `&x`. Its name is colorless (a `!`
+# callee's node effects must stay a call), it is not `main`, not asm, not an
+# intrinsic, not a value const, and no parameter is a by-value buffer (`size` 0).
+#
+# A call site is spliced when the call is BARE (no `in <geometry>` — a graft
+# switches the subtree's ambient and must survive to emit). An EFFECT-FREE argument
+# (no calls beyond numeric casts, no constructions, no trapping `Div`/`Mod`)
+# substitutes directly — evaluating it zero, once, or many times is unobservable.
+# An EFFECTFUL argument (M1) binds to a fresh temporary in a VALUE BLOCK wrapping
+# the spliced body — `{ const #iN = <arg>; ... <- <body> }` — so every argument
+# still evaluates exactly once, in call order, unused parameters included; the
+# block path is gated to INTEGER/`Bool` returns (the loop-yield type recovery does
+# not see block-local lets, so an aggregate or float would lose its typing there —
+# those splice only through the pure path). A parameter used as a Field/Index BASE
+# (a name position in the AST) needs a bare name after temp-binding.
+import std::compiler::ast::{ Expr, Stmt, MatchArm, StmtArm, Seg, FieldInit, Param, Func, Program }
+import std::data::str::{ eq }
+
+# The node budget for an inlinable body — generous for a leaf expression; the point
+# is to exclude the occasional page-sized scalar decision tree, not to tune.
+const inl_cap = (): Iarch -> 48
+
+const has_name = ([Str] xs, Str s): Bool -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(xs.len) then break
+		if eq(xs[i], s) then return true
+		i = i + 1
+	}
+
+	return false
+}
+
+const idx_of = ([Str] xs, Str s): Iarch -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(xs.len) then break
+		if eq(xs[i], s) then return i
+		i = i + 1
+	}
+
+	return -1
+}
+
+const is_bang_name = (Str n): Bool -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(n.len) then break
+		if Iarch(n[i]) == 33 then return true
+		i = i + 1
+	}
+
+	return false
+}
+
+# A builtin numeric type name used as a one-argument cast `T(x)` — the same set
+# typecheck's cast rule accepts. A cast is a pure identity/width operation.
+const is_cast_type = (Str name): Bool -> {
+	if eq(name, "Iarch") then return true
+	if eq(name, "Uarch") then return true
+	if eq(name, "Int") then return true
+	if eq(name, "Int8") then return true
+	if eq(name, "Int16") then return true
+	if eq(name, "Int32") then return true
+	if eq(name, "Int64") then return true
+	if eq(name, "Uint8") then return true
+	if eq(name, "Uint16") then return true
+	if eq(name, "Uint32") then return true
+	if eq(name, "Uint64") then return true
+	if eq(name, "Float32") then return true
+	if eq(name, "Float64") then return true
+
+	return false
+}
+
+# ── The inlinable-definition table ─────────────────────────────────────────────────────────────
+
+# One inlinable callee: its name, parameter names in order, the body expression,
+# and the declared return type name (gates the value-block path).
+data InlDef = { Str name, [Str] params, Expr body, Str ret }
+
+# A literal VALUE CONST (`const max_depth = 128`): emit models it as a nullary
+# function and AUTO-CALLS it at every bare reference — a runtime call per constant
+# read. Folding the reference to its literal erases the call; value consts are
+# literals-only (uniformly enforced), so the fold is total for this table.
+data ValDef = { Str name, Expr lit }
+
+# The rewriter's state: the definition tables and the gensym counter for value-block
+# temporaries. Spliced blocks bypass typecheck's shadowing rules and emit's env
+# lookup is first-match, so temp names must be globally unique; `#` cannot begin a
+# source identifier, so `#iN` can never collide with or capture a user local.
+data InlSt = { [InlDef] defs, [ValDef] vals, Iarch gen }
+
+const fresh = (*InlSt st): Str -> {
+	st.gen = st.gen + 1
+
+	return "#i${st.gen}"
+}
+
+# The value-block path handles INTEGER/`Bool` returns only — floats and aggregates
+# keep the pure path (emit's loop-yield scalar/aggregate recovery cannot see the
+# generated block's own lets, so their binding typing would be lost).
+const block_ret_ok = (Str rn): Bool ->
+	if eq(rn, "Float32") || eq(rn, "Float64") then false else is_cast_type(rn) || eq(rn, "Bool")
+
+# Count the nodes of a leaf-inlinable body expression, or -1 when any shape
+# disqualifies it. Every name reference must be a parameter — the body then cannot
+# capture, shadow, or be shadowed by anything at the splice site.
+const leaf_n = ([Str] ps, Expr e): Iarch -> match e {
+	Expr.Lit(_) -> 1,
+	Expr.BoolLit(_) -> 1,
+	Expr.FloatLit(_) -> 1,
+	Expr.StrLit(_) -> 1,
+	Expr.Unit -> 1,
+	Expr.Var(n) -> if has_name(ps, n) then 1 else -1,
+	Expr.Field(b, _) -> if has_name(ps, b) then 1 else -1,
+	Expr.FieldExpr(b, _) -> leaf_add(leaf_n(ps, b), 1),
+	Expr.Index(b, i) -> if has_name(ps, b) then leaf_add(leaf_n(ps, i), 1) else -1,
+	Expr.IndexField(b, i, _) -> if has_name(ps, b) then leaf_add(leaf_n(ps, i), 1) else -1,
+	Expr.IndexExpr(b, i) -> leaf2(ps, b, i),
+	Expr.Neg(x) -> leaf_add(leaf_n(ps, x), 1),
+	Expr.Not(x) -> leaf_add(leaf_n(ps, x), 1),
+	Expr.BitNot(x) -> leaf_add(leaf_n(ps, x), 1),
+	Expr.Add(a, b) -> leaf2(ps, a, b),
+	Expr.Sub(a, b) -> leaf2(ps, a, b),
+	Expr.Mul(a, b) -> leaf2(ps, a, b),
+	Expr.Div(a, b) -> leaf2(ps, a, b),
+	Expr.Mod(a, b) -> leaf2(ps, a, b),
+	Expr.BitAnd(a, b) -> leaf2(ps, a, b),
+	Expr.BitOr(a, b) -> leaf2(ps, a, b),
+	Expr.BitXor(a, b) -> leaf2(ps, a, b),
+	Expr.Shl(a, b) -> leaf2(ps, a, b),
+	Expr.Shr(a, b) -> leaf2(ps, a, b),
+	Expr.CmpEq(a, b) -> leaf2(ps, a, b),
+	Expr.CmpNe(a, b) -> leaf2(ps, a, b),
+	Expr.CmpLt(a, b) -> leaf2(ps, a, b),
+	Expr.CmpGt(a, b) -> leaf2(ps, a, b),
+	Expr.CmpLe(a, b) -> leaf2(ps, a, b),
+	Expr.CmpGe(a, b) -> leaf2(ps, a, b),
+	Expr.And(a, b) -> leaf2(ps, a, b),
+	Expr.Or(a, b) -> leaf2(ps, a, b),
+	Expr.If(c, t, el) -> leaf3(ps, c, t, el),
+	Expr.Call(n, _, args, g) -> if is_cast_type(n) && Iarch(args.len) == 1 && eq(g, "")
+		then leaf_add(leaf_n(ps, args[0]), 1)
+		else -1,
+	_ -> -1,
+}
+
+const leaf_add = (Iarch a, Iarch b): Iarch -> if a < 0 || b < 0 then -1 else a + b
+
+const leaf2 = ([Str] ps, Expr a, Expr b): Iarch ->
+	leaf_add(leaf_n(ps, a), leaf_add(leaf_n(ps, b), 1))
+
+const leaf3 = ([Str] ps, Expr a, Expr b, Expr c): Iarch ->
+	leaf_add(leaf_n(ps, a), leaf_add(leaf_n(ps, b), leaf_add(leaf_n(ps, c), 1)))
+
+const param_names = (Func f): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(f.params.len) then break
+		r = [...r, f.params[i].name]
+		i = i + 1
+	}
+
+	return r
+}
+
+const any_sized_param = (Func f): Bool -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(f.params.len) then break
+		if f.params[i].size != 0 then return true
+		i = i + 1
+	}
+
+	return false
+}
+
+# A guard-fold candidate: `ok` false when the body's shape disqualifies it.
+data GB = { Bool ok, Expr e }
+
+const no_gb = (): GB -> GB({ ok: false, e: Expr.Unit })
+
+# Fold a body of GUARD RETURNS into one nested `if` expression: `if c then return a`
+# ... `return z` is exactly `If(c, a, If(..., z))` — same evaluation order, same
+# short-circuit, and (leaf conditions and results) no effect anywhere. This is the
+# dominant cf helper idiom — a bare single `return` is its one-statement case.
+const guard_fold = ([Stmt] ss): GB -> {
+	const Iarch n = Iarch(ss.len)
+	if n == 0 then return no_gb()
+	let Expr acc = Expr.Unit
+	let Bool ok = false
+
+	match ss[n - 1] {
+		Stmt.Return(e) -> {
+			acc = e
+			ok = true
+		},
+		_ -> {},
+	}
+
+	if !ok then return no_gb()
+
+	let Iarch i = n - 2
+
+	loop {
+		if i < 0 then break
+		let Bool gok = false
+
+		match ss[i] {
+			Stmt.IfThen(c, s2) -> {
+				match s2 {
+					Stmt.Return(e) -> {
+						acc = Expr.If(c, e, acc)
+						gok = true
+					},
+					_ -> {},
+				}
+			},
+			_ -> {},
+		}
+
+		if !gok then return no_gb()
+		i = i - 1
+	}
+
+	return GB({ ok: true, e: acc })
+}
+
+const inl_defs = (Program prog): [InlDef] -> {
+	let [InlDef] defs = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(prog.funcs.len) then break
+		const Func f = prog.funcs[i]
+		if !f.is_asm &&
+			!f.is_value &&
+			!f.is_intrinsic &&
+			!is_bang_name(f.name) &&
+			!eq(f.name, "main") &&
+			Iarch(f.typarams.len) == 0 &&
+			!any_sized_param(f) then {
+			const GB gb = guard_fold(f.body)
+			if gb.ok then {
+				const [Str] ps = param_names(f)
+				const Iarch n = leaf_n(ps, gb.e)
+				if n >= 0 && n <= inl_cap()
+					then defs = [...defs, InlDef({ name: f.name, params: ps, body: gb.e, ret: f.ret_name })]
+			}
+		}
+		i = i + 1
+	}
+
+	return defs
+}
+
+const is_literal = (Expr e): Bool -> match e {
+	Expr.Lit(_) -> true,
+	Expr.BoolLit(_) -> true,
+	Expr.FloatLit(_) -> true,
+	Expr.StrLit(_) -> true,
+	_ -> false,
+}
+
+const inl_vals = (Program prog): [ValDef] -> {
+	let [ValDef] vals = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(prog.funcs.len) then break
+		const Func f = prog.funcs[i]
+		if f.is_value && !f.is_asm && Iarch(f.body.len) == 1 then {
+			match f.body[0] {
+				Stmt.Return(e) -> {
+					if is_literal(e) then vals = [...vals, ValDef({ name: f.name, lit: e })]
+				},
+				_ -> {},
+			}
+		}
+		i = i + 1
+	}
+
+	return vals
+}
+
+# Fold a bare reference to a literal value const — unless a LOCAL binder of the
+# same name is in scope (value-const names survive the flatten un-mangled, so a
+# like-named local shadows the const; the threaded scope decides).
+const fold_val = (*InlSt st, [Str] scope, Str n, Expr orig): Expr -> {
+	if has_name(scope, n) then return orig
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(st.vals.len) then break
+		if eq(st.vals[i].name, n) then return st.vals[i].lit
+		i = i + 1
+	}
+
+	return orig
+}
+
+const find_def = ([InlDef] defs, Str name): Iarch -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(defs.len) then break
+		if eq(defs[i].name, name) then return i
+		i = i + 1
+	}
+
+	return -1
+}
+
+# ── Call-site checks ───────────────────────────────────────────────────────────────────────────
+
+# Effect-free: evaluating `e` zero, one, or many times — in any order — is
+# indistinguishable from evaluating it once in place. Loads and arithmetic qualify;
+# calls, constructions, and trapping `Div`/`Mod` do not.
+const pure_e = (Expr e): Bool -> match e {
+	Expr.Lit(_) -> true,
+	Expr.BoolLit(_) -> true,
+	Expr.FloatLit(_) -> true,
+	Expr.StrLit(_) -> true,
+	Expr.Unit -> true,
+	Expr.Var(_) -> true,
+	Expr.Field(_, _) -> true,
+	Expr.FieldExpr(b, _) -> pure_e(b),
+	Expr.Index(_, i) -> pure_e(i),
+	Expr.IndexField(_, i, _) -> pure_e(i),
+	Expr.IndexExpr(b, i) -> pure_e(b) && pure_e(i),
+	Expr.Neg(x) -> pure_e(x),
+	Expr.Not(x) -> pure_e(x),
+	Expr.BitNot(x) -> pure_e(x),
+	Expr.Add(a, b) -> pure_e(a) && pure_e(b),
+	Expr.Sub(a, b) -> pure_e(a) && pure_e(b),
+	Expr.Mul(a, b) -> pure_e(a) && pure_e(b),
+	Expr.BitAnd(a, b) -> pure_e(a) && pure_e(b),
+	Expr.BitOr(a, b) -> pure_e(a) && pure_e(b),
+	Expr.BitXor(a, b) -> pure_e(a) && pure_e(b),
+	Expr.Shl(a, b) -> pure_e(a) && pure_e(b),
+	Expr.Shr(a, b) -> pure_e(a) && pure_e(b),
+	Expr.CmpEq(a, b) -> pure_e(a) && pure_e(b),
+	Expr.CmpNe(a, b) -> pure_e(a) && pure_e(b),
+	Expr.CmpLt(a, b) -> pure_e(a) && pure_e(b),
+	Expr.CmpGt(a, b) -> pure_e(a) && pure_e(b),
+	Expr.CmpLe(a, b) -> pure_e(a) && pure_e(b),
+	Expr.CmpGe(a, b) -> pure_e(a) && pure_e(b),
+	Expr.And(a, b) -> pure_e(a) && pure_e(b),
+	Expr.Or(a, b) -> pure_e(a) && pure_e(b),
+	Expr.If(c, t, el) -> pure_e(c) && pure_e(t) && pure_e(el),
+	Expr.Call(n, _, args, g) ->
+		is_cast_type(n) && Iarch(args.len) == 1 && eq(g, "") && pure_e(args[0]),
+	_ -> false,
+}
+
+const all_pure = ([Expr] es): Bool -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(es.len) then break
+		if !pure_e(es[i]) then return false
+		i = i + 1
+	}
+
+	return true
+}
+
+# Does `e` CONSTRUCT anywhere within? Conservative: every construction form counts
+# (boxed or not), a value block counts wholesale, and so does any shape this walk
+# does not enumerate — only shapes provably construction-free return false.
+const constructing = (Expr e): Bool -> match e {
+	Expr.Lit(_) -> false,
+	Expr.BoolLit(_) -> false,
+	Expr.FloatLit(_) -> false,
+	Expr.StrLit(_) -> false,
+	Expr.Unit -> false,
+	Expr.Var(_) -> false,
+	Expr.Addr(_) -> false,
+	Expr.Field(_, _) -> false,
+	Expr.FieldExpr(b, _) -> constructing(b),
+	Expr.Index(_, i) -> constructing(i),
+	Expr.IndexField(_, i, _) -> constructing(i),
+	Expr.IndexExpr(b, i) -> constructing(b) || constructing(i),
+	Expr.Neg(x) -> constructing(x),
+	Expr.Not(x) -> constructing(x),
+	Expr.BitNot(x) -> constructing(x),
+	Expr.Add(a, b) -> constructing(a) || constructing(b),
+	Expr.Sub(a, b) -> constructing(a) || constructing(b),
+	Expr.Mul(a, b) -> constructing(a) || constructing(b),
+	Expr.Div(a, b) -> constructing(a) || constructing(b),
+	Expr.Mod(a, b) -> constructing(a) || constructing(b),
+	Expr.BitAnd(a, b) -> constructing(a) || constructing(b),
+	Expr.BitOr(a, b) -> constructing(a) || constructing(b),
+	Expr.BitXor(a, b) -> constructing(a) || constructing(b),
+	Expr.Shl(a, b) -> constructing(a) || constructing(b),
+	Expr.Shr(a, b) -> constructing(a) || constructing(b),
+	Expr.CmpEq(a, b) -> constructing(a) || constructing(b),
+	Expr.CmpNe(a, b) -> constructing(a) || constructing(b),
+	Expr.CmpLt(a, b) -> constructing(a) || constructing(b),
+	Expr.CmpGt(a, b) -> constructing(a) || constructing(b),
+	Expr.CmpLe(a, b) -> constructing(a) || constructing(b),
+	Expr.CmpGe(a, b) -> constructing(a) || constructing(b),
+	Expr.And(a, b) -> constructing(a) || constructing(b),
+	Expr.Or(a, b) -> constructing(a) || constructing(b),
+	Expr.If(c, t, el) -> constructing(c) || constructing(t) || constructing(el),
+	Expr.Call(_, _, args, _) -> any_constructing(args),
+	_ -> true,
+}
+
+const any_constructing = ([Expr] es): Bool -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(es.len) then break
+		if constructing(es[i]) then return true
+		i = i + 1
+	}
+
+	return false
+}
+
+# A parameter used as a Field/Index BASE occupies a NAME position — its argument
+# must be a bare name to substitute name-for-name.
+const name_ok = ([Str] ps, [Expr] args, Str b): Bool -> {
+	const Iarch i = idx_of(ps, b)
+	if i < 0 then return true
+
+	return match args[i] { Expr.Var(_) -> true, _ -> false }
+}
+
+const can_sub = ([Str] ps, [Expr] args, Expr e): Bool -> match e {
+	Expr.Field(b, _) -> name_ok(ps, args, b),
+	Expr.Index(b, i) -> name_ok(ps, args, b) && can_sub(ps, args, i),
+	Expr.IndexField(b, i, _) -> name_ok(ps, args, b) && can_sub(ps, args, i),
+	Expr.FieldExpr(b, _) -> can_sub(ps, args, b),
+	Expr.IndexExpr(b, i) -> can_sub(ps, args, b) && can_sub(ps, args, i),
+	Expr.Neg(x) -> can_sub(ps, args, x),
+	Expr.Not(x) -> can_sub(ps, args, x),
+	Expr.BitNot(x) -> can_sub(ps, args, x),
+	Expr.Add(a, b) -> can_sub(ps, args, a) && can_sub(ps, args, b),
+	Expr.Sub(a, b) -> can_sub(ps, args, a) && can_sub(ps, args, b),
+	Expr.Mul(a, b) -> can_sub(ps, args, a) && can_sub(ps, args, b),
+	Expr.Div(a, b) -> can_sub(ps, args, a) && can_sub(ps, args, b),
+	Expr.Mod(a, b) -> can_sub(ps, args, a) && can_sub(ps, args, b),
+	Expr.BitAnd(a, b) -> can_sub(ps, args, a) && can_sub(ps, args, b),
+	Expr.BitOr(a, b) -> can_sub(ps, args, a) && can_sub(ps, args, b),
+	Expr.BitXor(a, b) -> can_sub(ps, args, a) && can_sub(ps, args, b),
+	Expr.Shl(a, b) -> can_sub(ps, args, a) && can_sub(ps, args, b),
+	Expr.Shr(a, b) -> can_sub(ps, args, a) && can_sub(ps, args, b),
+	Expr.CmpEq(a, b) -> can_sub(ps, args, a) && can_sub(ps, args, b),
+	Expr.CmpNe(a, b) -> can_sub(ps, args, a) && can_sub(ps, args, b),
+	Expr.CmpLt(a, b) -> can_sub(ps, args, a) && can_sub(ps, args, b),
+	Expr.CmpGt(a, b) -> can_sub(ps, args, a) && can_sub(ps, args, b),
+	Expr.CmpLe(a, b) -> can_sub(ps, args, a) && can_sub(ps, args, b),
+	Expr.CmpGe(a, b) -> can_sub(ps, args, a) && can_sub(ps, args, b),
+	Expr.And(a, b) -> can_sub(ps, args, a) && can_sub(ps, args, b),
+	Expr.Or(a, b) -> can_sub(ps, args, a) && can_sub(ps, args, b),
+	Expr.If(c, t, el) ->
+		can_sub(ps, args, c) && can_sub(ps, args, t) && can_sub(ps, args, el),
+	Expr.Call(_, _, args2, _) -> if Iarch(args2.len) == 1 then can_sub(ps, args, args2[0]) else true,
+	_ -> true,
+}
+
+# ── Substitution ───────────────────────────────────────────────────────────────────────────────
+
+const sub_var = ([Str] ps, [Expr] args, Str n, Expr orig): Expr -> {
+	const Iarch i = idx_of(ps, n)
+	if i >= 0 then return args[i]
+
+	return orig
+}
+
+# A name-position base: a parameter becomes its bare-name argument (`can_sub`
+# guaranteed the shape), anything else stays.
+const sub_base = ([Str] ps, [Expr] args, Str b): Str -> {
+	const Iarch i = idx_of(ps, b)
+	if i < 0 then return b
+
+	return match args[i] { Expr.Var(v) -> v, _ -> b }
+}
+
+const sub_e = ([Str] ps, [Expr] args, Expr e): Expr -> match e {
+	Expr.Var(n) -> sub_var(ps, args, n, e),
+	Expr.Field(b, f) -> Expr.Field(sub_base(ps, args, b), f),
+	Expr.FieldExpr(b, f) -> Expr.FieldExpr(sub_e(ps, args, b), f),
+	Expr.Index(b, i) -> Expr.Index(sub_base(ps, args, b), sub_e(ps, args, i)),
+	Expr.IndexField(b, i, f) -> Expr.IndexField(sub_base(ps, args, b), sub_e(ps, args, i), f),
+	Expr.IndexExpr(b, i) -> Expr.IndexExpr(sub_e(ps, args, b), sub_e(ps, args, i)),
+	Expr.Neg(x) -> Expr.Neg(sub_e(ps, args, x)),
+	Expr.Not(x) -> Expr.Not(sub_e(ps, args, x)),
+	Expr.BitNot(x) -> Expr.BitNot(sub_e(ps, args, x)),
+	Expr.Add(a, b) -> Expr.Add(sub_e(ps, args, a), sub_e(ps, args, b)),
+	Expr.Sub(a, b) -> Expr.Sub(sub_e(ps, args, a), sub_e(ps, args, b)),
+	Expr.Mul(a, b) -> Expr.Mul(sub_e(ps, args, a), sub_e(ps, args, b)),
+	Expr.Div(a, b) -> Expr.Div(sub_e(ps, args, a), sub_e(ps, args, b)),
+	Expr.Mod(a, b) -> Expr.Mod(sub_e(ps, args, a), sub_e(ps, args, b)),
+	Expr.BitAnd(a, b) -> Expr.BitAnd(sub_e(ps, args, a), sub_e(ps, args, b)),
+	Expr.BitOr(a, b) -> Expr.BitOr(sub_e(ps, args, a), sub_e(ps, args, b)),
+	Expr.BitXor(a, b) -> Expr.BitXor(sub_e(ps, args, a), sub_e(ps, args, b)),
+	Expr.Shl(a, b) -> Expr.Shl(sub_e(ps, args, a), sub_e(ps, args, b)),
+	Expr.Shr(a, b) -> Expr.Shr(sub_e(ps, args, a), sub_e(ps, args, b)),
+	Expr.CmpEq(a, b) -> Expr.CmpEq(sub_e(ps, args, a), sub_e(ps, args, b)),
+	Expr.CmpNe(a, b) -> Expr.CmpNe(sub_e(ps, args, a), sub_e(ps, args, b)),
+	Expr.CmpLt(a, b) -> Expr.CmpLt(sub_e(ps, args, a), sub_e(ps, args, b)),
+	Expr.CmpGt(a, b) -> Expr.CmpGt(sub_e(ps, args, a), sub_e(ps, args, b)),
+	Expr.CmpLe(a, b) -> Expr.CmpLe(sub_e(ps, args, a), sub_e(ps, args, b)),
+	Expr.CmpGe(a, b) -> Expr.CmpGe(sub_e(ps, args, a), sub_e(ps, args, b)),
+	Expr.And(a, b) -> Expr.And(sub_e(ps, args, a), sub_e(ps, args, b)),
+	Expr.Or(a, b) -> Expr.Or(sub_e(ps, args, a), sub_e(ps, args, b)),
+	Expr.If(c, t, el) ->
+		Expr.If(sub_e(ps, args, c), sub_e(ps, args, t), sub_e(ps, args, el)),
+	Expr.Call(n, ta, args2, g) -> Expr.Call(n, ta, sub_list(ps, args, args2), g),
+	_ -> e,
+}
+
+const sub_list = ([Str] ps, [Expr] args, [Expr] es): [Expr] -> {
+	let [Expr] r = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(es.len) then break
+		r = [...r, sub_e(ps, args, es[i])]
+		i = i + 1
+	}
+
+	return r
+}
+
+# ── The rewriter ───────────────────────────────────────────────────────────────────────────────
+
+# Splice an inlinable callee into a rewritten call, or keep the call. The spliced
+# body is leaf (no non-cast calls), so it never needs a second pass.
+const try_inline! = (*InlSt st, Str name, [Str] ta, [Expr] args, Str g): Expr -> {
+	const Expr keep = Expr.Call(name, ta, args, g)
+	if !eq(g, "") then return keep
+	const [InlDef] defs = st.defs
+	const Iarch di = find_def(defs, name)
+	if di < 0 then return keep
+	if Iarch(args.len) != Iarch(defs[di].params.len) then return keep
+
+	if all_pure(args) then {
+		if !can_sub(defs[di].params, args, defs[di].body) then return keep
+
+		return sub_e(defs[di].params, args, defs[di].body)
+	}
+
+	# M1: an effectful argument binds to a fresh temp; pure ones substitute directly
+	# (they are order-insensitive by definition, so evaluating them inside the body —
+	# after the effectful bindings — is unobservable). A CONSTRUCTING argument keeps
+	# the call: a construction in argument position has routing semantics of its own
+	# (the scalar-projection exemption classifies it off the callee's summary row —
+	# corpus 1357), and rebinding it to a block local would reclassify it.
+	if !block_ret_ok(defs[di].ret) then return keep
+	if any_constructing(args) then return keep
+	let [Stmt] lets = []
+	let [Expr] fargs = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(args.len) then break
+		if pure_e(args[i]) then fargs = [...fargs, args[i]] else {
+			const Str tn = fresh(st)
+			lets = [...lets, Stmt.Let(tn, false, "", args[i])]
+			fargs = [...fargs, Expr.Var(tn)]
+		}
+		i = i + 1
+	}
+
+	if !can_sub(defs[di].params, fargs, defs[di].body) then return keep
+	const Expr yv = sub_e(defs[di].params, fargs, defs[di].body)
+
+	return Expr.Loop([...lets, Stmt.Yield(yv)])
+}
+
+const rw_expr! = (*InlSt st, [Str] scope, Expr e): Expr -> match e {
+	Expr.Record(n, inits) -> Expr.Record(n, rw_fields!(st, scope, inits)),
+	Expr.FieldExpr(b, f) -> Expr.FieldExpr(rw_expr!(st, scope, b), f),
+	Expr.UnionMk(u, m, args) -> Expr.UnionMk(u, m, rw_list!(st, scope, args)),
+	Expr.Match(s, arms) -> Expr.Match(rw_expr!(st, scope, s), rw_arms!(st, scope, arms)),
+	Expr.ArrayLit(hs, sp, elems, en) ->
+		Expr.ArrayLit(hs, rw_expr!(st, scope, sp), rw_list!(st, scope, elems), en),
+	Expr.Index(b, i) -> Expr.Index(b, rw_expr!(st, scope, i)),
+	Expr.IndexField(b, i, f) -> Expr.IndexField(b, rw_expr!(st, scope, i), f),
+	Expr.IndexExpr(b, i) -> Expr.IndexExpr(rw_expr!(st, scope, b), rw_expr!(st, scope, i)),
+	Expr.Interp(segs) -> Expr.Interp(rw_segs!(st, scope, segs)),
+	Expr.Tuple(elems) -> Expr.Tuple(rw_list!(st, scope, elems)),
+	Expr.Spread(x) -> Expr.Spread(rw_expr!(st, scope, x)),
+	Expr.Loop(ss) -> Expr.Loop(rw_body!(st, scope, ss)),
+	Expr.Buffer(sz) -> Expr.Buffer(rw_expr!(st, scope, sz)),
+	Expr.Neg(x) -> Expr.Neg(rw_expr!(st, scope, x)),
+	Expr.Not(x) -> Expr.Not(rw_expr!(st, scope, x)),
+	Expr.BitNot(x) -> Expr.BitNot(rw_expr!(st, scope, x)),
+	Expr.Add(a, b) -> Expr.Add(rw_expr!(st, scope, a), rw_expr!(st, scope, b)),
+	Expr.Sub(a, b) -> Expr.Sub(rw_expr!(st, scope, a), rw_expr!(st, scope, b)),
+	Expr.Mul(a, b) -> Expr.Mul(rw_expr!(st, scope, a), rw_expr!(st, scope, b)),
+	Expr.Div(a, b) -> Expr.Div(rw_expr!(st, scope, a), rw_expr!(st, scope, b)),
+	Expr.Mod(a, b) -> Expr.Mod(rw_expr!(st, scope, a), rw_expr!(st, scope, b)),
+	Expr.BitAnd(a, b) -> Expr.BitAnd(rw_expr!(st, scope, a), rw_expr!(st, scope, b)),
+	Expr.BitOr(a, b) -> Expr.BitOr(rw_expr!(st, scope, a), rw_expr!(st, scope, b)),
+	Expr.BitXor(a, b) -> Expr.BitXor(rw_expr!(st, scope, a), rw_expr!(st, scope, b)),
+	Expr.Shl(a, b) -> Expr.Shl(rw_expr!(st, scope, a), rw_expr!(st, scope, b)),
+	Expr.Shr(a, b) -> Expr.Shr(rw_expr!(st, scope, a), rw_expr!(st, scope, b)),
+	Expr.CmpEq(a, b) -> Expr.CmpEq(rw_expr!(st, scope, a), rw_expr!(st, scope, b)),
+	Expr.CmpNe(a, b) -> Expr.CmpNe(rw_expr!(st, scope, a), rw_expr!(st, scope, b)),
+	Expr.CmpLt(a, b) -> Expr.CmpLt(rw_expr!(st, scope, a), rw_expr!(st, scope, b)),
+	Expr.CmpGt(a, b) -> Expr.CmpGt(rw_expr!(st, scope, a), rw_expr!(st, scope, b)),
+	Expr.CmpLe(a, b) -> Expr.CmpLe(rw_expr!(st, scope, a), rw_expr!(st, scope, b)),
+	Expr.CmpGe(a, b) -> Expr.CmpGe(rw_expr!(st, scope, a), rw_expr!(st, scope, b)),
+	Expr.And(a, b) -> Expr.And(rw_expr!(st, scope, a), rw_expr!(st, scope, b)),
+	Expr.Or(a, b) -> Expr.Or(rw_expr!(st, scope, a), rw_expr!(st, scope, b)),
+	Expr.If(c, t, el) ->
+		Expr.If(rw_expr!(st, scope, c), rw_expr!(st, scope, t), rw_expr!(st, scope, el)),
+	Expr.Call(n, ta, args, g) -> try_inline!(st, n, ta, rw_list!(st, scope, args), g),
+	Expr.DeferTap(n, args) -> Expr.DeferTap(n, rw_list!(st, scope, args)),
+	Expr.At(o, inner) -> rw_expr!(st, scope, inner),
+	Expr.Var(n) -> fold_val(st, scope, n, e),
+	_ -> e,
+}
+
+const rw_list! = (*InlSt st, [Str] scope, [Expr] es): [Expr] -> {
+	let [Expr] r = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(es.len) then break
+		r = [...r, rw_expr!(st, scope, es[i])]
+		i = i + 1
+	}
+
+	return r
+}
+
+const rw_fields! = (*InlSt st, [Str] scope, [FieldInit] fs): [FieldInit] -> {
+	let [FieldInit] r = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(fs.len) then break
+		r = [...r, FieldInit({ field: fs[i].field, value: rw_expr!(st, scope, fs[i].value) })]
+		i = i + 1
+	}
+
+	return r
+}
+
+const rw_segs! = (*InlSt st, [Str] scope, [Seg] segs): [Seg] -> {
+	let [Seg] r = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(segs.len) then break
+		r = [
+			...r,
+			Seg({
+				is_hole: segs[i].is_hole,
+				lit: segs[i].lit,
+				name: segs[i].name,
+				expr: if segs[i].is_hole then rw_expr!(st, scope, segs[i].expr) else segs[i].expr,
+			}),
+		]
+		i = i + 1
+	}
+
+	return r
+}
+
+const rw_arms! = (*InlSt st, [Str] scope, [MatchArm] arms): [MatchArm] -> {
+	let [MatchArm] r = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(arms.len) then break
+		r = [
+			...r,
+			MatchArm({
+				is_wild: arms[i].is_wild,
+				type_name: arms[i].type_name,
+				members: arms[i].members,
+				binds: arms[i].binds,
+				body: rw_expr!(st, cat_s(scope, arms[i].binds), arms[i].body),
+			}),
+		]
+		i = i + 1
+	}
+
+	return r
+}
+
+const rw_stmtarms! = (*InlSt st, [Str] scope, [StmtArm] arms): [StmtArm] -> {
+	let [StmtArm] r = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(arms.len) then break
+		r = [
+			...r,
+			StmtArm({
+				is_wild: arms[i].is_wild,
+				type_name: arms[i].type_name,
+				members: arms[i].members,
+				binds: arms[i].binds,
+				body: rw_body!(st, cat_s(scope, arms[i].binds), arms[i].body),
+			}),
+		]
+		i = i + 1
+	}
+
+	return r
+}
+
+const rw_stmt! = (*InlSt st, [Str] scope, Stmt s): Stmt -> match s {
+	Stmt.Let(n, m, ann, init) -> Stmt.Let(n, m, ann, rw_expr!(st, scope, init)),
+	Stmt.Assign(n, v) -> Stmt.Assign(n, rw_expr!(st, scope, v)),
+	Stmt.FieldAssign(b, f, v) -> Stmt.FieldAssign(b, f, rw_expr!(st, scope, v)),
+	Stmt.DeepFieldAssign(be, f, v) ->
+		Stmt.DeepFieldAssign(rw_expr!(st, scope, be), f, rw_expr!(st, scope, v)),
+	Stmt.IndexAssign(b, i, v) -> Stmt.IndexAssign(b, rw_expr!(st, scope, i), rw_expr!(st, scope, v)),
+	Stmt.Return(e) -> Stmt.Return(rw_expr!(st, scope, e)),
+	Stmt.ForIn(lv, iv, ss) ->
+		Stmt.ForIn(lv, iv, rw_body!(st, cat_s(scope, two_s(lv, iv)), ss)),
+	Stmt.Loop(lb, ss) -> Stmt.Loop(lb, rw_body!(st, scope, ss)),
+	Stmt.IfThen(c, s2) -> Stmt.IfThen(rw_expr!(st, scope, c), rw_stmt!(st, scope, s2)),
+	Stmt.IfElse(c, t, el) ->
+		Stmt.IfElse(rw_expr!(st, scope, c), rw_stmt!(st, scope, t), rw_stmt!(st, scope, el)),
+	Stmt.Do(e) -> Stmt.Do(rw_expr!(st, scope, e)),
+	Stmt.Block(ss) -> Stmt.Block(rw_body!(st, scope, ss)),
+	Stmt.Match(sc, arms) -> Stmt.Match(rw_expr!(st, scope, sc), rw_stmtarms!(st, scope, arms)),
+	Stmt.Destructure(ns, m, e) -> Stmt.Destructure(ns, m, rw_expr!(st, scope, e)),
+	Stmt.Yield(e) -> Stmt.Yield(rw_expr!(st, scope, e)),
+	Stmt.Closure(n, cps, rn, cbody) ->
+		Stmt.Closure(n, cps, rn, rw_body!(st, cat_s(scope, plist_names(cps)), cbody)),
+	Stmt.Defer(ss) -> Stmt.Defer(rw_body!(st, scope, ss)),
+	_ -> s,
+}
+
+# The walk accumulates binders in statement order (a `let` scopes from its own
+# statement onward; its initializer still sees the OUTER scope), so a like-named
+# local below shadows a value const only below.
+const rw_body! = (*InlSt st, [Str] scope, [Stmt] ss): [Stmt] -> {
+	let [Str] sc = cat_s(scope, no_strs())
+	let [Stmt] r = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(ss.len) then break
+		r = [...r, rw_stmt!(st, sc, ss[i])]
+
+		match ss[i] {
+			Stmt.Let(n, _, _, _) -> {
+				sc = [...sc, n]
+			},
+			Stmt.Destructure(ns, _, _) -> {
+				sc = cat_s(sc, ns)
+			},
+			Stmt.Closure(n, _, _, _) -> {
+				sc = [...sc, n]
+			},
+			_ -> {},
+		}
+
+		i = i + 1
+	}
+
+	return r
+}
+
+const no_strs = (): [Str] -> {
+	let [Str] e = []
+
+	return e
+}
+
+const two_s = (Str a, Str b): [Str] -> {
+	let [Str] r = [a]
+
+	return [...r, b]
+}
+
+const cat_s = ([Str] a, [Str] b): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(a.len) then break
+		r = [...r, a[i]]
+		i = i + 1
+	}
+
+	let Iarch j = 0
+
+	loop {
+		if j >= Iarch(b.len) then break
+		r = [...r, b[j]]
+		j = j + 1
+	}
+
+	return r
+}
+
+const plist_names = ([Param] ps): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(ps.len) then break
+		r = [...r, ps[i].name]
+		i = i + 1
+	}
+
+	return r
+}
+
+const rw_func! = (*InlSt st, Func f): Func -> Func({
+	name: f.name,
+	is_pub: f.is_pub,
+	ret_name: f.ret_name,
+	ret_elem: f.ret_elem,
+	params: f.params,
+	body: rw_body!(st, param_names(f), f.body),
+	is_asm: f.is_asm,
+	asm_body: f.asm_body,
+	is_value: f.is_value,
+	ret_telems: f.ret_telems,
+	typarams: f.typarams,
+	tbounds: f.tbounds,
+	ret_size: f.ret_size,
+	is_intrinsic: f.is_intrinsic,
+	asm_sym: f.asm_sym,
+	dfile: f.dfile,
+	dline: f.dline,
+	dcol: f.dcol,
+})
+
+# Inline every qualifying call site. Function count, order, and names are
+# untouched — emit's index-based linkage and the materialize tables stay valid.
+pub const inline_program! = (Program prog): Program -> {
+	const [InlDef] defs = inl_defs(prog)
+	const [ValDef] vals = inl_vals(prog)
+	if Iarch(defs.len) == 0 && Iarch(vals.len) == 0 then return prog
+
+	let InlSt stv = InlSt({ defs: defs, vals: vals, gen: 0 })
+	let [Func] funcs = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(prog.funcs.len) then break
+		const Func f = prog.funcs[i]
+		if f.is_asm then funcs = [...funcs, f] else funcs = [...funcs, rw_func!(&stv, f)]
+		i = i + 1
+	}
+
+	return Program({
+		imports: prog.imports,
+		recs: prog.recs,
+		unions: prog.unions,
+		funcs: funcs,
+		groups: prog.groups,
+	})
+}

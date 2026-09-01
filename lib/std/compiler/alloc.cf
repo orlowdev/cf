@@ -37,7 +37,7 @@ import std::compiler::ast::{
 import std::data::str::{ eq }
 import std::io::console::{ die }
 import std::compiler::diag::{ Diag }
-import std::compiler::spans::{ unat }
+import std::compiler::spans::{ unat, line_col_of, SrcMap, LC }
 
 # A name carries the allocation marker iff it contains a `!` (byte 33). The marker rides directly
 # after the base name in the source (`alloc!`); monomorphization then appends an instance suffix
@@ -958,11 +958,276 @@ const compute_bang! = (Program prog): [Bool] -> {
 	return bang
 }
 
+# ── Evidence probes ────────────────────────────────────────────────────────────────────────────
+# When a gate rejection fires, walk the body once more to find the STATEMENT that introduced the
+# color and anchor the report at its top expression's `At` span (the gates run pre-strip, so the
+# spans are still in the tree). Every descent decision REUSES the bool scanners above — the
+# probes add no analysis of their own, so they cannot drift from the enforcement; a probe that
+# finds no span (-1) leaves the report on the declaration stamp.
+
+const at_off = (Expr e): Iarch -> match e { Expr.At(o, _) -> o, _ -> -1 }
+
+# The first span among a statement's own expressions — the statement's source anchor.
+const stmt_off = (Stmt s): Iarch -> {
+	const [Expr] es = stmt_exprs(s)
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(es.len) then break
+		if at_off(es[i]) >= 0 then return at_off(es[i])
+		i = i + 1
+	}
+
+	return -1
+}
+
+# The anchor of the first trapping statement in `ss` (or -1), guided by `stmt_traps!`.
+const why_body! = (ACtx cx, Bool yesc, [Stmt] ss): Iarch -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(ss.len) then break
+		if stmt_traps!(cx, yesc, ss[i]) then return why_stmt!(cx, yesc, ss[i])
+		i = i + 1
+	}
+
+	return -1
+}
+
+const why_arms! = (ACtx cx, Bool yesc, [StmtArm] arms): Iarch -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(arms.len) then break
+		if body_traps!(cx, yesc, arms[i].body) then return why_body!(cx, yesc, arms[i].body)
+		i = i + 1
+	}
+
+	return -1
+}
+
+# The span of the first trapped construction within `e`, itself in a NON-escaping position —
+# the position mirror of `scan_trapped!`.
+const wt_expr! = (ACtx cx, Expr e): Iarch -> {
+	if is_construction(cx, e) then return at_off(e)
+
+	return match unat(e) {
+		Expr.Loop(ss) -> why_body!(cx, false, ss),
+		_ -> wt_list!(cx, expr_children(e)),
+	}
+}
+
+const wt_list! = (ACtx cx, [Expr] es): Iarch -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(es.len) then break
+		if scan_trapped!(cx, es[i]) then return wt_expr!(cx, es[i])
+		i = i + 1
+	}
+
+	return -1
+}
+
+# The span of the first trapped construction within `e` in an ESCAPING position — the position
+# mirror of `scan_escaping!` (the construction itself escapes; residue hides in arguments,
+# read bases, and conditions).
+const we_expr! = (ACtx cx, Expr e): Iarch -> match unat(e) {
+	Expr.Record(_, inits) -> we_list!(cx, field_values(inits)),
+	Expr.ArrayLit(_, sp, elems, _) -> if scan_trapped!(cx, sp)
+		then wt_expr!(cx, sp)
+		else we_list!(cx, elems),
+	Expr.Tuple(elems) -> we_list!(cx, elems),
+	Expr.UnionMk(_, _, args) -> we_list!(cx, args),
+	Expr.Buffer(sz) -> wt_expr!(cx, sz),
+	Expr.Interp(segs) -> wt_list!(cx, hole_exprs(segs)),
+	Expr.If(c, t, el) -> if scan_trapped!(cx, c)
+		then wt_expr!(cx, c)
+		else if scan_escaping!(cx, t) then we_expr!(cx, t) else we_expr!(cx, el),
+	Expr.Match(s, arms) -> if scan_trapped!(cx, s) then wt_expr!(cx, s) else we_arms!(cx, arms),
+	Expr.Loop(ss) -> why_body!(cx, true, ss),
+	Expr.Call(_, _, args, _) -> wt_list!(cx, args),
+	_ -> wt_expr!(cx, e),
+}
+
+const we_list! = (ACtx cx, [Expr] es): Iarch -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(es.len) then break
+		if scan_escaping!(cx, es[i]) then return we_expr!(cx, es[i])
+		i = i + 1
+	}
+
+	return -1
+}
+
+const we_arms! = (ACtx cx, [MatchArm] arms): Iarch -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(arms.len) then break
+		if scan_escaping!(cx, arms[i].body) then return we_expr!(cx, arms[i].body)
+		i = i + 1
+	}
+
+	return -1
+}
+
+# Descend to the trapped construction, mirroring `stmt_traps!`'s positions arm for arm; when
+# the mirror finds no span the statement's own anchor stands in. `$`-stack initializers keep
+# the statement anchor (their stack-mode scan has no position mirror; the whole init is the
+# offender).
+const why_stmt! = (ACtx cx, Bool yesc, Stmt s): Iarch -> {
+	const Iarch deep = match s {
+		Stmt.Return(e) -> we_expr!(cx, e),
+		Stmt.Yield(e) -> if yesc then we_expr!(cx, e) else wt_expr!(cx, e),
+		Stmt.Let(name, _, _, init) -> if has_name(cx.esc, name)
+			then we_expr!(cx, init)
+			else if is_stack_name(name) then at_off(init) else wt_expr!(cx, init),
+		Stmt.Assign(name, val) -> if target_escapes(cx, name)
+			then we_expr!(cx, val)
+			else wt_expr!(cx, val),
+		Stmt.FieldAssign(base, _, val) -> if target_escapes(cx, base)
+			then we_expr!(cx, val)
+			else wt_expr!(cx, val),
+		Stmt.DeepFieldAssign(be, _, val) -> if scan_trapped!(cx, be)
+			then wt_expr!(cx, be)
+			else if target_escapes(cx, deep_root(be)) then we_expr!(cx, val) else wt_expr!(cx, val),
+		Stmt.IndexAssign(base, idx, val) -> if scan_trapped!(cx, idx)
+			then wt_expr!(cx, idx)
+			else if target_escapes(cx, base) then we_expr!(cx, val) else wt_expr!(cx, val),
+		Stmt.Do(e) -> wt_expr!(cx, e),
+		Stmt.IfThen(c, s2) -> if scan_trapped!(cx, c)
+			then wt_expr!(cx, c)
+			else why_stmt!(cx, yesc, s2),
+		Stmt.IfElse(c, t, el) -> if scan_trapped!(cx, c)
+			then wt_expr!(cx, c)
+			else if stmt_traps!(cx, yesc, t) then why_stmt!(cx, yesc, t) else why_stmt!(cx, yesc, el),
+		Stmt.Block(ss) -> why_body!(cx, yesc, ss),
+		Stmt.Loop(ll_, ss) -> why_body!(cx, yesc, ss),
+		Stmt.ForIn(_, _, ss) -> why_body!(cx, yesc, ss),
+		Stmt.Match(sc, arms) -> if scan_trapped!(cx, sc)
+			then wt_expr!(cx, sc)
+			else why_arms!(cx, yesc, arms),
+		Stmt.Destructure(_, _, e) -> wt_expr!(cx, e),
+		Stmt.Defer(ss) -> why_body!(cx, false, ss),
+		Stmt.Closure(_, cps, _, cbody) -> why_closure!(cx, cps, cbody),
+		_ -> -1,
+	}
+	if deep >= 0 then return deep
+
+	return stmt_off(s)
+}
+
+# A closure's residue is found with its own context, exactly as `closure_traps!` colors it.
+const why_closure! = (ACtx cx, [Param] cps, [Stmt] cbody): Iarch -> {
+	const [Str] cparams = plist_names(cps)
+	const [Str] cesc = compute_esc(cparams, cbody)
+	const ACtx cx2 = ACtx({ unions: cx.unions, params: cparams, esc: cesc })
+
+	return why_body!(cx2, false, cbody)
+}
+
+# The anchor of the first effectful call in `ss` (or -1), guided by `stmt_calls_bang`.
+const whyc_body = ([Func] funcs, [Bool] bang, [Str] params, [Stmt] ss): Iarch -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(ss.len) then break
+		if stmt_calls_bang(funcs, bang, params, ss[i])
+			then return whyc_stmt(funcs, bang, params, ss[i])
+		i = i + 1
+	}
+
+	return -1
+}
+
+const whyc_arms = ([Func] funcs, [Bool] bang, [Str] params, [StmtArm] arms): Iarch -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(arms.len) then break
+		if body_calls_bang(funcs, bang, params, arms[i].body)
+			then return whyc_body(funcs, bang, params, arms[i].body)
+		i = i + 1
+	}
+
+	return -1
+}
+
+# The guilty call's own span: the node where `call_is_effectful` answers, else the first
+# guilty child (a nested call in an argument).
+const whyc_expr = ([Func] funcs, [Bool] bang, [Str] params, Expr e): Iarch -> {
+	const Bool here = match unat(e) {
+		Expr.Call(name, _, args, _) -> call_is_effectful(funcs, bang, params, name, args),
+		Expr.DeferTap(name, args) -> call_is_effectful(funcs, bang, params, name, args),
+		_ -> false,
+	}
+	if here then return at_off(e)
+
+	return match unat(e) {
+		Expr.Loop(ss) -> whyc_body(funcs, bang, params, ss),
+		_ -> whyc_list(funcs, bang, params, expr_children(e)),
+	}
+}
+
+const whyc_list = ([Func] funcs, [Bool] bang, [Str] params, [Expr] es): Iarch -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(es.len) then break
+		if expr_calls_bang(funcs, bang, params, es[i])
+			then return whyc_expr(funcs, bang, params, es[i])
+		i = i + 1
+	}
+
+	return -1
+}
+
+const whyc_stmt = ([Func] funcs, [Bool] bang, [Str] params, Stmt s): Iarch -> {
+	const Iarch sub = match s {
+		Stmt.IfThen(_, s2) -> if stmt_calls_bang(funcs, bang, params, s2)
+			then whyc_stmt(funcs, bang, params, s2)
+			else -1,
+		Stmt.IfElse(_, t, el) -> if stmt_calls_bang(funcs, bang, params, t)
+			then whyc_stmt(funcs, bang, params, t)
+			else if stmt_calls_bang(funcs, bang, params, el)
+				then whyc_stmt(funcs, bang, params, el)
+				else -1,
+		Stmt.Block(ss) -> whyc_body(funcs, bang, params, ss),
+		Stmt.Loop(ll_, ss) -> whyc_body(funcs, bang, params, ss),
+		Stmt.ForIn(_, _, ss) -> whyc_body(funcs, bang, params, ss),
+		Stmt.Match(_, arms) -> whyc_arms(funcs, bang, params, arms),
+		Stmt.Defer(ss) -> whyc_body(funcs, bang, params, ss),
+		Stmt.Closure(_, cps, _, cbody) ->
+			whyc_body(funcs, bang, cat_s(params, plist_names(cps)), cbody),
+		_ -> -1,
+	}
+	if sub >= 0 then return sub
+
+	const Iarch own = whyc_list(funcs, bang, params, stmt_exprs(s))
+	if own >= 0 then return own
+
+	return stmt_off(s)
+}
+
+# A gate diagnostic anchored at `off` when it maps into `f`'s file, else at the declaration.
+const gate_diag = ([SrcMap] maps, Func f, Iarch off, Str msg): Diag -> {
+	if off >= 0 then {
+		const LC lc = line_col_of(maps, f.dfile, off)
+		if lc.line > 0
+			then return Diag({ file: f.dfile, line: lc.line, col: lc.col, msg: msg, what: "" })
+	}
+
+	return Diag({ file: f.dfile, line: f.dline, col: f.dcol, msg: msg, what: "" })
+}
+
 # Validate the declared `!` marker against the computed color, both ways. `main` is exempt; an
 # `asm`/intrinsic body trusts its own marker (it is not re-derived). Rejections are COLLECTED —
 # the color is a per-fn classification already computed, so one run reports every mis-marked
 # declaration instead of dying at the first (each used to cost a full rebuild cycle).
-pub const check_alloc_program! = (Program prog): [Diag] -> {
+pub const check_alloc_program! = (Program prog, [SrcMap] maps): [Diag] -> {
 	const [Func] funcs = prog.funcs
 	const [Bool] bang = compute_bang!(prog)
 	let [Diag] diags = []
@@ -972,6 +1237,7 @@ pub const check_alloc_program! = (Program prog): [Diag] -> {
 		if j >= Iarch(funcs.len) then break
 		if !funcs[j].is_asm && !is_main(funcs[j]) then {
 			const Bool decl = is_bang_name(funcs[j].name)
+			# a redundant marker's fix is at the declaration — the marker itself is the offender
 			if decl && !bang[j]
 				then diags = [
 				...diags,
@@ -983,17 +1249,27 @@ pub const check_alloc_program! = (Program prog): [Diag] -> {
 					what: "",
 				}),
 			]
-			if !decl && bang[j]
-				then diags = [
-				...diags,
-				Diag({
-					file: funcs[j].dfile,
-					line: funcs[j].dline,
-					col: funcs[j].dcol,
-					msg: "cf: alloc: `${funcs[j].name}` allocates residue (or calls a `!` function) but is not marked `!`\n",
-					what: "",
-				}),
-			]
+			# a missing marker anchors at the EVIDENCE: the first trapped construction, else the
+			# first effectful call — the declaration stamp only when neither carries a span
+			if !decl && bang[j] then {
+				const [Str] params = param_names(funcs[j])
+				const ACtx cx = ACtx({
+					unions: prog.unions,
+					params: params,
+					esc: compute_esc(params, funcs[j].body),
+				})
+				let Iarch off = why_body!(cx, false, funcs[j].body)
+				if off < 0 then off = whyc_body(funcs, bang, params, funcs[j].body)
+				diags = [
+					...diags,
+					gate_diag(
+						maps,
+						funcs[j],
+						off,
+						"cf: alloc: `${funcs[j].name}` allocates residue (or calls a `!` function) but is not marked `!`\n",
+					),
+				]
+			}
 		}
 		j = j + 1
 	}
@@ -1113,7 +1389,7 @@ const root_ambient_set! = (Program prog): [Str] -> {
 # (non-`in`) calls — residue must run under a grafted geometry, never on the root page. In
 # `zero_root` mode the root has no bytes, so it tightens to reject ANY page use: an arena graft or
 # a root-ambient function that constructs residue on the page.
-pub const check_root_program! = (Program prog, Bool zero_root): [Diag] -> {
+pub const check_root_program! = (Program prog, Bool zero_root, [SrcMap] maps): [Diag] -> {
 	let [Diag] diags = []
 	const [Func] funcs = prog.funcs
 	const [Str] root = root_ambient_set!(prog)
@@ -1148,17 +1424,23 @@ pub const check_root_program! = (Program prog, Bool zero_root): [Diag] -> {
 		# root-ambient function that constructs a residue aggregate on the page is rejected. Legal
 		# storage (`$`, `static`, `fixed_buffer` allocations run `in fb`) never lands here — the first
 		# two aren't residue, and a `fixed_buffer` sink is reached `in fb`, off the root-ambient set.
-		if zero_root && fi >= 0 && !funcs[fi].is_asm && local_residue!(prog.unions, funcs[fi])
-			then diags = [
-			...diags,
-			Diag({
-				file: funcs[fi].dfile,
-				line: funcs[fi].dline,
-				col: funcs[fi].dcol,
-				msg: "cf: zero-root: `${funcs[fi].name}` allocates residue on the root page, but `--root-size 0` forbids it — use `$`-stack, `static`, or a `fixed_buffer` instead\n",
-				what: "",
-			}),
-		]
+		if zero_root && fi >= 0 && !funcs[fi].is_asm && local_residue!(prog.unions, funcs[fi]) then {
+			const [Str] params = param_names(funcs[fi])
+			const ACtx cx = ACtx({
+				unions: prog.unions,
+				params: params,
+				esc: compute_esc(params, funcs[fi].body),
+			})
+			diags = [
+				...diags,
+				gate_diag(
+					maps,
+					funcs[fi],
+					why_body!(cx, false, funcs[fi].body),
+					"cf: zero-root: `${funcs[fi].name}` allocates residue on the root page, but `--root-size 0` forbids it — use `$`-stack, `static`, or a `fixed_buffer` instead\n",
+				),
+			]
+		}
 		i = i + 1
 	}
 

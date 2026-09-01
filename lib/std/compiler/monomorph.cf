@@ -10,10 +10,12 @@
 #
 # Type arguments are given EXPLICITLY (`id[Iarch](x)`) or INFERRED (`id(x)`). Inference derives
 # each argument's type with the typechecker's own `type_of` over a threaded value environment
-# (parameters + `let`/match/`for`/destructure binders), so a parameter whose declared type IS a
-# type variable fixes it to the argument's type. Generic DATA/UNION types, array-typed type
-# variables, and union BOUNDS (`[Color 'T]`) are supported; STRUCTURAL inference (fixing `'T`
-# from INSIDE a `['T]`/tuple parameter) and a tuple-typed type variable are later bricks.
+# (parameters + `let`/match/`for`/destructure binders) and reads each type variable out of the
+# parameter's SHAPE — the whole type, a `['T]` array element, a tuple position, or a function
+# signature position (`('A) -> 'B` fixed by a lambda's / a named function's declared types, so a
+# HOF call like `map(f, xs)` needs no brackets). Generic DATA/UNION types, array-typed type
+# variables, and union BOUNDS (`[Color 'T]`) are supported; a tuple-typed type variable is a
+# later brick.
 
 import std::compiler::diag::{ Diag, DiagBag, record_dg }
 import std::compiler::spans::{ no_maps, unat }
@@ -49,6 +51,7 @@ import std::compiler::typecheck::{
 	param_ty!,
 	binding_ty!,
 	closure_tfn,
+	fn_ty_of_func!,
 	arm_bind_env,
 	check_destructure!,
 	dyn_of,
@@ -56,6 +59,7 @@ import std::compiler::typecheck::{
 	elem_ty!,
 }
 import std::compiler::closures::{ Subst, subst_expr }
+import std::compiler::retfill::{ derive_ret!, DerivedRet }
 
 # The accumulating state, threaded by pointer: the generic FUNCTION templates + their instance
 # clones (with a dedup key set); the generic RECORD/UNION templates + their instance clones (with
@@ -78,6 +82,12 @@ data MonoCtx = {
 	[RecDecl] crecs,
 	[UnionDecl] cunions,
 	Bool has_gen,
+	# the CURRENTLY-WALKED body's local closure declarations (name + the mono'd `Stmt.Closure`),
+	# newest-first on lookup — the lambda-body inference (`infer_from_lam_body!`) reads a lambda
+	# argument's parameters and first return through them. Reset per `mono_func!` body walk and
+	# saved/restored around it (nested instantiations via `ensure_instance!` re-enter).
+	[Str] lam_names,
+	[Stmt] lam_decls,
 	# the CURRENTLY-WALKED declaration's source stamp (retargeted as each template / concrete
 	# declaration is processed), so a rejection anywhere below names its enclosing decl
 	Str dfile,
@@ -1302,17 +1312,26 @@ const infer_from_elem! = (Str tv, Str pe, Str ae): Str -> {
 	return infer_from_elem!(tv, pin, ain)
 }
 
-# Match a tuple parameter's element list `ptel` against an argument tuple's `atel`, returning what
-# `tv` binds to at the first position that mentions it (or "").
+# A signature-position name a type variable may bind to: a concrete component name — not the
+# empty name and not a `$`-marker leaf (`$dyn`/`$tuple`, which a closure binding carries for an
+# aggregate parameter and which names no nominal type).
+const bindable_name = (Str n): Bool -> {
+	if Iarch(n.len) == 0 then return false
+
+	return Iarch(n[0]) != 36
+}
+
+# Match a tuple (or function-signature) parameter's element list `ptel` against an argument's
+# `atel`, returning what `tv` binds to at the first position that mentions it (or "").
 const infer_from_telems! = (Str tv, [TupElem] ptel, [TupElem] atel): Str -> {
 	let Iarch i = 0
 
 	loop {
 		if i >= Iarch(ptel.len) then break
 		if i < Iarch(atel.len) then {
-			if eq(ptel[i].name, tv) then return atel[i].name
+			if eq(ptel[i].name, tv) && bindable_name(atel[i].name) then return atel[i].name
 
-			if eq(ptel[i].name, "$tuple") then {
+			if eq(ptel[i].name, "$tuple") || eq(ptel[i].name, "$fn") then {
 				const Str b = infer_from_telems!(tv, ptel[i].sub, atel[i].sub)
 				if !eq(b, "") then return b
 			} else {
@@ -1342,6 +1361,41 @@ const infer_from_param! = (Str tv, Param p, Ty at): Str -> {
 	return ""
 }
 
+# The signature telems (`[args..., ret]`) a function-VALUE argument carries, for `$fn`-parameter
+# inference: a hoisted lambda / forwarded function parameter is a `TFn` binding in the value
+# environment (newest-first, shadowing), and a bare top-level function name contributes its
+# declared signature. Any other argument carries none (the parameter then fixes no variable).
+const fn_arg_sig! = (*MonoCtx m, Expr e, MonoEnv env): [TupElem] -> {
+	let [TupElem] sig = []
+	const Str nm = match unat(e) { Expr.Var(n) -> n, _ -> "" }
+	if eq(nm, "") then return sig
+	let Iarch i = Iarch(env.venv.len) - 1
+
+	loop {
+		if i < 0 then break
+		if eq(env.venv[i].name, nm) then {
+			match env.venv[i].ty { Ty.TFn(s) -> { sig = s }, _ -> {} }
+
+			return sig
+		}
+		i = i - 1
+	}
+
+	let Iarch f = 0
+
+	loop {
+		if f >= Iarch(m.cfuncs.len) then break
+		if eq(m.cfuncs[f].name, nm) then {
+			match fn_ty_of_func!(m.cfuncs[f]) { Ty.TFn(s) -> { sig = s }, _ -> {} }
+
+			return sig
+		}
+		f = f + 1
+	}
+
+	return sig
+}
+
 const infer_tyargs! = (*MonoCtx m, Func tmpl, [Expr] args, MonoEnv env): [Str] -> {
 	let [Str] tvals = []
 	let Iarch t = 0
@@ -1359,10 +1413,16 @@ const infer_tyargs! = (*MonoCtx m, Func tmpl, [Expr] args, MonoEnv env): [Str] -
 
 		loop {
 			if p >= Iarch(tmpl.params.len) then break
-			# a binding can only come from a parameter whose type is the variable itself, or an array
-			# / tuple that could nest it — skip every other parameter WITHOUT typing its argument (a
-			# function-value argument is a bare name that `type_of` rejects, and it can carry no `'T`)
+			# a binding can only come from a parameter whose type is the variable itself, an array /
+			# tuple that could nest it, or a FUNCTION type mentioning it (`('A) -> 'B`) — skip every
+			# other parameter WITHOUT typing its argument. A function-value argument is a bare name
+			# `type_of` rejects, so its signature is read directly (a lambda's declared types, a
+			# named function's) and matched structurally like a tuple's positions.
 			const Str pn = tmpl.params[p].type_name
+			if eq(pn, "$fn") && p < Iarch(args.len) then {
+				const Str fb = infer_from_telems!(tv, tmpl.params[p].telems, fn_arg_sig!(m, args[p], env))
+				if !eq(fb, "") then strong = fb
+			}
 			const Bool shaped = eq(pn, tv) || eq(pn, "$dyn") || eq(pn, "$tuple")
 			if shaped && p < Iarch(args.len) then {
 				let DiagBag fdg = record_dg()
@@ -1380,13 +1440,284 @@ const infer_tyargs! = (*MonoCtx m, Func tmpl, [Expr] args, MonoEnv env): [Str] -
 
 		let Str bound = strong
 		if eq(bound, "") then bound = weak
-		if eq(bound, "")
-			then bound = mrec_s(m, "cf: type: cannot infer a type argument for a generic call\n", "Iarch")
 		tvals = [...tvals, bound]
 		t = t + 1
 	}
 
+	# phase 2: a variable no ordinary argument pinned may still be derivable from a lambda
+	# argument's BODY (type_system §5.2 — the expected function type gives the params their
+	# types, and the body then yields the return): substitute the pinned variables into the
+	# `$fn` parameter's argument positions, type the lambda's parameters from them, then type
+	# the (already-monomorphized) body's first return under that environment — the result pins
+	# the variable sitting in the signature's return position.
+	let Iarch t2 = 0
+
+	loop {
+		if t2 >= Iarch(tmpl.typarams.len) then break
+		if eq(tvals[t2], "")
+			then tvals = set_at(tvals, t2, infer_from_lam_body!(m, tmpl, tmpl.typarams[t2], args, env, tvals))
+		t2 = t2 + 1
+	}
+
+	let Iarch t3 = 0
+
+	loop {
+		if t3 >= Iarch(tvals.len) then break
+		if eq(tvals[t3], "")
+			then tvals = set_at(
+			tvals,
+			t3,
+			mrec_s(m, "cf: type: cannot infer a type argument for a generic call\n", "Iarch"),
+		)
+		t3 = t3 + 1
+	}
+
 	return tvals
+}
+
+const set_at = ([Str] xs, Iarch i, Str v): [Str] -> {
+	let [Str] out = []
+	let Iarch j = 0
+
+	loop {
+		if j >= Iarch(xs.len) then break
+		if j == i then out = [...out, v]
+			else out = [...out, xs[j]]
+		j = j + 1
+	}
+
+	return out
+}
+
+# Whether a telem tree is free of type variables (a leaf name never starts `'`, at any depth).
+const telems_concrete = ([TupElem] tel): Bool -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(tel.len) then break
+		const Str n = tel[i].name
+		if Iarch(n.len) > 0 && Iarch(n[0]) == 39 then return false
+		if Iarch(n.len) > 1 && Iarch(n[0]) == 91 && Iarch(n[1]) == 39 then return false
+		if !telems_concrete(tel[i].sub) then return false
+		i = i + 1
+	}
+
+	return true
+}
+
+# The `Ty` of one signature-position telem (concrete names only — checked by the caller).
+const sig_pos_ty! = (*MonoCtx m, TupElem te): Ty -> {
+	if eq(te.name, "$fn") then return Ty.TFn(te.sub)
+	if eq(te.name, "$tuple") then return Ty.TTuple(te.sub)
+	if Iarch(te.name.len) > 1 && Iarch(te.name[0]) == 91 then return Ty.TDyn(bracket_inner!(te.name))
+
+	return named_ty(te.name, "", all_recs(m), all_unions(m))
+}
+
+# Derive `tv` from a lambda argument's body: find a `$fn` parameter whose RETURN position
+# mentions `tv`, resolve its argument to a locally-declared closure, type the closure's
+# parameters (its own annotations first, else the pinned-substituted argument positions),
+# then type the body's first `return` under them. "" when no lambda argument decides it.
+const infer_from_lam_body! = (
+	*MonoCtx m,
+	Func tmpl,
+	Str tv,
+	[Expr] args,
+	MonoEnv env,
+	[Str] tvals,
+): Str -> {
+	# the pinned-only substitution pairs
+	let [Str] ptvars = []
+	let [Str] ptvals = []
+	let Iarch pv = 0
+
+	loop {
+		if pv >= Iarch(tvals.len) then break
+		if !eq(tvals[pv], "") then {
+			ptvars = [...ptvars, tmpl.typarams[pv]]
+			ptvals = [...ptvals, tvals[pv]]
+		}
+		pv = pv + 1
+	}
+
+	let Iarch p = 0
+
+	loop {
+		if p >= Iarch(tmpl.params.len) then break
+		if eq(tmpl.params[p].type_name, "$fn") && p < Iarch(args.len) then {
+			const Str b = lam_ret_bind!(m, tmpl.params[p].telems, tv, args[p], env, ptvars, ptvals)
+			if !eq(b, "") then return b
+		}
+		p = p + 1
+	}
+
+	return ""
+}
+
+const lam_ret_bind! = (
+	*MonoCtx m,
+	[TupElem] ptel,
+	Str tv,
+	Expr arg,
+	MonoEnv env,
+	[Str] ptvars,
+	[Str] ptvals,
+): Str -> {
+	const Iarch n = Iarch(ptel.len)
+	if n < 1 then return ""
+	# the return position must mention the variable (else this parameter decides nothing)
+	if !mentions_tv!(ptel[n - 1].name, tv) then return ""
+	const Str nm = match unat(arg) { Expr.Var(vn) -> vn, _ -> "" }
+	if eq(nm, "") then return ""
+	const Iarch li = find_lam(m, nm)
+	if li < 0 then return ""
+
+	return match m.lam_decls[li] {
+		Stmt.Closure(cn, cps, cret, cbody) ->
+			lam_body_ret!(m, ptel, tv, cps, cbody, env, ptvars, ptvals),
+		_ -> "",
+	}
+}
+
+# Whether a leaf name mentions `tv` (bare or under array brackets).
+const mentions_tv! = (Str n, Str tv): Bool -> {
+	if eq(n, tv) then return true
+	const Str inner = bracket_inner!(n)
+	if eq(inner, "") then return false
+
+	return mentions_tv!(inner, tv)
+}
+
+const lam_body_ret! = (
+	*MonoCtx m,
+	[TupElem] ptel,
+	Str tv,
+	[Param] cps,
+	[Stmt] cbody,
+	MonoEnv env,
+	[Str] ptvars,
+	[Str] ptvals,
+): Str -> {
+	const [TupElem] stel = subst_telems!(m, ptel, ptvars, ptvals)
+	const Iarch arity = Iarch(stel.len) - 1
+	if Iarch(cps.len) != arity then return ""
+	# every argument position must be concrete after substitution — the lambda's parameters
+	# type from them (its own annotation wins where present)
+	let [VarTy] cenv = [...env.venv]
+	let Iarch i = 0
+
+	loop {
+		if i >= arity then break
+		let Ty pt = Ty.TNever
+		if !eq(cps[i].type_name, "") then pt = param_ty!(cps[i], all_recs(m), all_unions(m))
+			else {
+			let [TupElem] one = []
+			one = [...one, stel[i]]
+			if !telems_concrete(one) then return ""
+			pt = sig_pos_ty!(m, stel[i])
+		}
+		cenv = [
+			...cenv,
+			VarTy({
+				name: cps[i].name,
+				ty: pt,
+				mutable: false,
+				esc: false,
+				outer: false,
+				fixed: false,
+				is_ref: false,
+				fsize: 0,
+				elem: "",
+			}),
+		]
+		i = i + 1
+	}
+
+	# the first top-level `return` decides; a leading sibling closure binds, a `let` binds —
+	# anything else gives up (annotate then)
+	let Iarch s = 0
+
+	loop {
+		if s >= Iarch(cbody.len) then break
+
+		let Str got = "$stop"
+
+		match cbody[s] {
+			Stmt.Closure(inm, ips, iret, ibody) -> {
+				got = ""
+				cenv = [
+					...cenv,
+					VarTy({
+						name: inm,
+						ty: closure_tfn(iret, ips),
+						mutable: false,
+						esc: false,
+						outer: false,
+						fixed: false,
+						is_ref: false,
+						fsize: 0,
+						elem: "",
+					}),
+				]
+			},
+			Stmt.Let(ln, lm, lann, le) -> {
+				got = ""
+				let DiagBag ldg = record_dg()
+				const Ty lt = binding_ty!(lann, le, cenv, build_ctx(m, env.ret), &ldg)
+				cenv = [
+					...cenv,
+					VarTy({
+						name: ln,
+						ty: lt,
+						mutable: false,
+						esc: false,
+						outer: false,
+						fixed: false,
+						is_ref: false,
+						fsize: 0,
+						elem: "",
+					}),
+				]
+			},
+			Stmt.Return(re) -> {
+				let DiagBag rdg = record_dg()
+				const Ty rt = type_of!(re, cenv, build_ctx(m, env.ret), &rdg)
+				if !rdg.hot then {
+					const Str rn = ty_name(rt)
+					if !eq(rn, "") then {
+						# read the binding out of the UNsubstituted return position
+						const Str pr = ptel[Iarch(ptel.len) - 1].name
+						if eq(pr, tv) then got = rn
+							else got = infer_from_elem!(tv, pr, rn)
+						if eq(got, "") then got = "$stop"
+					}
+				}
+			},
+			_ -> {},
+		}
+
+		if eq(got, "$stop") then return ""
+		if !eq(got, "") then return got
+		s = s + 1
+	}
+
+	return ""
+}
+
+const fresh_lam_names = (): [Str] -> []
+
+const fresh_lam_decls = (): [Stmt] -> []
+
+const find_lam = (*MonoCtx m, Str nm): Iarch -> {
+	let Iarch i = Iarch(m.lam_names.len) - 1
+
+	loop {
+		if i < 0 then break
+		if eq(m.lam_names[i], nm) then return i
+		i = i - 1
+	}
+
+	return -1
 }
 
 # --- cloning + rewriting -------------------------------------------------------------------
@@ -1471,9 +1802,9 @@ const mono_func! = (*MonoCtx m, Func f, Str newname, [Str] tvars, [Str] tvals): 
 	}
 
 	const TySlot rst = subst_slot!(m, f.ret_name, f.ret_elem, f.ret_telems, tvars_t, tvals_t)
-	const Str rn = rst.name
-	const Str re = rst.elem
-	const [TupElem] rtel = rst.telems
+	let Str rn = rst.name
+	let Str re = rst.elem
+	let [TupElem] rtel = rst.telems
 	# seed the local value env with the (substituted) parameter types, so a generic call in the
 	# body can infer from a parameter reference. Only under generics: a non-generic function has
 	# nothing to instantiate, so the env stays empty and `type_of` is never invoked on it.
@@ -1514,7 +1845,28 @@ const mono_func! = (*MonoCtx m, Func f, Str newname, [Str] tvars, [Str] tvals): 
 		vpnames: vpnames,
 		vpvals: vpvals,
 	})
+	# the closure table is per-BODY: save the (suspended) outer walk's, start fresh, restore
+	# after — `ensure_instance!` re-enters this fn mid-walk
+	const [Str] slnames = m.lam_names
+	const [Stmt] sldecls = m.lam_decls
+	m.lam_names = fresh_lam_names()
+	m.lam_decls = fresh_lam_decls()
 	const [Stmt] body = mono_stmts!(m, f.body, env)
+	m.lam_names = slnames
+	m.lam_decls = sldecls
+	# an OMITTED return derives at clone time: the walked body is concrete here, so a caller
+	# minting this instance on demand reads a filled signature within the same round (its
+	# `match` arms resolve, its generic arguments pin). Only under generics — the template-free
+	# path stays the byte-identity — and a failed derivation keeps the blank for the post-mono
+	# fill pass (which also covers the walk-order cases the graft iteration retries).
+	if m.has_gen && eq(rn, "") && Iarch(rtel.len) == 0 && !f.is_asm && !f.is_intrinsic then {
+		const DerivedRet dr = derive_ret!(cat_funcs(m.cfuncs, m.instances), all_recs(m), all_unions(m), ps, body)
+		if dr.has then {
+			rn = dr.name
+			re = dr.elem
+			rtel = dr.telems
+		}
+	}
 	const [Str] no_tp = []
 	set_stamp(m, odf, odl, odc)
 
@@ -1746,8 +2098,35 @@ const mono_segs! = (*MonoCtx m, [Seg] segs, MonoEnv env): [Seg] -> {
 const arm_type! = (*MonoCtx m, Str tn, Str scrut_ty, MonoEnv env): Str -> {
 	if eq(tn, "") then return tn
 	if is_type_app(tn) then return mangle_type!(m, tn, env.tvars, env.tvals)   # explicitly-qualified `Maybe[Iarch]`
-	if find_union_template(m.union_templates, tn) >= 0 then return scrut_ty    # unqualified generic union → the scrutinee's concrete instance
+	# an unqualified generic union resolves to the scrutinee's concrete instance. When the
+	# scrutinee's type is NOT a known union here — typically it flows from an omitted return
+	# type the retfill pass (which runs after this one) has not filled — the arms cannot
+	# resolve; say what to annotate instead of leaking the template name downstream.
+	if find_union_template(m.union_templates, tn) >= 0 then {
+		if !names_known_union(m, scrut_ty)
+			then return mrec_s(
+			m,
+			"cf: type: a `match` arm's generic union cannot be resolved from the scrutinee — annotate the scrutinee's binding (or the return type of the function it flows from)\n",
+			tn,
+		)
+
+		return scrut_ty
+	}
+
 	return tn
+}
+
+const names_known_union = (*MonoCtx m, Str n): Bool -> {
+	const [UnionDecl] us = all_unions(m)
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(us.len) then break
+		if eq(us[i].name, n) then return true
+		i = i + 1
+	}
+
+	return false
 }
 
 # Extend the environment with a match arm's payload bindings, so a generic call inside the arm
@@ -1757,9 +2136,9 @@ const arm_env = (*MonoCtx m, Str tn, [Str] members, [Str] binds, MonoEnv env): M
 	if !m.has_gen then return env
 	if eq(tn, "") then return env
 	if Iarch(binds.len) == 0 then return env
+	# silent on failure — see `for_env!`: typecheck re-binds the arm post-fill
 	let DiagBag fdg = record_dg()
 	const [VarTy] nv = arm_bind_env(tn, members, binds, env.venv, build_ctx(m, env.ret), &fdg)
-	if fdg.hot then mrec_at(m, fdg.file, fdg.line, fdg.col, fdg.msg)
 
 	return MonoEnv({
 		tvars: env.tvars,
@@ -1897,9 +2276,10 @@ const for_env! = (*MonoCtx m, Str v, Str a, MonoEnv env): MonoEnv -> {
 	# generic call on the binder resolves the right instance (`for w in [Str]` → `id(w)` picks
 	# `id[Str]`).
 	const Str en = dyn_of(venv_ty(env.venv, a))
+	# a failure binds the poison silently — the typechecker rebuilds this same environment
+	# AFTER the retfill pass (an unannotated return reads as the word here) and reports for real
 	let DiagBag fdg = record_dg()
 	const Ty et = elem_ty!(en, build_ctx(m, env.ret), &fdg)
-	if fdg.hot then mrec_at(m, fdg.file, fdg.line, fdg.col, fdg.msg)
 
 	return env_bind(env, v, et)
 }
@@ -1963,9 +2343,10 @@ const mono_stmt_match! = (*MonoCtx m, Expr scrut, [StmtArm] arms, MonoEnv env): 
 # Extend the environment for the statements after a destructure — the tuple binders' types via
 # the typechecker's `check_destructure` over the (monomorphized) initializer.
 const destr_env! = (*MonoCtx m, [Str] pat, Bool mut, Expr e, MonoEnv env): MonoEnv -> {
+	# silent on failure — see `for_env!`: a destructure over a return the retfill pass has not
+	# filled yet would otherwise reject a valid program; typecheck re-validates post-fill
 	let DiagBag fdg = record_dg()
 	const [VarTy] nv = check_destructure!(pat, mut, e, env.venv, build_ctx(m, env.ret), &fdg)
-	if fdg.hot then mrec_at(m, fdg.file, fdg.line, fdg.col, fdg.msg)
 
 	return MonoEnv({
 		tvars: env.tvars,
@@ -1982,9 +2363,9 @@ const destr_env! = (*MonoCtx m, [Str] pat, Bool mut, Expr e, MonoEnv env): MonoE
 # Only under generics; a non-generic program never consults the environment, so this is skipped.
 # The `let` binder's type via the typechecker's `binding_ty` (a rejection latches into `m`).
 const let_env! = (*MonoCtx m, Str n, Str ann, Expr e, MonoEnv env): MonoEnv -> {
+	# silent on failure — see `for_env!`: typecheck re-validates the binding post-fill
 	let DiagBag fdg = record_dg()
 	const Ty t = binding_ty!(ann, e, env.venv, build_ctx(m, env.ret), &fdg)
-	if fdg.hot then mrec_at(m, fdg.file, fdg.line, fdg.col, fdg.msg)
 
 	return env_bind(env, n, t)
 }
@@ -2012,6 +2393,16 @@ const mono_stmts! = (*MonoCtx m, [Stmt] ss, MonoEnv env0): [Stmt] -> {
 		if i >= Iarch(ss.len) then break
 		const Stmt ms = mono_stmt!(m, ss[i], env)
 		out = [...out, ms]
+		# record a local closure for the lambda-body inference (its consumers follow it)
+		if m.has_gen then {
+			match ms {
+				Stmt.Closure(cn, cp, cr, cb) -> {
+					m.lam_names = [...m.lam_names, cn]
+					m.lam_decls = [...m.lam_decls, ms]
+				},
+				_ -> {},
+			}
+		}
 		env = mono_extend!(m, ms, env)  # extend using the MONO'd statement (concrete types) for the rest
 		i = i + 1
 	}
@@ -2118,9 +2509,37 @@ const check_union_templates! = (*MonoCtx m): Iarch -> {
 # `diags` means instantiation failed somewhere — the OUTPUT PROGRAM IS NOT USABLE then (a
 # poisoned walk hands back inputs unsubstituted, and a failed instance is simply missing);
 # the caller stops after this pass rather than let typecheck cascade on absent functions.
-pub data MonoOut = { Program prog, [Diag] diags }
+pub data MonoOut = {
+	Program prog,
+	[Diag] diags,
+	# the minted TYPE instances (+ their memo keys), exported so a SEEDED re-run — the
+	# retfill iteration grafts derived return types onto the raw program and monomorphizes
+	# again — resolves an instance-named return (`Maybe$Iarch`) before its minting body walks
+	[RecDecl] rec_instances,
+	[UnionDecl] union_instances,
+	[Str] type_keys,
+}
 
-pub const mono_program! = (Program prog): MonoOut -> {
+# The seed a re-run starts from: the prior round's type instances. Function instances are NOT
+# seeded — they re-mint deterministically on demand, and a prior round's could carry inference
+# artifacts the grafted returns exist to correct.
+pub data MonoSeed = { [RecDecl] recs, [UnionDecl] unions, [Str] type_keys }
+
+pub const no_mono_seed = (): MonoSeed -> {
+	const [RecDecl] nr = []
+	const [UnionDecl] nu = []
+	const [Str] nk = []
+
+	return MonoSeed({ recs: nr, unions: nu, type_keys: nk })
+}
+
+pub const mono_seed_of = (MonoOut mo): MonoSeed -> MonoSeed({
+	recs: mo.rec_instances,
+	unions: mo.union_instances,
+	type_keys: mo.type_keys,
+})
+
+pub const mono_program! = (Program prog, MonoSeed seed): MonoOut -> {
 	let [Func] templates = []
 	let [Func] concrete = []
 	let Iarch i = 0
@@ -2180,9 +2599,8 @@ pub const mono_program! = (Program prog): MonoOut -> {
 	const [Diag] no_diags = []
 	let [Func] no_inst = []
 	let [Str] no_keys = []
-	let [RecDecl] no_recinst = []
-	let [Str] no_tk = []
-	let [UnionDecl] no_uni = []
+	const [Str] no_lnames = []
+	const [Stmt] no_ldecls = []
 	# whether the program has ANY generic template — if not (cf's own source), the inference
 	# machinery (which drives the shared `type_of`) is never engaged and the pass is an identity
 	let Bool has_gen = false
@@ -2195,14 +2613,16 @@ pub const mono_program! = (Program prog): MonoOut -> {
 		instances: no_inst,
 		unions: unames,
 		rec_templates: rec_templates,
-		type_keys: no_tk,
-		rec_instances: no_recinst,
+		type_keys: seed.type_keys,
+		rec_instances: seed.recs,
 		union_templates: union_templates,
-		union_instances: no_uni,
+		union_instances: seed.unions,
 		cfuncs: concrete,
 		crecs: concrete_recs,
 		cunions: concrete_unions,
 		has_gen: has_gen,
+		lam_names: no_lnames,
+		lam_decls: no_ldecls,
 		dfile: "",
 		dline: 0,
 		dcol: 0,
@@ -2276,5 +2696,8 @@ pub const mono_program! = (Program prog): MonoOut -> {
 			groups: prog.groups,
 		}),
 		diags: m.mdiags,
+		rec_instances: m.rec_instances,
+		union_instances: m.union_instances,
+		type_keys: m.type_keys,
 	})
 }

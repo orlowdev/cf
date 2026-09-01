@@ -92,6 +92,8 @@ pub data Parser = {
 	Str file,
 	Os target_os,
 	Arch target_arch,
+	Bool build_debug,
+	Bool build_instrument,
 	Bool saw_fb,
 	Bool saw_fx,
 	Bool saw_el,
@@ -371,6 +373,8 @@ const parse_hole! = (*Parser p, Iarch hstart, Iarch hlen): Expr -> {
 		file: p.file,
 		target_os: Os.Darwin,
 		target_arch: Arch.Arm64,
+		build_debug: false,
+		build_instrument: false,
 		saw_fb: false,
 		saw_fx: false,
 		saw_el: false,
@@ -2565,7 +2569,22 @@ const parse_fixed_elem! = (*Parser p): Str -> {
 # A single parameter: `<type> <name>`. A pointer type (`*[Elem]`/`[Elem]`) becomes a
 # pointer parameter (no type name); a bare type-name identifier (`Iarch`, `Bool`, or
 # a record type) is kept in `type_name` for the typecheck phase to resolve.
-const parse_param! = (*Parser p): Param -> {
+const parse_param! = (*Parser p, Bool bare): Param -> {
+	# a BARE lowercase name (no type) — a lambda parameter typed by its surrounding context
+	# (type_system §5.1/§5.2: the expected function type gives the params their types; the
+	# consuming call's function-type parameter supplies it after the monomorph pass). Only a
+	# closure parses these — a top-level function types its parameters. An uppercase single
+	# ident still reads as a type missing its name and rejects below.
+	if bare
+	&& is_ident(peek(p))
+	&& (is_comma(p.toks[p.pos + 1].kind) || is_rparen(p.toks[p.pos + 1].kind))
+	&& !(Iarch(cur_name!(p)[0]) >= 65 && Iarch(cur_name!(p)[0]) <= 90) then {
+		const Str bname = cur_name!(p)
+		bev(p, p.pos, 2, bname)
+		p.pos = p.pos + 1
+
+		return Param({ name: bname, is_ptr: false, type_name: "", elem: "", telems: [], size: 0 })
+	}
 	if is_star(peek(p)) then {
 		p.pos = p.pos + 1 # `*`
 		# `*[Elem]` is a byte pointer (`$ptr`); `*Record` is a mutable record pointer whose
@@ -2745,10 +2764,20 @@ const lambda_ahead = (*Parser p): Bool -> {
 const parse_closure! = (*Parser p, Str name): Stmt -> {
 	bev(p, p.pos, 0, "") # the closure's scope opens at its `(` — parameters bind into it
 	p.pos = p.pos + 1 # `(`
-	const [Param] params = parse_params!(p)
+	const [Param] params = parse_params!(p, true)
 	if !is_rparen(peek(p)) then perr(p, "cf: parse: expected `)` in a closure\n")
 	p.pos = p.pos + 1
 	const RetSig rs = parse_ret_name!(p)
+	# a closure's return slot is a bare NAME: an array return rides bracket-encoded
+	# (`[Iarch]` — the same spelling a function-type component uses), and a tuple return
+	# has no carrier at all — rejected cleanly (a record names the positions anyway)
+	if eq(rs.name, "$tuple")
+		then perr(
+		p,
+		"cf: parse: a closure cannot declare a tuple return — return a record, or use a named function\n",
+	)
+	let Str crn = rs.name
+	if eq(rs.name, "$dyn") then crn = "[${rs.elem}]"
 	if !is_arrow(peek(p)) then perr(p, "cf: parse: expected `->` in a closure\n")
 	p.pos = p.pos + 1
 	const [Stmt] nobody = []
@@ -2757,7 +2786,7 @@ const parse_closure! = (*Parser p, Str name): Stmt -> {
 		const [Stmt] body = parse_block!(p)
 		bev(p, p.pos, 1, "")
 
-		return Stmt.Closure(name, params, rs.name, body)
+		return Stmt.Closure(name, params, crn, body)
 	}
 	# an expression body: nested anonymous lambdas hoist INTO this closure (they may capture its
 	# parameters), while lambdas queued by the enclosing statement stay shelved outside
@@ -2769,17 +2798,17 @@ const parse_closure! = (*Parser p, Str name): Stmt -> {
 	p.pending = [...shelved]
 	bev(p, p.pos, 1, "")
 
-	return Stmt.Closure(name, params, rs.name, one)
+	return Stmt.Closure(name, params, crn, one)
 }
 
 # The parenthesised parameter list; a repeated name is rejected. Any arity is
 # accepted here — `main`'s ≤3 cap is a whole-program rule checked at resolve time.
-const parse_params! = (*Parser p): [Param] -> {
+const parse_params! = (*Parser p, Bool bare): [Param] -> {
 	let [Param] params = []
 	if is_rparen(peek(p)) then return params
 
 	loop {
-		const Param pm = parse_param!(p)
+		const Param pm = parse_param!(p, bare)
 		if params_has(params, pm.name) then perr(p, "cf: parse: duplicate parameter name\n")
 		params = [...params, pm]
 		if !is_comma(peek(p)) then break
@@ -3158,7 +3187,7 @@ const parse_func! = (*Parser p): Func -> {
 	}
 	bev(p, p.pos, 0, "") # the function's scope opens at its `(` — parameters bind into it
 	p.pos = p.pos + 1
-	const [Param] params = parse_params!(p)
+	const [Param] params = parse_params!(p, false)
 	if !is_rparen(peek(p)) then perr(p, "cf: parse: expected `)`\n")
 	p.pos = p.pos + 1
 	const RetSig rs = parse_ret_name!(p)
@@ -3885,6 +3914,28 @@ const comptime_tok_is = (Str t, Str nsprefix): Bool -> {
 	return str_tail_eq(t, n + 1, "target") || str_tail_eq(t, n + 1, "current")
 }
 
+# Does a strip-minted comptime token read `std_comptime_build<sep><fact>`? Returns the
+# fact name (`debug`/`instrument`) or "" — a build fact is a BARE Bool condition
+# (`if build::debug then ...`), no comparison operand.
+const comptime_build_fact = (Str t): Str -> {
+	const Str nsprefix = "std_comptime_build"
+	const Iarch n = Iarch(nsprefix.len)
+	if Iarch(t.len) <= n then return ""
+	let Iarch i = 0
+
+	loop {
+		if i >= n then break
+		if t[i] != nsprefix[i] then return ""
+		i = i + 1
+	}
+
+	if Iarch(t[n]) != 1 && Iarch(t[n]) != 95 then return "" # the ns-sep (0x01) or `_` (full path)
+	if str_tail_eq(t, n + 1, "debug") then return "debug"
+	if str_tail_eq(t, n + 1, "instrument") then return "instrument"
+
+	return ""
+}
+
 # Evaluate a comptime condition at PARSE TIME against the build target (module_system §6/§7):
 # `<os|arch>::<member> <op> <Enum>.<Variant>` — `member` is `target`/`current` (equal on a
 # non-cross build), `op` is `==`/`!=`, and `Enum` matches the namespace (`os`→`Os`, `arch`→`Arch`).
@@ -3896,6 +3947,10 @@ const parse_cond! = (*Parser p): Bool -> {
 		p,
 		"cf: parse: expected a comptime target (`os::target`) in a comptime condition\n",
 	)
+	# a build FACT (`build::debug` / `build::instrument`) is a bare Bool — no operand
+	const Str bfact = comptime_build_fact(head)
+	if eq(bfact, "debug") then return p.build_debug
+	if eq(bfact, "instrument") then return p.build_instrument
 	let Bool is_os = false
 	let Bool is_arch = false
 

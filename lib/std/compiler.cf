@@ -7,19 +7,21 @@
 # for tools that need finer control.
 
 import std::data::{ Either }
-import std::data::str::{ eq }
+import std::data::str::{ eq, slice }
 import std::io::console::{ die }
 import std::io::file::{ create, close }
 import std::io::fd::{ Fd, IoRrr }
 import std::sys::{ Os, Arch }
 import std::compiler::ast::{ Program }
-import std::compiler::diag::{ Diag, sort_diags }
+import std::compiler::diag::{ Diag, TyRow, sort_diags }
 import std::compiler::resolve::{ resolve_program!, Resolved }
-import std::compiler::monomorph::{ mono_program!, MonoOut }
+import std::compiler::monomorph::{ mono_program!, MonoOut, MonoSeed, no_mono_seed, mono_seed_of }
+import std::compiler::retfill::{ retfill_program!, graft_rets, Grafted }
 import std::compiler::materialize::{ materialize_program!, Mat }
-import std::compiler::typecheck::{ check_program!, check_unreachable! }
+import std::compiler::typecheck::{ check_program!, check_unreachable!, check_types!, ret_hover! }
 import std::compiler::spans::{ strip_program, strip_funcs }
 import std::compiler::alloc::{ check_alloc_program!, check_root_program! }
+import std::compiler::inline::{ inline_program! }
 import std::compiler::hoist_defertap::{ hoist_defertaps! }
 import std::compiler::defer::{ lower_defers! }
 import std::compiler::closures::{ lift_program!, check_dropped_captures! }
@@ -59,19 +61,22 @@ pub const compile! = (
 	Arch target_arch,
 	Iarch root_size,
 	Bool dump_routing,
+	Bool no_inline,
 	Bool skip_embeds,
 	Str build_version,
+	Bool debug,
+	Bool instrument,
 ): [Diag] -> {
 	# front end: resolve the entry module and its transitive imports (lexing and parsing
 	# each) into one flattened AST — module_system §8
-	const Resolved rz = resolve_program!(input, "", target_os, target_arch)
+	const Resolved rz = resolve_program!(input, "", target_os, target_arch, debug, instrument)
 	const Program raw = rz.prog
 
 	# the `!` allocation algebra, checked both ways (memory_model §5) — UNCONDITIONAL: the whole
 	# tree (compiler + lib + corpus) is colored, so there is no flag. Run PRE-mono so the color is
 	# per SOURCE function (a generic that may allocate in any instantiation is `!` once).
 	# COLLECTED (D2): every mis-colored declaration reports in one run.
-	const [Diag] adiags = check_alloc_program!(raw)
+	const [Diag] adiags = check_alloc_program!(raw, rz.maps)
 
 	# root-allocation validation (memory_model §2): reject residue placed on the ROOT page —
 	# UNCONDITIONAL, no flag. Every program must run its allocating work `in` some arena; only the
@@ -80,7 +85,7 @@ pub const compile! = (
 	# grafts alike — so the binary provably never dynamically allocates.
 	const Bool zero_root = match target_os { Os.Bare -> root_size == 0, _ -> false }
 
-	const [Diag] rdiags = check_root_program!(raw, zero_root)
+	const [Diag] rdiags = check_root_program!(raw, zero_root, rz.maps)
 	const [Diag] gdiags = sort_diags([...adiags, ...rdiags])
 
 	# a mis-colored program stops HERE, before monomorph: the passes below still die fail-fast
@@ -89,15 +94,17 @@ pub const compile! = (
 	if Iarch(gdiags.len) > 0 then return gdiags
 
 	# monomorphize generic functions into concrete instances (type_system §8.1) — after this
-	# the program has no generic templates, only ordinary functions. COLLECTED (D2): every
-	# failed instantiation reports in one run; the pass's output is unusable then (missing
-	# instances), so its diags return ALONE — typecheck on the broken table would only add
-	# "undefined function" cascades on top.
-	const MonoOut mo = mono_program!(raw)
+	# the program has no generic templates, only ordinary functions — then fill omitted
+	# return types from the bodies (type_system §5.1), iterating when a fill is MATERIAL
+	# to inference (see `mono_and_fill!`). COLLECTED (D2): every failed instantiation
+	# reports in one run; a diag-carrying round's output is unusable (missing instances),
+	# so the FINAL round's diags return ALONE — typecheck on the broken table would only
+	# add "undefined function" cascades on top.
+	const MonoFill mf = mono_and_fill!(raw)
 
-	if Iarch(mo.diags.len) > 0 then return sort_diags(mo.diags)
+	if Iarch(mf.diags.len) > 0 then return sort_diags(mf.diags)
 
-	const Program mono = mo.prog
+	const Program mono = mf.prog
 
 	# the Materialize substep of the Memory arc (geometry_lowering §2): duplicate per
 	# (fn × geometry) under the std-source geometries, retarget the `in b` seed calls, and
@@ -138,7 +145,13 @@ pub const compile! = (
 
 	# lower local closures to top-level functions with hidden capture parameters (memory_model
 	# §7) — after typecheck (which validated them), before emit
-	const Program lowered = lift_program!(deferred)
+	const Program lifted = lift_program!(deferred)
+
+	# the pre-emit inliner: splice scalar leaf callees into their call sites — QBE has no
+	# inliner, so every per-byte helper otherwise pays the full call protocol. Runs LAST of
+	# the lowerings, so routing and emit classify exactly what is emitted. `--no-inline`
+	# keeps the 1:1 lowering for codegen debugging.
+	const Program lowered = if no_inline then lifted else inline_program!(lifted)
 
 	# the residue/survivor classification (memory_model §5, geometry_lowering §2-§3), computed
 	# ONCE: the same tables feed the oracle tripwire (every `!`-oracle escape must appear in the
@@ -171,6 +184,8 @@ pub const compile! = (
 		root_size,
 		skip_embeds,
 		build_version,
+		debug,
+		instrument,
 	)
 	close(qf)
 	close(af)
@@ -189,22 +204,22 @@ pub const compile! = (
 # A non-empty `src` names a file whose BYTES stand in for the entry's (an editor's unsaved
 # buffer); `input` remains the entry's identity — its diag stamps and import base.
 pub const check! = (Str input, Str src, Os target_os, Arch target_arch, Iarch root_size): [Diag] -> {
-	const Resolved rz = resolve_program!(input, src, target_os, target_arch)
+	const Resolved rz = resolve_program!(input, src, target_os, target_arch, false, false)
 	const Program raw = rz.prog
-	const [Diag] adiags = check_alloc_program!(raw)
+	const [Diag] adiags = check_alloc_program!(raw, rz.maps)
 
 	const Bool zero_root = match target_os { Os.Bare -> root_size == 0, _ -> false }
 
-	const [Diag] rdiags = check_root_program!(raw, zero_root)
+	const [Diag] rdiags = check_root_program!(raw, zero_root, rz.maps)
 	const [Diag] gdiags = sort_diags([...adiags, ...rdiags])
 
 	if Iarch(gdiags.len) > 0 then return gdiags
 
-	const MonoOut mo = mono_program!(raw)
+	const MonoFill mf = mono_and_fill!(raw)
 
-	if Iarch(mo.diags.len) > 0 then return sort_diags(mo.diags)
+	if Iarch(mf.diags.len) > 0 then return sort_diags(mf.diags)
 
-	const Program mono = mo.prog
+	const Program mono = mf.prog
 	const Mat mm = materialize_program!(mono, raw)
 	const Program prog = mm.prog
 	const [Diag] tdiags = check_program!(prog, input, false, rz.maps)
@@ -229,6 +244,173 @@ pub const check! = (Str input, Str src, Os target_os, Arch target_arch, Iarch ro
 	check_geom_escape!(lowered)
 
 	return []
+}
+
+# The deduced-type rows of every LOCAL binding in `input`'s own declarations — the LSP
+# hover's type oracle (the `cf lsp type` child). The front half of `check!` (resolve,
+# monomorph + return fill, materialize) followed by a LOGGED typecheck of the entry's
+# functions — the live (materialized) table AND the declarations Materialize pruned as
+# unreachable, so an uncalled function still answers hover. No diagnostics are collected:
+# a mid-edit tree yields whatever rows the checker reached, and the caller falls back when
+# the queried binding finds none. The passes before typecheck still die fail-fast — the
+# child process boundary absorbs that, exactly like `cf check`.
+pub const type_rows! = (Str input, Str src, Os target_os, Arch target_arch): [TyRow] -> {
+	const Resolved rz = resolve_program!(input, src, target_os, target_arch, false, false)
+	const Program raw = rz.prog
+	const MonoFill mf = mono_and_fill!(raw)
+	const Program mono = mf.prog
+	const Mat mm = materialize_program!(mono, raw)
+	const Program prog = mm.prog
+	const [TyRow] live = check_types!(prog.funcs, prog.funcs, prog.recs, prog.unions, rz.maps, input)
+
+	const [TyRow] pruned = check_types!(
+		mm.dropped,
+		mono.funcs,
+		mono.recs,
+		mono.unions,
+		rz.maps,
+		input,
+	)
+
+	return [...live, ...pruned]
+}
+
+# The DEDUCED return spelling of the function `name` declared in `input` — the hover
+# signature's tail when the written declaration omits it (`cf lsp type`'s function branch).
+# Resolve + monomorph/fill, then: a CONCRETE function fills in place under its own name
+# (`ret_hover!` renders the slot). A generic TEMPLATE is gone post-mono, so its return is
+# read back off its INSTANCES: each `name$A$B...` instance's filled return compares against
+# its own type arguments — a position that matches across every instance names the template's
+# type parameter (`twice$Iarch: Iarch` + `twice$Str: Str` → `'A`); otherwise a return every
+# instance agrees on is itself the answer; disagreement (or no instances — an uncalled
+# template) yields "". Empty on any miss — the caller just shows the signature bare.
+pub const fn_ret_hover! = (Str input, Str src, Os target_os, Arch target_arch, Str name): Str -> {
+	const Resolved rz = resolve_program!(input, src, target_os, target_arch, false, false)
+	const Program raw = rz.prog
+	const MonoFill mf = mono_and_fill!(raw)
+
+	for f in mf.prog.funcs {
+		if eq(f.name, name) then return ret_hover!(f)
+	}
+
+	# the template's type parameters (`'A`, `'B`) — gone from the mono table, read from raw
+	let [Str] typarams = []
+	let Bool found = false
+
+	for f in raw.funcs {
+		if eq(f.name, name) && Iarch(f.typarams.len) > 0 then {
+			typarams = [...typarams, ...f.typarams]
+			found = true
+		}
+	}
+
+	if !found then return ""
+	const Iarch np = Iarch(typarams.len)
+	# walk the instances: `live[k]` — typaram k still matches every instance's return
+	let [Bool] live = []
+	let Iarch k0 = 0
+
+	loop {
+		if k0 >= np then break
+		live = [...live, true]
+		k0 = k0 + 1
+	}
+
+	let Str uniform = ""
+	let Bool same = true
+	let Iarch seen = 0
+
+	for f in mf.prog.funcs {
+		const [Str] tyargs = inst_tyargs(f.name, name)
+		if Iarch(tyargs.len) != np then continue
+		const Str r = ret_hover!(f)
+		if Iarch(r.len) == 0 then continue
+		seen = seen + 1
+		if seen == 1 then uniform = r
+		if !eq(r, uniform) then same = false
+		let [Bool] nl = []
+
+		for (was, k) in live {
+			nl = [...nl, was && eq(r, tyargs[k])]
+		}
+
+		live = nl
+	}
+
+	if seen == 0 then return ""
+	let Iarch hit = -1
+
+	for (ok, k) in live {
+		if ok && hit < 0 then hit = k
+	}
+
+	if hit >= 0 then return typarams[hit]
+	if same then return uniform
+
+	return ""
+}
+
+# The `$`-joined type arguments of the instance name `iname` minted from the template
+# `base` (`twice$Iarch` → ["Iarch"]), or the empty list when `iname` is no such instance.
+const inst_tyargs = (Str iname, Str base): [Str] -> {
+	let [Str] none = []
+	const Iarch bn = Iarch(base.len)
+	if Iarch(iname.len) < bn + 2 then return none
+	let Iarch i = 0
+
+	loop {
+		if i >= bn then break
+		if Iarch(iname[i]) != Iarch(base[i]) then return none
+		i = i + 1
+	}
+
+	if Iarch(iname[bn]) != 36 then return none
+	let [Str] args = []
+	let Iarch a0 = bn + 1
+	let Iarch j = a0
+
+	loop {
+		if j > Iarch(iname.len) then break
+
+		if j == Iarch(iname.len) || Iarch(iname[j]) == 36 then {
+			args = [...args, slice(a0, j, iname)]
+			a0 = j + 1
+		}
+
+		j = j + 1
+	}
+
+	return args
+}
+
+data MonoFill = { Program prog, [Diag] diags }
+
+# Monomorphize, fill omitted returns, and ITERATE while a fill is material to inference: a
+# non-word derived return (a union instance, `Str`, an array, a tuple) that the monomorph
+# round read as the blank word default — mis-resolving a match arm's union or a generic
+# call's type argument — grafts onto the raw program, and the round reruns SEEDED with the
+# type instances already minted (so an instance-named return like `Maybe$Iarch` resolves
+# regardless of walk order). The fill pass runs even on a diag-carrying round (its typing
+# skips what it cannot resolve): the diags may be exactly what the graft fixes, so only the
+# FINAL round's survive. No material fill — the common case; a word-typed fill changes
+# nothing the monomorph pass can observe — means a single round, as before.
+const mono_and_fill! = (Program raw): MonoFill -> {
+	let Program mraw = raw
+	let MonoOut mo = mono_program!(mraw, no_mono_seed())
+	let Program filled = retfill_program!(mo.prog)
+	let Iarch rounds = 0
+
+	loop {
+		if rounds >= 3 then break
+		const Grafted g = graft_rets(mraw, filled)
+		if !g.material then break
+		mraw = g.prog
+		mo = mono_program!(mraw, mono_seed_of(mo))
+		filled = retfill_program!(mo.prog)
+		rounds = rounds + 1
+	}
+
+	return MonoFill({ prog: filled, diags: mo.diags })
 }
 
 # Extract the opened `Fd` from `create`'s outcome, or `die` with `msg` if it failed. `die` never
