@@ -756,7 +756,7 @@ data Bind = { Str from, Str to }
 # One loaded module, kept UNMANGLED as the resolution source-of-truth. `prefix` is the sanitized
 # import path that loaded it (empty for the entry); `mpath` the resolved file path (the dedup key);
 # `is_geom`/`tag` mark a fixed-suffix geometry module. `prog` is its parsed surface.
-data Modu = { Str prefix, Str mpath, Bool is_geom, Str tag, Program prog }
+data Modu = { Str prefix, Str mpath, Bool is_geom, Str tag, Str ipath, Program prog }
 # The constant resolution context. `mods` is every loaded module; `edir` the entry directory
 # relative import paths resolve against (the brick-narrowing: all relative imports resolve against
 # the entry, matching the loader); `itargets[m][k]` is the module index that module `m`'s import
@@ -2718,7 +2718,9 @@ const cat_src_n = ([Str] xs, Iarch n, Str s): [Str] -> {
 }
 
 # The resolved whole-program AST plus every module's line table (spans.cf).
-pub data Resolved = { Program prog, [SrcMap] maps }
+# `modpaths` is the `/`-separated import path of every loaded module (the entry omitted — its names
+# stay bare), so a downstream diagnostic can recover a mangled callee's source spelling.
+pub data Resolved = { Program prog, [SrcMap] maps, [Str] modpaths }
 
 pub const resolve_program! = (
 	Str entry,
@@ -2733,7 +2735,7 @@ pub const resolve_program! = (
 	const Program root = l0.prog
 	let [SrcMap] maps = [l0.map]
 	# the entry is prefix-empty (its names stay bare — it fixes the naming frame)
-	let [Modu] mods = [Modu({ prefix: "", mpath: entry, is_geom: false, tag: "", prog: root })]
+	let [Modu] mods = [Modu({ prefix: "", mpath: entry, is_geom: false, tag: "", ipath: "", prog: root })]
 	let [Import] work = []
 	# `wsrc[k]` names the module whose import list contributed `work[k]` — a missing file
 	# then reports its importer, not just the unresolvable path
@@ -2818,7 +2820,14 @@ pub const resolve_program! = (
 				const Program m = if is_floor_impl(im.path) then tag_floor_syms(m0) else m0
 				mods = [
 					...mods,
-					Modu({ prefix: sanitize_prefix!(im.path), mpath: mpath, is_geom: geom, tag: mtag, prog: m }),
+					Modu({
+						prefix: sanitize_prefix!(im.path),
+						mpath: mpath,
+						is_geom: geom,
+						tag: mtag,
+						ipath: im.path,
+						prog: m,
+					}),
 				]
 				work = cat_imports(work, m.imports)
 				wsrc = cat_src_n(wsrc, Iarch(m.imports.len), mpath)
@@ -2869,6 +2878,8 @@ pub const resolve_program! = (
 	let [UnionDecl] unions = []
 	let [Func] funcs = []
 	let [RecDecl] groups = []
+	# the import path of every non-entry module, for demangling callees in diagnostics
+	let [Str] modpaths = []
 	let Iarch mi = 0
 
 	loop {
@@ -2877,6 +2888,7 @@ pub const resolve_program! = (
 		unions = cat_unions(unions, mods[mi].prog.unions)
 		groups = cat_recs(groups, mods[mi].prog.groups) # grouped-parameter `type` decls (splatted below)
 		funcs = cat_funcs(funcs, mangle_module_funcs!(mi, rc))
+		if Iarch(mods[mi].ipath.len) > 0 then modpaths = [...modpaths, mods[mi].ipath]
 		mi = mi + 1
 	}
 
@@ -2903,5 +2915,5 @@ pub const resolve_program! = (
 		groups: nogroups,
 	})
 
-	return Resolved({ prog: rp, maps: maps })
+	return Resolved({ prog: rp, maps: maps, modpaths: modpaths })
 }

@@ -109,6 +109,10 @@ pub data Ctx = {
 	Iarch dline,
 	Iarch dcol,
 	[SrcMap] maps,
+	# the `/`-separated import path of every loaded module (module_system §8), so a diagnostic can
+	# recover a mangled callee's source spelling (`std_io_fd_stdout` → `std::io::fd::stdout`). Empty
+	# on the inference/hover ctxs, where the raw mangled name is an acceptable fallback.
+	[Str] modpaths,
 }
 
 # Record a rejection stamped with the CURRENTLY-CHECKED declaration's `path:line:col` (the Ctx
@@ -1896,6 +1900,80 @@ const callee_is_intrinsic_tc = (Ctx ctx, *DiagBag dg, Str n): Bool -> {
 	return ctx.funcs[i].is_intrinsic
 }
 
+# Does the flat `callee` read `<modpath-sanitized>_<member>` with a non-empty member? A module's
+# `/`-separated import path corresponds to `_` in the mangled prefix (`std/io/fd` heads
+# `std_io_fd_stdout`). Returns the module-prefix length matched in `callee`, or -1.
+const mod_prefix_match = (Str callee, Str modpath): Iarch -> {
+	const Iarch m = Iarch(modpath.len)
+	if m == 0 then return -1
+	if Iarch(callee.len) <= m + 1 then return -1
+	let Iarch i = 0
+
+	loop {
+		if i >= m then break
+		# a `/` in the import path is a `_` in the sanitized flat prefix (resolve's `sanitize_prefix!`)
+		const Iarch want = if Iarch(modpath[i]) == 47 then 95 else Iarch(modpath[i])
+		if Iarch(callee[i]) != want then return -1
+		i = i + 1
+	}
+
+	# a `_` must separate the module prefix from the member, else the prefix matched mid-segment
+	if Iarch(callee[m]) != 95 then return -1
+
+	return m
+}
+
+# An import path in source spelling: `/`→`::` (`std/io/fd` → `std::io::fd`).
+const path_to_ns! = (Str p): Str -> {
+	let [Uint8] v = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(p.len) then break
+
+		if Iarch(p[i]) == 47 then {
+			v = [...v, 58]
+			v = [...v, 58]
+		} else {
+			v = [...v, p[i]]
+		}
+
+		i = i + 1
+	}
+
+	return Str(v)
+}
+
+# The source spelling of a mangled callee for diagnostics: the flatten mangles a module-qualified
+# call `std::io::fd::stdout` to the flat `std_io_fd_stdout` (module_system §8), erasing the `::`
+# boundaries — so an "undefined function" report would otherwise name a function that appears
+# nowhere in source. Recover the display form by matching the callee against the loaded modules'
+# import paths: the LONGEST module path heading the callee names the module, and the remainder is
+# the member. A bare name matching no module (a local, or the entry's own unmangled function) is
+# returned unchanged.
+const callee_display! = (Str callee, [Str] modpaths): Str -> {
+	let Iarch best = -1
+	let Iarch bestlen = -1
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(modpaths.len) then break
+		const Iarch m = mod_prefix_match(callee, modpaths[i])
+
+		if m > bestlen then {
+			best = i
+			bestlen = m
+		}
+
+		i = i + 1
+	}
+
+	if best < 0 then return callee
+	const Str member = slice(bestlen + 1, Iarch(callee.len), callee)
+
+	return "${path_to_ns!(modpaths[best])}::${member}"
+}
+
 const call_type! = (Str callee, [Str] tyargs, [Expr] args, [VarTy] env, Ctx ctx, *DiagBag dg): Ty -> {
 	# the geometry constructor intrinsics (`fixed_arena.of(n)` / `growing_arena.of(n)`) yield an
 	# opaque node HANDLE — a pointer-sized value the compiler threads but never inspects; typed
@@ -2042,7 +2120,12 @@ const call_type! = (Str callee, [Str] tyargs, [Expr] args, [VarTy] env, Ctx ctx,
 		if is_tfn(env[cei].ty) then return indirect_call_type!(env[cei].ty, args, env, ctx, dg)
 	}
 	const Iarch fidx = find_func(ctx.funcs, callee)
-	if fidx < 0 then return terr(ctx, dg, "cf: type: call to an undefined function `${callee}`\n")
+	if fidx < 0
+		then return terr(
+		ctx,
+		dg,
+		"cf: type: call to an undefined function `${callee_display!(callee, ctx.modpaths)}`\n",
+	)
 	const Iarch np = Iarch(ctx.funcs[fidx].params.len)
 	const Iarch na = Iarch(args.len)
 	if np != na then return terr(ctx, dg, "cf: type: wrong number of call arguments\n")
@@ -5119,6 +5202,7 @@ const check_closure! = (
 		dline: ctx.dline,
 		dcol: ctx.dcol,
 		maps: ctx.maps,
+		modpaths: ctx.modpaths,
 	})
 	let [VarTy] cenv = env
 	let Iarch pi = 0
@@ -5638,6 +5722,7 @@ const check_func! = (Func fn, Ctx ctx, *DiagBag dg): Iarch -> {
 		dline: fn.dline,
 		dcol: fn.dcol,
 		maps: ctx.maps,
+		modpaths: ctx.modpaths,
 	})
 	let [VarTy] env = []
 	let Iarch pi = 0
@@ -5975,7 +6060,13 @@ const check_whole = (Program prog, Str entry, Bool require_main, *DiagBag dg): [
 # Typecheck the whole program: its structure, then every function. This phase is the
 # authority for all semantic validation; the emitter does no re-checking. `require_main`
 # gates the entry-point rejection: `compile!` demands one, `check!` (a module tree) does not.
-pub const check_program! = (Program prog, Str entry, Bool require_main, [SrcMap] maps): [Diag] -> {
+pub const check_program! = (
+	Program prog,
+	Str entry,
+	Bool require_main,
+	[SrcMap] maps,
+	[Str] modpaths,
+): [Diag] -> {
 	let DiagBag bag = record_dg()
 	let [Diag] diags = check_whole(prog, entry, require_main, &bag)
 	let Ctx ctx = Ctx({
@@ -5988,6 +6079,7 @@ pub const check_program! = (Program prog, Str entry, Bool require_main, [SrcMap]
 		dline: 0,
 		dcol: 0,
 		maps: maps,
+		modpaths: modpaths,
 	})
 	let Iarch f = 0
 
@@ -6027,6 +6119,7 @@ pub const check_unreachable! = (
 	[RecDecl] recs,
 	[UnionDecl] unions,
 	[SrcMap] maps,
+	[Str] modpaths,
 ): [Diag] -> {
 	let DiagBag bag = record_dg()
 	let [Diag] diags = []
@@ -6040,6 +6133,7 @@ pub const check_unreachable! = (
 		dline: 0,
 		dcol: 0,
 		maps: maps,
+		modpaths: modpaths,
 	})
 	let Iarch f = 0
 
@@ -6146,6 +6240,7 @@ pub const check_types! = (
 		dline: 0,
 		dcol: 0,
 		maps: maps,
+		modpaths: [],
 	})
 	let Iarch f = 0
 
