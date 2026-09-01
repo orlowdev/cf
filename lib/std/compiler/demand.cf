@@ -81,6 +81,39 @@ const cat_i = ([Iarch] a, [Iarch] b): [Iarch] -> {
 	return r
 }
 
+const no_b = (): [Bool] -> {
+	let [Bool] e = []
+
+	return e
+}
+
+const one_b = (Bool a): [Bool] -> {
+	let [Bool] r = [a]
+
+	return r
+}
+
+const cat_b = ([Bool] a, [Bool] b): [Bool] -> {
+	let [Bool] r = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(a.len) then break
+		r = [...r, a[i]]
+		i = i + 1
+	}
+
+	let Iarch j = 0
+
+	loop {
+		if j >= Iarch(b.len) then break
+		r = [...r, b[j]]
+		j = j + 1
+	}
+
+	return r
+}
+
 const has_s = ([Str] xs, Str s): Bool -> {
 	let Iarch i = 0
 
@@ -149,6 +182,19 @@ const minus_s = ([Str] a, [Str] b): [Str] -> {
 	}
 
 	return r
+}
+
+# Does any element of `a` appear in `b`?
+const any_in = ([Str] a, [Str] b): Bool -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(a.len) then break
+		if has_s(b, a[i]) then return true
+		i = i + 1
+	}
+
+	return false
 }
 
 const find_func = ([Func] fs, Str n): Iarch -> {
@@ -321,6 +367,284 @@ const anns_stmt = (Ann an, Stmt s): Ann -> {
 
 const var_name = (Expr e): Str -> match unat(e) { Expr.Var(n) -> n, _ -> "" }
 
+# ── mutation detection: which context types a function mutates in place (context.md §3) ───────────
+# A `let s = consume(T)` binds a MUTABLE view of the provided `T`; a field/index write through `s`
+# is an in-place mutation of that context — a MUTATING demand for `T`, which only a `let` provide
+# may discharge. We first collect the mutable consume bindings (name → type), then the writes.
+data MB = { [Str] names, [Str] tys }
+
+const mb_ty = (MB mb, Str name): Str -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(mb.names.len) then break
+		if eq(mb.names[i], name) then return mb.tys[i]
+		i = i + 1
+	}
+
+	return ""
+}
+
+# The type a `let x = consume(T)` binding names, or "" (not a mutable consume binding).
+const consume_bind_ty = (Stmt s): Str -> match s {
+	Stmt.Let(_, mut, _, init) -> if mut
+		then match unat(init) {
+			Expr.Call(n, _, a, _) -> if eq(n, consume_fn) && Iarch(a.len) >= 1 then var_name(a[0]) else "",
+			_ -> "",
+		}
+		else "",
+	_ -> "",
+}
+
+const mbinds_arms = (MB m, [StmtArm] arms): MB -> {
+	let MB a = m
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(arms.len) then break
+		a = mbinds_body(a, arms[i].body)
+		i = i + 1
+	}
+
+	return a
+}
+
+const mbinds_stmt = (MB m, Stmt s): MB -> {
+	let MB a = m
+	const Str t = consume_bind_ty(s)
+	if Iarch(t.len) > 0 then a = MB({ names: [...a.names, let_ann_name(s)], tys: [...a.tys, t] })
+
+	return match s {
+		Stmt.IfThen(_, b) -> mbinds_stmt(a, b),
+		Stmt.IfElse(_, tb, el) -> mbinds_stmt(mbinds_stmt(a, tb), el),
+		Stmt.Block(ss) -> mbinds_body(a, ss),
+		Stmt.Loop(_, ss) -> mbinds_body(a, ss),
+		Stmt.ForIn(_, _, ss) -> mbinds_body(a, ss),
+		Stmt.Match(_, arms) -> mbinds_arms(a, arms),
+		Stmt.Defer(ss) -> mbinds_body(a, ss),
+		Stmt.Closure(_, _, _, cb) -> mbinds_body(a, cb),
+		_ -> a,
+	}
+}
+
+const mbinds_body = (MB m, [Stmt] ss): MB -> {
+	let MB a = m
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(ss.len) then break
+		a = mbinds_stmt(a, ss[i])
+		i = i + 1
+	}
+
+	return a
+}
+
+# The root NAME of a chained lvalue's base (`a.b.c = v` → `a`), or "" for a non-name root.
+const deep_root = (Expr e): Str -> match unat(e) {
+	Expr.Var(n) -> n,
+	Expr.Field(b, _) -> b,
+	Expr.FieldExpr(b, _) -> deep_root(b),
+	Expr.Index(b, _) -> b,
+	Expr.IndexField(b, _, _) -> b,
+	Expr.IndexExpr(b, _) -> deep_root(b),
+	_ -> "",
+}
+
+# The context types a statement (transitively) mutates in place through a mutable consume binding.
+const own_mut_arms = (MB mb, [StmtArm] arms): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(arms.len) then break
+		r = cat_s(r, own_mut_body(mb, arms[i].body))
+		i = i + 1
+	}
+
+	return r
+}
+
+const own_mut_stmt = (MB mb, Stmt s): [Str] -> {
+	const [Str] here = match s {
+		Stmt.FieldAssign(base, _, _) -> one_or_none(mb_ty(mb, base)),
+		Stmt.IndexAssign(base, _, _) -> one_or_none(mb_ty(mb, base)),
+		Stmt.DeepFieldAssign(be, _, _) -> one_or_none(mb_ty(mb, deep_root(be))),
+		_ -> no_s(),
+	}
+
+	return cat_s(here, match s {
+		Stmt.IfThen(_, b) -> own_mut_stmt(mb, b),
+		Stmt.IfElse(_, tb, el) -> cat_s(own_mut_stmt(mb, tb), own_mut_stmt(mb, el)),
+		Stmt.Block(ss) -> own_mut_body(mb, ss),
+		Stmt.Loop(_, ss) -> own_mut_body(mb, ss),
+		Stmt.ForIn(_, _, ss) -> own_mut_body(mb, ss),
+		Stmt.Match(_, arms) -> own_mut_arms(mb, arms),
+		Stmt.Defer(ss) -> own_mut_body(mb, ss),
+		Stmt.Closure(_, _, _, cb) -> own_mut_body(mb, cb),
+		_ -> no_s(),
+	})
+}
+
+const one_or_none = (Str t): [Str] -> if Iarch(t.len) > 0 then one_s(t) else no_s()
+
+const own_mut_body = (MB mb, [Stmt] ss): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(ss.len) then break
+		r = cat_s(r, own_mut_stmt(mb, ss[i]))
+		i = i + 1
+	}
+
+	return r
+}
+
+# The context types function `f` mutates directly (before propagation) — the union over its body.
+const own_mut! = (Func f): [Str] -> {
+	const MB empty = MB({ names: no_s(), tys: no_s() })
+	const MB mb = mbinds_body(empty, f.body)
+
+	return union_s(own_mut_body(mb, f.body), no_s())
+}
+
+# ── the repointing rejection (§3): a let-ctx aggregate field held in place ────────────────────────
+# In-place mutation of a `let` provide is fine (a scalar or inline field); REPOINTING an aggregate
+# (pointer) field at a consumer-fresh construction is not — the value was born in a descendant arena
+# that dies before the provider's, so the record would outlive what it points at. Detected as a
+# `s.field = <construction>` where `s` is a mutable consume binding and `field` is a pointer slot.
+
+# The declared field-type name of `field` in record `t` (or "").
+const rec_field_ftype = ([RecDecl] recs, Str t, Str field): Str -> {
+	const Iarch ri = find_rec(recs, t)
+	if ri < 0 then return ""
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(recs[ri].fields.len) then break
+		if eq(recs[ri].fields[i], field) then return recs[ri].ftypes[i]
+		i = i + 1
+	}
+
+	return ""
+}
+
+# Is `ft` a POINTER field slot — a record, a `$dyn` array, a `Str`, or a raw `$ptr`? (A scalar word,
+# a fixed-width, or an inline `$fix` array is stored in place, never repointed, so it is safe.)
+const is_ptr_ftype = ([RecDecl] recs, Str ft): Bool -> {
+	if eq(ft, "$dyn") then return true
+	if eq(ft, "Str") then return true
+	if eq(ft, "$ptr") then return true
+
+	return find_rec(recs, ft) >= 0
+}
+
+# Is `e` a fresh aggregate construction (born in this frame)?
+const is_fresh_agg = (Expr e): Bool -> match unat(e) {
+	Expr.Record(_, _) -> true,
+	Expr.ArrayLit(_, _, _, _) -> true,
+	Expr.Tuple(_) -> true,
+	Expr.Buffer(_) -> true,
+	Expr.Interp(_) -> true,
+	Expr.UnionMk(_, _, _) -> true,
+	_ -> false,
+}
+
+const cat_d = ([Diag] a, [Diag] b): [Diag] -> {
+	let [Diag] r = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(a.len) then break
+		r = [...r, a[i]]
+		i = i + 1
+	}
+
+	let Iarch j = 0
+
+	loop {
+		if j >= Iarch(b.len) then break
+		r = [...r, b[j]]
+		j = j + 1
+	}
+
+	return r
+}
+
+const repoint_off_arms = (MB mb, [RecDecl] recs, [StmtArm] arms): [Iarch] -> {
+	let [Iarch] r = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(arms.len) then break
+		r = cat_i(r, repoint_off_body(mb, recs, arms[i].body))
+		i = i + 1
+	}
+
+	return r
+}
+
+const repoint_off_stmt = (MB mb, [RecDecl] recs, Stmt s): [Iarch] -> {
+	const [Iarch] here = match s {
+		Stmt.FieldAssign(base, field, val) -> if Iarch(mb_ty(mb, base).len) > 0 &&
+			is_ptr_ftype(recs, rec_field_ftype(recs, mb_ty(mb, base), field)) &&
+			is_fresh_agg(val)
+				then one_i(at_off(val))
+				else no_i(),
+		_ -> no_i(),
+	}
+
+	return cat_i(here, match s {
+		Stmt.IfThen(_, b) -> repoint_off_stmt(mb, recs, b),
+		Stmt.IfElse(_, tb, el) -> cat_i(repoint_off_stmt(mb, recs, tb), repoint_off_stmt(mb, recs, el)),
+		Stmt.Block(ss) -> repoint_off_body(mb, recs, ss),
+		Stmt.Loop(_, ss) -> repoint_off_body(mb, recs, ss),
+		Stmt.ForIn(_, _, ss) -> repoint_off_body(mb, recs, ss),
+		Stmt.Match(_, arms) -> repoint_off_arms(mb, recs, arms),
+		Stmt.Defer(ss) -> repoint_off_body(mb, recs, ss),
+		Stmt.Closure(_, _, _, cb) -> repoint_off_body(mb, recs, cb),
+		_ -> no_i(),
+	})
+}
+
+const repoint_off_body = (MB mb, [RecDecl] recs, [Stmt] ss): [Iarch] -> {
+	let [Iarch] r = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(ss.len) then break
+		r = cat_i(r, repoint_off_stmt(mb, recs, ss[i]))
+		i = i + 1
+	}
+
+	return r
+}
+
+const repoint_diags! = (Func f, [RecDecl] recs, [SrcMap] maps): [Diag] -> {
+	const MB empty = MB({ names: no_s(), tys: no_s() })
+	const MB mb = mbinds_body(empty, f.body)
+	const [Iarch] offs = repoint_off_body(mb, recs, f.body)
+	let [Diag] r = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(offs.len) then break
+		r = [
+			...r,
+			dg_at(
+				f,
+				maps,
+				offs[i],
+				"cf: ctx: `${f.name}` repoints a `let`-context aggregate field at a fresh value — context mutation is in-place only (the fresh value dies before the provider)\n",
+			),
+		]
+		i = i + 1
+	}
+
+	return r
+}
+
 # The type a `provide(arg)` provides: a record literal names it directly (`provide(Cfg({...}))`); a
 # bare name resolves through the annotation environment; anything else is indeterminable ("").
 const provide_ty = (Ann an, Expr arg): Str -> match unat(arg) {
@@ -329,46 +653,96 @@ const provide_ty = (Ann an, Expr arg): Str -> match unat(arg) {
 	_ -> "",
 }
 
-# The site sets a function's body yields, threaded through one walk. `provs`/`provoffs` are RAW and
-# parallel (one entry per provide site, `provoffs` the site's source offset for a located
-# diagnostic) — an indeterminable provide keeps its `""` here so the check can report it precisely.
-data Scan = { [Str] cons, [Str] provs, [Iarch] provoffs, [Str] calls }
+# Whether a call's tyargs carry the `$let` sentinel — a mutable provide `provide(let x)` (§2).
+const has_let_ty = ([Str] ta): Bool -> {
+	let Iarch i = 0
 
-const scan_empty = (): Scan -> Scan({ cons: no_s(), provs: no_s(), provoffs: no_i(), calls: no_s() })
+	loop {
+		if i >= Iarch(ta.len) then break
+		if eq(ta[i], "$let") then return true
+		i = i + 1
+	}
+
+	return false
+}
+
+# The site sets a function's body yields, threaded through one walk. `provs`/`provmut`/`provoffs` are
+# RAW and parallel (one entry per provide site: type, mutable-mode, source offset). `letmis` holds
+# the offsets of a `$let` marker on a NON-provide call (a misplaced `let`), reported explicitly.
+data Scan = { [Str] cons, [Str] provs, [Bool] provmut, [Iarch] provoffs, [Str] calls, [Iarch] letmis }
+
+const scan_empty = (): Scan -> Scan({
+	cons: no_s(),
+	provs: no_s(),
+	provmut: no_b(),
+	provoffs: no_i(),
+	calls: no_s(),
+	letmis: no_i(),
+})
 
 const scan_cat = (Scan a, Scan b): Scan -> Scan({
 	cons: cat_s(a.cons, b.cons),
 	provs: cat_s(a.provs, b.provs),
+	provmut: cat_b(a.provmut, b.provmut),
 	provoffs: cat_i(a.provoffs, b.provoffs),
 	calls: cat_s(a.calls, b.calls),
+	letmis: cat_i(a.letmis, b.letmis),
 })
 
-const scan_l! = (Ann an, [Str] params, [Expr] es): Scan -> {
+const scan_l = (Ann an, [Str] params, [Expr] es): Scan -> {
 	let Scan r = scan_empty()
 	let Iarch i = 0
 
 	loop {
 		if i >= Iarch(es.len) then break
-		r = scan_cat(r, scan_e!(an, params, es[i]))
+		r = scan_cat(r, scan_e(an, params, es[i]))
 		i = i + 1
 	}
 
 	return r
 }
 
-const scan_e! = (Ann an, [Str] params, Expr e): Scan -> {
+const sc_cons = (Str t): Scan -> Scan({
+	cons: one_s(t),
+	provs: no_s(),
+	provmut: no_b(),
+	provoffs: no_i(),
+	calls: no_s(),
+	letmis: no_i(),
+})
+
+const sc_prov = (Str t, Bool m, Iarch off): Scan -> Scan({
+	cons: no_s(),
+	provs: one_s(t),
+	provmut: one_b(m),
+	provoffs: one_i(off),
+	calls: no_s(),
+	letmis: no_i(),
+})
+
+const sc_call = (Str nm, [Iarch] mis): Scan -> Scan({
+	cons: no_s(),
+	provs: no_s(),
+	provmut: no_b(),
+	provoffs: no_i(),
+	calls: one_s(nm),
+	letmis: mis,
+})
+
+const scan_e = (Ann an, [Str] params, Expr e): Scan -> {
 	let Scan h = scan_empty()
 	const Iarch off = at_off(e)
 
 	match unat(e) {
-		Expr.Call(n, _, a, _) -> {
-			if eq(n, consume_fn) && Iarch(a.len) >= 1 then h = Scan({ cons: one_s(var_name(a[0])), provs: no_s(), provoffs: no_i(), calls: no_s() })
-			if eq(n, provide_fn) && Iarch(a.len) >= 1 then h = Scan({ cons: no_s(), provs: one_s(provide_ty(an, a[0])), provoffs: one_i(off), calls: no_s() })
+		Expr.Call(n, ta, a, _) -> {
+			if eq(n, consume_fn) && Iarch(a.len) >= 1 then h = sc_cons(var_name(a[0]))
+			if eq(n, provide_fn) && Iarch(a.len) >= 1 then h = sc_prov(provide_ty(an, a[0]), has_let_ty(ta), off)
+			# a `$let` marker on any OTHER call is a misplaced `let` (it marks a provide's value only)
 			if !eq(n, consume_fn) && !eq(n, provide_fn) && !has_s(params, n)
-				then h = Scan({ cons: no_s(), provs: no_s(), provoffs: no_i(), calls: one_s(n) })
+				then h = sc_call(n, if has_let_ty(ta) then one_i(off) else no_i())
 		},
 		Expr.DeferTap(f, _) -> {
-			if !has_s(params, f) then h = Scan({ cons: no_s(), provs: no_s(), provoffs: no_i(), calls: one_s(f) })
+			if !has_s(params, f) then h = sc_call(f, no_i())
 		},
 		_ -> { },
 	}
@@ -376,49 +750,49 @@ const scan_e! = (Ann an, [Str] params, Expr e): Scan -> {
 	# recurse over the children of the UNWRAPPED node: `kids` of an `At` wrapper re-yields the node
 	# itself, which would re-scan (and double-count) this very call — so descend through `unat(e)`.
 	const Scan sub = match unat(e) {
-		Expr.Loop(ss) -> scan_b!(an, params, ss),
-		_ -> scan_l!(an, params, kids(unat(e))),
+		Expr.Loop(ss) -> scan_b(an, params, ss),
+		_ -> scan_l(an, params, kids(unat(e))),
 	}
 
 	return scan_cat(h, sub)
 }
 
-const scan_arms! = (Ann an, [Str] params, [StmtArm] arms): Scan -> {
+const scan_arms = (Ann an, [Str] params, [StmtArm] arms): Scan -> {
 	let Scan r = scan_empty()
 	let Iarch i = 0
 
 	loop {
 		if i >= Iarch(arms.len) then break
-		r = scan_cat(r, scan_b!(an, params, arms[i].body))
+		r = scan_cat(r, scan_b(an, params, arms[i].body))
 		i = i + 1
 	}
 
 	return r
 }
 
-const scan_stmt! = (Ann an, [Str] params, Stmt s): Scan -> {
-	let Scan a = scan_l!(an, params, stmt_exprs(s))
+const scan_stmt = (Ann an, [Str] params, Stmt s): Scan -> {
+	let Scan a = scan_l(an, params, stmt_exprs(s))
 
 	return scan_cat(a, match s {
-		Stmt.IfThen(_, b) -> scan_stmt!(an, params, b),
-		Stmt.IfElse(_, t, el) -> scan_cat(scan_stmt!(an, params, t), scan_stmt!(an, params, el)),
-		Stmt.Block(ss) -> scan_b!(an, params, ss),
-		Stmt.Loop(_, ss) -> scan_b!(an, params, ss),
-		Stmt.ForIn(_, _, ss) -> scan_b!(an, params, ss),
-		Stmt.Match(_, arms) -> scan_arms!(an, params, arms),
-		Stmt.Defer(ss) -> scan_b!(an, params, ss),
-		Stmt.Closure(_, _, _, cb) -> scan_b!(an, params, cb),
+		Stmt.IfThen(_, b) -> scan_stmt(an, params, b),
+		Stmt.IfElse(_, t, el) -> scan_cat(scan_stmt(an, params, t), scan_stmt(an, params, el)),
+		Stmt.Block(ss) -> scan_b(an, params, ss),
+		Stmt.Loop(_, ss) -> scan_b(an, params, ss),
+		Stmt.ForIn(_, _, ss) -> scan_b(an, params, ss),
+		Stmt.Match(_, arms) -> scan_arms(an, params, arms),
+		Stmt.Defer(ss) -> scan_b(an, params, ss),
+		Stmt.Closure(_, _, _, cb) -> scan_b(an, params, cb),
 		_ -> scan_empty(),
 	})
 }
 
-const scan_b! = (Ann an, [Str] params, [Stmt] ss): Scan -> {
+const scan_b = (Ann an, [Str] params, [Stmt] ss): Scan -> {
 	let Scan r = scan_empty()
 	let Iarch i = 0
 
 	loop {
 		if i >= Iarch(ss.len) then break
-		r = scan_cat(r, scan_stmt!(an, params, ss[i]))
+		r = scan_cat(r, scan_stmt(an, params, ss[i]))
 		i = i + 1
 	}
 
@@ -466,6 +840,24 @@ const raw_demand = ([Func] funcs, [[Str]] residual, [Str] cons, [Str] calls): [S
 	return r
 }
 
+# The raw MUTATION demand: the types a function mutates itself, unioned with its callees' mutation
+# demands. Always inferred (whole-program), so a callee contributes its own `mres` — no `pub`
+# declaration of mutation (a mutating demand needs only the read `uses T`; the mode is checked at
+# the provide).
+const raw_mut = ([Func] funcs, [[Str]] mres, [Str] omut, [Str] calls): [Str] -> {
+	let [Str] r = omut
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(calls.len) then break
+		const Iarch j = find_func(funcs, calls[i])
+		if j >= 0 then r = union_s(r, mres[j])
+		i = i + 1
+	}
+
+	return r
+}
+
 # ── evidence: locate a provide/consume in a body, for a precise diagnostic anchor ────────────────
 
 const at_off = (Expr e): Iarch -> match e { Expr.At(o, _) -> o, _ -> -1 }
@@ -486,7 +878,17 @@ const dg_at = (Func f, [SrcMap] maps, Iarch off, Str msg): Diag -> {
 # and the STAMP (which writes it onto `Func.uses` for emit). `provs`/`provoffs` stay RAW and
 # parallel — one entry per provide site — so the check can flag an indeterminable one precisely and
 # count same-type sites for ambiguity.
-data Demands = { [[Str]] residual, [[Str]] cons, [[Str]] provs, [[Iarch]] provoffs, [[Str]] calls }
+data Demands = {
+	[[Str]] residual,
+	[[Str]] cons,
+	[[Str]] provs,
+	[[Bool]] provmut,
+	[[Iarch]] provoffs,
+	[[Str]] calls,
+	[[Str]] mres,
+	[[Str]] omut,
+	[[Iarch]] letmis,
+}
 
 pub const resolve_demands! = (Program prog): Demands -> {
 	const [Func] funcs = prog.funcs
@@ -494,9 +896,12 @@ pub const resolve_demands! = (Program prog): Demands -> {
 	const Iarch n = Iarch(funcs.len)
 	let [[Str]] cons = []
 	let [[Str]] provs = []
+	let [[Bool]] provmut = []
 	let [[Iarch]] provoffs = []
 	let [[Str]] calls = []
 	let [[Str]] disch = []
+	let [[Str]] omut = []
+	let [[Iarch]] letmis = []
 	let Iarch i = 0
 
 	loop {
@@ -504,19 +909,25 @@ pub const resolve_demands! = (Program prog): Demands -> {
 		if funcs[i].is_asm || funcs[i].is_intrinsic then {
 			cons = [...cons, no_s()]
 			provs = [...provs, no_s()]
+			provmut = [...provmut, no_b()]
 			provoffs = [...provoffs, no_i()]
 			calls = [...calls, no_s()]
 			disch = [...disch, no_s()]
+			omut = [...omut, no_s()]
+			letmis = [...letmis, no_i()]
 		} else {
 			const Ann an = param_ann(funcs[i].params)
 			const Ann an2 = anns_body(an, funcs[i].body)
 			const [Str] params = param_names(funcs[i].params)
-			const Scan sc = scan_b!(an2, params, funcs[i].body)
+			const Scan sc = scan_b(an2, params, funcs[i].body)
 			cons = [...cons, union_s(sc.cons, no_s())]
 			provs = [...provs, sc.provs]
+			provmut = [...provmut, sc.provmut]
 			provoffs = [...provoffs, sc.provoffs]
 			calls = [...calls, sc.calls]
 			disch = [...disch, discharged(recs, sc.provs)]
+			omut = [...omut, own_mut!(funcs[i])]
+			letmis = [...letmis, sc.letmis]
 		}
 		i = i + 1
 	}
@@ -524,11 +935,14 @@ pub const resolve_demands! = (Program prog): Demands -> {
 	# residual fixpoint: residual[i] = (own consumes ∪ callees' demands) − discharged(provides).
 	# Monotone increasing (the union grows, the discharge set is fixed per function), so it settles.
 	let [[Str]] residual = []
+	# mutation fixpoint, in lockstep: mres[i] = (own mutations ∪ callees' mutations) − discharged.
+	let [[Str]] mres = []
 	let Iarch z = 0
 
 	loop {
 		if z >= n then break
 		residual = [...residual, no_s()]
+		mres = [...mres, no_s()]
 		z = z + 1
 	}
 
@@ -544,6 +958,12 @@ pub const resolve_demands! = (Program prog): Demands -> {
 				residual[k] = res
 				changed = true
 			}
+			const [Str] rawm = raw_mut(funcs, mres, omut[k], calls[k])
+			const [Str] resm = minus_s(rawm, disch[k])
+			if Iarch(resm.len) != Iarch(mres[k].len) then {
+				mres[k] = resm
+				changed = true
+			}
 			k = k + 1
 		}
 
@@ -554,8 +974,12 @@ pub const resolve_demands! = (Program prog): Demands -> {
 		residual: residual,
 		cons: cons,
 		provs: provs,
+		provmut: provmut,
 		provoffs: provoffs,
 		calls: calls,
+		mres: mres,
+		omut: omut,
+		letmis: letmis,
 	})
 }
 
@@ -619,9 +1043,13 @@ pub const check_demand_program! = (Program prog, [SrcMap] maps): [Diag] -> {
 	const Demands dm = resolve_demands!(prog)
 	const [[Str]] cons = dm.cons
 	const [[Str]] provs = dm.provs
+	const [[Bool]] provmut = dm.provmut
 	const [[Iarch]] provoffs = dm.provoffs
 	const [[Str]] calls = dm.calls
 	const [[Str]] residual = dm.residual
+	const [[Str]] mres = dm.mres
+	const [[Str]] omut = dm.omut
+	const [[Iarch]] letmis = dm.letmis
 	let [Diag] diags = []
 	const [Str] taken = address_taken(prog)
 
@@ -745,6 +1173,50 @@ pub const check_demand_program! = (Program prog, [SrcMap] maps): [Diag] -> {
 			]
 			d = d + 1
 		}
+
+		# a mutating demand against a CONST provide (§3/§4): if a type this function provides `const`
+		# — directly or embedded by spread — is mutated anywhere in the provide's extent, the provide
+		# must be `let`. `mreach` is the mutation demand reaching this function's provides.
+		const [Str] mreach = raw_mut(funcs, mres, omut[f], calls[f])
+		const [Bool] pmf = provmut[f]
+		let Iarch mp = 0
+
+		loop {
+			if mp >= Iarch(pf.len) then break
+			if !pmf[mp] && any_in(expand_spread(recs, pf[mp], 0), mreach)
+				then diags = [
+				...diags,
+				dg_at(
+					ff,
+					maps,
+					pof[mp],
+					"cf: ctx: `${ff.name}` provides `${pf[mp]}` as `const` but a consumer mutates it — provide it mutable (`provide(let ...)`)\n",
+				),
+			]
+			mp = mp + 1
+		}
+
+		# a misplaced `let` marker — `let` marks a context provide's value, not a general argument
+		const [Iarch] lms = letmis[f]
+		let Iarch lm = 0
+
+		loop {
+			if lm >= Iarch(lms.len) then break
+			diags = [
+				...diags,
+				dg_at(
+					ff,
+					maps,
+					lms[lm],
+					"cf: ctx: `let` marks a context provide's value (`provide(let x)`), not an ordinary call argument\n",
+				),
+			]
+			lm = lm + 1
+		}
+
+		# the repointing rejection (§3): a `let`-ctx aggregate field may not be repointed at a
+		# consumer-fresh construction (young-pointer-into-old-record) — mutation is in-place only
+		diags = cat_d(diags, repoint_diags!(ff, recs, maps))
 
 		f = f + 1
 	}

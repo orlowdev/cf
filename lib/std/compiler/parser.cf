@@ -110,6 +110,11 @@ pub data Parser = {
 	Bool track,
 	[BindEv] evs,
 	[[BindEv]] evb,
+	# a leading `let` on a call's FIRST argument (`provide(let x)`, context.md §2) — a mutable
+	# context provide. Set by `parse_args!` for the just-parsed call, read+consumed by `parse_call!`
+	# (it stamps a `$let` tyarg on the call). Reset at the start of every `parse_args!`, so it never
+	# leaks between calls.
+	Bool arg_mut0,
 }
 
 # The chunk bound of the bind-event log: a full `evs` block of this many events moves to `evb`.
@@ -382,6 +387,7 @@ const parse_hole! = (*Parser p, Iarch hstart, Iarch hlen): Expr -> {
 		track: p.track,
 		evs: noevs,
 		evb: hoevb,
+		arg_mut0: false,
 	})
 	const Expr e = parse_expr!(&hp)
 	if !is_eof(peek(&hp))
@@ -531,7 +537,15 @@ const parse_pipe_target! = (*Parser p, Expr piped): Expr -> {
 	let [Str] tys = []
 	if is_lbracket(peek(p)) then tys = parse_tyargs!(p)
 	let [Expr] args = []
-	if is_lparen(peek(p)) then args = parse_args!(p)
+	# a `let`-marked first argument (`x |> provide(let s)`, context.md §2) rides as a `$let` tyarg,
+	# exactly as in `parse_call!`. Read `arg_mut0` only when an arg list was actually parsed — else
+	# it would be stale from an earlier call (`parse_args!` resets it only on entry).
+	let Bool mut0 = false
+	if is_lparen(peek(p)) then {
+		args = parse_args!(p)
+		mut0 = p.arg_mut0
+	}
+	if mut0 then tys = [...tys, "$let"]
 
 	return Expr.At(noff, Expr.Call(name, tys, [...args, piped], ""))
 }
@@ -749,9 +763,16 @@ const parse_if! = (*Parser p): Expr -> {
 # only collect the comma-separated argument expressions.
 const parse_args! = (*Parser p): [Expr] -> {
 	p.pos = p.pos + 1 # `(`
+	p.arg_mut0 = false
 	let [Expr] args = []
 	if !is_rparen(peek(p)) then {
 		loop {
+			# a leading `let` on the FIRST argument marks a MUTABLE context provide — `provide(let x)`
+			# (context.md §2). Consumed here; `parse_call!` reads `arg_mut0` and stamps a `$let` tyarg.
+			if Iarch(args.len) == 0 && kw(p, "let") then {
+				p.pos = p.pos + 1
+				p.arg_mut0 = true
+			}
 			# a `{ ... }` argument is a grouped-parameter literal (a bare `Record` with empty type_name,
 			# expanded to positional field values by the resolve group splat)
 			if is_lbrace(peek(p)) then args = [...args, parse_record_lit!(p, "")]
@@ -771,8 +792,16 @@ const parse_call! = (*Parser p, Str name): Expr -> {
 	const [Str] no_ty = []
 	# the callee NAME token sits one behind the `(` — the call's span anchor
 	const Iarch noff = p.ebase + p.toks[p.pos - 1].start
+	const [Expr] cargs = parse_args!(p)
+	# a `let`-marked first argument (`provide(let x)`) rides as a `$let` tyarg sentinel — resolve
+	# passes tyargs through untouched, so it reaches the demand pass and emit unread by anything else.
+	let [Str] cty = no_ty
+	if p.arg_mut0 then {
+		let [Str] m = ["$let"]
+		cty = m
+	}
 
-	return Expr.At(noff, Expr.Call(name, no_ty, parse_args!(p), ""))
+	return Expr.At(noff, Expr.Call(name, cty, cargs, ""))
 }
 
 # `f[T1, T2](args)` — a call to a generic function with explicit type arguments. Each type

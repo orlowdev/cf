@@ -29,16 +29,16 @@ _f123:
 	movq $1, %rax
 	ret
 
-.globl _f454
+.globl _f456
 .p2align 2
-_f454:
+_f456:
 	movq $0x2000001, %rax
 	syscall
 	ret
 
-.globl _f455
+.globl _f457
 .p2align 2
-_f455:
+_f457:
 	movq $0x2000002, %rax
 	syscall
 	jnc 1f

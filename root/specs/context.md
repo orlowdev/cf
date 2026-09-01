@@ -11,9 +11,9 @@ hidden argument to exactly the functions that demand it. Nothing here is a
 runtime registry; provision, discharge, and routing are all compile-time, and
 the only runtime artifact is a pointer in a register.
 
-Status: the **read-only `const`-context path runs end-to-end** (M-A surface +
-demand checker, M-B hidden-argument ABI). The `let`-provide mutation rules and
-context-across-tasks are not yet implemented. What lands:
+Status: **provide/consume run end-to-end for both `const` and `let` provides**
+(M-A surface + demand checker, M-B hidden-argument ABI, M-C `let`-provide
+mutation). Context-across-tasks (§7) is not yet implemented. What lands:
 
 - **Surface + checker** (M-A): the `std::mem::ctx` module (`provide`/`consume`
   as bodyless intrinsics), the `uses` clause (§4, [[ebnf.md]]), and the demand
@@ -29,6 +29,18 @@ context-across-tasks are not yet implemented. What lands:
   offset`) into the provided record. A `!` consumer receives both the node and
   its context pointers and materializes under its geometry normally.
 
+- **Mutation** (M-C): a provide carries a binding mode — `provide(x)` is `const`,
+  `provide(let x)` is mutable. A consumer mutates a provide by binding it `let`
+  (`let s = consume(T)`) and writing a field in place; the write compiles to a
+  store through the context pointer (emit is mode-agnostic — the mode is a
+  checker concern). The demand pass infers, whole-program, which types are
+  mutated and rejects: a mutating demand against a `const` provide (§4); a
+  repointing of a `let`-context aggregate field at a consumer-fresh value (§3,
+  in-place-only); and a `let` marker on any non-provide argument (§2). Mutation
+  is inferred from bodies rather than declared in `uses` — cf compiles
+  whole-program, so a `uses let T` contract spelling is unneeded for now (a note
+  for a future separate-compilation story).
+
 Deliberate M-B simplifications, both sound under the checker's guarantees:
 `provide` registers a pointer to the value *where the provider already built
 it* — no arena copy — because the provider's frame lexically outlives every
@@ -36,9 +48,8 @@ consumer; and the hidden signature is stamped in the demand pass's own
 deterministic order rather than a canonical type-name sort (each callee's
 definition and every call site read the same `uses` list, so the ABI is
 self-consistent whole-program). The arena-placement refinement (so the value is
-reclaimed with the arena) and a canonical sort are later polish. The `let`-provide
-mutation rules of §3 (in-place-only, no repointing) land with their stores next;
-context-across-tasks (§7) stays with the concurrency arc. The fn-free
+reclaimed with the arena) and a canonical sort are later polish.
+Context-across-tasks (§7) stays with the concurrency arc. The fn-free
 requirement of §3 needs no check — a record field type is a name or an array,
 never a `(A) -> B`, so a provided type is fn-free by grammar.
 
