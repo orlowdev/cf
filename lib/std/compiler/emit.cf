@@ -135,6 +135,9 @@ data Emit = {
 	# the current function's locals that a lifted closure captures BY ADDRESS (`$capref`):
 	# they must stay addressable cells; every other scalar local promotes to a re-assigned temp
 	[Str] cap_cells,
+	# does the current geometry's `on_scope_exit` have exactly the bump-family rewind body?
+	# then each `!` return emits the rewind INLINE instead of calling the hook (`emit_reset!`)
+	Bool bump_exit,
 }
 
 # A local/parameter in scope: its interned name, `slot`, its `rec_type` (a record/union
@@ -5399,17 +5402,79 @@ const emit_mark! = (*Emit ctx, Str nodeop): Iarch -> {
 	return mk
 }
 
+# Does geometry hook `fi` carry EXACTLY the bump-family rewind body —
+#   if raw::load(node + 48) == lim then raw::store(node + 40, top)
+#   return 0
+# — over its three parameters? Then `emit_reset!` emits the rewind INLINE at every `!`
+# return (identical ops to the survivor-mark path — `%res_0` IS `node+40`, so `%res_0+8`
+# is the limit at `node+48`), skipping a call per return in every bracketed frame. A
+# geometry whose exit does anything else (a compacting or `rc` hook) keeps the pluggable
+# call — the contract is matched, not assumed.
+const hook_is_bump_exit = ([Func] funcs, Iarch fi): Bool -> {
+	if fi < 0 then return false
+	const Func fn = funcs[fi]
+	if Iarch(fn.params.len) != 3 then return false
+	if Iarch(fn.body.len) != 2 then return false
+	const Str p0 = fn.params[0].name
+	const Str p1 = fn.params[1].name
+	const Str p2 = fn.params[2].name
+	const Bool guard_ok = match fn.body[0] {
+		Stmt.IfThen(c, b) -> exit_cond_ok(p0, p2, c) && exit_store_ok(p0, p1, b),
+		_ -> false,
+	}
+	if !guard_ok then return false
+
+	return match fn.body[1] {
+		Stmt.Return(e) -> expr_is_lit(0, e),
+		_ -> false,
+	}
+}
+
+const exit_cond_ok = (Str p0, Str p2, Expr c): Bool -> match c {
+	Expr.CmpEq(l, r) -> exit_load_ok(p0, l) && expr_is_var(p2, r),
+	_ -> false,
+}
+
+const exit_load_ok = (Str p0, Expr e): Bool -> match e {
+	Expr.Call(callee, _, args, _) -> eq(callee, "std_mem_raw_load") &&
+		Iarch(args.len) == 1 &&
+		exit_addr_ok(p0, 48, args[0]),
+	_ -> false,
+}
+
+const exit_store_ok = (Str p0, Str p1, Stmt s): Bool -> match s {
+	Stmt.Do(e) -> match e {
+		Expr.Call(callee, _, args, _) -> eq(callee, "std_mem_raw_store") &&
+			Iarch(args.len) == 2 &&
+			exit_addr_ok(p0, 40, args[0]) &&
+			expr_is_var(p1, args[1]),
+		_ -> false,
+	},
+	_ -> false,
+}
+
+const exit_addr_ok = (Str p0, Iarch off, Expr e): Bool -> match e {
+	Expr.Add(l, r) -> expr_is_var(p0, l) && expr_is_lit(off, r),
+	_ -> false,
+}
+
+const expr_is_var = (Str n, Expr e): Bool -> match e { Expr.Var(v) -> eq(v, n), _ -> false }
+
+const expr_is_lit = (Iarch v, Expr e): Bool -> match e { Expr.Lit(x) -> x == v, _ -> false }
+
 # Rewind the ambient subnode to a saved `{top, limit}` mark, reclaiming the scope's scratch in
 # bulk (geometry_lowering §2). The RESIDUE bracket (`%res_0`) is the geometry CONTRACT: place
 # the geometry's own `on_scope_exit(node, top, limit)` — the pluggable reclamation hook (a
-# compacting or `rc` geometry acts differently here), replacing the retired floor `cf_reset`.
+# compacting or `rc` geometry acts differently here), replacing the retired floor `cf_reset` —
+# INLINED when the hook body is exactly the bump-family rewind (`hook_is_bump_exit`, cached in
+# `ctx.bump_exit`), since the inline path below IS that body over `%res_0`.
 # The SURVIVOR-scope mark (`%node_0`) is an emit-internal optimization gate, not a contract
 # hook (a frame from which nothing escapes frees its survivors too), so it is rewound INLINE.
 # Both do the same bump-family fold: restore the top only when the subnode's limit is unchanged
 # since the mark (no elastic pull relocated its block), else skip — leaking the marked interval
 # once, reclaimed at the node's own teardown, never dangling.
 const emit_reset! = (*Emit ctx, Iarch mk, Str nodeop): Iarch -> {
-	if eq(nodeop, "%res_0") && !eq(ctx.mat_geom, "") then {
+	if eq(nodeop, "%res_0") && !eq(ctx.mat_geom, "") && !ctx.bump_exit then {
 		const Iarch xi = find_func(ctx.funcs, "on_scope_exit__${ctx.mat_geom}")
 		if xi < 0
 			then die("cf: emit: the `${ctx.mat_geom}` geometry module is missing `on_scope_exit` — stale std source?\n")
@@ -6810,6 +6875,10 @@ const emit_func! = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 	# route a carve residue-side, so unbracketed frames skip the scan
 	if fn_brackets(fn) then ctx.growok = growok_names(ctx.funcs, idx)
 	if !fn_brackets(fn) then ctx.growok = no_names()
+	# a bump-family `on_scope_exit` inlines at every `!` return (see `hook_is_bump_exit`)
+	ctx.bump_exit = false
+	if !eq(ctx.mat_geom, "") && fn_brackets(fn)
+		then ctx.bump_exit = hook_is_bump_exit(ctx.funcs, find_func(ctx.funcs, "on_scope_exit__${ctx.mat_geom}"))
 	# `--debug`: the declaration's file and line, as QBE debug directives — `dbgfile`
 	# before the function, `dbgloc` as the body's first instruction — become `.loc`
 	# lines and a DWARF line table, so tools attribute frames to source.
@@ -7996,6 +8065,7 @@ pub const emit_program! = (
 				loop_labels: no_names(),
 				loop_lids: no_lids(),
 				cap_cells: capref_names!(clofns, i),
+				bump_exit: false,
 			})
 			emit_func!(&ctx, prog.funcs[i], i)
 		}
