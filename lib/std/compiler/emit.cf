@@ -4381,8 +4381,45 @@ const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env)
 		const Str crn = ctx.funcs[fidx].ret_name
 		if find_rec(ctx.recs, crn) >= 0 then {
 			const Iarch ari = find_func(ctx.funcs, "on_alloc_ret__${ctx.mat_geom}$${crn}")
-			if ari < 0
-				then die("cf: emit: a materialized `${ctx.mat_geom}` body claims a returned `${crn}` but its hook instance is missing — materialize and emit disagree on the claimed types\n")
+			# an ABSENT claim hook is the geometry saying a returned value needs no claiming
+			# — the IDENTITY: the callee's result rides through untouched
+			if ari < 0 then return "%t${rt}"
+
+			# a single-`return`-of-a-leaf body TRANSCRIBES to its value expression over the
+			# site's operands — the bump family's identity claim (`return v`) unwraps to the
+			# claimed operand itself, zero instructions, no call left behind (the spec's
+			# no-op sweep). A hook that does real work at the claim (a gc's compact-on-claim)
+			# is not a single leaf return and keeps the call.
+			if claim_spliceable!(ctx.funcs[ari]) then {
+				const Iarch nt = ctx.next
+				ctx.next = ctx.next + 1
+				write_str(ctx.fd, "\t%t${nt} =l copy %node_0\n")
+				const [Binding] henv = [
+					Binding({
+						name: ctx.funcs[ari].params[0].name,
+						slot: nt,
+						rec_type: "",
+						elem: "",
+						is_cell: false,
+						telems: [],
+						fixed: "",
+					}),
+					Binding({
+						name: ctx.funcs[ari].params[1].name,
+						slot: rt,
+						rec_type: crn,
+						elem: "",
+						is_cell: false,
+						telems: [],
+						fixed: "",
+					}),
+				]
+
+				return match ctx.funcs[ari].body[0] {
+					Stmt.Return(e) -> emit_expr!(e, ctx, henv),
+					_ -> "%t${rt}",
+				}
+			}
 			const Iarch rt2 = ctx.next
 			ctx.next = ctx.next + 1
 			write_str(
@@ -5493,6 +5530,21 @@ const hook_spliceable! = (Func fn): Bool -> {
 	}
 }
 
+# A VALUE-producing hook (the `on_alloc_ret` claim) splices when its whole body is one
+# `return <leaf expr>` over its two params — the claim site then emits that expression
+# directly (the identity `return v` emits NOTHING: the operand rides through).
+const claim_spliceable! = (Func fn): Bool -> {
+	if Iarch(fn.params.len) != 2 then return false
+	if Iarch(fn.body.len) != 1 then return false
+	if fn.params[0].is_ptr || fn.params[1].is_ptr then return false
+	const [Str] ps = [fn.params[0].name, fn.params[1].name]
+
+	return match fn.body[0] {
+		Stmt.Return(e) -> hexpr_ok(ps, e),
+		_ -> false,
+	}
+}
+
 # Land the hook's body at the site: bind its parameters over `(node, top, lim)` as promoted
 # scalar bindings (plain copies QBE's copy elimination folds away), then emit each statement
 # through the ordinary statement emitter — the same lowering the hook's own function body
@@ -5546,16 +5598,16 @@ const emit_hook_splice! = (*Emit ctx, Func fn, Str nodeop, Iarch mk): Iarch -> {
 # since the mark (no elastic pull relocated its block), else skip — leaking the marked interval
 # once, reclaimed at the node's own teardown, never dangling.
 const emit_reset! = (*Emit ctx, Iarch mk, Str nodeop): Iarch -> {
-	if eq(nodeop, "%res_0") && !eq(ctx.mat_geom, "") && ctx.exit_hook >= 0 then {
-		emit_hook_splice!(ctx, ctx.funcs[ctx.exit_hook], "%node_0", mk)
-
-		return 0
-	}
-
 	if eq(nodeop, "%res_0") && !eq(ctx.mat_geom, "") then {
+		if ctx.exit_hook >= 0 then {
+			emit_hook_splice!(ctx, ctx.funcs[ctx.exit_hook], "%node_0", mk)
+
+			return 0
+		}
 		const Iarch xi = find_func(ctx.funcs, "on_scope_exit__${ctx.mat_geom}")
-		if xi < 0
-			then die("cf: emit: the `${ctx.mat_geom}` geometry module is missing `on_scope_exit` — stale std source?\n")
+		# an ABSENT hook is the geometry saying it needs no scope reclamation — the
+		# IDENTITY: nothing lands here, and the now-unused mark loads die in QBE's DCE
+		if xi < 0 then return 0
 		const Iarch hr = ctx.next
 		ctx.next = ctx.next + 1
 		write_str(
