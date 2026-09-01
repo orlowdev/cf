@@ -15,8 +15,8 @@ import std::sys::{ Os, Arch }
 import std::compiler::ast::{ Program }
 import std::compiler::diag::{ Diag, sort_diags }
 import std::compiler::resolve::{ resolve_program!, Resolved }
-import std::compiler::monomorph::{ mono_program!, MonoOut }
-import std::compiler::retfill::{ retfill_program! }
+import std::compiler::monomorph::{ mono_program!, MonoOut, MonoSeed, no_mono_seed, mono_seed_of }
+import std::compiler::retfill::{ retfill_program!, graft_rets, Grafted }
 import std::compiler::materialize::{ materialize_program!, Mat }
 import std::compiler::typecheck::{ check_program!, check_unreachable! }
 import std::compiler::spans::{ strip_program, strip_funcs }
@@ -94,18 +94,17 @@ pub const compile! = (
 	if Iarch(gdiags.len) > 0 then return gdiags
 
 	# monomorphize generic functions into concrete instances (type_system §8.1) — after this
-	# the program has no generic templates, only ordinary functions. COLLECTED (D2): every
-	# failed instantiation reports in one run; the pass's output is unusable then (missing
-	# instances), so its diags return ALONE — typecheck on the broken table would only add
-	# "undefined function" cascades on top.
-	const MonoOut mo = mono_program!(raw)
+	# the program has no generic templates, only ordinary functions — then fill omitted
+	# return types from the bodies (type_system §5.1), iterating when a fill is MATERIAL
+	# to inference (see `mono_and_fill!`). COLLECTED (D2): every failed instantiation
+	# reports in one run; a diag-carrying round's output is unusable (missing instances),
+	# so the FINAL round's diags return ALONE — typecheck on the broken table would only
+	# add "undefined function" cascades on top.
+	const MonoFill mf = mono_and_fill!(raw)
 
-	if Iarch(mo.diags.len) > 0 then return sort_diags(mo.diags)
+	if Iarch(mf.diags.len) > 0 then return sort_diags(mf.diags)
 
-	# fill omitted return types from the bodies (type_system §5.1) — POST-mono, where every
-	# body is concrete (instances minted, union constructions mangled), so the derivation can
-	# never meet a type variable; typecheck below reads the filled signatures
-	const Program mono = retfill_program!(mo.prog)
+	const Program mono = mf.prog
 
 	# the Materialize substep of the Memory arc (geometry_lowering §2): duplicate per
 	# (fn × geometry) under the std-source geometries, retarget the `in b` seed calls, and
@@ -216,11 +215,11 @@ pub const check! = (Str input, Str src, Os target_os, Arch target_arch, Iarch ro
 
 	if Iarch(gdiags.len) > 0 then return gdiags
 
-	const MonoOut mo = mono_program!(raw)
+	const MonoFill mf = mono_and_fill!(raw)
 
-	if Iarch(mo.diags.len) > 0 then return sort_diags(mo.diags)
+	if Iarch(mf.diags.len) > 0 then return sort_diags(mf.diags)
 
-	const Program mono = retfill_program!(mo.prog)
+	const Program mono = mf.prog
 	const Mat mm = materialize_program!(mono, raw)
 	const Program prog = mm.prog
 	const [Diag] tdiags = check_program!(prog, input, false, rz.maps)
@@ -245,6 +244,36 @@ pub const check! = (Str input, Str src, Os target_os, Arch target_arch, Iarch ro
 	check_geom_escape!(lowered)
 
 	return []
+}
+
+data MonoFill = { Program prog, [Diag] diags }
+
+# Monomorphize, fill omitted returns, and ITERATE while a fill is material to inference: a
+# non-word derived return (a union instance, `Str`, an array, a tuple) that the monomorph
+# round read as the blank word default — mis-resolving a match arm's union or a generic
+# call's type argument — grafts onto the raw program, and the round reruns SEEDED with the
+# type instances already minted (so an instance-named return like `Maybe$Iarch` resolves
+# regardless of walk order). The fill pass runs even on a diag-carrying round (its typing
+# skips what it cannot resolve): the diags may be exactly what the graft fixes, so only the
+# FINAL round's survive. No material fill — the common case; a word-typed fill changes
+# nothing the monomorph pass can observe — means a single round, as before.
+const mono_and_fill! = (Program raw): MonoFill -> {
+	let Program mraw = raw
+	let MonoOut mo = mono_program!(mraw, no_mono_seed())
+	let Program filled = retfill_program!(mo.prog)
+	let Iarch rounds = 0
+
+	loop {
+		if rounds >= 3 then break
+		const Grafted g = graft_rets(mraw, filled)
+		if !g.material then break
+		mraw = g.prog
+		mo = mono_program!(mraw, mono_seed_of(mo))
+		filled = retfill_program!(mo.prog)
+		rounds = rounds + 1
+	}
+
+	return MonoFill({ prog: filled, diags: mo.diags })
 }
 
 # Extract the opened `Fd` from `create`'s outcome, or `die` with `msg` if it failed. `die` never

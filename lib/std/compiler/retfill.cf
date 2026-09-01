@@ -189,6 +189,9 @@ const arm_env! = (*RfCtx c, Expr scrut, StmtArm a, [VarTy] env): [VarTy] -> {
 	let DiagBag bag = record_dg()
 	let Str tn = a.type_name
 	if eq(tn, "") then tn = ty_name(type_of!(scrut, env, build_rf_ctx(c), &bag))
+	# an arm still naming a TEMPLATE union (a diag-carrying monomorph round could not resolve
+	# it — the graft iteration will) binds nothing this pass
+	if names_template(c, tn) then return env
 
 	let DiagBag abag = record_dg()
 
@@ -836,6 +839,89 @@ const fill_round! = (*RfCtx c, [Func] funcs): [Func] -> {
 	}
 
 	return out
+}
+
+# The graft product: the raw program with the MATERIAL derived returns written onto its
+# functions, and whether any graft happened (material = a non-word fill — a word-typed
+# return is indistinguishable from the blank default during monomorph, so it never needs
+# a re-run).
+pub data Grafted = { Program prog, Bool material }
+
+const graft_one = (Func rf, Func pf): Func -> Func({
+	name: rf.name,
+	is_pub: rf.is_pub,
+	ret_name: pf.ret_name,
+	ret_elem: pf.ret_elem,
+	params: rf.params,
+	body: rf.body,
+	is_asm: rf.is_asm,
+	asm_body: rf.asm_body,
+	is_value: rf.is_value,
+	ret_telems: pf.ret_telems,
+	typarams: rf.typarams,
+	tbounds: rf.tbounds,
+	ret_size: rf.ret_size,
+	is_intrinsic: rf.is_intrinsic,
+	asm_sym: rf.asm_sym,
+	dfile: rf.dfile,
+	dline: rf.dline,
+	dcol: rf.dcol,
+})
+
+# Graft the fill pass's derived return types back onto the RAW (pre-monomorph) program, so
+# the next monomorph round's inference, match-arm resolution, and binding environments see
+# them. Only a concrete raw function with a blank return whose post-fill counterpart derived
+# a non-word type grafts.
+pub const graft_rets = (Program raw, Program post): Grafted -> {
+	let [Func] out = []
+	let Bool material = false
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(raw.funcs.len) then break
+		const Func rf = raw.funcs[i]
+		let Iarch pi = -1
+		if eq(rf.ret_name, "")
+		&& Iarch(rf.ret_telems.len) == 0
+		&& Iarch(rf.typarams.len) == 0
+		&& !rf.is_asm
+		&& !rf.is_intrinsic
+			then pi = post_index(post, rf.name)
+		let Bool grafted = false
+		if pi >= 0 then {
+			const Func pf = post.funcs[pi]
+			if !eq(pf.ret_name, "") && !eq(pf.ret_name, "Iarch") then {
+				out = [...out, graft_one(rf, pf)]
+				material = true
+				grafted = true
+			}
+		}
+		if !grafted then out = [...out, rf]
+		i = i + 1
+	}
+
+	return Grafted({
+		prog: Program({
+			imports: raw.imports,
+			recs: raw.recs,
+			unions: raw.unions,
+			funcs: out,
+			groups: raw.groups,
+		}),
+		material: material,
+	})
+}
+
+const post_index = (Program post, Str nm): Iarch -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(post.funcs.len) then break
+		if eq(post.funcs[i].name, nm) then return i
+		i = i + 1
+	}
+
+	return -1
 }
 
 # Fill every omitted return type derivable from the program as it stands — to a fixpoint, since
