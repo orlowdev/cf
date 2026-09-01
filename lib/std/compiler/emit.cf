@@ -4,8 +4,11 @@
 # instruction per interior node and returning the operand (`%tN`, or an inline
 # literal) that holds the node's value. A `*Emit` context threads the output fd
 # and the temp/label counters; a `[Binding]` environment (a read-only borrow)
-# resolves variable references to their stack slots. `emit_program` walks the
-# body's statement list and appends the freestanding `_start` floor.
+# resolves variable references to their temps/cells: a scalar local is a plain
+# RE-ASSIGNED temp (QBE's ssa pass makes the registers/phis) unless a closure
+# captures it by address, in which case it keeps a `%lpool` stack cell.
+# `emit_program` walks the body's statement list and appends the freestanding
+# `_start` floor.
 #
 # cf cannot yet spawn `qbe`/`cc`, so it emits the QBE IL and the arm64 asm floor
 # to two file descriptors and the external driver runs the `qbe`→`cc` tail.
@@ -13,7 +16,7 @@
 # ⚠ PARTIAL codegen — the root `page` runtime is now the real ELASTIC reserve-in-place
 # bump (see `emit_arena_qbe!`/`emit_arena_floor!`), but the per-node `%node`/`%ret` ABI and
 # carved arenas are not landed yet (the next arc). Integer ops are word
-# (`w`) ops; every local is a word stack slot (`alloc4`/`storew`/`loadw`); `/`/`%`
+# (`w`) ops; `/`/`%`
 # do not yet apply the §5.6 divide-by-zero guard; `const` vs `let` mutability is
 # not yet enforced (that is the typecheck brick).
 
@@ -129,6 +132,9 @@ data Emit = {
 	# (`@lend<lid>`) through these parallel stacks (an unlabeled loop pushes nothing)
 	[Str] loop_labels,
 	[Iarch] loop_lids,
+	# the current function's locals that a lifted closure captures BY ADDRESS (`$capref`):
+	# they must stay addressable cells; every other scalar local promotes to a re-assigned temp
+	[Str] cap_cells,
 }
 
 # A local/parameter in scope: its interned name, `slot`, its `rec_type` (a record/union
@@ -194,6 +200,57 @@ const binding_ptr! = (*Emit ctx, [Binding] env, Iarch idx): Str -> {
 const store_op = (Str scalar): Str -> if is_float_name(scalar)
 	then "store${float_qt(scalar)}"
 	else "storel"
+
+# The QBE class a promoted scalar local's temp carries: a float its own class (`d`/`s`),
+# everything else `l` — exactly the class `store_op` accepted into the old cell, so the
+# temp form is class-correct wherever the cell form was.
+const copy_cls = (Str fx): Str -> if is_float_name(fx) then float_qt(fx) else "l"
+
+# Does `s` start with `p`, byte for byte?
+const has_pfx = (Str s, Str p): Bool -> {
+	if Iarch(s.len) < Iarch(p.len) then return false
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(p.len) then break
+		if Iarch(s[i]) != Iarch(p[i]) then return false
+		i = i + 1
+	}
+
+	return true
+}
+
+# The scalar locals of function `fi` that some lifted closure captures by address. A lifted
+# closure is named `__clo_<fi>_<ci>[__tag]` (the enclosing function's final table index — the
+# lift appends its outputs, so originals keep their positions), and its `$capref` parameters
+# keep the captured variables' source names — so the whole set reads off the function table,
+# no body walk. `clofns` is pre-filtered to the `__clo_`-prefixed functions; the specialized
+# HOF clones (`hof$w..$__clo_..`) thread the SAME captured names to the same lifted closure,
+# so they add nothing to the set.
+const capref_names! = ([Func] clofns, Iarch fi): [Str] -> {
+	let [Str] out = []
+	const Str pfx = "__clo_${fi}_"
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(clofns.len) then break
+
+		if has_pfx(clofns[i].name, pfx) then {
+			let Iarch p = 0
+
+			loop {
+				if p >= Iarch(clofns[i].params.len) then break
+				if eq(clofns[i].params[p].type_name, "$capref")
+					then out = [...out, clofns[i].params[p].name]
+				p = p + 1
+			}
+		}
+
+		i = i + 1
+	}
+
+	return out
+}
 
 # The index of the record declared as `name`, or -1.
 const find_rec = ([RecDecl] recs, Str name): Iarch -> {
@@ -2277,22 +2334,20 @@ const emit_stringify_array! = (*Emit ctx, [Binding] env, Str vh, Str elem, Str b
 	emit_lit_str!(ctx, vh, "[")
 	const Iarch lid = ctx.label
 	ctx.label = ctx.label + 1
+	# the counter is a re-assigned temp (def before the loop, one def at the increment) — QBE's
+	# ssa pass registers it; a cell here would be an unpromotable in-body alloc
 	const Iarch ic = ctx.next
 	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${ic} =l alloc8 8\n")
-	write_str(ctx.fd, "\tstorel 0, %t${ic}\n")
+	write_str(ctx.fd, "\t%t${ic} =l copy 0\n")
 	write_str(ctx.fd, "@arloop${lid}\n")
-	const Iarch iv = ctx.next
-	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${iv} =l loadl %t${ic}\n")
 	const Iarch cmp = ctx.next
 	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${cmp} =w csgel %t${iv}, ${alen}\n")
+	write_str(ctx.fd, "\t%t${cmp} =w csgel %t${ic}, ${alen}\n")
 	write_str(ctx.fd, "\tjnz %t${cmp}, @ardone${lid}, @arbody${lid}\n")
 	write_str(ctx.fd, "@arbody${lid}\n")
 	const Iarch sc = ctx.next
 	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${sc} =w csgtl %t${iv}, 0\n")
+	write_str(ctx.fd, "\t%t${sc} =w csgtl %t${ic}, 0\n")
 	write_str(ctx.fd, "\tjnz %t${sc}, @arsep${lid}, @arelem${lid}\n")
 	write_str(ctx.fd, "@arsep${lid}\n")
 	emit_lit_str!(ctx, vh, ", ")
@@ -2300,7 +2355,7 @@ const emit_stringify_array! = (*Emit ctx, [Binding] env, Str vh, Str elem, Str b
 	write_str(ctx.fd, "@arelem${lid}\n")
 	const Iarch off = ctx.next
 	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${off} =l mul %t${iv}, ${stride}\n")
+	write_str(ctx.fd, "\t%t${off} =l mul %t${ic}, ${stride}\n")
 	const Iarch addr = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${addr} =l add ${data}, %t${off}\n")
@@ -2325,10 +2380,7 @@ const emit_stringify_array! = (*Emit ctx, [Binding] env, Str vh, Str elem, Str b
 
 	let [TupElem] notel = []
 	emit_stringify!(ctx, env, vh, elem, notel, eop)
-	const Iarch inc = ctx.next
-	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${inc} =l add %t${iv}, 1\n")
-	write_str(ctx.fd, "\tstorel %t${inc}, %t${ic}\n")
+	write_str(ctx.fd, "\t%t${ic} =l add %t${ic}, 1\n")
 	write_str(ctx.fd, "\tjmp @arloop${lid}\n")
 	write_str(ctx.fd, "@ardone${lid}\n")
 	emit_lit_str!(ctx, vh, "]")
@@ -3070,10 +3122,9 @@ const emit_destructure! = (*Emit ctx, [Binding] env, [Str] pat, Bool mutable, Ex
 					fixed: "",
 				}),
 			]
-		} else {
-			# a word or FLOAT position: copy the 8-byte slot into a fresh cell. A float records its
-			# scalar in `fixed` so `binding_ptr` reloads it with `loadd`/`loads` (the copy is
-			# bit-preserving).
+		} else if has_str(ctx.cap_cells, tok) then {
+			# a closure captures this position by address — it stays a cell (a float's raw
+			# `loadl`/`storel` spill is bit-preserving; `binding_ptr` reloads it in its class)
 			const Str pf = if is_float_name(ptype.name) then ptype.name else ""
 			const Iarch val = ctx.next
 			ctx.next = ctx.next + 1
@@ -3085,6 +3136,25 @@ const emit_destructure! = (*Emit ctx, [Binding] env, [Str] pat, Bool mutable, Ex
 			e2 = [
 				...e2,
 				Binding({ name: tok, slot: cell, rec_type: "", elem: "", is_cell: true, telems: [], fixed: pf }),
+			]
+		} else {
+			# a word or FLOAT position promotes to a re-assigned temp (a `let` position's
+			# reassignment re-defines it; QBE's ssa pass makes the registers). A float loads
+			# straight in its own class — the temp must carry `d`/`s`, not the cell's raw word.
+			const Str pf = if is_float_name(ptype.name) then ptype.name else ""
+			const Iarch val = ctx.next
+			ctx.next = ctx.next + 1
+
+			if is_float_name(ptype.name) then {
+				const Str qt = float_qt(ptype.name)
+				write_str(ctx.fd, "\t%t${val} =${qt} load${qt} %t${saddr}\n")
+			} else {
+				write_str(ctx.fd, "\t%t${val} =l loadl %t${saddr}\n")
+			}
+
+			e2 = [
+				...e2,
+				Binding({ name: tok, slot: val, rec_type: "", elem: "", is_cell: false, telems: [], fixed: pf }),
 			]
 		}
 
@@ -4215,8 +4285,14 @@ const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env)
 			# closure reads/writes it by reference. Passed as a raw `l`, no copy.
 			const Iarch bi = lookup_index(env, argvar_name(args[i]))
 			let Str cv = ""
-			if eq(ctx.funcs[fidx].params[i].type_name, "$capref") then cv = "%t${env[bi].slot}"
-				else cv = binding_ptr!(ctx, env, bi)
+
+			if eq(ctx.funcs[fidx].params[i].type_name, "$capref") then {
+				# the slot must be a real cell: a promoted (temp-bound) local has no address to
+				# pass. `cap_cells` keeps captured names cell-bound; a miss here is a compiler bug.
+				if !env[bi].is_cell
+					then die("cf: emit: internal: captured scalar `${argvar_name(args[i])}` is not cell-bound\n")
+				cv = "%t${env[bi].slot}"
+			} else cv = binding_ptr!(ctx, env, bi)
 			const Iarch tt = ctx.next
 			ctx.next = ctx.next + 1
 			write_str(ctx.fd, "\t%t${tt} =l copy ${cv}\n")
@@ -4363,10 +4439,9 @@ const arm_body_env! = (*Emit ctx, [Binding] env, Str type_name, [Str] members, [
 						fixed: "",
 					}),
 				]
-			} else {
-				# a word (or FLOAT) payload: copy the 8-byte slot to its own cell. A float payload records
-				# its scalar type in `fixed` so `binding_ptr` reloads it with `loadd`/`loads` (the raw
-				# `loadl`/`storel` copy here is bit-preserving); a plain word keeps `fixed: ""`.
+			} else if has_str(ctx.cap_cells, binds[bi]) then {
+				# a closure captures this payload bind by address — it stays a cell (the raw
+				# `loadl`/`storel` spill is bit-preserving; `binding_ptr` reloads in its class)
 				const Str psc = payload_type(ctx, type_name, members[0], bi)
 				const Str pf = if is_float_name(psc) then psc else ""
 				const Iarch val = ctx.next
@@ -4384,6 +4459,33 @@ const arm_body_env! = (*Emit ctx, [Binding] env, Str type_name, [Str] members, [
 						rec_type: "",
 						elem: "",
 						is_cell: true,
+						telems: [],
+						fixed: pf,
+					}),
+				]
+			} else {
+				# a word (or FLOAT) payload promotes to a plain temp bound directly — a float
+				# loads in its own class so the temp carries `d`/`s`.
+				const Str psc = payload_type(ctx, type_name, members[0], bi)
+				const Str pf = if is_float_name(psc) then psc else ""
+				const Iarch val = ctx.next
+				ctx.next = ctx.next + 1
+
+				if is_float_name(psc) then {
+					const Str qt = float_qt(psc)
+					write_str(ctx.fd, "\t%t${val} =${qt} load${qt} %t${addr}\n")
+				} else {
+					write_str(ctx.fd, "\t%t${val} =l loadl %t${addr}\n")
+				}
+
+				benv = [
+					...benv,
+					Binding({
+						name: binds[bi],
+						slot: val,
+						rec_type: "",
+						elem: "",
+						is_cell: false,
 						telems: [],
 						fixed: pf,
 					}),
@@ -4499,12 +4601,14 @@ const emit_guard_cmp! = (*Emit ctx, Str type_name, Str member, Str guard, Str s,
 const emit_match! = (*Emit ctx, Expr scrut, [MatchArm] arms, [Binding] env): Str -> {
 	const Str s = emit_expr!(scrut, ctx, env)
 	const Str tagop = scrut_tag!(ctx, match_union(arms), s)
+	# the arms merge through a shared TEMP assigned at each arm's end (QBE input is not SSA —
+	# its ssa pass makes the phi); every path into `@mend` runs exactly one arm, so the temp
+	# is defined wherever it is read
 	const Iarch slot = ctx.next
 	ctx.next = ctx.next + 1
 	const Iarch lid = ctx.label
 	ctx.label = ctx.label + 1
-	write_str(ctx.fd, "\t%t${slot} =l alloc8 8\n")
-	# the merge slot stores/loads in the arms' QBE type (a float-valued match yields `d`/`s`)
+	# the merge temp carries the arms' QBE type (a float-valued match yields `d`/`s`)
 	const Str qt = qtype_of_name(match_scalar!(ctx, env, arms))
 	const Iarch na = Iarch(arms.len)
 	let Iarch i = 0
@@ -4522,7 +4626,7 @@ const emit_match! = (*Emit ctx, Expr scrut, [MatchArm] arms, [Binding] env): Str
 				s,
 			)
 			const Str v = emit_expr!(arms[i].body, ctx, benv_e)
-			write_str(ctx.fd, "\tstore${qt} ${v}, %t${slot}\n")
+			write_str(ctx.fd, "\t%t${slot} =${qt} copy ${v}\n")
 			write_str(ctx.fd, "\tjmp @mend${lid}\n")
 		} else if arm_is_guarded(arms[i].binds) then {
 			# a GUARDED arm (single member + payload sub-patterns): test the tag, then each guard in
@@ -4562,7 +4666,7 @@ const emit_match! = (*Emit ctx, Expr scrut, [MatchArm] arms, [Binding] env): Str
 				s,
 			)
 			const Str vg = emit_expr!(arms[i].body, ctx, benv_g)
-			write_str(ctx.fd, "\tstore${qt} ${vg}, %t${slot}\n")
+			write_str(ctx.fd, "\t%t${slot} =${qt} copy ${vg}\n")
 			write_str(ctx.fd, "\tjmp @mend${lid}\n")
 			write_str(ctx.fd, "@mnext${lid}_${i}\n")
 		} else {
@@ -4594,7 +4698,7 @@ const emit_match! = (*Emit ctx, Expr scrut, [MatchArm] arms, [Binding] env): Str
 				s,
 			)
 			const Str v = emit_expr!(arms[i].body, ctx, benv_m)
-			write_str(ctx.fd, "\tstore${qt} ${v}, %t${slot}\n")
+			write_str(ctx.fd, "\t%t${slot} =${qt} copy ${v}\n")
 			write_str(ctx.fd, "\tjmp @mend${lid}\n")
 			write_str(ctx.fd, "@mnext${lid}_${i}\n")
 		}
@@ -4603,11 +4707,8 @@ const emit_match! = (*Emit ctx, Expr scrut, [MatchArm] arms, [Binding] env): Str
 	}
 
 	write_str(ctx.fd, "@mend${lid}\n")
-	const Iarch rt = ctx.next
-	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${rt} =${qt} load${qt} %t${slot}\n")
 
-	return "%t${rt}"
+	return "%t${slot}"
 }
 
 # The scrutinee's union for a statement-match (the first non-`_` arm's type name), "" if all `_`.
@@ -4873,17 +4974,15 @@ const emit_spread_copy! = (*Emit ctx, [Binding] env, Str hdr, Expr src, Iarch es
 	const Iarch slen = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${slen} =l loadl %t${lp}\n")
+	# the copy counter is a re-assigned temp (one def here, one at the increment) — QBE's ssa
+	# pass registers it; a cell here would be an unpromotable in-body alloc
 	const Iarch ci = ctx.next
 	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${ci} =l alloc8 8\n")
-	write_str(ctx.fd, "\tstorel 0, %t${ci}\n")
+	write_str(ctx.fd, "\t%t${ci} =l copy 0\n")
 	write_str(ctx.fd, "@cptop${lid}\n")
-	const Iarch iv = ctx.next
-	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${iv} =l loadl %t${ci}\n")
 	const Iarch cmp = ctx.next
 	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${cmp} =l csltl %t${iv}, %t${slen}\n")
+	write_str(ctx.fd, "\t%t${cmp} =l csltl %t${ci}, %t${slen}\n")
 	write_str(ctx.fd, "\tjnz %t${cmp}, @cpbody${lid}, @cpend${lid}\n")
 	write_str(ctx.fd, "@cpbody${lid}\n")
 	const Iarch sdata = ctx.next
@@ -4891,7 +4990,7 @@ const emit_spread_copy! = (*Emit ctx, [Binding] env, Str hdr, Expr src, Iarch es
 	write_str(ctx.fd, "\t%t${sdata} =l loadl ${shdr}\n")
 	const Iarch off = ctx.next
 	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${off} =l mul %t${iv}, ${esz}\n")
+	write_str(ctx.fd, "\t%t${off} =l mul %t${ci}, ${esz}\n")
 	const Iarch saddr = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${saddr} =l add %t${sdata}, %t${off}\n")
@@ -4902,13 +5001,7 @@ const emit_spread_copy! = (*Emit ctx, [Binding] env, Str hdr, Expr src, Iarch es
 	const Str slot = emit_dyn_push_call!(ctx, hdr, esz)
 	if esz == 1 then write_str(ctx.fd, "\tstoreb %t${sval}, ${slot}\n")
 	if esz != 1 then write_str(ctx.fd, "\tstorel %t${sval}, ${slot}\n")
-	const Iarch iv2 = ctx.next
-	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${iv2} =l loadl %t${ci}\n")
-	const Iarch iv3 = ctx.next
-	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${iv3} =l add %t${iv2}, 1\n")
-	write_str(ctx.fd, "\tstorel %t${iv3}, %t${ci}\n")
+	write_str(ctx.fd, "\t%t${ci} =l add %t${ci}, 1\n")
 	write_str(ctx.fd, "\tjmp @cptop${lid}\n")
 	write_str(ctx.fd, "@cpend${lid}\n")
 
@@ -5368,10 +5461,12 @@ const emit_for_body! = (*Emit ctx, [Binding] env, Str lv, Str arr, [Stmt] body):
 	const Iarch lenw = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${lenw} =l loadl %t${la}\n")
+	# the element index is a re-assigned temp: -1 here, incremented at `@ltop` (so `continue`
+	# advances) — two defs QBE's ssa pass phi-merges; a cell here would be an unpromotable
+	# in-body alloc paying a load+store every iteration
 	const Iarch ci = ctx.next
 	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${ci} =l alloc8 8\n")
-	write_str(ctx.fd, "\tstorel -1, %t${ci}\n")
+	write_str(ctx.fd, "\t%t${ci} =l copy -1\n")
 	# per-iteration reset: mark the node before the loop; rewound at the back-edge / break / continue
 	let Iarch lmark = -1
 	let Iarch lsur = -1
@@ -5388,16 +5483,10 @@ const emit_for_body! = (*Emit ctx, [Binding] env, Str lv, Str arr, [Stmt] body):
 	# still frees a carve born inside)
 	if lmark >= 0 then ctx.mk_env_base = Iarch(env.len)
 	write_str(ctx.fd, "@ltop${lid}\n")
-	const Iarch iv2 = ctx.next
-	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${iv2} =l loadl %t${ci}\n")
-	const Iarch iv = ctx.next
-	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${iv} =l add %t${iv2}, 1\n")
-	write_str(ctx.fd, "\tstorel %t${iv}, %t${ci}\n")
+	write_str(ctx.fd, "\t%t${ci} =l add %t${ci}, 1\n")
 	const Iarch cmp = ctx.next
 	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${cmp} =l csltl %t${iv}, %t${lenw}\n")
+	write_str(ctx.fd, "\t%t${cmp} =l csltl %t${ci}, %t${lenw}\n")
 	write_str(ctx.fd, "\tjnz %t${cmp}, @fbody${lid}, @lend${lid}\n")
 	write_str(ctx.fd, "@fbody${lid}\n")
 	const Iarch data = ctx.next
@@ -5406,7 +5495,7 @@ const emit_for_body! = (*Emit ctx, [Binding] env, Str lv, Str arr, [Stmt] body):
 	const Iarch esz = elem_bytes(env[ai].elem)
 	const Iarch off = ctx.next
 	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${off} =l mul %t${iv}, ${esz}\n")
+	write_str(ctx.fd, "\t%t${off} =l mul %t${ci}, ${esz}\n")
 	const Iarch eslot = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${eslot} =l add %t${data}, %t${off}\n")
@@ -5419,15 +5508,38 @@ const emit_for_body! = (*Emit ctx, [Binding] env, Str lv, Str arr, [Stmt] body):
 	if elem_is_agg(ctx, env[ai].elem) && !is_nested(env[ai].elem) then fer = env[ai].elem
 	const Iarch xval = ctx.next
 	ctx.next = ctx.next + 1
-	if esz == 1 then write_str(ctx.fd, "\t%t${xval} =l loadub %t${eslot}\n")
-	if esz != 1 then write_str(ctx.fd, "\t%t${xval} =l loadl %t${eslot}\n")
-	const Iarch xcell = ctx.next
-	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${xcell} =l alloc8 8\n")
-	write_str(ctx.fd, "\tstorel %t${xval}, %t${xcell}\n")
+	let Iarch xslot = xval
+	let Bool xc = false
+
+	if has_str(ctx.cap_cells, lv) then {
+		# a closure captures the loop variable by address — it stays a cell (the raw
+		# `loadl`/`storel` spill is bit-preserving; `binding_ptr` reloads in its class)
+		if esz == 1 then write_str(ctx.fd, "\t%t${xval} =l loadub %t${eslot}\n")
+		if esz != 1 then write_str(ctx.fd, "\t%t${xval} =l loadl %t${eslot}\n")
+		const Iarch xcell = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${xcell} =l alloc8 8\n")
+		write_str(ctx.fd, "\tstorel %t${xval}, %t${xcell}\n")
+		xslot = xcell
+		xc = true
+	} else {
+		# the loop variable promotes to a temp re-defined each iteration (QBE's ssa pass
+		# registers it); a float element loads straight in its own class
+		if esz == 1 then write_str(ctx.fd, "\t%t${xval} =l loadub %t${eslot}\n")
+
+		if esz != 1 then {
+			if is_float_name(fx) then {
+				const Str xqt = float_qt(fx)
+				write_str(ctx.fd, "\t%t${xval} =${xqt} load${xqt} %t${eslot}\n")
+			} else {
+				write_str(ctx.fd, "\t%t${xval} =l loadl %t${eslot}\n")
+			}
+		}
+	}
+
 	const [Binding] benv = [
 		...env,
-		Binding({ name: lv, slot: xcell, rec_type: fer, elem: "", is_cell: true, telems: [], fixed: fx }),
+		Binding({ name: lv, slot: xslot, rec_type: fer, elem: "", is_cell: xc, telems: [], fixed: fx }),
 	]
 	const Bool saved_inl = ctx.in_loop
 	ctx.in_loop = true
@@ -5497,14 +5609,13 @@ const emit_loop_body! = (*Emit ctx, [Binding] env, Str lbl, [Stmt] body): Iarch 
 	return 0
 }
 
-# Emit a value-yielding `loop { ... }` (an expression): allocate ONE merge slot before the loop
-# (so a long loop does not leak — it is not re-alloc'd per iteration), then `@ltop` / body /
-# back-edge / `@lend` like a statement loop, but with `cur_slot` set so each `<- v` stores its
-# value into the slot and jumps to `@lend`. After the loop, load the slot as the result.
+# Emit a value-yielding `loop { ... }` (an expression): reserve ONE merge TEMP before the loop,
+# then `@ltop` / body / back-edge / `@lend` like a statement loop, but with `cur_slot` set so
+# each `<- v` assigns the temp and jumps to `@lend`. Every path into `@lend` runs a yield, so
+# the temp is defined wherever it is read; QBE's ssa pass makes the phi.
 const emit_loop_value! = (*Emit ctx, [Binding] env, [Stmt] body): Str -> {
 	const Iarch slot = ctx.next
 	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${slot} =l alloc8 8\n")
 	const Iarch lid = ctx.label
 	ctx.label = ctx.label + 1
 	const Iarch saved = ctx.cur_loop
@@ -5528,13 +5639,8 @@ const emit_loop_value! = (*Emit ctx, [Binding] env, [Stmt] body): Str -> {
 	ctx.cur_slot = saved_slot
 	ctx.loop_mark = saved_mark
 	ctx.loop_sur_mark = saved_sur
-	# the slot loads in the yielded value's QBE type (a float loop yields `d`/`s`)
-	const Str qt = qtype_of_name(loop_yield_scalar_list!(ctx, env, body))
-	const Iarch rt = ctx.next
-	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${rt} =${qt} load${qt} %t${slot}\n")
 
-	return "%t${rt}"
+	return "%t${slot}"
 }
 
 # Emit a statement-position `if cond then <body>` guard: branch on the condition into a
@@ -5621,10 +5727,10 @@ const emit_simple_stmt! = (*Emit ctx, [Binding] env, Stmt s): Iarch -> {
 			term = 1
 		},
 		Stmt.Yield(e) -> {
-			# `<- v` — store the value (in its QBE type, `d`/`s` for a float) into the nearest
-			# value-loop's merge slot and break to `@lend`
+			# `<- v` — assign the value (in its QBE type, `d`/`s` for a float) to the nearest
+			# value-loop's merge temp and break to `@lend`
 			const Str v = emit_expr!(e, ctx, env)
-			write_str(ctx.fd, "\tstore${qtype_of!(ctx, env, e)} ${v}, %t${ctx.cur_slot}\n")
+			write_str(ctx.fd, "\t%t${ctx.cur_slot} =${qtype_of!(ctx, env, e)} copy ${v}\n")
 			write_str(ctx.fd, "\tjmp @lend${ctx.cur_loop}\n")
 			term = 1
 		},
@@ -5671,7 +5777,14 @@ const emit_simple_stmt! = (*Emit ctx, [Binding] env, Stmt s): Iarch -> {
 				emit_append_expr!(ctx, env, hdr, e, env[idx].elem)
 			} else {
 				const Str v = emit_expr!(e, ctx, env)
-				write_str(ctx.fd, "\t${store_op(env[idx].fixed)} ${v}, %t${env[idx].slot}\n")
+
+				# a cell binding (a captured local) stores through its address; a promoted
+				# binding re-defines its temp — QBE's ssa pass makes the phis
+				if env[idx].is_cell then {
+					write_str(ctx.fd, "\t${store_op(env[idx].fixed)} ${v}, %t${env[idx].slot}\n")
+				} else {
+					write_str(ctx.fd, "\t%t${env[idx].slot} =${copy_cls(env[idx].fixed)} copy ${v}\n")
+				}
 			}
 
 			ctx.alloc_node = saved_an
@@ -5839,12 +5952,26 @@ const emit_block! = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 						else scalar_of!(ctx, env, e)
 					const Iarch slot = ctx.next
 					ctx.next = ctx.next + 1
-					write_str(ctx.fd, "\t%t${slot} =l add %lpool, ${emit_local_slot(ctx) * 8}\n")
-					write_str(ctx.fd, "\t${store_op(fx)} ${v}, %t${slot}\n")
-					env = [
-						...env,
-						Binding({ name: n, slot: slot, rec_type: "", elem: "", is_cell: true, telems: [], fixed: fx }),
-					]
+
+					if has_str(ctx.cap_cells, n) then {
+						# a closure captures this local by its cell ADDRESS (`$capref`) — it must
+						# stay addressable memory, so it keeps a pool cell
+						write_str(ctx.fd, "\t%t${slot} =l add %lpool, ${emit_local_slot(ctx) * 8}\n")
+						write_str(ctx.fd, "\t${store_op(fx)} ${v}, %t${slot}\n")
+						env = [
+							...env,
+							Binding({ name: n, slot: slot, rec_type: "", elem: "", is_cell: true, telems: [], fixed: fx }),
+						]
+					} else {
+						# locals promotion: an uncaptured scalar lives in a plain temp, re-defined
+						# on reassignment — QBE's ssa pass turns the defs into registers/phis, so
+						# reads cost nothing instead of a load per access
+						write_str(ctx.fd, "\t%t${slot} =${copy_cls(fx)} copy ${v}\n")
+						env = [
+							...env,
+							Binding({ name: n, slot: slot, rec_type: "", elem: "", is_cell: false, telems: [], fixed: fx }),
+						]
+					}
 				} else {
 					# a `$`-marked binding builds its aggregate on the STACK (reclaimed at frame exit); the
 					# flag rides through the whole initializer emit (nested literals included) and is cleared
@@ -5868,7 +5995,7 @@ const emit_block! = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 						btel = init_telems!(ctx, env, e)
 					}
 
-					if m then {
+					if m && has_str(ctx.cap_cells, n) then {
 						const Iarch cell = ctx.next
 						ctx.next = ctx.next + 1
 						write_str(ctx.fd, "\t%t${cell} =l add %lpool, ${emit_local_slot(ctx) * 8}\n")
@@ -5881,6 +6008,21 @@ const emit_block! = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 								rec_type: rt,
 								elem: belem,
 								is_cell: true,
+								telems: btel,
+								fixed: "",
+							}),
+						]
+					} else if m then {
+						# a mutable aggregate's base pointer promotes to a re-assigned temp: a
+						# repoint (`xs = []`) re-defines it, a self-spread grows in place through it
+						env = [
+							...env,
+							Binding({
+								name: n,
+								slot: base,
+								rec_type: rt,
+								elem: belem,
+								is_cell: false,
 								telems: btel,
 								fixed: "",
 							}),
@@ -6678,13 +6820,12 @@ const emit_func! = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 	}
 	write_str(ctx.fd, "@start\n")
 	if ctx.debug && fn.dline > 0 then write_str(ctx.fd, "\tdbgloc ${fn.dline}, ${fn.dcol}\n")
-	# (`if`/`&&`/`||` value merges need no pool: they merge through a shared TEMP assigned in each
-	# branch — see `emit_if!` — so nothing here is allocated for them.)
-	# The LOCAL-slot POOL. A word/pointer local's cell was
-	# `alloc8`'d at its declaration; when that declaration sits in a loop body the alloc is a per-
-	# iteration `sub sp` that never unwinds. Instead every local's cell is `%lpool + slot*8`, and
-	# `emit_block!` rewinds `ctx.local_slot` on scope exit so a loop body reuses the same slots each
-	# iteration. 128 slots is far past any real live-local nesting; `emit_local_slot` dies if exceeded.
+	# The LOCAL-slot POOL — only for locals a closure captures by ADDRESS (`$capref`,
+	# `ctx.cap_cells`): a captured cell must be addressable memory, and pooling it here (rather
+	# than an `alloc8` at its declaration) keeps a loop-body declaration from bumping `sp` every
+	# iteration. Every other local is a plain re-assigned TEMP (QBE's ssa pass makes the
+	# registers/phis), the same way `if`/`&&`/`||`/`match`/value-loop merges ride shared temps.
+	# When no local is captured the pool has no uses and QBE's slot promotion deletes the alloc.
 	write_str(ctx.fd, "\t%lpool =l alloc8 1024\n")
 	ctx.local_slot = 0
 	# a materialized body's dynamic-growth pushes (`cf_dyn_push_g` / `cf_*_append_g`) reserve
@@ -7690,6 +7831,17 @@ pub const emit_program! = (
 		di = di + 1
 	}
 
+	# the lifted-closure functions, once — each function's by-address capture set (`cap_cells`)
+	# reads off this list by name prefix, so locals promotion knows which locals stay cells
+	let [Func] clofns = []
+	let Iarch cfi = 0
+
+	loop {
+		if cfi >= Iarch(prog.funcs.len) then break
+		if has_pfx(prog.funcs[cfi].name, "__clo_") then clofns = [...clofns, prog.funcs[cfi]]
+		cfi = cfi + 1
+	}
+
 	let Iarch i = 0
 
 	loop {
@@ -7736,6 +7888,7 @@ pub const emit_program! = (
 				target_arch: target_arch,
 				loop_labels: no_names(),
 				loop_lids: no_lids(),
+				cap_cells: capref_names!(clofns, i),
 			})
 			emit_func!(&ctx, prog.funcs[i], i)
 		}
