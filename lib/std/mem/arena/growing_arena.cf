@@ -22,7 +22,6 @@
 # and calls with only the args THEY provide. The compiler supplies the whole behavior at the
 # call site, spending the ambient node it already holds on the placed `carve` below.
 import std::mem::raw
-import std::comptime::build
 
 # Carve a growing arena from the ambient node, starting at `n` bytes, and hand back its handle. When
 # it fills it pulls another `n`-sized block from its parent, so `n` is the growth quantum, not a
@@ -48,97 +47,22 @@ pub intrinsic destroy = (Uarch node): ()
 # own `aux` at +64). The `reserve` slot (+32) is NOT written — emit publishes this node's reserve
 # entry there after the carve. `node` is compiler-supplied (the ambient parent) when lowering an
 # `of(n)` call.
-if build::instrument then {
-	# `--instrument` (the debug arc): the header EXTENDS append-only past the shared 72
-	# bytes — count@72, bytes@80, pulls@88 — and the reserves maintain the counters.
-	# `std::mem::stats::arena(a)` reads them back. Emit's folded mark/reset offsets
-	# (+0/+8, +40/+48) are untouched; the lean variants below stay the shipped shape.
-	const carve = (Uarch node, Uarch n): Uarch -> {
-		const Uarch r = (n + 7) % 8
-		const Uarch sz = n + 7 - r
-		const Uarch hdr = raw::alloc(node, 96)
-		const Uarch blk = raw::alloc(node, sz)
-		const Uarch end = blk + sz
-		raw::store(hdr, blk)
-		raw::store(hdr + 8, end)
-		raw::store(hdr + 16, node)
-		raw::store(hdr + 24, sz)
-		raw::store(hdr + 40, 0)
-		raw::store(hdr + 48, 0)
-		raw::store(hdr + 56, node)
-		raw::store(hdr + 64, sz)
-		raw::store(hdr + 72, 0)
-		raw::store(hdr + 80, 0)
-		raw::store(hdr + 88, 0)
+const carve = (Uarch node, Uarch n): Uarch -> {
+	const Uarch r = (n + 7) % 8
+	const Uarch sz = n + 7 - r
+	const Uarch hdr = raw::alloc(node, 72)
+	const Uarch blk = raw::alloc(node, sz)
+	const Uarch end = blk + sz
+	raw::store(hdr, blk)
+	raw::store(hdr + 8, end)
+	raw::store(hdr + 16, node)
+	raw::store(hdr + 24, sz)
+	raw::store(hdr + 40, 0)
+	raw::store(hdr + 48, 0)
+	raw::store(hdr + 56, node)
+	raw::store(hdr + 64, sz)
 
-		return hdr
-	}
-	const reserve_ret = (Uarch node, Uarch sz): Uarch -> {
-		raw::store(node + 72, raw::load(node + 72) + 1)
-		raw::store(node + 80, raw::load(node + 80) + sz)
-		let Uarch p = raw::load(node)
-		if p + sz > raw::load(node + 8) then {
-			raw::store(node + 88, raw::load(node + 88) + 1)
-			pull(node, sz)
-			p = raw::load(node)
-		}
-		raw::store(node, p + sz)
-
-		return p
-	}
-	const reserve_alloc = (Uarch node, Uarch sz): Uarch -> {
-		raw::store(node + 72, raw::load(node + 72) + 1)
-		raw::store(node + 80, raw::load(node + 80) + sz)
-		const Uarch r = node + 40
-		let Uarch p = raw::load(r)
-		if p + sz > raw::load(r + 8) then {
-			raw::store(node + 88, raw::load(node + 88) + 1)
-			pull(r, sz)
-			p = raw::load(r)
-		}
-		raw::store(r, p + sz)
-
-		return p
-	}
-} else {
-	const carve = (Uarch node, Uarch n): Uarch -> {
-		const Uarch r = (n + 7) % 8
-		const Uarch sz = n + 7 - r
-		const Uarch hdr = raw::alloc(node, 72)
-		const Uarch blk = raw::alloc(node, sz)
-		const Uarch end = blk + sz
-		raw::store(hdr, blk)
-		raw::store(hdr + 8, end)
-		raw::store(hdr + 16, node)
-		raw::store(hdr + 24, sz)
-		raw::store(hdr + 40, 0)
-		raw::store(hdr + 48, 0)
-		raw::store(hdr + 56, node)
-		raw::store(hdr + 64, sz)
-
-		return hdr
-	}
-	const reserve_ret = (Uarch node, Uarch sz): Uarch -> {
-		let Uarch p = raw::load(node)
-		if p + sz > raw::load(node + 8) then {
-			pull(node, sz)
-			p = raw::load(node)
-		}
-		raw::store(node, p + sz)
-
-		return p
-	}
-	const reserve_alloc = (Uarch node, Uarch sz): Uarch -> {
-		const Uarch r = node + 40
-		let Uarch p = raw::load(r)
-		if p + sz > raw::load(r + 8) then {
-			pull(r, sz)
-			p = raw::load(r)
-		}
-		raw::store(r, p + sz)
-
-		return p
-	}
+	return hdr
 }
 
 # An elastic subnode's grow step (≡ the floor's cf_arena_pull): pull a fresh block — the larger
@@ -155,6 +79,34 @@ const pull = (Uarch sub, Uarch sz): Uarch -> {
 	raw::store(sub + 8, blk + bs)
 
 	return 0
+}
+
+# Reserve `sz` on the SURVIVOR side — `on_ret` minus the copy. An elastic survivor bumps within
+# its block and pulls a fresh chunk on overflow (limit at node+8). Monomorphic: no kind test.
+const reserve_ret = (Uarch node, Uarch sz): Uarch -> {
+	let Uarch p = raw::load(node)
+	if p + sz > raw::load(node + 8) then {
+		pull(node, sz)
+		p = raw::load(node)
+	}
+	raw::store(node, p + sz)
+
+	return p
+}
+
+# Reserve `sz` on the RESIDUE side — `on_alloc` minus the copy. An elastic residue bumps up its
+# private chain (at node+40), pulling its first/next chunk from the parent as needed (limit at
+# node+48). Monomorphic: no kind test.
+const reserve_alloc = (Uarch node, Uarch sz): Uarch -> {
+	const Uarch r = node + 40
+	let Uarch p = raw::load(r)
+	if p + sz > raw::load(r + 8) then {
+		pull(r, sz)
+		p = raw::load(r)
+	}
+	raw::store(r, p + sz)
+
+	return p
 }
 
 # ── the scope bracket (geometry_lowering §2) ─────────────────────────────────────────────

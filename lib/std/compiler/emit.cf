@@ -2586,6 +2586,16 @@ const emit_geom_reserve! = (*Emit ctx, Iarch size): Iarch -> {
 	const Iarch t = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${t} =l call $${fsym!(ctx.funcs, ctx.debug, hi)}(l %node_0, l ${size})\n")
+	# `--instrument` (the sanitizer model): observe the reserve — the observer runtime is
+	# readable std source (std::mem::observe), auto-loaded by resolve for this build
+	if ctx.instrument then {
+		const Iarch oi = find_func(ctx.funcs, "std_mem_observe_on_reserve")
+		if oi < 0
+			then die("cf: emit: an instrumented build lost `std::mem::observe` — resolve should have loaded it\n")
+		# the observer may carry the hidden ambient node (compute_nodesig) — match its signature
+		const Str amb = if ctx.nodesig[oi] then "l %node_0, " else ""
+		write_str(ctx.fd, "\tcall $${fsym!(ctx.funcs, ctx.debug, oi)}(${amb}l %node_0, l ${size})\n")
+	}
 
 	return t
 }
@@ -6893,7 +6903,7 @@ const emit_func! = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 # is carried by the pointer, so one shared floor helper serves every geometry (no per-geometry
 # copy, no runtime kind-dispatch). The `_g` suffix is historical: the legacy non-`_g` set that
 # grew via the now-deleted `cf_alloc` kind-switch is gone (every allocation is materialized).
-const emit_dyn_helpers! = (Fd fd): Iarch -> {
+const emit_dyn_helpers! = (Fd fd, Bool instrument, Str obsym, Bool obs_amb): Iarch -> {
 	const Str sfx = "_g"
 	const Str rf = ", l %reservefn"
 	write_str(fd, "function l $cf_dyn_push${sfx}(l %node, l %hdr, w %esize${rf}) {\n")
@@ -6914,6 +6924,13 @@ const emit_dyn_helpers! = (Fd fd): Iarch -> {
 	write_str(fd, "\t%ncap =l add %dbl, %z4\n")
 	write_str(fd, "\t%nbytes =l mul %ncap, %es\n")
 	write_str(fd, "\t%ndata =l call %reservefn(l %node, l %nbytes)\n")
+	# `--instrument`: observe the growth reserve (one site covers every push/append —
+	# the append helpers grow through this one)
+	if instrument then {
+		if obs_amb
+			then write_str(fd, "\tcall $${obsym}(l %node, l %node, l %nbytes)\n")
+			else write_str(fd, "\tcall $${obsym}(l %node, l %nbytes)\n")
+	}
 	write_str(fd, "\t%odata =l loadl %hdr\n")
 	write_str(fd, "\t%obytes =l mul %len, %es\n")
 	write_str(fd, "\tstorel 0, %ip\n")
@@ -7192,7 +7209,16 @@ const emit_dyn_helpers! = (Fd fd): Iarch -> {
 	return 0
 }
 
-const emit_arena_qbe! = (Fd fd, Bool is_bare, Iarch root_size, Bool dyn_g, Str pgs): Iarch -> {
+const emit_arena_qbe! = (
+	Fd fd,
+	Bool is_bare,
+	Iarch root_size,
+	Bool dyn_g,
+	Str pgs,
+	Bool instrument,
+	Str obsym,
+	Bool obs_amb,
+): Iarch -> {
 	# a `Bare` target's root is a fixed `root_size`-byte BSS block (`$cf_root`, default 1 MiB) — no
 	# mmap. cf_root_page_init seeds $cf_page over it as a two-ended block (survivor limit == residue
 	# top == base+root_size), so the page reserve bumps within it and
@@ -7227,7 +7253,7 @@ const emit_arena_qbe! = (Fd fd, Bool is_bare, Iarch root_size, Bool dyn_g, Str p
 	# (the floor `cf_reset` scope-fold helper is RETIRED — a `!` frame's residue bracket now rewinds
 	# through the geometry's own `on_scope_exit` hook, placed by `emit_reset!`; the survivor-scope
 	# mark rewinds inline. See geometry_lowering §2.)
-	if dyn_g then emit_dyn_helpers!(fd)
+	if dyn_g then emit_dyn_helpers!(fd, instrument, obsym, obs_amb)
 	# cf_str_eq(a, b) — Str value equality (used by string `match`): compare the low word of the
 	# `len@8` slot (LE, matching `cf_str_append`), then the `bytes@0` run byte-for-byte; returns
 	# 1 if equal, 0 otherwise. Length-driven, so an interior NUL and an empty string compare right.
@@ -7596,15 +7622,26 @@ pub const emit_program! = (
 	# statically
 	# in the `$cf_page` data, so an arena grafted from the page follows the pointer like any other
 	# parent. Kept by materialize whenever a child draws from the page; -1 (absent) when nothing does.
-	const Iarch pgidx = find_func(prog.funcs, "reserve_ret__pg")
-	const Str pgsym = if pgidx >= 0 then fsym!(prog.funcs, debug, pgidx) else ""
-	emit_arena_qbe!(qbe_fd, is_bare, root_size, dyn_g, pgsym)
 	# address-taken functions (used as a value anywhere) are excluded from the flat-return reset — an
 	# indirect call site cannot claim. Computed once for the whole program (geometry_lowering §3).
 	# node-free pruning (geometry_lowering §4): which signatures carry the hidden %node_0
 	const [Str] at = address_taken(prog)
 	const [Bool] nsig = compute_nodesig(prog, at)
 	const [Bool] mts = compute_mints(prog, at)
+	const Iarch pgidx = find_func(prog.funcs, "reserve_ret__pg")
+	const Str pgsym = if pgidx >= 0 then fsym!(prog.funcs, debug, pgidx) else ""
+	# the observer symbol for `--instrument` injections (the sanitizer model) — resolve
+	# auto-loaded the module, so a miss here is a compiler bug
+	let Str obsym = ""
+	let Bool obs_amb = false
+	if instrument then {
+		const Iarch oi = find_func(prog.funcs, "std_mem_observe_on_reserve")
+		if oi < 0
+			then die("cf: emit: an instrumented build lost `std::mem::observe` — resolve should have loaded it\n")
+		obsym = fsym!(prog.funcs, debug, oi)
+		obs_amb = nsig[oi]
+	}
+	emit_arena_qbe!(qbe_fd, is_bare, root_size, dyn_g, pgsym, instrument, obsym, obs_amb)
 	# the interned string literals: laid down once as static data (see emit_str_lit!). `skip_embeds`
 	# (bootstrap intermediates) drops embedded file data so it never reaches the committed seed.
 	const [Str] slt = slit_program!(prog, skip_embeds, build_version)

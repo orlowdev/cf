@@ -28,17 +28,17 @@ _f123:
 	mov x0, #0
 	ret
 
-.globl _f429
+.globl _f427
 .p2align 2
-_f429:
+_f427:
 	mov x0, x0
 	mov x16, #1
 	svc #0x80
 	ret
 
-.globl _f430
+.globl _f428
 .p2align 2
-_f430:
+_f428:
 	mov x16, #2
 	svc #0x80
 	b.cc 1f
