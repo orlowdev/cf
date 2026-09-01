@@ -44,12 +44,19 @@ const peek_b = (*Jp p): Iarch -> {
 	return Iarch(p.src[p.pos])
 }
 
-const skip_ws = (*Jp p): () -> {
+# Skip whitespace and return the byte now at the cursor (-1 at the end) — the fused form of
+# the skip-then-peek pair every grammar site wants: one bounds check serves both, and a
+# printable non-space byte (all of a compact document) exits on the FIRST compare.
+const ws_peek = (*Jp p): Iarch -> {
 	loop {
-		const Iarch c = peek_b(p)
-		if c != 32 && c != 9 && c != 10 && c != 13 then break
+		if p.pos >= Iarch(p.src.len) then return -1
+		const Iarch c = Iarch(p.src[p.pos])
+		if c > 32 then return c
+		if c != 32 && c != 9 && c != 10 && c != 13 then return c
 		p.pos = p.pos + 1
 	}
+
+	return -1
 }
 
 # Advance over the literal `w` if the source carries it at the cursor.
@@ -212,66 +219,82 @@ const parse_string! = (*Jp p): Str -> {
 
 # A number per the JSON grammar — `-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?` — kept as
 # its raw lexeme (a view into the source), never converted here.
+# The lexeme scans on a LOCAL cursor (`i`/`n`/`s` live in registers) and writes `p.pos` back
+# once per section — scanning through the `*Jp` pointer would reload pos/src/len per byte,
+# since every `p.pos` store invalidates what the pointer was seen to hold.
 const parse_number = (*Jp p): Json -> {
 	const Iarch start = p.pos
+	const Str s = p.src
+	const Iarch n = Iarch(s.len)
+	let Iarch i = p.pos
 
-	if peek_b(p) == 45 then p.pos = p.pos + 1
-	const Iarch first = peek_b(p)
+	if i < n && Iarch(s[i]) == 45 then i = i + 1
+	let Iarch first = -1
+	if i < n then first = Iarch(s[i])
 
 	if first == 48 then {
-		p.pos = p.pos + 1
+		i = i + 1
 	} else {
 		if first < 49 || first > 57 then {
+			p.pos = i
 			jerr(p, "a number needs a digit after its sign")
 
 			return Json.Null
 		}
 
 		loop {
-			const Iarch c = peek_b(p)
+			if i >= n then break
+			const Iarch c = Iarch(s[i])
 			if c < 48 || c > 57 then break
-			p.pos = p.pos + 1
+			i = i + 1
 		}
 	}
 
-	if peek_b(p) == 46 then {
-		p.pos = p.pos + 1
-		const Iarch fd = peek_b(p)
+	if i < n && Iarch(s[i]) == 46 then {
+		i = i + 1
+		let Iarch fd = -1
+		if i < n then fd = Iarch(s[i])
 
 		if fd < 48 || fd > 57 then {
+			p.pos = i
 			jerr(p, "a fraction needs at least one digit")
 
 			return Json.Null
 		}
 
 		loop {
-			const Iarch c = peek_b(p)
+			if i >= n then break
+			const Iarch c = Iarch(s[i])
 			if c < 48 || c > 57 then break
-			p.pos = p.pos + 1
+			i = i + 1
 		}
 	}
-	const Iarch ex = peek_b(p)
+	let Iarch ex = -1
+	if i < n then ex = Iarch(s[i])
 
 	if ex == 101 || ex == 69 then {
-		p.pos = p.pos + 1
-		const Iarch sg = peek_b(p)
-		if sg == 43 || sg == 45 then p.pos = p.pos + 1
-		const Iarch ed = peek_b(p)
+		i = i + 1
+		if i < n && (Iarch(s[i]) == 43 || Iarch(s[i]) == 45) then i = i + 1
+		let Iarch ed = -1
+		if i < n then ed = Iarch(s[i])
 
 		if ed < 48 || ed > 57 then {
+			p.pos = i
 			jerr(p, "an exponent needs at least one digit")
 
 			return Json.Null
 		}
 
 		loop {
-			const Iarch c = peek_b(p)
+			if i >= n then break
+			const Iarch c = Iarch(s[i])
 			if c < 48 || c > 57 then break
-			p.pos = p.pos + 1
+			i = i + 1
 		}
 	}
+	p.pos = i
 
-	return Json.Num(bytes::view(start, p.pos, p.src))
+	return Json.Num(bytes::view(start, i, p.src))
 }
 
 const parse_array! = (*Jp p): Json -> {
@@ -285,8 +308,7 @@ const parse_array! = (*Jp p): Json -> {
 	}
 	let [Json] xs = []
 
-	skip_ws(p)
-	if peek_b(p) == 93 then {
+	if ws_peek(p) == 93 then {
 		p.pos = p.pos + 1
 		p.depth = p.depth - 1
 
@@ -297,8 +319,7 @@ const parse_array! = (*Jp p): Json -> {
 		const Json v = parse_value!(p)
 		if p.bad then return Json.Null
 		xs = [...xs, v]
-		skip_ws(p)
-		const Iarch c = peek_b(p)
+		const Iarch c = ws_peek(p)
 
 		if c == 93 then {
 			p.pos = p.pos + 1
@@ -310,7 +331,6 @@ const parse_array! = (*Jp p): Json -> {
 			return Json.Null
 		}
 		p.pos = p.pos + 1
-		skip_ws(p)
 	}
 
 	p.depth = p.depth - 1
@@ -329,8 +349,7 @@ const parse_object! = (*Jp p): Json -> {
 	}
 	let [JsonEntry] es = []
 
-	skip_ws(p)
-	if peek_b(p) == 125 then {
+	if ws_peek(p) == 125 then {
 		p.pos = p.pos + 1
 		p.depth = p.depth - 1
 
@@ -338,27 +357,23 @@ const parse_object! = (*Jp p): Json -> {
 	}
 
 	loop {
-		skip_ws(p)
-		if peek_b(p) != 34 then {
+		if ws_peek(p) != 34 then {
 			jerr(p, "expected a `\"` object key")
 
 			return Json.Null
 		}
 		const Str k = parse_string!(p)
 		if p.bad then return Json.Null
-		skip_ws(p)
-		if peek_b(p) != 58 then {
+		if ws_peek(p) != 58 then {
 			jerr(p, "expected `:` after an object key")
 
 			return Json.Null
 		}
 		p.pos = p.pos + 1
-		skip_ws(p)
 		const Json v = parse_value!(p)
 		if p.bad then return Json.Null
 		es = [...es, JsonEntry({ key: k, val: v })]
-		skip_ws(p)
-		const Iarch c = peek_b(p)
+		const Iarch c = ws_peek(p)
 
 		if c == 125 then {
 			p.pos = p.pos + 1
@@ -379,7 +394,7 @@ const parse_object! = (*Jp p): Json -> {
 
 const parse_value! = (*Jp p): Json -> {
 	if p.bad then return Json.Null
-	const Iarch c = peek_b(p)
+	const Iarch c = ws_peek(p)
 
 	if c == 123 then return parse_object!(p)
 	if c == 91 then return parse_array!(p)
@@ -416,11 +431,9 @@ const parse_value! = (*Jp p): Json -> {
 pub const parse! = (Str src): Either[JsonRrr, Json] -> {
 	let Jp p = Jp({ src: src, pos: 0, depth: 0, bad: false, eoff: 0, emsg: "" })
 
-	skip_ws(&p)
 	const Json v = parse_value!(&p)
 
-	skip_ws(&p)
-	if !p.bad && p.pos < Iarch(p.src.len) then jerr(&p, "trailing bytes after the value")
+	if !p.bad && ws_peek(&p) >= 0 then jerr(&p, "trailing bytes after the value")
 	if p.bad then return Either[JsonRrr, Json].Left(JsonRrr({ off: p.eoff, msg: p.emsg }))
 
 	return Either[JsonRrr, Json].Right(v)
