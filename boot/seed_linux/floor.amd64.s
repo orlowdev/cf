@@ -6,9 +6,9 @@ f129:
 	addq $8, %rsp
 	ret
 
-.globl f137
+.globl f139
 .p2align 2
-f137:
+f139:
 	movq %rdi, %rax
 	movq %rsi, %rdi
 	movq %rdx, %rsi
@@ -19,15 +19,15 @@ f137:
 	syscall
 	ret
 
-.globl f138
+.globl f140
 .p2align 2
-f138:
+f140:
 	movq $1, %rax
 	ret
 
-.globl f489
+.globl f496
 .p2align 2
-f489:
+f496:
 	movl $231, %eax
 	syscall
 	ret

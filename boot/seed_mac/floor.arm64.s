@@ -6,9 +6,9 @@ _f129:
 	ldp x29, x30, [sp], #16
 	ret
 
-.globl _f137
+.globl _f139
 .p2align 2
-_f137:
+_f139:
 	mov x16, x0
 	mov x0, x1
 	mov x1, x2
@@ -22,23 +22,23 @@ _f137:
 1:
 	ret
 
-.globl _f138
+.globl _f140
 .p2align 2
-_f138:
+_f140:
 	mov x0, #0
 	ret
 
-.globl _f489
+.globl _f496
 .p2align 2
-_f489:
+_f496:
 	mov x0, x0
 	mov x16, #1
 	svc #0x80
 	ret
 
-.globl _f490
+.globl _f497
 .p2align 2
-_f490:
+_f497:
 	mov x16, #2
 	svc #0x80
 	b.cc 1f

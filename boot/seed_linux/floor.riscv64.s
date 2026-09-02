@@ -8,9 +8,9 @@ f129:
 	addi sp, sp, 16
 	ret
 
-.globl f137
+.globl f139
 .p2align 2
-f137:
+f139:
 	mv a7, a0
 	mv a0, a1
 	mv a1, a2
@@ -21,15 +21,15 @@ f137:
 	ecall
 	ret
 
-.globl f138
+.globl f140
 .p2align 2
-f138:
+f140:
 	li a0, 2
 	ret
 
-.globl f489
+.globl f496
 .p2align 2
-f489:
+f496:
 	mv a0, a0
 	li a7, 94
 	ecall
