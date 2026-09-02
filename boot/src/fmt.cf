@@ -324,9 +324,11 @@ const match_end = (*[Uint8] src, [Token] toks, Iarch li): Iarch -> {
 #
 # Line formatting (Phase B): reproduce the token stream, but rewrite every line START to `depth`
 # hard tabs (nesting depth over `(){}[]`) and collapse each run of blank lines to a single one.
-# Inter-token spacing WITHIN a line is preserved verbatim — cf's newlines are statement
-# separators, so the user's line breaks stand; only leading indentation and blank runs are
-# canonicalised (both invisible to the lexer, so the output always re-lexes to the same tokens).
+# Inter-token spacing WITHIN a line is canonicalised too (Phase F, see the emit loop): a
+# whitespace run is exactly one space, edges against brackets and commas take their canonical
+# gap, and a zero gap between glued tokens stays zero — cf's newlines are statement separators,
+# so the user's line breaks stand, and every rewrite is lexer-invisible (the output re-lexes to
+# the same tokens).
 #
 # Trailing commas (Phase C): a pre-pass classifies each bracketed group by whether it holds a
 # top-level comma (the safe marker of a comma-separated LIST — cf places commas only inside
@@ -799,13 +801,26 @@ pub const format_source! = (*[Uint8] src, Iarch n, Str file): [Uint8] -> {
 			const Iarch nl = count_nl(src, gfrom, gto)
 
 			if nl == 0 then {
-				let Iarch k = gfrom
+				# Inter-token spacing WITHIN a line, canonicalised (Phase F): tight after a `(`/`[`
+				# and before a `)`/`]`/`,`; one space inside `{ }` braces (an empty `{}` stays
+				# tight) and after a `,`; a comment always sits one space off the code it trails;
+				# any other whitespace run collapses to EXACTLY one space. A zero gap between two
+				# glued tokens stays zero — gluing is meaning (`f(`, `x!`, `a.b`, `ns::m`) — and a
+				# space is only added or removed against bracket/comma delimiters, whose single-byte
+				# tokens cannot merge with a neighbour, so the output always re-lexes identically.
+				const TokKind gpk = p.kind
+				const TokKind gtk = t.kind
 
-				loop {
-					if k >= gto then break
-					out = [...out, src[k]]
-					k = k + 1
-				}
+				if is_comment(gtk) then out = [...out, Uint8(32)]
+				else if is_lparen(gpk) ||
+					is_lbracket(gpk) ||
+					is_rparen(gtk) ||
+					is_rbracket(gtk) ||
+					is_comma(gtk) then {
+				} else if is_lbrace(gpk) then {
+					if !is_rbrace(gtk) then out = [...out, Uint8(32)]
+				} else if is_rbrace(gtk) || is_comma(gpk) then out = [...out, Uint8(32)]
+				else if gto > gfrom then out = [...out, Uint8(32)]
 			} else if (tok_is_then(src, t) &&
 					(is_rbrace(p.kind) || (i + 1 < Iarch(toks.len) && is_lbrace(toks[i + 1].kind)))) ||
 				(tok_is_else(src, t) && is_rbrace(p.kind)) then {
