@@ -83,6 +83,38 @@ const wait4_raw = (Iarch pid, *[Uint8] st): Iarch -> syscall6(7, Uarch(pid), st,
 # getpid() — the calling process's id. Handy for unique temp-file names.
 pub const getpid = (): Iarch -> syscall6(20, 0, 0, 0, 0, 0, 0)
 
+# Store `v` into `buf` at `at` as a little-endian integer of `width` bytes — the writer twin of
+# the fs floors' `le` reader, for assembling a syscall struct in a byte buffer.
+const store_le = (*[Uint8] buf, Iarch at, Iarch width, Iarch v): () -> {
+	let Iarch rest = v
+	let Iarch k = 0
+
+	loop {
+		if k >= width then break
+
+		buf[at + k] = Uint8(rest % 256)
+		rest = rest / 256
+		k = k + 1
+	}
+}
+
+# select() with no fd sets — only the timeout. darwin exposes no `nanosleep` syscall, so a
+# zero-fd select (number 93) is the freestanding way to block for an interval. `tv` is a BSD
+# `struct timeval`: `tv_sec` i64 at 0, `tv_usec` i32 at 8 (padded to 16).
+const sleep_raw = (*[Uint8] tv): Iarch -> syscall6(93, 0, 0, 0, 0, tv, 0)
+
+# Block the calling process for `ms` milliseconds — a kernel wait, not a spin. The polling
+# heartbeat of `cf --watch`. (The struct is a `$`-stack slot filled by `store_le`, never an
+# array literal — a literal would be arena residue and force a `!` on a pure wait.)
+pub const sleep_ms = (Iarch ms): () -> {
+	let [16 Uint8] $tv
+
+	store_le($tv, 0, 8, ms / 1000)
+	store_le($tv, 8, 4, ms % 1000 * 1000)
+	store_le($tv, 12, 4, 0)
+	sleep_raw($tv)
+}
+
 # Copy `len` bytes of `buf` starting at `start` into a fresh owned Str (the fs::slice_str idiom —
 # append inline, never return a bare indexed byte).
 const slice = (*[Uint8] buf, Iarch start, Iarch len): Str -> {

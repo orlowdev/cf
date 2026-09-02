@@ -24,6 +24,8 @@ import cli::{
 	is_test_cmd,
 	test_targets,
 	test_bail,
+	has_watch,
+	strip_watch,
 	is_version_cmd,
 	is_help_cmd,
 	host_arch,
@@ -40,9 +42,9 @@ import std::compiler::spans::{ line_col_of, LC, SrcMap }
 import std::compiler::diag::{ Diag, TyRow, print_diags! }
 import std::mem::arena::growing_arena
 import qbe::{ qbe_translate }
-import std::process::{ run!, find_executable!, getpid, exit }
-import std::io::fs::{ remove, read_dir!, walk_dir! }
-import std::io::fd::{ Fd, DirEntry, IoRrr, entry_is_dir }
+import std::process::{ run!, find_executable!, getpid, exit, sleep_ms }
+import std::io::fs::{ remove, read_dir!, walk_dir!, stat! }
+import std::io::fd::{ Fd, DirEntry, IoRrr, entry_is_dir, is_dir }
 import std::io::file::{ create, close, write_str, open_read, read }
 import std::data::{ Either }
 import std::io::console::{ eprint, print, println }
@@ -1182,6 +1184,153 @@ const run_test_file! = (Str target, Bool bail, [Str] env, [Str] req): Iarch -> {
 	return rc
 }
 
+# Does `path` name a directory? The watch loop's classifier: a directory root walks
+# recursively, a file root watches its containing tree.
+const is_dir_path! = (Str p): Bool -> match stat!(p) {
+	Either.Left(e) -> false,
+	Either.Right(s) -> is_dir(s),
+}
+
+# Fold `v` into the running fingerprint — order-sensitive multiplicative mixing, so any changed
+# byte of a path, size, mtime, or the file count moves the hash.
+const fp_mix = (Iarch h, Iarch v): Iarch -> h * 1000003 + v
+
+# One file's contribution to the fingerprint: its path bytes, then its size and mtime (a
+# vanished file contributes a marker instead, so a deletion is a change too).
+const fp_file! = (Iarch h, Str f): Iarch -> {
+	let Iarch v = h
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(f.len) then break
+		v = fp_mix(v, Iarch(f[i]))
+		i = i + 1
+	}
+
+	return match stat!(f) {
+		Either.Left(e) -> fp_mix(v, -1),
+		Either.Right(s) -> fp_mix(fp_mix(v, s.size), s.mtime),
+	}
+}
+
+# The fingerprint of everything a watch observes: each directory root contributes every `.cf`
+# under it (walk_dir! — sorted, dot-entries skipped, so a merged-test entry never self-triggers),
+# a file root contributes itself. The poll loop re-runs when the value moves — an edit, an added
+# or removed file, a rename.
+const fp_roots! = ([Str] roots): Iarch -> {
+	let Iarch h = 5381
+
+	for r in roots {
+		if is_dir_path!(r) then {
+			for f in walk_dir!(r) if ends_with(".cf", f) then h = fp_file!(h, f)
+		} else {
+			h = fp_file!(h, r)
+		}
+	}
+
+	return h
+}
+
+# The path of THIS cf binary, for `--watch` to re-spawn: argv[0] as-is when it carries a slash,
+# else resolved on PATH (how the kernel found it in the first place).
+const resolve_self! = ([Str] args, [Str] env): Str -> {
+	const Str a0 = args[0]
+	let Bool slashed = false
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(a0.len) then break
+		if Iarch(a0[i]) == 47 then slashed = true
+		i = i + 1
+	}
+
+	if slashed then return a0
+
+	return match find_executable!(env, a0) {
+		Either.Right(p) -> p,
+		Either.Left(e) -> {
+			eprint("cf: --watch: cannot resolve the cf binary to re-run\n")
+			exit(2)
+
+			<- ""
+		},
+	}
+}
+
+# The directory trees a watch observes. For `cf test`: each directory target itself; a file
+# target's whole containing directory (its merged run resolves sibling imports there). For a
+# compile: the entry's directory — imports resolve relative to the entry, so its tree
+# over-approximates the spec's non-std import graph (cf_cli §6; std is baked into cf and cannot
+# change under a running watch).
+const watch_roots! = ([Str] args): [Str] -> {
+	if is_test_cmd(args) then {
+		let [Str] roots = []
+
+		for t in test_targets(args) {
+			if is_dir_path!(t) then roots = [...roots, t]
+			else {
+				const Iarch sl = last_slash(t)
+				const Str d = if sl < 0 then "." else slice(0, sl, t)
+				roots = [...roots, d]
+			}
+		}
+
+		if Iarch(roots.len) == 0 then {
+			eprint("cf: test: give a file or directory to test — cf test <file.cf|dir>...\n")
+			exit(2)
+		}
+
+		return roots
+	}
+
+	# a compile: the FIRST `.cf` positional is the entry (no flag ends in `.cf`)
+	let Str input = ""
+	let Iarch i = 1
+
+	loop {
+		if i >= Iarch(args.len) then break
+		if eq(input, "") && ends_with(".cf", args[i]) then input = args[i]
+		i = i + 1
+	}
+
+	if eq(input, "") then {
+		eprint("cf: --watch: no `.cf` input on the command line\n")
+		exit(2)
+	}
+
+	const Iarch sl = last_slash(input)
+	const Str d = if sl < 0 then "." else slice(0, sl, input)
+
+	return [d]
+}
+
+# `--watch` (cf_cli §2/§6/§7): run the command once, then poll the watched trees (4x/second)
+# and re-run on every change. Each run spawns THIS cf as a child with `--watch` stripped — the
+# child owns every exit path (a failed build must not end the watcher) and each run starts
+# clean. The loop never returns; ^C ends it.
+const run_watch! = ([Str] args, [Str] env): Iarch -> {
+	const [Str] child = strip_watch(args)
+	const Str cfbin = resolve_self!(args, env)
+	const [Str] roots = watch_roots!(child)
+
+	loop {
+		const Iarch fp = fp_roots!(roots)
+		const Iarch rc = run!(cfbin, child, env)
+
+		if rc == 0 then println("cf: watch: ok — waiting for changes (^C stops)")
+		else println("cf: watch: exit ${rc} — waiting for changes (^C stops)")
+
+		loop {
+			sleep_ms(250)
+			if fp_roots!(roots) != fp then break
+		}
+
+		println("")
+	}
+
+	return 0
+}
+
 # The help screen — the accurate command surface of THIS binary (reality), in the shape of
 # [[cf_cli.md]]. It lists only what cf implements today; the commands the spec defers (run/test/
 # lint) are named at the end as not-yet-implemented rather than advertised as working. Printed to
@@ -1192,7 +1341,7 @@ const print_help = (): () -> {
 	println("")
 	println("Usage:")
 	println("  cf [c|compile] <file.cf> -o <out> [options]   compile <file.cf> to a native binary")
-	println("  cf test <file.cf|dir>... [--bail]             build and run the targets' case!s (alias: t)")
+	println("  cf test <file.cf|dir>... [--bail] [--watch]   build and run the targets' case!s (alias: t)")
 	println("  cf format <file|dir>... [--check]             format C! source in place       (alias: f)")
 	println("  cf check <file.cf> [--src <buf>]              validate a module tree, no output")
 	println("  cf lsp                                        serve the Language Server Protocol on stdio")
@@ -1209,6 +1358,7 @@ const print_help = (): () -> {
 	println("  -P, --preserve-intermediates  keep the emitted QBE IL + asm")
 	println("  --skip-embeds                 emit without baking in std           (bootstrap seed only)")
 	println("  --dump-routing                print each function's escape/alias classification")
+	println("  --watch                       re-run the command when the watched tree changes (also cf test)")
 	println("")
 	println("Specified but not yet implemented: run, lint (see root/specs/cf_cli.md).")
 }
@@ -1226,6 +1376,23 @@ pub const main = ([Str] args, [Str] env) -> {
 	if is_version_cmd(args) then {
 		println(compiler_version)
 		exit(0)
+	}
+
+	# `--watch` (cf_cli §2/§6/§7) — the polling re-run loop for `cf test` and a compile. It
+	# branches off before the routes: each iteration re-spawns cf itself with `--watch`
+	# stripped, so every exit path below (a diagnostic's exit(1) included) ends the CHILD,
+	# never the watcher. The other subcommands don't take the flag. (`args.len >= 2` here:
+	# a bare `cf` already took the help exit.)
+	const Bool watched = has_watch(args)
+	&& !is_fmt_cmd(args)
+	&& !eq(args[1], "check")
+	&& !eq(args[1], "lsp")
+	&& !eq(args[1], "docs")
+
+	if watched then {
+		const wa = growing_arena::of(16777216)
+
+		return run_watch!(args, env) in wa
 	}
 
 	# `cf format`/`cf f` — formats source, not a compile; branches off before the pipeline.
