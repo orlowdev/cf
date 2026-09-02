@@ -8,20 +8,26 @@
 # aside (its name is changed so it is no longer the entry, then dropped as unreachable). Any other
 # build never runs this pass, so the cases stay unreached and cost the artifact nothing.
 import std::compiler::ast::{ Program, Func, Stmt, Expr, Import }
-import std::data::str::{ eq, starts_with, ends_with }
+import std::data::str::{ eq, starts_with, ends_with, contains }
 
 const run_prefix = "__cf_run_"
 
-# The module name of the entry file, as the report's per-line prefix (testing.md §5): the path with
-# a leading `./` dropped, the `.cf` extension dropped, and `/` rewritten `::` — exactly how a module
-# name is formed (module_system) — then ` -> `. The runner prints it before each case; the case's
-# own teardown (or `todo!`) completes the line with its mark and description — the walker headers
-# the report, the case reports the verdict (testing.md §1/§3).
+# The module name of the file DECLARING a case, as the report's per-line prefix (testing.md §5):
+# the path with a leading `./` dropped, the `.cf` extension dropped, and `/` rewritten `::` —
+# exactly how a module name is formed (module_system) — then ` -> `. Derived per run wrapper from
+# its `dfile` stamp (the parser records the declaring file), so a MERGED test build — one binary
+# importing many test modules — prefixes every line with the right module. The runner prints it
+# before each case; the case's own teardown (or `todo!`) completes the line with its mark and
+# description — the walker headers the report, the case reports the verdict (testing.md §1/§3).
 const module_prefix = (Str input): [Uint8] -> {
 	let Iarch start = 0
 	if Iarch(input.len) >= 2 && Iarch(input[0]) == 46 && Iarch(input[1]) == 47 then start = 2
 	let Iarch stop = Iarch(input.len)
-	if ends_with(".cf", input) then stop = stop - 3
+	# a module path built by resolve carries a trailing NUL for the raw `open` syscall — trim it
+	if stop > 0 && Iarch(input[stop - 1]) == 0 then stop = stop - 1
+	if stop >= 3 && Iarch(input[stop - 3]) == 46 && Iarch(input[stop - 2]) == 99
+	&& Iarch(input[stop - 1]) == 102
+		then stop = stop - 3
 	let [Uint8] out = []
 	let Iarch i = start
 
@@ -86,16 +92,21 @@ const mk_main = ([Stmt] body): Func -> Func({
 	dcol: 0,
 })
 
-# Add the `cf test` runner `main` over the parser's `__cf_run_*!` wrappers. No wrappers ⇒ not a test
-# build ⇒ the program passes through untouched. `input` names the entry file (the report prefix);
+# Add the `cf test` runner `main` over the parser's `__cf_run_*!` wrappers — matched ANYWHERE in
+# the name, since a wrapper declared in an IMPORTED test module carries its module's flat mangle
+# prefix (a merged test build imports every test file; the entry's own wrappers stay bare).
 # `bail` stops the run at the first failing case (cf_cli §7).
-pub const inject_test_runner! = (Program p, Str input, Bool bail): Program -> {
+pub const inject_test_runner! = (Program p, Bool bail): Program -> {
 	let [Str] runs = []
+	let [Str] rfiles = []
 	let Iarch i = 0
 
 	loop {
 		if i >= Iarch(p.funcs.len) then break
-		if starts_with(run_prefix, p.funcs[i].name) then runs = [...runs, p.funcs[i].name]
+		if contains(run_prefix, p.funcs[i].name) && !p.funcs[i].is_asm && !p.funcs[i].is_value then {
+			runs = [...runs, p.funcs[i].name]
+			rfiles = [...rfiles, p.funcs[i].dfile]
+		}
 		i = i + 1
 	}
 
@@ -141,14 +152,13 @@ pub const inject_test_runner! = (Program p, Str input, Bool bail): Program -> {
 		Stmt.Let("root", false, "", Expr.Call("of__el", [], [Expr.Lit(1048576)], "")),
 		Stmt.Let("fails", true, "Uarch", Expr.Lit(0)),
 	]
-	const [Uint8] mpfx = module_prefix(input)
 	let Iarch r = 0
 
 	loop {
 		if r >= Iarch(runs.len) then break
 		body = [
 			...body,
-			Stmt.Do(Expr.Call("std_test_report_prefix", [], [Expr.StrLit(mpfx)], "")),
+			Stmt.Do(Expr.Call("std_test_report_prefix", [], [Expr.StrLit(module_prefix(rfiles[r]))], "")),
 			Stmt.Assign("fails", Expr.Add(Expr.Var("fails"), Expr.Call(runs[r], [], [], "root"))),
 		]
 		# `--bail`: the first failing case ends the run — the tally is already non-zero

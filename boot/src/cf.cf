@@ -952,6 +952,65 @@ const has_cases! = (Str path): Bool -> {
 	return false
 }
 
+# The module path of test file `f` inside walked `target` (`suite`, `suite/sub/tunion.cf` ->
+# `sub::tunion`), or "" when it cannot be spelled as an import — every segment must be an
+# identifier (`[A-Za-z_][A-Za-z0-9_]*`), so a `1494_*.cf` corpus-style name falls back to its own
+# per-file run.
+const test_mod_of = (Str target, Str f): Str -> {
+	const Iarch skip = Iarch(target.len) + 1
+	const Iarch stop = Iarch(f.len) - 3
+	let [Uint8] out = []
+	let Bool segstart = true
+	let Iarch i = skip
+
+	loop {
+		if i >= stop then break
+		const Iarch c = Iarch(f[i])
+		if c == 47 then {
+			out = [...out, 58, 58]
+			segstart = true
+		} else {
+			const Bool alpha = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95
+			const Bool digit = c >= 48 && c <= 57
+			if segstart && !alpha then return ""
+			if !alpha && !digit then return ""
+			out = [...out, f[i]]
+			segstart = false
+		}
+		i = i + 1
+	}
+
+	return Str({ bytes: out, len: Iarch(out.len) })
+}
+
+# One MERGED test build (testing.md §6): a transient dot-named entry inside `target` imports every
+# spellable test module (relative imports resolve against the ENTRY's directory), so the whole
+# directory compiles and runs as ONE binary — one build, one process, every case prefixed by its
+# own module (the run wrappers carry their declaring file). The entry is removed afterwards; the
+# walk skips dot-entries, so a concurrent walk never sees it.
+const run_merged! = (Str target, [Str] mods, Bool bail, [Str] env): Iarch -> {
+	const Iarch pid = getpid()
+	const Str entry = "${target}/.__cf_test_${pid}.cf"
+
+	const Fd fd = match create(entry) {
+		Either.Left(e) -> {
+			eprint("cf: test: cannot write the merged entry under ${target}\n")
+			exit(2)
+
+			<- Fd({ n: Uarch(0) })
+		},
+		Either.Right(f) -> f,
+	}
+
+	for m in mods write_str(fd, "import ${m}\n")
+
+	close(fd)
+	const Iarch rc = run_test_file!(entry, bail, env)
+	remove(entry)
+
+	return rc
+}
+
 # `cf test <file>` (cf_cli §7, testing.md §6): build the target with the TEST route — `is_test` injects
 # a runner `main` over every `case!`/`todo!` in the file — run the resulting binary, and exit with its
 # code (0 when every case passed, 1 when any failed). The report lines print to stdout as the cases
@@ -968,20 +1027,33 @@ const run_test! = (Str target, Bool bail, [Str] env): Iarch -> {
 	match dtry {
 		Either.Left(e) -> {},
 		Either.Right(entries) -> {
-			const [Str] files = collect_tests!(target)
-			let Iarch worst = 0
-			let Iarch ran = 0
+			const [Str] all = collect_tests!(target)
+			let [Str] merged = []
+			let [Str] loose = []
 
-			for f in files {
+			for f in all {
 				if has_cases!(f) then {
-					ran = ran + 1
-					const Iarch rc = run_test_file!(f, bail, env)
-					if rc != 0 then worst = 1
-					if bail && worst != 0 then return 1
+					const Str m = test_mod_of(target, f)
+					if eq(m, "") then loose = [...loose, f]
+					else merged = [...merged, m]
 				}
 			}
 
-			if ran == 0 then println("cf: test: no cases under ${target}")
+			if Iarch(merged.len) == 0 && Iarch(loose.len) == 0
+				then println("cf: test: no cases under ${target}")
+			let Iarch worst = 0
+
+			if Iarch(merged.len) > 0 then {
+				const Iarch rc = run_merged!(target, merged, bail, env)
+				if rc != 0 then worst = 1
+				if bail && worst != 0 then return 1
+			}
+
+			for f in loose {
+				const Iarch rc = run_test_file!(f, bail, env)
+				if rc != 0 then worst = 1
+				if bail && worst != 0 then return 1
+			}
 
 			return worst
 		},
