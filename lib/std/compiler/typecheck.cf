@@ -5795,10 +5795,6 @@ const check_func! = (Func fn, Ctx ctx, *DiagBag dg): Iarch -> {
 		# on an unknown name
 		canon_telems(fn.ret_telems, ctx.recs, ctx.unions)
 	}
-	# `main` yields the process exit code (an Iarch), so an explicit `Unit`/`()` return type
-	# (or the valueless `return` that desugars to `()`) is rejected there.
-	if eq(fn.name, "main") && eq(fn.ret_name, "Unit")
-		then return terr_i(ctx, dg, "cf: type: main must return an Iarch exit code, not Unit\n")
 	# an asm-bodied function has no statement body to check — its parameters and return type
 	# still register it for callers (call_type resolves them); the asm is emitted verbatim.
 	if fn.is_asm then {
@@ -5903,8 +5899,9 @@ const check_func! = (Func fn, Ctx ctx, *DiagBag dg): Iarch -> {
 	const Iarch dr = check_stmts!(fn.body, env, fctx, dg, lk_none)
 	# The body must DEFINITELY return or diverge (`dr >= 2`: a `return`, or a diverging `die`/`exit`
 	# tail) — except a `()` function, which may fall through: reaching the end yields the implicit
-	# unit. (emit synthesizes the trailing `ret` for a fell-through `()` body.)
-	if dr < 2 && !is_tunit(frt)
+	# unit. (emit synthesizes the trailing `ret` for a fell-through `()` body.) `main` may also
+	# fall through: its synthesized `ret 0` is the success exit code.
+	if dr < 2 && !is_tunit(frt) && !eq(fn.name, "main")
 		then return terr_i(ctx, dg, "cf: type: a function body must end with `return`\n")
 
 	return 0
@@ -6150,14 +6147,15 @@ const check_whole = (Program prog, Str entry, Bool require_main, *DiagBag dg): [
 				mpj = mpj + 1
 			}
 
-			# `main`'s value is the process exit code, so it returns a word `Iarch` (or is unannotated);
-			# a record/union/Str/array/tuple return is rejected
+			# `main`'s value is the process exit code, so it returns a word `Iarch` (or is unannotated),
+			# or `()` — a unit main exits 0; a record/union/Str/array/tuple return is rejected
 			const Str mrt = prog.funcs[i].ret_name
-			if !eq(mrt, "") && !eq(mrt, "Iarch") && !eq(mrt, "Int") && !eq(mrt, "Uarch")
-				then ferr(
+			if !eq(mrt, "") && !eq(mrt, "Iarch") && !eq(mrt, "Int") && !eq(mrt, "Uarch") &&
+				!eq(mrt, "Unit")
+					then ferr(
 				prog.funcs[i],
 				dg,
-				"cf: type: `main` must return `Iarch` (its value is the exit code)\n",
+				"cf: type: `main` must return `Iarch` (its value is the exit code) or `()`\n",
 			)
 			mains = mains + 1
 		}

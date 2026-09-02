@@ -1660,23 +1660,25 @@ it without a call.
   whether or not the body allocates. The entry is `main`, full stop. (Allocation
   still happens inside, in the page geometry below — the name just carries no
   signal no one consumes.)
-- **Signature.** The entry returns an `Iarch` exit code and takes the process
-  arguments and environment. All three are **optional by arity** — the runtime
-  supplies as many as the signature declares:
+- **Signature.** The entry returns an `Iarch` exit code — or `()`, in which case
+  the process exits `0`. A `()` (or unannotated) `main` may also **fall through**
+  without a `return`; reaching the end of the body is the success exit. It takes
+  the process arguments and environment as `[Str]`s, both **optional by arity** —
+  the runtime supplies as many as the signature declares:
 
   ```
-  pub const main = () -> 0                                       # no args
-  pub const main = (Iarch argc, *[Str] argv) -> { return 0 }      # argc + argv
-  pub const main = (Iarch argc, *[Str] argv, *[Str] envp) -> {    # + environment
-    return 0
+  pub const main = () -> 0                                  # no args
+  pub const main = ([Str] args) -> { return 0 }             # arguments
+  pub const main = ([Str] args, [Str] env): () -> {         # + environment; exits 0
+    io::println(args[0])
   }
   ```
 
-  `argc` is the count, `argv` a pointer to the argument strings, `envp` a pointer
-  to the environment strings. The environment is a **parameter, not ambient
-  state**: it is data the runtime hands to `main`, and any other code that needs
-  it receives it only by explicit provision from here — no module can reach it on
-  its own.
+  `args` holds the argument strings (`args[0]` the program name, `Iarch(args.len)`
+  the count), `env` the environment strings. The environment is a **parameter, not
+  ambient state**: it is data the runtime hands to `main`, and any other code that
+  needs it receives it only by explicit provision from here — no module can reach
+  it on its own.
 
 - **Geometry.** The entry runs in the **page geometry**; user-defined geometries
   live inside its body (see the memory model). That the entry runs uncalled, the
