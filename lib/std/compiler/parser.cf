@@ -291,6 +291,21 @@ const slice_eq = (*[Uint8] src, Iarch start, Iarch len, Str word): Bool -> {
 	return true
 }
 
+# Is there a newline between byte offsets `a` (inclusive) and `b` (exclusive)? Decides
+# whether a token STARTS on the same source line as an earlier one — `return`'s value
+# must begin on the keyword's own line.
+const newline_between = (*[Uint8] src, Iarch a, Iarch b): Bool -> {
+	let Iarch i = a
+
+	loop {
+		if i >= b then break
+		if Iarch(src[i]) == 10 then return true
+		i = i + 1
+	}
+
+	return false
+}
+
 # Intern a source slice into an owned `Str` (a binding name / a variable reference),
 # copying the bytes so the name outlives the source buffer.
 const intern! = (*[Uint8] src, Iarch start, Iarch len): Str -> {
@@ -2177,15 +2192,18 @@ const parse_stmt! = (*Parser p): Stmt -> {
 		return Stmt.Continue(exit_label!(p))
 	}
 	if kw(p, "return") then {
+		const Iarch rkend = p.toks[p.pos].start + p.toks[p.pos].len
 		p.pos = p.pos + 1
 		# a valueless `return` is sugar for `return ()` — the unit value (type_system §6.1);
 		# typecheck then requires a `Unit`-returning fn. cf's grammar has no statement
-		# separator, so a bare `return` is only unambiguous before a boundary token that
-		# cannot begin an expression: `}` (end of block / braced guard body / last match arm)
-		# or `,` (a `,`-separated statement-match arm). Everywhere else `return` greedily
-		# takes the following expression — so a valueless guarded return must be braced
-		# (`if c then { return }`), never `if c then return <more...>` (that returns the value).
+		# separator, so the return value must START on the keyword's own line: before a
+		# boundary token that cannot begin an expression (`}` — end of block / braced guard
+		# body / last match arm — or `,`, a `,`-separated statement-match arm), or when the
+		# next token sits on a LATER line, the `return` is valueless and that token opens an
+		# ordinary (unreachable) statement. An expression that begins on `return`'s line may
+		# still span further lines as usual.
 		if is_rbrace(peek(p)) || is_comma(peek(p)) then return Stmt.Return(Expr.Unit)
+		if newline_between(p.src, rkend, p.toks[p.pos].start) then return Stmt.Return(Expr.Unit)
 		const Expr rv = parse_expr!(p)
 
 		return Stmt.Return(geom_stamp(p, rv, in_clause_name!(p)))

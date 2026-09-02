@@ -949,7 +949,7 @@ param          = [ type ] , var_name | type , record_pattern ;   (* Int32 x  |  
 
 block          = "{" , { statement } , "}" ;
 statement      = var_decl | return_stmt | yield_stmt | assign_stmt | if_stmt | expression ;   (* (temporary) — widened further with more control flow *)
-return_stmt    = "return" , [ expression ] ;                   (* exits the whole function *)
+return_stmt    = "return" , [ expression ] ;                   (* exits the whole function; the expression must START on `return`'s line (it may then span further lines) — a bare `return` before `}`/`,` or a line end returns the unit value *)
 yield_stmt     = "<-" , expression ;                           (* yields a block's value and ends the block (terminal, like return); inside a loop it breaks the loop with that value *)
 ```
 
