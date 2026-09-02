@@ -1,6 +1,6 @@
-.globl f120
+.globl f119
 .p2align 2
-f120:
+f119:
 	addi sp, sp, -16
 	sd ra, 8(sp)
 	call _cf_qbe_run

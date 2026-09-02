@@ -1,6 +1,6 @@
-.globl f120
+.globl f119
 .p2align 2
-f120:
+f119:
 	subq $8, %rsp
 	call _cf_qbe_run
 	addq $8, %rsp

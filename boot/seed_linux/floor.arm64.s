@@ -1,6 +1,6 @@
-.globl f120
+.globl f119
 .p2align 2
-f120:
+f119:
 	stp x29, x30, [sp, #-16]!
 	bl _cf_qbe_run
 	ldp x29, x30, [sp], #16

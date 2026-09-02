@@ -41,7 +41,7 @@ import std::compiler::diag::{ Diag, TyRow, print_diags! }
 import std::mem::arena::growing_arena
 import qbe::{ qbe_translate }
 import std::process::{ run!, find_executable!, getpid, exit }
-import std::io::fs::{ remove, read_dir! }
+import std::io::fs::{ remove, read_dir!, walk_dir! }
 import std::io::fd::{ DirEntry, IoRrr, entry_is_dir }
 import std::io::file::{ create, close, write_str }
 import std::data::{ Either }
@@ -850,65 +850,13 @@ const run_full! = (Cli c, [Str] env): Iarch -> {
 	return st
 }
 
-# Recursively collect every `.cf` file under `dir` (testing.md §6 — a directory target runs the
-# cases in every file it holds). Insertion-sorted by name so the run order is stable across
-# filesystems. Skips `.`/`..`; an unreadable directory contributes nothing.
+# Every `.cf` file under `dir` (testing.md §6 — a directory target runs the cases in every file
+# it holds): `std::io::fs::walk_dir!` recurses, sorts, and skips dot-entries; only the `.cf`
+# filter is the test route's own.
 const collect_tests! = (Str dir): [Str] -> {
-	const Either[IoRrr, [DirEntry]] r = read_dir!(dir)
 	let [Str] out = []
 
-	match r {
-		Either.Left(e) -> {},
-		Either.Right(entries) -> {
-			for e in entries {
-				if !eq(e.name, ".") && !eq(e.name, "..") then {
-					const Str child = "${dir}/${e.name}"
-
-					if entry_is_dir(e) then {
-						out = [...out, ...collect_tests!(child)]
-					} else if ends_with(".cf", e.name) then {
-						out = [...out, child]
-					}
-				}
-			}
-		},
-	}
-
-	return sort_paths(out)
-}
-
-# Byte-wise `<` on two paths, for the stable run order.
-const path_lt = (Str a, Str b): Bool -> {
-	let Iarch i = 0
-
-	loop {
-		if i >= Iarch(a.len) || i >= Iarch(b.len) then break
-		if Iarch(a[i]) < Iarch(b[i]) then return true
-		if Iarch(a[i]) > Iarch(b[i]) then return false
-		i = i + 1
-	}
-
-	return Iarch(a.len) < Iarch(b.len)
-}
-
-const sort_paths = ([Str] xs): [Str] -> {
-	let [Str] out = []
-
-	for x in xs {
-		let [Str] next = []
-		let Bool placed = false
-
-		for o in out {
-			if !placed && path_lt(x, o) then {
-				next = [...next, x]
-				placed = true
-			}
-			next = [...next, o]
-		}
-
-		if !placed then next = [...next, x]
-		out = next
-	}
+	for f in walk_dir!(dir) if ends_with(".cf", f) then out = [...out, f]
 
 	return out
 }
