@@ -23,13 +23,40 @@ import std::compiler::token::{
 	Token,
 	TokKind,
 	is_eof,
+	is_ident,
+	is_intlit,
+	is_floatlit,
 	is_strlit,
 	is_comment,
 	is_comma,
+	is_colon,
+	is_pathsep,
+	is_dot,
+	is_ellipsis,
 	is_arrow,
 	is_eq,
+	is_eqeq,
+	is_ne,
+	is_lt,
+	is_gt,
+	is_le,
+	is_ge,
+	is_plus,
+	is_minus,
+	is_star,
+	is_slash,
+	is_percent,
+	is_amp,
+	is_pipe,
+	is_caret,
+	is_tilde,
+	is_bang,
+	is_shl,
+	is_shr,
 	is_logor,
 	is_logand,
+	is_yield,
+	is_pipearrow,
 	is_lparen,
 	is_rparen,
 	is_lbrace,
@@ -184,6 +211,149 @@ const is_decl_kw = (*[Uint8] src, Token t): Bool -> {
 		then return true
 
 	return false
+}
+
+# Is token `t` a binary operator ALWAYS written with one space on each side? Every cf operator
+# with no unary reading: `=` `==` `!=` `<` `>` `<=` `>=` `+` `/` `%` `|` `^` `<<` `>>` `&&` `||`
+# `|>` `->` `<-`. The three with a unary reading (`-` neg, `*` pointer type, `&` address-of) are
+# position-classified via `ends_operand` instead.
+const is_spaced_op = (TokKind k): Bool -> is_eq(k) ||
+	is_eqeq(k) ||
+	is_ne(k) ||
+	is_lt(k) ||
+	is_gt(k) ||
+	is_le(k) ||
+	is_ge(k) ||
+	is_plus(k) ||
+	is_slash(k) ||
+	is_percent(k) ||
+	is_pipe(k) ||
+	is_caret(k) ||
+	is_shl(k) ||
+	is_shr(k) ||
+	is_logand(k) ||
+	is_logor(k) ||
+	is_pipearrow(k) ||
+	is_arrow(k) ||
+	is_yield(k)
+
+# Can token kind `k` BEGIN an operand? — the targets a prefix operator glues onto (`-1`,
+# `!flag`, `*[Uint8]`, `&pt`, `-(a + b)`, `...xs`).
+const starts_operand = (TokKind k): Bool -> is_ident(k) ||
+	is_intlit(k) ||
+	is_floatlit(k) ||
+	is_strlit(k) ||
+	is_lparen(k) ||
+	is_lbracket(k)
+
+# The statement/clause keywords `ends_operand` must reject that have no matcher of their own:
+# `let`, `in`, `as`, `asm`, `break`, `uses`, `defer`, `provide` (matched by RAW BYTES like
+# `is_decl_kw` — no per-token Str temporaries on this hot walk).
+const tok_is_other_kw = (*[Uint8] src, Token t): Bool -> {
+	const Iarch l = Iarch(t.len)
+	const Iarch s = t.start
+	if l == 3 && Iarch(src[s]) == 108 && Iarch(src[s + 1]) == 101 && Iarch(src[s + 2]) == 116
+		then return true
+	if l == 2 && Iarch(src[s]) == 105 && Iarch(src[s + 1]) == 110 then return true
+	if l == 2 && Iarch(src[s]) == 97 && Iarch(src[s + 1]) == 115 then return true
+	if l == 3 && Iarch(src[s]) == 97 && Iarch(src[s + 1]) == 115 && Iarch(src[s + 2]) == 109
+		then return true
+	if l == 5 &&
+		Iarch(src[s]) == 98 &&
+		Iarch(src[s + 1]) == 114 &&
+		Iarch(src[s + 2]) == 101 &&
+		Iarch(src[s + 3]) == 97 &&
+		Iarch(src[s + 4]) == 107
+			then return true
+	if l == 4 &&
+		Iarch(src[s]) == 117 &&
+		Iarch(src[s + 1]) == 115 &&
+		Iarch(src[s + 2]) == 101 &&
+		Iarch(src[s + 3]) == 115
+			then return true
+	if l == 5 &&
+		Iarch(src[s]) == 100 &&
+		Iarch(src[s + 1]) == 101 &&
+		Iarch(src[s + 2]) == 102 &&
+		Iarch(src[s + 3]) == 101 &&
+		Iarch(src[s + 4]) == 114
+			then return true
+	if l == 7 &&
+		Iarch(src[s]) == 112 &&
+		Iarch(src[s + 1]) == 114 &&
+		Iarch(src[s + 2]) == 111 &&
+		Iarch(src[s + 3]) == 118 &&
+		Iarch(src[s + 4]) == 105 &&
+		Iarch(src[s + 5]) == 100 &&
+		Iarch(src[s + 6]) == 101
+			then return true
+
+	return false
+}
+
+# Does token `i` END an operand — a literal, a closing bracket, or an identifier that is not a
+# keyword? The `-`/`*`/`&` after an operand-ender reads BINARY (`a - b`, `n * 2`, `x & mask`);
+# after anything else it reads PREFIX (`-1`, `*[Uint8]`, `&pt`). Keywords lex as plain idents,
+# so `then -1` / `return -x` / `const *P p` need the byte-matched exclusions; a MISSED keyword
+# only costs a cosmetic space (the tokens re-lex the same either way), never a corruption.
+const ends_operand = (*[Uint8] src, [Token] toks, Iarch i): Bool -> {
+	if i < 0 then return false
+	const Token t = toks[i]
+	const TokKind k = t.kind
+	if is_intlit(k) || is_floatlit(k) || is_strlit(k) then return true
+	if is_rparen(k) || is_rbracket(k) || is_rbrace(k) then return true
+	if !is_ident(k) then return false
+	if is_decl_kw(src, t) then return false
+	if tok_is_then(src, t) || tok_is_else(src, t) || tok_is_return(src, t) then return false
+	if tok_is_if(src, t) || tok_is_match(src, t) || tok_is_loop(src, t) then return false
+
+	return !tok_is_other_kw(src, t)
+}
+
+# The canonical intra-line gap BEFORE token `i` (Phase F), for a gap holding no newline: 0
+# (glued), 1 (one space), or -1 (the author's gap, collapsed — one space if any whitespace
+# stood there, else none; gluing is meaning: `f(`, `x.y`, `ns::m` never gain a space, and an
+# unclassifiable pair is never re-glued). Every 0/1 rewrite is lexer-safe: a space is only
+# added between tokens (never merges), and only removed against single-byte delimiters or onto
+# an operand start — the guards below keep `1 . 5`, `: :` and `! =` from minting `1.5`, `::`,
+# `!=`.
+const gap_spaces = (*[Uint8] src, [Token] toks, Iarch i): Iarch -> {
+	const Token p = toks[i - 1]
+	const Token t = toks[i]
+	const TokKind pk = p.kind
+	const TokKind tk = t.kind
+	if is_comment(tk) then return 1
+	if is_lparen(pk) || is_lbracket(pk) || is_rparen(tk) || is_rbracket(tk) || is_comma(tk)
+		then return 0
+	if is_lbrace(pk) then return if is_rbrace(tk) then 0 else 1
+	if is_rbrace(tk) || is_comma(pk) then return 1
+
+	# member access and module paths glue — except a dot against a number, where gluing could
+	# mint a float literal
+	if is_dot(pk) || is_dot(tk) then {
+		if is_intlit(pk) || is_floatlit(pk) || is_intlit(tk) || is_floatlit(tk) then return -1
+
+		return 0
+	}
+
+	if is_pathsep(pk) || is_pathsep(tk) then return 0
+	# `:` glues to what it annotates and takes one space after (`f: v`, `): Iarch`)
+	if is_colon(tk) then return if is_colon(pk) then 1 else 0
+	if is_colon(pk) then return 1
+	if is_spaced_op(pk) || is_spaced_op(tk) then return 1
+
+	if is_minus(pk) || is_star(pk) || is_amp(pk) then {
+		if ends_operand(src, toks, i - 2) then return 1
+
+		return if starts_operand(tk) then 0 else -1
+	}
+
+	if is_minus(tk) || is_star(tk) || is_amp(tk)
+		then return if ends_operand(src, toks, i - 1) then 1 else -1
+	if is_bang(pk) || is_tilde(pk) || is_ellipsis(pk)
+		then return if starts_operand(tk) then 0 else -1
+
+	return -1
 }
 
 # Is the `{` at token `o` the opener of a STATEMENT block (a function/loop/if/arm body), as
@@ -801,26 +971,12 @@ pub const format_source! = (*[Uint8] src, Iarch n, Str file): [Uint8] -> {
 			const Iarch nl = count_nl(src, gfrom, gto)
 
 			if nl == 0 then {
-				# Inter-token spacing WITHIN a line, canonicalised (Phase F): tight after a `(`/`[`
-				# and before a `)`/`]`/`,`; one space inside `{ }` braces (an empty `{}` stays
-				# tight) and after a `,`; a comment always sits one space off the code it trails;
-				# any other whitespace run collapses to EXACTLY one space. A zero gap between two
-				# glued tokens stays zero — gluing is meaning (`f(`, `x!`, `a.b`, `ns::m`) — and a
-				# space is only added or removed against bracket/comma delimiters, whose single-byte
-				# tokens cannot merge with a neighbour, so the output always re-lexes identically.
-				const TokKind gpk = p.kind
-				const TokKind gtk = t.kind
-
-				if is_comment(gtk) then out = [...out, Uint8(32)]
-				else if is_lparen(gpk) ||
-					is_lbracket(gpk) ||
-					is_rparen(gtk) ||
-					is_rbracket(gtk) ||
-					is_comma(gtk) then {
-				} else if is_lbrace(gpk) then {
-					if !is_rbrace(gtk) then out = [...out, Uint8(32)]
-				} else if is_rbrace(gtk) || is_comma(gpk) then out = [...out, Uint8(32)]
-				else if gto > gfrom then out = [...out, Uint8(32)]
+				# Inter-token spacing WITHIN a line, canonicalised (Phase F) — see `gap_spaces` for
+				# the full canon (bracket/comma edges, `{ }` spacing, glued `.`/`::`/`:`, one space
+				# around binary operators with `-`/`*`/`&` position-classified, prefix ops glued,
+				# any other whitespace run collapsed to exactly one space).
+				const Iarch gs = gap_spaces(src, toks, i)
+				if gs == 1 || (gs < 0 && gto > gfrom) then out = [...out, Uint8(32)]
 			} else if (tok_is_then(src, t) &&
 					(is_rbrace(p.kind) || (i + 1 < Iarch(toks.len) && is_lbrace(toks[i + 1].kind)))) ||
 				(tok_is_else(src, t) && is_rbrace(p.kind)) then {
