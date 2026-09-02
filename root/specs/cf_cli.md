@@ -200,23 +200,24 @@ current restart semantics.
 ## 7. `test`, `format`, `lint`, `lsp`, `docs`
 
 ```
-cf test   <file|dir>   --watch  --bail
-cf format <file|dir>   --check
-cf lint   <file|dir>   --check
+cf test   <file|dir>...   --watch  --bail
+cf format <file|dir>...   --check
+cf lint   <file|dir>      --check
 cf lsp                 [--port <n>]
 cf docs   [<term>]
 ```
 
 - **`test`** runs the tests in a `.cf` file, or walks a directory recursively and
-  runs the tests in every `.cf` it finds. `--watch` re-runs on change; `--bail`
-  exits the whole process on the first failing test. What *is* a test, and the
-  assertion surface, are a small **dedicated testing spec** (deferred).
-- **`format`** formats a file or a directory tree in place. It is the same
-  formatter that runs as the pipeline's cross-cutting canonicaliser
-  (see [[order_of_compilation.md]] §6), exposed as a command — so what `cf format`
-  writes and what an arc emit is byte-compared against are one and the same.
-  `--check` makes no writes and exits non-zero if any file is not already
-  formatted (the CI gate).
+  runs the tests in every `.cf` it finds. Any number of targets may be given;
+  each runs in turn and the exit reflects the worst. `--watch` re-runs on change;
+  `--bail` exits the whole process on the first failing test. What *is* a test,
+  and the assertion surface, are a small **dedicated testing spec** (deferred).
+- **`format`** formats files or directory trees in place — every given target is
+  visited. It is the same formatter that runs as the pipeline's cross-cutting
+  canonicaliser (see [[order_of_compilation.md]] §6), exposed as a command — so
+  what `cf format` writes and what an arc emit is byte-compared against are one
+  and the same. `--check` makes no writes and exits non-zero if any file is not
+  already formatted (the CI gate).
 - **`lint`** lints a file or a directory tree; `--check` exits non-zero on any
   finding. The lint set is a later subject.
 - **`lsp`** starts the Language Server over **stdio** — an editor spawns it and

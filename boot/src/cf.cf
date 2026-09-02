@@ -22,7 +22,7 @@ import cli::{
 	is_fmt_cmd,
 	fmt_cli_parse,
 	is_test_cmd,
-	test_target,
+	test_targets,
 	test_bail,
 	is_version_cmd,
 	is_help_cmd,
@@ -1088,7 +1088,7 @@ const run_merged! = (Str target, [Str] mods, Bool bail, [Str] env): Iarch -> {
 # run. The test binary is a self-contained build to a temp path, run once, then removed.
 const run_test! = (Str target, Bool bail, [Str] env): Iarch -> {
 	if eq(target, "") then {
-		eprint("cf: test: give a file or directory to test — cf test <file.cf|dir>\n")
+		eprint("cf: test: give a file or directory to test — cf test <file.cf|dir>...\n")
 		exit(2)
 	}
 	# a DIRECTORY target walks recursively: each `.cf` builds and runs as its own test binary, the
@@ -1192,8 +1192,8 @@ const print_help = (): () -> {
 	println("")
 	println("Usage:")
 	println("  cf [c|compile] <file.cf> -o <out> [options]   compile <file.cf> to a native binary")
-	println("  cf test <file.cf|dir> [--bail]                build and run the target's case!s (alias: t)")
-	println("  cf format <file|dir> [--check]                format C! source in place       (alias: f)")
+	println("  cf test <file.cf|dir>... [--bail]             build and run the targets' case!s (alias: t)")
+	println("  cf format <file|dir>... [--check]             format C! source in place       (alias: f)")
 	println("  cf check <file.cf> [--src <buf>]              validate a module tree, no output")
 	println("  cf lsp                                        serve the Language Server Protocol on stdio")
 	println("  cf docs [<term>]                              browse the standard-library API")
@@ -1229,11 +1229,19 @@ pub const main = ([Str] args, [Str] env) -> {
 	}
 
 	# `cf format`/`cf f` — formats source, not a compile; branches off before the pipeline.
+	# Every target is visited; the exit is 1 iff any of them failed (or, with `--check`, needed
+	# reformatting).
 	if is_fmt_cmd(args) then {
 		const fa = growing_arena::of(16777216)
 		const FmtCli fc = fmt_cli_parse(args) in fa
+		let Iarch fworst = 0
 
-		return format_target!(fc.path, fc.check) in fa
+		for p in fc.paths {
+			const Iarch rc = format_target!(p, fc.check) in fa
+			if rc != 0 then fworst = 1
+		}
+
+		return fworst
 	}
 
 	# `cf check <input.cf> [--src <file>]` — the full validation pipeline, no output: located
@@ -1332,10 +1340,28 @@ pub const main = ([Str] args, [Str] env) -> {
 		return docs_run!(args) in doca
 	}
 
+	# `cf test`/`cf t` — every target runs (each file or directory through its own merged
+	# build); the exit is 1 iff any of them failed, and `--bail` stops at the first failing
+	# target (its in-run bail already stopped at the first failing case).
 	if is_test_cmd(args) then {
 		const ta = growing_arena::of(16777216)
+		const [Str] targets = test_targets(args)
+		const Bool bail = test_bail(args)
 
-		return run_test!(test_target(args), test_bail(args), env) in ta
+		if Iarch(targets.len) == 0 then {
+			eprint("cf: test: give a file or directory to test — cf test <file.cf|dir>...\n")
+			exit(2)
+		}
+
+		let Iarch tworst = 0
+
+		for t in targets {
+			const Iarch rc = run_test!(t, bail, env) in ta
+			if rc != 0 then tworst = 1
+			if bail && tworst != 0 then return 1
+		}
+
+		return tworst
 	}
 
 	# cf runs its whole compilation under ONE growing arena grafted from the root page (memory_model
