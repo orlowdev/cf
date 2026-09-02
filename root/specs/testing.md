@@ -74,26 +74,35 @@ clause apply unchanged inside the body.
 ([[geometry_lowering.md]] §5) — bump allocation, elastic overflow, standard duplex
 node — that differs from a plain arena in two orthogonal ways:
 
-1. its construction **provides** a **`let` verdict accumulator** on it
+1. its construction **provides** a **`let` verdict accumulator** over it
    ([[context.md]] §2–§3) — the record an assertion appends `{ok, message}` to
-   (§4). A `let` provide of shared mutable state, so the appends are in-place
-   writes into storage the case arena already reserved. This is what gives the
-   assertions their reach: they consume it by *type* ([[context.md]] §4), at any
-   call depth, colorlessly (§4).
-2. its **`on_scope_exit` reports**. Where a plain arena's exit hook only rewinds,
-   `test_arena`'s **reads the accumulated verdicts and the case description, dumps
-   the verdict** (§5), folds one failure bit up to the root, *then* reclaims. That
-   is a different hook body, so `test_arena` **is a distinct geometry** — a growing
-   arena whose reclamation bracket also reports.
+   (§4). The runner builds the accumulator in **its own ambient node**
+   ([[context.md]], Placement — manifold storage, one bracket above the case arena, so
+   it strictly outlives the arena and the tally can still read it after the
+   teardown), then grafts the `test_arena` inside that provide's extent. A
+   `let` provide of shared mutable state, so the appends are in-place writes
+   into node storage the runner already reserved. This is what gives the
+   assertions their reach: they consume it by *type* ([[context.md]] §4), at
+   any call depth, colorlessly (§4).
+2. its **teardown reports**. Where a plain arena's `destroy` only rewinds,
+   `test_arena::destroy` is a **real function** (not the bodyless rewind
+   intrinsic) declared `uses Verdicts`: it consumes the accumulator, **dumps
+   the case's verdict** (§5), *then* reclaims with the same survivor rewind.
+   That is a different teardown, so `test_arena` **is a distinct geometry** —
+   a growing arena whose reclamation bracket also reports.
 
-The two mechanisms split by **who is reaching the accumulator**. An assertion is
-ordinary demand-chain code, so it reaches it by type through the hidden context
-pointer. The exit hook is **not** a demand-chain consumer — its signature is
-`(node, top, lim)` ([[geometry_lowering.md]] §1), so it cannot `consume` — it
-reaches the accumulator **through the node**: the case provides it at a known
-position on the fresh arena, and the accumulator carries the case description, so
-the one shared hook can dump any case. Context gives the writers their reach; the
-geometry gives the reader its guaranteed-last slot. Both are load-bearing.
+Both reader and writers reach the accumulator the **same** way — the demand
+chain. An assertion consumes it by type through the hidden context pointer; the
+teardown is placed by the case lowering *inside the provide's extent*, so its
+`consume` resolves to the case's provide like any other consumer's. One
+mechanism, no side channel: context gives every reacher — writer or reader —
+its reach. (Reporting from the geometry's `on_scope_exit` hook instead would
+also fit the model: a hook body splices inline into the function whose scope
+exits ([[geometry_lowering.md]] §1), so a consuming hook is not forbidden — its
+demand would simply attribute to the spliced-into function like any inlined
+consume. It is machinery the teardown form doesn't need, so v1 reports from
+`destroy`; the requirement is only that reporting is **deferred to after the
+case body has fully run**, which any bracket-exit placement satisfies.)
 
 The user **cannot override this**: `case!(...) in <geom>` is a compile error. The
 case's ambient node is always its `test_arena`; that is what makes the body's
