@@ -52,7 +52,7 @@ const src_lo = (Token t): Iarch -> if is_strlit(t.kind) then t.start - 1 else t.
 
 const src_hi = (Token t): Iarch -> if is_strlit(t.kind)
 	then t.start + t.len + 1
-	else t.start + t.len
+else t.start + t.len
 
 # Count newline bytes in `src[from..to]`.
 const count_nl = (*[Uint8] src, Iarch from, Iarch to): Iarch -> {
@@ -224,8 +224,8 @@ const if_chain_end = (*[Uint8] src, [Token] toks, Iarch li): Iarch -> {
 			if tk >= nt then break
 			const TokKind kk = toks[tk].kind
 			if is_opener(kk) then d = d + 1
-				else if is_closer(kk) then d = d - 1
-					else if d == 0 && tok_is_then(src, toks[tk]) then break
+			else if is_closer(kk) then d = d - 1
+			else if d == 0 && tok_is_then(src, toks[tk]) then break
 			tk = tk + 1
 		}
 
@@ -240,7 +240,7 @@ const if_chain_end = (*[Uint8] src, [Token] toks, Iarch li): Iarch -> {
 		loop {
 			if m >= nt then break
 			if is_opener(toks[m].kind) then bd = bd + 1
-				else if is_closer(toks[m].kind) then {
+			else if is_closer(toks[m].kind) then {
 				bd = bd - 1
 				if bd == 0 then break
 			}
@@ -253,7 +253,7 @@ const if_chain_end = (*[Uint8] src, [Token] toks, Iarch li): Iarch -> {
 		if m + 1 < nt && tok_is_else(src, toks[m + 1]) then {
 			saw_else = true
 			if m + 2 < nt && tok_is_if(src, toks[m + 2]) then j = m + 2
-				else if m + 2 < nt && is_lbrace(toks[m + 2].kind) then {
+			else if m + 2 < nt && is_lbrace(toks[m + 2].kind) then {
 				# a final `else {...}` — skip its balanced body and end the chain there
 				let Iarch ed = 0
 				let Iarch em = m + 2
@@ -261,7 +261,7 @@ const if_chain_end = (*[Uint8] src, [Token] toks, Iarch li): Iarch -> {
 				loop {
 					if em >= nt then break
 					if is_opener(toks[em].kind) then ed = ed + 1
-						else if is_closer(toks[em].kind) then {
+					else if is_closer(toks[em].kind) then {
 						ed = ed - 1
 						if ed == 0 then break
 					}
@@ -273,7 +273,7 @@ const if_chain_end = (*[Uint8] src, [Token] toks, Iarch li): Iarch -> {
 				return em
 			} else return -1
 		} else if saw_else then return end
-				else return -1
+		else return -1
 	}
 
 	return end
@@ -296,7 +296,7 @@ const match_end = (*[Uint8] src, [Token] toks, Iarch li): Iarch -> {
 		const TokKind kk = toks[b].kind
 		if d == 0 && is_lbrace(kk) then break
 		if is_opener(kk) then d = d + 1
-			else if is_closer(kk) then d = d - 1
+		else if is_closer(kk) then d = d - 1
 		b = b + 1
 	}
 
@@ -307,7 +307,7 @@ const match_end = (*[Uint8] src, [Token] toks, Iarch li): Iarch -> {
 	loop {
 		if m >= nt then return -1
 		if is_opener(toks[m].kind) then bd = bd + 1
-			else if is_closer(toks[m].kind) then {
+		else if is_closer(toks[m].kind) then {
 			bd = bd - 1
 			if bd == 0 then break
 		}
@@ -340,23 +340,28 @@ const match_end = (*[Uint8] src, [Token] toks, Iarch li): Iarch -> {
 pub const format_source! = (*[Uint8] src, Iarch n, Str file): [Uint8] -> {
 	const [Token] toks = lex_fmt(src, n, file)
 	# Pre-pass: per token, `add_after[j]` appends a `,` right after token j, `drop_tok[j]` elides
-	# the comma at j. Both start all-false, one slot per token.
+	# the comma at j, `mate[j]` is the matching bracket of an opener/closer (else -1). All start
+	# empty, one slot per token.
 	let [Bool] add_after = []
 	let [Bool] drop_tok = []
+	let [Iarch] mate = []
 	let Iarch z = 0
 
 	loop {
 		if z >= Iarch(toks.len) then break
 		add_after = [...add_after, false]
 		drop_tok = [...drop_tok, false]
+		mate = [...mate, -1]
 		z = z + 1
 	}
 
 	# A per-group stack: `stk_last[d]` = index of group d's last content token (not a comma or
-	# comment), `stk_comma[d]` = whether it holds a top-level comma. `sp` is the live depth;
-	# entries past `sp` are stale (the stack is grown once, never shrunk).
+	# comment), `stk_comma[d]` = whether it holds a top-level comma, `stk_open[d]` = the opener's
+	# token index (for `mate`). `sp` is the live depth; entries past `sp` are stale (the stack is
+	# grown once, never shrunk).
 	let [Iarch] stk_last = []
 	let [Bool] stk_comma = []
+	let [Iarch] stk_open = []
 	let Iarch sp = 0
 	let Iarch pi = 0
 
@@ -369,16 +374,20 @@ pub const format_source! = (*[Uint8] src, Iarch n, Str file): [Uint8] -> {
 			if sp >= Iarch(stk_last.len) then {
 				stk_last = [...stk_last, -1]
 				stk_comma = [...stk_comma, false]
+				stk_open = [...stk_open, -1]
 			}
 
 			stk_last[sp] = -1
 			stk_comma[sp] = false
+			stk_open[sp] = pi
 			sp = sp + 1
 		} else if is_closer(pk) then {
 			if sp > 0 then {
 				const Iarch last = stk_last[sp - 1]
 				const Bool hasc = stk_comma[sp - 1]
 				sp = sp - 1
+				mate[stk_open[sp]] = pi
+				mate[pi] = stk_open[sp]
 
 				if hasc && last >= 0 then {
 					# an existing trailing comma sits after the last content token (nothing but a
@@ -416,6 +425,43 @@ pub const format_source! = (*[Uint8] src, Iarch n, Str file): [Uint8] -> {
 		}
 
 		pi = pi + 1
+	}
+
+	# INDENT-TRANSPARENT parens, matched as a PAIR: a `(` whose closer directly follows the `}` of
+	# a brace group that OPENS on the `(`'s own line contributes no indent stop — the brace pair
+	# alone steps the interior — and its `)` none either. This covers a record threaded straight
+	# into a call (`Ctor({ ... })`) and a hugged trailing lambda (`f(a, () -> {` … `})`): the
+	# fields or body indent once and the closing `})` returns to the statement's own column. An
+	# EXPLODED group never matches (a newline separates its `(` from any block's `{`, and a
+	# trailing comma sits before its `)`), so its paren still steps — and because the closer
+	# inherits its OPENER's transparency, a `)` behind some block's `}` can never unwind a stop
+	# its `(` counted.
+	let [Bool] ptrans = []
+	let Iarch pz = 0
+
+	loop {
+		if pz >= Iarch(toks.len) then break
+		ptrans = [...ptrans, false]
+		pz = pz + 1
+	}
+
+	let Iarch pt = 0
+
+	loop {
+		if pt >= Iarch(toks.len) then break
+
+		if is_lparen(toks[pt].kind) && mate[pt] >= 0 then {
+			const Iarch pc = mate[pt]
+
+			if pc - 1 > pt && is_rbrace(toks[pc - 1].kind) && mate[pc - 1] >= 0 then {
+				if count_nl(src, src_hi(toks[pt]), src_lo(toks[mate[pc - 1]])) == 0 then {
+					ptrans[pt] = true
+					ptrans[pc] = true
+				}
+			}
+		}
+
+		pt = pt + 1
 	}
 
 	# Blank lines around `loop`, `return` and if-chain STATEMENTS. `blank_before[j]` forces one blank
@@ -485,7 +531,7 @@ pub const format_source! = (*[Uint8] src, Iarch n, Str file): [Uint8] -> {
 					loop {
 						if m >= Iarch(toks.len) then break
 						if is_opener(toks[m].kind) then d = d + 1
-							else if is_closer(toks[m].kind) then {
+						else if is_closer(toks[m].kind) then {
 							d = d - 1
 							if d == 0 then break
 						}
@@ -643,8 +689,8 @@ pub const format_source! = (*[Uint8] src, Iarch n, Str file): [Uint8] -> {
 					if jt >= Iarch(toks.len) then break
 					const TokKind tk3 = toks[jt].kind
 					if is_opener(tk3) then rt = rt + 1
-						else if is_closer(tk3) then rt = rt - 1
-							else if rt == 0 && tok_is_then(src, toks[jt]) then break
+					else if is_closer(tk3) then rt = rt - 1
+					else if rt == 0 && tok_is_then(src, toks[jt]) then break
 					jt = jt + 1
 				}
 
@@ -693,8 +739,8 @@ pub const format_source! = (*[Uint8] src, Iarch n, Str file): [Uint8] -> {
 			if sx >= de then break
 			const TokKind sk = toks[sx].kind
 			if is_opener(sk) then sd = sd + 1
-				else if is_closer(sk) then sd = sd - 1
-					else if is_arrow(sk) then {
+			else if is_closer(sk) then sd = sd - 1
+			else if is_arrow(sk) then {
 				if sd == 0 then {
 					isf = true
 					break
@@ -782,7 +828,7 @@ pub const format_source! = (*[Uint8] src, Iarch n, Str file): [Uint8] -> {
 				# and an operand after a trailing `||`/`&&` step one stop; a `then`/`else` clause steps by
 				# its ladder level, so a deep `else if` chain nests visibly.
 				if is_arrow(p.kind) || is_logor(p.kind) || is_logand(p.kind) then ind = ind + 1
-					else if tok_is_then(src, t) || tok_is_else(src, t) then ind = ind + ladder[i]
+				else if tok_is_then(src, t) || tok_is_else(src, t) then ind = ind + ladder[i]
 				if ind < 0 then ind = 0
 				let Iarch ti = 0
 
@@ -840,19 +886,16 @@ pub const format_source! = (*[Uint8] src, Iarch n, Str file): [Uint8] -> {
 
 		# a Phase-C trailing comma, injected directly after the last content token's text
 		if add_after[i] then out = [...out, Uint8(44)]
-		# `({` and `})` — a record threaded straight into a call (`Ctor({ ... })`) — count as ONE
-		# indent stop, not two: the `(` is transparent when a `{` follows, and the `)` when a `}`
-		# precedes. So the fields indent once under the constructor and the closing `})` de-indents
-		# to the constructor's own line.
-		if is_opener(t.kind) &&
-			!(is_lparen(t.kind) && i + 1 < Iarch(toks.len) && is_lbrace(toks[i + 1].kind)) then {
+		# an indent-transparent paren pair (`Ctor({ ... })`, a hugged `f(a, () -> {` … `})`)
+		# counts as no stop — the brace pair alone steps the interior (see `ptrans` above)
+		if is_opener(t.kind) && !ptrans[i] then {
 			depth = depth + 1
 			if depth >= Iarch(cstk.len) then cstk = [...cstk, 0]
 			cstk[depth] = pending_clause
 			carry = carry + pending_clause
 		}
 
-		if is_closer(t.kind) && !(is_rparen(t.kind) && i > 0 && is_rbrace(toks[i - 1].kind)) then {
+		if is_closer(t.kind) && !ptrans[i] then {
 			if depth >= 0 && depth < Iarch(cstk.len) then carry = carry - cstk[depth]
 			depth = depth - 1
 		}
@@ -860,7 +903,7 @@ pub const format_source! = (*[Uint8] src, Iarch n, Str file): [Uint8] -> {
 		# a line-leading `then`/`else` (a clause-split, not a joined `} else {`/`then {`) hands its
 		# ladder offset to a `{` that opens right after it, so that block's body indents under it
 		if lead && (tok_is_then(src, t) || tok_is_else(src, t)) then pending_clause = ladder[i]
-			else pending_clause = 0
+		else pending_clause = 0
 		i = i + 1
 	}
 
@@ -905,20 +948,29 @@ const col_of = (*[Uint8] src, Iarch pos): Iarch -> {
 	return pos - k - 1
 }
 
-# The single-line width of the comma-group at opener `o`: each token's own width plus inter-token
-# spacing canonicalised at the structural points — nothing after an opener or before a closer, one
-# space after a comma, verbatim elsewhere. `uncollapsible` if any non-structural gap carries a hard
-# break (a comment, or an element the user split over lines), or the group holds a non-empty `{...}`
-# STATEMENT block (which must be multi-line) — such a group can never be one line.
-const group_flat_width = (*[Uint8] src, [Token] toks, [Iarch] close_of, [Bool] cgroup, Iarch o): Iarch -> {
-	const Iarch c = close_of[o]
+# The single-line width of the tokens [o..hi] of the group at opener `o`: each token's own width
+# plus inter-token spacing canonicalised at the structural points — nothing after an opener or
+# before a closer, one space after a comma, verbatim elsewhere. `hi` is the group's closer for the
+# whole-group width, or the trailing block's `{` for a hug head (which deliberately ENDS in that
+# `{`, so the statement-block bail exempts `hi` itself). `uncollapsible` if any non-structural gap
+# carries a hard break (a comment, or an element the user split over lines), or the range holds a
+# non-empty `{...}` STATEMENT block (which must be multi-line) — such a range can never be one line.
+const group_flat_width = (
+	*[Uint8] src,
+	[Token] toks,
+	[Iarch] close_of,
+	[Bool] cgroup,
+	Iarch o,
+	Iarch hi,
+): Iarch -> {
 	let Iarch w = 0
 	let Iarch k = o
 
 	loop {
-		if k > c then break
+		if k > hi then break
 		if is_comment(toks[k].kind) then return uncollapsible
 		if k > o &&
+			k < hi &&
 			is_lbrace(toks[k].kind) &&
 			!cgroup[k] &&
 			close_of[k] > k + 1 &&
@@ -926,13 +978,13 @@ const group_flat_width = (*[Uint8] src, [Token] toks, [Iarch] close_of, [Bool] c
 				then return uncollapsible
 		w = w + (src_hi(toks[k]) - src_lo(toks[k]))
 
-		if k < c then {
+		if k < hi then {
 			const Token a = toks[k]
 			const Token b = toks[k + 1]
 			# canonical inter-token spacing: `, ` after a comma, `{ `/` }` inside braces (cf spaces
 			# record/union braces), nothing at a `(`/`[` edge, verbatim elsewhere
 			if is_comma(a.kind) || is_lbrace(a.kind) || is_rbrace(b.kind) then w = w + 1
-				else if !is_opener(a.kind) && !is_closer(b.kind) then {
+			else if !is_opener(a.kind) && !is_closer(b.kind) then {
 				if count_nl(src, src_hi(a), src_lo(b)) > 0 then return uncollapsible
 				w = w + (src_lo(b) - src_hi(a))
 			}
@@ -957,8 +1009,8 @@ const group_one_per_line = (*[Uint8] src, [Token] toks, [Iarch] close_of, Iarch 
 		if m >= c then break
 		const TokKind km = toks[m].kind
 		if is_opener(km) then d = d + 1
-			else if is_closer(km) then d = d - 1
-				else if is_comma(km) then {
+		else if is_closer(km) then d = d - 1
+		else if is_comma(km) then {
 			if d == 0 then {
 				if count_nl(src, src_hi(toks[m]), src_lo(toks[m + 1])) == 0 then return false
 			}
@@ -967,6 +1019,50 @@ const group_one_per_line = (*[Uint8] src, [Token] toks, [Iarch] close_of, Iarch 
 	}
 
 	return true
+}
+
+# The trailing-lambda HUG: a CALL whose last argument ends in a `-> { ... }` statement block keeps
+# its head on one line — `f(a, () -> {` … `})` — instead of exploding one argument per line: the
+# block already breaks the group, so hugging costs no width, and the body reads at one stop like
+# any block. Returns the index of that trailing block's `{` when the paren group at opener `o` is
+# hug-shaped: its last content token is the `}` of a top-level `->`-opened statement block (only a
+# trailing comma may sit between that `}` and the closer), and no comment precedes the block. -1
+# otherwise. (A block that is NOT last — data-last stdlib calls take their lambda FIRST — or an
+# arms `{...}` (a comma-group, not a statement block) explodes as before.)
+const hug_open = (*[Uint8] src, [Token] toks, [Iarch] close_of, [Bool] cgroup, Iarch o): Iarch -> {
+	if !is_lparen(toks[o].kind) then return -1
+	const Iarch c = close_of[o]
+	let Iarch d = 0
+	let Iarch k = o + 1
+
+	loop {
+		if k >= c then break
+		const TokKind kk = toks[k].kind
+		if is_comment(kk) then return -1
+
+		if d == 0 &&
+			is_lbrace(kk) &&
+			!cgroup[k] &&
+			close_of[k] > k + 1 &&
+			close_of[k] < c &&
+			opens_stmt_block(src, toks, k) then {
+			# only a trailing comma may sit between the block's `}` and the group's closer
+			let Iarch a = close_of[k] + 1
+
+			loop {
+				if a >= c then break
+				if !is_comma(toks[a].kind) then return -1
+				a = a + 1
+			}
+
+			return k
+		}
+
+		if is_opener(kk) then d = d + 1 else if is_closer(kk) then d = d - 1
+		k = k + 1
+	}
+
+	return -1
 }
 
 # One reflow pass over an already-formatted buffer: pick each OUTERMOST comma-group that is not in
@@ -1039,12 +1135,47 @@ const reflow! = (*[Uint8] src, Iarch n, Str file): [Uint8] -> {
 		if is_opener(gk) && cgroup[g] && close_of[g] >= 0 && g >= skip_until then {
 			const Iarch c = close_of[g]
 			const Iarch col = col_of(src, src_lo(toks[g]))
-			const Iarch fw = group_flat_width(src, toks, close_of, cgroup, g)
+			const Iarch fw = group_flat_width(src, toks, close_of, cgroup, g, c)
 			const Bool ml = count_nl(src, src_lo(toks[g]), src_hi(toks[c])) > 0
 			const Bool broken_want = fw >= uncollapsible || col + fw > line_limit
 
 			if broken_want then {
-				if !ml || !group_one_per_line(src, toks, close_of, g) then {
+				const Iarch hb = hug_open(src, toks, close_of, cgroup, g)
+				const Iarch hw = if hb >= 0
+					then group_flat_width(src, toks, close_of, cgroup, g, hb)
+				else uncollapsible
+
+				if hb >= 0 && col + hw <= line_limit then {
+					# HUG: flatten the head (opener through the trailing block's `{`) onto the
+					# group's line and glue the closer to the block's `}`; a leftover trailing
+					# comma between them is elided by the following `format_source!` pass once
+					# it shares the closer's line. The body's own gaps stay as they are (the
+					# statement-block marking above keeps a non-empty block multi-line).
+					let Iarch m = g + 1
+
+					loop {
+						if m > hb then break
+						const Token a = toks[m - 1]
+						const Token b = toks[m]
+						if is_lbrace(a.kind) then gapd[m] = Uint8(gap_space)
+						else if is_rbrace(b.kind) then gapd[m] = Uint8(gap_space)
+						else if is_opener(a.kind) then gapd[m] = Uint8(gap_none)
+						else if is_closer(b.kind) then gapd[m] = Uint8(gap_none)
+						else if is_comma(a.kind) then gapd[m] = Uint8(gap_space)
+						else gapd[m] = Uint8(gap_verbatim)
+						m = m + 1
+					}
+
+					let Iarch a2 = close_of[hb] + 1
+
+					loop {
+						if a2 > c then break
+						gapd[a2] = Uint8(gap_none)
+						a2 = a2 + 1
+					}
+
+					skip_until = c
+				} else if !ml || !group_one_per_line(src, toks, close_of, g) then {
 					# EXPLODE: a hard break after the opener, after every top-level comma, and
 					# before the closer; interior (nested) gaps stay verbatim
 					gapd[g + 1] = Uint8(gap_nl)
@@ -1056,8 +1187,8 @@ const reflow! = (*[Uint8] src, Iarch n, Str file): [Uint8] -> {
 						if m >= c then break
 						const TokKind km = toks[m].kind
 						if is_opener(km) then d = d + 1
-							else if is_closer(km) then d = d - 1
-								else if is_comma(km) then {
+						else if is_closer(km) then d = d - 1
+						else if is_comma(km) then {
 							if d == 0 then gapd[m + 1] = Uint8(gap_nl)
 						}
 						m = m + 1
@@ -1077,11 +1208,11 @@ const reflow! = (*[Uint8] src, Iarch n, Str file): [Uint8] -> {
 						const Token a = toks[m - 1]
 						const Token b = toks[m]
 						if is_lbrace(a.kind) then gapd[m] = Uint8(gap_space)
-							else if is_rbrace(b.kind) then gapd[m] = Uint8(gap_space)
-								else if is_opener(a.kind) then gapd[m] = Uint8(gap_none)
-									else if is_closer(b.kind) then gapd[m] = Uint8(gap_none)
-										else if is_comma(a.kind) then gapd[m] = Uint8(gap_space)
-											else gapd[m] = Uint8(gap_verbatim)
+						else if is_rbrace(b.kind) then gapd[m] = Uint8(gap_space)
+						else if is_opener(a.kind) then gapd[m] = Uint8(gap_none)
+						else if is_closer(b.kind) then gapd[m] = Uint8(gap_none)
+						else if is_comma(a.kind) then gapd[m] = Uint8(gap_space)
+						else gapd[m] = Uint8(gap_verbatim)
 						m = m + 1
 					}
 
@@ -1118,8 +1249,8 @@ const reflow! = (*[Uint8] src, Iarch n, Str file): [Uint8] -> {
 		} else {
 			const Iarch dir = Iarch(gapd[e])
 			if dir == gap_nl then out = [...out, Uint8(10)]
-				else if dir == gap_space then out = [...out, Uint8(32)]
-					else if dir == gap_verbatim then {
+			else if dir == gap_space then out = [...out, Uint8(32)]
+			else if dir == gap_verbatim then {
 				let Iarch q = prev_hi
 				const Iarch gt = src_lo(t)
 
@@ -1243,8 +1374,8 @@ const break_expr! = (*[Uint8] src, Iarch n, Str file): [Uint8] -> {
 							if jc >= belast then break
 							const TokKind ck = toks[jc].kind
 							if is_opener(ck) then rc = rc + 1
-								else if is_closer(ck) then rc = rc - 1
-									else if rc == 0 && (tok_is_then(src, toks[jc]) || tok_is_else(src, toks[jc])) then {
+							else if is_closer(ck) then rc = rc - 1
+							else if rc == 0 && (tok_is_then(src, toks[jc]) || tok_is_else(src, toks[jc])) then {
 								gapd[jc] = Uint8(gap_nl)
 								if thi < 0 && tok_is_then(src, toks[jc]) then thi = jc
 							}
@@ -1259,8 +1390,8 @@ const break_expr! = (*[Uint8] src, Iarch n, Str file): [Uint8] -> {
 								if qg >= thi then break
 								const TokKind qgk = toks[qg].kind
 								if is_opener(qgk) then rg = rg + 1
-									else if is_closer(qgk) then rg = rg - 1
-										else if (is_logor(qgk) || is_logand(qgk)) && rg == 0 then gapd[qg + 1] = Uint8(gap_nl)
+								else if is_closer(qgk) then rg = rg - 1
+								else if (is_logor(qgk) || is_logand(qgk)) && rg == 0 then gapd[qg + 1] = Uint8(gap_nl)
 								qg = qg + 1
 							}
 						}
@@ -1274,8 +1405,8 @@ const break_expr! = (*[Uint8] src, Iarch n, Str file): [Uint8] -> {
 							if qg >= belast then break
 							const TokKind qgk = toks[qg].kind
 							if is_opener(qgk) then rg = rg + 1
-								else if is_closer(qgk) then rg = rg - 1
-									else if (is_logor(qgk) || is_logand(qgk)) && rg == 0 then gapd[qg + 1] = Uint8(gap_nl)
+							else if is_closer(qgk) then rg = rg - 1
+							else if (is_logor(qgk) || is_logand(qgk)) && rg == 0 then gapd[qg + 1] = Uint8(gap_nl)
 							qg = qg + 1
 						}
 					}
@@ -1295,8 +1426,8 @@ const break_expr! = (*[Uint8] src, Iarch n, Str file): [Uint8] -> {
 						if j >= ti then break
 						const TokKind jk = toks[j].kind
 						if is_opener(jk) then rel = rel + 1
-							else if is_closer(jk) then rel = rel - 1
-								else if is_arrow(jk) && rel == 0 && j + 1 < ti && !is_lbrace(toks[j + 1].kind) then {
+						else if is_closer(jk) then rel = rel - 1
+						else if is_arrow(jk) && rel == 0 && j + 1 < ti && !is_lbrace(toks[j + 1].kind) then {
 							arrow = j
 							break
 						}
@@ -1320,7 +1451,7 @@ const break_expr! = (*[Uint8] src, Iarch n, Str file): [Uint8] -> {
 								has_block = true
 								break
 							} else if is_opener(bk) then rb = rb + 1
-									else if is_closer(bk) then rb = rb - 1
+							else if is_closer(bk) then rb = rb - 1
 							jb = jb + 1
 						}
 					}
@@ -1341,8 +1472,8 @@ const break_expr! = (*[Uint8] src, Iarch n, Str file): [Uint8] -> {
 								if jc >= ti then break
 								const TokKind ck = toks[jc].kind
 								if is_opener(ck) then rc = rc + 1
-									else if is_closer(ck) then rc = rc - 1
-										else if rc == 0 && tok_is_then(src, toks[jc]) then is_cond = true
+								else if is_closer(ck) then rc = rc - 1
+								else if rc == 0 && tok_is_then(src, toks[jc]) then is_cond = true
 								jc = jc + 1
 							}
 
@@ -1360,8 +1491,8 @@ const break_expr! = (*[Uint8] src, Iarch n, Str file): [Uint8] -> {
 									if jk2 >= ti then break
 									const TokKind ck2 = toks[jk2].kind
 									if is_opener(ck2) then rk = rk + 1
-										else if is_closer(ck2) then rk = rk - 1
-											else if rk == 0 && (tok_is_then(src, toks[jk2]) || tok_is_else(src, toks[jk2])) then {
+									else if is_closer(ck2) then rk = rk - 1
+									else if rk == 0 && (tok_is_then(src, toks[jk2]) || tok_is_else(src, toks[jk2])) then {
 										gapd[jk2] = Uint8(gap_nl)
 										if thi < 0 && tok_is_then(src, toks[jk2]) then thi = jk2
 									}
@@ -1376,8 +1507,8 @@ const break_expr! = (*[Uint8] src, Iarch n, Str file): [Uint8] -> {
 										if jq >= thi then break
 										const TokKind qk2 = toks[jq].kind
 										if is_opener(qk2) then rq = rq + 1
-											else if is_closer(qk2) then rq = rq - 1
-												else if (is_logor(qk2) || is_logand(qk2)) && rq == 0 then gapd[jq + 1] = Uint8(gap_nl)
+										else if is_closer(qk2) then rq = rq - 1
+										else if (is_logor(qk2) || is_logand(qk2)) && rq == 0 then gapd[jq + 1] = Uint8(gap_nl)
 										jq = jq + 1
 									}
 								}
@@ -1392,8 +1523,8 @@ const break_expr! = (*[Uint8] src, Iarch n, Str file): [Uint8] -> {
 									if q > belast then break
 									const TokKind qk = toks[q].kind
 									if is_opener(qk) then r3 = r3 + 1
-										else if is_closer(qk) then r3 = r3 - 1
-											else if (is_logor(qk) || is_logand(qk)) && r3 == 0 then gapd[q + 1] = Uint8(gap_nl)
+									else if is_closer(qk) then r3 = r3 - 1
+									else if (is_logor(qk) || is_logand(qk)) && r3 == 0 then gapd[q + 1] = Uint8(gap_nl)
 									q = q + 1
 								}
 							}
@@ -1414,8 +1545,8 @@ const break_expr! = (*[Uint8] src, Iarch n, Str file): [Uint8] -> {
 							if jc >= ti then break
 							const TokKind ck = toks[jc].kind
 							if is_opener(ck) then rc = rc + 1
-								else if is_closer(ck) then rc = rc - 1
-									else if rc == 0 && (tok_is_then(src, toks[jc]) || tok_is_else(src, toks[jc])) then {
+							else if is_closer(ck) then rc = rc - 1
+							else if rc == 0 && (tok_is_then(src, toks[jc]) || tok_is_else(src, toks[jc])) then {
 								gapd[jc] = Uint8(gap_nl)
 								if thi < 0 && tok_is_then(src, toks[jc]) then thi = jc
 							}
@@ -1432,8 +1563,8 @@ const break_expr! = (*[Uint8] src, Iarch n, Str file): [Uint8] -> {
 								if jq >= cend2 then break
 								const TokKind qk2 = toks[jq].kind
 								if is_opener(qk2) then rq = rq + 1
-									else if is_closer(qk2) then rq = rq - 1
-										else if (is_logor(qk2) || is_logand(qk2)) && rq == 0 then gapd[jq + 1] = Uint8(gap_nl)
+								else if is_closer(qk2) then rq = rq - 1
+								else if (is_logor(qk2) || is_logand(qk2)) && rq == 0 then gapd[jq + 1] = Uint8(gap_nl)
 								jq = jq + 1
 							}
 						}
