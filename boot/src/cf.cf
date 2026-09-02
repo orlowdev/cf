@@ -42,8 +42,8 @@ import std::mem::arena::growing_arena
 import qbe::{ qbe_translate }
 import std::process::{ run!, find_executable!, getpid, exit }
 import std::io::fs::{ remove, read_dir!, walk_dir! }
-import std::io::fd::{ DirEntry, IoRrr, entry_is_dir }
-import std::io::file::{ create, close, write_str }
+import std::io::fd::{ Fd, DirEntry, IoRrr, entry_is_dir }
+import std::io::file::{ create, close, write_str, open_read, read }
 import std::data::{ Either }
 import std::io::console::{ eprint, print, println }
 
@@ -861,6 +861,97 @@ const collect_tests! = (Str dir): [Str] -> {
 	return out
 }
 
+# `cf format <dir>`: every `.cf` under the directory, recursively (`std::io::fs::walk_dir!` —
+# sorted, dot-entries skipped). `--check` aggregates: exit 1 iff ANY file needs reformatting
+# (every file is still visited, so the report is complete); without it each file rewrites in
+# place. A file target formats exactly as before.
+const format_target! = (Str path, Bool check): Iarch -> {
+	const Either[IoRrr, [DirEntry]] dtry = read_dir!(path)
+
+	match dtry {
+		Either.Left(e) -> {},
+		Either.Right(entries) -> {
+			let Iarch worst = 0
+
+			for f in walk_dir!(path) {
+				if ends_with(".cf", f) then {
+					const Iarch rc = format_file!(f, check)
+					if rc != 0 then worst = 1
+				}
+			}
+
+			return worst
+		},
+	}
+
+	return format_file!(path, check)
+}
+
+# Does the file textually carry a `case!(`/`todo!(` call? The directory walk's prefilter
+# (testing.md §6): a file with neither cannot register a case, so it never spends a compile —
+# a library module under `cf test <dir>` is simply skipped. A mention inside a comment
+# false-positives into one compile whose empty runner exits 0 (testsynth); an unreadable or
+# over-sized file passes through to the compile, which reports it properly.
+const has_cases! = (Str path): Bool -> {
+	let [1048576 Uint8] buf
+	let Bool opened = true
+
+	const Fd fd = match open_read(path) {
+		Either.Left(e) -> {
+			opened = false
+
+			<- Fd({ n: Uarch(0) })
+		},
+		Either.Right(f) -> f,
+	}
+
+	if !opened then return true
+	const Iarch n = match read(fd, buf, Uarch(buf.len)) {
+		Either.Left(e) -> 0,
+		Either.Right(k) -> k,
+	}
+
+	close(fd)
+
+	if n >= Iarch(buf.len) then return true
+	const Str c1 = "case!("
+	const Str c2 = "todo!("
+	let Iarch i = 0
+
+	loop {
+		if i + 6 > n then break
+		let Bool m1 = true
+		let Bool m2 = true
+		let Iarch k = 0
+
+		loop {
+			if k >= 6 then break
+			if Iarch(buf[i + k]) != Iarch(c1[k]) then m1 = false
+			if Iarch(buf[i + k]) != Iarch(c2[k]) then m2 = false
+			k = k + 1
+		}
+
+		if m1 || m2 then {
+			# only a TOP-LEVEL call registers a case: the match's line must start with a
+			# non-space, non-`#` byte (`case!(` at column 0, or `std::test::case!(` whose line
+			# starts at `std`) — a comment mention or an indented body call is not a case
+			let Iarch ls = i
+
+			loop {
+				if ls == 0 then break
+				if Iarch(buf[ls - 1]) == 10 then break
+				ls = ls - 1
+			}
+
+			const Iarch fc = Iarch(buf[ls])
+			if fc != 35 && fc != 32 && fc != 9 then return true
+		}
+		i = i + 1
+	}
+
+	return false
+}
+
 # `cf test <file>` (cf_cli §7, testing.md §6): build the target with the TEST route — `is_test` injects
 # a runner `main` over every `case!`/`todo!` in the file — run the resulting binary, and exit with its
 # code (0 when every case passed, 1 when any failed). The report lines print to stdout as the cases
@@ -879,12 +970,18 @@ const run_test! = (Str target, Bool bail, [Str] env): Iarch -> {
 		Either.Right(entries) -> {
 			const [Str] files = collect_tests!(target)
 			let Iarch worst = 0
+			let Iarch ran = 0
 
 			for f in files {
-				const Iarch rc = run_test_file!(f, bail, env)
-				if rc != 0 then worst = 1
-				if bail && worst != 0 then return 1
+				if has_cases!(f) then {
+					ran = ran + 1
+					const Iarch rc = run_test_file!(f, bail, env)
+					if rc != 0 then worst = 1
+					if bail && worst != 0 then return 1
+				}
 			}
+
+			if ran == 0 then println("cf: test: no cases under ${target}")
 
 			return worst
 		},
@@ -975,7 +1072,7 @@ pub const main = ([Str] args, [Str] env) -> {
 		const fa = growing_arena::of(16777216)
 		const FmtCli fc = fmt_cli_parse(args) in fa
 
-		return format_file!(fc.path, fc.check) in fa
+		return format_target!(fc.path, fc.check) in fa
 	}
 
 	# `cf check <input.cf> [--src <file>]` — the full validation pipeline, no output: located
