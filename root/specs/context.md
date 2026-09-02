@@ -41,18 +41,22 @@ mutation). Context-across-tasks (§7) is not yet implemented. What lands:
   whole-program, so a `uses let T` contract spelling is unneeded for now (a note
   for a future separate-compilation story).
 
-**Placement is by ALIAS, not copy** (ratified M-D): `provide(x)` registers a
-pointer to the value *where the provider already built it* — no arena copy. The
-demand checker guarantees the provider's frame lexically outlives every
-consumer, so the pointer is always valid; and because the provided value and
-the context are the *same* storage, a `let` provide has a single source of
-truth — a mutation through `consume` and a read of the original binding never
-diverge. Copying the value survivor-side into the arena (so it reclaimed with
-`destroy`) was considered and rejected: for a `let` provide it splits the value
-into a frame original and an arena copy that silently diverge under mutation,
-which would demand move semantics to make safe — a worse trade than the slight
-over-retention (the aliased value reclaims with the provider's frame, not at an
-early `destroy`). The hidden signature is stamped in the demand pass's own
+**Placement is MANIFOLD storage, aliased — never copied, never stack.** A
+provided value is an aggregate, and an aggregate is always built in the
+provider's **ambient node** ([[memory_model.md]] §2 — only scalars and
+`$`-bindings live on the stack; a provided type is an aggregate, so a provide
+can never point at frame storage). `provide(x)` registers a pointer to that
+node address, *where the provider already built the value* — no copy of any
+kind. The demand checker guarantees the provider's extent lexically encloses
+every consumer, so the pointer is always valid; and because the provided value
+and the context are the *same* node bytes, a `let` provide has a single source
+of truth — a mutation through `consume` and a read of the original binding
+never diverge. Copying the value into a *child* node at the provide (so it
+reclaimed with that child's `destroy`) is rejected: it splits a `let` provide
+into an original and a copy that silently diverge under mutation, which would
+demand move semantics to make safe — a worse trade than the slight
+over-retention (the aliased value reclaims at the provider's own `!` bracket,
+not at a child's early `destroy`). The hidden signature is stamped in the demand pass's own
 deterministic whole-program order; a canonical type-name sort would only matter
 for separate compilation (each definition and every call site already read the
 same `uses` list, so the ABI is self-consistent), so it is left unspelled.
