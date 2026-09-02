@@ -993,13 +993,15 @@ pub const format_source! = (*[Uint8] src, Iarch n, Str file): [Uint8] -> {
 				if nl >= 2 || blank_before[i] then out = [...out, Uint8(10)]
 				let Iarch ind = depth + carry
 				if is_closer(t.kind) then ind = depth - 1 + carry
-				# a line whose PREVIOUS line ended in a `->` or a trailing `||`/`&&` operator, or which
-				# is led by a `then`/`else` clause keyword, is an expression continuation — indent it
-				# past its bracket depth (the `break_expr!` pass places such breaks). A post-`->` body
-				# and an operand after a trailing `||`/`&&` step one stop; a `then`/`else` clause steps by
-				# its ladder level, so a deep `else if` chain nests visibly.
+				# a line whose PREVIOUS line ended in a `->` or a trailing `||`/`&&` operator, which
+				# is led by a `then`/`else` clause keyword, or which is led by a `|>` pipe stage or
+				# a `.` member step, is an expression continuation — indent it past its bracket
+				# depth (the `break_expr!` pass places such breaks). A post-`->` body, an operand
+				# after a trailing `||`/`&&` and a leading `|>`/`.` step one stop; a `then`/`else`
+				# clause steps by its ladder level, so a deep `else if` chain nests visibly.
 				if is_arrow(p.kind) || is_logor(p.kind) || is_logand(p.kind) then ind = ind + 1
 				else if tok_is_then(src, t) || tok_is_else(src, t) then ind = ind + ladder[i]
+				else if is_pipearrow(t.kind) || is_dot(t.kind) then ind = ind + 1
 				if ind < 0 then ind = 0
 				let Iarch ti = 0
 
@@ -1453,11 +1455,13 @@ const reflow! = (*[Uint8] src, Iarch n, Str file): [Uint8] -> {
 
 # Expression-break pass (Phase D, higher precedence than argument reflow): for each over-long
 # line with a top-level `->` and an expression (non-block) body, either drop the body onto one
-# continuation line if it fits a further tab in, or — failing that — split it on its top-level
-# `||`/`&&` when every operand then fits on its own continuation line. `format_source!` supplies
-# the `+1` indent (a line after a `->`, or led by `||`/`&&`, is a continuation). A body that
-# still would not fit either way is left for the argument pass, whose NESTED continuation indent
-# this pass does not attempt. Only structural newlines change, so a settled buffer returns equal.
+# continuation line if it fits a further tab in, or — failing that — break it at its top-level
+# `|>` stages (the pipe LEADS each continuation line), else split it on its top-level `||`/`&&`.
+# `format_source!` supplies the `+1` indent (a line after a `->`, or led by `||`/`&&`/`|>`/`.`,
+# is a continuation). A body that still would not fit either way is left for the argument pass,
+# whose NESTED continuation indent this pass does not attempt — except a PURE `.` member chain,
+# which breaks at its dots when nothing else (pipe, `||`, comma-group) can cut the line. Only
+# structural newlines change, so a settled buffer returns equal.
 const break_expr! = (*[Uint8] src, Iarch n, Str file): [Uint8] -> {
 	const [Token] toks = lex_fmt(src, n, file)
 	const Iarch nt = Iarch(toks.len)
@@ -1684,9 +1688,13 @@ const break_expr! = (*[Uint8] src, Iarch n, Str file): [Uint8] -> {
 									}
 								}
 							} else {
-								# expression body: split on ALL its top-level `||`/`&&` (the operator shape
-								# wins over a call's comma list; an operand that is itself still too wide then
-								# explodes its own arguments on its own line, via `reflow!`)
+								# expression body: a top-level `|>` chain wins first — break BEFORE each
+								# pipe, one stage per continuation line (`|>` is cf's LOOSEST operator, so
+								# a textually top-level `||`/`&&` here belongs to a stage). With no pipe,
+								# split on ALL top-level `||`/`&&` (the operator shape wins over a call's
+								# comma list; an operand that is itself still too wide then explodes its
+								# own arguments on its own line, via `reflow!`)
+								let Bool piped = false
 								let Iarch r3 = 0
 								let Iarch q = bs
 
@@ -1694,20 +1702,41 @@ const break_expr! = (*[Uint8] src, Iarch n, Str file): [Uint8] -> {
 									if q > belast then break
 									const TokKind qk = toks[q].kind
 									if is_opener(qk) then r3 = r3 + 1
-									else if is_closer(qk) then r3 = r3 - 1
-									else if (is_logor(qk) || is_logand(qk)) && r3 == 0 then gapd[q + 1] = Uint8(gap_nl)
+									else if is_closer(qk) then {
+										if r3 > 0 then r3 = r3 - 1
+									} else if is_pipearrow(qk) && r3 == 0 then {
+										gapd[q] = Uint8(gap_nl)
+										piped = true
+									}
 									q = q + 1
+								}
+
+								if !piped then {
+									let Iarch r4 = 0
+									let Iarch q4 = bs
+
+									loop {
+										if q4 > belast then break
+										const TokKind qk4 = toks[q4].kind
+										if is_opener(qk4) then r4 = r4 + 1
+										else if is_closer(qk4) then r4 = r4 - 1
+										else if (is_logor(qk4) || is_logand(qk4)) && r4 == 0
+											then gapd[q4 + 1] = Uint8(gap_nl)
+										q4 = q4 + 1
+									}
 								}
 							}
 						}
 					} else if arrow < 0 then {
-						# a non-arrow conditional or plain boolean (`let x = if ...`, `return if ...`, a
-						# `if C then break` / `if C then return ...` guard, `let x = a || b`). Split its
-						# clauses in place (`if ...` stays on the line); then, if the CONDITION (up to its
-						# `then`) — or the whole expression when there is no `then` — still overflows, split
-						# it on its top-level `||`/`&&` BEFORE a call's argument list is exploded
-						# (if/then/else > `||`/`&&` > comma-list). (A block-body arrow reaches neither
-						# branch: `reflow!` explodes it with its head put.)
+						# a non-arrow conditional, pipe chain or plain boolean (`let x = if ...`,
+						# `return if ...`, a `if C then break` guard, `let x = a |> f`, `let x = a || b`).
+						# Split its clauses in place (`if ...` stays on the line); then, if the CONDITION
+						# (up to its `then`) — or the whole expression when there is no `then` — still
+						# overflows, break it at its top-level `|>` stages, else split its top-level
+						# `||`/`&&`, BEFORE a call's argument list is exploded; a pure `.` member chain
+						# with nothing else to cut breaks at its dots dead last
+						# (if/then/else > `|>` > `||`/`&&` > comma-list > `.`). (A block-body arrow
+						# reaches neither branch: `reflow!` explodes it with its head put.)
 						let Iarch thi = -1
 						let Iarch rc = 0
 						let Iarch jc = tstart
@@ -1727,16 +1756,102 @@ const break_expr! = (*[Uint8] src, Iarch n, Str file): [Uint8] -> {
 						const Iarch cend2 = if thi >= 0 then thi else belast + 1
 
 						if indent + src_hi(toks[cend2 - 1]) - src_lo(toks[tstart]) > line_limit then {
-							let Iarch rq = 0
-							let Iarch jq = tstart
+							# a top-level `|>` chain wins first (pipes are cf's LOOSEST operator): break
+							# BEFORE each pipe past the line's leader, one stage per continuation line
+							let Bool piped = false
 
-							loop {
-								if jq >= cend2 then break
-								const TokKind qk2 = toks[jq].kind
-								if is_opener(qk2) then rq = rq + 1
-								else if is_closer(qk2) then rq = rq - 1
-								else if (is_logor(qk2) || is_logand(qk2)) && rq == 0 then gapd[jq + 1] = Uint8(gap_nl)
-								jq = jq + 1
+							if thi < 0 then {
+								let Iarch rp = 0
+								let Iarch jp = tstart + 1
+
+								loop {
+									if jp >= cend2 then break
+									const TokKind pk2 = toks[jp].kind
+									if is_opener(pk2) then rp = rp + 1
+									else if is_closer(pk2) then {
+										if rp > 0 then rp = rp - 1
+									} else if is_pipearrow(pk2) && rp == 0 then {
+										gapd[jp] = Uint8(gap_nl)
+										piped = true
+									}
+									jp = jp + 1
+								}
+							}
+
+							let Bool orsplit = false
+
+							if !piped then {
+								let Iarch rq = 0
+								let Iarch jq = tstart
+
+								loop {
+									if jq >= cend2 then break
+									const TokKind qk2 = toks[jq].kind
+									if is_opener(qk2) then rq = rq + 1
+									else if is_closer(qk2) then rq = rq - 1
+									else if (is_logor(qk2) || is_logand(qk2)) && rq == 0 then {
+										gapd[jq + 1] = Uint8(gap_nl)
+										orsplit = true
+									}
+									jq = jq + 1
+								}
+							}
+
+							# LAST resort — a `.` member chain (`o.inner.v`), breaking BEFORE each dot
+							# past the leader: only when nothing else can shorten the line — no pipe or
+							# `||`/`&&` split, no conditional, no comma ANYWHERE (a comma-group is
+							# `reflow!`'s to explode) — and only a PURE chain: two+ top-level dots past
+							# the `=` and no other top-level operator (cutting `a.b == c.d` at its dots
+							# would read mangled)
+							if !piped && !orsplit && thi < 0 then {
+								let Iarch ds = tstart
+								let Iarch rs = 0
+								let Iarch js = tstart
+
+								loop {
+									if js >= cend2 then break
+									const TokKind sk2 = toks[js].kind
+									if is_opener(sk2) then rs = rs + 1
+									else if is_closer(sk2) then rs = rs - 1
+									else if is_eq(sk2) && rs == 0 then ds = js + 1
+									js = js + 1
+								}
+
+								let Iarch ndots = 0
+								let Bool clean = true
+								let Iarch rd = 0
+								let Iarch jd = ds
+
+								loop {
+									if jd >= cend2 then break
+									const TokKind dk2 = toks[jd].kind
+									if is_comma(dk2) then clean = false
+									if is_opener(dk2) then rd = rd + 1
+									else if is_closer(dk2) then {
+										if rd > 0 then rd = rd - 1
+									} else if rd == 0 then {
+										if is_dot(dk2) then ndots = ndots + 1
+										else if is_spaced_op(dk2) || is_minus(dk2) || is_star(dk2) || is_amp(dk2)
+											then clean = false
+									}
+									jd = jd + 1
+								}
+
+								if clean && ndots >= 2 then {
+									let Iarch rb = 0
+									let Iarch jb2 = ds
+
+									loop {
+										if jb2 >= cend2 then break
+										const TokKind bk2 = toks[jb2].kind
+										if is_opener(bk2) then rb = rb + 1
+										else if is_closer(bk2) then {
+											if rb > 0 then rb = rb - 1
+										} else if is_dot(bk2) && rb == 0 && jb2 > tstart
+											then gapd[jb2] = Uint8(gap_nl)
+										jb2 = jb2 + 1
+									}
+								}
 							}
 						}
 					}
