@@ -813,6 +813,7 @@ const run_full! = (Cli c, [Str] env): Iarch -> {
 		c.instrument,
 		c.is_test,
 		c.is_bail,
+		c.test_files,
 	)
 
 	# type errors come back as values — the CLI edge is where they become text
@@ -983,6 +984,42 @@ const test_mod_of = (Str target, Str f): Str -> {
 	return Str({ bytes: out, len: Iarch(out.len) })
 }
 
+# The validated module stem of a lone test file (`t2m.cf` -> `t2m`), or "" when it is not a
+# spellable identifier.
+const test_stem = (Str f): Str -> {
+	const Iarch stop = Iarch(f.len) - 3
+	if stop <= 0 then return ""
+	let [Uint8] out = []
+	let Iarch i = 0
+
+	loop {
+		if i >= stop then break
+		const Iarch c = Iarch(f[i])
+		const Bool alpha = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95
+		const Bool digit = c >= 48 && c <= 57
+		if i == 0 && !alpha then return ""
+		if !alpha && !digit then return ""
+		out = [...out, f[i]]
+		i = i + 1
+	}
+
+	return Str({ bytes: out, len: Iarch(out.len) })
+}
+
+# The last `/` in `p`, or -1.
+const last_slash = (Str p): Iarch -> {
+	let Iarch at = -1
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(p.len) then break
+		if Iarch(p[i]) == 47 then at = i
+		i = i + 1
+	}
+
+	return at
+}
+
 # One MERGED test build (testing.md §6): a transient dot-named entry inside `target` imports every
 # spellable test module (relative imports resolve against the ENTRY's directory), so the whole
 # directory compiles and runs as ONE binary — one build, one process, every case prefixed by its
@@ -991,6 +1028,38 @@ const test_mod_of = (Str target, Str f): Str -> {
 const run_merged! = (Str target, [Str] mods, Bool bail, [Str] env): Iarch -> {
 	const Iarch pid = getpid()
 	const Str entry = "${target}/.__cf_test_${pid}.cf"
+	# the requested files, spelled exactly as resolve will record them (entry-dir + module path):
+	# the runner drives ONLY these — a dependency's own cases stay quiet unless it is the target
+	let [Str] req = []
+
+	for m in mods {
+		let [Uint8] fb = []
+		let Iarch ti = 0
+
+		loop {
+			if ti >= Iarch(target.len) then break
+			fb = [...fb, target[ti]]
+			ti = ti + 1
+		}
+
+		fb = [...fb, 47]
+		let Iarch mi = 0
+
+		loop {
+			if mi >= Iarch(m.len) then break
+			if Iarch(m[mi]) == 58 then {
+				fb = [...fb, 47]
+				mi = mi + 2
+			} else {
+				fb = [...fb, m[mi]]
+				mi = mi + 1
+			}
+		}
+
+		fb = [...fb, 46, 99, 102]
+		req = [...req, Str({ bytes: fb, len: Iarch(fb.len) })]
+	}
+
 
 	const Fd fd = match create(entry) {
 		Either.Left(e) -> {
@@ -1005,7 +1074,7 @@ const run_merged! = (Str target, [Str] mods, Bool bail, [Str] env): Iarch -> {
 	for m in mods write_str(fd, "import ${m}\n")
 
 	close(fd)
-	const Iarch rc = run_test_file!(entry, bail, env)
+	const Iarch rc = run_test_file!(entry, bail, env, req)
 	remove(entry)
 
 	return rc
@@ -1050,7 +1119,8 @@ const run_test! = (Str target, Bool bail, [Str] env): Iarch -> {
 			}
 
 			for f in loose {
-				const Iarch rc = run_test_file!(f, bail, env)
+				const [Str] just = [f]
+				const Iarch rc = run_test_file!(f, bail, env, just)
 				if rc != 0 then worst = 1
 				if bail && worst != 0 then return 1
 			}
@@ -1059,10 +1129,25 @@ const run_test! = (Str target, Bool bail, [Str] env): Iarch -> {
 		},
 	}
 
-	return run_test_file!(target, bail, env)
+	# a single FILE also runs as a MODULE behind a merged entry in its own directory: compiled as
+	# a bare entry it would load a SECOND time whenever its own import tree reaches back to it
+	# (std::data::str under std::test -> console -> process), doubling every case — as a module
+	# import it dedupes against that load. An unspellable name (a digit-led corpus file) keeps
+	# the bare-entry path; such a file is outside any import tree that could reach it.
+	const Iarch sl = last_slash(target)
+	const Str fdir = if sl < 0 then "." else slice(0, sl, target)
+	const Str base = if sl < 0 then target else slice(sl + 1, Iarch(target.len), target)
+	if ends_with(".cf", base) then {
+		const Str m = test_stem(base)
+		if !eq(m, "") then return run_merged!(fdir, [m], bail, env)
+	}
+
+	const [Str] justt = [target]
+
+	return run_test_file!(target, bail, env, justt)
 }
 
-const run_test_file! = (Str target, Bool bail, [Str] env): Iarch -> {
+const run_test_file! = (Str target, Bool bail, [Str] env, [Str] req): Iarch -> {
 	const Iarch pid = getpid()
 	const Str out = "/tmp/cf-test-${pid}"
 	const Cli c = Cli({
@@ -1083,6 +1168,7 @@ const run_test_file! = (Str target, Bool bail, [Str] env): Iarch -> {
 		build_version: "",
 		is_test: true,
 		is_bail: bail,
+		test_files: req,
 	})
 	const Iarch bst = run_full!(c, env)
 	if bst != 0 then return bst
@@ -1271,6 +1357,7 @@ pub const main = ([Str] args, [Str] env) -> {
 			c.instrument,
 			c.is_test,
 			c.is_bail,
+			c.test_files,
 		) in a
 
 		if Iarch(ds.len) > 0 then {
