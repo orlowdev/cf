@@ -33,6 +33,7 @@
 # those splice only through the pure path). A parameter used as a Field/Index BASE
 # (a name position in the AST) needs a bare name after temp-binding.
 import std::compiler::ast::{ Expr, Stmt, MatchArm, StmtArm, Seg, FieldInit, Param, Func, Program }
+import std::compiler::astutil::{ agg_val_names, is_agg_const_val }
 import std::data::str::{ eq }
 
 # The node budget for an inlinable body — generous for a leaf expression; the point
@@ -101,10 +102,14 @@ const is_cast_type = (Str name): Bool -> {
 # and the declared return type name (gates the value-block path).
 data InlDef = { Str name, [Str] params, Expr body, Str ret }
 
-# A literal VALUE CONST (`const max_depth = 128`): emit models it as a nullary
-# function and AUTO-CALLS it at every bare reference — a runtime call per constant
-# read. Folding the reference to its literal erases the call; value consts are
-# literals-only (uniformly enforced), so the fold is total for this table.
+# A foldable VALUE CONST: emit models a value const as a nullary function and
+# AUTO-CALLS it at every bare reference — a runtime call per constant read. Folding
+# the reference to its body erases the call. For a LITERAL body (`const max_depth =
+# 128`) the fold is an optimization; for an AGGREGATE body (`const STDOUT =
+# Fd({...})`, `is_agg_const_val`) it is MANDATORY — the construction can only run
+# under the REFERENCING function's geometry ambient, so the ambient-less nullary
+# original is never emitted (emit's `agg_val_body` skip) and every reference must
+# splice.
 data ValDef = { Str name, Expr lit }
 
 # The rewriter's state: the definition tables and the gensym counter for value-block
@@ -288,7 +293,8 @@ const is_literal = (Expr e): Bool -> match e {
 	_ -> false,
 }
 
-const inl_vals = (Program prog): [ValDef] -> {
+const inl_vals! = (Program prog): [ValDef] -> {
+	const [Str] aggnames = agg_val_names(prog.funcs)
 	let [ValDef] vals = []
 	let Iarch i = 0
 
@@ -298,12 +304,38 @@ const inl_vals = (Program prog): [ValDef] -> {
 		if f.is_value && !f.is_asm && Iarch(f.body.len) == 1 then {
 			match f.body[0] {
 				Stmt.Return(e) -> {
-					if is_literal(e) then vals = [...vals, ValDef({ name: f.name, lit: e })]
+					if is_literal(e) || has_name(aggnames, f.name)
+						then vals = [...vals, ValDef({ name: f.name, lit: e })]
 				},
 				_ -> {},
 			}
 		}
 		i = i + 1
+	}
+
+	# PRE-FOLD const-in-const references so every table entry is self-contained: an
+	# aggregate const may read another (`pub const N = STDOUT.n`, `Fd({ n: WIDTH })`) and
+	# the use-site fold is one-shot (a spliced body is not re-walked). Each pass resolves
+	# at least one chain link, so passes are capped at the table size — a (spec-rejected)
+	# reference cycle stops converging instead of hanging.
+	const [InlDef] nodefs = []
+	const [Str] noscope = []
+	let Iarch pass = 0
+
+	loop {
+		if pass >= Iarch(vals.len) then break
+		let InlSt pst = InlSt({ defs: nodefs, vals: vals, gen: 0 })
+		let [ValDef] nv = []
+		let Iarch k = 0
+
+		loop {
+			if k >= Iarch(vals.len) then break
+			nv = [...nv, ValDef({ name: vals[k].name, lit: rw_expr!(&pst, noscope, vals[k].lit) })]
+			k = k + 1
+		}
+
+		vals = nv
+		pass = pass + 1
 	}
 
 	return vals
@@ -323,6 +355,34 @@ const fold_val = (*InlSt st, [Str] scope, Str n, Expr orig): Expr -> {
 	}
 
 	return orig
+}
+
+# Fold `CONST.field` — a Field whose BASE names an AGGREGATE value const: the base splices
+# to its construction (`FieldExpr`), keeping the read inside the referencing ambient. A
+# union-tag base (`Color.Red`) or a literal-const base resolves to no aggregate entry and
+# stays put (the literal fn is still emitted, so its auto-call keeps working).
+const fold_field = (*InlSt st, [Str] scope, Str b, Str f, Expr orig): Expr -> {
+	if has_name(scope, b) then return orig
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(st.vals.len) then break
+		if eq(st.vals[i].name, b) then {
+			if is_agg_splice(st.vals[i].lit) then return Expr.FieldExpr(st.vals[i].lit, f)
+
+			return orig
+		}
+		i = i + 1
+	}
+
+	return orig
+}
+
+# A table entry an aggregate Field/read base may splice to: a construction, or a pre-folded
+# read that itself resolved to one (`FieldExpr` — `const N = STDOUT.n` chains).
+const is_agg_splice = (Expr e): Bool -> match e {
+	Expr.FieldExpr(_, _) -> true,
+	_ -> is_agg_const_val(e),
 }
 
 const find_def = ([InlDef] defs, Str name): Iarch -> {
@@ -640,6 +700,7 @@ const rw_expr! = (*InlSt st, [Str] scope, Expr e): Expr -> match e {
 	Expr.DeferTap(n, args) -> Expr.DeferTap(n, rw_list!(st, scope, args)),
 	Expr.At(o, inner) -> rw_expr!(st, scope, inner),
 	Expr.Var(n) -> fold_val(st, scope, n, e),
+	Expr.Field(b, f) -> fold_field(st, scope, b, f, e),
 	_ -> e,
 }
 
@@ -862,7 +923,7 @@ const rw_func! = (*InlSt st, Func f): Func -> Func({
 # untouched — emit's index-based linkage and the materialize tables stay valid.
 pub const inline_program! = (Program prog): Program -> {
 	const [InlDef] defs = inl_defs(prog)
-	const [ValDef] vals = inl_vals(prog)
+	const [ValDef] vals = inl_vals!(prog)
 	if Iarch(defs.len) == 0 && Iarch(vals.len) == 0 then return prog
 
 	let InlSt stv = InlSt({ defs: defs, vals: vals, gen: 0 })

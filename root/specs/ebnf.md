@@ -24,7 +24,8 @@ _(temporary)_ are placeholders that will be widened in later rounds.
   comments. Like whitespace, a comment is a lexer concern and is stripped before
   the rules below apply.
 - Identifier casing is part of the grammar: **types are PascalCase**, **values
-  (variable names) are snake_case**.
+  (variable names) are snake_case**, **exported value constants are
+  UPPER_SNAKE_CASE**.
 
 ## Character Classes
 
@@ -45,9 +46,16 @@ hex_digit = dec_digit | "a" | "b" | "c" | "d" | "e" | "f"
 ## Identifiers
 
 ```ebnf
-type_name = uppercase , { uppercase | lowercase | dec_digit } ;         (* PascalCase: Int, Uint8 *)
-var_name  = [ "$" ] , lowercase , { lowercase | dec_digit | "_" } , [ "!" ] ;   (* snake_case: x, the_number, alloc!, $buf *)
+type_name  = uppercase , { uppercase | lowercase | dec_digit } ;         (* PascalCase: Int, Uint8 *)
+var_name   = [ "$" ] , lowercase , { lowercase | dec_digit | "_" } , [ "!" ] ;   (* snake_case: x, the_number, alloc!, $buf *)
+const_name = uppercase , { uppercase | dec_digit | "_" } ;               (* UPPER_SNAKE_CASE: STDOUT, KEY_UP *)
 ```
+
+A `const_name` names a **top-level value const** (see Variable Declaration and
+Visibility) — screaming means immutable. The shapes overlap on a name with no
+lowercase letter (`X`, `FD`): such a name reads as a `const_name` in every value
+position, so a type name should always mix case (`Fd`, not `FD`). Only a
+MIXED-case uppercase-initial name is a type.
 
 A `var_name` may end in a single `!`. Lexically the `!` is part of the
 identifier (`alloc!` is one token). It is the **allocation-effect marker** and
@@ -830,9 +838,26 @@ This is enforced at the grammar level.
 ```ebnf
 let_decl   = "let" , ( type , var_name , [ "=" , expression ]   (* type given: init optional *)
                      | var_name , "=" , expression ) ;          (* no type: init required *)
-const_decl = "const" , [ type ] , var_name , "=" , expression ;
+const_decl = "const" , [ type ] , ( var_name | const_name ) , "=" , expression ;
 var_decl   = let_decl | const_decl | destructure_decl ;   (* destructure_decl: see Destructuring *)
 ```
+
+The `const_name` alternative is the **top-level value const** form (`pub const
+STDOUT = Fd({ ... })` — see Visibility): an **exported** (`pub`) non-function
+value const **must** be a `const_name`; a module-private one may use either
+casing. A function is still a `var_name` const binding (it is a function first,
+a const second), and a **local** `const` statement stays `var_name`.
+
+A top-level value const's value may be a **literal** (its type inferred: a
+string is `Str`, a Bool `Bool`, anything scalar the `Int` word) or a **data
+aggregate construction** — a record (`Fd({ ... })`), a union member
+(`Color.Red`, `IoRrr.Other(e)`), or a field read off another aggregate const
+(`STDOUT.n`). A construction names its own type. Each **reference** to an
+aggregate const constructs the value afresh **in the referencing function's
+ambient** (construction is application — the reference is the construction,
+spliced at the site). An aggregate may only be the const's **whole value**: one
+trapped inside a wider expression (`const BAD = ORIGIN.x + 1`) is rejected —
+the intermediate record would have no geometry to live in.
 
 Examples:
 
@@ -1544,11 +1569,14 @@ declaration = [ "pub" ] , ( data_decl | type_decl | union_decl | var_decl | intr
 ```
 
 `pub` sits before the declaration keyword and applies to **data, types, and
-values** (`let`/`const`, and thus functions, which are `const`-bound lambdas):
+values** (`let`/`const`, and thus functions, which are `const`-bound lambdas).
+An exported **non-function value const** must be UPPER_SNAKE_CASE (`const_name`,
+§ Identifiers) — screaming means immutable; a function keeps its `var_name`:
 
 ```
-pub const x = 1        (* exported — importable *)
-const y = 2            (* module-private *)
+pub const LIMIT = 1        (* exported value const — UPPER_SNAKE_CASE required *)
+const greeting = "hi"      (* module-private value const — snake_case fine *)
+pub const lex = (...) -> ...   (* a function is a var_name const binding *)
 pub data Point = { Int32 x, Int32 y }
 pub type ServerOptions = { Int32 port, Str host }
 ```

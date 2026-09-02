@@ -36,6 +36,7 @@ import std::compiler::ast::{
 }
 import std::data::str::{ eq }
 import std::io::console::{ die }
+import std::compiler::astutil::{ agg_val_names }
 import std::compiler::diag::{ Diag }
 import std::compiler::spans::{ unat, line_col_of, SrcMap, LC }
 
@@ -180,7 +181,10 @@ const union_boxed = ([UnionDecl] unions, Str name): Bool -> {
 # The read-only context threaded through the residue scan: the union table (to tell a boxed
 # construction from a bare-word one), the current function's parameter names (a rehome target),
 # and the set of local names that escape.
-data ACtx = { [UnionDecl] unions, [Str] params, [Str] esc }
+# `aggs` — the aggregate value-const names (astutil `agg_val_names`): a reference to one IS
+# the construction the inline fold later splices in, so the residue scan counts it like a
+# written construction (trapped when its value does not escape).
+data ACtx = { [UnionDecl] unions, [Str] params, [Str] esc, [Str] aggs }
 
 # The immediate EXPRESSION children of `e`, for the generic residue / call recursion. Every
 # recursive expr form except a value block `Expr.Loop` (which holds STATEMENTS, walked specially)
@@ -296,7 +300,17 @@ const is_construction = (ACtx cx, Expr e): Bool -> match unat(e) {
 	Expr.Buffer(_) -> true,
 	Expr.Interp(_) -> true,
 	Expr.UnionMk(u, _, _) -> union_boxed(cx.unions, u),
+	# a reference to an AGGREGATE value const (`ORIGIN`, `ORIGIN.x`) is the construction the
+	# inline fold splices here — a shadowing local/param of the same name wins instead
+	Expr.Var(n) -> in_aggs(cx, n),
+	Expr.Field(b, _) -> in_aggs(cx, b),
 	_ -> false,
+}
+
+const in_aggs = (ACtx cx, Str n): Bool -> {
+	if has_name(cx.params, n) then return false
+
+	return has_name(cx.aggs, n)
 }
 
 # Whether ANY of `es` traps a residue (non-escaping context).
@@ -340,6 +354,10 @@ const any_escaping! = (ACtx cx, [Expr] es): Bool -> {
 # residue, but a construction inside a call argument, a read base, or an if-condition IS. Returns
 # whether any trapped construction exists within.
 const scan_escaping! = (ACtx cx, Expr e): Bool -> match unat(e) {
+	# a bare aggregate-const reference in an escaping position (`return ORIGIN`) is a
+	# construction whose value escapes ret-side — not residue (a `.field` read off one stays
+	# on the trapped path below: the read escapes, the record does not)
+	Expr.Var(_) -> false,
 	Expr.Record(_, inits) -> any_escaping!(cx, field_values(inits)),
 	Expr.ArrayLit(_, sp, elems, _) -> scan_trapped!(cx, sp) || any_escaping!(cx, elems),
 	Expr.Tuple(elems) -> any_escaping!(cx, elems),
@@ -472,7 +490,7 @@ const stmt_traps! = (ACtx cx, Bool yesc, Stmt s): Bool -> match s {
 	# is the enclosing function's — descend with the same context
 	Stmt.Defer(ss) -> body_traps!(cx, false, ss),
 	# a closure's residue is its own; analyze it with its own context and let a `!` closure color us
-	Stmt.Closure(_, cps, _, cbody) -> closure_traps!(cx.unions, cps, cbody),
+	Stmt.Closure(_, cps, _, cbody) -> closure_traps!(cx.unions, cx.aggs, cps, cbody),
 	_ -> false,
 }
 
@@ -1179,19 +1197,19 @@ const param_names = (Func f): [Str] -> plist_names(f.params)
 # own, escaping to the enclosing caller only when returned. Analyze the body with the CLOSURE's own
 # parameters and a fresh escape set — if it traps residue, the enclosing function (which defines and
 # invokes it) is colored `!`, exactly as if it called a `!` function. Closures do not nest in v1.
-const closure_traps! = ([UnionDecl] unions, [Param] cps, [Stmt] cbody): Bool -> {
+const closure_traps! = ([UnionDecl] unions, [Str] aggs, [Param] cps, [Stmt] cbody): Bool -> {
 	const [Str] cparams = plist_names(cps)
 	const [Str] cesc = compute_esc(cparams, cbody)
-	const ACtx cx2 = ACtx({ unions: unions, params: cparams, esc: cesc })
+	const ACtx cx2 = ACtx({ unions: unions, params: cparams, esc: cesc, aggs: aggs })
 
 	return body_traps!(cx2, false, cbody)
 }
 
 # Does function `f` hold a trapped (non-escaping) aggregate residence of its own?
-const local_residue! = ([UnionDecl] unions, Func f): Bool -> {
+const local_residue! = ([UnionDecl] unions, [Str] aggs, Func f): Bool -> {
 	const [Str] params = param_names(f)
 	const [Str] esc = compute_esc(params, f.body)
-	const ACtx cx = ACtx({ unions: unions, params: params, esc: esc })
+	const ACtx cx = ACtx({ unions: unions, params: params, esc: esc, aggs: aggs })
 
 	return body_traps!(cx, false, f.body)
 }
@@ -1334,6 +1352,7 @@ const is_main = (Func f): Bool -> eq(f.name, "main")
 # transitively makes an effectful call (a concrete `!` callee, or a `!` function VALUE argument).
 const compute_bang! = (Program prog): [Bool] -> {
 	const [Func] funcs = prog.funcs
+	const [Str] aggs = agg_val_names(funcs)
 	const Iarch n = Iarch(funcs.len)
 	let [Bool] bang = []
 	let Iarch i = 0
@@ -1342,7 +1361,7 @@ const compute_bang! = (Program prog): [Bool] -> {
 		if i >= n then break
 		const Bool seed = if funcs[i].is_asm
 			then is_bang_name(funcs[i].name)
-		else local_residue!(prog.unions, funcs[i])
+		else local_residue!(prog.unions, aggs, funcs[i])
 		bang = [...bang, seed]
 		i = i + 1
 	}
@@ -1538,7 +1557,7 @@ const why_stmt! = (ACtx cx, Bool yesc, Stmt s): Iarch -> {
 const why_closure! = (ACtx cx, [Param] cps, [Stmt] cbody): Iarch -> {
 	const [Str] cparams = plist_names(cps)
 	const [Str] cesc = compute_esc(cparams, cbody)
-	const ACtx cx2 = ACtx({ unions: cx.unions, params: cparams, esc: cesc })
+	const ACtx cx2 = ACtx({ unions: cx.unions, params: cparams, esc: cesc, aggs: cx.aggs })
 
 	return why_body!(cx2, false, cbody)
 }
@@ -1670,13 +1689,33 @@ const is_cf_body = (Str n): Bool -> {
 # declaration instead of dying at the first (each used to cost a full rebuild cycle).
 pub const check_alloc_program! = (Program prog, [SrcMap] maps): [Diag] -> {
 	const [Func] funcs = prog.funcs
+	const [Str] aggs = agg_val_names(funcs)
 	const [Bool] bang = compute_bang!(prog)
 	let [Diag] diags = []
 	let Iarch j = 0
 
 	loop {
 		if j >= Iarch(funcs.len) then break
-		if !funcs[j].is_asm && !is_main(funcs[j]) then {
+		# a VALUE const in the aggregate set is exempt from the `!` gates: it is never called
+		# (every reference splices via the inline fold, moving any residue into the referencing
+		# body, whose own scan counts it). A value const OUTSIDE the set that still traps an
+		# aggregate (`const BAD = ORIGIN.x + 1` — the read's record has nowhere to live) cannot
+		# carry a `!` marker, so it is rejected outright.
+		if funcs[j].is_value then {
+			if !funcs[j].is_asm &&
+				!has_name(aggs, funcs[j].name) &&
+				local_residue!(prog.unions, aggs, funcs[j]) then {
+				diags = [
+					...diags,
+					gate_diag(
+						maps,
+						funcs[j],
+						-1,
+						"cf: alloc: a value const cannot trap an aggregate inside a wider expression — make the aggregate the const's whole value, or bind the read inside a function\n",
+					),
+				]
+			}
+		} else if !funcs[j].is_asm && !is_main(funcs[j]) then {
 			const Bool decl = is_bang_name(funcs[j].name)
 			# a redundant marker's fix is at the declaration — the marker itself is the offender.
 			# A synthesized `__cf_body_*!` case body (testing.md §2) is exempt from THIS direction:
@@ -1702,6 +1741,7 @@ pub const check_alloc_program! = (Program prog, [SrcMap] maps): [Diag] -> {
 					unions: prog.unions,
 					params: params,
 					esc: compute_esc(params, funcs[j].body),
+					aggs: aggs,
 				})
 				let Iarch off = why_body!(cx, false, funcs[j].body)
 				if off < 0 then off = whyc_body(funcs, bang, params, funcs[j].body)
@@ -1837,6 +1877,7 @@ const root_ambient_set! = (Program prog): [Str] -> {
 pub const check_root_program! = (Program prog, Bool zero_root, [SrcMap] maps): [Diag] -> {
 	let [Diag] diags = []
 	const [Func] funcs = prog.funcs
+	const [Str] rt_aggs = agg_val_names(funcs)
 	const [Str] root = root_ambient_set!(prog)
 	# ZERO-ROOT mode (`--root-size 0` on `Bare`): the root page has no bytes, so NO page use is legal.
 	# An arena graft carves its header from the ambient node — bare (root-ambient) it draws on the
@@ -1869,12 +1910,17 @@ pub const check_root_program! = (Program prog, Bool zero_root, [SrcMap] maps): [
 		# root-ambient function that constructs a residue aggregate on the page is rejected. Legal
 		# storage (`$`, `static`, `fixed_buffer` allocations run `in fb`) never lands here — the first
 		# two aren't residue, and a `fixed_buffer` sink is reached `in fb`, off the root-ambient set.
-		if zero_root && fi >= 0 && !funcs[fi].is_asm && local_residue!(prog.unions, funcs[fi]) then {
+		if zero_root &&
+			fi >= 0 &&
+			!funcs[fi].is_asm &&
+			!funcs[fi].is_value &&
+			local_residue!(prog.unions, rt_aggs, funcs[fi]) then {
 			const [Str] params = param_names(funcs[fi])
 			const ACtx cx = ACtx({
 				unions: prog.unions,
 				params: params,
 				esc: compute_esc(params, funcs[fi].body),
+				aggs: rt_aggs,
 			})
 			diags = [
 				...diags,

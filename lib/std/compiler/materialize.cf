@@ -51,6 +51,7 @@ import std::compiler::ast::{
 	UnionMember,
 }
 import std::compiler::routing::{ kids, stmt_exprs }
+import std::compiler::astutil::{ agg_val_names }
 
 # The pass result: the rewritten program plus the geometry copies — `names[i]` is a copy's
 # function name and `geoms[i]` its tag ("fb"/"fx"/"el"/"pg"); emit consults the pair to pick the
@@ -208,7 +209,7 @@ const union_boxed = ([UnionDecl] unions, Str name): Bool -> {
 	return false
 }
 
-const alloc_expr = (Expr e, [UnionDecl] uns): Bool -> {
+const alloc_expr = (Expr e, [UnionDecl] uns, [Str] aggs): Bool -> {
 	const Bool here = match unat(e) {
 		Expr.Record(_, _) -> true,
 		Expr.ArrayLit(_, _, _, _) -> true,
@@ -217,10 +218,17 @@ const alloc_expr = (Expr e, [UnionDecl] uns): Bool -> {
 		Expr.StrLit(_) -> true,
 		Expr.Buffer(_) -> true,
 		Expr.UnionMk(_, _, _) -> true,
+		# a bare reference to an AGGREGATE value const (`STDOUT`) is an allocation-to-be:
+		# the inline fold splices its construction into this body after this pass, so the
+		# syntactic scan must count the reference or the function stays unmaterialized and
+		# the spliced construction lands on the retired floor.
+		Expr.Var(n) -> in_names(aggs, n),
 		# `U.Member` on a boxed union is a tag-only box (emit_field! reserves 8 bytes) — a
 		# heap construction the syntactic scan would otherwise miss (it reads as a Field, not
 		# a UnionMk), leaving the boxing function unmaterialized and stuck on the `cf_alloc` floor.
-		Expr.Field(b, _) -> union_boxed(uns, b),
+		# An aggregate-const base (`STDOUT.n`) splices the construction the same way a bare
+		# reference does.
+		Expr.Field(b, _) -> union_boxed(uns, b) || in_names(aggs, b),
 		Expr.Call(n, _, _, _) ->
 			eq(n, "Str") || eq(n, "of__fx") || eq(n, "of__el") || eq(n, "of__fb") || eq(n, "of__te"),
 		_ -> false,
@@ -228,55 +236,67 @@ const alloc_expr = (Expr e, [UnionDecl] uns): Bool -> {
 
 	if here then return true
 
-	return match unat(e) { Expr.Loop(ss) -> alloc_body(ss, uns), _ -> alloc_list(kids(e), uns) }
+	return match unat(e) { Expr.Loop(ss) -> alloc_body(ss, uns, aggs), _ -> alloc_list(kids(e), uns, aggs) }
 }
 
-const alloc_list = ([Expr] es, [UnionDecl] uns): Bool -> {
+const in_names = ([Str] xs, Str s): Bool -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(xs.len) then break
+		if eq(xs[i], s) then return true
+		i = i + 1
+	}
+
+	return false
+}
+
+const alloc_list = ([Expr] es, [UnionDecl] uns, [Str] aggs): Bool -> {
 	let Iarch i = 0
 
 	loop {
 		if i >= Iarch(es.len) then break
-		if alloc_expr(es[i], uns) then return true
+		if alloc_expr(es[i], uns, aggs) then return true
 		i = i + 1
 	}
 
 	return false
 }
 
-const alloc_stmt = (Stmt s, [UnionDecl] uns): Bool -> {
-	if alloc_list(stmt_exprs(s), uns) then return true
+const alloc_stmt = (Stmt s, [UnionDecl] uns, [Str] aggs): Bool -> {
+	if alloc_list(stmt_exprs(s), uns, aggs) then return true
 
 	return match s {
-		Stmt.IfThen(_, b) -> alloc_stmt(b, uns),
-		Stmt.IfElse(_, t, el) -> alloc_stmt(t, uns) || alloc_stmt(el, uns),
-		Stmt.Block(ss) -> alloc_body(ss, uns),
-		Stmt.Loop(ll_, ss) -> alloc_body(ss, uns),
-		Stmt.ForIn(_, _, ss) -> alloc_body(ss, uns),
-		Stmt.Match(_, arms) -> alloc_arms(arms, uns),
-		Stmt.Defer(ss) -> alloc_body(ss, uns),
-		Stmt.Closure(_, _, _, cb) -> alloc_body(cb, uns),
+		Stmt.IfThen(_, b) -> alloc_stmt(b, uns, aggs),
+		Stmt.IfElse(_, t, el) -> alloc_stmt(t, uns, aggs) || alloc_stmt(el, uns, aggs),
+		Stmt.Block(ss) -> alloc_body(ss, uns, aggs),
+		Stmt.Loop(ll_, ss) -> alloc_body(ss, uns, aggs),
+		Stmt.ForIn(_, _, ss) -> alloc_body(ss, uns, aggs),
+		Stmt.Match(_, arms) -> alloc_arms(arms, uns, aggs),
+		Stmt.Defer(ss) -> alloc_body(ss, uns, aggs),
+		Stmt.Closure(_, _, _, cb) -> alloc_body(cb, uns, aggs),
 		_ -> false,
 	}
 }
 
-const alloc_arms = ([StmtArm] arms, [UnionDecl] uns): Bool -> {
+const alloc_arms = ([StmtArm] arms, [UnionDecl] uns, [Str] aggs): Bool -> {
 	let Iarch i = 0
 
 	loop {
 		if i >= Iarch(arms.len) then break
-		if alloc_body(arms[i].body, uns) then return true
+		if alloc_body(arms[i].body, uns, aggs) then return true
 		i = i + 1
 	}
 
 	return false
 }
 
-const alloc_body = ([Stmt] ss, [UnionDecl] uns): Bool -> {
+const alloc_body = ([Stmt] ss, [UnionDecl] uns, [Str] aggs): Bool -> {
 	let Iarch i = 0
 
 	loop {
 		if i >= Iarch(ss.len) then break
-		if alloc_stmt(ss[i], uns) then return true
+		if alloc_stmt(ss[i], uns, aggs) then return true
 		i = i + 1
 	}
 
@@ -982,7 +1002,11 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 	const Iarch mi = find_fn(prog.funcs, "main")
 	if mi < 0
 		then return Mat({ prog: strip_pg(prog), names: no_strs, geoms: no_strs, dropped: no_funcs })
-	const Bool main_allocs = alloc_body(prog.funcs[mi].body, prog.unions)
+	# the AGGREGATE value consts (astutil `agg_val_names`): the direct-allocation scan counts a
+	# reference to one as the referencing body's own allocation (the inline fold splices the
+	# construction there after this pass)
+	const [Str] aggs = agg_val_names(prog.funcs)
+	const Bool main_allocs = alloc_body(prog.funcs[mi].body, prog.unions, aggs)
 	# UNIFORM ENTRY ABI (std::rt::floor): the hosted `_start` ALWAYS builds argv+env before `main`, so
 	# `reserve_ret__pg` — the page reserve those pre-main bridges build the `[Str]`s through — must
 	# ALWAYS survive, regardless of main's params. (Bare builds no args; its kept reserve is a dead
@@ -1004,7 +1028,7 @@ pub const materialize_program! = (Program prog, Program raw): Mat -> {
 		gbinds = gb_body(prog.funcs[i].body, i, gbinds)
 		let Bool da = false
 		if !prog.funcs[i].is_asm
-			then da = name_has_bang(prog.funcs[i].name) || alloc_body(prog.funcs[i].body, prog.unions)
+			then da = name_has_bang(prog.funcs[i].name) || alloc_body(prog.funcs[i].body, prog.unions, aggs)
 		ma = [...ma, da]
 		i = i + 1
 	}

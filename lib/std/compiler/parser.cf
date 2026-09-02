@@ -2400,6 +2400,24 @@ const is_pascal_name = (Str n): Bool -> {
 	return c >= 65 && c <= 90
 }
 
+# An UPPER_SNAKE_CASE name (A-Z, 0-9, `_` only, leading A-Z) — a top-level value CONST
+# (screaming means immutable, ebnf § Identifiers); a TYPE is PascalCase (mixed case),
+# an ordinary value name snake_case. Pub: the resolver's casing split reads it too.
+pub const is_upper_snake = (Str n): Bool -> {
+	if Iarch(n.len) == 0 then return false
+	if !(Iarch(n[0]) >= 65 && Iarch(n[0]) <= 90) then return false
+	let Iarch i = 1
+
+	loop {
+		if i >= Iarch(n.len) then break
+		const Iarch c = Iarch(n[i])
+		if !((c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95) then return false
+		i = i + 1
+	}
+
+	return true
+}
+
 # Is `name` already among the parameters parsed so far?
 const params_has = ([Param] params, Str name): Bool -> {
 	let Iarch i = 0
@@ -3196,9 +3214,10 @@ const parse_func! = (*Parser p): Func -> {
 	const [Str] no_tp = []
 	# `[pub] const NAME = <expr>` with no `(` — a top-level VALUE const (module_system /
 	# ebnf § Modules), modeled as a nullary function returning the value; a bare reference
-	# to NAME auto-calls it (typecheck/emit). Its return type is inferred from a LITERAL value:
-	# a string (`Str`) or a Bool (`Bool`) keeps its type, anything else defaults to the `Int`
-	# word (`ret_name` "") — cf's value consts are literals (flags, sizes, greetings).
+	# to NAME auto-calls it (typecheck/emit). Its return type is inferred from the value:
+	# a string (`Str`) or a Bool (`Bool`) literal keeps its type, a data-aggregate
+	# CONSTRUCTION (`Fd({...})`, `Color.Red`) its constructed type, anything else defaults
+	# to the `Int` word (`ret_name` "").
 	if !is_lparen(peek(p)) then {
 		if is_intrin
 			then perr(
@@ -3206,17 +3225,29 @@ const parse_func! = (*Parser p): Func -> {
 			"cf: parse: an `intrinsic` needs a parameter list — `intrinsic name = (args): Ret`\n",
 		)
 		if Iarch(typarams.len) > 0 then perr(p, "cf: parse: a top-level value const cannot be generic\n")
-		# a value name is lowercase-initial (uppercase-initial is a TYPE) — ebnf § Identifiers
-		if Iarch(name[0]) >= 65 && Iarch(name[0]) <= 90
+		# a value-const name is snake_case or UPPER_SNAKE_CASE (screaming means immutable);
+		# a MIXED-case uppercase-initial name is a TYPE — ebnf § Identifiers
+		if !is_upper_snake(name) && Iarch(name[0]) >= 65 && Iarch(name[0]) <= 90
 			then perr(
 			p,
-			"cf: parse: a value name must be lowercase — an uppercase-initial name is a type\n",
+			"cf: parse: a value name must be snake_case or UPPER_SNAKE_CASE — a PascalCase name is a type\n",
 		)
 		const [Param] noparams = []
 		const [Stmt] vempty = []
 		const Expr vexpr = parse_expr!(p)
 
-		const Str vret = match unat(vexpr) { Expr.StrLit(_) -> "Str", Expr.BoolLit(_) -> "Bool", _ -> "" }
+		# the const's type from its value: a Str/Bool literal keeps its type (else the Int
+		# word); a CONSTRUCTION names its type — `Fd({...})` (a record), `IoRrr.Other(e)` (a
+		# payload member), `Color.Red` (a tag-only member parses as a PascalCase field base;
+		# an UPPER_SNAKE base is instead a fellow-CONST read (`STDOUT.n`), a word)
+		const Str vret = match unat(vexpr) {
+			Expr.StrLit(_) -> "Str",
+			Expr.BoolLit(_) -> "Bool",
+			Expr.Record(tn, _) -> tn,
+			Expr.UnionMk(tn, _, _) -> tn,
+			Expr.Field(b, _) -> if is_pascal_name(b) && !is_upper_snake(b) then b else "",
+			_ -> "",
+		}
 
 		const [Stmt] vbody = [...vempty, Stmt.Return(vexpr)]
 		const [Seg] vnoasm = []

@@ -46,6 +46,7 @@ import std::compiler::ast::{
 	Program,
 }
 import std::compiler::astutil::{
+	agg_val_names,
 	is_spread,
 	spread_inner,
 	is_skip,
@@ -146,6 +147,9 @@ data Emit = {
 	# demanded type against this — directly, or an interior pointer into a record that spreads it.
 	[Str] ctx_tys,
 	[Str] ctx_ops,
+	# the AGGREGATE value-const names (astutil `agg_val_names`): never emitted (no ambient), every
+	# reference spliced by the inline fold — a call reaching one here is a missed reference position
+	[Str] aggvals,
 }
 
 # The resolved intrinsic callees for context (module_system §8 flattens the module path).
@@ -2887,7 +2891,7 @@ const emit_agg_alloc! = (*Emit ctx, Iarch size): Iarch -> {
 	# RETIRED. A bare `mat_geom` reaching here would be an allocation with no ambient — an internal
 	# error (`check_root` should have rejected it), not a silent floor fallback.
 	if !eq(ctx.mat_geom, "") then return emit_geom_reserve!(ctx, size)
-	die("cf: emit: internal — a fixed-layout aggregate allocation reached the retired cf_alloc floor with no geometry ambient\n")
+	die("cf: emit: internal — a fixed-layout aggregate allocation reached the retired cf_alloc floor with no geometry ambient (in `${ctx.funcs[ctx.cur_fn].name}`)\n")
 
 	return 0
 }
@@ -4707,6 +4711,10 @@ const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env)
 	}
 	const Iarch fidx = find_func(ctx.funcs, callee)
 	if fidx < 0 then die("cf: emit: internal: unresolved call (should be caught by typecheck)\n")
+	# an aggregate value const is never emitted (no ambient) — every reference splices in the
+	# inline fold, so one surviving to a call here means a reference position the fold missed
+	if has_str(ctx.aggvals, callee)
+		then die("cf: emit: an aggregate value const can only be referenced whole or through `.field` — bind it to a local for anything else\n")
 	const Iarch nargs = Iarch(args.len)
 	let [ArgOp] aops = []
 	let Iarch i = 0
@@ -8621,13 +8629,17 @@ pub const emit_program! = (
 		cfi = cfi + 1
 	}
 
+	# the AGGREGATE value consts: never emitted (their constructions have no geometry ambient
+	# here — the inline pass spliced each into every referencing body), and a call reaching one
+	# anyway trips emit_call!'s guard
+	const [Str] aggvals = agg_val_names(prog.funcs)
 	let Iarch i = 0
 
 	loop {
 		if i >= Iarch(prog.funcs.len) then break
 		# an asm function is emitted into the floor, not through QBE; an intrinsic has no body at
 		# all — the compiler supplies its behavior at each call site, so it emits no function.
-		if !prog.funcs[i].is_asm && !prog.funcs[i].is_intrinsic then {
+		if !prog.funcs[i].is_asm && !prog.funcs[i].is_intrinsic && !has_str(aggvals, prog.funcs[i].name) then {
 			let Emit ctx = Emit({
 				fd: qbe_fd,
 				next: 0,
@@ -8671,6 +8683,7 @@ pub const emit_program! = (
 				exit_hook: -1,
 				ctx_tys: no_names(),
 				ctx_ops: no_names(),
+				aggvals: aggvals,
 			})
 			emit_func!(&ctx, prog.funcs[i], i)
 		}
