@@ -859,6 +859,13 @@ spliced at the site). An aggregate may only be the const's **whole value**: one
 trapped inside a wider expression (`const BAD = ORIGIN.x + 1`) is rejected —
 the intermediate record would have no geometry to live in.
 
+An aggregate const is **not a value for a mutable place**: `let f = STDOUT`,
+storing one inside a `let` aggregate (`let fds = [STDOUT]`), and assigning one
+into any `let` slot are all rejected — the mutable copy would masquerade as the
+const, and screaming means immutable. Bind it with `const`, pass it as an
+argument, return it, or read a scalar field off it (`let n = STDOUT.n` is a
+plain number and stays legal).
+
 Examples:
 
 ```

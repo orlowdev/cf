@@ -1648,6 +1648,138 @@ const whyc_stmt = ([Func] funcs, [Bool] bang, [Str] params, Stmt s): Iarch -> {
 }
 
 # A gate diagnostic anchored at `off` when it maps into `f`'s file, else at the declaration.
+# ── Mutable stores of aggregate value consts ──────────────────────────────────────────────────
+# An aggregate value const may be bound `const`, passed as an argument, or returned — each
+# reference is its own fresh construction. But a MUTABLE store — `let f = STDOUT`, one inside a
+# `let` aggregate (`let fds = [STDOUT]`, `let (a, b) = (STDOUT, 1)`), or any reassignment value —
+# is rejected: the mutable copy would masquerade as the const, and screaming means immutable.
+# The scan follows VALUE positions only (construction spines, if/match/loop-yield results); a
+# call result or a scalar field read (`let n = STDOUT.n`) stores a plain value and stays legal.
+
+const mstore_expr = ([Str] aggs, Expr e): Bool -> match unat(e) {
+	Expr.Var(n) -> has_name(aggs, n),
+	Expr.Record(_, inits) -> mstore_fields(aggs, inits),
+	Expr.ArrayLit(_, _, elems, _) -> mstore_list(aggs, elems),
+	Expr.Tuple(elems) -> mstore_list(aggs, elems),
+	Expr.UnionMk(_, _, args) -> mstore_list(aggs, args),
+	Expr.Spread(x) -> mstore_expr(aggs, x),
+	Expr.If(_, t, el) -> mstore_expr(aggs, t) || mstore_expr(aggs, el),
+	Expr.Match(_, arms) -> mstore_marms(aggs, arms),
+	Expr.Loop(ss) -> mstore_yields(aggs, ss),
+	_ -> false,
+}
+
+const mstore_list = ([Str] aggs, [Expr] es): Bool -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(es.len) then break
+		if mstore_expr(aggs, es[i]) then return true
+		i = i + 1
+	}
+
+	return false
+}
+
+const mstore_fields = ([Str] aggs, [FieldInit] fs): Bool -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(fs.len) then break
+		if mstore_expr(aggs, fs[i].value) then return true
+		i = i + 1
+	}
+
+	return false
+}
+
+const mstore_marms = ([Str] aggs, [MatchArm] arms): Bool -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(arms.len) then break
+		if mstore_expr(aggs, arms[i].body) then return true
+		i = i + 1
+	}
+
+	return false
+}
+
+# a value-yielding loop stores its `<- v` yields — only those flow into the binding
+const mstore_yields = ([Str] aggs, [Stmt] ss): Bool -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(ss.len) then break
+
+		match ss[i] {
+			Stmt.Yield(e) -> {
+				if mstore_expr(aggs, e) then return true
+			},
+			_ -> {},
+		}
+
+		i = i + 1
+	}
+
+	return false
+}
+
+# The At anchor of the first mutable agg-const store in `ss`, or -1.
+const mstore_body = ([Str] aggs, [Stmt] ss): Iarch -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(ss.len) then break
+		const Iarch o = mstore_stmt(aggs, ss[i])
+		if o >= 0 then return o
+		i = i + 1
+	}
+
+	return -1
+}
+
+const mstore_val = ([Str] aggs, Expr v, Stmt s): Iarch ->
+	if mstore_expr(aggs, v) then stmt_off(s) else -1
+
+const mstore_stmt = ([Str] aggs, Stmt s): Iarch -> match s {
+	Stmt.Let(_, mutable, _, init) -> if mutable then mstore_val(aggs, init, s) else -1,
+	Stmt.Destructure(_, mutable, e) -> if mutable then mstore_val(aggs, e, s) else -1,
+	Stmt.Assign(_, v) -> mstore_val(aggs, v, s),
+	Stmt.FieldAssign(_, _, v) -> mstore_val(aggs, v, s),
+	Stmt.DeepFieldAssign(_, _, v) -> mstore_val(aggs, v, s),
+	Stmt.IndexAssign(_, _, v) -> mstore_val(aggs, v, s),
+	Stmt.IfThen(_, b) -> mstore_stmt(aggs, b),
+	Stmt.IfElse(_, t, el) -> mstore_pair(aggs, t, el),
+	Stmt.Block(ss) -> mstore_body(aggs, ss),
+	Stmt.Loop(_, ss) -> mstore_body(aggs, ss),
+	Stmt.ForIn(_, _, ss) -> mstore_body(aggs, ss),
+	Stmt.Match(_, arms) -> mstore_stmtarms(aggs, arms),
+	Stmt.Defer(ss) -> mstore_body(aggs, ss),
+	Stmt.Closure(_, _, _, cb) -> mstore_body(aggs, cb),
+	_ -> -1,
+}
+
+const mstore_pair = ([Str] aggs, Stmt t, Stmt el): Iarch -> {
+	const Iarch o = mstore_stmt(aggs, t)
+	if o >= 0 then return o
+
+	return mstore_stmt(aggs, el)
+}
+
+const mstore_stmtarms = ([Str] aggs, [StmtArm] arms): Iarch -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(arms.len) then break
+		const Iarch o = mstore_body(aggs, arms[i].body)
+		if o >= 0 then return o
+		i = i + 1
+	}
+
+	return -1
+}
+
 const gate_diag = ([SrcMap] maps, Func f, Iarch off, Str msg): Diag -> {
 	if off >= 0 then {
 		const LC lc = line_col_of(maps, f.dfile, off)
@@ -1696,6 +1828,20 @@ pub const check_alloc_program! = (Program prog, [SrcMap] maps): [Diag] -> {
 
 	loop {
 		if j >= Iarch(funcs.len) then break
+		# mutable stores of aggregate value consts — every body, `main` and value consts included
+		if !funcs[j].is_asm then {
+			const Iarch mso = mstore_body(subtract_names(aggs, param_names(funcs[j])), funcs[j].body)
+			if mso >= 0
+				then diags = [
+				...diags,
+				gate_diag(
+					maps,
+					funcs[j],
+					mso,
+					"cf: alloc: an aggregate value const cannot be stored in a mutable place — the `let` copy would masquerade as the const; bind it with `const` or construct the value explicitly\n",
+				),
+			]
+		}
 		# a VALUE const in the aggregate set is exempt from the `!` gates: it is never called
 		# (every reference splices via the inline fold, moving any residue into the referencing
 		# body, whose own scan counts it). A value const OUTSIDE the set that still traps an
