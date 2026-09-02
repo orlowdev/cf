@@ -729,3 +729,178 @@ pub const as_int = (Json j): Either[JsonRrr, Iarch] -> {
 
 	return Either[JsonRrr, Iarch].Left(JsonRrr({ off: 0, msg: "not a number value" }))
 }
+
+# ── tests (testing.md §1: cases live beside the code; `cf test` runs them, other builds discard
+# them after type-checking) ───────────────────────────────────────────────────────────────────
+import std::test::{ equals }
+import std::data::str::{ repeat }
+
+case!("compact documents round-trip through parse and render", () -> {
+	const [Str] docs = [
+		"null",
+		"true",
+		"false",
+		"42",
+		"-3.14",
+		"1e10",
+		"0.10",
+		"\"hi\"",
+		"[]",
+		"{}",
+		"[1,2,3]",
+		"[[1],[2]]",
+		"{\"a\":1,\"b\":[true,null]}",
+		"{\"a\":1,\"a\":2}",
+		"\"\\n\\t\\b\\f\\u0001\"",
+	]
+
+	for d in docs {
+		match parse!(d) {
+			Either.Left(e) -> equals(true, false),
+			Either.Right(v) -> equals(d, render!(v)),
+		}
+	}
+})
+
+case!("whitespace around tokens is skipped", () -> {
+	match parse!(" [ 1 , { \"a\" : null } ] ") {
+		Either.Left(e) -> equals(true, false),
+		Either.Right(v) -> equals("[1,{\"a\":null}]", render!(v)),
+	}
+})
+
+case!("unicode escapes decode to UTF-8", () -> {
+	match parse!("\"\\u0041\"") {
+		Either.Left(e) -> equals(true, false),
+		Either.Right(v) -> equals("\"A\"", render!(v)),
+	}
+
+	match parse!("\"\\ud83d\\ude00\"") {
+		Either.Left(e) -> equals(true, false),
+		Either.Right(v) -> equals("\"😀\"", render!(v)),
+	}
+})
+
+case!("malformed documents come back Left", () -> {
+	const [Str] bads = ["", "tru", "[1,]", "{\"a\":}", "\"abc", "[1 2]", "{\"a\" 1}", "nulls"]
+
+	for d in bads {
+		match parse!(d) {
+			Either.Left(e) -> equals(true, true),
+			Either.Right(v) -> equals(true, false),
+		}
+	}
+
+	match parse!("1 2") {
+		Either.Left(e) -> equals(2, e.off),
+		Either.Right(v) -> equals(true, false),
+	}
+})
+
+case!("nesting beyond the depth cap is rejected", () -> {
+	match parse!(repeat(200, "[")) {
+		Either.Left(e) -> equals(129, e.off),
+		Either.Right(v) -> equals(true, false),
+	}
+})
+
+case!("get scans entries in order and at indexes arrays", () -> {
+	match parse!("{\"a\":1,\"b\":2,\"a\":3}") {
+		Either.Left(e) -> equals(true, false),
+		Either.Right(j) -> {
+			match get("a", j) {
+				Maybe.Just(v) -> equals("1", render!(v)),
+				Maybe.Nothing -> equals(true, false),
+			}
+
+			match get("x", j) {
+				Maybe.Just(v) -> equals(true, false),
+				Maybe.Nothing -> equals(true, true),
+			}
+		},
+	}
+
+	match parse!("[10,20]") {
+		Either.Left(e) -> equals(true, false),
+		Either.Right(j) -> {
+			match at(1, j) {
+				Maybe.Just(v) -> equals("20", render!(v)),
+				Maybe.Nothing -> equals(true, false),
+			}
+
+			match at(2, j) {
+				Maybe.Just(v) -> equals(true, false),
+				Maybe.Nothing -> equals(true, true),
+			}
+
+			match at(-1, j) {
+				Maybe.Just(v) -> equals(true, false),
+				Maybe.Nothing -> equals(true, true),
+			}
+		},
+	}
+
+	match get("a", Json.Null) {
+		Maybe.Just(v) -> equals(true, false),
+		Maybe.Nothing -> equals(true, true),
+	}
+
+	match at(0, Json.Null) {
+		Maybe.Just(v) -> equals(true, false),
+		Maybe.Nothing -> equals(true, true),
+	}
+})
+
+case!("as_int converts integral lexemes and rejects the rest", () -> {
+	match as_int(Json.Num("42")) {
+		Either.Left(e) -> equals(true, false),
+		Either.Right(v) -> equals(42, v),
+	}
+
+	match as_int(Json.Num("-7")) {
+		Either.Left(e) -> equals(true, false),
+		Either.Right(v) -> equals(-7, v),
+	}
+
+	match as_int(Json.Num("3.5")) {
+		Either.Left(e) -> equals(true, true),
+		Either.Right(v) -> equals(true, false),
+	}
+
+	match as_int(Json.Num("99999999999999999999")) {
+		Either.Left(e) -> equals(true, eq("the number overflows an Iarch", e.msg)),
+		Either.Right(v) -> equals(true, false),
+	}
+
+	match as_int(Json.Bool(true)) {
+		Either.Left(e) -> equals(true, eq("not a number value", e.msg)),
+		Either.Right(v) -> equals(true, false),
+	}
+})
+
+case!("as_float converts within the exact window only", () -> {
+	match as_float(Json.Num("1.5")) {
+		Either.Left(e) -> equals(true, false),
+		Either.Right(v) -> equals(1.5, v),
+	}
+
+	match as_float(Json.Num("-2.5e2")) {
+		Either.Left(e) -> equals(true, false),
+		Either.Right(v) -> equals(0.0 - 250.0, v),
+	}
+
+	match as_float(Json.Num("1234567890123456")) {
+		Either.Left(e) -> equals(true, true),
+		Either.Right(v) -> equals(true, false),
+	}
+
+	match as_float(Json.Num("1e30")) {
+		Either.Left(e) -> equals(true, true),
+		Either.Right(v) -> equals(true, false),
+	}
+
+	match as_float(Json.Str("x")) {
+		Either.Left(e) -> equals(true, eq("not a number value", e.msg)),
+		Either.Right(v) -> equals(true, false),
+	}
+})
