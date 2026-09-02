@@ -12,7 +12,7 @@
 # argv/env discipline the environment is read here and threaded down explicitly (to resolve `cc` on
 # PATH), never accessed ambiently.
 
-import std::data::str::{ eq, slice }
+import std::data::str::{ eq, slice, ends_with }
 import std::sys::{ Os, Arch }
 import std::comptime::os
 import cli::{
@@ -23,6 +23,7 @@ import cli::{
 	fmt_cli_parse,
 	is_test_cmd,
 	test_target,
+	test_bail,
 	is_version_cmd,
 	is_help_cmd,
 	host_arch,
@@ -40,7 +41,8 @@ import std::compiler::diag::{ Diag, TyRow, print_diags! }
 import std::mem::arena::growing_arena
 import qbe::{ qbe_translate }
 import std::process::{ run!, find_executable!, getpid, exit }
-import std::io::fs::{ remove }
+import std::io::fs::{ remove, read_dir! }
+import std::io::fd::{ DirEntry, IoRrr, entry_is_dir }
 import std::io::file::{ create, close, write_str }
 import std::data::{ Either }
 import std::io::console::{ eprint, print, println }
@@ -810,6 +812,7 @@ const run_full! = (Cli c, [Str] env): Iarch -> {
 		c.debug,
 		c.instrument,
 		c.is_test,
+		c.is_bail,
 	)
 
 	# type errors come back as values — the CLI edge is where they become text
@@ -847,15 +850,102 @@ const run_full! = (Cli c, [Str] env): Iarch -> {
 	return st
 }
 
+# Recursively collect every `.cf` file under `dir` (testing.md §6 — a directory target runs the
+# cases in every file it holds). Insertion-sorted by name so the run order is stable across
+# filesystems. Skips `.`/`..`; an unreadable directory contributes nothing.
+const collect_tests! = (Str dir): [Str] -> {
+	const Either[IoRrr, [DirEntry]] r = read_dir!(dir)
+	let [Str] out = []
+
+	match r {
+		Either.Left(e) -> {},
+		Either.Right(entries) -> {
+			for e in entries {
+				if !eq(e.name, ".") && !eq(e.name, "..") then {
+					const Str child = "${dir}/${e.name}"
+
+					if entry_is_dir(e) then {
+						out = [...out, ...collect_tests!(child)]
+					} else if ends_with(".cf", e.name) then {
+						out = [...out, child]
+					}
+				}
+			}
+		},
+	}
+
+	return sort_paths(out)
+}
+
+# Byte-wise `<` on two paths, for the stable run order.
+const path_lt = (Str a, Str b): Bool -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(a.len) || i >= Iarch(b.len) then break
+		if Iarch(a[i]) < Iarch(b[i]) then return true
+		if Iarch(a[i]) > Iarch(b[i]) then return false
+		i = i + 1
+	}
+
+	return Iarch(a.len) < Iarch(b.len)
+}
+
+const sort_paths = ([Str] xs): [Str] -> {
+	let [Str] out = []
+
+	for x in xs {
+		let [Str] next = []
+		let Bool placed = false
+
+		for o in out {
+			if !placed && path_lt(x, o) then {
+				next = [...next, x]
+				placed = true
+			}
+			next = [...next, o]
+		}
+
+		if !placed then next = [...next, x]
+		out = next
+	}
+
+	return out
+}
+
 # `cf test <file>` (cf_cli §7, testing.md §6): build the target with the TEST route — `is_test` injects
 # a runner `main` over every `case!`/`todo!` in the file — run the resulting binary, and exit with its
 # code (0 when every case passed, 1 when any failed). The report lines print to stdout as the cases
 # run. The test binary is a self-contained build to a temp path, run once, then removed.
-const run_test! = (Str target, [Str] env): Iarch -> {
+const run_test! = (Str target, Bool bail, [Str] env): Iarch -> {
 	if eq(target, "") then {
-		eprint("cf: test: give a file to test — cf test <file.cf>\n")
+		eprint("cf: test: give a file or directory to test — cf test <file.cf|dir>\n")
 		exit(2)
 	}
+	# a DIRECTORY target walks recursively: each `.cf` builds and runs as its own test binary, the
+	# exit code is 1 iff any file failed (a compile error counts), and `--bail` stops at the first
+	# failing file (its own in-binary bail already stopped at the first failing case)
+	const Either[IoRrr, [DirEntry]] dtry = read_dir!(target)
+	match dtry {
+		Either.Left(e) -> {},
+		Either.Right(entries) -> {
+			const [Str] files = collect_tests!(target)
+			let Iarch worst = 0
+
+			for f in files {
+				const Iarch rc = run_test_file!(f, bail, env)
+				if rc != 0 then worst = 1
+				if bail && worst != 0 then return 1
+			}
+
+			return worst
+		},
+	}
+
+	return run_test_file!(target, bail, env)
+}
+
+const run_test_file! = (Str target, Bool bail, [Str] env): Iarch -> {
 	const Iarch pid = getpid()
 	const Str out = "/tmp/cf-test-${pid}"
 	const Cli c = Cli({
@@ -875,6 +965,7 @@ const run_test! = (Str target, [Str] env): Iarch -> {
 		skip_embeds: false,
 		build_version: "",
 		is_test: true,
+		is_bail: bail,
 	})
 	const Iarch bst = run_full!(c, env)
 	if bst != 0 then return bst
@@ -895,6 +986,7 @@ const print_help = (): () -> {
 	println("")
 	println("Usage:")
 	println("  cf [c|compile] <file.cf> -o <out> [options]   compile <file.cf> to a native binary")
+	println("  cf test <file.cf|dir> [--bail]                build and run the target's case!s (alias: t)")
 	println("  cf format <file|dir> [--check]                format C! source in place       (alias: f)")
 	println("  cf check <file.cf> [--src <buf>]              validate a module tree, no output")
 	println("  cf lsp                                        serve the Language Server Protocol on stdio")
@@ -912,7 +1004,7 @@ const print_help = (): () -> {
 	println("  --skip-embeds                 emit without baking in std           (bootstrap seed only)")
 	println("  --dump-routing                print each function's escape/alias classification")
 	println("")
-	println("Specified but not yet implemented: run, test, lint (see root/specs/cf_cli.md).")
+	println("Specified but not yet implemented: run, lint (see root/specs/cf_cli.md).")
 }
 
 pub const main = ([Str] args, [Str] env) -> {
@@ -1037,7 +1129,7 @@ pub const main = ([Str] args, [Str] env) -> {
 	if is_test_cmd(args) then {
 		const ta = growing_arena::of(16777216)
 
-		return run_test!(test_target(args), env) in ta
+		return run_test!(test_target(args), test_bail(args), env) in ta
 	}
 
 	# cf runs its whole compilation under ONE growing arena grafted from the root page (memory_model
@@ -1061,6 +1153,7 @@ pub const main = ([Str] args, [Str] env) -> {
 			c.debug,
 			c.instrument,
 			c.is_test,
+			c.is_bail,
 		) in a
 
 		if Iarch(ds.len) > 0 then {

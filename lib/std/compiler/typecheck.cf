@@ -882,6 +882,69 @@ const fixed_name = (Iarch b, Bool s): Str -> {
 
 # The written type NAME a `Ty` denotes — the inverse of `named_ty`. A `TDyn` renders as its
 # `[Elem]` bracket string; a `TPtr`/`TTuple`/`TFn` has no bare scalar name and yields "".
+# Does the named type reach ITSELF through its fields/payloads (any depth)? The structural-eq
+# walk emit expands per leaf would never terminate on such a type, so `equals` rejects it
+# (testing.md §4). `path` holds the names already entered; a revisit is the cycle. Arrays walk
+# their element; `$fix`/`$dyn` fields walk `felems`; scalars end the walk.
+const no_path = (): [Str] -> {
+	let [Str] r = []
+
+	return r
+}
+
+const eq_ty_recursive! = (Ctx ctx, Str tn, [Str] path): Bool -> {
+	if eq(tn, "") then return false
+	if is_nested(tn) then return eq_ty_recursive!(ctx, nested_inner!(tn), path)
+	let Iarch p = 0
+
+	loop {
+		if p >= Iarch(path.len) then break
+		if eq(path[p], tn) then return true
+		p = p + 1
+	}
+
+	const Iarch ri = find_rec(ctx.recs, tn)
+	if ri >= 0 then {
+		const [Str] p2 = [...path, tn]
+		let Iarch f = 0
+
+		loop {
+			if f >= Iarch(ctx.recs[ri].ftypes.len) then break
+			const Str ft = ctx.recs[ri].ftypes[f]
+			const Str walk = if eq(ft, "$dyn") || eq(ft, "$fix") then ctx.recs[ri].felems[f] else ft
+			if eq_ty_recursive!(ctx, walk, p2) then return true
+			f = f + 1
+		}
+
+		return false
+	}
+	const Iarch ui = find_union(ctx.unions, tn)
+	if ui >= 0 then {
+		const [Str] p2 = [...path, tn]
+		let Iarch m = 0
+
+		loop {
+			if m >= Iarch(ctx.unions[ui].members.len) then break
+			let Iarch pp = 0
+
+			loop {
+				if pp >= Iarch(ctx.unions[ui].members[m].payloads.len) then break
+				const Str pt = ctx.unions[ui].members[m].payloads[pp]
+				const Str walk = if eq(pt, "$dyn")
+					then ctx.unions[ui].members[m].pelems[pp]
+					else pt
+				if eq_ty_recursive!(ctx, walk, p2) then return true
+				pp = pp + 1
+			}
+			m = m + 1
+		}
+
+		return false
+	}
+
+	return false
+}
+
 pub const ty_name = (Ty t): Str -> match t {
 	Ty.TInt -> "Iarch",
 	Ty.TBool -> "Bool",
@@ -2129,8 +2192,16 @@ const call_type! = (Str callee, [Str] tyargs, [Expr] args, [VarTy] env, Ctx ctx,
 	if eq(callee, "std_test_structural_eq") && callee_is_intrinsic_tc(ctx, dg, callee) then {
 		if Iarch(args.len) != 2
 			then return terr(ctx, dg, "cf: type: std::test::equals compares two values — actual |> equals(expected)\n")
-		type_of!(args[0], env, ctx, dg)
+		const Ty t0 = type_of!(args[0], env, ctx, dg)
 		type_of!(args[1], env, ctx, dg)
+		# a recursive (self-referential) type is rejected here (testing.md §4): the structural
+		# compare emit expands would never terminate on it
+		if eq_ty_recursive!(ctx, ty_name(t0), no_path())
+			then return terr(
+			ctx,
+			dg,
+			"cf: type: std::test::equals cannot compare `${ty_name(t0)}` — a recursive (self-referential) type has no terminating structural comparison\n",
+		)
 
 		return Ty.TBool
 	}

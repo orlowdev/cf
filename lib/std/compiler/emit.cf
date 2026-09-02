@@ -2458,7 +2458,7 @@ const emit_eq! = (*Emit ctx, [Binding] env, Str aop, Str bop, Str name, [TupElem
 	if eq(name, "$tuple") then return emit_eq_tuple!(ctx, env, aop, bop, telems)
 	if is_nested(name) then return emit_eq_array!(ctx, env, aop, bop, nested_inner!(name))
 	if find_rec(ctx.recs, name) >= 0 then return emit_eq_record!(ctx, env, aop, bop, name)
-	if find_union(ctx.unions, name) >= 0 then return emit_eq_union!(ctx, aop, bop, name)
+	if find_union(ctx.unions, name) >= 0 then return emit_eq_union!(ctx, env, aop, bop, name)
 	# a scalar leaf: a float compares by its width, everything else (int/bool/fixed/pointer/tag word) as
 	# an 8-byte value in its slot
 	const Str ins = if is_float_name(name) then "ceq${float_qt(name)}" else "ceql"
@@ -2567,23 +2567,86 @@ const emit_eq_array! = (*Emit ctx, [Binding] env, Str a, Str b, Str elem): Str -
 	return "%t${res}"
 }
 
-# a union: tag-only unions (enums) compare by tag. A payloaded union is a later stage.
-const emit_eq_union! = (*Emit ctx, Str a, Str b, Str un): Str -> {
+# a union: tags compare first; equal tags on a payloaded member then compare each payload slot
+# (`box + 8 + p*8`, the stringify walk's layout) by its declared type, recursively. A tag-only
+# union stays the single tag compare.
+const emit_eq_union! = (*Emit ctx, [Binding] env, Str a, Str b, Str un): Str -> {
 	const Iarch ui = find_union(ctx.unions, un)
-	let Iarch m = 0
+	let Bool haspay = false
+	let Iarch m0 = 0
 
 	loop {
-		if m >= Iarch(ctx.unions[ui].members.len) then break
-		if Iarch(ctx.unions[ui].members[m].payloads.len) > 0
-			then die("cf: emit: std::test::equals cannot compare a payloaded union yet — tag-only unions work\n")
-		m = m + 1
+		if m0 >= Iarch(ctx.unions[ui].members.len) then break
+		if Iarch(ctx.unions[ui].members[m0].payloads.len) > 0 then haspay = true
+		m0 = m0 + 1
 	}
 
 	const Str atag = scrut_tag!(ctx, un, a)
 	const Str btag = scrut_tag!(ctx, un, b)
+	const Iarch te = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${te} =w ceql ${atag}, ${btag}\n")
+	if !haspay then return "%t${te}"
+
+	# the result slot starts as the tag compare — it already answers unequal tags AND equal
+	# tag-only members; a matched payloaded member overwrites it with its payload compare
+	const Iarch lid = ctx.label
+	ctx.label = ctx.label + 1
+	const Iarch rs = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${rs} =l alloc8 8\n")
+	write_str(ctx.fd, "\tstorew %t${te}, %t${rs}\n")
+	write_str(ctx.fd, "\tjnz %t${te}, @equn${lid}, @eqund${lid}\n")
+	write_str(ctx.fd, "@equn${lid}\n")
+	let Iarch m = 0
+
+	loop {
+		if m >= Iarch(ctx.unions[ui].members.len) then break
+		if Iarch(ctx.unions[ui].members[m].payloads.len) > 0 then {
+			const Iarch ml = ctx.label
+			ctx.label = ctx.label + 1
+			const Iarch mc = ctx.next
+			ctx.next = ctx.next + 1
+			write_str(ctx.fd, "\t%t${mc} =w ceql ${atag}, ${m}\n")
+			write_str(ctx.fd, "\tjnz %t${mc}, @equb${ml}, @equx${ml}\n")
+			write_str(ctx.fd, "@equb${ml}\n")
+			let Str acc = ""
+			let Iarch pp = 0
+
+			loop {
+				if pp >= Iarch(ctx.unions[ui].members[m].payloads.len) then break
+				const Str ptype = ctx.unions[ui].members[m].payloads[pp]
+				const Str pname = if eq(ptype, "$dyn")
+					then "[${ctx.unions[ui].members[m].pelems[pp]}]"
+					else ptype
+				const Iarch poff = 8 + pp * 8
+				const Str aslot = if is_float_name(ptype)
+					then load_field_at!(ctx, a, poff, ptype)
+					else load_at!(ctx, a, poff)
+				const Str bslot = if is_float_name(ptype)
+					then load_field_at!(ctx, b, poff, ptype)
+					else load_at!(ctx, b, poff)
+				acc = eq_and!(
+					ctx,
+					acc,
+					emit_eq!(ctx, env, aslot, bslot, pname, ctx.unions[ui].members[m].ptelems[pp]),
+				)
+				pp = pp + 1
+			}
+
+			if eq(acc, "") then acc = eq_true!(ctx)
+			write_str(ctx.fd, "\tstorew ${acc}, %t${rs}\n")
+			write_str(ctx.fd, "\tjmp @eqund${lid}\n")
+			write_str(ctx.fd, "@equx${ml}\n")
+		}
+		m = m + 1
+	}
+
+	write_str(ctx.fd, "\tjmp @eqund${lid}\n")
+	write_str(ctx.fd, "@eqund${lid}\n")
 	const Iarch r = ctx.next
 	ctx.next = ctx.next + 1
-	write_str(ctx.fd, "\t%t${r} =w ceql ${atag}, ${btag}\n")
+	write_str(ctx.fd, "\t%t${r} =w loaduw %t${rs}\n")
 
 	return "%t${r}"
 }
