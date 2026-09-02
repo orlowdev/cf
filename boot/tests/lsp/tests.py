@@ -345,3 +345,29 @@ def run(s, check, tdp, uri_of):
     check("workspace/symbol lists all decls",
           names == sorted(["use_pair", "main", "op_v", "Pair", "twice", "combine", "untouched", "Op"]), repr(names))
     s2.stop()
+
+    # --- textDocument/formatting ---
+    fmt_params = {"textDocument": {"uri": uri_of(FIX)}, "options": {"tabSize": 4, "insertSpaces": False}}
+    r = s.request("textDocument/formatting", fmt_params)["result"]
+    check("formatting a clean file: no edits", r == [], repr(r))
+
+    # a dirty overlay (trailing blank lines) formats back to the canonical bytes in ONE edit
+    perturbed = text + "\n\n\n"
+    s.notify("textDocument/didChange", {"textDocument": {"uri": uri_of(FIX)},
+                                        "contentChanges": [{"text": perturbed}]})
+    s.drain()
+    r = s.request("textDocument/formatting", fmt_params)["result"]
+    check("formatting the dirty overlay: one whole-document edit", r is not None and len(r) == 1, repr(r))
+    check("formatting newText restores the canonical bytes",
+          r is not None and len(r) == 1 and r[0]["newText"] == text,
+          repr(r[0]["newText"][-40:] if r else r))
+    check("formatting range spans the whole overlay",
+          r is not None and len(r) == 1 and r[0]["range"]["start"] == {"line": 0, "character": 0}
+          and r[0]["range"]["end"] == {"line": perturbed.count("\n"), "character": 0},
+          repr(r[0]["range"] if r else r))
+
+    # a save drops the overlay — the clean disk file answers again
+    s.notify("textDocument/didSave", {"textDocument": {"uri": uri_of(FIX)}})
+    s.drain()
+    r = s.request("textDocument/formatting", fmt_params)["result"]
+    check("formatting after save falls back to the clean disk file", r == [], repr(r))

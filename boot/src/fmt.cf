@@ -2109,38 +2109,17 @@ const reflow_and_format! = (*[Uint8] src, Iarch n, Str file): [Uint8] -> {
 	return format_source!(rf, Iarch(rf.len), file)
 }
 
-# file is not already formatted, else 0. Without `--check` it rewrites the file in place
-# (skipping the write when the file is already formatted) and returns 0.
-pub const format_file! = (Str path, Bool check): Iarch -> {
-	# One file's read buffer — sized like resolve's (cf's own largest module, emit.cf, is past
-	# 256 KB; 1 MB leaves headroom). A read that FILLS the buffer means truncation — die loudly.
-	let [1048576 Uint8] buf
-
-	const Fd fd = match open_read(path) {
-		Either.Left(e) -> {
-			die("cf: format: cannot open the input file\n")
-
-			<- Fd({ n: Uarch(0) })
-		},
-		Either.Right(f) -> f,
-	}
-
-	const Iarch n = match read(fd, buf, Uarch(buf.len)) {
-		Either.Left(e) -> die("cf: format: reading the input file failed\n"),
-		Either.Right(k) -> k,
-	}
-
-	close(fd)
-
-	if n >= Iarch(buf.len)
-		then die("cf: format: the input file exceeds the read buffer — grow it in fmt.cf\n")
-
+# The COMPLETE formatting pipeline over an in-memory buffer: canonicalise (`format_source!`),
+# wrap comments once, then converge the fit reflow. The shared core of `format_file!` (which
+# rewrites in place) and the LSP's textDocument/formatting (which returns a whole-document
+# edit, no disk write). Total: a broken buffer formats token-stream-wise, it never dies.
+pub const format_bytes! = (*[Uint8] src, Iarch n, Str path): [Uint8] -> {
 	# Format-first fit reflow (Phase D): canonicalise, then each round apply `break_expr!`
 	# (drop a fitting `->` body to its own line — higher precedence) and `reflow!` (collapse or
 	# explode one level of comma-groups), re-`format_source!`-ing after each, until the result
 	# stops changing. Every pass only rewrites structural newlines and the re-format is idempotent,
 	# so this converges; the guard caps a pathological input rather than any real one.
-	let [Uint8] out = format_source!(buf, n, path)
+	let [Uint8] out = format_source!(src, n, path)
 	# comment wrap (Phase E) runs ONCE, after indentation canonicalises (widths measure at
 	# final columns) and before the code reflow (which never moves comment lines): wrapped
 	# output is all within the limit, so a second format finds nothing to split.
@@ -2172,6 +2151,37 @@ pub const format_file! = (Str path, Bool check): Iarch -> {
 		if converged then break
 		guard = guard + 1
 	}
+
+	return out
+}
+
+# file is not already formatted, else 0. Without `--check` it rewrites the file in place
+# (skipping the write when the file is already formatted) and returns 0.
+pub const format_file! = (Str path, Bool check): Iarch -> {
+	# One file's read buffer — sized like resolve's (cf's own largest module, emit.cf, is past
+	# 256 KB; 1 MB leaves headroom). A read that FILLS the buffer means truncation — die loudly.
+	let [1048576 Uint8] buf
+
+	const Fd fd = match open_read(path) {
+		Either.Left(e) -> {
+			die("cf: format: cannot open the input file\n")
+
+			<- Fd({ n: Uarch(0) })
+		},
+		Either.Right(f) -> f,
+	}
+
+	const Iarch n = match read(fd, buf, Uarch(buf.len)) {
+		Either.Left(e) -> die("cf: format: reading the input file failed\n"),
+		Either.Right(k) -> k,
+	}
+
+	close(fd)
+
+	if n >= Iarch(buf.len)
+		then die("cf: format: the input file exceeds the read buffer — grow it in fmt.cf\n")
+
+	const [Uint8] out = format_bytes!(buf, n, path)
 
 	# Is the file already formatted? (out == buf[0..n], byte for byte.)
 	let Bool same = Iarch(out.len) == n

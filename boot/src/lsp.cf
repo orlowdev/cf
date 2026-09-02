@@ -21,6 +21,7 @@ import std::io::fs::{ remove, exists!, read_dir!, walk_dir! }
 import std::process::{ run!, find_executable!, getenv!, getpid, exit }
 import std::io::console::{ eprint }
 import std::mem::arena::growing_arena
+import fmt::{ format_bytes! }
 
 # --- transport --------------------------------------------------------------------------------
 
@@ -507,6 +508,7 @@ const init_result! = (): Json -> Json.Obj([
 					# before prompting — the same renameability check rename itself makes
 					ent("renameProvider", Json.Obj([ent("prepareProvider", Json.Bool(true))])),
 					ent("documentHighlightProvider", Json.Bool(true)),
+					ent("documentFormattingProvider", Json.Bool(true)),
 					ent(
 						"completionProvider",
 						Json.Obj([ent("triggerCharacters", Json.Arr([jstr(":"), jstr(".")]))]),
@@ -624,6 +626,78 @@ const doc_symbols! = (Str uri, Str srcf, Str srcp): Json -> {
 	const Str src = match read_file!(from) { Either.Right(s) -> s, Either.Left(e) -> "" }
 
 	return Json.Arr(scan_symbols!(src))
+}
+
+# --- formatting -------------------------------------------------------------------------------
+
+# The 0-based LSP position just past the end of `src` — the exclusive end of a whole-document
+# replacement range: line = the newline count, character = the bytes after the last newline
+# (positionEncoding is utf-8, so byte columns ARE the protocol's columns).
+const end_pos = (Str src): Json -> {
+	let Iarch line = 0
+	let Iarch col = 0
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(src.len) then break
+
+		if Iarch(src[i]) == 10 then {
+			line = line + 1
+			col = 0
+		} else {
+			col = col + 1
+		}
+
+		i = i + 1
+	}
+
+	return Json.Obj([ent("line", jnum(line)), ent("character", jnum(col))])
+}
+
+# Answer textDocument/formatting: run the FULL `cf format` pipeline (fmt::format_bytes! — the
+# very canonicaliser `cf format` writes and the arc emits compare against) over the uri's bytes
+# — the live overlay when one stands in for exactly this file — and reply with ONE
+# whole-document TextEdit, or an empty list when the buffer is already formatted. In-process:
+# the formatter is a total token-stream rewrite, so a broken mid-edit buffer cannot take the
+# server down the way a child-worthy `cf check` die would.
+const format_edits! = (Str uri, Str srcf, Str srcp): Json -> {
+	const Str path = uri_to_path!(uri)
+
+	let Str from = path
+
+	const Str owner = match read_file!(srcp) { Either.Right(s) -> s, Either.Left(e) -> "" }
+
+	if eq(owner, path) then from = srcf
+
+	const Str src = match read_file!(from) { Either.Right(s) -> s, Either.Left(e) -> "" }
+
+	const [Json] none = []
+	if Iarch(src.len) == 0 then return Json.Arr(none)
+	const [Uint8] out = format_bytes!(src.bytes, Iarch(src.len), path)
+	# already formatted? byte-compare — no edit at all beats a no-op whole-file replace
+	let Bool same = Iarch(out.len) == Iarch(src.len)
+
+	if same then {
+		let Iarch j = 0
+
+		loop {
+			if j >= Iarch(out.len) then break
+
+			if Iarch(src[j]) != Iarch(out[j]) then {
+				same = false
+				break
+			}
+
+			j = j + 1
+		}
+	}
+
+	if same then return Json.Arr(none)
+	const Str text = Str({ bytes: out, len: Iarch(out.len) })
+	const Json start = Json.Obj([ent("line", jnum(0)), ent("character", jnum(0))])
+	const Json range = Json.Obj([ent("start", start), ent("end", end_pos(src))])
+
+	return Json.Arr([Json.Obj([ent("range", range), ent("newText", jstr(text))])])
 }
 
 # --- goto definition --------------------------------------------------------------------------
@@ -3138,6 +3212,13 @@ const serve_one! = (Str argv0, [Str] env): Iarch -> {
 		const Str uri = jtext(jget("uri", jget("textDocument", jget("params", req))))
 
 		respond!(id, doc_symbols!(uri, srcf, srcp))
+
+		return 1
+	}
+	if eq(method, "textDocument/formatting") then {
+		const Str uri = jtext(jget("uri", jget("textDocument", jget("params", req))))
+
+		respond!(id, format_edits!(uri, srcf, srcp))
 
 		return 1
 	}
