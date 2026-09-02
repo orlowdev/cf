@@ -26,7 +26,7 @@ import std::compiler::ast::{ Program, Func, RecDecl, Param, Stmt, Expr, StmtArm,
 import std::compiler::routing::{ kids, stmt_exprs }
 import std::compiler::spans::{ unat, SrcMap, line_col_of, LC }
 import std::compiler::diag::{ Diag }
-import std::compiler::alloc::{ value_refs_free }
+import std::compiler::alloc::{ fnval_uses!, FnVals, FnFlow, FnFwd, FnInv }
 import std::data::str::{ eq }
 
 # The resolved intrinsic callees (module_system §8 flattens `std::mem::ctx::provide` to this flat
@@ -921,6 +921,65 @@ data Demands = {
 	[[Str]] mres,
 	[[Str]] omut,
 	[[Iarch]] letmis,
+	[FnFlow] eff,
+	[FnInv] pescs,
+	[Str] illegal,
+}
+
+const has_flow = ([FnFlow] xs, Str callee, Iarch idx, Str g): Bool -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(xs.len) then break
+		if eq(xs[i].callee, callee) && xs[i].idx == idx && eq(xs[i].g, g) then return true
+		i = i + 1
+	}
+
+	return false
+}
+
+const has_inv = ([FnInv] xs, Str owner, Iarch pidx): Bool -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(xs.len) then break
+		if eq(xs[i].owner, owner) && xs[i].pidx == pidx then return true
+		i = i + 1
+	}
+
+	return false
+}
+
+# Close fn-value flows over parameter FORWARDING: a value passed into a fn-typed parameter that
+# is itself passed on into another fn-typed parameter flows there too, transitively (context.md
+# §4). Worklist over the growing list; dedup keeps a forwarding cycle finite.
+const eff_flows = ([FnFwd] fwds, [FnFlow] seed): [FnFlow] -> {
+	let [FnFlow] eff = []
+	let Iarch s = 0
+
+	loop {
+		if s >= Iarch(seed.len) then break
+		if !has_flow(eff, seed[s].callee, seed[s].idx, seed[s].g) then eff = [...eff, seed[s]]
+		s = s + 1
+	}
+
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(eff.len) then break
+		let Iarch w = 0
+
+		loop {
+			if w >= Iarch(fwds.len) then break
+			if eq(fwds[w].owner, eff[i].callee) && fwds[w].pidx == eff[i].idx
+			&& !has_flow(eff, fwds[w].callee, fwds[w].idx, eff[i].g)
+				then eff = [...eff, FnFlow({ callee: fwds[w].callee, idx: fwds[w].idx, g: eff[i].g })]
+			w = w + 1
+		}
+		i = i + 1
+	}
+
+	return eff
 }
 
 pub const resolve_demands! = (Program prog): Demands -> {
@@ -963,6 +1022,23 @@ pub const resolve_demands! = (Program prog): Demands -> {
 			letmis = [...letmis, sc.letmis]
 		}
 		i = i + 1
+	}
+
+	# fn-value flows (context.md §4): a function passed into a fn-typed parameter that the owner
+	# INVOKES is a call edge — the flowed demands arrive at the parameter's call site and discharge
+	# against the owner's provides exactly like a named callee's. Forwarding composes transitively
+	# (eff_flows); a flow into a never-invoked parameter contributes nothing (todo!'s shape).
+	const FnVals fv = fnval_uses!(prog)
+	const [FnFlow] eff = eff_flows(fv.fwds, fv.flows)
+	let Iarch fe = 0
+
+	loop {
+		if fe >= Iarch(eff.len) then break
+		if has_inv(fv.invs, eff[fe].callee, eff[fe].idx) then {
+			const Iarch oi = find_func(funcs, eff[fe].callee)
+			if oi >= 0 then calls[oi] = union_s(calls[oi], [eff[fe].g])
+		}
+		fe = fe + 1
 	}
 
 	# residual fixpoint: residual[i] = (own consumes ∪ callees' demands) − discharged(provides).
@@ -1013,6 +1089,9 @@ pub const resolve_demands! = (Program prog): Demands -> {
 		mres: mres,
 		omut: omut,
 		letmis: letmis,
+		eff: eff,
+		pescs: fv.pescs,
+		illegal: fv.illegal,
 	})
 }
 
@@ -1084,7 +1163,6 @@ pub const check_demand_program! = (Program prog, [SrcMap] maps): [Diag] -> {
 	const [[Str]] omut = dm.omut
 	const [[Iarch]] letmis = dm.letmis
 	let [Diag] diags = []
-	const [Str] taken = value_refs_free(prog)
 
 	# main must discharge every demand it carries — nothing provides context to the entry (§4).
 	const Iarch mi = find_func(funcs, "main")
@@ -1254,14 +1332,16 @@ pub const check_demand_program! = (Program prog, [SrcMap] maps): [Diag] -> {
 		f = f + 1
 	}
 
-	# a demand-carrying function cannot be taken as a VALUE: its ABI differs by its demands, so an
-	# indirect call site cannot supply the hidden pointers (§4). Its demand is its declared `uses`
-	# when `pub`, else its inferred residual.
+	# a demand-carrying function may become a VALUE only where every use is a call argument into a
+	# fn-typed parameter — a specialized direct call supplies the hidden pointers like a named
+	# callee's (§4). Any OTHER value position (bound, returned, stored, a non-fn or unresolvable
+	# argument slot) is rejected: there the value survives to runtime dispatch, whose site cannot
+	# supply the demands. Its demand is its declared `uses` when `pub`, else its inferred residual.
 	let Iarch v = 0
 
 	loop {
-		if v >= Iarch(taken.len) then break
-		const Iarch j = find_func(funcs, taken[v])
+		if v >= Iarch(dm.illegal.len) then break
+		const Iarch j = find_func(funcs, dm.illegal[v])
 		if j >= 0 && !funcs[j].is_asm && !funcs[j].is_intrinsic then {
 			const Func jf = funcs[j]
 			const [Str] dem = if jf.is_pub then jf.uses else residual[j]
@@ -1272,12 +1352,39 @@ pub const check_demand_program! = (Program prog, [SrcMap] maps): [Diag] -> {
 					file: jf.dfile,
 					line: jf.dline,
 					col: jf.dcol,
-					msg: "cf: ctx: `${jf.name}` carries context demands (`${dem[0]}`) and cannot be used as a value — take it as an explicit parameter\n",
+					msg: "cf: ctx: `${jf.name}` carries context demands (`${dem[0]}`) and cannot be used as a value — pass it into a fn-typed parameter (a specialized direct call) or take its data as an explicit parameter\n",
 					what: "",
 				}),
 			]
 		}
 		v = v + 1
+	}
+
+	# a demand-carrying flow into a fn-typed parameter that itself ESCAPES as a value cannot be
+	# tracked to its call sites — reject at the flow (§4).
+	let Iarch pv = 0
+
+	loop {
+		if pv >= Iarch(dm.eff.len) then break
+		if has_inv(dm.pescs, dm.eff[pv].callee, dm.eff[pv].idx) then {
+			const Iarch j = find_func(funcs, dm.eff[pv].g)
+			if j >= 0 && !funcs[j].is_asm && !funcs[j].is_intrinsic then {
+				const Func jf = funcs[j]
+				const [Str] dem = if jf.is_pub then jf.uses else residual[j]
+				if Iarch(dem.len) > 0
+					then diags = [
+					...diags,
+					Diag({
+						file: jf.dfile,
+						line: jf.dline,
+						col: jf.dcol,
+						msg: "cf: ctx: `${jf.name}` carries context demands and flows into a fn-typed parameter of `${dm.eff[pv].callee}` that escapes as a value — the demand cannot be threaded there\n",
+						what: "",
+					}),
+				]
+			}
+		}
+		pv = pv + 1
 	}
 
 	return diags

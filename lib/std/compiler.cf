@@ -23,6 +23,7 @@ import std::compiler::spans::{ strip_program, strip_funcs }
 import std::compiler::alloc::{ check_alloc_program!, check_root_program! }
 import std::compiler::demand::{ check_demand_program!, stamp_demands! }
 import std::compiler::testsynth::{ inject_test_runner! }
+import std::compiler::specialize::{ specialize_fnvals! }
 import std::compiler::inline::{ inline_program! }
 import std::compiler::hoist_defertap::{ hoist_defertaps! }
 import std::compiler::defer::{ lower_defers! }
@@ -118,7 +119,12 @@ pub const compile! = (
 
 	if Iarch(mf.diags.len) > 0 then return sort_diags(mf.diags)
 
-	const Program mono = mf.prog
+	# specialize demand-carrying fn-VALUE arguments into per-value clones (context.md §4): a
+	# call passing such a value retargets to `f$d<i>$g`, whose body calls `g` DIRECTLY — the
+	# hidden context pointers thread only at direct call sites. Before Materialize, so a clone
+	# (and a body newly reachable under a geometry through one — `cb() in ta`) is materialized,
+	# typechecked, lowered, and routed like hand-written source.
+	const Program mono = specialize_fnvals!(mf.prog)
 
 	# the Materialize substep of the Memory arc (geometry_lowering §2): duplicate per
 	# (fn × geometry) under the std-source geometries, retarget the `in b` seed calls, and
@@ -165,8 +171,12 @@ pub const compile! = (
 	const Program deferred = lower_defers!(tapped)
 
 	# lower local closures to top-level functions with hidden capture parameters (memory_model
-	# §7) — after typecheck (which validated them), before emit
-	const Program lifted = lift_program!(deferred)
+	# §7) — after typecheck (which validated them), before emit. The lift also SPECIALIZES: a HOF
+	# called with a capturing closure or a demand-carrying fn value clones per argument
+	# (context.md §4), so re-stamp demands over the lifted program — the clones and lifted bodies
+	# get their exact `uses` signatures (a clone that discharges a flowed demand inside its own
+	# provide stamps empty; emit threads the hidden pointers off these stamps).
+	const Program lifted = stamp_demands!(lift_program!(deferred))
 
 	# the pre-emit inliner: splice scalar leaf callees into their call sites — QBE has no
 	# inliner, so every per-byte helper otherwise pays the full call protocol. Runs LAST of
@@ -237,12 +247,13 @@ pub const check! = (Str input, Str src, Os target_os, Arch target_arch, Iarch ro
 
 	if Iarch(gdiags.len) > 0 then return gdiags
 
-	const MonoFill mf = mono_and_fill!(raw)
+	const Program raw2c = stamp_demands!(raw)
+	const MonoFill mf = mono_and_fill!(raw2c)
 
 	if Iarch(mf.diags.len) > 0 then return sort_diags(mf.diags)
 
-	const Program mono = mf.prog
-	const Mat mm = materialize_program!(mono, raw)
+	const Program mono = specialize_fnvals!(mf.prog)
+	const Mat mm = materialize_program!(mono, raw2c)
 	const Program prog = mm.prog
 	const [Diag] tdiags = check_program!(prog, input, false, rz.maps, rz.modpaths)
 	const [Diag] xdiags = check_unreachable!(
