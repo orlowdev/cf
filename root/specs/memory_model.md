@@ -228,10 +228,22 @@ Coloring a HOF by its callback is the classic effect-system trap. C!'s rule:
   is a `!` function value. An effectful call requires a geometry and colors _its_
   enclosing function `!`. So `map(xs, f!)` is effectful at the site — the effect
   rides the visibly-`!` argument, never hidden.
+- **Node side.** An `in` clause on a call **whose callee is a function value**
+  binds per specialization: when the specialized callee is `!`, the clause
+  selects its ambient node exactly as for a named `!` callee; when it is
+  colorless, the clause is **inert**. This is the one place `in` tolerates a
+  colorless callee — the value's color is unknowable at the HOF's definition
+  and concrete at each specialization, and the same HOF source must serve both
+  colors (a named callee's color is always known, so `in` on a named colorless
+  call stays an error).
 
 Because geometries are comptime, every HOF is **specialized per call site**, so
 the effect resolves to a concrete answer wherever it matters. There is no runtime
-effect polymorphism to reason about.
+effect polymorphism to reason about. (One implementation latitude survives from
+§7: a **capture-free, demand-free, colorless** function value may stay
+runtime-dispatched — nothing about its call needs comptime exactness. Any value
+carrying captures, demands ([[context.md]] §4), or `!` must specialize to direct
+calls, and one that cannot is rejected.)
 
 ### Declared and checked
 

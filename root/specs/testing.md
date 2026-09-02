@@ -21,8 +21,12 @@ Timeout and coverage are named and deferred (§7); everything else below is v1.
 
 A test is a top-level **call** — cf has no top-level statements, and a test is the
 one thing that must sit beside a module's declarations without being one, so it
-borrows the only top-level form there is (a call). Two forms, both structural: the
-compiler recognizes them by name and never emits them as ordinary calls.
+borrows the only top-level form there is (a call). Two forms. `case!` and `todo!`
+are **real `std::test` functions** — ordinary HOF source, not compiler forms; the
+only thing the compiler knows about them is positional: a top-level expression is
+legal **iff** it is one of these two calls, and each one registers as an entry the
+test runner (§6) drives. Under any other route the registered calls are simply
+never reached.
 
 ```
 std::test::case!("my_awesome_function works", () -> {
@@ -76,14 +80,16 @@ node — that differs from a plain arena in two orthogonal ways:
 
 1. its construction **provides** a **`let` verdict accumulator** over it
    ([[context.md]] §2–§3) — the record an assertion appends `{ok, message}` to
-   (§4). The runner builds the accumulator in **its own ambient node**
+   (§4). `case!` builds a fresh accumulator per case in **its own ambient node**
    ([[context.md]], Placement — manifold storage, one bracket above the case arena, so
-   it strictly outlives the arena and the tally can still read it after the
+   it strictly outlives the arena and the returned tally reads it after the
    teardown), then grafts the `test_arena` inside that provide's extent. A
    `let` provide of shared mutable state, so the appends are in-place writes
-   into node storage the runner already reserved. This is what gives the
+   into node storage `case!` already reserved. This is what gives the
    assertions their reach: they consume it by *type* ([[context.md]] §4), at
-   any call depth, colorlessly (§4).
+   any call depth, colorlessly (§4). (Fresh per case, never reset and reused:
+   a case's `desc` is a `Str` — a pointer slot — and re-aiming a shared
+   `let` provide's pointer slot is exactly what §3's in-place rule forbids.)
 2. its **teardown reports**. Where a plain arena's `destroy` only rewinds,
    `test_arena::destroy` is a **real function** (not the bodyless rewind
    intrinsic) declared `uses Verdicts`: it consumes the accumulator, **dumps
@@ -93,7 +99,7 @@ node — that differs from a plain arena in two orthogonal ways:
 
 Both reader and writers reach the accumulator the **same** way — the demand
 chain. An assertion consumes it by type through the hidden context pointer; the
-teardown is placed by the case lowering *inside the provide's extent*, so its
+teardown sits in `case!`'s own source *inside the provide's extent*, so its
 `consume` resolves to the case's provide like any other consumer's. One
 mechanism, no side channel: context gives every reacher — writer or reader —
 its reach. (Reporting from the geometry's `on_scope_exit` hook instead would
@@ -104,9 +110,12 @@ consume. It is machinery the teardown form doesn't need, so v1 reports from
 `destroy`; the requirement is only that reporting is **deferred to after the
 case body has fully run**, which any bracket-exit placement satisfies.)
 
-The user **cannot override this**: `case!(...) in <geom>` is a compile error. The
-case's ambient node is always its `test_arena`; that is what makes the body's
-ambient allocation well-defined and what the accumulator is provided on. The
+The case's ambient node is always its `test_arena` **by construction** — `case!`'s
+own source runs the body `in` the arena it just carved, so no caller choice can
+repoint it. An `in` clause on the `case!` call itself selects only the **parent**
+the `test_arena` carves from — which is precisely how the runner places every case
+in the run arena (§6) — and at the top level, where the user writes a `case!`,
+there is no binding in scope to name, so no override even exists to write. The
 provide's extent is the whole case body ([[context.md]] §2 — extent is lexical,
 from the provide to scope end), so every assertion under it, **at any call depth**,
 reaches it. (Inside the body a nested `... in fb` is fine — it grafts an allocation
@@ -118,6 +127,27 @@ assertion writes onto the provided accumulator, and the close reads what
 accumulated. This is the same scope bracket the bump geometries already use to
 reclaim their block; the case simply provides a richer value over it and reports
 before it reclaims.
+
+All of which is nothing but ordinary C! — `case!` **is std source**, the whole
+per-case lifecycle in five lines ([[context.md]]'s provide idiom over a carve,
+a callback pinned to it, the reporting teardown deferred):
+
+```
+pub const case! = (Str desc, () -> () cb): Uarch -> {
+    let Verdicts vd = { desc: desc, count: 0, fails: 0 }
+    const ta = test_arena::of(65536)
+        |> ctx::provide(let vd)
+        |> defer test_arena::destroy
+    cb() in ta
+    return vd.fails
+}
+```
+
+`cb` may allocate or not — the `in ta` binds per specialization
+([[memory_model.md]] §6, the node-side rule) — and its assertions' `uses
+Verdicts` demand rides the value into the specialized direct call
+([[context.md]] §4). `todo!` is the trivial sibling: report pending, never call
+`cb`, return `0`.
 
 ## 4. Assertions
 
@@ -188,6 +218,23 @@ the result:
 - the module's own `pub const main`, if any, **steps aside** — the test route's
   entry is the runner over the file's `case!`s, not the app;
 - every other declaration stays (a `case!` calls the module's real functions);
+- the synthesized runner is nothing but the registered calls and a tally — a
+  run-level parent arena the per-case `test_arena`s carve from, and each
+  registered `case!` invoked directly in it, its returned fail count summed:
+
+  ```
+  const main = () -> {
+      const run = growing_arena::of(…)
+      let Uarch fails = 0
+      fails = fails + case!("adds numbers", () -> { … }) in run
+      fails = fails + todo!("handles empty", () -> { … }) in run
+      return if fails > 0 then 1 else 0
+  }
+  ```
+
+  Everything per-case — the fresh accumulator, its provide, the `test_arena`,
+  the reporting teardown — lives in `case!`'s own std source (§3), not in the
+  runner and not in the compiler;
 - a **directory** target walks recursively and runs the `case!`s in every `.cf`
   it finds; a **file** target runs that file's;
 - `--bail` stops the whole process at the first failing case (see [[cf_cli.md]]

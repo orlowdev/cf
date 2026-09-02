@@ -192,8 +192,9 @@ whether the consumer mutates: a mutating demand is discharged only by a `let`
 provide; a read-only demand by either mode. At every call site the compiler
 projects the lexically available provides onto the callee's demand set; a
 demand no provide in scope can discharge is a comptime error naming the type
-and the site. Because compilation is whole-program and fn values are
-demand-free (below), the analysis is closed — there is no conservative
+and the site. Because compilation is whole-program and a demand-carrying fn
+value never survives to runtime dispatch (below — its every use specializes
+to a direct call), the analysis is closed — there is no conservative
 over-threading and no runtime failure mode. React-style "no provider" crashes
 are unrepresentable.
 
@@ -213,10 +214,18 @@ Two obligations fall out of the ABI:
   [[ebnf.md]]). Within a module demands are inferred freely; at a module
   boundary the hidden signature is part of the contract and must be written,
   exactly as `!` is worn on the name.
-- **Fn values are demand-free.** A function with a non-empty demand set
-  cannot become a value — its ABI differs by its demands, so an indirect call
-  site cannot supply them. Rejected cleanly; a function meant to be passed
-  around takes its data as an explicit parameter.
+- **A demand-carrying fn value must resolve to direct calls.** A function
+  with a non-empty demand set may become a value **iff every use of that
+  value is a specialized direct call** ([[memory_model.md]] §6 — every HOF is
+  specialized per call site, so the callee behind the value is concrete and
+  its hidden signature is suppliable exactly like a named callee's). What is
+  rejected — cleanly, at comptime — is a demand-carrying value that would
+  survive to runtime dispatch: stored into a runtime aggregate, returned, or
+  called through a slot no specialization resolves. There the ABI genuinely
+  cannot be supplied (the indirect site does not know the demands). A
+  function meant to travel that way takes its data as an explicit parameter.
+  (Capturing values cannot escape at all — [[memory_model.md]] §7 — so this
+  rule only ever bites capture-free values used indirectly.)
 
 Escape of a consumed value through a return is not special: the context
 pointer is an argument, so aliasing it into a return is the routing pass's
