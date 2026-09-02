@@ -4180,14 +4180,16 @@ const mk_test_func = (Str name, Bool is_pub, Str ret_name, [Stmt] body): Func ->
 })
 
 # A top-level `case!`/`todo!` (testing.md §1): the one non-declaration a module may carry, since cf
-# has no top-level statements. The body is SPLICED — not kept as a `() -> ()` thunk — because it
-# consumes `Verdicts` and a demand-carrying function cannot be a value (context.md §4). We synthesize
-# two functions: `__cf_case_<n>` holding the body verbatim, and `__cf_run_<n>!` — the runner wrapper
-# that opens a `test_arena`, provides a fresh verdict accumulator, runs the body (directly, so the
-# demand threads), reports the verdict, and returns the fail count for the tally. Under `cf test` a
-# synthesized `main` drives every `__cf_run_*!`; any other build leaves them unreached, so they cost
-# the artifact nothing. Imports the wrappers need are injected here; the body's own references are the
-# user's imports.
+# has no top-level statements. The compiler's knowledge of the two calls is purely POSITIONAL —
+# `case!`/`todo!` are real `std::test` functions (testing.md §3), so all this does is hoist the
+# body lambda to a top-level `__cf_body_<n>!` function (capture-free by position; the marker is
+# always stamped since a body's color is unknowable at parse — alloc.cf exempts the prefix from
+# the over-mark direction) and mint the one-line `__cf_run_<n>!` registration the runner tallies:
+# `return std_test_case!(desc, __cf_body_<n>!)`. The body value is a demand-carrying fn at a
+# specialized direct call (context.md §4); everything per-case — accumulator, provide, arena,
+# reporting teardown — lives in `case!`'s own std source. Under `cf test` a synthesized `main`
+# drives every `__cf_run_*!`; any other build leaves them unreached, so they cost the artifact
+# nothing. The injected import loads `std/test`; the body's own references are the user's imports.
 const parse_toplevel_case! = (*Parser p): Program -> {
 	if !is_ident(peek(p)) then perr(p, "cf: parse: expected a declaration or a `case!`/`todo!` call\n")
 	const Str callee = cur_name!(p)
@@ -4217,67 +4219,23 @@ const parse_toplevel_case! = (*Parser p): Program -> {
 	if !is_rparen(peek(p)) then perr(p, "cf: parse: expected `)` to close `case!`\n")
 	p.pos = p.pos + 1
 
+	# the synthesized calls are built AFTER resolve's token pass, so they carry the FINAL mangled
+	# name resolve looks up directly: `std::test::case!` → `std_test_case!`. The injected import
+	# loads the module.
 	const Str rn = "__cf_run_${int_to_dec!(nid)}!"
-	const Expr vrec = Expr.Record("Verdicts", [
-		FieldInit({ field: "desc", value: descExpr }),
-		FieldInit({ field: "count", value: Expr.Lit(0) }),
-		FieldInit({ field: "fails", value: Expr.Lit(0) }),
-	])
-	# the synthesized calls are built AFTER resolve's token pass, so they carry the FINAL mangled names
-	# resolve looks up directly: `std::mem::ctx::provide` → `std_mem_ctx_provide`, the `test_arena`
-	# geometry members → their tag-mangled `of__te`/`destroy__te`, `std::test::report` →
-	# `std_test_report`. A type stays bare (`Verdicts`); the injected imports load the modules.
-	# The body is SPLICED between the provide and the teardown — inlined into this one `!` wrapper rather
-	# than a separate function, because whether a body allocates (constructing expected values) is not
-	# known at parse but the `!` marker must match: the wrapper always allocates (the accumulator + the
-	# arena), so the body's own residue rides its frame and is reclaimed when the wrapper returns. The
-	# case PROVIDES the verdict accumulator on the `test_arena`; the body's assertions consume it, and
-	# `test_arena::destroy` — a context consumer — reads it back and dumps the verdict at scope close.
-	# The wrapper returns the fail count for the runner's tally.
-	const [Stmt] pre = [
-		Stmt.Let("vd", true, "Verdicts", vrec),
-		Stmt.Let(
-			"ta",
-			false,
-			"",
-			Expr.Call(
-				"std_mem_ctx_provide",
-				["$let"],
-				[Expr.Var("vd"), Expr.Call("of__te", [], [Expr.Lit(65536)], "")],
-				"",
-			),
-		),
-	]
-	const [Stmt] post = [
-		Stmt.Do(Expr.Call("destroy__te", [], [Expr.Var("ta")], "")),
-		Stmt.Return(Expr.Field("vd", "fails")),
-	]
-	const [Stmt] rbody = if is_todo
-		then [
-		Stmt.Let("vd", true, "Verdicts", vrec),
-		Stmt.Do(Expr.Call("std_test_report_todo", [], [Expr.Field("vd", "desc")], "")),
-		Stmt.Return(Expr.Lit(0)),
-	]
-		else [...pre, ...body, ...post]
+	const Str bn = "__cf_body_${int_to_dec!(nid)}!"
+	const Func bodyf = mk_test_func(bn, false, "Unit", body)
+	const Str entry = if is_todo then "std_test_todo!" else "std_test_case!"
+	const [Stmt] rbody = [Stmt.Return(Expr.Call(entry, [], [descExpr, Expr.Var(bn)], ""))]
 	const Func runf = mk_test_func(rn, false, "Uarch", rbody)
-	const [Str] tnames = ["Verdicts", "report_todo"]
-	const [Str] none = []
+	const [Str] tnames = ["Verdicts"]
 	const [Import] imps = [
 		Import({ path: "std/test", names: tnames, alias: "", wildcard: false, dline: 0, dcol: 0 }),
-		Import({ path: "std/mem/ctx", names: none, alias: "", wildcard: false, dline: 0, dcol: 0 }),
-		Import({
-			path: "std/mem/arena/test_arena",
-			names: none,
-			alias: "",
-			wildcard: false,
-			dline: 0,
-			dcol: 0,
-		}),
 	]
 	const [RecDecl] norec = []
 	const [UnionDecl] nouni = []
 
-	return Program({ imports: imps, recs: norec, unions: nouni, funcs: [runf], groups: norec })
+	return Program({ imports: imps, recs: norec, unions: nouni, funcs: [bodyf, runf], groups: norec })
 }
 
 const parse_item! = (*Parser p): Program -> {

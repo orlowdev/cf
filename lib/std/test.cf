@@ -10,25 +10,20 @@
 #     add(max, 1) |> std::test::equals(min)
 #   })
 #
-# The calls are a deliberate shape, not a runtime API: cf has no top-level statements, so a case —
-# the one thing that must sit beside a module's real declarations without being one — borrows the
-# only top-level form there is, a call. The compiler recognizes `case!`/`todo!` structurally and
-# never emits them as ordinary calls (testing.md §1). `cf test <file|dir>` builds a runner over
-# exactly these cases; any other build throws them away, so tests cost a shipped program nothing.
+# The calls are a deliberate shape: cf has no top-level statements, so a case — the one thing that
+# must sit beside a module's real declarations without being one — borrows the only top-level form
+# there is, a call. The compiler's knowledge of them is purely POSITIONAL (testing.md §1): a
+# top-level expression is legal iff it is one of these two calls, and each registers as an entry
+# the `cf test` runner drives; any other build leaves them unreached, so tests cost a shipped
+# program nothing.
 #
-# This module is the RUNTIME half a case rests on: the verdict accumulator a case provides, the
-# assertion that appends to it, and the teardown reporter. `case!`/`todo!` themselves are compiler
-# intrinsics (the runner synthesis), not functions here.
+# `case!` and `todo!` themselves are ORDINARY functions below — the whole per-case lifecycle is
+# std source, nothing spliced, nothing compiler-lowered. The body callback is a demand-carrying fn
+# value at a specialized direct call (context.md §4): the assertions' `uses Verdicts` demand rides
+# the value into the per-body clone, where `case!`'s own provide discharges it.
 import std::io::console::{ print, println }
 import std::mem::ctx
-
-# `case!(description, () -> { … })` and `todo!(…)` are the test cases (testing.md §1) — top-level
-# CALLS, not runtime functions, so they are NOT declared here. cf has no top-level statements, so a
-# case borrows the only top-level form there is; the parser recognizes `case!`/`todo!` structurally
-# and, under `cf test`, SPLICES each body into a scope that provides the verdict accumulator (the body
-# is not a first-class thunk: it consumes `Verdicts`, and a demand-carrying function cannot be a value
-# — context.md §4). Any other build throws the cases away. What this module provides is the runtime a
-# spliced body rests on: the accumulator, the assertion, and the reporter.
+import std::mem::arena::test_arena
 
 # The verdict accumulator a case provides on its `test_arena` (testing.md §3): the case description,
 # how many assertions ran, and how many failed. A `let` provide of shared mutable state (context.md
@@ -60,12 +55,24 @@ pub const verdict_push = (Bool ok): () uses Verdicts -> {
 pub const equals = ['T]('T expected, 'T actual): () uses Verdicts ->
 	verdict_push(structural_eq(expected, actual))
 
-# Mark a `todo!` case pending (testing.md §5): its body is type-checked but never run, and it stays
-# outside the pass/fail tally. The runner calls this for a pending case (a `case!`'s own verdict is
-# dumped by `test_arena::destroy`, which consumes the accumulator). A later stage adds the module
-# prefix and the per-mismatch detail.
-pub const report_todo = (Str desc): () -> {
-	print("⋯ ")
-	print(desc)
-	println(" (todo)")
+# One test case (testing.md §3) — the whole per-case lifecycle, five lines of ordinary C!:
+# a fresh accumulator in the AMBIENT node (one bracket above the case arena, so the tally reads it
+# after the teardown's rewind), the `test_arena` grafted inside the provide's extent with the
+# reporting teardown deferred, and the body pinned to the arena — `cb() in ta` binds when the
+# specialized body is `!` and is inert when it is colorless (memory_model §6, node side). Returns
+# the case's fail count for the runner's tally.
+pub const case! = (Str desc, () -> () cb): Uarch -> {
+	let Verdicts vd = { desc: desc, count: 0, fails: 0 }
+	const ta = test_arena::of(65536)
+		|> std::mem::ctx::provide(let vd)
+		|> defer test_arena::destroy
+	cb() in ta
+	return vd.fails
+}
+
+# A pending case (testing.md §5): `cb` is type-checked like any case body but never called, and
+# the case stays outside the pass/fail tally — flipping `todo!` to `case!` is a one-word edit.
+pub const todo! = (Str desc, () -> () cb): Uarch -> {
+	println("⋯ ${desc} (todo)")
+	return 0
 }
