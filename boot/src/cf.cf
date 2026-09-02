@@ -21,6 +21,8 @@ import cli::{
 	FmtCli,
 	is_fmt_cmd,
 	fmt_cli_parse,
+	is_test_cmd,
+	test_target,
 	is_version_cmd,
 	is_help_cmd,
 	host_arch,
@@ -807,6 +809,7 @@ const run_full! = (Cli c, [Str] env): Iarch -> {
 		c.build_version,
 		c.debug,
 		c.instrument,
+		c.is_test,
 	)
 
 	# type errors come back as values — the CLI edge is where they become text
@@ -842,6 +845,44 @@ const run_full! = (Cli c, [Str] env): Iarch -> {
 	}
 
 	return st
+}
+
+# `cf test <file>` (cf_cli §7, testing.md §6): build the target with the TEST route — `is_test` injects
+# a runner `main` over every `case!`/`todo!` in the file — run the resulting binary, and exit with its
+# code (0 when every case passed, 1 when any failed). The report lines print to stdout as the cases
+# run. The test binary is a self-contained build to a temp path, run once, then removed.
+const run_test! = (Str target, [Str] env): Iarch -> {
+	if eq(target, "") then {
+		eprint("cf: test: give a file to test — cf test <file.cf>\n")
+		exit(2)
+	}
+	const Iarch pid = getpid()
+	const Str out = "/tmp/cf-test-${pid}"
+	const Cli c = Cli({
+		input: target,
+		out_qbe: "",
+		out_asm: "",
+		target_os: os::target,
+		target_arch: host_arch(),
+		root_size: 1048576,
+		dump_routing: false,
+		no_inline: false,
+		debug: false,
+		instrument: false,
+		full: true,
+		output: out,
+		preserve: false,
+		skip_embeds: false,
+		build_version: "",
+		is_test: true,
+	})
+	const Iarch bst = run_full!(c, env)
+	if bst != 0 then return bst
+	const [Str] noargv = []
+	const Iarch rc = run!(out, noargv, env)
+	remove(out)
+
+	return rc
 }
 
 # The help screen — the accurate command surface of THIS binary (reality), in the shape of
@@ -993,6 +1034,12 @@ pub const main = ([Str] args, [Str] env) -> {
 		return docs_run!(args) in doca
 	}
 
+	if is_test_cmd(args) then {
+		const ta = growing_arena::of(16777216)
+
+		return run_test!(test_target(args), env) in ta
+	}
+
 	# cf runs its whole compilation under ONE growing arena grafted from the root page (memory_model
 	# §2, §4): main holds no residue on the root, and the pipeline runs `in a`.
 	const a = growing_arena::of(16777216)
@@ -1013,6 +1060,7 @@ pub const main = ([Str] args, [Str] env) -> {
 			c.build_version,
 			c.debug,
 			c.instrument,
+			c.is_test,
 		) in a
 
 		if Iarch(ds.len) > 0 then {

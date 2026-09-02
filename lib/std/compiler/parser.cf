@@ -4127,6 +4127,149 @@ const parse_comptime_if! = (*Parser p): Program -> {
 # Parse a single top-level item into a one-item `Program` fragment: an import, a
 # `data`/`union`/`type` declaration, a function (each optionally `pub`), or a nested comptime
 # `if` (which yields its winning branch's items).
+# Does the callee name end in `target` (`case!`/`todo!`)? By the time parse runs, resolve's token pass
+# has collapsed a `::`-path use into ONE mangled ident — `std::test::case!` becomes `std_test_case!` —
+# so the kind is recognized as the name's suffix, whatever separator the mangle used. A pure suffix
+# compare, so it allocates nothing. (Top-level calls are only ever `case!`/`todo!`, so a user name that
+# merely ends in `case!` and appears at the top level would be an error regardless.)
+const seg_is = (Str callee, Str target): Bool -> {
+	const Iarch cl = Iarch(callee.len)
+	const Iarch tl = Iarch(target.len)
+	if cl < tl then return false
+	let Iarch k = 0
+
+	loop {
+		if k >= tl then break
+		if Iarch(callee[cl - tl + k]) != Iarch(target[k]) then return false
+		k = k + 1
+	}
+
+	return true
+}
+
+# Build a plain (non-generic, no-param) synthetic function — the shape both a case's spliced body and
+# its runner wrapper take. Fields the test synthesis never uses default to empty.
+const mk_test_func = (Str name, Bool is_pub, Str ret_name, [Stmt] body): Func -> Func({
+	name: name,
+	is_pub: is_pub,
+	ret_name: ret_name,
+	ret_elem: "",
+	params: [],
+	body: body,
+	uses: [],
+	is_asm: false,
+	asm_body: [],
+	is_value: false,
+	ret_telems: [],
+	typarams: [],
+	tbounds: [],
+	ret_size: 0,
+	is_intrinsic: false,
+	asm_sym: "",
+	dfile: "",
+	dline: 0,
+	dcol: 0,
+})
+
+# A top-level `case!`/`todo!` (testing.md §1): the one non-declaration a module may carry, since cf
+# has no top-level statements. The body is SPLICED — not kept as a `() -> ()` thunk — because it
+# consumes `Verdicts` and a demand-carrying function cannot be a value (context.md §4). We synthesize
+# two functions: `__cf_case_<n>` holding the body verbatim, and `__cf_run_<n>!` — the runner wrapper
+# that opens a `test_arena`, provides a fresh verdict accumulator, runs the body (directly, so the
+# demand threads), reports the verdict, and returns the fail count for the tally. Under `cf test` a
+# synthesized `main` drives every `__cf_run_*!`; any other build leaves them unreached, so they cost
+# the artifact nothing. Imports the wrappers need are injected here; the body's own references are the
+# user's imports.
+const parse_toplevel_case! = (*Parser p): Program -> {
+	if !is_ident(peek(p)) then perr(p, "cf: parse: expected a declaration or a `case!`/`todo!` call\n")
+	const Str callee = cur_name!(p)
+	const Bool is_todo = seg_is(callee, "todo!")
+	if !seg_is(callee, "case!") && !is_todo
+		then perr(p, "cf: parse: a top-level call must be `case!` or `todo!` — cf has no top-level statements\n")
+	const Iarch nid = p.pos
+	p.pos = p.pos + 1 # callee
+	if !is_lparen(peek(p)) then perr(p, "cf: parse: `case!` takes a description and a `() -> { ... }` body\n")
+	p.pos = p.pos + 1 # `(`
+	if !is_strlit(peek(p)) then perr(p, "cf: parse: `case!`'s first argument is a description string\n")
+	const Iarch dstart = p.toks[p.pos].start
+	const Iarch dlen = p.toks[p.pos].len
+	p.pos = p.pos + 1
+	const Expr descExpr = parse_string!(p, dstart, dlen)
+	if !is_comma(peek(p)) then perr(p, "cf: parse: `case!(description, () -> { ... })` needs a comma\n")
+	p.pos = p.pos + 1
+	if !is_lparen(peek(p)) then perr(p, "cf: parse: `case!`'s body is a `() -> { ... }`\n")
+	p.pos = p.pos + 1
+	if !is_rparen(peek(p)) then perr(p, "cf: parse: `case!`'s body takes no parameters — `() -> { ... }`\n")
+	p.pos = p.pos + 1
+	if !is_arrow(peek(p)) then perr(p, "cf: parse: expected `->` in `case!`'s body\n")
+	p.pos = p.pos + 1
+	if !is_lbrace(peek(p)) then perr(p, "cf: parse: `case!`'s body must be a `{ ... }` block\n")
+	p.pos = p.pos + 1
+	const [Stmt] body = parse_block!(p) # parses the body, consumes `}`
+	if !is_rparen(peek(p)) then perr(p, "cf: parse: expected `)` to close `case!`\n")
+	p.pos = p.pos + 1
+
+	const Str rn = "__cf_run_${int_to_dec!(nid)}!"
+	const Expr vrec = Expr.Record("Verdicts", [
+		FieldInit({ field: "desc", value: descExpr }),
+		FieldInit({ field: "count", value: Expr.Lit(0) }),
+		FieldInit({ field: "fails", value: Expr.Lit(0) }),
+	])
+	# the synthesized calls are built AFTER resolve's token pass, so they carry the FINAL mangled names
+	# resolve looks up directly: `std::mem::ctx::provide` → `std_mem_ctx_provide`, the `test_arena`
+	# geometry members → their tag-mangled `of__te`/`destroy__te`, `std::test::report` →
+	# `std_test_report`. A type stays bare (`Verdicts`); the injected imports load the modules.
+	# The body is SPLICED between the provide and the report — inlined into this one `!` wrapper rather
+	# than a separate function, because whether a body allocates (constructing expected values) is not
+	# known at parse but the `!` marker must match: the wrapper always allocates (the accumulator + the
+	# arena), so the body's own residue rides its frame and is reclaimed when the wrapper returns.
+	const [Stmt] pre = [
+		Stmt.Let("vd", true, "Verdicts", vrec),
+		Stmt.Let(
+			"ta",
+			false,
+			"",
+			Expr.Call(
+				"std_mem_ctx_provide",
+				["$let"],
+				[Expr.Var("vd"), Expr.Call("of__te", [], [Expr.Lit(65536)], "")],
+				"",
+			),
+		),
+	]
+	const [Stmt] post = [
+		Stmt.Do(Expr.Call("std_test_report", [], [Expr.Field("vd", "desc"), Expr.Field("vd", "fails")], "")),
+		Stmt.Do(Expr.Call("destroy__te", [], [Expr.Var("ta")], "")),
+		Stmt.Return(Expr.Field("vd", "fails")),
+	]
+	const [Stmt] rbody = if is_todo
+		then [
+		Stmt.Let("vd", true, "Verdicts", vrec),
+		Stmt.Do(Expr.Call("std_test_report_todo", [], [Expr.Field("vd", "desc")], "")),
+		Stmt.Return(Expr.Lit(0)),
+	]
+		else [...pre, ...body, ...post]
+	const Func runf = mk_test_func(rn, false, "Uarch", rbody)
+	const [Str] tnames = ["Verdicts", "report", "report_todo"]
+	const [Str] none = []
+	const [Import] imps = [
+		Import({ path: "std/test", names: tnames, alias: "", wildcard: false, dline: 0, dcol: 0 }),
+		Import({ path: "std/mem/ctx", names: none, alias: "", wildcard: false, dline: 0, dcol: 0 }),
+		Import({
+			path: "std/mem/arena/test_arena",
+			names: none,
+			alias: "",
+			wildcard: false,
+			dline: 0,
+			dcol: 0,
+		}),
+	]
+	const [RecDecl] norec = []
+	const [UnionDecl] nouni = []
+
+	return Program({ imports: imps, recs: norec, unions: nouni, funcs: [runf], groups: norec })
+}
+
 const parse_item! = (*Parser p): Program -> {
 	if kw(p, "if") then return parse_comptime_if!(p)
 	let [Import] imports = []
@@ -4148,8 +4291,11 @@ const parse_item! = (*Parser p): Program -> {
 	} else if heads(p, "static") then {
 		# a module-level `static [N Uint8] NAME` — a BSS byte buffer, modeled as a value-const Func
 		funcs = [...funcs, parse_static!(p)]
-	} else {
+	} else if kw(p, "pub") || kw(p, "const") || kw(p, "intrinsic") then {
 		funcs = [...funcs, parse_func!(p)]
+	} else {
+		# the only non-declaration a module may carry: a top-level `case!`/`todo!` (testing.md §1)
+		return parse_toplevel_case!(p)
 	}
 
 	return Program({ imports: imports, recs: recs, unions: unions, funcs: funcs, groups: groups })

@@ -1,0 +1,118 @@
+# std::compiler::testsynth — synthesize the `cf test` runner (testing.md §6).
+#
+# The parser turns each top-level `case!`/`todo!` into two functions: `__cf_case_<n>` holding the
+# body verbatim, and `__cf_run_<n>!` — the wrapper that opens a `test_arena`, provides a fresh verdict
+# accumulator, runs the body, reports the verdict, and returns the case's fail count. Under `cf test`
+# this pass adds the entry `main` that drives every `__cf_run_*!` in declaration order, sums the
+# fails, and returns a non-zero exit code iff any case failed. The module's own `main`, if any, steps
+# aside (its name is changed so it is no longer the entry, then dropped as unreachable). Any other
+# build never runs this pass, so the cases stay unreached and cost the artifact nothing.
+import std::compiler::ast::{ Program, Func, Stmt, Expr, Import }
+import std::data::str::{ eq, starts_with }
+
+const run_prefix = "__cf_run_"
+
+# A Func with its `name` replaced — used to step the module's own `main` aside. cf has no record-value
+# spread, so every field is carried explicitly.
+const renamed = (Func f, Str name): Func -> Func({
+	name: name,
+	is_pub: f.is_pub,
+	ret_name: f.ret_name,
+	ret_elem: f.ret_elem,
+	params: f.params,
+	body: f.body,
+	uses: f.uses,
+	is_asm: f.is_asm,
+	asm_body: f.asm_body,
+	is_value: f.is_value,
+	ret_telems: f.ret_telems,
+	typarams: f.typarams,
+	tbounds: f.tbounds,
+	ret_size: f.ret_size,
+	is_intrinsic: f.is_intrinsic,
+	asm_sym: f.asm_sym,
+	dfile: f.dfile,
+	dline: f.dline,
+	dcol: f.dcol,
+})
+
+const mk_main = ([Stmt] body): Func -> Func({
+	name: "main",
+	is_pub: true,
+	ret_name: "",
+	ret_elem: "",
+	params: [],
+	body: body,
+	uses: [],
+	is_asm: false,
+	asm_body: [],
+	is_value: false,
+	ret_telems: [],
+	typarams: [],
+	tbounds: [],
+	ret_size: 0,
+	is_intrinsic: false,
+	asm_sym: "",
+	dfile: "",
+	dline: 0,
+	dcol: 0,
+})
+
+# Add the `cf test` runner `main` over the parser's `__cf_run_*!` wrappers. No wrappers ⇒ not a test
+# build ⇒ the program passes through untouched.
+pub const inject_test_runner! = (Program p): Program -> {
+	let [Str] runs = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(p.funcs.len) then break
+		if starts_with(run_prefix, p.funcs[i].name) then runs = [...runs, p.funcs[i].name]
+		i = i + 1
+	}
+
+	if Iarch(runs.len) == 0 then return p
+
+	# step the module's own `main` aside — the runner is the sole entry
+	let [Func] fs = []
+	let Iarch j = 0
+
+	loop {
+		if j >= Iarch(p.funcs.len) then break
+		if eq(p.funcs[j].name, "main") then fs = [...fs, renamed(p.funcs[j], "__cf_user_main")]
+		else fs = [...fs, p.funcs[j]]
+		j = j + 1
+	}
+
+	# the runner body: a root arena, a running fail tally, one `__cf_run_*!() in root` per case, and a
+	# 0/1 exit code. Each wrapper carves its own `test_arena` from `root`, so every case runs in it.
+	let [Stmt] body = [
+		Stmt.Let("root", false, "", Expr.Call("of__el", [], [Expr.Lit(1048576)], "")),
+		Stmt.Let("fails", true, "Uarch", Expr.Lit(0)),
+	]
+	let Iarch r = 0
+
+	loop {
+		if r >= Iarch(runs.len) then break
+		body = [
+			...body,
+			Stmt.Assign("fails", Expr.Add(Expr.Var("fails"), Expr.Call(runs[r], [], [], "root"))),
+		]
+		r = r + 1
+	}
+
+	body = [...body, Stmt.Return(Expr.If(Expr.CmpGt(Expr.Var("fails"), Expr.Lit(0)), Expr.Lit(1), Expr.Lit(0)))]
+	const [Func] withmain = [...fs, mk_main(body)]
+	const [Import] imps = [
+		...p.imports,
+		Import({
+			path: "std/mem/arena/growing_arena",
+			names: [],
+			alias: "",
+			wildcard: false,
+			dline: 0,
+			dcol: 0,
+		}),
+	]
+
+	return Program({ imports: imps, recs: p.recs, unions: p.unions, funcs: withmain, groups: p.groups })
+}

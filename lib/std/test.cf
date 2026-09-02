@@ -1,0 +1,82 @@
+# std::test — unit tests that live beside the code they check (testing.md).
+#
+# A test file carries its cases inline, at the top level, as calls:
+#
+#   std::test::case!("adds two numbers", () -> {
+#     add(2, 2) |> std::test::equals(4)
+#   })
+#
+#   std::test::todo!("overflow wraps", () -> {
+#     add(max, 1) |> std::test::equals(min)
+#   })
+#
+# The calls are a deliberate shape, not a runtime API: cf has no top-level statements, so a case —
+# the one thing that must sit beside a module's real declarations without being one — borrows the
+# only top-level form there is, a call. The compiler recognizes `case!`/`todo!` structurally and
+# never emits them as ordinary calls (testing.md §1). `cf test <file|dir>` builds a runner over
+# exactly these cases; any other build throws them away, so tests cost a shipped program nothing.
+#
+# This module is the RUNTIME half a case rests on: the verdict accumulator a case provides, the
+# assertion that appends to it, and the teardown reporter. `case!`/`todo!` themselves are compiler
+# intrinsics (the runner synthesis), not functions here.
+import std::io::console::{ print, println }
+import std::mem::ctx
+
+# `case!(description, () -> { … })` and `todo!(…)` are the test cases (testing.md §1) — top-level
+# CALLS, not runtime functions, so they are NOT declared here. cf has no top-level statements, so a
+# case borrows the only top-level form there is; the parser recognizes `case!`/`todo!` structurally
+# and, under `cf test`, SPLICES each body into a scope that provides the verdict accumulator (the body
+# is not a first-class thunk: it consumes `Verdicts`, and a demand-carrying function cannot be a value
+# — context.md §4). Any other build throws the cases away. What this module provides is the runtime a
+# spliced body rests on: the accumulator, the assertion, and the reporter.
+
+# The verdict accumulator a case provides on its `test_arena` (testing.md §3): the case description,
+# how many assertions ran, and how many failed. A `let` provide of shared mutable state (context.md
+# §3) — each assertion consumes it and appends in place; the reporting teardown reads it at case
+# close. Layout is load-bearing: the teardown reads these fields by raw offset (desc@0, count@16,
+# fails@24), so append fields only at the end.
+pub data Verdicts = { Str desc, Uarch count, Uarch fails }
+
+# `structural_eq(expected, actual)` — the comparison behind `equals`, supplied by the compiler
+# (testing.md §4): true when the two are structurally equal (primitives by value, `Str` by bytes;
+# records, arrays, and unions join in a later stage). A bodyless intrinsic — emit generates the
+# per-type compare at the call site, so it never runs as an ordinary call.
+pub intrinsic structural_eq = ['T]('T expected, 'T actual): Bool
+
+# Append one verdict onto the case's accumulator (testing.md §4): a colorless in-place mutation of
+# the `let` verdict provide (context.md §1). The whole case body runs regardless of earlier results —
+# a case fails if ANY verdict did — so this only accumulates; it never aborts.
+pub const verdict_push = (Bool ok): () uses Verdicts -> {
+	let v = std::mem::ctx::consume(Verdicts)
+	v.count = v.count + 1
+	if !ok then {
+		v.fails = v.fails + 1
+	}
+}
+
+# `equals(expected, actual)` — the canonical assertion (testing.md §4). Written data-last in a pipe
+# (`actual |> equals(expected)`), it compares structurally and appends the verdict. Colorless: it
+# reads and mutates the case's `let` verdict provide, allocating nothing (`uses Verdicts`).
+pub const equals = ['T]('T expected, 'T actual): () uses Verdicts ->
+	verdict_push(structural_eq(expected, actual))
+
+# Dump one case's verdict (testing.md §5): a tick for a case whose every assertion held, a cross for
+# one with any mismatch. The synthesized runner calls this after the case body runs, reading the
+# accumulator's own fields (so no `raw` and no `*Verdicts` parameter — the reporter stays off the
+# context-demand path). A later stage adds the module prefix and the per-mismatch detail.
+pub const report = (Str desc, Uarch fails): () -> {
+	if fails == 0 then {
+		print("✓ ")
+	} else {
+		print("✗ ")
+	}
+	println(desc)
+}
+
+# Mark a `todo!` case pending (testing.md §5): its body is type-checked but never run, and it stays
+# outside the pass/fail tally. The runner calls this instead of `report` for a pending case.
+pub const report_todo = (Str desc): () -> {
+	print("⋯ ")
+	print(desc)
+	println(" (todo)")
+}

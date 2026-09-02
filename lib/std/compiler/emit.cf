@@ -1088,12 +1088,12 @@ const loop_residue_safe = (*Emit ctx, [Binding] env, Str loopvar, [Stmt] body): 
 #      0/2/4 trap at capacity), so it needs only gates 1–2.
 
 const is_grow_leaf = (Expr e): Bool -> match e {
-	Expr.Call(c, _, _, _) -> eq(c, "of__el"),
+	Expr.Call(c, _, _, _) -> eq(c, "of__el") || eq(c, "of__te"),
 	_ -> false,
 }
 
 const is_carve_leaf = (Expr e): Bool -> match e {
-	Expr.Call(c, _, _, _) -> eq(c, "of__fx") || eq(c, "of__el"),
+	Expr.Call(c, _, _, _) -> eq(c, "of__fx") || eq(c, "of__el") || eq(c, "of__te"),
 	_ -> false,
 }
 
@@ -2401,6 +2401,191 @@ const emit_stringify_array! = (*Emit ctx, [Binding] env, Str vh, Str elem, Str b
 	emit_lit_str!(ctx, vh, "]")
 
 	return 0
+}
+
+# ── structural equality (testing.md §4) ──────────────────────────────────────────────────
+# The comparison behind `std::test::equals`, mirroring the stringify family but over TWO operands.
+# Each `emit_eq*` returns a `w` Bool temp (1 = equal). `aop`/`bop` are the operand handles — a pointer
+# for an aggregate, the value for a scalar. A recursive (self-referential) type would recurse forever
+# here; it is rejected at type-check time (a later stage).
+
+# `and` two running Bool temps; the empty accumulator (`""`) starts the chain, so the first term flows
+# through unchanged.
+const eq_and! = (*Emit ctx, Str acc, Str e): Str -> {
+	if eq(acc, "") then return e
+	const Iarch r = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${r} =w and ${acc}, ${e}\n")
+
+	return "%t${r}"
+}
+
+# a `w` constant 1 in a temp — an aggregate with no leaves (an empty record/tuple) is trivially equal.
+const eq_true! = (*Emit ctx): Str -> {
+	const Iarch r = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${r} =w copy 1\n")
+
+	return "%t${r}"
+}
+
+# load array element `i` (by `elem`): `[Uint8]` strides 1 with `loadub`, a float loads `d`/`s`, else an
+# 8-byte word `loadl` — mirrors emit_stringify_array!'s element read.
+const load_elem! = (*Emit ctx, Str data, Str ioff, Str elem): Str -> {
+	const Iarch addr = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${addr} =l add ${data}, ${ioff}\n")
+	const Iarch v = ctx.next
+	ctx.next = ctx.next + 1
+	if eq(elem, "Uint8") then write_str(ctx.fd, "\t%t${v} =l loadub %t${addr}\n")
+	else if is_float_name(elem)
+		then write_str(ctx.fd, "\t%t${v} =${float_qt(elem)} load${float_qt(elem)} %t${addr}\n")
+	else write_str(ctx.fd, "\t%t${v} =l loadl %t${addr}\n")
+
+	return "%t${v}"
+}
+
+const emit_eq! = (*Emit ctx, [Binding] env, Str aop, Str bop, Str name, [TupElem] telems): Str -> {
+	if eq(name, "Str") then {
+		const Iarch s = ctx.next
+		const Iarch r = ctx.next + 1
+		ctx.next = ctx.next + 2
+		write_str(ctx.fd, "\t%t${s} =l call $cf_str_eq(l ${aop}, l ${bop})\n")
+		write_str(ctx.fd, "\t%t${r} =w cnel %t${s}, 0\n")
+
+		return "%t${r}"
+	}
+	if eq(name, "$tuple") then return emit_eq_tuple!(ctx, env, aop, bop, telems)
+	if is_nested(name) then return emit_eq_array!(ctx, env, aop, bop, nested_inner!(name))
+	if find_rec(ctx.recs, name) >= 0 then return emit_eq_record!(ctx, env, aop, bop, name)
+	if find_union(ctx.unions, name) >= 0 then return emit_eq_union!(ctx, aop, bop, name)
+	# a scalar leaf: a float compares by its width, everything else (int/bool/fixed/pointer/tag word) as
+	# an 8-byte value in its slot
+	const Str ins = if is_float_name(name) then "ceq${float_qt(name)}" else "ceql"
+	const Iarch r = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${r} =w ${ins} ${aop}, ${bop}\n")
+
+	return "%t${r}"
+}
+
+const emit_eq_record! = (*Emit ctx, [Binding] env, Str a, Str b, Str rt): Str -> {
+	const Iarch ri = find_rec(ctx.recs, rt)
+	let Str acc = ""
+	let Iarch f = 0
+	let Iarch off = 0
+
+	loop {
+		if f >= Iarch(ctx.recs[ri].fields.len) then break
+		const Str ftype = ctx.recs[ri].ftypes[f]
+		if eq(ftype, "$fix")
+			then die("cf: emit: std::test::equals cannot compare a record with an inline fixed-array field yet\n")
+		const Str fname = if eq(ftype, "$dyn") then "[${ctx.recs[ri].felems[f]}]" else ftype
+		const Str aslot = if is_float_name(ftype)
+			then load_field_at!(ctx, a, off, ftype)
+			else load_at!(ctx, a, off)
+		const Str bslot = if is_float_name(ftype)
+			then load_field_at!(ctx, b, off, ftype)
+			else load_at!(ctx, b, off)
+		acc = eq_and!(ctx, acc, emit_eq!(ctx, env, aslot, bslot, fname, ctx.recs[ri].ftelems[f]))
+		off = off + field_bytes_at(ctx.recs, ri, f)
+		f = f + 1
+	}
+
+	if eq(acc, "") then return eq_true!(ctx)
+
+	return acc
+}
+
+const emit_eq_tuple! = (*Emit ctx, [Binding] env, Str a, Str b, [TupElem] telems): Str -> {
+	let Str acc = ""
+	let Iarch k = 0
+
+	loop {
+		if k >= Iarch(telems.len) then break
+		const TupElem te = telems[k]
+		const Iarch off = k * 8
+		const Str aslot = if is_float_name(te.name)
+			then load_field_at!(ctx, a, off, te.name)
+			else load_at!(ctx, a, off)
+		const Str bslot = if is_float_name(te.name)
+			then load_field_at!(ctx, b, off, te.name)
+			else load_at!(ctx, b, off)
+		acc = eq_and!(ctx, acc, emit_eq!(ctx, env, aslot, bslot, te.name, tel_sub(te)))
+		k = k + 1
+	}
+
+	if eq(acc, "") then return eq_true!(ctx)
+
+	return acc
+}
+
+# a `[Elem]` array: equal iff the lengths match AND every element matches. A runtime loop with an early
+# exit on the first mismatch; the result is a phi over the pass/fail exits.
+const emit_eq_array! = (*Emit ctx, [Binding] env, Str a, Str b, Str elem): Str -> {
+	const Iarch stride = elem_bytes(elem)
+	const Str adata = load_at!(ctx, a, 0)
+	const Str alen = load_at!(ctx, a, 8)
+	const Str bdata = load_at!(ctx, b, 0)
+	const Str blen = load_at!(ctx, b, 8)
+	const Iarch lid = ctx.label
+	ctx.label = ctx.label + 1
+	const Iarch le = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${le} =w ceql ${alen}, ${blen}\n")
+	write_str(ctx.fd, "\tjnz %t${le}, @eqli${lid}, @eqfail${lid}\n")
+	write_str(ctx.fd, "@eqli${lid}\n")
+	const Iarch ic = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${ic} =l copy 0\n")
+	write_str(ctx.fd, "@eqloop${lid}\n")
+	const Iarch cmp = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${cmp} =w csgel %t${ic}, ${alen}\n")
+	write_str(ctx.fd, "\tjnz %t${cmp}, @eqpass${lid}, @eqbody${lid}\n")
+	write_str(ctx.fd, "@eqbody${lid}\n")
+	const Iarch ioff = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${ioff} =l mul %t${ic}, ${stride}\n")
+	const Str aelem = load_elem!(ctx, adata, "%t${ioff}", elem)
+	const Str belem = load_elem!(ctx, bdata, "%t${ioff}", elem)
+	let [TupElem] notel = []
+	const Str ee = emit_eq!(ctx, env, aelem, belem, elem, notel)
+	write_str(ctx.fd, "\tjnz ${ee}, @eqcont${lid}, @eqfail${lid}\n")
+	write_str(ctx.fd, "@eqcont${lid}\n")
+	write_str(ctx.fd, "\t%t${ic} =l add %t${ic}, 1\n")
+	write_str(ctx.fd, "\tjmp @eqloop${lid}\n")
+	write_str(ctx.fd, "@eqpass${lid}\n")
+	write_str(ctx.fd, "\tjmp @eqdone${lid}\n")
+	write_str(ctx.fd, "@eqfail${lid}\n")
+	write_str(ctx.fd, "\tjmp @eqdone${lid}\n")
+	write_str(ctx.fd, "@eqdone${lid}\n")
+	const Iarch res = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${res} =w phi @eqpass${lid} 1, @eqfail${lid} 0\n")
+
+	return "%t${res}"
+}
+
+# a union: tag-only unions (enums) compare by tag. A payloaded union is a later stage.
+const emit_eq_union! = (*Emit ctx, Str a, Str b, Str un): Str -> {
+	const Iarch ui = find_union(ctx.unions, un)
+	let Iarch m = 0
+
+	loop {
+		if m >= Iarch(ctx.unions[ui].members.len) then break
+		if Iarch(ctx.unions[ui].members[m].payloads.len) > 0
+			then die("cf: emit: std::test::equals cannot compare a payloaded union yet — tag-only unions work\n")
+		m = m + 1
+	}
+
+	const Str atag = scrut_tag!(ctx, un, a)
+	const Str btag = scrut_tag!(ctx, un, b)
+	const Iarch r = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${r} =w ceql ${atag}, ${btag}\n")
+
+	return "%t${r}"
 }
 
 # Emit an interpolated string `"...${name}..."`: build a fresh `[Uint8]` byte vector
@@ -4117,7 +4302,10 @@ const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env)
 
 		return "%t${tr}"
 	}
-	if eq(callee, "of__el") && callee_is_intrinsic(ctx, callee) then {
+	# `growing_arena::of` and `test_arena::of` share this lowering: a test arena IS a growing arena
+	# (testing.md §3), so it carves the same `el` node and publishes the same elastic reserve —
+	# materialize folds a `te` body to `el`, so the case body reserves exactly as `el`.
+	if (eq(callee, "of__el") || eq(callee, "of__te")) && callee_is_intrinsic(ctx, callee) then {
 		const Str gv = emit_expr!(args[0], ctx, env)
 		const Iarch cel = find_func(ctx.funcs, "carve__el")
 		if cel < 0
@@ -4152,7 +4340,10 @@ const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env)
 	# base IS the carve mark; setting the parent's survivor top (`parent+0`, where `parent` is the
 	# child's survivor parent link at `b+16`) back to `b` reclaims the child and everything bumped
 	# after it. Uniform for the bump family (fx/el); user-placed via `defer`.
-	if (eq(callee, "destroy__fx") || eq(callee, "destroy__el"))
+	# `<geom>::destroy(b)` — the survivor rewind, uniform for the bump family (fx/el, and te which is an
+	# el-twin: a test arena reclaims exactly like a growing one; the case's verdict is reported by an
+	# explicit call in the synthesized runner, not here).
+	if (eq(callee, "destroy__fx") || eq(callee, "destroy__el") || eq(callee, "destroy__te"))
 	&& callee_is_intrinsic(ctx, callee) then {
 		const Str bn = emit_expr!(args[0], ctx, env)
 		const Iarch pp = ctx.next
@@ -4164,6 +4355,32 @@ const emit_call! = (*Emit ctx, Str callee, [Expr] args, Str geom, [Binding] env)
 		write_str(ctx.fd, "\tstorel ${bn}, %t${par}\n")
 
 		return ""
+	}
+	# `std::test::structural_eq(expected, actual)` (testing.md §4): the comparison behind `equals`,
+	# yielding a Bool word (1 = equal). A `Str` compares by bytes (`cf_str_eq`); a scalar — integer,
+	# `Bool`, pointer, float, or a tag-only union — reuses the `==` compare, which picks the right width
+	# and float form. Aggregates (records, arrays, boxed unions, tuples) are Stage C — a structural walk
+	# joins here later.
+	if eq(callee, "std_test_structural_eq") && callee_is_intrinsic(ctx, callee) then {
+		const Str aggt = init_agg_type!(ctx, env, args[0])
+		let [TupElem] notel = []
+		# a scalar leaf (integer/Bool/pointer/float/tag-only union) reuses the `==` compare, which picks
+		# the right width and float form
+		if eq(aggt, "") then return emit_binop!(ctx, "ceql", args[0], args[1], env)
+		# Str and the aggregates: emit both operands (a pointer for an aggregate), then a structural walk.
+		# The walk yields a `w` Bool; widen it to `l` so it flows into `verdict_push`'s `l` Bool argument
+		# without a same-type `copy` mismatch (the scalar `==` path already yields `l`).
+		const Str aop = emit_expr!(args[0], ctx, env)
+		const Str bop = emit_expr!(args[1], ctx, env)
+		let Str w = ""
+		if eq(aggt, "Str") then w = emit_eq!(ctx, env, aop, bop, "Str", notel)
+		else if eq(aggt, "$dyn") then w = emit_eq!(ctx, env, aop, bop, "[${init_elem!(ctx, env, args[0])}]", notel)
+		else w = emit_eq!(ctx, env, aop, bop, aggt, init_telems!(ctx, env, args[0]))
+		const Iarch wl = ctx.next
+		ctx.next = ctx.next + 1
+		write_str(ctx.fd, "\t%t${wl} =l extuw ${w}\n")
+
+		return "%t${wl}"
 	}
 	# `ctx::provide(value, node)` (context.md §2): register a pointer to `value` as the scope's
 	# provider of its type, and thread the node on so the construction pipe continues to `defer
@@ -6452,7 +6669,7 @@ const nfp_alloc_expr = ([UnionDecl] unions, Bool stackm, Expr e): Bool -> {
 		Expr.Match(_, arms) -> nfp_marms_strpat(arms),
 		Expr.UnionMk(u, _, _) -> union_is_boxed(unions, u),
 		Expr.Call(n, _, _, _) ->
-			eq(n, "Str") || eq(n, "of__fx") || eq(n, "of__el") || eq(n, "of__fb"),
+			eq(n, "Str") || eq(n, "of__fx") || eq(n, "of__el") || eq(n, "of__fb") || eq(n, "of__te"),
 		_ -> false,
 	}
 
@@ -6962,7 +7179,7 @@ const emit_slits! = (Fd fd, [Str] tbl): Iarch -> {
 const mint_expr = (Expr e): Bool -> {
 	const Bool here = match e {
 		Expr.Call(n, _, _, g) ->
-			eq(g, "") && (eq(n, "of__fx") || eq(n, "of__el") || eq(n, "of__fb")),
+			eq(g, "") && (eq(n, "of__fx") || eq(n, "of__el") || eq(n, "of__fb") || eq(n, "of__te")),
 		_ -> false,
 	}
 

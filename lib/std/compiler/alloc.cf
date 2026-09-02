@@ -747,6 +747,129 @@ pub const address_taken = (Program prog): [Str] -> {
 	return r
 }
 
+const subtract_names = ([Str] xs, [Str] drop): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(xs.len) then break
+		if !has_name(drop, xs[i]) then r = [...r, xs[i]]
+		i = i + 1
+	}
+
+	return r
+}
+
+# The names BOUND inside a function body: every local a `let`/`const` introduces, a `for … in` loop
+# variable, a destructure, a `match` arm's captures, and a nested closure's name + parameters —
+# collected recursively through blocks, loops, ifs, matches, defers, and closures, AND through the
+# EXPRESSIONS those statements hold (a value block `{ …; <- v }` is an `Expr.Loop([Stmt])`, so a
+# `const` inside a match-arm block or an `if`-branch is a binding reached only by descending into the
+# expression tree). Paired with the function's parameters, this is the set a var-reference must miss
+# to count as FREE (a reference to a top-level name rather than a local).
+const bound_names_sarms = ([StmtArm] arms): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(arms.len) then break
+		r = cat_s(r, cat_s(arms[i].binds, bound_names_body(arms[i].body)))
+		i = i + 1
+	}
+
+	return r
+}
+
+const bound_names_marms = ([MatchArm] arms): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(arms.len) then break
+		r = cat_s(r, cat_s(arms[i].binds, bound_names_expr(arms[i].body)))
+		i = i + 1
+	}
+
+	return r
+}
+
+const bound_names_elist = ([Expr] es): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(es.len) then break
+		r = cat_s(r, bound_names_expr(es[i]))
+		i = i + 1
+	}
+
+	return r
+}
+
+const bound_names_expr = (Expr e): [Str] -> match unat(e) {
+	Expr.Loop(ss) -> bound_names_body(ss),
+	Expr.Match(s, arms) -> cat_s(bound_names_expr(s), bound_names_marms(arms)),
+	_ -> bound_names_elist(expr_children(e)),
+}
+
+const bound_names_stmt = (Stmt s): [Str] -> match s {
+	Stmt.Let(n, _, _, init) -> cat_s(exl_one_s(n), bound_names_expr(init)),
+	Stmt.ForIn(v, _, ss) -> cat_s(exl_one_s(v), bound_names_body(ss)),
+	Stmt.Loop(_, ss) -> bound_names_body(ss),
+	Stmt.Block(ss) -> bound_names_body(ss),
+	Stmt.IfThen(c, s2) -> cat_s(bound_names_expr(c), bound_names_stmt(s2)),
+	Stmt.IfElse(c, t, el) -> cat_s(bound_names_expr(c), cat_s(bound_names_stmt(t), bound_names_stmt(el))),
+	Stmt.Match(sc, arms) -> cat_s(bound_names_expr(sc), bound_names_sarms(arms)),
+	Stmt.Destructure(ns, _, e) -> cat_s(ns, bound_names_expr(e)),
+	Stmt.Defer(ss) -> bound_names_body(ss),
+	Stmt.Closure(n, ps, _, ss) -> cat_s(exl_one_s(n), cat_s(plist_names(ps), bound_names_body(ss))),
+	Stmt.Return(e) -> bound_names_expr(e),
+	Stmt.Yield(e) -> bound_names_expr(e),
+	Stmt.Do(e) -> bound_names_expr(e),
+	Stmt.Assign(_, e) -> bound_names_expr(e),
+	Stmt.FieldAssign(_, _, e) -> bound_names_expr(e),
+	Stmt.DeepFieldAssign(be, _, e) -> cat_s(bound_names_expr(be), bound_names_expr(e)),
+	Stmt.IndexAssign(_, ix, e) -> cat_s(bound_names_expr(ix), bound_names_expr(e)),
+	_ -> no_strs(),
+}
+
+const bound_names_body = ([Stmt] ss): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(ss.len) then break
+		r = cat_s(r, bound_names_stmt(ss[i]))
+		i = i + 1
+	}
+
+	return r
+}
+
+# The names used as a VALUE that are FREE — not bound as a local or parameter in the referencing
+# function. Like `address_taken`, a direct call's callee is a bare Str (not a Var), so a top-level
+# FUNCTION name lands here only when genuinely taken as a value (passed to a HOF, bound, returned) —
+# but UNLIKE `address_taken`, a same-named LOCAL is excluded, per function. The demand pass uses this
+# precise form: a `uses` function must not be rejected as "used as a value" merely because some
+# unrelated local somewhere shares its name (`address_taken` over-collects, which is safe for emit's
+# conservative use but wrong for a rejection).
+pub const value_refs_free = (Program prog): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(prog.funcs.len) then break
+		if !prog.funcs[i].is_asm then {
+			const [Str] refs = var_refs_body(prog.funcs[i].body)
+			const [Str] bound = union_names(param_names(prog.funcs[i]), bound_names_body(prog.funcs[i].body))
+			r = union_names(r, subtract_names(refs, bound))
+		}
+		i = i + 1
+	}
+
+	return r
+}
+
 const plist_names = ([Param] ps): [Str] -> {
 	let [Str] r = []
 	let Iarch i = 0
