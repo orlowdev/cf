@@ -430,3 +430,27 @@ def run(s, check, tdp, uri_of):
     # namespace guard must not swallow it)
     got = complete("const x = std::io.\nconst y = notamodule.\n" + text, 1, 21)
     check("completion after a value dot still answers", len(got) > 0, repr(got))
+
+    # an import-path member completes as its DESTRUCTURE: label plain, insertText braced
+    def complete_raw(buf, line, char):
+        s.notify("textDocument/didChange", {"textDocument": {"uri": uri_of(FIX)},
+                                            "contentChanges": [{"text": buf}]})
+        s.drain()
+        return s.request("textDocument/completion", tdp(FIX, line, char))["result"] or []
+
+    r = complete_raw("import std::data::\n" + text, 0, 18)
+    ins = {x["label"]: x.get("insertText") for x in r}
+    check("import member inserts the destructure", ins.get("Either") == "{ Either }", repr(ins))
+
+    # a wildcard-dispatch barrel's surface reaches the import path too
+    r = complete_raw("import std::io::console::\n" + text, 0, 25)
+    labs = [x["label"] for x in r]
+    check("import console:: offers the wildcard surface",
+          "println" in labs and "print" in labs, repr(labs))
+    check("import console:: members all insert braces",
+          all(x.get("insertText") == "{ %s }" % x["label"] for x in r), repr(r[:3]))
+
+    # a use-site member keeps the plain insert (no braces outside imports)
+    r = complete_raw("import std::io\nconst x = io::fd::\n" + text, 1, 18)
+    check("use-site members insert plainly",
+          all("insertText" not in x for x in r), repr(r[:3]))
