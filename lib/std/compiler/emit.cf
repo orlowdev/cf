@@ -1827,6 +1827,40 @@ const emit_binop! = (*Emit ctx, Str op, Expr l, Expr r, [Binding] env): Str -> {
 	return emit_fixed_canon!(ctx, fixed_bits(fx), fixed_signed(fx), res)
 }
 
+# `==`/`!=` — equality is STRUCTURAL (type_system §5). A scalar (integer, float, Bool,
+# tag-only union word) keeps the plain compare, which picks width/signedness/float form;
+# a `Str` or an aggregate (record/tuple/array/boxed union) runs the same structural walk
+# `std::test::equals` uses. The walk yields a `w` 0/1; it is widened (`==`) or negated
+# (`!=`) into the `l` Bool every comparison yields.
+const emit_cmp_eq! = (*Emit ctx, Expr l, Expr r, [Binding] env, Bool is_ne): Str -> {
+	let Str aggt = init_agg_type!(ctx, env, l)
+	let Bool froml = true
+	if eq(aggt, "") then {
+		aggt = init_agg_type!(ctx, env, r)
+		froml = false
+	}
+	# an UNBOXED (tag-only) union value IS its tag word — the scalar compare covers it
+	if find_union(ctx.unions, aggt) >= 0 && !union_is_boxed(ctx.unions, aggt) then aggt = ""
+	if eq(aggt, "") then return emit_binop!(ctx, if is_ne then "cnel" else "ceql", l, r, env)
+	const Expr side = if froml then l else r
+	const Str aop = emit_expr!(l, ctx, env)
+	const Str bop = emit_expr!(r, ctx, env)
+	let [TupElem] notel = []
+	let Str w = ""
+	if eq(aggt, "Str") then w = emit_eq!(ctx, env, aop, bop, "Str", notel)
+	else if eq(aggt, "$dyn")
+		then w = emit_eq!(ctx, env, aop, bop, "[${init_elem!(ctx, env, side)}]", notel)
+	else if eq(aggt, "$tuple")
+		then w = emit_eq!(ctx, env, aop, bop, "$tuple", init_telems!(ctx, env, side))
+	else w = emit_eq!(ctx, env, aop, bop, aggt, notel)
+	const Iarch res = ctx.next
+	ctx.next = ctx.next + 1
+	if is_ne then write_str(ctx.fd, "\t%t${res} =l ceqw ${w}, 0\n")
+	else write_str(ctx.fd, "\t%t${res} =l extuw ${w}\n")
+
+	return "%t${res}"
+}
+
 # Emit a unary operator whose result is `<op> <operand>` (a two-operand QBE
 # instruction with a constant): negation `sub 0, x`, logical not `ceql x, 0` (a
 # Bool 0/1 → its complement), bitwise not `xor x, -1` (all bits flipped). A fixed-width
@@ -7048,8 +7082,8 @@ const emit_expr! = (Expr e, *Emit ctx, [Binding] env): Str -> match e {
 	Expr.BitXor(l, r) -> emit_binop!(ctx, "xor", l, r, env),
 	Expr.Shl(l, r) -> emit_binop!(ctx, "shl", l, r, env),
 	Expr.Shr(l, r) -> emit_binop!(ctx, "sar", l, r, env),
-	Expr.CmpEq(l, r) -> emit_binop!(ctx, "ceql", l, r, env),
-	Expr.CmpNe(l, r) -> emit_binop!(ctx, "cnel", l, r, env),
+	Expr.CmpEq(l, r) -> emit_cmp_eq!(ctx, l, r, env, false),
+	Expr.CmpNe(l, r) -> emit_cmp_eq!(ctx, l, r, env, true),
 	Expr.CmpLt(l, r) -> emit_binop!(ctx, "csltl", l, r, env),
 	Expr.CmpGt(l, r) -> emit_binop!(ctx, "csgtl", l, r, env),
 	Expr.CmpLe(l, r) -> emit_binop!(ctx, "cslel", l, r, env),

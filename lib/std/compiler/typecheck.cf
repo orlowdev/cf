@@ -946,6 +946,113 @@ const eq_ty_recursive! = (Ctx ctx, Str tn, [Str] path): Bool -> {
 	return false
 }
 
+# Does the named type transitively carry an inline fixed-array (`$fix`) field? The
+# structural-eq walk has no per-element compare for one yet, so `==`/`!=` rejects it up
+# front instead of dying inside emit. Runs only AFTER the recursion check passed, so the
+# walk terminates without a visited set.
+const eq_ty_has_fix! = (Ctx ctx, Str tn): Bool -> {
+	if eq(tn, "") then return false
+	if is_nested(tn) then return eq_ty_has_fix!(ctx, nested_inner!(tn))
+	const Iarch ri = find_rec(ctx.recs, tn)
+	if ri >= 0 then {
+		let Iarch f = 0
+
+		loop {
+			if f >= Iarch(ctx.recs[ri].ftypes.len) then break
+			const Str ft = ctx.recs[ri].ftypes[f]
+			if eq(ft, "$fix") then return true
+			const Str walk = if eq(ft, "$dyn") then ctx.recs[ri].felems[f] else ft
+			if eq_ty_has_fix!(ctx, walk) then return true
+			f = f + 1
+		}
+
+		return false
+	}
+	const Iarch ui = find_union(ctx.unions, tn)
+	if ui >= 0 then {
+		let Iarch m = 0
+
+		loop {
+			if m >= Iarch(ctx.unions[ui].members.len) then break
+			let Iarch pp = 0
+
+			loop {
+				if pp >= Iarch(ctx.unions[ui].members[m].payloads.len) then break
+				const Str pt = ctx.unions[ui].members[m].payloads[pp]
+				const Str walk = if eq(pt, "$dyn")
+					then ctx.unions[ui].members[m].pelems[pp]
+				else pt
+				if eq_ty_has_fix!(ctx, walk) then return true
+				pp = pp + 1
+			}
+
+			m = m + 1
+		}
+
+		return false
+	}
+
+	return false
+}
+
+# A type `==`/`!=` compares STRUCTURALLY (type_system §5) — everything beyond the numeric
+# leaves: Bool, Str, records, tuples, arrays, and unions (tag first, then payload).
+const cmp_structural = (Ty t): Bool ->
+	is_tbool(t)
+	|| is_tstr(t)
+	|| is_ttuple(t)
+	|| !eq(rec_of(t), "")
+	|| !eq(union_of(t), "")
+	|| !eq(dyn_of(t), "")
+
+# The structural-`==` gates at the `Ty` level: a named type defers to the name walks
+# above; a tuple checks each position (a nested position recurses, a leaf walks its name).
+const cmp_ty_recursive! = (Ctx ctx, Ty t): Bool -> match t {
+	Ty.TRec(n) -> eq_ty_recursive!(ctx, n, no_path()),
+	Ty.TUnion(n) -> eq_ty_recursive!(ctx, n, no_path()),
+	Ty.TDyn(n) -> eq_ty_recursive!(ctx, "[${n}]", no_path()),
+	Ty.TTuple(e) -> tel_list_recursive!(ctx, e),
+	_ -> false,
+}
+
+const tel_list_recursive! = (Ctx ctx, [TupElem] tel): Bool -> {
+	let Iarch k = 0
+
+	loop {
+		if k >= Iarch(tel.len) then break
+		if tel_is_nest(tel[k]) then {
+			if tel_list_recursive!(ctx, tel[k].sub) then return true
+		}
+		else if eq_ty_recursive!(ctx, tel[k].name, no_path()) then return true
+		k = k + 1
+	}
+
+	return false
+}
+
+const cmp_ty_fix! = (Ctx ctx, Ty t): Bool -> match t {
+	Ty.TRec(n) -> eq_ty_has_fix!(ctx, n),
+	Ty.TUnion(n) -> eq_ty_has_fix!(ctx, n),
+	Ty.TDyn(n) -> eq_ty_has_fix!(ctx, "[${n}]"),
+	Ty.TTuple(e) -> tel_list_fix!(ctx, e),
+	_ -> false,
+}
+
+const tel_list_fix! = (Ctx ctx, [TupElem] tel): Bool -> {
+	let Iarch k = 0
+
+	loop {
+		if k >= Iarch(tel.len) then break
+		if tel_is_nest(tel[k]) then {
+			if tel_list_fix!(ctx, tel[k].sub) then return true
+		}
+		else if eq_ty_has_fix!(ctx, tel[k].name) then return true
+		k = k + 1
+	}
+
+	return false
+}
+
 pub const ty_name = (Ty t): Str -> match t {
 	Ty.TInt -> "Iarch",
 	Ty.TBool -> "Bool",
@@ -1539,27 +1646,39 @@ const int_binop! = (Expr l, Expr r, [VarTy] env, Ctx ctx, *DiagBag dg): Ty -> {
 	return int_result_ty(lt, rt, l, r, ctx, dg)
 }
 
-# `== != < > <= >=` — integer operands, a Bool result. `==`/`!=` (`is_eq`) also
-# compare two values of the SAME tag-only union: both lower to a word tag, so the
-# comparison is a tag compare (type_system §5 — equality is structural). Ordering
-# (`< > <= >=`) stays integer-only, and a payload-carrying union is recovered with
-# `match`, not compared by tag.
+# `== != < > <= >=` — a Bool result. Equality `==`/`!=` (`is_eq`) is STRUCTURAL and
+# near-universal (type_system §5): numerics and Bool by value, `Str` by bytes,
+# records/tuples/arrays field-wise, unions by tag then payload — both operands the same
+# type. A function value has no equality (undecidable, and erased at specialize); a
+# recursive type has no terminating structural walk; both reject. Ordering (`< > <= >=`)
+# stays defined ONLY on the twelve numeric types.
 const cmp_op! = (Expr l, Expr r, [VarTy] env, Ctx ctx, *DiagBag dg, Bool is_eq): Ty -> {
 	const Ty lt = type_of!(l, env, ctx, dg)
 	const Ty rt = type_of!(r, env, ctx, dg)
-	const Str lu = union_of(lt)
-	if is_eq && !eq(lu, "") then {
-		if !eq(lu, union_of(rt))
+	if is_eq && (is_tfn(lt) || is_tfn(rt))
+		then return terr(
+		ctx,
+		dg,
+		"cf: type: `==` on a function value — function equality is undecidable (type_system §5)\n",
+	)
+	if is_eq && (cmp_structural(lt) || cmp_structural(rt)) then {
+		if !ty_eq(lt, rt)
 			then return terr(
 			ctx,
 			dg,
-			"cf: type: `==`/`!=` on a union needs both operands to be the same union\n",
+			"cf: type: `==`/`!=` needs both operands of the same type\n",
 		)
-		if union_has_payload(ctx.unions, lu)
+		if cmp_ty_recursive!(ctx, lt)
 			then return terr(
 			ctx,
 			dg,
-			"cf: type: a union with a payload is recovered with `match`, not compared\n",
+			"cf: type: `==`/`!=` cannot compare `${ty_name(lt)}` — a recursive (self-referential) type has no terminating structural comparison\n",
+		)
+		if cmp_ty_fix!(ctx, lt)
+			then return terr(
+			ctx,
+			dg,
+			"cf: type: `==`/`!=` cannot compare `${ty_name(lt)}` — an inline fixed-array field has no structural comparison yet\n",
 		)
 
 		return Ty.TBool
