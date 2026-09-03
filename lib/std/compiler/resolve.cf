@@ -18,7 +18,7 @@ import std::compiler::diag::{ die_at_lc }
 import std::compiler::spans::{ SrcMap, src_map, unat }
 import std::io::file::{ open_read, read, close }
 import std::io::fd::{ Fd, IoRrr }
-import std::comptime::{ embed_dir, EmbeddedFile }
+import std::comptime::{ embed, embed_dir, EmbeddedFile }
 import std::compiler::token::{ Token, is_ident, is_lbrace, is_rbrace, is_pathsep, is_star }
 import std::compiler::ast::{
 	Expr,
@@ -532,17 +532,160 @@ const path_eq_pre = (Str a, Str b, Iarch blen): Bool -> {
 	return true
 }
 
+# A teaching rejection for an import whose LAST segment names a MEMBER rather than a module
+# (`import std::comptime::os::target`, with or without `as`): when the path-minus-tail IS a module
+# (on disk or embedded) and the tail is plausibly its member — a pub declaration, a destructured
+# reexport name, or anything behind a wildcard reexport — the import is one segment too deep; say
+# how to spell it. Returns "" otherwise (a genuinely missing import, the caller's plain error
+# stands).
+const leaf_hint! = ([EmbeddedFile] embedded, Str path, Iarch plen, Str impath, Os tos, Arch tarch): Str -> {
+	# the last `/` of the BUILT path splits `<dir><parent>` from `<leaf>.cf`
+	let Iarch lsl = -1
+	let Iarch i = 0
+
+	loop {
+		if i >= plen then break
+		if Iarch(path[i]) == 47 then lsl = i
+		i = i + 1
+	}
+
+	if lsl <= 0 then return ""
+	# probe `<dir><parent>.cf` the way the loader would open it: disk first, then the embed table
+	let [Uint8] pv = []
+	let Iarch j = 0
+
+	loop {
+		if j >= lsl then break
+		pv = [...pv, path[j]]
+		j = j + 1
+	}
+
+	pv = [...pv, 46] # '.'
+	pv = [...pv, 99] # 'c'
+	pv = [...pv, 102] # 'f'
+	const Iarch pplen = Iarch(pv.len)
+	pv = [...pv, 0] # NUL terminator for `open`
+	const Str pp = Str(pv)
+
+	let Bool have = match open_read(pp) {
+		Either.Left(e) -> false,
+		Either.Right(fd) -> {
+			close(fd)
+
+			<- true
+		},
+	}
+
+	if !have then {
+		for ef in embedded {
+			if path_eq_pre(ef.path, pp, pplen) then have = true
+		}
+	}
+
+	if !have then return ""
+	# spell the fix from the IMPORT path: `std/comptime/os/target` → import `std::comptime::os`,
+	# reference `os::target`
+	let Iarch cut = -1
+	let Iarch k = 0
+
+	loop {
+		if k >= Iarch(impath.len) then break
+		if Iarch(impath[k]) == 47 then cut = k
+		k = k + 1
+	}
+
+	if cut <= 0 then return ""
+	let [Uint8] lv0 = []
+	let Iarch t0 = cut + 1
+
+	loop {
+		if t0 >= Iarch(impath.len) then break
+		lv0 = [...lv0, impath[t0]]
+		t0 = t0 + 1
+	}
+
+	const Str leaf0 = Str(lv0)
+	# the parent opens — parse it (one level, nothing registered) and require the tail to look
+	# like a member, so a typo'd MODULE path (`std::nosuch`) keeps the plain missing-module error
+	const Loaded pl = load_module!(pp, "", "", "", 0, 0, tos, tarch, false, false, false)
+	let Bool member = has_pub_func(pl.prog, leaf0)
+
+	if !member then {
+		let Iarch mi = 0
+
+		loop {
+			if mi >= Iarch(pl.prog.imports.len) then break
+			if pl.prog.imports[mi].wildcard then member = true
+			if in_priv(pl.prog.imports[mi].names, leaf0) then member = true
+			mi = mi + 1
+		}
+	}
+
+	if !member then return ""
+	let Iarch pcut = 0 # start of the parent's last segment
+	let [Uint8] ns = []
+	let Iarch m = 0
+
+	loop {
+		if m >= cut then break
+
+		if Iarch(impath[m]) == 47 then {
+			ns = [...ns, 58] # ':'
+			ns = [...ns, 58]
+			pcut = m + 1
+		} else {
+			ns = [...ns, impath[m]]
+		}
+
+		m = m + 1
+	}
+
+	const Str pns = Str(ns)
+	const Str leaf = leaf0
+	let [Uint8] sv = []
+	let Iarch u = pcut
+
+	loop {
+		if u >= cut then break
+		sv = [...sv, impath[u]]
+		u = u + 1
+	}
+
+	const Str pseg = Str(sv)
+
+	return "cf: resolve: `${leaf}` is not a module — import `${pns}` and use `${pseg}::${leaf}` (`as` renames a namespace, not a member)\n"
+}
+
+# The std library baked into this binary: every module under `lib/std`, plus the top-level barrel
+# `lib/std.cf` that sits BESIDE the embedded root (the directory walk never carries it — prepended
+# under its one fixed path). The resolver's disk-miss fallback and the LSP's barrel-surface walk
+# share this one table.
+pub const embedded_std = (): [EmbeddedFile] -> [
+	EmbeddedFile({ path: "lib/std.cf", content: embed("lib/std.cf") }),
+	...embed_dir("lib/std"),
+]
+
 # cf hosts its own standard library: the bytes of every `lib/std` module are baked into the binary
 # by `embed_dir` (std::comptime), so a shipped cf resolves `std::…` imports with NOTHING on disk.
 # Called only when the on-disk `open` failed, so a repo/dev build (lib/std present) never builds the
 # table — it is materialized here, matched by path, and its bytes copied into `buf`. Returns the
 # module's byte length, or dies if the path is neither on disk nor embedded (a real missing import).
-const embed_fallback! = (Str path, Str importer, Iarch iline, Iarch icol, *[Uint8] buf, Iarch cap): Iarch -> {
+const embed_fallback! = (
+	Str path,
+	Str impath,
+	Str importer,
+	Iarch iline,
+	Iarch icol,
+	Os tos,
+	Arch tarch,
+	*[Uint8] buf,
+	Iarch cap,
+): Iarch -> {
 	# drop `build_path!`'s trailing NUL before matching against the bare embedded path.
 	let Iarch plen = Iarch(path.len)
 
 	if plen > 0 && Iarch(path[plen - 1]) == 0 then plen = plen - 1
-	const [EmbeddedFile] embedded = embed_dir("lib/std")
+	const [EmbeddedFile] embedded = embedded_std()
 	let Iarch n = -1
 
 	for ef in embedded {
@@ -567,6 +710,14 @@ const embed_fallback! = (Str path, Str importer, Iarch iline, Iarch icol, *[Uint
 			eprint("cf: cannot open the input file: ")
 			eprint(Str({ bytes: path.bytes, len: plen }))
 			die("\n")
+		}
+		# the tail may name a member of a real module — a leaf import (`std::io::fd::STDIN`, or an
+		# attempted leaf rename `std::comptime::os::target as t`): teach the two-step spelling
+		const Str hint = leaf_hint!(embedded, path, plen, impath, tos, tarch)
+
+		if Iarch(hint.len) > 0 then {
+			if iline > 0 then die_at_lc(importer, iline, icol, hint)
+			die(hint)
 		}
 		# a parsed import carries its stamp — the rejection lands on the `import` line itself
 		# (a synthetic import, stamped 0, keeps the unlocated form)
@@ -593,6 +744,7 @@ pub data Loaded = { Program prog, SrcMap map, [BindEv] evs }
 
 const load_module! = (
 	Str path,
+	Str impath,
 	Str src,
 	Str importer,
 	Iarch iline,
@@ -617,7 +769,8 @@ const load_module! = (
 	if Iarch(src.len) > 0 then rpath = src
 
 	const Iarch n = match open_read(rpath) {
-		Either.Left(e) -> embed_fallback!(path, importer, iline, icol, buf, Iarch(buf.len)),
+		Either.Left(e) ->
+			embed_fallback!(path, impath, importer, iline, icol, target_os, target_arch, buf, Iarch(buf.len)),
 		Either.Right(fd) -> {
 			const Iarch k = match read(fd, buf, Uarch(buf.len)) {
 				Either.Left(e) -> die("cf: reading an imported module failed: ${path}\n"),
@@ -713,7 +866,7 @@ const load_module! = (
 # imports are followed: local bindings live in the one file, so the entry's own parse is the
 # whole index (`src` overlays the bytes like `--src` everywhere else).
 pub const entry_binds! = (Str path, Str src, Os target_os, Arch target_arch): Loaded ->
-	load_module!(path, src, "", 0, 0, target_os, target_arch, false, false, true)
+	load_module!(path, "", src, "", 0, 0, target_os, target_arch, false, false, true)
 
 # Append every element of `src` onto `dst` (cf has no two-spread merge, so grow one at a
 # time). One helper per declaration list — the payload types differ.
@@ -864,7 +1017,8 @@ const sanitize_prefix! = (Str path): Str -> {
 # The resolved file path an import resolves to — `std/`-prefixed under the lib root, everything
 # else against the entry dir (the loader's rule, replayed so `find_mod` matches what was loaded).
 const mod_target_path! = (Str edir, Str impath): Str -> {
-	if has_prefix(impath, "std/") then return build_path!("lib/", impath)
+	# the bare `std` names the top-level barrel `lib/std.cf` — the one std path with no `/`
+	if has_prefix(impath, "std/") || eq(impath, "std") then return build_path!("lib/", impath)
 
 	return build_path!(edir, impath)
 }
@@ -2774,7 +2928,19 @@ pub const resolve_program! = (
 	Bool binstr,
 ): Resolved -> {
 	const Str edir = dir_of!(entry)
-	const Loaded l0 = load_module!(entry, src, "", 0, 0, target_os, target_arch, bdebug, binstr, false)
+	const Loaded l0 = load_module!(
+		entry,
+		"",
+		src,
+		"",
+		0,
+		0,
+		target_os,
+		target_arch,
+		bdebug,
+		binstr,
+		false,
+	)
 	const Program root = l0.prog
 	let [SrcMap] maps = [l0.map]
 	# the entry is prefix-empty (its names stay bare — it fixes the naming frame)
@@ -2859,6 +3025,7 @@ pub const resolve_program! = (
 				}
 				const Loaded lw = load_module!(
 					mpath,
+					im.path,
 					"",
 					wsrc[wi],
 					work[wi].dline,

@@ -21,6 +21,8 @@ import std::io::fs::{ remove, exists!, read_dir!, walk_dir! }
 import std::process::{ run!, find_executable!, getenv!, getpid, exit }
 import std::io::console::{ eprint }
 import std::mem::arena::growing_arena
+import std::comptime::{ EmbeddedFile }
+import std::compiler::resolve::{ embedded_std }
 import fmt::{ format_bytes! }
 
 # --- transport --------------------------------------------------------------------------------
@@ -2966,11 +2968,376 @@ const next_seg = (Str m, [Str] hints, Iarch n): Str -> {
 	return ""
 }
 
+# --- barrel-surface completion (the import graph as API structure) ---------------------------
+#
+# Completion for a qualified prefix follows the BARRELS — the `pub import` reexport structure a
+# library presents as its API — not the file tree. `std::io::` offers what `lib/std/io.cf`
+# forwards (`fd`, `console`, `file`, `fs`), not every declaration whose file path happens to
+# contain `/io/`. A direct file path still compiles and still resolves; only the SUGGESTIONS
+# stop inventing spellings the barrels never promised.
+
+# One export-surface entry: the completion label, its LSP CompletionItemKind (9 Module for a
+# namespace reexport — a next path segment), and the detail column (the reexport's target path,
+# or the declaration line).
+data SurfRow = { Str name, Iarch kind, Str detail }
+
+# One parsed import declaration line: `form` 0 = not an import, 1 = namespace, 2 = destructured
+# (`::{`), 3 = wildcard (`as *`); `path` the `::` module path as written; `alias` the bound
+# namespace name (the last segment, or the `as` rename); `tail` the text after `::{` (a
+# destructure may continue on later lines); `is_pub` whether the line reexports.
+data ImpRow = { Iarch form, Str path, Str alias, Str tail, Bool is_pub }
+
+const no_imp = (): ImpRow -> ImpRow({ form: 0, path: "", alias: "", tail: "", is_pub: false })
+
+# Parse one line as an import declaration (leading whitespace tolerated — a platform-dispatch
+# barrel nests its reexports under a comptime `if`). A trailing `# …` comment drops.
+const parse_imp = (Str ln): ImpRow -> {
+	let Str s = trim(ln)
+	let Bool is_pub = false
+
+	if starts_with("pub import ", s) then {
+		is_pub = true
+		s = slice(11, Iarch(s.len), s)
+	} else if starts_with("import ", s) then {
+		s = slice(7, Iarch(s.len), s)
+	} else {
+		return no_imp()
+	}
+
+	const Iarch hc = index_of(" #", s)
+	if hc >= 0 then s = slice(0, hc, s)
+	s = trim(s)
+	if Iarch(s.len) == 0 then return no_imp()
+	const Iarch br = index_of("::{", s)
+
+	if br >= 0 then {
+		return ImpRow({
+			form: 2,
+			path: slice(0, br, s),
+			alias: "",
+			tail: slice(br + 3, Iarch(s.len), s),
+			is_pub: is_pub,
+		})
+	}
+
+	const Iarch ai = index_of(" as ", s)
+
+	if ai >= 0 then {
+		const Str an = trim(slice(ai + 4, Iarch(s.len), s))
+		const Str p = slice(0, ai, s)
+		if eq(an, "*") then return ImpRow({ form: 3, path: p, alias: "", tail: "", is_pub: is_pub })
+
+		return ImpRow({ form: 1, path: p, alias: an, tail: "", is_pub: is_pub })
+	}
+
+	const [Str] segs = split("::", s)
+
+	return ImpRow({ form: 1, path: s, alias: segs[Iarch(segs.len) - 1], tail: "", is_pub: is_pub })
+}
+
+# The identifier runs of a destructure segment (`eq, starts_with,` → the names).
+const name_runs = (Str s): [Str] -> {
+	let [Str] out = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(s.len) then break
+
+		if name_byte(Iarch(s[i])) then {
+			let Iarch e = i
+
+			loop {
+				if e >= Iarch(s.len) || !name_byte(Iarch(s[e])) then break
+				e = e + 1
+			}
+
+			out = [...out, slice(i, e, s)]
+			i = e
+		} else {
+			i = i + 1
+		}
+	}
+
+	return out
+}
+
+# The directory prefix of a file path, `/` kept (`/a/b/c.cf` → `/a/b/`).
+const dir_of = (Str p): Str -> {
+	let Iarch lsl = -1
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(p.len) then break
+		if Iarch(p[i]) == 47 then lsl = i
+		i = i + 1
+	}
+
+	if lsl < 0 then return ""
+
+	return slice(0, lsl + 1, p)
+}
+
+# The source text of module path `mpath` (`std/io`): a `std`-rooted path opens `<pwd>/lib/…`
+# (the dev tree first, then the std baked into this very binary), anything else resolves
+# against the checked file's directory. "" when the path names no module.
+const mod_bytes! = (Str pwd, Str edir, Str mpath): Str -> {
+	const Bool is_std = starts_with("std/", mpath) || eq(mpath, "std")
+	let Str p = ""
+
+	if is_std then {
+		if Iarch(pwd.len) > 0 then p = "${pwd}/lib/${mpath}.cf" else p = "lib/${mpath}.cf"
+	} else {
+		p = "${edir}${mpath}.cf"
+	}
+
+	const Str disk = match read_file!(czstr!(p)) { Either.Right(s) -> s, Either.Left(e) -> "" }
+
+	if Iarch(disk.len) > 0 then return disk
+	if !is_std then return ""
+	const [EmbeddedFile] embedded = embedded_std()
+	const Str want = "lib/${mpath}.cf"
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(embedded.len) then break
+		if eq(embedded[i].path, want) then return embedded[i].content
+		i = i + 1
+	}
+
+	return ""
+}
+
+# The destructured names `names`, each resolved against the TARGET module's surface for its
+# kind and detail (a name the target does not surface completes as a plain constant).
+const flush_names! = (Str pwd, Str edir, Str ptxt, [Str] names, Iarch depth): [SurfRow] -> {
+	const [SurfRow] sub = surface!(pwd, edir, join("/", split("::", ptxt)), depth + 1)
+	let [SurfRow] out = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(names.len) then break
+		let Bool hit = false
+		let Iarch j = 0
+
+		loop {
+			if j >= Iarch(sub.len) then break
+
+			if !hit && eq(sub[j].name, names[i]) then {
+				out = [...out, sub[j]]
+				hit = true
+			}
+
+			j = j + 1
+		}
+
+		if !hit then out = [...out, SurfRow({ name: "${names[i]}", kind: 21, detail: ptxt })]
+		i = i + 1
+	}
+
+	return out
+}
+
+# The export surface of module `mpath`, as completion rows: its own pub declarations, the
+# names its destructured/wildcard `pub import`s forward (kinds looked up in the target), and
+# each namespace `pub import`'s alias as a next path segment (kind 9). Every branch of a
+# comptime `if` contributes (the union, deduped) — completion folds no target. `depth` caps
+# barrel chains; a missing module is the empty surface.
+const surface! = (Str pwd, Str edir, Str mpath, Iarch depth): [SurfRow] -> {
+	let [SurfRow] out = []
+	if depth > 6 then return out
+	const Str text = mod_bytes!(pwd, edir, mpath)
+	if Iarch(text.len) == 0 then return out
+	const [Str] lines = split("\n", text)
+	let [Str] seen = []
+	let Bool inbr = false
+	let Bool brpub = false
+	let Str brpath = ""
+	let [Str] brnames = []
+	let Iarch li = 0
+
+	loop {
+		if li >= Iarch(lines.len) then break
+		const Str ln = lines[li]
+
+		if inbr then {
+			# inside a multi-line `pub import a::b::{ …` block: collect names until the `}`
+			const Iarch ce = index_of("}", ln)
+			let Str part = "${ln}"
+			if ce >= 0 then part = slice(0, ce, ln)
+			const [Str] add = name_runs(part)
+			let Iarch ai = 0
+
+			loop {
+				if ai >= Iarch(add.len) then break
+				brnames = [...brnames, add[ai]]
+				ai = ai + 1
+			}
+
+			if ce >= 0 then {
+				inbr = false
+
+				if brpub then {
+					const [SurfRow] fr = flush_names!(pwd, edir, brpath, brnames, depth)
+					let Iarch fi = 0
+
+					loop {
+						if fi >= Iarch(fr.len) then break
+
+						if !in_list(fr[fi].name, seen) then {
+							seen = [...seen, fr[fi].name]
+							out = [...out, fr[fi]]
+						}
+
+						fi = fi + 1
+					}
+				}
+			}
+		} else {
+			const ImpRow im = parse_imp(ln)
+
+			if im.form == 2 then {
+				const Iarch ce = index_of("}", im.tail)
+
+				if ce >= 0 then {
+					if im.is_pub then {
+						const [SurfRow] fr = flush_names!(pwd, edir, im.path, name_runs(slice(0, ce, im.tail)), depth)
+						let Iarch fi = 0
+
+						loop {
+							if fi >= Iarch(fr.len) then break
+
+							if !in_list(fr[fi].name, seen) then {
+								seen = [...seen, fr[fi].name]
+								out = [...out, fr[fi]]
+							}
+
+							fi = fi + 1
+						}
+					}
+				} else {
+					inbr = true
+					brpub = im.is_pub
+					brpath = im.path
+					brnames = name_runs(im.tail)
+				}
+			} else if im.form == 3 && im.is_pub then {
+				# wildcard reexport — the whole target surface splices flat
+				const [SurfRow] sub = surface!(pwd, edir, join("/", split("::", im.path)), depth + 1)
+				let Iarch si = 0
+
+				loop {
+					if si >= Iarch(sub.len) then break
+
+					if !in_list(sub[si].name, seen) then {
+						seen = [...seen, sub[si].name]
+						out = [...out, sub[si]]
+					}
+
+					si = si + 1
+				}
+			} else if im.form == 1 && im.is_pub then {
+				if !in_list(im.alias, seen) then {
+					seen = [...seen, im.alias]
+					out = [...out, SurfRow({ name: im.alias, kind: 9, detail: im.path })]
+				}
+			} else if im.form == 0 && starts_with("pub ", ln) then {
+				const DeclLine d = scan_decl(ln)
+
+				if d.kind > 0 then {
+					const Str nm = slice(d.ns, d.ne, ln)
+
+					if !in_list(nm, seen) then {
+						seen = [...seen, nm]
+						out = [...out, SurfRow({ name: nm, kind: citem_kind(d.kind), detail: tidy_sig(ln) })]
+					}
+				}
+			}
+		}
+
+		li = li + 1
+	}
+
+	return out
+}
+
+# The module path a qualified prefix names, chased the way the compiler resolves the spelling:
+# the FIRST segment may be one of the checked file's import aliases (`import std::comptime::os
+# as myos` → `myos::` completes like `os::`), the remaining segments join as the direct path.
+# "" when no module file answers — the caller falls back to the file-tree walk.
+const hints_module! = (Str pwd, Str edir, [Str] flines, [Str] hints): Str -> {
+	if Iarch(hints.len) == 0 then return ""
+	let Str tgt = ""
+	let Iarch fi = 0
+
+	loop {
+		if fi >= Iarch(flines.len) then break
+		const ImpRow im = parse_imp(flines[fi])
+		if im.form == 1 && eq(im.alias, hints[0]) then tgt = im.path
+		fi = fi + 1
+	}
+
+	let [Str] segs = []
+
+	if Iarch(tgt.len) > 0 then {
+		const [Str] ts = split("::", tgt)
+		let Iarch k = 0
+
+		loop {
+			if k >= Iarch(ts.len) then break
+			segs = [...segs, ts[k]]
+			k = k + 1
+		}
+	} else {
+		segs = [...segs, hints[0]]
+	}
+
+	let Iarch i = 1
+
+	loop {
+		if i >= Iarch(hints.len) then break
+		segs = [...segs, hints[i]]
+		i = i + 1
+	}
+
+	const Str mpath = join("/", segs)
+	if Iarch(mod_bytes!(pwd, edir, mpath).len) == 0 then return ""
+
+	return mpath
+}
+
+# Where the completion cursor sits relative to an import declaration: on one at all, and
+# inside its `::{ … }` destructure block (whose module path is `path`).
+data ImpCtx = { Bool online, Bool inbrace, Str path }
+
+const imp_ctx = (Str ln, Iarch c0): ImpCtx -> {
+	# `trim` eats the trailing space of a bare `import `, so the keyword alone counts too
+	const Str t = trim(ln)
+	const Bool decl = starts_with("import ", t) ||
+		starts_with("pub import ", t) ||
+		eq(t, "import") ||
+		eq(t, "pub import")
+
+	if !decl then return ImpCtx({ online: false, inbrace: false, path: "" })
+	const Iarch pi = index_of("import ", ln)
+	const Iarch br = index_of("::{", ln)
+
+	if pi >= 0 && br > pi && c0 > br + 2 then {
+		const Iarch ce = index_of("}", ln)
+
+		if ce < 0 || ce >= c0 then {
+			return ImpCtx({ online: true, inbrace: true, path: trim(slice(pi + 7, br, ln)) })
+		}
+	}
+
+	return ImpCtx({ online: true, inbrace: false, path: "" })
+}
+
 # Answer textDocument/completion: what the typed prefix could become. A `Type.` base offers
-# the union's members; a qualified prefix (`str::`) offers the hint-narrowed declarations
-# plus the NEXT path segment of each matching module (so `std::` walks the tree); a bare
-# prefix offers every declaration in scope, deduped by name. The client filters by the typed
-# word, so no server-side prefix filtering.
+# the union's members; a qualified prefix (`str::`) resolves through the barrel structure —
+# the named module's EXPORT SURFACE (its pub declarations, forwarded names, and reexported
+# namespaces as next segments) — falling back to the hint-narrowed file-tree walk only when
+# no module answers; a bare prefix offers every declaration in scope, deduped by name. The
+# client filters by the typed word, so no server-side prefix filtering.
 const completions! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, Iarch c0): Json -> {
 	const [Json] nothing = []
 	if !starts_with("file://", uri) then return Json.Arr(nothing)
@@ -3008,6 +3375,61 @@ const completions! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l
 		return Json.Arr(items)
 	}
 
+	const Str edir = dir_of(path)
+	const ImpCtx ic = imp_ctx(lines[l0], c0)
+
+	# inside `import a::b::{ …` — the destructured module's VALUE surface, nothing else
+	if ic.inbrace then {
+		const [SurfRow] bsurf = surface!(pwd, edir, join("/", split("::", ic.path)), 0)
+
+		for s in bsurf {
+			if s.kind != 9 then items = [...items, citem(s.name, s.kind, s.detail)]
+		}
+
+		return Json.Arr(items)
+	}
+
+	# a qualified prefix that names a module: its EXPORT SURFACE (barrel-following). On an
+	# import PATH position only the kind-9 namespaces complete — a member there would
+	# autocomplete straight into the leaf-import rejection.
+	if Iarch(t.hints.len) > 0 then {
+		const Str bm = hints_module!(pwd, edir, lines, t.hints)
+
+		if Iarch(bm.len) > 0 then {
+			const [SurfRow] bsurf = surface!(pwd, edir, bm, 0)
+			let Iarch nout = 0
+
+			for s in bsurf {
+				if !(ic.online && s.kind != 9) then {
+					items = [...items, citem(s.name, s.kind, s.detail)]
+					nout = nout + 1
+				}
+			}
+
+			if nout > 0 then return Json.Arr(items)
+		}
+	}
+
+	# an import line's FIRST segment: the roots — `std` and the checked file's siblings
+	if ic.online && Iarch(t.hints.len) == 0 then {
+		items = [...items, citem("std", 9, "the standard library")]
+
+		match read_dir!(edir) {
+			Either.Left(e) -> {},
+			Either.Right(entries) -> for e in entries {
+				if Iarch(e.name.len) > 0 && Iarch(e.name[0]) != 46 then {
+					if entry_is_dir(e) then {
+						items = [...items, citem(e.name, 9, "${edir}${e.name}/")]
+					} else if ends_with(".cf", e.name) && !eq("${edir}${e.name}", path) then {
+						items = [...items, citem(slice(0, Iarch(e.name.len) - 3, e.name), 9, "${edir}${e.name}")]
+					}
+				}
+			},
+		}
+
+		return Json.Arr(items)
+	}
+
 	let [Str] seen = []
 
 	# a bare prefix: the LOCALS visible at the cursor come first — kind 6 (Variable), the
@@ -3027,15 +3449,18 @@ const completions! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l
 		}
 	}
 
-	const [SymRow] decls = all_decls!(scan, owner, srcf)
+	# an import PATH position continues with modules only — the decl dump never applies there
+	if !ic.online then {
+		const [SymRow] decls = all_decls!(scan, owner, srcf)
 
-	for d in decls {
-		let Bool keep = true
-		if Iarch(t.hints.len) > 0 then keep = hint_ok!(t.hints, Iarch(t.hints.len), d.file)
+		for d in decls {
+			let Bool keep = true
+			if Iarch(t.hints.len) > 0 then keep = hint_ok!(t.hints, Iarch(t.hints.len), d.file)
 
-		if keep && !in_list(d.sname, seen) then {
-			seen = [...seen, d.sname]
-			items = [...items, citem(d.sname, citem_kind(d.kind), d.file)]
+			if keep && !in_list(d.sname, seen) then {
+				seen = [...seen, d.sname]
+				items = [...items, citem(d.sname, citem_kind(d.kind), d.file)]
+			}
 		}
 	}
 

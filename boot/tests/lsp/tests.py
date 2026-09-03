@@ -371,3 +371,50 @@ def run(s, check, tdp, uri_of):
     s.drain()
     r = s.request("textDocument/formatting", fmt_params)["result"]
     check("formatting after save falls back to the clean disk file", r == [], repr(r))
+
+    # --- completion: barrel-following (the import graph as API structure) ---
+    def complete(buf, line, char):
+        s.notify("textDocument/didChange", {"textDocument": {"uri": uri_of(FIX)},
+                                            "contentChanges": [{"text": buf}]})
+        s.drain()
+        r = s.request("textDocument/completion", tdp(FIX, line, char))["result"]
+        return [(x["label"], x["kind"]) for x in (r or [])]
+
+    # the std root: the 8 top-level barrels, all Modules, nothing buried
+    got = complete("const x = std::\n" + text, 0, 15)
+    check("completion std:: lists the top barrels",
+          sorted(got) == sorted([("comptime", 9), ("compiler", 9), ("data", 9), ("io", 9),
+                                 ("math", 9), ("process", 9), ("sys", 9), ("test", 9)]), repr(got))
+
+    # an import path continues with MODULES only — io.cf's namespace reexports, no members
+    got = complete("import std::io::\n" + text, 0, 16)
+    check("completion import std::io:: follows the barrel",
+          sorted(got) == sorted([("fd", 9), ("console", 9), ("file", 9), ("fs", 9), ("term", 9)]),
+          repr(got))
+    check("completion import std::io:: buries no member",
+          all(k == 9 for _, k in got), repr(got))
+
+    # a use through the file's import alias walks the same surface
+    got = complete("import std::io\nconst x = io::\n" + text, 1, 14)
+    check("completion io:: through the alias",
+          sorted(n for n, _ in got) == sorted(["fd", "console", "file", "fs", "term"]), repr(got))
+
+    # an `as`-renamed alias completes like its target
+    got = complete("import std::comptime::os as myos\nconst x = myos::\n" + text, 1, 16)
+    check("completion through an as-renamed alias",
+          sorted(n for n, _ in got) == sorted(["target", "current"]), repr(got))
+
+    # inside `::{` — the destructured module's VALUE surface with true kinds
+    got = complete("import std::data::{ \n" + text, 0, 20)
+    check("completion inside the destructure brace",
+          sorted(n for n, _ in got) == sorted(["Either", "Maybe", "Json", "JsonEntry", "JsonRrr"]),
+          repr(got))
+
+    # a member surface two hops deep keeps declaration kinds (22 Struct, 3 Function, 21 Constant)
+    got = complete("import std::io\nconst x = io::fd::\n" + text, 1, 18)
+    check("completion io::fd:: surfaces the module's pubs",
+          ("STDIN", 21) in got and ("Fd", 22) in got and ("entry_is_dir", 3) in got, repr(got))
+
+    # the first segment of an import: the roots only
+    got = complete("import \n" + text, 0, 7)
+    check("completion import first segment offers std", got == [("std", 9)], repr(got))
