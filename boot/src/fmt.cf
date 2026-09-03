@@ -163,6 +163,25 @@ const tok_is_match = (*[Uint8] src, Token t): Bool -> {
 	return true
 }
 
+# Does token `t`'s source text equal the keyword `for` (bytes f,o,r)?
+const tok_is_for = (*[Uint8] src, Token t): Bool -> {
+	if Iarch(t.len) != 3 then return false
+	if Iarch(src[t.start]) != 102 then return false
+	if Iarch(src[t.start + 1]) != 111 then return false
+	if Iarch(src[t.start + 2]) != 114 then return false
+
+	return true
+}
+
+# Does token `t`'s source text equal the keyword `in` (bytes i,n)?
+const tok_is_in = (*[Uint8] src, Token t): Bool -> {
+	if Iarch(t.len) != 2 then return false
+	if Iarch(src[t.start]) != 105 then return false
+	if Iarch(src[t.start + 1]) != 110 then return false
+
+	return true
+}
+
 # Does token `t` open a TOP-LEVEL declaration? — a keyword that begins one (`pub` covers every
 # `pub ...` form): `const`/`pub`/`data`/`union`/`type`/`import`/`intrinsic`. At bracket depth 0 and
 # line-leading, such a token marks a declaration boundary (a `const` inside a body is a local, but
@@ -308,6 +327,64 @@ const ends_operand = (*[Uint8] src, [Token] toks, Iarch i): Bool -> {
 	if tok_is_if(src, t) || tok_is_match(src, t) || tok_is_loop(src, t) then return false
 
 	return !tok_is_other_kw(src, t)
+}
+
+# Does the line-leading token `i` BEGIN a next-line for-loop body? True when the line above
+# (skipping comment-only lines, which ride with the body) is a bare for-HEADER: a bracket-level
+# `for` followed by its `in`, whose iterable runs to the end of the line — no `{` and no same-line
+# statement head after it (expressions never juxtapose, so a statement head shows as an operand
+# ender followed by an identifier or `<-`). Such a break is the unbraced single-statement body
+# (ebnf for_expr branch), an expression continuation: it indents one stop past its header, and
+# `format_source!` carries that stop into any block the body line opens.
+const for_body_break = (*[Uint8] src, [Token] toks, Iarch i): Bool -> {
+	let Iarch hi = i
+
+	loop {
+		if hi <= 0 then return false
+		let Iarch s = hi - 1
+
+		loop {
+			if s <= 0 then break
+			if count_nl(src, src_hi(toks[s - 1]), src_lo(toks[s])) > 0 then break
+			s = s - 1
+		}
+
+		let Bool allc = true
+		let Iarch c = s
+
+		loop {
+			if c >= hi then break
+			if !is_comment(toks[c].kind) then allc = false
+			c = c + 1
+		}
+
+		if !allc then {
+			let Iarch bal = 0
+			let Iarch st = 0
+			let Iarch j = s
+
+			loop {
+				if j >= hi then break
+				const Token t = toks[j]
+				if is_closer(t.kind) then bal = bal - 1
+				if st == 0 && bal == 0 && is_ident(t.kind) && tok_is_for(src, t) then st = 1
+				else if st == 1 && bal == 0 && is_ident(t.kind) && tok_is_in(src, t) then st = 2
+				else if st == 2 then {
+					if bal == 0 && is_lbrace(t.kind) then return false
+					if ends_operand(src, toks, j - 1) && (is_ident(t.kind) || is_yield(t.kind))
+						then return false
+				}
+				if is_opener(t.kind) then bal = bal + 1
+				j = j + 1
+			}
+
+			return st == 2
+		}
+
+		hi = s
+	}
+
+	return false
 }
 
 # The canonical intra-line gap BEFORE token `i` (Phase F), for a gap holding no newline: 0
@@ -952,6 +1029,10 @@ pub const format_source! = (*[Uint8] src, Iarch n, Str file): [Uint8] -> {
 	let Iarch carry = 0
 	let [Iarch] cstk = []
 	let Iarch pending_clause = 0
+	# `fcarry` is the next-line for-body's stop, live for its whole LINE: every bracket the body
+	# line opens pushes it into `carry` (via `cstk`), so a multi-line body (`if ... then {` …)
+	# indents its interior past the body head, not just past the `for` header
+	let Iarch fcarry = 0
 	let Iarch i = 0
 
 	loop {
@@ -989,6 +1070,7 @@ pub const format_source! = (*[Uint8] src, Iarch n, Str file): [Uint8] -> {
 				out = [...out, Uint8(32)]
 			} else {
 				lead = true
+				fcarry = 0
 				out = [...out, Uint8(10)]
 				if nl >= 2 || blank_before[i] then out = [...out, Uint8(10)]
 				let Iarch ind = depth + carry
@@ -1002,6 +1084,10 @@ pub const format_source! = (*[Uint8] src, Iarch n, Str file): [Uint8] -> {
 				if is_arrow(p.kind) || is_logor(p.kind) || is_logand(p.kind) then ind = ind + 1
 				else if tok_is_then(src, t) || tok_is_else(src, t) then ind = ind + ladder[i]
 				else if is_pipearrow(t.kind) || is_dot(t.kind) then ind = ind + 1
+				else if for_body_break(src, toks, i) then {
+					ind = ind + 1
+					fcarry = 1
+				}
 				if ind < 0 then ind = 0
 				let Iarch ti = 0
 
@@ -1064,8 +1150,8 @@ pub const format_source! = (*[Uint8] src, Iarch n, Str file): [Uint8] -> {
 		if is_opener(t.kind) && !ptrans[i] then {
 			depth = depth + 1
 			if depth >= Iarch(cstk.len) then cstk = [...cstk, 0]
-			cstk[depth] = pending_clause
-			carry = carry + pending_clause
+			cstk[depth] = pending_clause + fcarry
+			carry = carry + pending_clause + fcarry
 		}
 
 		if is_closer(t.kind) && !ptrans[i] then {

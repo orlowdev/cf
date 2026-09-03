@@ -1389,9 +1389,12 @@ Points:
   form unambiguous against the one-binder `for x in`.
   `for` is **nameless** — no label. The body is a `branch` (a `block` or a single
   expression), which is what makes it one-lineable (`for i in xs if ...`) and an
-  expression (`... then i else 2`). The iterable is a full `expression`; because
-  expressions never juxtapose (calls always use `()`), the boundary between it
-  and the body is unambiguous — `xs { ... }` and `xs if ...` both split cleanly. The
+  expression (`... then i else 2`). An unbraced body binds exactly one statement
+  wherever it starts — on the header's line or the next (indented) one; only a
+  multi-statement body needs the `{ ... }`. The iterable is a full `expression`;
+  because expressions never juxtapose (calls always use `()`), the boundary
+  between it and the body is unambiguous — `xs { ... }` and `xs if ...` both
+  split cleanly, on one line or across the break. The
   `in` here is the loop's own, distinct from the geometry `in` clause (the `for`
   keyword leads, so there is no clash).
 - **`break` / `continue` are never-typed expressions.** Each takes an optional
