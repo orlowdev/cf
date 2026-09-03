@@ -27,9 +27,9 @@ f144:
 	li a0, 2
 	ret
 
-.globl f500
+.globl f501
 .p2align 2
-f500:
+f501:
 	mv a0, a0
 	li a7, 94
 	ecall

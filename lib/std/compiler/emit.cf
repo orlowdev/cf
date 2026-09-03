@@ -150,6 +150,9 @@ data Emit = {
 	# the AGGREGATE value-const names (astutil `agg_val_names`): never emitted (no ambient), every
 	# reference spliced by the inline fold — a call reaching one here is a missed reference position
 	[Str] aggvals,
+	# the current function converts self-tail-calls to loops (tco_eligible, decided before the
+	# body emits): one flag gates BOTH the `@tailtop` label and every tail jump, so they agree
+	Bool tco_ok,
 }
 
 # The resolved intrinsic callees for context (module_system §8 flattens the module path).
@@ -6340,6 +6343,228 @@ const emit_ifelse! = (*Emit ctx, [Binding] env, Expr cond, Stmt tb, Stmt eb): Ia
 	return both
 }
 
+# ── Self-tail-call → loop (TCO, the out-of-stack fix) ────────────────────────────────────────────
+# QBE emits every call as a plain `call` — frame push, no tail calls — so `return f(n-1, acc)`
+# inside `f` stacks one un-returned frame per step and deep recursion dies on the guard page. But
+# a `return` IS tail position: nothing in this frame is pending after the callee, so a SELF-call
+# can reuse the frame in place — evaluate the arguments, store them into the parameter bindings,
+# and jump back to `@tailtop` (the label emit_func! places right after the parameter spills). The
+# hidden ABI needs no restore: a self-call threads the same `%node_0` and the same `%cxp<k>`s.
+# v1 converts COLORLESS functions only (no `!`): their `return` is already a bare `ret`, so the
+# jump substitutes exactly; a bracketed frame must rewind its residue — and only its residue, the
+# arguments may live survivor-side — per iteration, which is the v2 ordering. Mutual tail
+# recursion and non-tail recursion (`1 + f(n-1)` has pending work per frame) stay frame-per-call.
+
+# The hazard scan: a body `alloc8` re-executed per tail iteration would grow `sp` each pass — QBE
+# assigns static slots only to constant allocs in the START block (arm64/isel), and `@tailtop`
+# ends it — trading the recursion's frame growth for silent alloc creep. A `$`-stack Let is that
+# alloc (and the Let arm's own in-loop `$` rejection cannot see this loop, which is born at
+# emit), so its presence disables the conversion. Defer lowering's `$ret` snapshot also lands
+# here, harmlessly: a defer-carrying `return` is `return $ret`, never a self-call. (Capture cells
+# are the other mid-body allocs — tco_eligible gates them off wholesale. A payloaded-union `==`
+# allocs its 8-byte result slot too, but per iteration that is still far below the frame-per-call
+# it replaces, so it stays eligible.)
+const tco_hazard_expr = (Expr e): Bool -> match e {
+	Expr.Loop(ss) -> tco_hazard_body(ss),
+	_ -> tco_hazard_list(kids(e)),
+}
+
+const tco_hazard_list = ([Expr] es): Bool -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(es.len) then break
+		if tco_hazard_expr(es[i]) then return true
+		i = i + 1
+	}
+
+	return false
+}
+
+const tco_hazard_names = ([Str] ns): Bool -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(ns.len) then break
+		if is_stack_name(ns[i]) then return true
+		i = i + 1
+	}
+
+	return false
+}
+
+const tco_hazard_stmt = (Stmt s): Bool -> {
+	const Bool here = match s {
+		Stmt.Let(n, _, _, _) -> is_stack_name(n),
+		Stmt.Destructure(ns, _, _) -> tco_hazard_names(ns),
+		_ -> false,
+	}
+
+	if here then return true
+	if tco_hazard_list(stmt_exprs(s)) then return true
+
+	return match s {
+		Stmt.IfThen(_, b) -> tco_hazard_stmt(b),
+		Stmt.IfElse(_, t, el) -> tco_hazard_stmt(t) || tco_hazard_stmt(el),
+		Stmt.Block(ss) -> tco_hazard_body(ss),
+		Stmt.Loop(_, ss) -> tco_hazard_body(ss),
+		Stmt.ForIn(_, _, ss) -> tco_hazard_body(ss),
+		Stmt.Match(_, arms) -> tco_hazard_arms(arms),
+		Stmt.Defer(ss) -> tco_hazard_body(ss),
+		Stmt.Closure(_, _, _, cb) -> tco_hazard_body(cb),
+		_ -> false,
+	}
+}
+
+const tco_hazard_arms = ([StmtArm] arms): Bool -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(arms.len) then break
+		if tco_hazard_body(arms[i].body) then return true
+		i = i + 1
+	}
+
+	return false
+}
+
+const tco_hazard_body = ([Stmt] ss): Bool -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(ss.len) then break
+		if tco_hazard_stmt(ss[i]) then return true
+		i = i + 1
+	}
+
+	return false
+}
+
+# Does the body hold at least one statement-level `return <self-call>`? Decides whether the
+# `@tailtop` label is worth placing. (A self-tail return inside a VALUE loop is not counted —
+# rare enough to skip — but if the flag is up it converts like any other: `ctx.tco_ok` gates
+# label and jumps together, so they can never disagree.)
+const tco_tail_stmt = (Stmt s, Str fname): Bool -> match s {
+	Stmt.Return(e) -> match e { Expr.Call(cn, _, _, cg) -> eq(cn, fname) && eq(cg, ""), _ -> false },
+	Stmt.IfThen(_, b) -> tco_tail_stmt(b, fname),
+	Stmt.IfElse(_, t, el) -> tco_tail_stmt(t, fname) || tco_tail_stmt(el, fname),
+	Stmt.Block(ss) -> tco_tail_body(ss, fname),
+	Stmt.Loop(_, ss) -> tco_tail_body(ss, fname),
+	Stmt.ForIn(_, _, ss) -> tco_tail_body(ss, fname),
+	Stmt.Match(_, arms) -> tco_tail_arms(arms, fname),
+	_ -> false,
+}
+
+const tco_tail_arms = ([StmtArm] arms, Str fname): Bool -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(arms.len) then break
+		if tco_tail_body(arms[i].body, fname) then return true
+		i = i + 1
+	}
+
+	return false
+}
+
+const tco_tail_body = ([Stmt] ss, Str fname): Bool -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(ss.len) then break
+		if tco_tail_stmt(ss[i], fname) then return true
+		i = i + 1
+	}
+
+	return false
+}
+
+# TCO eligibility, decided once per function before its body emits. Colorless only (v1); a
+# capture-carrying function is out (its cells `alloc8` mid-body — the hazard note above); `main`
+# never self-tails (it holds the graft); a value const cannot reference itself.
+const tco_eligible = (*Emit ctx, Func fn): Bool -> {
+	if eq(fn.name, "main") then return false
+	if fn.is_value then return false
+	if fn_brackets(fn) then return false
+	if has_cap_param(fn) then return false
+	if Iarch(ctx.cap_cells.len) > 0 then return false
+	if tco_hazard_body(fn.body) then return false
+
+	return tco_tail_body(fn.body, fn.name)
+}
+
+# `return f(args)` where `f` IS this function: loop instead of call. The arguments are ALL
+# evaluated into fresh temps first — `return f(b, a)` must read both old parameter values before
+# either binding is overwritten — then stored into the parameter bindings (env's stable prefix:
+# emit_block! seeds env from the spill loop's list and scopes only ever append). A cell stores
+# through its slot in the value's class; a write-once aggregate/pointer temp is re-`copy`-defined
+# (QBE's ssa pass phis it at `@tailtop`). Returns false when `e` is not an eligible self-call —
+# the caller emits the ordinary call + `ret`.
+const emit_tail_jump! = (*Emit ctx, [Binding] env, Expr e): Bool -> {
+	if !ctx.tco_ok then return false
+
+	match e {
+		Expr.Call(cn, _, cargs, cg) -> {
+			if !eq(cg, "") then return false
+			if !eq(cn, ctx.funcs[ctx.cur_fn].name) then return false
+			# a binding shadowing the function's name would make this an INDIRECT call
+			if lookup_index(env, cn) >= 0 then return false
+			# a body `provide` extended the context scope: the hidden ctx args are no longer
+			# the incoming `%cxp<k>` identity — take the plain call
+			if Iarch(ctx.ctx_tys.len) != Iarch(ctx.funcs[ctx.cur_fn].uses.len) then return false
+			if Iarch(cargs.len) != Iarch(ctx.funcs[ctx.cur_fn].params.len) then return false
+			let [Iarch] tts = []
+			let Iarch i = 0
+
+			loop {
+				if i >= Iarch(cargs.len) then break
+				# per-kind argument evaluation, mirroring emit_call! (capture params cannot
+				# occur — tco_eligible gates them)
+				const Param p = ctx.funcs[ctx.cur_fn].params[i]
+				let Str aqt = "l"
+				let Str v = ""
+
+				if eq(p.type_name, "$fn") then v = emit_fnval!(ctx, env, cargs[i])
+				else if eq(p.type_name, "$ptr") then v = emit_ptr_arg!(ctx, env, cargs[i])
+				else if is_agg_param(p, ctx.recs, ctx.unions) then v = emit_expr!(cargs[i], ctx, env)
+				else {
+					aqt = qtype_of_name(p.type_name)
+					v = emit_expr!(cargs[i], ctx, env)
+				}
+
+				const Iarch tt = ctx.next
+				ctx.next = ctx.next + 1
+				write_str(ctx.fd, "\t%t${tt} =${aqt} copy ${v}\n")
+				tts = [...tts, tt]
+				i = i + 1
+			}
+
+			let Iarch j = 0
+
+			loop {
+				if j >= Iarch(tts.len) then break
+
+				if env[j].is_cell then {
+					write_str(ctx.fd, "\t${store_op(env[j].fixed)} %t${tts[j]}, %t${env[j].slot}\n")
+				} else {
+					write_str(ctx.fd, "\t%t${env[j].slot} =l copy %t${tts[j]}\n")
+				}
+
+				j = j + 1
+			}
+
+			write_str(ctx.fd, "\tjmp @tailtop\n")
+
+			return true
+		},
+		_ -> {
+			return false
+		},
+	}
+
+	return false
+}
+
 # Emit one "simple" statement — a loop exit, an early return, an assignment, or a nested
 # `if` guard. It is the fall-through case of `emit_block` and the body of every guard, so
 # it reads the environment but never extends it (a binding/block statement is a block
@@ -6387,21 +6612,27 @@ const emit_simple_stmt! = (*Emit ctx, [Binding] env, Stmt s): Iarch -> {
 			term = 1
 		},
 		Stmt.Return(e) -> {
-			# a bare `({...})` record literal is built as the function's return record type (its own
-			# type_name is empty); every other value emits normally
-			let Str v = ""
-			if is_bare_record_e(e) && find_rec(ctx.recs, ctx.cur_ret) >= 0 then {
-				const Iarch b = emit_record_lit!(ctx, ctx.cur_ret, record_inits_e(e), env)
-				v = "%t${b}"
-			} else v = emit_expr!(e, ctx, env)
-			# rewind the residue subnode to the frame's entry mark, reclaiming its trapped
-			# scratch — and, where nothing escapes (fn_surmarks), the SURVIVOR triple too,
-			# freeing dropped callee returns and carved child arenas (the scalar return value
-			# rides a register, so it survives both). geometry_lowering §2.
-			if ctx.reset_mark >= 0 then emit_reset!(ctx, ctx.reset_mark, "%res_0")
-			if ctx.sur_mark >= 0 then emit_reset!(ctx, ctx.sur_mark, "%node_0")
-			write_str(ctx.fd, "\tret ${v}\n")
-			term = 1
+			# a SELF-tail-call reuses the frame: store the arguments into the parameter bindings
+			# and jump back to `@tailtop` instead of calling (emit_tail_jump!, the TCO block above)
+			if emit_tail_jump!(ctx, env, e) then {
+				term = 1
+			} else {
+				# a bare `({...})` record literal is built as the function's return record type (its
+				# own type_name is empty); every other value emits normally
+				let Str v = ""
+				if is_bare_record_e(e) && find_rec(ctx.recs, ctx.cur_ret) >= 0 then {
+					const Iarch b = emit_record_lit!(ctx, ctx.cur_ret, record_inits_e(e), env)
+					v = "%t${b}"
+				} else v = emit_expr!(e, ctx, env)
+				# rewind the residue subnode to the frame's entry mark, reclaiming its trapped
+				# scratch — and, where nothing escapes (fn_surmarks), the SURVIVOR triple too,
+				# freeing dropped callee returns and carved child arenas (the scalar return value
+				# rides a register, so it survives both). geometry_lowering §2.
+				if ctx.reset_mark >= 0 then emit_reset!(ctx, ctx.reset_mark, "%res_0")
+				if ctx.sur_mark >= 0 then emit_reset!(ctx, ctx.sur_mark, "%node_0")
+				write_str(ctx.fd, "\tret ${v}\n")
+				term = 1
+			}
 		},
 		Stmt.Assign(n, e) -> {
 			# `name = value`. A dynamic-array SELF-spread `xs = [...xs, e]` grows the header in
@@ -7478,6 +7709,9 @@ const emit_func! = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 		const Iarch xf = find_func(ctx.funcs, "on_scope_exit__${ctx.mat_geom}")
 		if xf >= 0 && hook_spliceable!(ctx.funcs[xf]) then ctx.exit_hook = xf
 	}
+	# self-tail-call → loop (the TCO block above emit_tail_jump!): decided before the body
+	# so the `@tailtop` label below and every tail jump in the body agree
+	ctx.tco_ok = tco_eligible(ctx, fn)
 	# `--debug`: the declaration's file and line, as QBE debug directives — `dbgfile`
 	# before the function, `dbgloc` as the body's first instruction — become `.loc`
 	# lines and a DWARF line table, so tools attribute frames to source.
@@ -7729,6 +7963,10 @@ const emit_func! = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 		pi = pi + 1
 	}
 
+	# the self-tail loop-back point: the parameters are spilled/bound above (their `alloc8`s stay
+	# in `@start` — static slots), so a tail jump that has re-stored the bindings re-enters here;
+	# `%node_0`/`%cxp<k>` ride through unchanged (a self-call threads the same ambient)
+	if ctx.tco_ok then write_str(ctx.fd, "@tailtop\n")
 	const Iarch bterm = emit_block!(ctx, fn.body, params)
 	# a body that falls through (no trailing `return`/terminator) needs a synthesized `ret` so the
 	# QBE block is closed: a `()` function returns its implicit unit, and a diverging tail (`die`)
@@ -8686,6 +8924,7 @@ pub const emit_program! = (
 				ctx_tys: no_names(),
 				ctx_ops: no_names(),
 				aggvals: aggvals,
+				tco_ok: false,
 			})
 			emit_func!(&ctx, prog.funcs[i], i)
 		}
