@@ -121,7 +121,8 @@ pub data Parser = {
 const ev_block = (): Iarch -> 128
 
 # One local-binding event for the LSP's goto-definition (`cf lsp def`): a scope OPEN (kind 0)
-# or CLOSE (kind 1) at a byte offset, or a binding of `name` — a parameter (2), a `let`/`const`
+# or CLOSE (kind 1) at a byte offset, or a binding of `name` — a parameter (2; a `['T]` type
+# parameter and a `[Iarch n]` comptime value parameter bind as parameters too), a `let`/`const`
 # local (3), a `for` binder (4), or a match payload bind (5). Replayed in parse order with a
 # depth counter, the innermost binding of a name still in scope at a cursor offset is its
 # definition site. Kind 6 is a USE — every source token the parser reads as a NAME reference
@@ -3036,6 +3037,10 @@ const parse_typarams! = (*Parser p): TyParams -> {
 			if !is_ident(peek(p))
 				then perr(p, "cf: parse: a bound or value-parameter type must be followed by a name\n")
 		}
+		# the variable BINDS like a parameter (kind 2) into the declaration's scope — its uses in
+		# the signature, fields, and body log kind-6 events, so goto/refs/rename resolve a `'T`
+		# (or a comptime value parameter's name) exactly like a local's
+		bev(p, p.pos, 2, cur_name!(p))
 		tps = [...tps, cur_name!(p)]
 		tbs = [...tbs, bound]
 		p.pos = p.pos + 1
@@ -3225,6 +3230,7 @@ const parse_func! = (*Parser p): Func -> {
 	let [Str] typarams = []
 	let [Str] tbounds = []
 	if typarams_ahead(p) then {
+		bev(p, p.pos, 0, "") # a generic function's scope opens EARLY, at the `[` — its type params bind into it
 		const TyParams tpb = parse_typarams!(p)
 		typarams = tpb.names
 		tbounds = tpb.bounds
@@ -3299,7 +3305,9 @@ const parse_func! = (*Parser p): Func -> {
 			dcol: 0,
 		})
 	}
-	bev(p, p.pos, 0, "") # the function's scope opens at its `(` — parameters bind into it
+	# the function's scope opens at its `(` — parameters bind into it (a generic's opened
+	# already, back at its `['T]`)
+	if Iarch(typarams.len) == 0 then bev(p, p.pos, 0, "")
 	p.pos = p.pos + 1
 	const [Param] params = parse_params!(p, false)
 	if !is_rparen(peek(p)) then perr(p, "cf: parse: expected `)`\n")
@@ -3444,6 +3452,7 @@ const parse_data! = (*Parser p): RecDecl -> {
 	let [Str] typarams = []
 	let [Str] tbounds = []
 	if typarams_ahead(p) then {
+		bev(p, p.pos, 0, "") # a generic record's scope opens at the `[` — its type params bind into it
 		const TyParams tpb = parse_typarams!(p)
 		typarams = tpb.names
 		tbounds = tpb.bounds
@@ -3452,8 +3461,11 @@ const parse_data! = (*Parser p): RecDecl -> {
 	p.pos = p.pos + 1
 	if !is_lbrace(peek(p)) then perr(p, "cf: parse: expected `{` in a data declaration\n")
 	p.pos = p.pos + 1
+	const RecDecl rec = parse_record_body!(p, name, typarams, tbounds)
+	# a generic record's scope closes after its body — the type params stay declaration-local
+	if Iarch(typarams.len) > 0 then bev(p, p.pos, 1, "")
 
-	return parse_record_body!(p, name, typarams, tbounds)
+	return rec
 }
 
 # Parse a record/group FIELD BODY — the fields between `{` and `}` (the opening `{` already
@@ -3624,6 +3636,7 @@ const parse_group! = (*Parser p): RecDecl -> {
 	let [Str] typarams = []
 	let [Str] tbounds = []
 	if typarams_ahead(p) then {
+		bev(p, p.pos, 0, "") # a generic group's scope opens at the `[` — its type params bind into it
 		const TyParams tpb = parse_typarams!(p)
 		typarams = tpb.names
 		tbounds = tpb.bounds
@@ -3633,6 +3646,8 @@ const parse_group! = (*Parser p): RecDecl -> {
 	if !is_lbrace(peek(p)) then perr(p, "cf: parse: expected `{` in a group `type` declaration\n")
 	p.pos = p.pos + 1
 	const RecDecl g = parse_record_body!(p, name, typarams, tbounds)
+	# a generic group's scope closes after its body — the type params stay declaration-local
+	if Iarch(typarams.len) > 0 then bev(p, p.pos, 1, "")
 	if Iarch(g.fields.len) == 0
 		then perr(p, "cf: parse: a grouped-parameter `type` must declare at least one field\n")
 	# reject a duplicate field name AND a `...` declaration spread (a group is never used as a record,
@@ -3671,6 +3686,7 @@ const parse_union! = (*Parser p): UnionDecl -> {
 	let [Str] typarams = []
 	let [Str] tbounds = []
 	if typarams_ahead(p) then {
+		bev(p, p.pos, 0, "") # a generic union's scope opens at the `[` — its type params bind into it
 		const TyParams tpb = parse_typarams!(p)
 		typarams = tpb.names
 		tbounds = tpb.bounds
@@ -3776,6 +3792,8 @@ const parse_union! = (*Parser p): UnionDecl -> {
 
 	if !is_rbrace(peek(p)) then perr(p, "cf: parse: expected `}` in a union declaration\n")
 	p.pos = p.pos + 1
+	# a generic union's scope closes after its body — the type params stay declaration-local
+	if Iarch(typarams.len) > 0 then bev(p, p.pos, 1, "")
 
 	return UnionDecl({
 		name: name,

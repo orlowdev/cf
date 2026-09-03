@@ -133,6 +133,50 @@ def run(s, check, tdp, uri_of):
           rc.stderr.decode()[:200])
     os.unlink(f.name)
 
+    # --- type variables ('T): goto/refs/rename bind to their own declaration ---
+    l, c = pos_of(lines, 38, "'T", 3)  # pick2's return-type use
+    r = s.request("textDocument/definition", tdp(FIX, l, c))["result"]
+    if isinstance(r, list): r = r[0] if r else None
+    check("goto on 'T lands on its ['T]", r is not None
+          and r["range"]["start"] == {"line": 38, "character": lines[38].index("'T")}, repr(r))
+
+    r = s.request("textDocument/prepareRename", tdp(FIX, l, c))["result"]
+    check("prepare on 'T answers", r is not None and r.get("placeholder") == "'T", repr(r))
+
+    r = s.request("textDocument/references", tdp(FIX, l, c, {"context": {"includeDeclaration": True}}))["result"]
+    check("refs on 'T: 4 rows, all in pick2", r is not None and len(r) == 4
+          and all(x["range"]["start"]["line"] == 38 for x in r), repr(r))
+
+    l, c = pos_of(lines, 36, "'K", 1)  # Kv's field-type use
+    r = s.request("textDocument/references", tdp(FIX, l, c, {"context": {"includeDeclaration": True}}))["result"]
+    check("refs on a data 'K: decl + field use", r is not None and len(r) == 2
+          and all(x["range"]["start"]["line"] == 36 for x in r), repr(r))
+
+    l, c = pos_of(lines, 38, "'T", 3)
+    r = s.request("textDocument/rename", tdp(FIX, l, c, {"newName": "T"}))["result"]
+    check("rename 'T dropping the ' refuses", r is None, repr(r))
+    r = s.request("textDocument/rename", tdp(FIX, l, c, {"newName": "'t"}))["result"]
+    check("rename 'T to lowercase refuses", r is None, repr(r))
+    l2_, c2_ = pos_of(lines, 10, "total", 1)
+    r = s.request("textDocument/rename", tdp(FIX, l2_, c2_, {"newName": "'X"}))["result"]
+    check("rename a value to a 'X refuses", r is None, repr(r))
+
+    r = s.request("textDocument/rename", tdp(FIX, l, c, {"newName": "'U"}))["result"]
+    edits = (r or {}).get("changes", {}).get(uri_of(FIX), [])
+    check("rename 'T -> 'U: 4 edits", len(edits) == 4, repr(r))
+    new = [list(x) for x in lines]
+    for e in sorted(edits, key=lambda e: (e["range"]["start"]["line"], e["range"]["start"]["character"]), reverse=True):
+        ln, s0, e0 = e["range"]["start"]["line"], e["range"]["start"]["character"], e["range"]["end"]["character"]
+        new[ln][s0:e0] = list(e["newText"])
+    renamed = "\n".join("".join(x) for x in new)
+    with tempfile.NamedTemporaryFile("w", suffix=".cf", delete=False) as f:
+        f.write(renamed)
+    rc = subprocess.run(["/Users/orlowdev/Code/cf/var/cf", "check", f.name],
+                        capture_output=True, cwd="/Users/orlowdev/Code/cf")
+    check("'U-renamed program checks clean", rc.returncode == 0 and "'T" not in renamed
+          and "Kv['K, 'V]" in renamed, rc.stderr.decode()[:200])
+    os.unlink(f.name)
+
     # --- cross-file pub rename (fix2: main.cf + lib.cf) ---
     import shutil, subprocess as sp
     m2 = open(FIX2).read().split("\n")
