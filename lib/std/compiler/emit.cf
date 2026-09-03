@@ -156,6 +156,9 @@ data Emit = {
 	# per-function stack-probe eligibility (oos_probe_set!, computed once per program): DFS
 	# back-edge targets of the call graph plus `$`-stack carriers
 	[Bool] oos,
+	# guard-page mode (oos_mode 0): `main`'s prologue installs the floor's SIGSEGV handler
+	# (`cf_oos_guard_init`) instead of any prologue probes
+	Bool oos_guard,
 	# bounds-check elimination state (the BCE block): bound facts `i|arrkey|slack`, len-alias
 	# facts `n|arrkey|0`, and the fn-wide non-negative induction counters
 	[Str] bfx,
@@ -9389,6 +9392,9 @@ const emit_func! = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 		write_str(ctx.fd, "\t%t${sb} =l alloc8 8\n")
 		write_str(ctx.fd, "\t%t${sb + 1} =l sub %t${sb}, 7340032\n")
 		write_str(ctx.fd, "\tstorel %t${sb + 1}, $cf_stack_lim\n")
+		# guard-page mode: install the floor's OOS signal handler, anchored at main's frame
+		# (the rlimit-derived si_addr window and the alt stack are set up in the floor)
+		if ctx.oos_guard then write_str(ctx.fd, "\tcall $cf_oos_guard_init(l %t${sb})\n")
 	}
 	# a materialized body's dynamic-growth pushes (`cf_dyn_push_g` / `cf_*_append_g`) reserve
 	# through the geometry's bump half via a FUNCTION POINTER; copy the survivor reserve symbol into
@@ -10071,6 +10077,10 @@ const emit_arena_qbe! = (
 	# the stack-probe threshold (the OOS block above emit_tail_jump!): zero until `main`'s
 	# prologue seeds it — a zero limit always passes, so pre-main code needs no init ordering
 	write_str(fd, "data $cf_stack_lim = { l 0 }\n")
+	# (the guard-page handler's statics — the si_addr window, the SIG_DFL act, the scratch
+	# act, the alternate signal stack — are FLOOR-owned asm data: only the floor's
+	# `cf_oos_guard_init`/`cf_oos_handler` touch them, and floor-side definition keeps the
+	# bootstrap clean — a seed-built cf0 with no knowledge of them still links the floor.)
 	# (the floor `cf_reset` scope-fold helper is RETIRED — a `!` frame's residue bracket now rewinds
 	# through the geometry's own `on_scope_exit` hook, placed by `emit_reset!`; the survivor-scope
 	# mark rewinds inline. See geometry_lowering §2.)
@@ -10418,7 +10428,7 @@ pub const emit_program! = (
 	Str build_version,
 	Bool debug,
 	Bool instrument,
-	Bool no_oos,
+	Iarch oos_mode,
 ): Iarch -> {
 	# a `Bare` target (bare metal / Wasm) links no OS: the root is a static BSS region (no mmap), and
 	# there is no exit syscall — the floor halts. Every other target keeps the darwin mmap/exit floor.
@@ -10455,9 +10465,10 @@ pub const emit_program! = (
 	const [Str] at = address_taken(prog)
 	const [Bool] nsig = compute_nodesig(prog, at)
 	const [Bool] mts = compute_mints(prog, at)
-	# the stack-probe set (the OOS block above emit_tail_jump!), once for the whole program;
-	# `--no-oos-probe` empties it — runaway recursion then keeps the raw guard-page fault
-	const [Bool] oosp = if no_oos then no_oos_probes(prog.funcs) else oos_probe_set!(prog.funcs, at)
+	# the OOS trap mode: 0 (default) = the guard-page signal handler, zero steady-state cost —
+	# no probes; 1 (`--oos-probe`) = the prologue probes instead; 2 (`--no-oos-probe`) =
+	# neither, runaway recursion keeps the raw guard-page fault
+	const [Bool] oosp = if oos_mode == 1 then oos_probe_set!(prog.funcs, at) else no_oos_probes(prog.funcs)
 	const Iarch pgidx = find_func(prog.funcs, "reserve_ret__pg")
 	const Str pgsym = if pgidx >= 0 then fsym!(prog.funcs, debug, pgidx) else ""
 	# the observer symbol for `--instrument` injections (the sanitizer model) — resolve
@@ -10574,6 +10585,7 @@ pub const emit_program! = (
 				aggvals: aggvals,
 				tco_ok: false,
 				oos: oosp,
+				oos_guard: oos_mode == 0,
 				bfx: no_names(),
 				lfx: no_names(),
 				nonneg: no_names(),

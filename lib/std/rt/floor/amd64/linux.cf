@@ -109,6 +109,111 @@ pub const cf_oob = (): () -> asm "
 	syscall
 "
 
+# The OOS guard-page handler's statics — see the arm64/linux floor for the full story.
+pub const cf_oos_data = (): () -> asm "
+	.data
+	.balign 8
+cf_oos_win:
+	.quad 1
+	.quad 0
+cf_oos_dflact:
+	.skip 32
+cf_oos_actbuf:
+	.skip 32
+	.bss
+	.balign 16
+cf_oos_stk:
+	.skip 32768
+	.text
+"
+
+# The OOS guard-page handler — see the arm64/linux floor for the full story. x86-64 differs
+# in the syscall numbers (rt_sigaction 13, sigaltstack 131, prlimit64 302) and in one quirk:
+# the kernel supplies no default sigreturn trampoline, so the act carries SA_RESTORER and
+# `cf_oos_restorer` (rt_sigreturn 15). `cf_oos_guard_init(anchor)` stores the rlimit-derived
+# si_addr window (an unlimited rlimit keeps the empty {1, 0} data default — faults stay
+# raw), registers the static alternate stack, installs `cf_oos_handler` for SIGSEGV.
+pub const cf_oos_guard_init = (): () -> asm "
+	pushq %rbp
+	movq %rsp, %rbp
+	pushq %rbx
+	subq $56, %rsp
+	movq %rdi, %rbx
+	xorl %edi, %edi
+	movl $3, %esi
+	xorl %edx, %edx
+	leaq 16(%rsp), %r10
+	movl $302, %eax
+	syscall
+	movq 16(%rsp), %r8
+	leaq cf_oos_win(%rip), %r9
+	movq %r8, %rcx
+	shrq $46, %rcx
+	jnz 2f
+	movq %rbx, %rcx
+	subq %r8, %rcx
+	leaq -524288(%rcx), %rdx
+	movq %rdx, (%r9)
+	leaq 2097152(%rcx), %rdx
+	movq %rdx, 8(%r9)
+2:
+	leaq cf_oos_stk(%rip), %rcx
+	movq %rcx, 16(%rsp)
+	movq $0, 24(%rsp)
+	movq $32768, 32(%rsp)
+	leaq 16(%rsp), %rdi
+	xorl %esi, %esi
+	movl $131, %eax
+	syscall
+	leaq cf_oos_actbuf(%rip), %r9
+	leaq cf_oos_handler(%rip), %rcx
+	movq %rcx, (%r9)
+	movq $0x0C000004, %rcx
+	movq %rcx, 8(%r9)
+	leaq cf_oos_restorer(%rip), %rcx
+	movq %rcx, 16(%r9)
+	movl $11, %edi
+	movq %r9, %rsi
+	xorl %edx, %edx
+	movl $8, %r10d
+	movl $13, %eax
+	syscall
+	addq $56, %rsp
+	popq %rbx
+	popq %rbp
+	ret
+"
+
+# SA_SIGINFO hands (sig, siginfo*, ucontext*) in rdi/rsi/rdx; si_addr sits at +16. Inside
+# the window → `cf_oos` (exit 72); outside → reinstall SIG_DFL and return so the retry dies
+# raw.
+pub const cf_oos_handler = (): () -> asm "
+	movq 16(%rsi), %r8
+	leaq cf_oos_win(%rip), %r9
+	movq (%r9), %r10
+	movq 8(%r9), %r11
+	cmpq %r10, %r8
+	jb 1f
+	cmpq %r11, %r8
+	ja 1f
+	jmp cf_oos
+1:
+	leaq cf_oos_dflact(%rip), %rsi
+	xorl %edx, %edx
+	movl $8, %r10d
+	movl $13, %eax
+	syscall
+	ret
+"
+
+# The userspace sigreturn trampoline SA_RESTORER points at (the x86-64 kernel provides
+# none): the kernel returns here after the handler; rt_sigreturn (15) restores the
+# interrupted context.
+pub const cf_oos_restorer = (): () -> asm "
+	movl $15, %eax
+	syscall
+"
+
 # The freestanding entry (amd64/linux). The kernel lays argc/argv/envp on the STACK ([rsp]=argc,
 # rsp+8=argv[], NULL, envp[], NULL, auxv), not registers — so `_start` reads them into callee-saved
 # r12/r13/r14, initializes the embedded QBE's libc (musl), seeds the root page, then ALWAYS builds

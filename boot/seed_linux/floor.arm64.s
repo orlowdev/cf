@@ -139,6 +139,98 @@ cf_oob:
 	mov x8, #94
 	svc #0
 
+.globl cf_oos_data
+.p2align 2
+cf_oos_data:
+	.data
+	.balign 8
+cf_oos_win:
+	.quad 1
+	.quad 0
+cf_oos_dflact:
+	.skip 32
+cf_oos_actbuf:
+	.skip 32
+	.bss
+	.balign 16
+cf_oos_stk:
+	.skip 32768
+	.text
+
+.globl cf_oos_guard_init
+.p2align 2
+cf_oos_guard_init:
+	stp x29, x30, [sp, #-64]!
+	mov x29, sp
+	mov x9, x0
+	mov x0, #0
+	mov x1, #3
+	mov x2, #0
+	add x3, sp, #16
+	mov x8, #261
+	svc #0
+	ldr x10, [sp, #16]
+	adrp x11, cf_oos_win
+	add x11, x11, :lo12:cf_oos_win
+	lsr x12, x10, #46
+	cbnz x12, 2f
+	sub x13, x9, x10
+	mov x14, #524288
+	sub x14, x13, x14
+	str x14, [x11]
+	mov x15, #2097152
+	add x15, x13, x15
+	str x15, [x11, #8]
+2:
+	adrp x12, cf_oos_stk
+	add x12, x12, :lo12:cf_oos_stk
+	str x12, [sp, #16]
+	str xzr, [sp, #24]
+	mov x13, #32768
+	str x13, [sp, #32]
+	add x0, sp, #16
+	mov x1, #0
+	mov x8, #132
+	svc #0
+	adrp x14, cf_oos_actbuf
+	add x14, x14, :lo12:cf_oos_actbuf
+	adrp x15, cf_oos_handler
+	add x15, x15, :lo12:cf_oos_handler
+	str x15, [x14]
+	mov x13, #4
+	movk x13, #0x0800, lsl #16
+	str x13, [x14, #8]
+	mov x0, #11
+	mov x1, x14
+	mov x2, #0
+	mov x3, #8
+	mov x8, #134
+	svc #0
+	ldp x29, x30, [sp], #64
+	ret
+
+.globl cf_oos_handler
+.p2align 2
+cf_oos_handler:
+	ldr x9, [x1, #16]
+	adrp x10, cf_oos_win
+	add x10, x10, :lo12:cf_oos_win
+	ldr x11, [x10]
+	ldr x12, [x10, #8]
+	cmp x9, x11
+	b.lo 1f
+	cmp x9, x12
+	b.hi 1f
+	b cf_oos
+1:
+	adrp x1, cf_oos_dflact
+	add x1, x1, :lo12:cf_oos_dflact
+	mov x2, #0
+	mov x3, #8
+	mov x8, #134
+	svc #0
+	ret
+
 .globl _start
 .p2align 2
 _start:

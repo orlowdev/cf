@@ -136,6 +136,90 @@ cf_oob:
 	li a7, 94
 	ecall
 
+.globl cf_oos_data
+.p2align 2
+cf_oos_data:
+	.data
+	.balign 8
+cf_oos_win:
+	.quad 1
+	.quad 0
+cf_oos_dflact:
+	.skip 32
+cf_oos_actbuf:
+	.skip 32
+	.bss
+	.balign 16
+cf_oos_stk:
+	.skip 32768
+	.text
+
+.globl cf_oos_guard_init
+.p2align 2
+cf_oos_guard_init:
+	addi sp, sp, -64
+	sd ra, 56(sp)
+	mv t0, a0
+	li a0, 0
+	li a1, 3
+	li a2, 0
+	addi a3, sp, 16
+	li a7, 261
+	ecall
+	ld t1, 16(sp)
+	lla t2, cf_oos_win
+	srli t3, t1, 46
+	bnez t3, 2f
+	sub t4, t0, t1
+	li t5, 524288
+	sub t5, t4, t5
+	sd t5, 0(t2)
+	li t6, 2097152
+	add t6, t4, t6
+	sd t6, 8(t2)
+2:
+	lla t3, cf_oos_stk
+	sd t3, 16(sp)
+	sd zero, 24(sp)
+	li t4, 32768
+	sd t4, 32(sp)
+	addi a0, sp, 16
+	li a1, 0
+	li a7, 132
+	ecall
+	lla t5, cf_oos_actbuf
+	lla t6, cf_oos_handler
+	sd t6, 0(t5)
+	li t4, 0x08000004
+	sd t4, 8(t5)
+	li a0, 11
+	mv a1, t5
+	li a2, 0
+	li a3, 8
+	li a7, 134
+	ecall
+	ld ra, 56(sp)
+	addi sp, sp, 64
+	ret
+
+.globl cf_oos_handler
+.p2align 2
+cf_oos_handler:
+	ld t0, 16(a1)
+	lla t1, cf_oos_win
+	ld t2, 0(t1)
+	ld t3, 8(t1)
+	bltu t0, t2, 1f
+	bgtu t0, t3, 1f
+	j cf_oos
+1:
+	lla a1, cf_oos_dflact
+	li a2, 0
+	li a3, 8
+	li a7, 134
+	ecall
+	ret
+
 .globl _start
 .p2align 2
 _start:

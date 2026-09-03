@@ -133,6 +133,102 @@ cf_oob:
 	movq $231, %rax
 	syscall
 
+.globl cf_oos_data
+.p2align 2
+cf_oos_data:
+	.data
+	.balign 8
+cf_oos_win:
+	.quad 1
+	.quad 0
+cf_oos_dflact:
+	.skip 32
+cf_oos_actbuf:
+	.skip 32
+	.bss
+	.balign 16
+cf_oos_stk:
+	.skip 32768
+	.text
+
+.globl cf_oos_guard_init
+.p2align 2
+cf_oos_guard_init:
+	pushq %rbp
+	movq %rsp, %rbp
+	pushq %rbx
+	subq $56, %rsp
+	movq %rdi, %rbx
+	xorl %edi, %edi
+	movl $3, %esi
+	xorl %edx, %edx
+	leaq 16(%rsp), %r10
+	movl $302, %eax
+	syscall
+	movq 16(%rsp), %r8
+	leaq cf_oos_win(%rip), %r9
+	movq %r8, %rcx
+	shrq $46, %rcx
+	jnz 2f
+	movq %rbx, %rcx
+	subq %r8, %rcx
+	leaq -524288(%rcx), %rdx
+	movq %rdx, (%r9)
+	leaq 2097152(%rcx), %rdx
+	movq %rdx, 8(%r9)
+2:
+	leaq cf_oos_stk(%rip), %rcx
+	movq %rcx, 16(%rsp)
+	movq $0, 24(%rsp)
+	movq $32768, 32(%rsp)
+	leaq 16(%rsp), %rdi
+	xorl %esi, %esi
+	movl $131, %eax
+	syscall
+	leaq cf_oos_actbuf(%rip), %r9
+	leaq cf_oos_handler(%rip), %rcx
+	movq %rcx, (%r9)
+	movq $0x0C000004, %rcx
+	movq %rcx, 8(%r9)
+	leaq cf_oos_restorer(%rip), %rcx
+	movq %rcx, 16(%r9)
+	movl $11, %edi
+	movq %r9, %rsi
+	xorl %edx, %edx
+	movl $8, %r10d
+	movl $13, %eax
+	syscall
+	addq $56, %rsp
+	popq %rbx
+	popq %rbp
+	ret
+
+.globl cf_oos_handler
+.p2align 2
+cf_oos_handler:
+	movq 16(%rsi), %r8
+	leaq cf_oos_win(%rip), %r9
+	movq (%r9), %r10
+	movq 8(%r9), %r11
+	cmpq %r10, %r8
+	jb 1f
+	cmpq %r11, %r8
+	ja 1f
+	jmp cf_oos
+1:
+	leaq cf_oos_dflact(%rip), %rsi
+	xorl %edx, %edx
+	movl $8, %r10d
+	movl $13, %eax
+	syscall
+	ret
+
+.globl cf_oos_restorer
+.p2align 2
+cf_oos_restorer:
+	movl $15, %eax
+	syscall
+
 .globl _start
 .p2align 2
 _start:
