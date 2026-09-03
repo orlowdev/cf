@@ -5892,6 +5892,21 @@ const emit_mark! = (*Emit ctx, Str nodeop): Iarch -> {
 	return mk
 }
 
+# Re-take a frame mark IN PLACE after a tail-site rewind: the same mark temps are re-defined
+# from the subnode's current `{top, limit}` (QBE's ssa pass phis them at `@tailtop`), so the
+# next iteration rewinds against ITS OWN baseline. Without this, the first elastic pull would
+# defeat the guarded rewind for every later iteration — the entry mark's limit never matches a
+# relocated block again, and the constant-arena loop degrades to an unbounded leak.
+const emit_remark! = (*Emit ctx, Iarch mk, Str nodeop): Iarch -> {
+	const Iarch a1 = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${mk} =l loadl ${nodeop}\n")
+	write_str(ctx.fd, "\t%t${a1} =l add ${nodeop}, 8\n")
+	write_str(ctx.fd, "\t%t${mk + 1} =l loadl %t${a1}\n")
+
+	return 0
+}
+
 # ── inlining the scope-exit hook by TRANSCRIPTION ────────────────────────────────────────
 # A geometry's `on_scope_exit` inlines at each `!` return by emitting the hook's OWN BODY at
 # the site, its parameters bound over the site's operands — the hook content (user-visible
@@ -6350,10 +6365,20 @@ const emit_ifelse! = (*Emit ctx, [Binding] env, Expr cond, Stmt tb, Stmt eb): Ia
 # can reuse the frame in place — evaluate the arguments, store them into the parameter bindings,
 # and jump back to `@tailtop` (the label emit_func! places right after the parameter spills). The
 # hidden ABI needs no restore: a self-call threads the same `%node_0` and the same `%cxp<k>`s.
-# v1 converts COLORLESS functions only (no `!`): their `return` is already a bare `ret`, so the
-# jump substitutes exactly; a bracketed frame must rewind its residue — and only its residue, the
-# arguments may live survivor-side — per iteration, which is the v2 ordering. Mutual tail
-# recursion and non-tail recursion (`1 + f(n-1)` has pending work per frame) stay frame-per-call.
+# A COLORLESS function's `return` is a bare `ret`, so the jump substitutes exactly. A BRACKETED
+# (`!`) frame also converts (v2), and per-iteration ARENA reclamation splits on the parameters:
+# when every parameter is a REGISTER value (a scalar, or a `$fn` code address — static text), no
+# argument can carry a pointer into this frame's arena, so the tail site rewinds the residue
+# bracket (and the survivor mark where one stands) to the entry mark exactly as the `return` it
+# replaces would — the loop runs in constant arena. An AGGREGATE/pointer parameter may reference
+# the CURRENT iteration's residue (a residue-routed local passed along is alive across a real
+# call, but a rewind-then-jump would reclaim it under the next iteration's feet), so the rewind
+# is SKIPPED: scratch accumulates to the final return's rewind — bounded by what the recursion
+# it replaces held live at peak (every un-returned frame's residue), leak-direction, never a
+# dangle. The ORDER at the tail site is load-bearing either way: evaluate ALL arguments first
+# (their values are born survivor-side/registers), only then rewind, then store, then jump.
+# Mutual tail recursion and non-tail recursion (`1 + f(n-1)` has pending work per frame) stay
+# frame-per-call.
 
 # The hazard scan: a body `alloc8` re-executed per tail iteration would grow `sp` each pass — QBE
 # assigns static slots only to constant allocs in the START block (arm64/isel), and `@tailtop`
@@ -6479,18 +6504,35 @@ const tco_tail_body = ([Stmt] ss, Str fname): Bool -> {
 	return false
 }
 
-# TCO eligibility, decided once per function before its body emits. Colorless only (v1); a
+# TCO eligibility, decided once per function before its body emits — colorless AND bracketed
+# (`!`) functions both convert (the v2 split above governs per-iteration reclamation). A
 # capture-carrying function is out (its cells `alloc8` mid-body — the hazard note above); `main`
 # never self-tails (it holds the graft); a value const cannot reference itself.
 const tco_eligible = (*Emit ctx, Func fn): Bool -> {
 	if eq(fn.name, "main") then return false
 	if fn.is_value then return false
-	if fn_brackets(fn) then return false
 	if has_cap_param(fn) then return false
 	if Iarch(ctx.cap_cells.len) > 0 then return false
 	if tco_hazard_body(fn.body) then return false
 
 	return tco_tail_body(fn.body, fn.name)
+}
+
+# Is every parameter a REGISTER value — a word/fixed/float/`Bool`/tag-only-union scalar, or a
+# `$fn` code address (static text, never an arena pointer)? Then no tail-call argument can
+# reference this frame's arena and the per-iteration rewind is sound (the v2 split above).
+const tco_regs_only = (*Emit ctx, [Param] ps): Bool -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(ps.len) then break
+		if ps[i].is_ptr then return false
+		if eq(ps[i].type_name, "$ptr") then return false
+		if is_agg_param(ps[i], ctx.recs, ctx.unions) then return false
+		i = i + 1
+	}
+
+	return true
 }
 
 # `return f(args)` where `f` IS this function: loop instead of call. The arguments are ALL
@@ -6537,6 +6579,29 @@ const emit_tail_jump! = (*Emit ctx, [Binding] env, Expr e): Bool -> {
 				write_str(ctx.fd, "\t%t${tt} =${aqt} copy ${v}\n")
 				tts = [...tts, tt]
 				i = i + 1
+			}
+
+			# per-iteration arena reclamation (the v2 split in the block comment above): with
+			# register-only parameters, rewind the residue bracket (and the survivor mark
+			# where one stands) exactly as the `return` this jump replaces would — AFTER the
+			# arguments are evaluated, BEFORE they are stored. Each rewind then RE-TAKES its
+			# mark (emit_remark!) so the next iteration rewinds against its own baseline —
+			# an elastic pull mid-iteration skips one guarded rewind (leak-once, as at any
+			# return) instead of defeating every later one. Aggregate parameters skip all of
+			# it (an argument may point into this iteration's residue); the final `return`
+			# still rewinds everything to the ENTRY marks... which the loop has moved — the
+			# per-iteration rewinds already reclaimed everything below them, so the final
+			# rewind covering just the last iteration is the same net reclamation.
+			if tco_regs_only(ctx, ctx.funcs[ctx.cur_fn].params) then {
+				if ctx.reset_mark >= 0 then {
+					emit_reset!(ctx, ctx.reset_mark, "%res_0")
+					emit_remark!(ctx, ctx.reset_mark, "%res_0")
+				}
+
+				if ctx.sur_mark >= 0 then {
+					emit_reset!(ctx, ctx.sur_mark, "%node_0")
+					emit_remark!(ctx, ctx.sur_mark, "%node_0")
+				}
 			}
 
 			let Iarch j = 0
@@ -7965,7 +8030,8 @@ const emit_func! = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 
 	# the self-tail loop-back point: the parameters are spilled/bound above (their `alloc8`s stay
 	# in `@start` — static slots), so a tail jump that has re-stored the bindings re-enters here;
-	# `%node_0`/`%cxp<k>` ride through unchanged (a self-call threads the same ambient)
+	# `%node_0`/`%cxp<k>` ride through unchanged (a self-call threads the same ambient), and a
+	# bracketed frame's entry marks sit above too — the loop rewinds TO them, never re-takes them
 	if ctx.tco_ok then write_str(ctx.fd, "@tailtop\n")
 	const Iarch bterm = emit_block!(ctx, fn.body, params)
 	# a body that falls through (no trailing `return`/terminator) needs a synthesized `ret` so the
