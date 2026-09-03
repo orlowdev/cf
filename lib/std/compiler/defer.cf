@@ -205,8 +205,136 @@ const exit_base = ([LB] lbs, Str l, Iarch loop_base): Iarch -> {
 	return loop_base
 }
 
+# ── Expression recursion: a VALUE loop (`Expr.Loop`) nests statements inside an expression, and
+# a `return` inside its body must fire the pending defers exactly like any other return — it used
+# to slip through untouched (the defers were silently skipped on that path). The walkers rebuild
+# every expression, entering a value-loop body through `rw_stmts!` with the discipline a statement
+# loop gets (`loop_base` = the entry depth). A closure body is NOT entered — its returns belong to
+# the closure's own scope, not this function's defer stack.
+const rw_exprs! = ([Expr] es, [[Stmt]] cur, Iarch lb, [LB] lbs): [Expr] -> {
+	let [Expr] out = []
+
+	for e in es {
+		out = [...out, rw_expr!(e, cur, lb, lbs)]
+	}
+
+	return out
+}
+
+const rw_fields! = ([FieldInit] fs, [[Stmt]] cur, Iarch lb, [LB] lbs): [FieldInit] -> {
+	let [FieldInit] out = []
+
+	for f in fs {
+		out = [...out, FieldInit({ field: f.field, value: rw_expr!(f.value, cur, lb, lbs) })]
+	}
+
+	return out
+}
+
+const rw_segs! = ([Seg] segs, [[Stmt]] cur, Iarch lb, [LB] lbs): [Seg] -> {
+	let [Seg] out = []
+
+	for s in segs {
+		out = [
+			...out,
+			Seg({ is_hole: s.is_hole, lit: s.lit, name: s.name, expr: rw_expr!(s.expr, cur, lb, lbs) }),
+		]
+	}
+
+	return out
+}
+
+const rw_earms! = ([MatchArm] arms, [[Stmt]] cur, Iarch lb, [LB] lbs): [MatchArm] -> {
+	let [MatchArm] out = []
+
+	for a in arms {
+		out = [
+			...out,
+			MatchArm({
+				is_wild: a.is_wild,
+				type_name: a.type_name,
+				members: a.members,
+				binds: a.binds,
+				body: rw_expr!(a.body, cur, lb, lbs),
+			}),
+		]
+	}
+
+	return out
+}
+
+const rw_expr! = (Expr e, [[Stmt]] cur, Iarch lb, [LB] lbs): Expr -> match e {
+	Expr.At(off, inner) -> Expr.At(off, rw_expr!(inner, cur, lb, lbs)),
+	Expr.Lit(v) -> Expr.Lit(v),
+	Expr.BoolLit(b) -> Expr.BoolLit(b),
+	Expr.Var(n) -> Expr.Var(n),
+	Expr.StrLit(bs) -> Expr.StrLit(bs),
+	Expr.FloatLit(t) -> Expr.FloatLit(t),
+	Expr.Record(n, fs) -> Expr.Record(n, rw_fields!(fs, cur, lb, lbs)),
+	Expr.Field(b, f) -> Expr.Field(b, f),
+	Expr.FieldExpr(b, f) -> Expr.FieldExpr(rw_expr!(b, cur, lb, lbs), f),
+	Expr.UnionMk(t, m, args) -> Expr.UnionMk(t, m, rw_exprs!(args, cur, lb, lbs)),
+	Expr.Match(scrut, arms) ->
+		Expr.Match(rw_expr!(scrut, cur, lb, lbs), rw_earms!(arms, cur, lb, lbs)),
+	Expr.ArrayLit(hs, sp, elems, et) ->
+		Expr.ArrayLit(hs, rw_expr!(sp, cur, lb, lbs), rw_exprs!(elems, cur, lb, lbs), et),
+	Expr.Index(a, i) -> Expr.Index(a, rw_expr!(i, cur, lb, lbs)),
+	Expr.IndexField(a, i, f) -> Expr.IndexField(a, rw_expr!(i, cur, lb, lbs), f),
+	Expr.IndexExpr(b, i) -> Expr.IndexExpr(rw_expr!(b, cur, lb, lbs), rw_expr!(i, cur, lb, lbs)),
+	Expr.Interp(segs) -> Expr.Interp(rw_segs!(segs, cur, lb, lbs)),
+	Expr.Tuple(elems) -> Expr.Tuple(rw_exprs!(elems, cur, lb, lbs)),
+	Expr.Spread(x) -> Expr.Spread(rw_expr!(x, cur, lb, lbs)),
+	Expr.Unit -> Expr.Unit,
+	Expr.Loop(ss) -> Expr.Loop(rw_stmts!(ss, cur, Iarch(cur.len), lbs)),
+	Expr.Buffer(sz) -> Expr.Buffer(rw_expr!(sz, cur, lb, lbs)),
+	Expr.Addr(n) -> Expr.Addr(n),
+	Expr.Neg(x) -> Expr.Neg(rw_expr!(x, cur, lb, lbs)),
+	Expr.Not(x) -> Expr.Not(rw_expr!(x, cur, lb, lbs)),
+	Expr.BitNot(x) -> Expr.BitNot(rw_expr!(x, cur, lb, lbs)),
+	Expr.Add(l, r) -> Expr.Add(rw_expr!(l, cur, lb, lbs), rw_expr!(r, cur, lb, lbs)),
+	Expr.Sub(l, r) -> Expr.Sub(rw_expr!(l, cur, lb, lbs), rw_expr!(r, cur, lb, lbs)),
+	Expr.Mul(l, r) -> Expr.Mul(rw_expr!(l, cur, lb, lbs), rw_expr!(r, cur, lb, lbs)),
+	Expr.Div(l, r) -> Expr.Div(rw_expr!(l, cur, lb, lbs), rw_expr!(r, cur, lb, lbs)),
+	Expr.Mod(l, r) -> Expr.Mod(rw_expr!(l, cur, lb, lbs), rw_expr!(r, cur, lb, lbs)),
+	Expr.BitAnd(l, r) -> Expr.BitAnd(rw_expr!(l, cur, lb, lbs), rw_expr!(r, cur, lb, lbs)),
+	Expr.BitOr(l, r) -> Expr.BitOr(rw_expr!(l, cur, lb, lbs), rw_expr!(r, cur, lb, lbs)),
+	Expr.BitXor(l, r) -> Expr.BitXor(rw_expr!(l, cur, lb, lbs), rw_expr!(r, cur, lb, lbs)),
+	Expr.Shl(l, r) -> Expr.Shl(rw_expr!(l, cur, lb, lbs), rw_expr!(r, cur, lb, lbs)),
+	Expr.Shr(l, r) -> Expr.Shr(rw_expr!(l, cur, lb, lbs), rw_expr!(r, cur, lb, lbs)),
+	Expr.CmpEq(l, r) -> Expr.CmpEq(rw_expr!(l, cur, lb, lbs), rw_expr!(r, cur, lb, lbs)),
+	Expr.CmpNe(l, r) -> Expr.CmpNe(rw_expr!(l, cur, lb, lbs), rw_expr!(r, cur, lb, lbs)),
+	Expr.CmpLt(l, r) -> Expr.CmpLt(rw_expr!(l, cur, lb, lbs), rw_expr!(r, cur, lb, lbs)),
+	Expr.CmpGt(l, r) -> Expr.CmpGt(rw_expr!(l, cur, lb, lbs), rw_expr!(r, cur, lb, lbs)),
+	Expr.CmpLe(l, r) -> Expr.CmpLe(rw_expr!(l, cur, lb, lbs), rw_expr!(r, cur, lb, lbs)),
+	Expr.CmpGe(l, r) -> Expr.CmpGe(rw_expr!(l, cur, lb, lbs), rw_expr!(r, cur, lb, lbs)),
+	Expr.And(l, r) -> Expr.And(rw_expr!(l, cur, lb, lbs), rw_expr!(r, cur, lb, lbs)),
+	Expr.Or(l, r) -> Expr.Or(rw_expr!(l, cur, lb, lbs), rw_expr!(r, cur, lb, lbs)),
+	Expr.If(c, t, el) ->
+		Expr.If(rw_expr!(c, cur, lb, lbs), rw_expr!(t, cur, lb, lbs), rw_expr!(el, cur, lb, lbs)),
+	Expr.Call(n, ta, args, g) -> Expr.Call(n, ta, rw_exprs!(args, cur, lb, lbs), g),
+	Expr.DeferTap(fn, args) -> Expr.DeferTap(fn, rw_exprs!(args, cur, lb, lbs)),
+}
+
+# The expression positions of a NON-exit statement, rewritten in place (the statement itself
+# neither fires nor accumulates — only value loops inside its expressions matter).
+const rw_stmt_exprs! = (Stmt s, [[Stmt]] cur, Iarch lb, [LB] lbs): Stmt -> match s {
+	Stmt.Let(n, m, ann, init) -> Stmt.Let(n, m, ann, rw_expr!(init, cur, lb, lbs)),
+	Stmt.Assign(n, v) -> Stmt.Assign(n, rw_expr!(v, cur, lb, lbs)),
+	Stmt.FieldAssign(b, f, v) -> Stmt.FieldAssign(b, f, rw_expr!(v, cur, lb, lbs)),
+	Stmt.DeepFieldAssign(b, f, v) ->
+		Stmt.DeepFieldAssign(rw_expr!(b, cur, lb, lbs), f, rw_expr!(v, cur, lb, lbs)),
+	Stmt.IndexAssign(n, ix, v) ->
+		Stmt.IndexAssign(n, rw_expr!(ix, cur, lb, lbs), rw_expr!(v, cur, lb, lbs)),
+	Stmt.Do(e) -> Stmt.Do(rw_expr!(e, cur, lb, lbs)),
+	Stmt.Destructure(ns, m, e) -> Stmt.Destructure(ns, m, rw_expr!(e, cur, lb, lbs)),
+	Stmt.Yield(e) -> Stmt.Yield(rw_expr!(e, cur, lb, lbs)),
+	_ -> s,
+}
+
 const rw_stmt_in! = (Stmt s, [[Stmt]] cur, Iarch loop_base, [LB] lbs): Stmt -> match s {
-	Stmt.Return(e) -> if Iarch(cur.len) == 0 then s else synth_return(e, cur),
+	Stmt.Return(e) -> if Iarch(cur.len) == 0
+		then Stmt.Return(rw_expr!(e, cur, loop_base, lbs))
+	else synth_return(rw_expr!(e, cur, loop_base, lbs), cur),
 	Stmt.Break(bl_) ->
 		Stmt.Block(append_stmts(fire_from(cur, exit_base(lbs, bl_, loop_base)), stmt_singleton(s))),
 	Stmt.Continue(bl_) ->
@@ -215,11 +343,16 @@ const rw_stmt_in! = (Stmt s, [[Stmt]] cur, Iarch loop_base, [LB] lbs): Stmt -> m
 	Stmt.Loop(ll_, bd) ->
 		Stmt.Loop(ll_, rw_stmts!(bd, cur, Iarch(cur.len), push_lb(lbs, ll_, Iarch(cur.len)))),
 	Stmt.ForIn(v, a, bd) -> Stmt.ForIn(v, a, rw_stmts!(bd, cur, Iarch(cur.len), lbs)),
-	Stmt.IfThen(c, st) -> Stmt.IfThen(c, rw_stmt_in!(st, cur, loop_base, lbs)),
-	Stmt.IfElse(c, t, e) ->
-		Stmt.IfElse(c, rw_stmt_in!(t, cur, loop_base, lbs), rw_stmt_in!(e, cur, loop_base, lbs)),
-	Stmt.Match(scrut, arms) -> Stmt.Match(scrut, rw_arms!(arms, cur, loop_base, lbs)),
-	_ -> s,
+	Stmt.IfThen(c, st) ->
+		Stmt.IfThen(rw_expr!(c, cur, loop_base, lbs), rw_stmt_in!(st, cur, loop_base, lbs)),
+	Stmt.IfElse(c, t, e) -> Stmt.IfElse(
+		rw_expr!(c, cur, loop_base, lbs),
+		rw_stmt_in!(t, cur, loop_base, lbs),
+		rw_stmt_in!(e, cur, loop_base, lbs),
+	),
+	Stmt.Match(scrut, arms) ->
+		Stmt.Match(rw_expr!(scrut, cur, loop_base, lbs), rw_arms!(arms, cur, loop_base, lbs)),
+	_ -> rw_stmt_exprs!(s, cur, loop_base, lbs),
 }
 
 # Rewrite a scope's statement list (v2 — block/loop-scoped defer): accumulate the defers DECLARED
@@ -244,8 +377,9 @@ const rw_stmts! = ([Stmt] stmts, [[Stmt]] inherited, Iarch loop_base, [LB] lbs):
 				cur = [...cur, dbody]
 			},
 			Stmt.Return(e) -> {
-				if Iarch(cur.len) == 0 then out = [...out, s]
-				else out = [...out, synth_return(e, cur)]
+				if Iarch(cur.len) == 0
+					then out = [...out, Stmt.Return(rw_expr!(e, cur, loop_base, lbs))]
+				else out = [...out, synth_return(rw_expr!(e, cur, loop_base, lbs), cur)]
 			},
 			Stmt.Break(bl_) -> {
 				out = append_stmts(out, fire_from(cur, exit_base(lbs, bl_, loop_base)))
@@ -265,22 +399,32 @@ const rw_stmts! = ([Stmt] stmts, [[Stmt]] inherited, Iarch loop_base, [LB] lbs):
 				out = [...out, Stmt.ForIn(v, a, rw_stmts!(bd, cur, Iarch(cur.len), lbs))]
 			},
 			Stmt.IfThen(c, st) -> {
-				out = [...out, Stmt.IfThen(c, rw_stmt_in!(st, cur, loop_base, lbs))]
+				out = [
+					...out,
+					Stmt.IfThen(rw_expr!(c, cur, loop_base, lbs), rw_stmt_in!(st, cur, loop_base, lbs)),
+				]
 			},
 			Stmt.IfElse(c, t, e) -> {
 				out = [
 					...out,
-					Stmt.IfElse(c, rw_stmt_in!(t, cur, loop_base, lbs), rw_stmt_in!(e, cur, loop_base, lbs)),
+					Stmt.IfElse(
+						rw_expr!(c, cur, loop_base, lbs),
+						rw_stmt_in!(t, cur, loop_base, lbs),
+						rw_stmt_in!(e, cur, loop_base, lbs),
+					),
 				]
 			},
 			Stmt.Block(ss) -> {
 				out = [...out, Stmt.Block(rw_stmts!(ss, cur, loop_base, lbs))]
 			},
 			Stmt.Match(scrut, arms) -> {
-				out = [...out, Stmt.Match(scrut, rw_arms!(arms, cur, loop_base, lbs))]
+				out = [
+					...out,
+					Stmt.Match(rw_expr!(scrut, cur, loop_base, lbs), rw_arms!(arms, cur, loop_base, lbs)),
+				]
 			},
 			_ -> {
-				out = [...out, s]
+				out = [...out, rw_stmt_exprs!(s, cur, loop_base, lbs)]
 			},
 		}
 
