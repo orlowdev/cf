@@ -1,7 +1,7 @@
 # C! (cflang) — Zed extension
 
 Syntax highlighting, bracket matching, indentation, folding, document outline,
-and **diagnostics** (via the `cf lsp` language server) for
+test **run buttons**, and **diagnostics** (via the `cf lsp` language server) for
 [C!](../../root/specs/ebnf.md) in the [Zed](https://zed.dev) editor.
 
 ## What's here
@@ -9,11 +9,34 @@ and **diagnostics** (via the `cf lsp` language server) for
 ```
 extension.toml                   Zed manifest — grammar + language + language server
 src/lib.rs                       the wasm shim handing Zed the `cf lsp` command
-tree-sitter-cflang/grammar.js    the C! grammar, translated from root/specs/ebnf.md
 languages/cflang/config.toml     file suffix (.cf), comments (#), brackets, tabs
 languages/cflang/*.scm           tree-sitter queries: highlights, brackets,
-                                 indents, folds, outline
+                                 indents, folds, outline, runnables
 ```
+
+The grammar lives in its own repo,
+[tree-sitter-cflang](https://github.com/orlowdev/tree-sitter-cflang), vendored
+beside this one in the cf tree at `usr/tree-sitter-cflang`.
+
+## Running tests
+
+`languages/cflang/runnables.scm` marks every `case!`/`todo!` call, so Zed shows
+a run button in the gutter next to each test case. The button fires whatever
+task carries the `cflang-case` tag — define one in your project's
+`.zed/tasks.json` (the cf repo ships one that uses `./var/cf`):
+
+```json
+[
+  {
+    "label": "cf test $ZED_RELATIVE_FILE",
+    "command": "cf",
+    "args": ["test", "$ZED_RELATIVE_FILE"],
+    "tags": ["cflang-case"]
+  }
+]
+```
+
+`cf test` runs a whole file's cases — there is no per-case filter.
 
 ## Language server
 
@@ -40,35 +63,30 @@ There is no separate TextMate/regex grammar.
 2. Pick this directory (`usr/zed`). Open any `.cf` file to see it applied.
 
 Zed loads the language config and queries **live** from this directory, but
-fetches the _grammar_ from a git commit — see `extension.toml`:
-
-```toml
-[grammars.cflang]
-repository = "file:///Users/orlowdev/Code/cflang"  # this repo, local — no push
-rev = "..."                                            # a commit containing the grammar
-path = "usr/zed/tree-sitter-cflang"                     # its subdirectory
-```
-
-`file://` means no GitHub push is needed, but `git clone` only sees committed
-state, so the grammar must live at a real commit and `rev` pins it.
+fetches the _grammar_ from the tree-sitter-cflang GitHub repo at the commit
+pinned by `rev` in `extension.toml`.
 
 ## Iterating
 
 - **Queries / `config.toml`** — edit freely, then **`zed: reload extensions`**.
   No commit needed; Zed reads them live.
-- **`grammar.js`** — after editing, regenerate, commit, and bump `rev`:
+- **`grammar.js`** — edit in `usr/tree-sitter-cflang`, regenerate, commit, push
+  the subtree upstream, and pin the new rev:
 
   ```sh
-  cd tree-sitter-cflang
-  npx tree-sitter-cli generate      # regenerate src/
-  npx tree-sitter-cli parse FILE.cf # sanity-check (look for ERROR nodes)
-  cd - && git commit -am "..."        # grammar must be committed for Zed to fetch it
-  git rev-parse HEAD                 # put this SHA in extension.toml `rev`
+  cd ../tree-sitter-cflang
+  npx tree-sitter generate           # regenerate src/
+  npx tree-sitter parse FILE.cf      # sanity-check (look for ERROR nodes)
+  cd ../.. && git commit …           # the subtree split hash is what gets pushed
+  git subtree split --prefix=usr/tree-sitter-cflang   # → SHA for `rev`
+  git subtree push --prefix=usr/tree-sitter-cflang git@github.com:orlowdev/tree-sitter-cflang.git master
   ```
 
   Then **`zed: reload extensions`**.
 
-The grammar parses the entire `boot/` corpus with zero error nodes.
+The grammar parses `lib/`, `boot/src`, and the valid `boot/tests` corpus with
+zero error nodes (sole corner: `n!= 0`, whose bang the lexer cannot split
+without lookahead).
 
 ## Deliberate scope decisions
 
@@ -85,8 +103,6 @@ highlighting over strict conformance:
 - **Index / type-application overlap** (`xs[8]` vs `f[8]`) is resolved by the
   receiver's type in the real language — unknown to a syntax grammar — so the
   grammar biases toward indexing, the common case.
-
-## LSP
-
-Deferred: C! has no language server yet. When one exists, register it under
-`[language_servers.cflang]` in `extension.toml`; nothing else here changes.
+- **Types and UPPER_SNAKE consts share one token.** `STDOUT` and `Str` are
+  lexically inseparable without lookahead, so `type_name` covers both and the
+  highlight query recolors the all-caps shape as a constant via `#match?`.

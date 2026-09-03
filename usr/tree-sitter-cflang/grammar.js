@@ -81,7 +81,16 @@ module.exports = grammar({
 
   rules: {
     module: $ => repeat($._module_item),
-    _module_item: $ => choice($.import_declaration, $._declaration, $.comptime_if),
+    // A top-level call is a test case (`case!("…", () -> {…})`, `todo!` —
+    // testing.md §1): the one expression form legal at module level. The
+    // callee is a bare or `::`-qualified name — narrower than the expression
+    // grammar's call, so a declaration's tail (`= Box` + `[…]`) never forks
+    // into one. The compiler enforces which calls are actually legal here.
+    _module_item: $ => choice($.import_declaration, $._declaration, $.comptime_if, $._toplevel_call),
+    _toplevel_call: $ => alias($.toplevel_call, $.call_expression),
+    toplevel_call: $ => seq(
+      choice($.var_name, $.qualified_name), optional($.type_args), $.arguments,
+    ),
 
     // Build-time conditional compilation at the top level: it reuses
     // `if … then … else`, but a module item is never an expression, so a
@@ -104,7 +113,10 @@ module.exports = grammar({
     // snake_case; an editor grammar should not flag what compiles.
     _word: _ => /\$?[a-z_][A-Za-z0-9_]*!?/,
     var_name: $ => $._word,
-    type_name: _ => /[A-Z][A-Za-z0-9]*/,
+    // One token covers types AND the UPPER_SNAKE value consts (`STDOUT`,
+    // `K_GLORY`, `NOT_FOUND`) — lexically inseparable without lookahead, so the
+    // highlight query recolors the all-caps shape via `#match?`.
+    type_name: _ => /[A-Z][A-Za-z0-9_]*/,
     type_var: $ => seq("'", $.type_name),
 
     // A `::`-path to a module member (`std::io::print`, `growing_arena::of`,
@@ -283,7 +295,9 @@ module.exports = grammar({
       seq($._type, $.var_name, optional(seq('=', $._expression))),
       seq($.var_name, '=', $._expression),
     )),
-    const_declaration: $ => seq('const', optional($._type), $.var_name, '=', $._expression),
+    // The bound name is `var_name` — or `type_name`, which here is an
+    // UPPER_SNAKE value const (`pub const STDOUT = …`), not a type.
+    const_declaration: $ => seq('const', optional($._type), choice($.var_name, $.type_name), '=', $._expression),
 
     destructure_declaration: $ => seq(choice('let', 'const'), $._pattern, '=', $._expression),
 
@@ -304,9 +318,14 @@ module.exports = grammar({
       optional($.generic_params),
       $.param_list,
       optional(seq(':', $._type)),
+      optional($.uses_clause),
       '->',
       choice($.block, $.asm_block, $._expression),
     )),
+
+    // `uses T1, T2` between the return type and the `->` — the declared hidden
+    // context demands (context.md §4). `uses` is a contextual keyword.
+    uses_clause: $ => seq('uses', commaSep1($.type_name)),
 
     generic_params: $ => seq('[', commaSepT($.generic_param), ']'),
     generic_param: $ => choice(
@@ -416,7 +435,10 @@ module.exports = grammar({
       $._postfix, optional($.type_args), $.arguments,
     )),
     type_args: $ => seq('[', commaSepT($._type_arg), ']'),
-    arguments: $ => seq('(', optional(commaSepT($._expression)), ')'),
+    arguments: $ => seq('(', optional(commaSepT(choice($.let_argument, $._expression))), ')'),
+    // `provide(let x)` — a `let` marks a context provide's value as mutable
+    // (context.md §2); the one place `let` heads a call argument.
+    let_argument: $ => seq('let', $.var_name),
 
     // A `type_name`/`member_access` in value position is a construction callee
     // (`Point(1, 2)`, `Uarch(fd)`, `Maybe.Just(1)`) — the PascalCase casing tells
