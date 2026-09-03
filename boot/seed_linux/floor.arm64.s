@@ -25,9 +25,9 @@ f144:
 	mov x0, #0
 	ret
 
-.globl f502
+.globl f505
 .p2align 2
-f502:
+f505:
 	mov x0, x0
 	mov x8, #94
 	svc #0
@@ -129,6 +129,13 @@ cf_oom:
 .p2align 2
 cf_oos:
 	mov x0, #72
+	mov x8, #94
+	svc #0
+
+.globl cf_oob
+.p2align 2
+cf_oob:
+	mov x0, #73
 	mov x8, #94
 	svc #0
 

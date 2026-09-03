@@ -21,7 +21,7 @@
 # not yet enforced (that is the typecheck brick).
 
 import std::io::console::{ die }
-import std::data::str::{ eq }
+import std::data::str::{ eq, slice }
 import std::sys::{ Os, Arch }
 import std::data::{ Either }
 import std::io::file::{ write_str, read_file_into }
@@ -156,6 +156,12 @@ data Emit = {
 	# per-function stack-probe eligibility (oos_probe_set!, computed once per program): DFS
 	# back-edge targets of the call graph plus `$`-stack carriers
 	[Bool] oos,
+	# bounds-check elimination state (the BCE block): bound facts `i|arrkey`, len-alias facts
+	# `n|arrkey`, and the fn-wide non-negative induction counters
+	[Str] bfx,
+	[Str] lfx,
+	[Str] nonneg,
+	Bool nn_done,
 }
 
 # The resolved intrinsic callees for context (module_system §8 flattens the module path).
@@ -5243,6 +5249,11 @@ const stmt_match_union = ([StmtArm] arms): Str -> {
 const emit_stmt_match! = (*Emit ctx, [Binding] env, Expr scrut, [StmtArm] arms): Iarch -> {
 	const Str s = emit_expr!(scrut, ctx, env)
 	const Str tagop = scrut_tag!(ctx, stmt_match_union(arms), s)
+	# BCE arm scope: every arm starts from the entry facts; the join intersects all exits
+	const [Str] sbf = ctx.bfx
+	const [Str] slf = ctx.lfx
+	let [Str] accb = sbf
+	let [Str] accl = slf
 	const Iarch lid = ctx.label
 	ctx.label = ctx.label + 1
 	const Iarch na = Iarch(arms.len)
@@ -5260,7 +5271,11 @@ const emit_stmt_match! = (*Emit ctx, [Binding] env, Expr scrut, [StmtArm] arms):
 				arms[i].binds,
 				s,
 			)
+			ctx.bfx = sbf
+			ctx.lfx = slf
 			const Iarch t = emit_block!(ctx, arms[i].body, benv_e)
+			accb = facts_isect(accb, ctx.bfx)
+			accl = facts_isect(accl, ctx.lfx)
 			if t == 0 then write_str(ctx.fd, "\tjmp @smend${lid}\n")
 		} else if arm_is_guarded(arms[i].binds) then {
 			# a GUARDED arm (single member + payload sub-patterns): test the tag, then each guard in
@@ -5299,7 +5314,11 @@ const emit_stmt_match! = (*Emit ctx, [Binding] env, Expr scrut, [StmtArm] arms):
 				arms[i].binds,
 				s,
 			)
+			ctx.bfx = sbf
+			ctx.lfx = slf
 			const Iarch t = emit_block!(ctx, arms[i].body, benv_g)
+			accb = facts_isect(accb, ctx.bfx)
+			accl = facts_isect(accl, ctx.lfx)
 			if t == 0 then write_str(ctx.fd, "\tjmp @smend${lid}\n")
 			write_str(ctx.fd, "@snext${lid}_${i}\n")
 		} else {
@@ -5330,7 +5349,11 @@ const emit_stmt_match! = (*Emit ctx, [Binding] env, Expr scrut, [StmtArm] arms):
 				arms[i].binds,
 				s,
 			)
+			ctx.bfx = sbf
+			ctx.lfx = slf
 			const Iarch t = emit_block!(ctx, arms[i].body, benv_m)
+			accb = facts_isect(accb, ctx.bfx)
+			accl = facts_isect(accl, ctx.lfx)
 			if t == 0 then write_str(ctx.fd, "\tjmp @smend${lid}\n")
 			write_str(ctx.fd, "@snext${lid}_${i}\n")
 		}
@@ -5339,6 +5362,8 @@ const emit_stmt_match! = (*Emit ctx, [Binding] env, Expr scrut, [StmtArm] arms):
 	}
 
 	write_str(ctx.fd, "@smend${lid}\n")
+	ctx.bfx = accb
+	ctx.lfx = accl
 
 	return 0
 }
@@ -5547,6 +5572,551 @@ const emit_buffer! = (*Emit ctx, Expr sz): Str -> {
 	return "%t${hdr}"
 }
 
+# ── Bounds-check ELIMINATION (BCE) ───────────────────────────────────────────────────────────────
+# The hot scanning idiom — `loop { if i >= n then break ... xs[i] ... i = i + 1 }` — pays the
+# full check per byte without elision (~20% on byte-heavy code, measured). Emit owns the shapes,
+# so it proves the check redundant where the SOURCE already guards:
+#   - a LEN-ALIAS fact `n ≡ len(xs)` from `const n = Iarch(xs.len)` (arrays only GROW — no cf
+#     operation shrinks one — so the alias stays a lower bound and a repoint is an Assign, killed);
+#   - a BOUND fact `i < len(xs)` from a dominating guard: `if i >= L then break|continue|return`
+#     (fall-through path) or `if i < L then <body>` (inside the body), L the direct `.len` or a
+#     len-alias;
+#   - a fn-wide NON-NEGATIVITY set: bindings born from a non-negative literal whose every
+#     assignment is `x + <non-negative>`/a literal/a member of the set (induction counters).
+# TIERS at an access `xs[i]`: bound fact AND `i` provably non-negative → NO check; bound fact
+# alone → a 2-instruction `i >= 0` compare (the guard's signed `>=` never excluded a negative
+# index, so the zero side must stay); no fact → the full check. SOUNDNESS: kills are applied at
+# the emission FUNNEL (the Assign/FieldAssign/DeepFieldAssign arms), branch exits INTERSECT
+# facts (an add or a kill inside a branch never leaks), and every loop entry clears bound facts
+# (the in-body guard re-establishes them each iteration) and prunes len-aliases against the
+# body's kills (the back edge re-runs the guard against the SAME binding).
+data BceKills = { [Str] names, [Str] fields, Bool wild }
+
+# The array KEY a `.len` read names: `xs.len` → "xs", `p.src.len` → "p.src" (through an `Iarch`
+# cast), else "".
+const bce_len_key = (Expr e): Str -> match e {
+	Expr.Call(cn, _, args, g) ->
+		if eq(cn, "Iarch") && eq(g, "") && Iarch(args.len) == 1 then bce_len_key(args[0]) else "",
+	Expr.Field(b, f) -> if eq(f, "len") then b else "",
+	Expr.FieldExpr(be, f) -> if eq(f, "len") then match be {
+		Expr.Field(b2, f2) -> "${b2}.${f2}",
+		_ -> "",
+	} else "",
+	_ -> "",
+}
+
+const bce_var_name = (Expr e): Str -> match e { Expr.Var(n) -> n, _ -> "" }
+
+# An index expression's fact key: a binding `i`, or a field cursor `p.pos` → "p.pos".
+const bce_idx_key = (Expr e): Str -> match e {
+	Expr.Var(n) -> n,
+	Expr.Field(b, f) -> "${b}.${f}",
+	_ -> "",
+}
+
+# The key a guard's LIMIT expression bounds: a direct `.len` read, or a binding len-aliased to one.
+const bce_limit_key = (*Emit ctx, Expr l): Str -> {
+	const Str dk = bce_len_key(l)
+	if !eq(dk, "") then return dk
+	const Str n = bce_var_name(l)
+	if eq(n, "") then return ""
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(ctx.lfx.len) then break
+		const Str nm = fact_left(ctx.lfx[i])
+		if eq(nm, n) then return fact_right(ctx.lfx[i])
+		i = i + 1
+	}
+
+	return ""
+}
+
+const fact_key = (Str a, Str b): Str -> "${a}|${b}"
+
+const fact_left = (Str k): Str -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(k.len) then break
+		if Iarch(k[i]) == 124 then return slice(0, i, k)
+		i = i + 1
+	}
+
+	return k
+}
+
+const fact_right = (Str k): Str -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(k.len) then break
+		if Iarch(k[i]) == 124 then return slice(i + 1, Iarch(k.len), k)
+		i = i + 1
+	}
+
+	return ""
+}
+
+# Keep only entries present in BOTH lists — the branch-exit rule (adds and kills both scoped).
+const facts_isect = ([Str] a, [Str] b): [Str] -> {
+	let [Str] out = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(a.len) then break
+		if has_str(b, a[i]) then out = [...out, a[i]]
+		i = i + 1
+	}
+
+	return out
+}
+
+# The base binding of a field key "b.f" ("" for a plain name).
+const fact_base = (Str k): Str -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(k.len) then break
+		if Iarch(k[i]) == 46 then return slice(0, i, k)
+		i = i + 1
+	}
+
+	return ""
+}
+
+# Does fact entry `k` (either list) depend on assigned name `n` — as either side directly, or
+# as the base binding of either side's field key?
+const fact_uses_name = (Str k, Str n): Bool -> {
+	const Str l = fact_left(k)
+	if eq(l, n) then return true
+	if eq(fact_base(l), n) then return true
+	const Str r = fact_right(k)
+	if eq(r, n) then return true
+
+	return eq(fact_base(r), n)
+}
+
+const facts_kill_name = ([Str] xs, Str n): [Str] -> {
+	let [Str] out = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(xs.len) then break
+		if !fact_uses_name(xs[i], n) then out = [...out, xs[i]]
+		i = i + 1
+	}
+
+	return out
+}
+
+const facts_kill_field = ([Str] xs, Str fk): [Str] -> {
+	let [Str] out = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(xs.len) then break
+		if !eq(fact_right(xs[i]), fk) then if !eq(fact_left(xs[i]), fk) then out = [...out, xs[i]]
+		i = i + 1
+	}
+
+	return out
+}
+
+const bce_kill_name = (*Emit ctx, Str n): Iarch -> {
+	ctx.bfx = facts_kill_name(ctx.bfx, n)
+	ctx.lfx = facts_kill_name(ctx.lfx, n)
+
+	return 0
+}
+
+const bce_kill_field! = (*Emit ctx, Str b, Str f): Iarch -> {
+	ctx.bfx = facts_kill_field(ctx.bfx, "${b}.${f}")
+	ctx.lfx = facts_kill_field(ctx.lfx, "${b}.${f}")
+
+	return 0
+}
+
+const bce_clear = (*Emit ctx): Iarch -> {
+	ctx.bfx = no_names()
+	ctx.lfx = no_names()
+
+	return 0
+}
+
+# Collect a body's kills (assigned names, repointed fields, `wild` for the conservative forms)
+# — the loop-entry prune: a len-alias touched anywhere in a loop body cannot cross its back edge.
+const bce_kills_stmt = (Stmt s, BceKills acc): BceKills -> match s {
+	Stmt.Assign(n, _) -> BceKills({ names: [...acc.names, n], fields: acc.fields, wild: acc.wild }),
+	Stmt.Destructure(ns, _, _) ->
+		BceKills({ names: [...acc.names, ...ns], fields: acc.fields, wild: acc.wild }),
+	Stmt.FieldAssign(b, f, _) ->
+		BceKills({ names: acc.names, fields: [...acc.fields, "${b}.${f}"], wild: acc.wild }),
+	Stmt.DeepFieldAssign(_, _, _) -> BceKills({ names: acc.names, fields: acc.fields, wild: true }),
+	Stmt.IfThen(_, b) -> bce_kills_stmt(b, acc),
+	Stmt.IfElse(_, t, el) -> bce_kills_stmt(el, bce_kills_stmt(t, acc)),
+	Stmt.Block(ss) -> bce_kills_body(ss, acc),
+	Stmt.Loop(_, ss) -> bce_kills_body(ss, acc),
+	Stmt.ForIn(_, _, ss) -> bce_kills_body(ss, acc),
+	Stmt.Match(_, arms) -> bce_kills_arms(arms, acc),
+	Stmt.Defer(ss) -> bce_kills_body(ss, acc),
+	Stmt.Closure(_, _, _, _) -> BceKills({ names: acc.names, fields: acc.fields, wild: true }),
+	_ -> acc,
+}
+
+const bce_kills_arms = ([StmtArm] arms, BceKills acc): BceKills -> {
+	let BceKills r = acc
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(arms.len) then break
+		r = bce_kills_body(arms[i].body, r)
+		i = i + 1
+	}
+
+	return r
+}
+
+const bce_kills_body = ([Stmt] ss, BceKills acc): BceKills -> {
+	let BceKills r = acc
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(ss.len) then break
+		r = bce_kills_stmt(ss[i], r)
+		i = i + 1
+	}
+
+	return r
+}
+
+# Loop entry: bound facts never cross a back edge (the in-body guard re-establishes them);
+# len-aliases survive only when the body touches neither side.
+const bce_enter_loop! = (*Emit ctx, [Stmt] body): Iarch -> {
+	ctx.bfx = no_names()
+	# the kills prescan only pays when a len-alias is actually alive (they are rare)
+	if Iarch(ctx.lfx.len) == 0 then return 0
+	const [Str] non = no_names()
+	const BceKills k = bce_kills_body(body, BceKills({ names: non, fields: non, wild: false }))
+
+	if k.wild then {
+		ctx.lfx = no_names()
+
+		return 0
+	}
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(k.names.len) then break
+		ctx.lfx = facts_kill_name(ctx.lfx, k.names[i])
+		i = i + 1
+	}
+
+	let Iarch j = 0
+
+	loop {
+		if j >= Iarch(k.fields.len) then break
+		ctx.lfx = facts_kill_field(ctx.lfx, k.fields[j])
+		j = j + 1
+	}
+
+	return 0
+}
+
+# The post-statement transition (emit_block's walk): a `const n = Iarch(xs.len)` adds a
+# len-alias; a fall-through `if i >= L then break|continue|return` adds a bound fact.
+const bce_stmt_post = (*Emit ctx, Stmt s): Iarch -> {
+	match s {
+		Stmt.Destructure(dns, _, _) -> {
+			let Iarch di = 0
+
+			loop {
+				if di >= Iarch(dns.len) then break
+				bce_kill_name(ctx, dns[di])
+				di = di + 1
+			}
+		},
+		Stmt.Let(n, _, _, init) -> {
+			const Str lk = bce_len_key(init)
+			if !eq(lk, "") then ctx.lfx = [...ctx.lfx, fact_key(n, lk)]
+		},
+		Stmt.IfThen(c, b) -> {
+			const Bool exits = match b {
+				Stmt.Break(bl_) -> Iarch(bl_.len) == 0,
+				Stmt.Continue(cl_) -> Iarch(cl_.len) == 0,
+				Stmt.Return(_) -> true,
+				_ -> false,
+			}
+
+			if exits then {
+				match c {
+					Expr.CmpGe(l, r) -> {
+						const Str iv = bce_idx_key(l)
+						const Str ak = bce_limit_key(ctx, r)
+						if !eq(iv, "") && !eq(ak, "")
+							then ctx.bfx = [...ctx.bfx, fact_key(iv, ak)]
+					},
+					_ -> {},
+				}
+			}
+		},
+		_ -> {},
+	}
+
+	return 0
+}
+
+# The elision tier for an access `key[idx]`: 2 = no check (bound fact + non-negative counter),
+# 1 = zero-compare only (bound fact), 0 = full check.
+const bce_tier! = (*Emit ctx, Str key, Expr idx): Iarch -> {
+	const Str iv = bce_idx_key(idx)
+	if eq(iv, "") then return 0
+	if !has_str(ctx.bfx, fact_key(iv, key)) then return 0
+
+	if !ctx.nn_done then {
+		ctx.nonneg = nn_scan!(ctx.funcs[ctx.cur_fn].body)
+		ctx.nn_done = true
+	}
+
+	if has_str(ctx.nonneg, iv) then return 2
+
+	return 1
+}
+
+# ── The fn-wide NON-NEGATIVITY set: induction counters (`let i = 0`, every assignment
+# `i + <non-negative>`/a literal/a set member). Two fixpoint rounds catch chained counters
+# (`let j = i + 1`).
+const nn_expr_ok = ([Str] set, Expr e): Bool -> match e {
+	Expr.Lit(v) -> v >= 0,
+	Expr.Var(n) -> has_str(set, n),
+	Expr.Add(l, r) -> if nn_expr_ok(set, l) then nn_expr_ok(set, r) else false,
+	_ -> false,
+}
+
+const nn_lets_stmt! = (Stmt s, [Str] ns, [[Expr]] es): NnAcc -> {
+	match s {
+		Stmt.Let(n, _, _, init) -> {
+			return NnAcc({ names: [...ns, n], exprs: [...es, nn_one(init)] })
+		},
+		Stmt.Assign(n, v) -> {
+			return NnAcc({ names: [...ns, "=${n}"], exprs: [...es, nn_one(v)] })
+		},
+		Stmt.IfThen(_, b) -> {
+			return nn_lets_stmt!(b, ns, es)
+		},
+		Stmt.IfElse(_, t, el) -> {
+			const NnAcc a = nn_lets_stmt!(t, ns, es)
+
+			return nn_lets_stmt!(el, a.names, a.exprs)
+		},
+		Stmt.Block(ss) -> {
+			return nn_lets_body!(ss, ns, es)
+		},
+		Stmt.Loop(_, ss) -> {
+			return nn_lets_body!(ss, ns, es)
+		},
+		Stmt.ForIn(_, _, ss) -> {
+			return nn_lets_body!(ss, ns, es)
+		},
+		Stmt.Match(_, arms) -> {
+			return nn_lets_arms!(arms, ns, es)
+		},
+		Stmt.Defer(ss) -> {
+			return nn_lets_body!(ss, ns, es)
+		},
+		Stmt.Closure(_, _, _, cb) -> {
+			return nn_lets_body!(cb, ns, es)
+		},
+		Stmt.Destructure(dns, _, _) -> {
+			return nn_destructure!(dns, ns, es)
+		},
+		_ -> {
+			return NnAcc({ names: ns, exprs: es })
+		},
+	}
+
+	return NnAcc({ names: ns, exprs: es })
+}
+
+data NnAcc = { [Str] names, [[Expr]] exprs }
+
+const nn_one = (Expr e): [Expr] -> {
+	const [Expr] r = [e]
+
+	return r
+}
+
+# a destructured name is assigned from a tuple position — unknown sign; record it as a
+# disqualifying assignment (a `-1` literal can never pass `nn_expr_ok`)
+const nn_destructure! = ([Str] dns, [Str] ns, [[Expr]] es): NnAcc -> {
+	let [Str] rn = ns
+	let [[Expr]] re = es
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(dns.len) then break
+		rn = [...rn, "=${dns[i]}"]
+		re = [...re, nn_one(Expr.Lit(-1))]
+		i = i + 1
+	}
+
+	return NnAcc({ names: rn, exprs: re })
+}
+
+const nn_lets_arms! = ([StmtArm] arms, [Str] ns, [[Expr]] es): NnAcc -> {
+	let NnAcc a = NnAcc({ names: ns, exprs: es })
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(arms.len) then break
+		a = nn_lets_body!(arms[i].body, a.names, a.exprs)
+		i = i + 1
+	}
+
+	return a
+}
+
+const nn_lets_body! = ([Stmt] ss, [Str] ns, [[Expr]] es): NnAcc -> {
+	let NnAcc a = NnAcc({ names: ns, exprs: es })
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(ss.len) then break
+		a = nn_lets_stmt!(ss[i], a.names, a.exprs)
+		i = i + 1
+	}
+
+	return a
+}
+
+# The fixpoint over the collected decls/assigns. Entries prefixed "=" are assignments; the
+# comparison strips the prefix by byte (no allocation in the quadratic loops).
+const nn_is_assign = (Str nm): Bool -> if Iarch(nm.len) == 0 then false else Iarch(nm[0]) == 61
+
+const nn_same = (Str tagged, Str bare): Bool -> {
+	if Iarch(tagged.len) != Iarch(bare.len) + 1 then return false
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(bare.len) then break
+		if Iarch(tagged[i + 1]) != Iarch(bare[i]) then return false
+		i = i + 1
+	}
+
+	return true
+}
+
+const nn_scan! = ([Stmt] body): [Str] -> {
+	const [Str] n0 = []
+	const [[Expr]] e0 = []
+	const NnAcc a = nn_lets_body!(body, n0, e0)
+	# OPTIMISTIC start (every declared name in), then remove violators to a fixpoint: a
+	# mutually-justified counter pair (`i = j + 1` / `let j = i + 1`) stays in — sound because
+	# every retained write is an add of retained/non-negative parts, so no execution can write
+	# the first negative value.
+	let [Str] set = []
+	let Iarch i0 = 0
+
+	loop {
+		if i0 >= Iarch(a.names.len) then break
+		if !nn_is_assign(a.names[i0]) then set = [...set, a.names[i0]]
+		i0 = i0 + 1
+	}
+
+	let Iarch round = 0
+
+	loop {
+		if round >= 8 then break
+		let [Str] nset = []
+		let Bool changed = false
+		let Iarch i = 0
+
+		loop {
+			if i >= Iarch(set.len) then break
+			const Str nm = set[i]
+			let Bool ok = true
+			let Iarch j = 0
+
+			loop {
+				if j >= Iarch(a.names.len) then break
+
+				if nn_is_assign(a.names[j]) then {
+					if nn_same(a.names[j], nm)
+						then if !nn_expr_ok(set, a.exprs[j][0]) then ok = false
+				} else {
+					if eq(a.names[j], nm)
+						then if !nn_expr_ok(set, a.exprs[j][0]) then ok = false
+				}
+
+				j = j + 1
+			}
+
+			if ok then nset = [...nset, nm]
+			if !ok then changed = true
+			i = i + 1
+		}
+
+		set = nset
+		if !changed then break
+		round = round + 1
+	}
+
+	return set
+}
+
+# ── Bounds check (OOB → trap): `xs[i]`/`s[i]` are CLAIMS — refute with a `cf_oob` trap (exit
+# 73, beside oom 70 / mmap 71 / oos 72) instead of touching a neighbor: an unchecked read is
+# silent garbage, and an unchecked WRITE through a promoted small array smashes the frame's
+# return address — the one live UB hole the trap census found. One UNSIGNED compare against the
+# header's `len@8` folds the negative-index case (`Uarch(i) < Uarch(len)`). Raw `*[T]` pointers
+# (no header — the std/mem-gated floor primitive) and comptime-indexed tuples sit below the
+# check; `for`-in never indexes, so the dominant idiom pays nothing.
+const emit_oob_check! = (*Emit ctx, Str hdr, Str iv): Iarch -> {
+	const Iarch lid = ctx.label
+	ctx.label = ctx.label + 1
+	const Iarch t = ctx.next
+	ctx.next = ctx.next + 3
+	write_str(ctx.fd, "\t%t${t} =l add ${hdr}, 8\n")
+	write_str(ctx.fd, "\t%t${t + 1} =l loadl %t${t}\n")
+	write_str(ctx.fd, "\t%t${t + 2} =w cultl ${iv}, %t${t + 1}\n")
+	write_str(ctx.fd, "\tjnz %t${t + 2}, @bok${lid}, @boob${lid}\n")
+	write_str(ctx.fd, "@boob${lid}\n")
+	write_str(ctx.fd, "\tcall $cf_oob()\n")
+	write_str(ctx.fd, "\tjmp @bok${lid}\n")
+	write_str(ctx.fd, "@bok${lid}\n")
+
+	return 0
+}
+
+# The 2-instruction lower tier: a dominating guard proved `i < len`, but its signed compare
+# never excluded a negative index — only the zero side remains.
+const emit_nn_check! = (*Emit ctx, Str iv): Iarch -> {
+	const Iarch lid = ctx.label
+	ctx.label = ctx.label + 1
+	const Iarch t = ctx.next
+	ctx.next = ctx.next + 1
+	write_str(ctx.fd, "\t%t${t} =w csgel ${iv}, 0\n")
+	write_str(ctx.fd, "\tjnz %t${t}, @bok${lid}, @boob${lid}\n")
+	write_str(ctx.fd, "@boob${lid}\n")
+	write_str(ctx.fd, "\tcall $cf_oob()\n")
+	write_str(ctx.fd, "\tjmp @bok${lid}\n")
+	write_str(ctx.fd, "@bok${lid}\n")
+
+	return 0
+}
+
+# One bounds check at the elision tier the facts allow (`key` "" = no fact channel — full check).
+const emit_bounds! = (*Emit ctx, Str hdr, Str iv, Str key, Expr idx): Iarch -> {
+	const Iarch t = if eq(key, "") then 0 else bce_tier!(ctx, key, idx)
+	if t == 2 then return 0
+	if t == 1 then return emit_nn_check!(ctx, iv)
+
+	return emit_oob_check!(ctx, hdr, iv)
+}
+
+# The fact key an IndexExpr BASE names: `p.src[i]` → "p.src"; anything else has no channel.
+const bce_base_key = (Expr base): Str -> match base { Expr.Field(b, f) -> "${b}.${f}", _ -> "" }
+
 # Emit `xs[i]` — load the i-th element (element address = data + i*8).
 const emit_index! = (*Emit ctx, [Binding] env, Str arr, Expr idx): Str -> {
 	const Iarch ai = lookup_index(env, arr)
@@ -5590,6 +6160,7 @@ const emit_index! = (*Emit ctx, [Binding] env, Str arr, Expr idx): Str -> {
 	# a string index `s[i]` reads the i-th byte: the header's bytes pointer @0, then +i.
 	if !stat && eq(env[ai].rec_type, "Str") then {
 		const Str siv = emit_expr!(idx, ctx, env)
+		emit_bounds!(ctx, hdr, siv, if stat then "" else arr, idx)
 		const Iarch sbytes = ctx.next
 		ctx.next = ctx.next + 1
 		write_str(ctx.fd, "\t%t${sbytes} =l loadl ${hdr}\n")
@@ -5606,6 +6177,7 @@ const emit_index! = (*Emit ctx, [Binding] env, Str arr, Expr idx): Str -> {
 		return "%t${sval}"
 	}
 	const Str iv = emit_expr!(idx, ctx, env)
+	emit_bounds!(ctx, hdr, iv, if stat then "" else arr, idx)
 	const Iarch esz = elem_bytes(selem)
 	const Iarch data = ctx.next
 	ctx.next = ctx.next + 1
@@ -5659,6 +6231,7 @@ const emit_index_field! = (*Emit ctx, [Binding] env, Str arr, Expr idx, Str fiel
 		return load_typed!(ctx, "%t${tfaddr}", field_scalar(ctx, tn, field))
 	}
 	const Str iv = emit_expr!(idx, ctx, env)
+	emit_bounds!(ctx, hdr, iv, arr, idx)
 	const Iarch data = ctx.next
 	ctx.next = ctx.next + 1
 	write_str(ctx.fd, "\t%t${data} =l loadl ${hdr}\n")
@@ -5729,6 +6302,7 @@ const emit_index_expr! = (*Emit ctx, [Binding] env, Expr base, Expr idx): Str ->
 	# a string index `s[i]` reads the i-th byte: the header's bytes pointer @0, then +i.
 	if eq(bt, "Str") then {
 		const Str siv = emit_expr!(idx, ctx, env)
+		emit_bounds!(ctx, hv, siv, bce_base_key(base), idx)
 		const Iarch sbytes = ctx.next
 		ctx.next = ctx.next + 1
 		write_str(ctx.fd, "\t%t${sbytes} =l loadl ${hv}\n")
@@ -5745,6 +6319,7 @@ const emit_index_expr! = (*Emit ctx, [Binding] env, Expr base, Expr idx): Str ->
 		return "%t${sval}"
 	}
 	const Str iv = emit_expr!(idx, ctx, env)
+	emit_bounds!(ctx, hv, iv, bce_base_key(base), idx)
 	const Iarch esz = elem_bytes(init_elem!(ctx, env, base))
 	const Iarch data = ctx.next
 	ctx.next = ctx.next + 1
@@ -6114,6 +6689,8 @@ const emit_reset! = (*Emit ctx, Iarch mk, Str nodeop): Iarch -> {
 # Called directly from `emit_block`'s `ForIn` arm, which binds the loop variable, array
 # name, and body.
 const emit_for_body! = (*Emit ctx, [Binding] env, Str lv, Str arr, [Stmt] body): Iarch -> {
+	# BCE loop entry (see emit_loop_body!)
+	bce_enter_loop!(ctx, body)
 	const Iarch ai = lookup_index(env, arr)
 	const Str hdr = binding_ptr!(ctx, env, ai)
 	const Iarch lid = ctx.label
@@ -6236,6 +6813,8 @@ const emit_for_body! = (*Emit ctx, [Binding] env, Str lv, Str arr, [Stmt] body):
 # restored around the body so a nested loop targets itself. Called directly from
 # `emit_block`'s `Loop` arm, which binds the body.
 const emit_loop_body! = (*Emit ctx, [Binding] env, Str lbl, [Stmt] body): Iarch -> {
+	# BCE loop entry: bound facts never cross the back edge; len-aliases survive a clean body
+	bce_enter_loop!(ctx, body)
 	const Iarch lid = ctx.label
 	ctx.label = ctx.label + 1
 	const Iarch saved = ctx.cur_loop
@@ -6287,6 +6866,8 @@ const emit_loop_body! = (*Emit ctx, [Binding] env, Str lbl, [Stmt] body): Iarch 
 # each `<- v` assigns the temp and jumps to `@lend`. Every path into `@lend` runs a yield, so
 # the temp is defined wherever it is read; QBE's ssa pass makes the phi.
 const emit_loop_value! = (*Emit ctx, [Binding] env, [Stmt] body): Str -> {
+	# BCE loop entry (see emit_loop_body!)
+	bce_enter_loop!(ctx, body)
 	const Iarch slot = ctx.next
 	ctx.next = ctx.next + 1
 	const Iarch lid = ctx.label
@@ -6328,7 +6909,23 @@ const emit_guard! = (*Emit ctx, [Binding] env, Expr cond, Stmt body): Iarch -> {
 	ctx.label = ctx.label + 1
 	write_str(ctx.fd, "\tjnz ${cc}, @then${gid}, @gnext${gid}\n")
 	write_str(ctx.fd, "@then${gid}\n")
+	# BCE branch scope: `if i < L then <body>` bounds `i` inside the body; the exit
+	# INTERSECTS (an add or a kill inside the branch never leaks to the join)
+	const [Str] sbf = ctx.bfx
+	const [Str] slf = ctx.lfx
+
+	match cond {
+		Expr.CmpLt(gl, gr) -> {
+			const Str gi = bce_idx_key(gl)
+			const Str gk = bce_limit_key(ctx, gr)
+			if !eq(gi, "") && !eq(gk, "") then ctx.bfx = [...ctx.bfx, fact_key(gi, gk)]
+		},
+		_ -> {},
+	}
+
 	const Iarch term = emit_simple_stmt!(ctx, env, body)
+	ctx.bfx = facts_isect(sbf, ctx.bfx)
+	ctx.lfx = facts_isect(slf, ctx.lfx)
 	if term == 0 then write_str(ctx.fd, "\tjmp @gnext${gid}\n")
 	write_str(ctx.fd, "@gnext${gid}\n")
 
@@ -6347,10 +6944,29 @@ const emit_ifelse! = (*Emit ctx, [Binding] env, Expr cond, Stmt tb, Stmt eb): Ia
 	ctx.label = ctx.label + 1
 	write_str(ctx.fd, "\tjnz ${cc}, @then${gid}, @else${gid}\n")
 	write_str(ctx.fd, "@then${gid}\n")
+	# BCE branch scope: exclusive branches each start from the entry facts; the join intersects
+	const [Str] sbf = ctx.bfx
+	const [Str] slf = ctx.lfx
+
+	match cond {
+		Expr.CmpLt(gl, gr) -> {
+			const Str gi = bce_idx_key(gl)
+			const Str gk = bce_limit_key(ctx, gr)
+			if !eq(gi, "") && !eq(gk, "") then ctx.bfx = [...ctx.bfx, fact_key(gi, gk)]
+		},
+		_ -> {},
+	}
+
 	const Iarch tterm = emit_simple_stmt!(ctx, env, tb)
+	const [Str] tbf = ctx.bfx
+	const [Str] tlf = ctx.lfx
+	ctx.bfx = sbf
+	ctx.lfx = slf
 	if tterm == 0 then write_str(ctx.fd, "\tjmp @end${gid}\n")
 	write_str(ctx.fd, "@else${gid}\n")
 	const Iarch eterm = emit_simple_stmt!(ctx, env, eb)
+	ctx.bfx = facts_isect(facts_isect(sbf, tbf), ctx.bfx)
+	ctx.lfx = facts_isect(facts_isect(slf, tlf), ctx.lfx)
 	if eterm == 0 then write_str(ctx.fd, "\tjmp @end${gid}\n")
 	let Iarch both = 0
 	if tterm == 1 then {
@@ -7029,6 +7645,8 @@ const emit_simple_stmt! = (*Emit ctx, [Binding] env, Stmt s): Iarch -> {
 			ctx.alloc_node = saved_an
 			ctx.carve_node = saved_cn
 			ctx.grow_node = saved_gn
+			# BCE funnel kill: the assigned name may be an index/len-alias/array binding
+			bce_kill_name(ctx, n)
 		},
 		Stmt.FieldAssign(b, f, e) -> {
 			# `base.field = value` — store the value into the record's field in place.
@@ -7043,6 +7661,8 @@ const emit_simple_stmt! = (*Emit ctx, [Binding] env, Stmt s): Iarch -> {
 			write_str(ctx.fd, "\t%t${addr} =l add ${bp}, ${off}\n")
 			# a float field stores `stored`/`stores`; a word/pointer field `storel`
 			write_str(ctx.fd, "\t${store_op(field_scalar(ctx, rt, f))} ${v}, %t${addr}\n")
+			# BCE funnel kill: a `b.f` store may repoint a field-keyed array
+			bce_kill_field!(ctx, b, f)
 		},
 		Stmt.DeepFieldAssign(be, f, e) -> {
 			# `a.b.c = value` — evaluate the value first (it may read the aggregate), then address the
@@ -7056,6 +7676,8 @@ const emit_simple_stmt! = (*Emit ctx, [Binding] env, Stmt s): Iarch -> {
 			ctx.next = ctx.next + 1
 			write_str(ctx.fd, "\t%t${addr} =l add ${bp}, ${off}\n")
 			write_str(ctx.fd, "\t${store_op(field_scalar(ctx, rt, f))} ${v}, %t${addr}\n")
+			# BCE funnel kill: a deep store may repoint anything reachable — drop every fact
+			bce_clear(ctx)
 		},
 		Stmt.IndexAssign(a, ix, val) -> {
 			# `arr[idx] = val` — store the value at data + idx*8
@@ -7080,6 +7702,8 @@ const emit_simple_stmt! = (*Emit ctx, [Binding] env, Stmt s): Iarch -> {
 
 				return 0
 			}
+			# the WRITE is the exploit-class direction (a promoted array's slot is frame memory)
+			emit_bounds!(ctx, hdr, iv, if stat then "" else a, ix)
 			const Iarch esz = elem_bytes(selem)
 			const Iarch data = ctx.next
 			ctx.next = ctx.next + 1
@@ -7297,6 +7921,9 @@ const emit_block! = (*Emit ctx, [Stmt] stmts, [Binding] params): Iarch -> {
 				terminal = emit_simple_stmt!(ctx, env, s)
 			},
 		}
+
+		# BCE post-statement transition: len-alias and fall-through guard facts
+		bce_stmt_post(ctx, s)
 
 		i = i + 1
 	}
@@ -8068,6 +8695,10 @@ const emit_func! = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 	# self-tail-call → loop (the TCO block above emit_tail_jump!): decided before the body
 	# so the `@tailtop` label below and every tail jump in the body agree
 	ctx.tco_ok = tco_eligible(ctx, fn)
+	# the BCE non-negativity set computes LAZILY (bce_tier), only in functions that reach a
+	# guarded access — the scan is quadratic-ish and most functions never index under a guard
+	ctx.nonneg = no_names()
+	ctx.nn_done = false
 	# `--debug`: the declaration's file and line, as QBE debug directives — `dbgfile`
 	# before the function, `dbgloc` as the body's first instruction — become `.loc`
 	# lines and a DWARF line table, so tools attribute frames to source.
@@ -9023,6 +9654,11 @@ const emit_arena_floor! = (Fd fd, Bool is_bare, Iarch root_size): Iarch -> {
 		write_str(fd, "\tret\n")
 		write_str(fd, "cf_oom:\n")
 		write_str(fd, "\tb cf_oom\n")
+		# a refuted bounds claim halts too (no kernel to exit through) — bounds are soundness
+		# on bare (no guard page anywhere)
+		write_str(fd, ".globl cf_oob\n")
+		write_str(fd, "cf_oob:\n")
+		write_str(fd, "\tb cf_oob\n")
 
 		return 0
 	}
@@ -9326,6 +9962,10 @@ pub const emit_program! = (
 				aggvals: aggvals,
 				tco_ok: false,
 				oos: oosp,
+				bfx: no_names(),
+				lfx: no_names(),
+				nonneg: no_names(),
+				nn_done: false,
 			})
 			emit_func!(&ctx, prog.funcs[i], i)
 		}
