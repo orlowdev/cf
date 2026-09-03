@@ -1846,6 +1846,16 @@ const goto_def! = (Str argv0, [Str] env, Str uri, Str srcf, Str srcp, Iarch l0, 
 			}
 		}
 
+		# a MID-path segment (`io` in `import std::io::fd`) names a module the tree never
+		# LOADED — resolve the path through the barrel machinery (aliases chased) to its
+		# on-disk file instead
+		const Str bm = hints_module!(pwd, dir_of(path), lines, t.lead)
+
+		if Iarch(bm.len) > 0 then {
+			const Str mf = mod_file!(pwd, dir_of(path), bm)
+			if Iarch(mf.len) > 0 then return Json.Arr([location!(uri, path, mf, 0, 0, 1)])
+		}
+
 		return Json.Null
 	}
 
@@ -3070,6 +3080,26 @@ const name_runs = (Str s): [Str] -> {
 	return out
 }
 
+# A surface row's detail, styled like a hover: a function shows its bare signature
+# (`(DirEntry e): Bool`), everything else its declaration head with the `pub`, the `=`, and
+# the body dropped (`data DirEntry`, `union IoRrr`, `const STDIN`).
+const surf_detail = (Str nm, Str ln): Str -> {
+	const FnSig fs = fn_sig_of(nm, ln)
+
+	if Iarch(fs.sig.len) > 0 then {
+		# `name: (params): Ret` → the bare `(params): Ret` (the label already carries the name)
+		const Iarch cut = Iarch(nm.len) + 2
+		if Iarch(fs.sig.len) > cut then return slice(cut, Iarch(fs.sig.len), fs.sig)
+	}
+
+	let Str head = trim(ln)
+	if starts_with("pub ", head) then head = slice(4, Iarch(head.len), head)
+	const Iarch eqi = index_of(" = ", head)
+	if eqi > 0 then return slice(0, eqi, head)
+
+	return tidy_sig(head)
+}
+
 # The directory prefix of a file path, `/` kept (`/a/b/c.cf` → `/a/b/`).
 const dir_of = (Str p): Str -> {
 	let Iarch lsl = -1
@@ -3086,22 +3116,33 @@ const dir_of = (Str p): Str -> {
 	return slice(0, lsl + 1, p)
 }
 
-# The source text of module path `mpath` (`std/io`): a `std`-rooted path opens `<pwd>/lib/…`
-# (the dev tree first, then the std baked into this very binary), anything else resolves
-# against the checked file's directory. "" when the path names no module.
-const mod_bytes! = (Str pwd, Str edir, Str mpath): Str -> {
-	const Bool is_std = starts_with("std/", mpath) || eq(mpath, "std")
+# The on-disk file of module path `mpath` (`std/io` → `<pwd>/lib/std/io.cf`), or "" when no
+# readable file answers (an embedded-only std module has no file — nothing to jump to).
+const mod_file! = (Str pwd, Str edir, Str mpath): Str -> {
 	let Str p = ""
 
-	if is_std then {
+	if starts_with("std/", mpath) || eq(mpath, "std") then {
 		if Iarch(pwd.len) > 0 then p = "${pwd}/lib/${mpath}.cf" else p = "lib/${mpath}.cf"
 	} else {
 		p = "${edir}${mpath}.cf"
 	}
 
-	const Str disk = match read_file!(czstr!(p)) { Either.Right(s) -> s, Either.Left(e) -> "" }
+	return match read_file!(czstr!(p)) { Either.Right(s) -> p, Either.Left(e) -> "" }
+}
 
-	if Iarch(disk.len) > 0 then return disk
+# The source text of module path `mpath` (`std/io`): a `std`-rooted path opens `<pwd>/lib/…`
+# (the dev tree first, then the std baked into this very binary), anything else resolves
+# against the checked file's directory. "" when the path names no module.
+const mod_bytes! = (Str pwd, Str edir, Str mpath): Str -> {
+	const Bool is_std = starts_with("std/", mpath) || eq(mpath, "std")
+	const Str p = mod_file!(pwd, edir, mpath)
+
+	if Iarch(p.len) > 0 then {
+		const Str disk = match read_file!(czstr!(p)) { Either.Right(s) -> s, Either.Left(e) -> "" }
+
+		if Iarch(disk.len) > 0 then return disk
+	}
+
 	if !is_std then return ""
 	const [EmbeddedFile] embedded = embedded_std()
 	const Str want = "lib/${mpath}.cf"
@@ -3257,7 +3298,7 @@ const surface! = (Str pwd, Str edir, Str mpath, Iarch depth): [SurfRow] -> {
 
 					if !in_list(nm, seen) then {
 						seen = [...seen, nm]
-						out = [...out, SurfRow({ name: nm, kind: citem_kind(d.kind), detail: tidy_sig(ln) })]
+						out = [...out, SurfRow({ name: nm, kind: citem_kind(d.kind), detail: surf_detail(nm, ln) })]
 					}
 				}
 			}

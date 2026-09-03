@@ -454,3 +454,27 @@ def run(s, check, tdp, uri_of):
     r = complete_raw("import std::io\nconst x = io::fd::\n" + text, 1, 18)
     check("use-site members insert plainly",
           all("insertText" not in x for x in r), repr(r[:3]))
+
+    # completion details styled like hovers: bare fn signatures, decl heads without `pub`/`=`
+    r = complete_raw("import std::io\nconst x = io::fd::\n" + text, 1, 18)
+    det = {x["label"]: x["detail"] for x in r}
+    check("detail: bare function signature", det.get("entry_is_dir") == "(DirEntry e): Bool", repr(det))
+    check("detail: data head without =", det.get("Fd") == "data Fd", repr(det))
+    check("detail: union head without =", det.get("IoRrr") == "union IoRrr", repr(det))
+    check("detail: value const head", det.get("STDIN") == "const STDIN", repr(det))
+
+    # goto on EVERY import path segment jumps to that module's file (mid-path resolves
+    # through the barrel machinery even when the tree never loaded the module)
+    s.notify("textDocument/didChange", {"textDocument": {"uri": uri_of(FIX)},
+                                        "contentChanges": [{"text": "import std::io::fd\n" + text}]})
+    s.drain()
+
+    def goto_file(line, char):
+        r = s.request("textDocument/definition", tdp(FIX, line, char))["result"]
+        if isinstance(r, list) and r:
+            return r[0]["uri"].split("/cf/")[-1]
+        return None
+
+    check("goto std jumps to the root barrel", goto_file(0, 7) == "lib/std.cf", repr(goto_file(0, 7)))
+    check("goto io mid-path jumps to the io barrel", goto_file(0, 12) == "lib/std/io.cf", repr(goto_file(0, 12)))
+    check("goto fd still jumps to the module", goto_file(0, 16) == "lib/std/io/fd.cf", repr(goto_file(0, 16)))
