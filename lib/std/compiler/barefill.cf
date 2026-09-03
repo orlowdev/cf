@@ -1,0 +1,223 @@
+# barefill — make a BARE record literal carry the type its position supplies (post-typecheck).
+#
+# A bare `({ ... })` record literal is legal exactly where a type already rides the position:
+# a record-annotated binding (`const Point p = ({...})`), a `return` under a record return
+# annotation, and a nested field init (typed by its parent literal's declaration). Typecheck
+# validates the first two by CONTEXT — but a lowering may MOVE the expression out of its
+# position (defer snapshots a return value into a fresh binding), and the context is lost with
+# the move: the defer + bare-return shape used to die in emit. This pass runs right after the
+# span strip and stamps every ROOT bare literal into a NAMED one (`Point({...})`), so the type
+# rides the construction itself and no later pass needs position context. Only valid programs
+# reach it (compile!/check! return on diagnostics first), so the annotation/return name is
+# guaranteed to fit — the stamp materializes exactly the type the checker already used. A
+# NESTED bare field literal keeps riding its parent's name (the parent travels whole; emit
+# resolves it against the field's declared type), and emit's own `cur_ret`/`ann` bare handling
+# stays as a backstop; the lowerings rely on this pass.
+
+import std::compiler::ast::{ Program, Func, Expr, Stmt, Seg, FieldInit, MatchArm, StmtArm }
+import std::data::str::{ eq }
+
+# The stamp: a root bare literal adopts the position's type name; anything else is untouched.
+const stamp = (Expr e, Str tn): Expr -> match e {
+	Expr.Record(old, fs) -> if eq(old, "") && !eq(tn, "") then Expr.Record(tn, fs) else e,
+	_ -> e,
+}
+
+# The walkers thread `ret` — the enclosing function's (or closure's) declared return type
+# name — down to every `return`, including one buried in a value loop inside an initializer.
+const fill_exprs = ([Expr] es, Str ret): [Expr] -> {
+	let [Expr] out = []
+
+	for e in es {
+		out = [...out, fill_expr(e, ret)]
+	}
+
+	return out
+}
+
+const fill_fields = ([FieldInit] fs, Str ret): [FieldInit] -> {
+	let [FieldInit] out = []
+
+	for f in fs {
+		out = [...out, FieldInit({ field: f.field, value: fill_expr(f.value, ret) })]
+	}
+
+	return out
+}
+
+const fill_segs = ([Seg] segs, Str ret): [Seg] -> {
+	let [Seg] out = []
+
+	for s in segs {
+		out = [
+			...out,
+			Seg({ is_hole: s.is_hole, lit: s.lit, name: s.name, expr: fill_expr(s.expr, ret) }),
+		]
+	}
+
+	return out
+}
+
+const fill_arms = ([MatchArm] arms, Str ret): [MatchArm] -> {
+	let [MatchArm] out = []
+
+	for a in arms {
+		out = [
+			...out,
+			MatchArm({
+				is_wild: a.is_wild,
+				type_name: a.type_name,
+				members: a.members,
+				binds: a.binds,
+				body: fill_expr(a.body, ret),
+			}),
+		]
+	}
+
+	return out
+}
+
+const fill_stmt_arms = ([StmtArm] arms, Str ret): [StmtArm] -> {
+	let [StmtArm] out = []
+
+	for a in arms {
+		out = [
+			...out,
+			StmtArm({
+				is_wild: a.is_wild,
+				type_name: a.type_name,
+				members: a.members,
+				binds: a.binds,
+				body: fill_stmts(a.body, ret),
+			}),
+		]
+	}
+
+	return out
+}
+
+const fill_expr = (Expr e, Str ret): Expr -> match e {
+	Expr.At(off, inner) -> Expr.At(off, fill_expr(inner, ret)),
+	Expr.Lit(v) -> Expr.Lit(v),
+	Expr.BoolLit(b) -> Expr.BoolLit(b),
+	Expr.Var(n) -> Expr.Var(n),
+	Expr.StrLit(bs) -> Expr.StrLit(bs),
+	Expr.FloatLit(t) -> Expr.FloatLit(t),
+	Expr.Record(n, fs) -> Expr.Record(n, fill_fields(fs, ret)),
+	Expr.Field(b, f) -> Expr.Field(b, f),
+	Expr.FieldExpr(b, f) -> Expr.FieldExpr(fill_expr(b, ret), f),
+	Expr.UnionMk(t, m, args) -> Expr.UnionMk(t, m, fill_exprs(args, ret)),
+	Expr.Match(scrut, arms) -> Expr.Match(fill_expr(scrut, ret), fill_arms(arms, ret)),
+	Expr.ArrayLit(hs, sp, elems, et) ->
+		Expr.ArrayLit(hs, fill_expr(sp, ret), fill_exprs(elems, ret), et),
+	Expr.Index(a, i) -> Expr.Index(a, fill_expr(i, ret)),
+	Expr.IndexField(a, i, f) -> Expr.IndexField(a, fill_expr(i, ret), f),
+	Expr.IndexExpr(b, i) -> Expr.IndexExpr(fill_expr(b, ret), fill_expr(i, ret)),
+	Expr.Interp(segs) -> Expr.Interp(fill_segs(segs, ret)),
+	Expr.Tuple(elems) -> Expr.Tuple(fill_exprs(elems, ret)),
+	Expr.Spread(x) -> Expr.Spread(fill_expr(x, ret)),
+	Expr.Unit -> Expr.Unit,
+	Expr.Loop(ss) -> Expr.Loop(fill_stmts(ss, ret)),
+	Expr.Buffer(sz) -> Expr.Buffer(fill_expr(sz, ret)),
+	Expr.Addr(n) -> Expr.Addr(n),
+	Expr.Neg(x) -> Expr.Neg(fill_expr(x, ret)),
+	Expr.Not(x) -> Expr.Not(fill_expr(x, ret)),
+	Expr.BitNot(x) -> Expr.BitNot(fill_expr(x, ret)),
+	Expr.Add(l, r) -> Expr.Add(fill_expr(l, ret), fill_expr(r, ret)),
+	Expr.Sub(l, r) -> Expr.Sub(fill_expr(l, ret), fill_expr(r, ret)),
+	Expr.Mul(l, r) -> Expr.Mul(fill_expr(l, ret), fill_expr(r, ret)),
+	Expr.Div(l, r) -> Expr.Div(fill_expr(l, ret), fill_expr(r, ret)),
+	Expr.Mod(l, r) -> Expr.Mod(fill_expr(l, ret), fill_expr(r, ret)),
+	Expr.BitAnd(l, r) -> Expr.BitAnd(fill_expr(l, ret), fill_expr(r, ret)),
+	Expr.BitOr(l, r) -> Expr.BitOr(fill_expr(l, ret), fill_expr(r, ret)),
+	Expr.BitXor(l, r) -> Expr.BitXor(fill_expr(l, ret), fill_expr(r, ret)),
+	Expr.Shl(l, r) -> Expr.Shl(fill_expr(l, ret), fill_expr(r, ret)),
+	Expr.Shr(l, r) -> Expr.Shr(fill_expr(l, ret), fill_expr(r, ret)),
+	Expr.CmpEq(l, r) -> Expr.CmpEq(fill_expr(l, ret), fill_expr(r, ret)),
+	Expr.CmpNe(l, r) -> Expr.CmpNe(fill_expr(l, ret), fill_expr(r, ret)),
+	Expr.CmpLt(l, r) -> Expr.CmpLt(fill_expr(l, ret), fill_expr(r, ret)),
+	Expr.CmpGt(l, r) -> Expr.CmpGt(fill_expr(l, ret), fill_expr(r, ret)),
+	Expr.CmpLe(l, r) -> Expr.CmpLe(fill_expr(l, ret), fill_expr(r, ret)),
+	Expr.CmpGe(l, r) -> Expr.CmpGe(fill_expr(l, ret), fill_expr(r, ret)),
+	Expr.And(l, r) -> Expr.And(fill_expr(l, ret), fill_expr(r, ret)),
+	Expr.Or(l, r) -> Expr.Or(fill_expr(l, ret), fill_expr(r, ret)),
+	Expr.If(c, t, el) -> Expr.If(fill_expr(c, ret), fill_expr(t, ret), fill_expr(el, ret)),
+	Expr.Call(n, ta, args, g) -> Expr.Call(n, ta, fill_exprs(args, ret), g),
+	Expr.DeferTap(fn, args) -> Expr.DeferTap(fn, fill_exprs(args, ret)),
+}
+
+# The two stamped positions: a `return`'s value adopts the enclosing return type, and a
+# record-annotated `let`'s value adopts its annotation (an empty annotation stamps nothing).
+# A closure's body refills under the CLOSURE's own return type.
+const fill_stmt = (Stmt s, Str ret): Stmt -> match s {
+	Stmt.Let(n, m, ann, init) -> Stmt.Let(n, m, ann, stamp(fill_expr(init, ret), ann)),
+	Stmt.Assign(n, v) -> Stmt.Assign(n, fill_expr(v, ret)),
+	Stmt.FieldAssign(b, f, v) -> Stmt.FieldAssign(b, f, fill_expr(v, ret)),
+	Stmt.DeepFieldAssign(b, f, v) ->
+		Stmt.DeepFieldAssign(fill_expr(b, ret), f, fill_expr(v, ret)),
+	Stmt.IndexAssign(n, i, v) -> Stmt.IndexAssign(n, fill_expr(i, ret), fill_expr(v, ret)),
+	Stmt.Return(v) -> Stmt.Return(stamp(fill_expr(v, ret), ret)),
+	Stmt.ForIn(v, arr, body) -> Stmt.ForIn(v, arr, fill_stmts(body, ret)),
+	Stmt.Loop(lbl, body) -> Stmt.Loop(lbl, fill_stmts(body, ret)),
+	Stmt.Break(lbl) -> Stmt.Break(lbl),
+	Stmt.Continue(lbl) -> Stmt.Continue(lbl),
+	Stmt.IfThen(c, st) -> Stmt.IfThen(fill_expr(c, ret), fill_stmt(st, ret)),
+	Stmt.IfElse(c, t, el) ->
+		Stmt.IfElse(fill_expr(c, ret), fill_stmt(t, ret), fill_stmt(el, ret)),
+	Stmt.Do(e) -> Stmt.Do(fill_expr(e, ret)),
+	Stmt.Block(ss) -> Stmt.Block(fill_stmts(ss, ret)),
+	Stmt.Match(scrut, arms) -> Stmt.Match(fill_expr(scrut, ret), fill_stmt_arms(arms, ret)),
+	Stmt.Destructure(ns, m, e) -> Stmt.Destructure(ns, m, fill_expr(e, ret)),
+	Stmt.Yield(e) -> Stmt.Yield(fill_expr(e, ret)),
+	Stmt.Closure(n, ps, rn, body) -> Stmt.Closure(n, ps, rn, fill_stmts(body, rn)),
+	Stmt.Defer(body) -> Stmt.Defer(fill_stmts(body, ret)),
+}
+
+const fill_stmts = ([Stmt] ss, Str ret): [Stmt] -> {
+	let [Stmt] out = []
+
+	for s in ss {
+		out = [...out, fill_stmt(s, ret)]
+	}
+
+	return out
+}
+
+const fill_func = (Func f): Func -> Func({
+	name: f.name,
+	is_pub: f.is_pub,
+	ret_name: f.ret_name,
+	ret_elem: f.ret_elem,
+	params: f.params,
+	body: fill_stmts(f.body, f.ret_name),
+	is_asm: f.is_asm,
+	asm_body: f.asm_body,
+	is_value: f.is_value,
+	ret_telems: f.ret_telems,
+	typarams: f.typarams,
+	tbounds: f.tbounds,
+	ret_size: f.ret_size,
+	is_intrinsic: f.is_intrinsic,
+	asm_sym: f.asm_sym,
+	dfile: f.dfile,
+	dline: f.dline,
+	dcol: f.dcol,
+	uses: f.uses,
+})
+
+# The whole program with every root bare literal named — run right after the span strip.
+pub const fill_bares = (Program p): Program -> {
+	let [Func] out = []
+
+	for f in p.funcs {
+		out = [...out, fill_func(f)]
+	}
+
+	return Program({
+		imports: p.imports,
+		recs: p.recs,
+		unions: p.unions,
+		funcs: out,
+		groups: p.groups,
+	})
+}
