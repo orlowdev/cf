@@ -3,10 +3,13 @@
 # A `defer f(x)` / `defer { ... }` schedules work to run when the enclosing function returns, in
 # LIFO order, AFTER the return value is fixed. This pass removes every `Defer` node and rewrites
 # each `return e` reachable with pending defers into
-#     { const $ret = e; <defers, last-declared first>; return $ret }
-# The `$ret` binding SNAPSHOTS the value before the defers run: a word return keeps the value it
-# read (a later mutation of the source does not change it), while a record return keeps the arena
-# POINTER — so defers that mutate the record through it are observed by the caller.
+#     { const __cf_dret = e; <defers, last-declared first>; return __cf_dret }
+# The `__cf_dret` binding SNAPSHOTS the value before the defers run: a word return keeps the value
+# it read (a later mutation of the source does not change it), while a record return keeps the
+# arena POINTER — so defers that mutate the record through it are observed by the caller.
+# The name must NOT be `$`-prefixed: emit reads a leading `$` as the user's stack-binding marker
+# (`ctx.alloc_stack`), which built a literal return value ON THE DYING FRAME — a dangling pointer
+# the caller then read as garbage (the old name `$ret` did exactly that).
 #
 # v1 (typecheck enforces): a `defer` is only a direct function-body statement, so defers accumulate
 # purely along the top-level statement list. A `return` nested in a loop / `if` still fires the
@@ -73,13 +76,14 @@ const stmt_has_defer = (Stmt s): Bool -> match s {
 # accumulator is unaliased.
 const clone_pending = ([[Stmt]] xs): [[Stmt]] -> [...xs]
 
-# `{ const $ret = e; <defers LIFO>; return $ret }` — snapshot the return value, run the pending
+# `{ const __cf_dret = e; <defers LIFO>; return __cf_dret }` — snapshot the return value, run the
+# pending
 # defers last-declared-first, then return the snapshot. Each defer body is spliced as its OWN
 # `Stmt.Block` (its own scope), matching the source: two sibling `defer { ... }` blocks are separate
 # scopes that typecheck validated independently, so each may reuse a local name — flattening them
 # into one scope would collide those names (typecheck already ran, so the clash would slip to emit).
 const synth_return = (Expr e, [[Stmt]] pending): Stmt -> {
-	let [Stmt] blk = [Stmt.Let("$ret", false, "", e)]
+	let [Stmt] blk = [Stmt.Let("__cf_dret", false, "", e)]
 	let Iarch i = Iarch(pending.len) - 1
 
 	loop {
@@ -88,7 +92,7 @@ const synth_return = (Expr e, [[Stmt]] pending): Stmt -> {
 		i = i - 1
 	}
 
-	blk = [...blk, Stmt.Return(Expr.Var("$ret"))]
+	blk = [...blk, Stmt.Return(Expr.Var("__cf_dret"))]
 
 	return Stmt.Block(blk)
 }

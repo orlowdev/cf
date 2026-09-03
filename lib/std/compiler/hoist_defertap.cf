@@ -4,9 +4,11 @@
 # `defer f(x)` in value position (a binding RHS, a return value, or a `|> defer f` pipe target)
 # both SCHEDULES f(x) at scope exit AND evaluates to its tapped argument x. This pass rewrites each
 # such `Expr.DeferTap(f, args)` into three top-level pieces:
-#     const $tapK = <last arg>          # snapshot the tapped value once, at the defer point
-#     defer f(<other args>, $tapK)      # a Stmt.Defer the later lower_defers pass schedules (LIFO)
-#     ...$tapK...                           # the DeferTap expression is replaced by the snapshot
+#     const __cf_tapK = <last arg>          # snapshot the tapped value once, at the defer point
+#     defer f(<other args>, __cf_tapK)      # a Stmt.Defer the later lower_defers pass schedules
+# (LIFO)
+#     ...__cf_tapK...                           # the DeferTap expression is replaced by the
+# snapshot
 # temp
 # The snapshot makes the tap a stable value (a later mutation of the source does not change it) and
 # feeds the deferred call the same value. Runs BEFORE lower_defers (so the emitted `Stmt.Defer`s
@@ -38,7 +40,8 @@ const no_stmts = (): [Stmt] -> {
 	return e
 }
 
-# A mutable, per-function counter for unique `$tapK` names (a word field is reassignable; a `[Stmt]`
+# A mutable, per-function counter for unique `__cf_tapK` names (a word field is reassignable; a
+# `[Stmt]`
 # field would not be — so the accumulated statements are returned, not stored on the state).
 data HoistState = { Iarch ctr }
 # A rewritten expression plus the statements that must run before it (the snapshot + scheduled defer
@@ -69,16 +72,17 @@ const hoist_exprs = (*HoistState st, [Expr] es): HoistedList -> {
 	return HoistedList({ exprs: oute, pre: outp })
 }
 
-# `defer fn(args)` → snapshot the last arg into a fresh `$tapK`, schedule `fn(..., $tapK)`, yield
+# `defer fn(args)` → snapshot the last arg into a fresh `__cf_tapK`, schedule `fn(..., __cf_tapK)`,
+# yield
 # the
 # snapshot. Nested DeferTaps in the args are lifted first (their pre-statements run before ours).
 const hoist_defertap = (*HoistState st, Str fn, [Expr] args): HoistedExpr -> {
 	const HoistedList h = hoist_exprs(st, args)
 	const Iarch k = st.ctr
 	st.ctr = st.ctr + 1
-	const Str tap = "$tap${k}"
+	const Str tap = "__cf_tap${k}"
 	const Iarch n = Iarch(h.exprs.len)
-	# the scheduled call keeps the earlier args as-is and replaces the tapped (last) arg with $tapK
+	# the scheduled call keeps the earlier args as-is and replaces the tapped (last) arg with __cf_tapK
 	let [Expr] dargs = []
 	let Iarch i = 0
 
