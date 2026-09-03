@@ -478,3 +478,12 @@ def run(s, check, tdp, uri_of):
     check("goto std jumps to the root barrel", goto_file(0, 7) == "lib/std.cf", repr(goto_file(0, 7)))
     check("goto io mid-path jumps to the io barrel", goto_file(0, 12) == "lib/std/io.cf", repr(goto_file(0, 12)))
     check("goto fd still jumps to the module", goto_file(0, 16) == "lib/std/io/fd.cf", repr(goto_file(0, 16)))
+
+    # a value-const hover reads `NAME: Type` (the initializer's ctor head), never the initializer
+    s.notify("textDocument/didChange", {"textDocument": {"uri": uri_of(FIX)},
+                                        "contentChanges": [{"text": "import std::io::fd\nconst a = fd::STDERR\n" + text}]})
+    s.drain()
+    r = s.request("textDocument/hover", tdp(FIX, 1, 14))["result"]
+    check("value-const hover is typed",
+          r is not None and r["contents"]["value"].startswith("```cf\nSTDERR: Fd\n```"),
+          repr(r["contents"]["value"][:60] if r else r))
