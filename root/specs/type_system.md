@@ -443,8 +443,21 @@ field-wise, unions by tag then payload — yielding `Bool`. It is *almost* unive
 the one caveat is **floats follow IEEE** (§2.2), so `NaN != NaN` and a value (or an
 aggregate) containing `NaN` is not self-equal — `==` is not reflexive on floats.
 Ordering `< <= > >=` is defined **only on the twelve numeric types** (other types,
-including `Str`, support only `==`/`!=`); on floats it is the IEEE **partial** order
-(every comparison with `NaN` is false). Both yield `Bool`.
+including `Str`, support only `==`/`!=` — and functions and `()` not even that,
+below); on floats it is the IEEE **partial** order (every comparison with `NaN` is
+false). Both yield `Bool`. A **self-referential type is rejected** — its structural
+walk would not terminate — as is a type carrying an inline `[N T]` field (no element
+compare yet; a liftable restriction, not a rule).
+
+**Equality never sees a `*`.** `*T ≡ T` in the value plane (§6.4), so a reference
+operand — a `*T` parameter, a field read — compares its **referent**, structurally,
+and a record's `*T` field contributes its referent's contents, at any depth. There
+is **no identity relation** at the language surface: comparing addresses would make
+placement observable, and the model keeps the raw address inside the `asm` floor
+(§4/§6.4) precisely so passes and geometries may move, splice, and copy aggregates
+without changing what a program can see. Code that needs "same node" gives the node
+identity **as data** — an explicit id field — which, unlike an address, survives
+relocation and serialization.
 
 For the cases that need a *reflexive, total* comparison over floats — hash keys,
 sorted containers, dedup — the standard library provides **`total_eq`** and
@@ -460,11 +473,20 @@ order. This is a std surface, not a type rule — the type gate only fixes that 
 undecidable (two functions are equal only if they agree on every input), and cf
 functions are comptime-first-class and erased at specialize, so there is no runtime
 function value to compare. Runtime polymorphism is *union + `match`*, not
-function-pointers; if a pointer ever names a callable, that is pointer identity
-(§4/§6.4), a separate question, not function-value `==`. The ban is **transitive**:
-`==` (and `total_eq`/`total_cmp`) on any aggregate that transitively contains a
+function-pointers — and with no identity relation to fall back on (above), nothing
+about a callable is comparable. The ban is **transitive**: `==` (and
+`total_eq`/`total_cmp`) on any aggregate that transitively contains a
 function-typed field is rejected too, since structural recursion would reach a field
 with no equality.
+
+**`==` on `()` is a compile error too**, from the opposite end of the same
+spectrum: function equality is *undecidable*, unit equality is *trivially decided* —
+`()` has one value and zero information, so the comparison is a tautology, dead
+code in expression clothing. And since `()` is not a type name (§6.1) — never a
+payload, a field, an element, or a type argument — unit equality cannot arise
+transitively inside a structural walk; "a value or nothing" is spelled as a
+tag-only union member (`Nothing`), which compares by tag. The only writable site is
+a literal comparison of unit-returning expressions, and that is always a bug.
 
 **Logical.** `&&`, `||`, and unary `!` take `Bool` operands and yield `Bool`
 ([[ebnf.md]]); `&&`/`||` short-circuit. There is no truthiness — a non-`Bool` is not
