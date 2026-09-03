@@ -5823,6 +5823,43 @@ const bce_enter_loop! = (*Emit ctx, [Stmt] body): Iarch -> {
 	return 0
 }
 
+# A failed exit-guard condition holds NEGATED on the fall-through path: `i >= L` gives
+# `i < L`, and an `||` chain gives every arm negated (`!(A || B)` = `!A && !B`).
+const bce_break_facts = (*Emit ctx, Expr c): Iarch -> {
+	match c {
+		Expr.CmpGe(l, r) -> {
+			const Str iv = bce_idx_key(l)
+			const Str ak = bce_limit_key(ctx, r)
+			if !eq(iv, "") && !eq(ak, "") then ctx.bfx = [...ctx.bfx, fact_key(iv, ak)]
+		},
+		Expr.Or(a, b) -> {
+			bce_break_facts(ctx, a)
+			bce_break_facts(ctx, b)
+		},
+		_ -> {},
+	}
+
+	return 0
+}
+
+# A held then-condition: `i < L` bounds the body, and an `&&` chain holds every arm.
+const bce_then_facts = (*Emit ctx, Expr c): Iarch -> {
+	match c {
+		Expr.CmpLt(l, r) -> {
+			const Str iv = bce_idx_key(l)
+			const Str ak = bce_limit_key(ctx, r)
+			if !eq(iv, "") && !eq(ak, "") then ctx.bfx = [...ctx.bfx, fact_key(iv, ak)]
+		},
+		Expr.And(a, b) -> {
+			bce_then_facts(ctx, a)
+			bce_then_facts(ctx, b)
+		},
+		_ -> {},
+	}
+
+	return 0
+}
+
 # The post-statement transition (emit_block's walk): a `const n = Iarch(xs.len)` adds a
 # len-alias; a fall-through `if i >= L then break|continue|return` adds a bound fact.
 const bce_stmt_post = (*Emit ctx, Stmt s): Iarch -> {
@@ -5848,17 +5885,7 @@ const bce_stmt_post = (*Emit ctx, Stmt s): Iarch -> {
 				_ -> false,
 			}
 
-			if exits then {
-				match c {
-					Expr.CmpGe(l, r) -> {
-						const Str iv = bce_idx_key(l)
-						const Str ak = bce_limit_key(ctx, r)
-						if !eq(iv, "") && !eq(ak, "")
-							then ctx.bfx = [...ctx.bfx, fact_key(iv, ak)]
-					},
-					_ -> {},
-				}
-			}
+			if exits then bce_break_facts(ctx, c)
 		},
 		_ -> {},
 	}
@@ -6110,8 +6137,16 @@ const emit_bounds! = (*Emit ctx, Str hdr, Str iv, Str key, Expr idx): Iarch -> {
 	const Iarch t = if eq(key, "") then 0 else bce_tier!(ctx, key, idx)
 	if t == 2 then return 0
 	if t == 1 then return emit_nn_check!(ctx, iv)
+	emit_oob_check!(ctx, hdr, iv)
+	# the passed check IS a dominating proof: a later same-index access needs at most the
+	# zero side (check-CSE — the `src[i] == 92 … src[i] == 34` ladders collapse)
+	const Str ik = bce_idx_key(idx)
 
-	return emit_oob_check!(ctx, hdr, iv)
+	if !eq(ik, "") && !eq(key, "") then {
+		if !has_str(ctx.bfx, fact_key(ik, key)) then ctx.bfx = [...ctx.bfx, fact_key(ik, key)]
+	}
+
+	return 0
 }
 
 # The fact key an IndexExpr BASE names: `p.src[i]` → "p.src"; anything else has no channel.
@@ -6914,14 +6949,7 @@ const emit_guard! = (*Emit ctx, [Binding] env, Expr cond, Stmt body): Iarch -> {
 	const [Str] sbf = ctx.bfx
 	const [Str] slf = ctx.lfx
 
-	match cond {
-		Expr.CmpLt(gl, gr) -> {
-			const Str gi = bce_idx_key(gl)
-			const Str gk = bce_limit_key(ctx, gr)
-			if !eq(gi, "") && !eq(gk, "") then ctx.bfx = [...ctx.bfx, fact_key(gi, gk)]
-		},
-		_ -> {},
-	}
+	bce_then_facts(ctx, cond)
 
 	const Iarch term = emit_simple_stmt!(ctx, env, body)
 	ctx.bfx = facts_isect(sbf, ctx.bfx)
@@ -6948,14 +6976,7 @@ const emit_ifelse! = (*Emit ctx, [Binding] env, Expr cond, Stmt tb, Stmt eb): Ia
 	const [Str] sbf = ctx.bfx
 	const [Str] slf = ctx.lfx
 
-	match cond {
-		Expr.CmpLt(gl, gr) -> {
-			const Str gi = bce_idx_key(gl)
-			const Str gk = bce_limit_key(ctx, gr)
-			if !eq(gi, "") && !eq(gk, "") then ctx.bfx = [...ctx.bfx, fact_key(gi, gk)]
-		},
-		_ -> {},
-	}
+	bce_then_facts(ctx, cond)
 
 	const Iarch tterm = emit_simple_stmt!(ctx, env, tb)
 	const [Str] tbf = ctx.bfx
