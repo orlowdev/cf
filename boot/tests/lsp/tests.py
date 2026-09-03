@@ -418,3 +418,15 @@ def run(s, check, tdp, uri_of):
     # the first segment of an import: the roots only
     got = complete("import \n" + text, 0, 7)
     check("completion import first segment offers std", got == [("std", 9)], repr(got))
+
+    # a dot after a namespace path reads a field off no value — answer nothing, not the dump
+    got = complete("const x = std::io.\n" + text, 0, 18)
+    check("completion after std::io. is empty", got == [], repr(got))
+
+    got = complete("import std::io\nconst x = io.\n" + text, 1, 13)
+    check("completion after an alias dot is empty", got == [], repr(got))
+
+    # a record variable's dot keeps the old bare answer (fields are not scanned, but the
+    # namespace guard must not swallow it)
+    got = complete("const x = std::io.\nconst y = notamodule.\n" + text, 1, 21)
+    check("completion after a value dot still answers", len(got) > 0, repr(got))
