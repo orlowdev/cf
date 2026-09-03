@@ -27,9 +27,9 @@ f144:
 	li a0, 2
 	ret
 
-.globl f501
+.globl f502
 .p2align 2
-f501:
+f502:
 	mv a0, a0
 	li a7, 94
 	ecall
@@ -119,6 +119,13 @@ cf_mmap_fail:
 .p2align 2
 cf_oom:
 	li a0, 70
+	li a7, 94
+	ecall
+
+.globl cf_oos
+.p2align 2
+cf_oos:
+	li a0, 72
 	li a7, 94
 	ecall
 

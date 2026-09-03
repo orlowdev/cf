@@ -25,9 +25,9 @@ f144:
 	movq $1, %rax
 	ret
 
-.globl f501
+.globl f502
 .p2align 2
-f501:
+f502:
 	movl $231, %eax
 	syscall
 	ret
@@ -116,6 +116,13 @@ cf_mmap_fail:
 .p2align 2
 cf_oom:
 	movq $70, %rdi
+	movq $231, %rax
+	syscall
+
+.globl cf_oos
+.p2align 2
+cf_oos:
+	movq $72, %rdi
 	movq $231, %rax
 	syscall
 

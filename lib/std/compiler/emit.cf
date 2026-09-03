@@ -153,6 +153,9 @@ data Emit = {
 	# the current function converts self-tail-calls to loops (tco_eligible, decided before the
 	# body emits): one flag gates BOTH the `@tailtop` label and every tail jump, so they agree
 	Bool tco_ok,
+	# per-function stack-probe eligibility (oos_probe_set!, computed once per program): DFS
+	# back-edge targets of the call graph plus `$`-stack carriers
+	[Bool] oos,
 }
 
 # The resolved intrinsic callees for context (module_system §8 flattens the module path).
@@ -6504,6 +6507,294 @@ const tco_tail_body = ([Stmt] ss, Str fname): Bool -> {
 	return false
 }
 
+# ── Stack probe (OOS → trap) ─────────────────────────────────────────────────────────────────────
+# Unbounded stack growth needs a CALL CYCLE, and every function on a cycle is a NON-LEAF, so a
+# prologue probe on non-leaf functions catches any runaway recursion within one leaf frame of the
+# threshold — leaves stay probe-free. The probe compares the frame's own `%lpool` address (a
+# stack-resident slot, so it tracks `sp`) against `$cf_stack_lim` — seeded by `main` at 7 MiB
+# below ITS frame, zero before that (a zero limit always passes, so the pre-main bridges need no
+# init ordering) — and calls the floor's `cf_oos` (exit 72, beside `cf_oom`'s 70) instead of
+# running into the guard page as a bare SIGSEGV. The ~1 MiB of real stack past the threshold
+# (an 8 MiB default main stack) absorbs the trapping frame itself (`$`-stack frames cap at 256
+# KiB) plus the deepest leaf. Hosted targets only — a bare target owns its stack layout. A
+# TCO-converted loop probes ONCE at entry (`@tailtop` sits after the probe): the loop is
+# constant-stack by construction.
+# Which functions carry the probe: runaway growth must LAP a call-graph cycle, and every lap
+# passes the target of a DFS BACK EDGE — so probing exactly the back-edge targets is sound and
+# leaves straight-line call chains probe-free (bounded by program shape; probing every non-leaf
+# cost ~8% on the compiler). Indirect calls ride a VIRTUAL node: a function making one edges
+# into it, and it edges out to every address-taken function — recursion closed through a
+# fn-value still laps a probed node. A `$`-stack-carrying function probes unconditionally: its
+# frame runs up to 256 KiB, and a cycle lap through unprobed big frames could outrun the margin.
+const oos_one = (Str n): [Str] -> {
+	const [Str] r = [n]
+
+	return r
+}
+
+const oos_cat = ([Str] a, [Str] b): [Str] -> [...a, ...b]
+
+const oos_calls_expr = (Expr e): [Str] -> match e {
+	Expr.Call(cn, _, args, _) -> oos_cat(oos_one(cn), oos_calls_list(args)),
+	Expr.Loop(ss) -> oos_calls_body(ss),
+	_ -> oos_calls_list(kids(e)),
+}
+
+const oos_calls_list = ([Expr] es): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(es.len) then break
+		r = oos_cat(r, oos_calls_expr(es[i]))
+		i = i + 1
+	}
+
+	return r
+}
+
+const oos_calls_stmt = (Stmt s): [Str] -> {
+	const [Str] here = oos_calls_list(stmt_exprs(s))
+
+	const [Str] deep = match s {
+		Stmt.IfThen(_, b) -> oos_calls_stmt(b),
+		Stmt.IfElse(_, t, el) -> oos_cat(oos_calls_stmt(t), oos_calls_stmt(el)),
+		Stmt.Block(ss) -> oos_calls_body(ss),
+		Stmt.Loop(_, ss) -> oos_calls_body(ss),
+		Stmt.ForIn(_, _, ss) -> oos_calls_body(ss),
+		Stmt.Match(_, arms) -> oos_calls_arms(arms),
+		Stmt.Defer(ss) -> oos_calls_body(ss),
+		Stmt.Closure(_, _, _, cb) -> oos_calls_body(cb),
+		_ -> no_names(),
+	}
+
+	return oos_cat(here, deep)
+}
+
+const oos_calls_arms = ([StmtArm] arms): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(arms.len) then break
+		r = oos_cat(r, oos_calls_body(arms[i].body))
+		i = i + 1
+	}
+
+	return r
+}
+
+const oos_calls_body = ([Stmt] ss): [Str] -> {
+	let [Str] r = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(ss.len) then break
+		r = oos_cat(r, oos_calls_stmt(ss[i]))
+		i = i + 1
+	}
+
+	return r
+}
+
+# Three-color DFS over the not-yet-removed graph; a GRAY successor is a back edge, and the
+# CANDIDATE cycle-breaker is its target — or its SOURCE when the target is the virtual node
+# `vn`, which cannot carry a probe (the source sits on the same cycle).
+const oos_dfs = (Iarch v, Iarch vn, [[Iarch]] adj, *[Iarch] color, *[Iarch] cand, *[Iarch] gone): Iarch -> {
+	color[v] = 1
+	const [Iarch] es = adj[v]
+	let Iarch k = 0
+
+	loop {
+		if k >= Iarch(es.len) then break
+		const Iarch w = es[k]
+
+		if gone[w] == 0 then {
+			if color[w] == 1 then {
+				if w == vn then cand[v] = 1
+				if w != vn then cand[w] = 1
+			}
+
+			if color[w] == 0 then oos_dfs(w, vn, adj, color, cand, gone)
+		}
+
+		k = k + 1
+	}
+
+	color[v] = 2
+
+	return 0
+}
+
+# The `--no-oos-probe` set: no function probes.
+const no_oos_probes = ([Func] funcs): [Bool] -> {
+	let [Bool] out = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(funcs.len) then break
+		out = [...out, false]
+		i = i + 1
+	}
+
+	return out
+}
+
+const oos_probe_set! = ([Func] funcs, [Str] at): [Bool] -> {
+	const Iarch n = Iarch(funcs.len)
+	let [[Iarch]] adj = []
+	let Iarch i = 0
+
+	loop {
+		if i >= n then break
+		let [Iarch] es = []
+
+		if !funcs[i].is_asm && !funcs[i].is_intrinsic then {
+			const [Str] cs = oos_calls_body(funcs[i].body)
+			let Iarch k = 0
+
+			loop {
+				if k >= Iarch(cs.len) then break
+				const Iarch fi = find_func(funcs, cs[k])
+
+				if fi >= 0 then {
+					# asm floor fns and intrinsics never call back into user code
+					if !funcs[fi].is_asm && !funcs[fi].is_intrinsic then es = [...es, fi]
+				} else {
+					# an unresolved non-cast/`Str`/raw callee is an INDIRECT call through a
+					# fn-value binding — edge into the virtual node
+					if !is_cast_type(cs[k]) && !eq(cs[k], "Str") && !is_raw_intrinsic(cs[k])
+						then es = [...es, n]
+				}
+
+				k = k + 1
+			}
+		}
+
+		adj = [...adj, es]
+		i = i + 1
+	}
+
+	# the virtual indirect node: out-edges to every address-taken emitted function
+	let [Iarch] ind = []
+	let Iarch j = 0
+
+	loop {
+		if j >= n then break
+		if !funcs[j].is_asm && !funcs[j].is_intrinsic && has_str(at, funcs[j].name)
+			then ind = [...ind, j]
+		j = j + 1
+	}
+
+	adj = [...adj, ind]
+	# greedy FEEDBACK-VERTEX-SET rounds: DFS the remaining graph collecting cycle-breaker
+	# candidates; none left → acyclic, every cycle holds a probed node. Otherwise remove the
+	# highest-degree candidate (in×out over the remaining graph; lowest index breaks ties —
+	# deterministic) into the probe set and go again. One function per cycle instead of every
+	# back-edge target: the same soundness at a several-fold lower dynamic probe count.
+	let [Iarch] gone = []
+	let [Iarch] probed = []
+	let Iarch z = 0
+
+	loop {
+		if z > n then break
+		gone = [...gone, 0]
+		probed = [...probed, 0]
+		z = z + 1
+	}
+
+	loop {
+		let [Iarch] color = []
+		let [Iarch] cand = []
+		let Iarch y = 0
+
+		loop {
+			if y > n then break
+			color = [...color, 0]
+			cand = [...cand, 0]
+			y = y + 1
+		}
+
+		let Iarch v = 0
+
+		loop {
+			if v > n then break
+			if gone[v] == 0 && color[v] == 0 then oos_dfs(v, n, adj, color, cand, gone)
+			v = v + 1
+		}
+
+		# degrees over the remaining graph, for the greedy pick
+		let [Iarch] indeg = []
+		let [Iarch] outdeg = []
+		let Iarch d = 0
+
+		loop {
+			if d > n then break
+			indeg = [...indeg, 0]
+			outdeg = [...outdeg, 0]
+			d = d + 1
+		}
+
+		let Iarch u = 0
+
+		loop {
+			if u > n then break
+
+			if gone[u] == 0 then {
+				const [Iarch] ues = adj[u]
+				let Iarch q = 0
+
+				loop {
+					if q >= Iarch(ues.len) then break
+
+					if gone[ues[q]] == 0 then {
+						outdeg[u] = outdeg[u] + 1
+						indeg[ues[q]] = indeg[ues[q]] + 1
+					}
+
+					q = q + 1
+				}
+			}
+
+			u = u + 1
+		}
+
+		let Iarch best = -1
+		let Iarch bscore = -1
+		let Iarch c = 0
+
+		loop {
+			if c >= n then break
+
+			if cand[c] == 1 && gone[c] == 0 then {
+				const Iarch score = indeg[c] * outdeg[c]
+
+				if score > bscore then {
+					bscore = score
+					best = c
+				}
+			}
+
+			c = c + 1
+		}
+
+		if best < 0 then break
+		gone[best] = 1
+		probed[best] = 1
+	}
+
+	let [Bool] out = []
+	let Iarch m = 0
+
+	loop {
+		if m >= n then break
+		out = [...out, probed[m] == 1 || tco_hazard_body(funcs[m].body)]
+		m = m + 1
+	}
+
+	return out
+}
+
 # TCO eligibility, decided once per function before its body emits — colorless AND bracketed
 # (`!`) functions both convert (the v2 split above governs per-iteration reclamation). A
 # capture-carrying function is out (its cells `alloc8` mid-body — the hazard note above); `main`
@@ -7843,6 +8134,22 @@ const emit_func! = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 	# When no local is captured the pool has no uses and QBE's slot promotion deletes the alloc.
 	write_str(ctx.fd, "\t%lpool =l alloc8 1024\n")
 	ctx.local_slot = 0
+
+	# hosted targets carry the stack probe (the OOS block above emit_tail_jump!); a bare target
+	# owns its stack layout and keeps the raw fault
+	const Bool hosted = match ctx.target_os { Os.Bare -> false, _ -> true }
+
+	# `main` seeds `$cf_stack_lim` at 7 MiB below its own frame (the 8 MiB default main stack
+	# leaves ~1 MiB of real headroom past the threshold for the trapping frame + deepest leaf).
+	# A DEDICATED 8-byte slot supplies the frame address — never `%lpool`, whose address use
+	# would pin the whole 1 KiB pool into the frame that QBE's slot promotion otherwise deletes.
+	if is_main && hosted then {
+		const Iarch sb = ctx.next
+		ctx.next = ctx.next + 2
+		write_str(ctx.fd, "\t%t${sb} =l alloc8 8\n")
+		write_str(ctx.fd, "\t%t${sb + 1} =l sub %t${sb}, 7340032\n")
+		write_str(ctx.fd, "\tstorel %t${sb + 1}, $cf_stack_lim\n")
+	}
 	# a materialized body's dynamic-growth pushes (`cf_dyn_push_g` / `cf_*_append_g`) reserve
 	# through the geometry's bump half via a FUNCTION POINTER; copy the survivor reserve symbol into
 	# `%rfsur_0` once here (it dominates every site, one copy per body). The residue reserve pointer
@@ -8028,6 +8335,26 @@ const emit_func! = (*Emit ctx, Func fn, Iarch idx): Iarch -> {
 		pi = pi + 1
 	}
 
+	# the stack probe (the OOS block above emit_tail_jump!): AFTER the spills, so every prologue
+	# `alloc8` stays in `@start` (static slots), and BEFORE `@tailtop`, so a converted tail loop
+	# probes once at entry — it is constant-stack by construction. `main` skips it (it just
+	# seeded the limit; its own frame trivially passes).
+	if hosted && !is_main && ctx.oos[idx] then {
+		const Iarch plid = ctx.label
+		ctx.label = ctx.label + 1
+		const Iarch pt = ctx.next
+		ctx.next = ctx.next + 3
+		# a DEDICATED 8-byte slot supplies this frame's stack address — never `%lpool`, whose
+		# address use would pin the whole 1 KiB pool into every probed frame
+		write_str(ctx.fd, "\t%t${pt} =l alloc8 8\n")
+		write_str(ctx.fd, "\t%t${pt + 1} =l loadl $cf_stack_lim\n")
+		write_str(ctx.fd, "\t%t${pt + 2} =w cugtl %t${pt}, %t${pt + 1}\n")
+		write_str(ctx.fd, "\tjnz %t${pt + 2}, @sok${plid}, @soos${plid}\n")
+		write_str(ctx.fd, "@soos${plid}\n")
+		write_str(ctx.fd, "\tcall $cf_oos()\n")
+		write_str(ctx.fd, "\tjmp @sok${plid}\n")
+		write_str(ctx.fd, "@sok${plid}\n")
+	}
 	# the self-tail loop-back point: the parameters are spilled/bound above (their `alloc8`s stay
 	# in `@start` — static slots), so a tail jump that has re-stored the bindings re-enters here;
 	# `%node_0`/`%cxp<k>` ride through unchanged (a self-call threads the same ambient), and a
@@ -8501,6 +8828,9 @@ const emit_arena_qbe! = (
 		"export data $cf_page = { l 0, l 0, l 0, l 0, l $${pgs}, l 0, l 0, l 0, l 0 }\n",
 	)
 	else write_str(fd, "export data $cf_page = { l 0, l 0, l 0, l 0, l 0, l 0, l 0, l 0, l 0 }\n")
+	# the stack-probe threshold (the OOS block above emit_tail_jump!): zero until `main`'s
+	# prologue seeds it — a zero limit always passes, so pre-main code needs no init ordering
+	write_str(fd, "data $cf_stack_lim = { l 0 }\n")
 	# (the floor `cf_reset` scope-fold helper is RETIRED — a `!` frame's residue bracket now rewinds
 	# through the geometry's own `on_scope_exit` hook, placed by `emit_reset!`; the survivor-scope
 	# mark rewinds inline. See geometry_lowering §2.)
@@ -8843,6 +9173,7 @@ pub const emit_program! = (
 	Str build_version,
 	Bool debug,
 	Bool instrument,
+	Bool no_oos,
 ): Iarch -> {
 	# a `Bare` target (bare metal / Wasm) links no OS: the root is a static BSS region (no mmap), and
 	# there is no exit syscall — the floor halts. Every other target keeps the darwin mmap/exit floor.
@@ -8879,6 +9210,9 @@ pub const emit_program! = (
 	const [Str] at = address_taken(prog)
 	const [Bool] nsig = compute_nodesig(prog, at)
 	const [Bool] mts = compute_mints(prog, at)
+	# the stack-probe set (the OOS block above emit_tail_jump!), once for the whole program;
+	# `--no-oos-probe` empties it — runaway recursion then keeps the raw guard-page fault
+	const [Bool] oosp = if no_oos then no_oos_probes(prog.funcs) else oos_probe_set!(prog.funcs, at)
 	const Iarch pgidx = find_func(prog.funcs, "reserve_ret__pg")
 	const Str pgsym = if pgidx >= 0 then fsym!(prog.funcs, debug, pgidx) else ""
 	# the observer symbol for `--instrument` injections (the sanitizer model) — resolve
@@ -8991,6 +9325,7 @@ pub const emit_program! = (
 				ctx_ops: no_names(),
 				aggvals: aggvals,
 				tco_ok: false,
+				oos: oosp,
 			})
 			emit_func!(&ctx, prog.funcs[i], i)
 		}
