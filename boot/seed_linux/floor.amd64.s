@@ -25,9 +25,9 @@ f144:
 	movq $1, %rax
 	ret
 
-.globl f505
+.globl f503
 .p2align 2
-f505:
+f503:
 	movl $231, %eax
 	syscall
 	ret
