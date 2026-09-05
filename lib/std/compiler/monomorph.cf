@@ -50,7 +50,7 @@ import std::compiler::typecheck::{
 	named_ty,
 	param_ty!,
 	binding_ty!,
-	closure_tfn,
+	closure_tfn!,
 	fn_ty_of_func!,
 	arm_bind_env,
 	check_destructure!,
@@ -1326,15 +1326,36 @@ const bracket_inner! = (Str s): Str -> {
 # Match a `[...]` parameter element STRING `pe` (which mentions the type variable `tv`, possibly
 # under
 # more brackets) against an argument array's element STRING `ae`, returning what `tv` binds to — or
-# "" if `pe` does not mention `tv` or the array nesting does not line up.
+# "" if `pe` does not mention `tv` or the structure does not line up. A type APPLICATION
+# decomposes positionwise (`Oath['C,Uarch]` against `Oath[Iarch,Uarch]` pins `'C`), so a
+# variable inside a generic union/record reference — a chain operator's `('A) -> Oath['B,'E]`
+# stage, std::data's `('A) -> Either['L,'B]` — is read out of a function argument's signature.
 const infer_from_elem! = (Str tv, Str pe, Str ae): Str -> {
 	if eq(pe, tv) then return ae
 	const Str pin = bracket_inner!(pe)
-	if eq(pin, "") then return ""
-	const Str ain = bracket_inner!(ae)
-	if eq(ain, "") then return ""
 
-	return infer_from_elem!(tv, pin, ain)
+	if !eq(pin, "") then {
+		const Str ain = bracket_inner!(ae)
+		if eq(ain, "") then return ""
+
+		return infer_from_elem!(tv, pin, ain)
+	}
+
+	if is_type_app(pe) && is_type_app(ae) && eq(type_base!(pe), type_base!(ae)) then {
+		const [Str] pargs = type_args!(pe)
+		const [Str] aargs = type_args!(ae)
+		if Iarch(pargs.len) != Iarch(aargs.len) then return ""
+		let Iarch i = 0
+
+		loop {
+			if i >= Iarch(pargs.len) then break
+			const Str b = infer_from_elem!(tv, pargs[i], aargs[i])
+			if !eq(b, "") then return b
+			i = i + 1
+		}
+	}
+
+	return ""
 }
 
 # A signature-position name a type variable may bind to: a concrete component name — not the
@@ -1692,7 +1713,7 @@ const lam_body_ret! = (
 					...cenv,
 					VarTy({
 						name: inm,
-						ty: closure_tfn(iret, ips),
+						ty: closure_tfn!(iret, ips),
 						mutable: false,
 						esc: false,
 						outer: false,
@@ -2375,8 +2396,42 @@ const mono_stmt! = (*MonoCtx m, Stmt s, MonoEnv env): Stmt -> match s {
 	Stmt.Do(e) -> Stmt.Do(mono_expr!(m, e, env)),
 	Stmt.Block(stmts) -> Stmt.Block(mono_stmts!(m, stmts, env)),
 	Stmt.Match(scrut, arms) -> mono_stmt_match!(m, scrut, arms, env),
-	Stmt.Closure(nm, params, ret, body) -> Stmt.Closure(nm, params, ret, mono_stmts!(m, body, env)),
+	# a closure's SIGNATURE slots substitute like a top-level signature's: a type variable from
+	# the enclosing template binds, and a concrete generic application (`Oath[Uarch,Uarch]`)
+	# mangles to its instance name — so a closure passed to a fn-typed parameter compares
+	# nominally against the (already-mangled) parameter signature
+	Stmt.Closure(nm, params, ret, body) ->
+		Stmt.Closure(
+		nm,
+		mono_closure_params!(m, params, env),
+		mangle_type!(m, ret, env.tvars, env.tvals),
+		mono_stmts!(m, body, env),
+	),
 	Stmt.Defer(body) -> Stmt.Defer(mono_stmts!(m, body, env)),
+}
+
+# A closure's param list, each slot substituted/mangled whole (the `$fn`/`$dyn`/`$tuple`
+# markers ride subst_slot's default arms; a raw application leaf becomes its instance name).
+const mono_closure_params! = (*MonoCtx m, [Param] ps, MonoEnv env): [Param] -> {
+	let [Param] out = []
+
+	for p in ps {
+		const TySlot sl = subst_slot!(m, p.type_name, p.elem, p.telems, env.tvars, env.tvals)
+
+		out = [
+			...out,
+			Param({
+				name: p.name,
+				is_ptr: p.is_ptr,
+				type_name: sl.name,
+				elem: sl.elem,
+				telems: sl.telems,
+				size: p.size,
+			}),
+		]
+	}
+
+	return out
 }
 
 const mono_stmt_arms! = (*MonoCtx m, [StmtArm] arms, MonoEnv env, Str scrut_ty): [StmtArm] -> {
@@ -2449,7 +2504,7 @@ const mono_extend! = (*MonoCtx m, Stmt s, MonoEnv env): MonoEnv -> {
 		Stmt.Destructure(pat, mut, e) -> destr_env!(m, pat, mut, e, env),
 		# a local closure enters the value env as its function type, so a later statement may
 		# pass it (or an anonymous lambda's hoisted name) to a generic function
-		Stmt.Closure(nm, params, ret, body) -> env_bind(env, nm, closure_tfn(ret, params)),
+		Stmt.Closure(nm, params, ret, body) -> env_bind(env, nm, closure_tfn!(ret, params)),
 		_ -> env,
 	}
 }
