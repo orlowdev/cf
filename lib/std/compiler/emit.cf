@@ -8789,24 +8789,27 @@ const nfp_ind_body = ([Func] funcs, [Stmt] ss): Bool -> {
 
 # An UN-GRAFTED direct call to a node-signature callee (an `in b` call threads the geom
 # binding, not the ambient, so it does not force the caller).
-const nfp_prop_expr = ([Func] funcs, [Bool] sig, Expr e): Bool -> {
+const nfp_prop_expr = ([Func] funcs, [Bool] sig, [Str] lcl, Expr e): Bool -> {
 	# a bare non-local Var / a field or index off one AUTO-CALLS a top-level value-const
 	# (emit_var!/emit_field!/the static index paths route through emit_call!), so those are
-	# call edges too — invisible as Expr.Call, caught by their base name here
+	# call edges too — invisible as Expr.Call, caught by their base name here. A name the
+	# FUNCTION BINDS (a param or a local) is NOT an auto-call: without the exclusion, a local
+	# that merely shares its name with a node-carrying fn poisons this fn's signature — fatal
+	# for the pinned-ABI reserve family (page.cf's local `p` vs a user fn `p`).
 	const Bool here = match e {
 		Expr.Call(n, _, _, g) -> eq(g, "") && nfp_callee_sig(funcs, sig, n),
-		Expr.Var(n) -> nfp_callee_sig(funcs, sig, n),
-		Expr.Field(b, _) -> nfp_callee_sig(funcs, sig, b),
-		Expr.Index(b, _) -> nfp_callee_sig(funcs, sig, b),
-		Expr.IndexField(b, _, _) -> nfp_callee_sig(funcs, sig, b),
+		Expr.Var(n) -> !has_str(lcl, n) && nfp_callee_sig(funcs, sig, n),
+		Expr.Field(b, _) -> !has_str(lcl, b) && nfp_callee_sig(funcs, sig, b),
+		Expr.Index(b, _) -> !has_str(lcl, b) && nfp_callee_sig(funcs, sig, b),
+		Expr.IndexField(b, _, _) -> !has_str(lcl, b) && nfp_callee_sig(funcs, sig, b),
 		_ -> false,
 	}
 
 	if here then return true
 
 	return match e {
-		Expr.Loop(ss) -> nfp_prop_body(funcs, sig, ss),
-		_ -> nfp_prop_list(funcs, sig, kids(e)),
+		Expr.Loop(ss) -> nfp_prop_body(funcs, sig, lcl, ss),
+		_ -> nfp_prop_list(funcs, sig, lcl, kids(e)),
 	}
 }
 
@@ -8817,60 +8820,79 @@ const nfp_callee_sig = ([Func] funcs, [Bool] sig, Str n): Bool -> {
 	return sig[j]
 }
 
-const nfp_prop_list = ([Func] funcs, [Bool] sig, [Expr] es): Bool -> {
+const nfp_prop_list = ([Func] funcs, [Bool] sig, [Str] lcl, [Expr] es): Bool -> {
 	let Iarch i = 0
 
 	loop {
 		if i >= Iarch(es.len) then break
-		if nfp_prop_expr(funcs, sig, es[i]) then return true
+		if nfp_prop_expr(funcs, sig, lcl, es[i]) then return true
 		i = i + 1
 	}
 
 	return false
 }
 
-const nfp_prop_stmt = ([Func] funcs, [Bool] sig, Stmt s): Bool -> {
+const nfp_prop_stmt = ([Func] funcs, [Bool] sig, [Str] lcl, Stmt s): Bool -> {
 	# element assignment to a `static [N Uint8]` auto-calls its value-const for the header
-	const Bool sh = match s { Stmt.IndexAssign(a, _, _) -> nfp_callee_sig(funcs, sig, a), _ -> false }
+	const Bool sh = match s {
+		Stmt.IndexAssign(a, _, _) -> !has_str(lcl, a) && nfp_callee_sig(funcs, sig, a),
+		_ -> false,
+	}
 
 	if sh then return true
-	if nfp_prop_list(funcs, sig, stmt_exprs(s)) then return true
+	if nfp_prop_list(funcs, sig, lcl, stmt_exprs(s)) then return true
 
 	return match s {
-		Stmt.IfThen(_, b) -> nfp_prop_stmt(funcs, sig, b),
-		Stmt.IfElse(_, t, el) -> nfp_prop_stmt(funcs, sig, t) || nfp_prop_stmt(funcs, sig, el),
-		Stmt.Block(ss) -> nfp_prop_body(funcs, sig, ss),
-		Stmt.Loop(ll_, ss) -> nfp_prop_body(funcs, sig, ss),
-		Stmt.ForIn(_, _, ss) -> nfp_prop_body(funcs, sig, ss),
-		Stmt.Match(_, arms) -> nfp_prop_arms(funcs, sig, arms),
-		Stmt.Defer(ss) -> nfp_prop_body(funcs, sig, ss),
-		Stmt.Closure(_, _, _, cb) -> nfp_prop_body(funcs, sig, cb),
+		Stmt.IfThen(_, b) -> nfp_prop_stmt(funcs, sig, lcl, b),
+		Stmt.IfElse(_, t, el) ->
+			nfp_prop_stmt(funcs, sig, lcl, t) || nfp_prop_stmt(funcs, sig, lcl, el),
+		Stmt.Block(ss) -> nfp_prop_body(funcs, sig, lcl, ss),
+		Stmt.Loop(ll_, ss) -> nfp_prop_body(funcs, sig, lcl, ss),
+		Stmt.ForIn(_, _, ss) -> nfp_prop_body(funcs, sig, lcl, ss),
+		Stmt.Match(_, arms) -> nfp_prop_arms(funcs, sig, lcl, arms),
+		Stmt.Defer(ss) -> nfp_prop_body(funcs, sig, lcl, ss),
+		Stmt.Closure(_, _, _, cb) -> nfp_prop_body(funcs, sig, lcl, cb),
 		_ -> false,
 	}
 }
 
-const nfp_prop_arms = ([Func] funcs, [Bool] sig, [StmtArm] arms): Bool -> {
+const nfp_prop_arms = ([Func] funcs, [Bool] sig, [Str] lcl, [StmtArm] arms): Bool -> {
 	let Iarch i = 0
 
 	loop {
 		if i >= Iarch(arms.len) then break
-		if nfp_prop_body(funcs, sig, arms[i].body) then return true
+		if nfp_prop_body(funcs, sig, lcl, arms[i].body) then return true
 		i = i + 1
 	}
 
 	return false
 }
 
-const nfp_prop_body = ([Func] funcs, [Bool] sig, [Stmt] ss): Bool -> {
+const nfp_prop_body = ([Func] funcs, [Bool] sig, [Str] lcl, [Stmt] ss): Bool -> {
 	let Iarch i = 0
 
 	loop {
 		if i >= Iarch(ss.len) then break
-		if nfp_prop_stmt(funcs, sig, ss[i]) then return true
+		if nfp_prop_stmt(funcs, sig, lcl, ss[i]) then return true
 		i = i + 1
 	}
 
 	return false
+}
+
+# The names function `f` BINDS — its params plus every local its body introduces (deep) —
+# the auto-call exclusion set for the node-signature propagation.
+const nfp_locals = (Func f): [Str] -> {
+	let [Str] out = stmts_locals(f.body)
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(f.params.len) then break
+		out = [...out, f.params[i].name]
+		i = i + 1
+	}
+
+	return out
 }
 
 # ── the string-literal intern table ─────────────────────────────────────────────────────────
@@ -9200,7 +9222,7 @@ const compute_mints = (Program prog, [Str] at): [Bool] -> {
 		loop {
 			if k >= Iarch(prog.funcs.len) then break
 			if !mts[k] && !prog.funcs[k].is_asm then {
-				if nfp_prop_body(prog.funcs, mts, prog.funcs[k].body) then {
+				if nfp_prop_body(prog.funcs, mts, nfp_locals(prog.funcs[k]), prog.funcs[k].body) then {
 					mts[k] = true
 					changed = true
 				}
@@ -9243,7 +9265,7 @@ const compute_mints = (Program prog, [Str] at): [Bool] -> {
 			loop {
 				if k3 >= Iarch(prog.funcs.len) then break
 				if !mts[k3] && !prog.funcs[k3].is_asm then {
-					if nfp_prop_body(prog.funcs, mts, prog.funcs[k3].body) then {
+					if nfp_prop_body(prog.funcs, mts, nfp_locals(prog.funcs[k3]), prog.funcs[k3].body) then {
 						mts[k3] = true
 						changed2 = true
 					}
@@ -9283,7 +9305,7 @@ const compute_nodesig = (Program prog, [Str] at): [Bool] -> {
 		loop {
 			if k >= Iarch(prog.funcs.len) then break
 			if !sig[k] && !prog.funcs[k].is_asm then {
-				if nfp_prop_body(prog.funcs, sig, prog.funcs[k].body) then {
+				if nfp_prop_body(prog.funcs, sig, nfp_locals(prog.funcs[k]), prog.funcs[k].body) then {
 					sig[k] = true
 					changed = true
 				}
