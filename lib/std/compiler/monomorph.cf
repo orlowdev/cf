@@ -660,13 +660,32 @@ const subst_slots! = (
 # in resolve's `__<tag>` private-mangling, so (template, args) → name is injective (no collision
 # between `pair[Iarch, Str]` and a `pair__Iarch[Str]`). The name is only a resolution key —
 # emit names every function positionally (`$f<idx>`), so the `$` never reaches a QBE symbol.
-const mangle_instance = (Str gname, [Str] tyargs): Str -> {
+# One canonical spelling per word-alias identity POST-mono: `Uarch` IS `Uint64` (named_ty
+# resolves both to one TFixed), but the string layers — signature leaves,
+# array element names, instance keys — compare nominally. A tyarg pinned from a written
+# signature carries the alias while one pinned from a value's type carries the resolved name,
+# so without one spelling a single type splits into two never-equal instances. Every
+# substituted slot flows through `mangle_type!`, which canonicalizes its scalar leaves; the
+# instance key canonicalizes its (possibly raw-pinned) arguments the same way.
+const canon_scalar = (Str t): Str -> {
+	if eq(t, "Uarch") then return "Uint64"
+
+	return t
+}
+
+const canon_targ! = (Str t): Str -> {
+	if is_arr_enc(t) then return "[${canon_targ!(arr_elem!(t))}]"
+
+	return canon_scalar(t)
+}
+
+const mangle_instance! = (Str gname, [Str] tyargs): Str -> {
 	let Str s = gname
 	let Iarch i = 0
 
 	loop {
 		if i >= Iarch(tyargs.len) then break
-		s = "${s}$${tyargs[i]}"
+		s = "${s}$${canon_targ!(tyargs[i])}"
 		i = i + 1
 	}
 
@@ -771,7 +790,7 @@ const type_key_seen = (*MonoCtx m, Str mn): Bool -> {
 # generic application to its instance (`'T` → `Iarch`; `Box['T]` → `Box$Iarch`, generating the
 # `Box$Iarch` record). Recurses through nested applications and registers each instance.
 const mangle_type! = (*MonoCtx m, Str name, [Str] tvars, [Str] tvals): Str -> {
-	if !is_type_app(name) then return subst_ty(name, tvars, tvals)
+	if !is_type_app(name) then return canon_scalar(subst_ty(name, tvars, tvals))
 	const Str base = type_base!(name)
 	# an EMPTY base is the array encoding `[Elem]` (not a generic application) — mangle the
 	# element and keep the encoding; `subst_slot` later expands it into a `$dyn` type slot
@@ -896,7 +915,7 @@ const ensure_type_instance! = (*MonoCtx m, Str base, [Str] margs): Str -> {
 # its type parameters in every member payload type — which may register further instances, e.g.
 # a recursive `List['T]` referencing `List['T]`) and return its mangled name.
 const ensure_union_instance! = (*MonoCtx m, Str base, [Str] margs): Str -> {
-	const Str mn = mangle_instance(base, margs)
+	const Str mn = mangle_instance!(base, margs)
 	if type_key_seen(m, mn) then return mn
 	m.type_keys = [...m.type_keys, mn] # mark before recursing so a recursive union terminates
 	const Iarch ui = find_union_template(m.union_templates, base)
@@ -952,7 +971,7 @@ const mangle_types! = (*MonoCtx m, [Str] names, [Str] tvars, [Str] tvals): [Str]
 # its type parameters in every field type — which may register further instances) and return
 # its mangled name.
 const ensure_rec_instance! = (*MonoCtx m, Str base, [Str] margs): Str -> {
-	const Str mn = mangle_instance(base, margs)
+	const Str mn = mangle_instance!(base, margs)
 	if type_key_seen(m, mn) then return mn
 	m.type_keys = [...m.type_keys, mn] # mark before recursing (a self-referential type terminates)
 	const Iarch ri = find_rec_template(m.rec_templates, base)
@@ -1749,7 +1768,7 @@ const find_lam = (*MonoCtx m, Str nm): Iarch -> {
 # Ensure the instance of `gname` with concrete `tyargs` exists (generating it, and transitively
 # any instance its body needs), and return its mangled name.
 const ensure_instance! = (*MonoCtx m, Str gname, [Str] tyargs): Str -> {
-	const Str mn = mangle_instance(gname, tyargs)
+	const Str mn = mangle_instance!(gname, tyargs)
 	if key_seen(m, mn) then return mn
 	m.keys = [...m.keys, mn] # mark before recursing so a recursive generic terminates
 	const Iarch ti = find_template(m.templates, gname)
