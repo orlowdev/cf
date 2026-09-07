@@ -32,3 +32,9 @@
 ; record fields, shown nested under their type
 (field_declaration
   (var_name) @name) @item
+
+; a test case (`case!("…", …)` / `todo!`, testing.md) — a top-level call is one
+((call_expression
+  (var_name) @context
+  (arguments (string) @name)) @item
+  (#match? @context "^(case|todo)!$"))

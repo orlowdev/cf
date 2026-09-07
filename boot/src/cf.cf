@@ -12,7 +12,7 @@
 # argv/env discipline the environment is read here and threaded down explicitly (to resolve `cc` on
 # PATH), never accessed ambiently.
 
-import std::data::str::{ eq, slice }
+import std::data::str::{ eq, slice, ends_with }
 import std::sys::{ Os, Arch }
 import std::comptime::os
 import cli::{
@@ -21,25 +21,31 @@ import cli::{
 	FmtCli,
 	is_fmt_cmd,
 	fmt_cli_parse,
+	is_test_cmd,
+	test_targets,
+	test_bail,
+	has_watch,
+	strip_watch,
 	is_version_cmd,
 	is_help_cmd,
 	host_arch,
 }
-import std::compiler::buildinfo::{ compiler_version }
+import std::compiler::buildinfo::{ COMPILER_VERSION }
 import fmt::{ format_file! }
 import docs::{ docs_run! }
 import lsp::{ lsp_run! }
-import std::compiler::{ compile!, check! }
+import std::compiler::{ compile!, check!, type_rows!, fn_ret_hover! }
 import std::compiler::ast::{ Program }
 import std::compiler::resolve::{ resolve_program!, Resolved, entry_binds!, Loaded }
 import std::compiler::parser::{ BindEv }
 import std::compiler::spans::{ line_col_of, LC, SrcMap }
-import std::compiler::diag::{ Diag, print_diags! }
+import std::compiler::diag::{ Diag, TyRow, print_diags! }
 import std::mem::arena::growing_arena
 import qbe::{ qbe_translate }
-import std::process::{ run!, find_executable!, getpid, exit }
-import std::io::fs::{ remove }
-import std::io::file::{ create, close, write_str }
+import std::process::{ run!, find_executable!, getpid, exit, sleep_ms }
+import std::io::fs::{ remove, read_dir!, walk_dir!, stat! }
+import std::io::fd::{ Fd, DirEntry, IoRrr, entry_is_dir, is_dir }
+import std::io::file::{ create, close, write_str, open_read, read }
 import std::data::{ Either }
 import std::io::console::{ eprint, print, println }
 
@@ -260,7 +266,7 @@ const has_str = ([Str] xs, Str s): Bool -> {
 # every function/record/union name their defining file, so the distinct stamp set IS the module
 # list. The LSP's goto-definition index: it line-scans these files for top-level declarations.
 const run_modules! = (Str input, Str src): Iarch -> {
-	const Resolved rz = resolve_program!(input, src, os::target, host_arch())
+	const Resolved rz = resolve_program!(input, src, os::target, host_arch(), false, false)
 	const Program raw = rz.prog
 	let [Str] mods = []
 
@@ -354,6 +360,106 @@ const run_def! = (Str input, Str src, Iarch off, Str name): Iarch -> {
 	const LC lc = line_col_of(maps, input, b)
 	if lc.line <= 0 then return 0
 	println("${lc.line}:${lc.col}")
+
+	return 0
+}
+
+# `cf lsp type <input.cf> <off> <name> [--src <buf>]`: the DEDUCED type of the LOCAL binding
+# of `name` visible at byte offset `off` — one display line, `let`/`const` + name + type (a
+# parameter prints bare). When NO local binds the name, a same-file function's deduced RETURN
+# prints instead (see the fallback in the body); otherwise nothing. The binder
+# comes from the tracked entry parse (the same replay as `def`); the types from a logged
+# whole-tree typecheck (`type_rows!`). A row correlates back to THIS binder by the enclosing
+# declaration's stamp line plus the nearest expression ANCHOR at or after the binder — cf
+# rejects shadowing, so two binds of one name in one declaration are sibling-scope binds and
+# the anchor (a `let`'s initializer, a `for`/arm body's first expression, always between a
+# binder and the next same-named one) picks the right sibling. An anchorless row (a
+# parameter, a closure name — unique per declaration) matches by name alone. A generic's
+# instances log one row each off the same anchor; the distinct renderings join as `A | B`.
+const run_type! = (Str input, Str src, Iarch off, Str name): Iarch -> {
+	const Loaded ld = entry_binds!(input, src, os::target, host_arch())
+	const Iarch b = binder_at!(ld.evs, off, name)
+
+	# no local binds the name: a same-file FUNCTION answers with its deduced RETURN spelling
+	# alone (the server composes the signature from the declaration line and appends it)
+	if b < 0 then {
+		let Bool isfn = false
+
+		for fn in ld.prog.funcs {
+			if eq(fn.name, name) then isfn = true
+		}
+
+		if !isfn then return 0
+		const Str fr = fn_ret_hover!(input, src, os::target, host_arch(), name)
+		if Iarch(fr.len) > 0 then println(fr)
+
+		return 0
+	}
+
+	# the binder's KIND (2 param / 3 local / 4 for / 5 match bind) — a parameter reads like a
+	# signature fragment (no prefix); every other bind carries its `let`/`const` nature
+	let Iarch bkind = 3
+
+	for ev in ld.evs {
+		if ev.off == b && ev.kind >= 2 && ev.kind <= 5 && eq(ev.name, name) then bkind = ev.kind
+	}
+
+	const [SrcMap] maps = [ld.map]
+	const LC blc = line_col_of(maps, input, b)
+	if blc.line <= 0 then return 0
+	# the enclosing declaration: the nearest function stamp at or above the binder's line
+	let Iarch dline = -1
+
+	for fn in ld.prog.funcs {
+		if fn.dline <= blc.line && fn.dline > dline then dline = fn.dline
+	}
+
+	if dline < 0 then return 0
+	const [TyRow] rows = type_rows!(input, src, os::target, host_arch())
+	# this declaration's binds of the name
+	let [TyRow] cand = []
+
+	for r in rows {
+		if r.dline == dline && eq(r.name, name) then cand = [...cand, r]
+	}
+
+	if Iarch(cand.len) == 0 then return 0
+	# the nearest anchor at/after the binder wins; anchorless rows only when none lands
+	let Iarch best = -1
+
+	for (r, i) in cand {
+		if r.anchor >= b then {
+			if best < 0 || r.anchor < cand[best].anchor then best = i
+		}
+	}
+
+	let [Str] tys = []
+	let Bool mut = false
+
+	for r in cand {
+		let Bool take = false
+		if best >= 0 then take = r.anchor == cand[best].anchor
+		if best < 0 then take = r.anchor < 0
+
+		if take && !has_str(tys, r.ty) then {
+			tys = [...tys, r.ty]
+			if r.mut then mut = true
+		}
+	}
+
+	if Iarch(tys.len) == 0 then return 0
+	let Str out = tys[0]
+	let Iarch ti = 1
+
+	loop {
+		if ti >= Iarch(tys.len) then break
+		out = "${out} | ${tys[ti]}"
+		ti = ti + 1
+	}
+
+	let Str prefix = if mut then "let " else "const "
+	if bkind == 2 then prefix = ""
+	println("${prefix}${name}: ${out}")
 
 	return 0
 }
@@ -591,7 +697,7 @@ const run_uses! = (Str input, Str src, Str name): Iarch -> {
 # of a child per file: the cross-file rename front end at tree scale. A parse-broken file
 # anywhere dies nonzero — the server discards the partial output rather than mis-rename.
 const run_uses_all! = (Str entry, Str src, Str name): Iarch -> {
-	const Resolved rz = resolve_program!(entry, src, os::target, host_arch())
+	const Resolved rz = resolve_program!(entry, src, os::target, host_arch(), false, false)
 	const Program raw = rz.prog
 	let [Str] mods = []
 
@@ -702,8 +808,15 @@ const run_full! = (Cli c, [Str] env): Iarch -> {
 		c.target_arch,
 		c.root_size,
 		c.dump_routing,
+		c.no_inline,
+		c.oos_mode,
 		c.skip_embeds,
 		c.build_version,
+		c.debug,
+		c.instrument,
+		c.is_test,
+		c.is_bail,
+		c.test_files,
 	)
 
 	# type errors come back as values — the CLI edge is where they become text
@@ -741,6 +854,485 @@ const run_full! = (Cli c, [Str] env): Iarch -> {
 	return st
 }
 
+# Every `.cf` file under `dir` (testing.md §6 — a directory target runs the cases in every file
+# it holds): `std::io::fs::walk_dir!` recurses, sorts, and skips dot-entries; only the `.cf`
+# filter is the test route's own.
+const collect_tests! = (Str dir): [Str] -> {
+	let [Str] out = []
+
+	for f in walk_dir!(dir) if ends_with(".cf", f) then out = [...out, f]
+
+	return out
+}
+
+# `cf format <dir>`: every `.cf` under the directory, recursively (`std::io::fs::walk_dir!` —
+# sorted, dot-entries skipped). `--check` aggregates: exit 1 iff ANY file needs reformatting
+# (every file is still visited, so the report is complete); without it each file rewrites in
+# place. A file target formats exactly as before.
+const format_target! = (Str path, Bool check): Iarch -> {
+	const Either[IoRrr, [DirEntry]] dtry = read_dir!(path)
+
+	match dtry {
+		Either.Left(e) -> {},
+		Either.Right(entries) -> {
+			let Iarch worst = 0
+
+			for f in walk_dir!(path) {
+				if ends_with(".cf", f) then {
+					const Iarch rc = format_file!(f, check)
+					if rc != 0 then worst = 1
+				}
+			}
+
+			return worst
+		},
+	}
+
+	return format_file!(path, check)
+}
+
+# Does the file textually carry a `case!(`/`todo!(` call? The directory walk's prefilter
+# (testing.md §6): a file with neither cannot register a case, so it never spends a compile —
+# a library module under `cf test <dir>` is simply skipped. A mention inside a comment
+# false-positives into one compile whose empty runner exits 0 (testsynth); an unreadable or
+# over-sized file passes through to the compile, which reports it properly.
+const has_cases! = (Str path): Bool -> {
+	let [1048576 Uint8] buf
+	let Bool opened = true
+
+	const Fd fd = match open_read(path) {
+		Either.Left(e) -> {
+			opened = false
+
+			<- Fd({ n: Uarch(0) })
+		},
+		Either.Right(f) -> f,
+	}
+
+	if !opened then return true
+
+	const Iarch n = match read(fd, buf, Uarch(buf.len)) { Either.Left(e) -> 0, Either.Right(k) -> k }
+
+	close(fd)
+
+	if n >= Iarch(buf.len) then return true
+	const Str c1 = "case!("
+	const Str c2 = "todo!("
+	let Iarch i = 0
+
+	loop {
+		if i + 6 > n then break
+		let Bool m1 = true
+		let Bool m2 = true
+		let Iarch k = 0
+
+		loop {
+			if k >= 6 then break
+			if Iarch(buf[i + k]) != Iarch(c1[k]) then m1 = false
+			if Iarch(buf[i + k]) != Iarch(c2[k]) then m2 = false
+			k = k + 1
+		}
+
+		if m1 || m2 then {
+			# only a TOP-LEVEL call registers a case: the match's line must start with a
+			# non-space, non-`#` byte (`case!(` at column 0, or `std::test::case!(` whose line
+			# starts at `std`) — a comment mention or an indented body call is not a case
+			let Iarch ls = i
+
+			loop {
+				if ls == 0 then break
+				if Iarch(buf[ls - 1]) == 10 then break
+				ls = ls - 1
+			}
+
+			const Iarch fc = Iarch(buf[ls])
+			if fc != 35 && fc != 32 && fc != 9 then return true
+		}
+		i = i + 1
+	}
+
+	return false
+}
+
+# The module path of test file `f` inside walked `target` (`suite`, `suite/sub/tunion.cf` ->
+# `sub::tunion`), or "" when it cannot be spelled as an import — every segment must be an
+# identifier (`[A-Za-z_][A-Za-z0-9_]*`), so a `1494_*.cf` corpus-style name falls back to its own
+# per-file run.
+const test_mod_of = (Str target, Str f): Str -> {
+	const Iarch skip = Iarch(target.len) + 1
+	const Iarch stop = Iarch(f.len) - 3
+	let [Uint8] out = []
+	let Bool segstart = true
+	let Iarch i = skip
+
+	loop {
+		if i >= stop then break
+		const Iarch c = Iarch(f[i])
+
+		if c == 47 then {
+			out = [...out, 58, 58]
+			segstart = true
+		} else {
+			const Bool alpha = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95
+			const Bool digit = c >= 48 && c <= 57
+			if segstart && !alpha then return ""
+			if !alpha && !digit then return ""
+			out = [...out, f[i]]
+			segstart = false
+		}
+
+		i = i + 1
+	}
+
+	return Str({ bytes: out, len: Iarch(out.len) })
+}
+
+# The validated module stem of a lone test file (`t2m.cf` -> `t2m`), or "" when it is not a
+# spellable identifier.
+const test_stem = (Str f): Str -> {
+	const Iarch stop = Iarch(f.len) - 3
+	if stop <= 0 then return ""
+	let [Uint8] out = []
+	let Iarch i = 0
+
+	loop {
+		if i >= stop then break
+		const Iarch c = Iarch(f[i])
+		const Bool alpha = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95
+		const Bool digit = c >= 48 && c <= 57
+		if i == 0 && !alpha then return ""
+		if !alpha && !digit then return ""
+		out = [...out, f[i]]
+		i = i + 1
+	}
+
+	return Str({ bytes: out, len: Iarch(out.len) })
+}
+
+# The last `/` in `p`, or -1.
+const last_slash = (Str p): Iarch -> {
+	let Iarch at = -1
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(p.len) then break
+		if Iarch(p[i]) == 47 then at = i
+		i = i + 1
+	}
+
+	return at
+}
+
+# One MERGED test build (testing.md §6): a transient dot-named entry inside `target` imports every
+# spellable test module (relative imports resolve against the ENTRY's directory), so the whole
+# directory compiles and runs as ONE binary — one build, one process, every case prefixed by its
+# own module (the run wrappers carry their declaring file). The entry is removed afterwards; the
+# walk skips dot-entries, so a concurrent walk never sees it.
+const run_merged! = (Str target, [Str] mods, Bool bail, [Str] env): Iarch -> {
+	const Iarch pid = getpid()
+	const Str entry = "${target}/.__cf_test_${pid}.cf"
+	# the requested files, spelled exactly as resolve will record them (entry-dir + module path):
+	# the runner drives ONLY these — a dependency's own cases stay quiet unless it is the target
+	let [Str] req = []
+
+	for m in mods {
+		let [Uint8] fb = []
+		let Iarch ti = 0
+
+		loop {
+			if ti >= Iarch(target.len) then break
+			fb = [...fb, target[ti]]
+			ti = ti + 1
+		}
+
+		fb = [...fb, 47]
+		let Iarch mi = 0
+
+		loop {
+			if mi >= Iarch(m.len) then break
+
+			if Iarch(m[mi]) == 58 then {
+				fb = [...fb, 47]
+				mi = mi + 2
+			} else {
+				fb = [...fb, m[mi]]
+				mi = mi + 1
+			}
+		}
+
+		fb = [...fb, 46, 99, 102]
+		req = [...req, Str({ bytes: fb, len: Iarch(fb.len) })]
+	}
+
+	const Fd fd = match create(entry) {
+		Either.Left(e) -> {
+			eprint("cf: test: cannot write the merged entry under ${target}\n")
+			exit(2)
+
+			<- Fd({ n: Uarch(0) })
+		},
+		Either.Right(f) -> f,
+	}
+
+	for m in mods write_str(fd, "import ${m}\n")
+
+	close(fd)
+	const Iarch rc = run_test_file!(entry, bail, env, req)
+	remove(entry)
+
+	return rc
+}
+
+# `cf test <file>` (cf_cli §7, testing.md §6): build the target with the TEST route — `is_test`
+# injects
+# a runner `main` over every `case!`/`todo!` in the file — run the resulting binary, and exit with
+# its
+# code (0 when every case passed, 1 when any failed). The report lines print to stdout as the cases
+# run. The test binary is a self-contained build to a temp path, run once, then removed.
+const run_test! = (Str target, Bool bail, [Str] env): Iarch -> {
+	if eq(target, "") then {
+		eprint("cf: test: give a file or directory to test — cf test <file.cf|dir>...\n")
+		exit(2)
+	}
+	# a DIRECTORY target walks recursively: each `.cf` builds and runs as its own test binary, the
+	# exit code is 1 iff any file failed (a compile error counts), and `--bail` stops at the first
+	# failing file (its own in-binary bail already stopped at the first failing case)
+	const Either[IoRrr, [DirEntry]] dtry = read_dir!(target)
+
+	match dtry {
+		Either.Left(e) -> {},
+		Either.Right(entries) -> {
+			const [Str] all = collect_tests!(target)
+			let [Str] merged = []
+			let [Str] loose = []
+
+			for f in all {
+				if has_cases!(f) then {
+					const Str m = test_mod_of(target, f)
+					if eq(m, "") then loose = [...loose, f]
+					else merged = [...merged, m]
+				}
+			}
+
+			if Iarch(merged.len) == 0 && Iarch(loose.len) == 0
+				then println("cf: test: no cases under ${target}")
+			let Iarch worst = 0
+
+			if Iarch(merged.len) > 0 then {
+				const Iarch rc = run_merged!(target, merged, bail, env)
+				if rc != 0 then worst = 1
+				if bail && worst != 0 then return 1
+			}
+
+			for f in loose {
+				const [Str] just = [f]
+				const Iarch rc = run_test_file!(f, bail, env, just)
+				if rc != 0 then worst = 1
+				if bail && worst != 0 then return 1
+			}
+
+			return worst
+		},
+	}
+
+	# a single FILE also runs as a MODULE behind a merged entry in its own directory: compiled as
+	# a bare entry it would load a SECOND time whenever its own import tree reaches back to it
+	# (std::data::str under std::test -> console -> process), doubling every case — as a module
+	# import it dedupes against that load. An unspellable name (a digit-led corpus file) keeps
+	# the bare-entry path; such a file is outside any import tree that could reach it.
+	const Iarch sl = last_slash(target)
+	const Str fdir = if sl < 0 then "." else slice(0, sl, target)
+	const Str base = if sl < 0 then target else slice(sl + 1, Iarch(target.len), target)
+	if ends_with(".cf", base) then {
+		const Str m = test_stem(base)
+		if !eq(m, "") then return run_merged!(fdir, [m], bail, env)
+	}
+
+	const [Str] justt = [target]
+
+	return run_test_file!(target, bail, env, justt)
+}
+
+const run_test_file! = (Str target, Bool bail, [Str] env, [Str] req): Iarch -> {
+	const Iarch pid = getpid()
+	const Str out = "/tmp/cf-test-${pid}"
+	const Cli c = Cli({
+		input: target,
+		out_qbe: "",
+		out_asm: "",
+		target_os: os::target,
+		target_arch: host_arch(),
+		root_size: 1048576,
+		dump_routing: false,
+		no_inline: false,
+		oos_mode: 0,
+		debug: false,
+		instrument: false,
+		full: true,
+		output: out,
+		preserve: false,
+		skip_embeds: false,
+		build_version: "",
+		is_test: true,
+		is_bail: bail,
+		test_files: req,
+	})
+	const Iarch bst = run_full!(c, env)
+	if bst != 0 then return bst
+	const [Str] noargv = []
+	const Iarch rc = run!(out, noargv, env)
+	remove(out)
+
+	return rc
+}
+
+# Does `path` name a directory? The watch loop's classifier: a directory root walks
+# recursively, a file root watches its containing tree.
+const is_dir_path! = (Str p): Bool -> match stat!(p) {
+	Either.Left(e) -> false,
+	Either.Right(s) -> is_dir(s),
+}
+
+# Fold `v` into the running fingerprint — order-sensitive multiplicative mixing, so any changed
+# byte of a path, size, mtime, or the file count moves the hash.
+const fp_mix = (Iarch h, Iarch v): Iarch -> h * 1000003 + v
+
+# One file's contribution to the fingerprint: its path bytes, then its size and mtime (a
+# vanished file contributes a marker instead, so a deletion is a change too).
+const fp_file! = (Iarch h, Str f): Iarch -> {
+	let Iarch v = h
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(f.len) then break
+		v = fp_mix(v, Iarch(f[i]))
+		i = i + 1
+	}
+
+	return match stat!(f) {
+		Either.Left(e) -> fp_mix(v, -1),
+		Either.Right(s) -> fp_mix(fp_mix(v, s.size), s.mtime),
+	}
+}
+
+# The fingerprint of everything a watch observes: each directory root contributes every `.cf`
+# under it (walk_dir! — sorted, dot-entries skipped, so a merged-test entry never self-triggers),
+# a file root contributes itself. The poll loop re-runs when the value moves — an edit, an added
+# or removed file, a rename.
+const fp_roots! = ([Str] roots): Iarch -> {
+	let Iarch h = 5381
+
+	for r in roots {
+		if is_dir_path!(r) then {
+			for f in walk_dir!(r) if ends_with(".cf", f) then h = fp_file!(h, f)
+		} else {
+			h = fp_file!(h, r)
+		}
+	}
+
+	return h
+}
+
+# The path of THIS cf binary, for `--watch` to re-spawn: argv[0] as-is when it carries a slash,
+# else resolved on PATH (how the kernel found it in the first place).
+const resolve_self! = ([Str] args, [Str] env): Str -> {
+	const Str a0 = args[0]
+	let Bool slashed = false
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(a0.len) then break
+		if Iarch(a0[i]) == 47 then slashed = true
+		i = i + 1
+	}
+
+	if slashed then return a0
+
+	return match find_executable!(env, a0) {
+		Either.Right(p) -> p,
+		Either.Left(e) -> {
+			eprint("cf: --watch: cannot resolve the cf binary to re-run\n")
+			exit(2)
+
+			<- ""
+		},
+	}
+}
+
+# The directory trees a watch observes. For `cf test`: each directory target itself; a file
+# target's whole containing directory (its merged run resolves sibling imports there). For a
+# compile: the entry's directory — imports resolve relative to the entry, so its tree
+# over-approximates the spec's non-std import graph (cf_cli §6; std is baked into cf and cannot
+# change under a running watch).
+const watch_roots! = ([Str] args): [Str] -> {
+	if is_test_cmd(args) then {
+		let [Str] roots = []
+
+		for t in test_targets(args) {
+			if is_dir_path!(t) then roots = [...roots, t]
+			else {
+				const Iarch sl = last_slash(t)
+				const Str d = if sl < 0 then "." else slice(0, sl, t)
+				roots = [...roots, d]
+			}
+		}
+
+		if Iarch(roots.len) == 0 then {
+			eprint("cf: test: give a file or directory to test — cf test <file.cf|dir>...\n")
+			exit(2)
+		}
+
+		return roots
+	}
+
+	# a compile: the FIRST `.cf` positional is the entry (no flag ends in `.cf`)
+	let Str input = ""
+	let Iarch i = 1
+
+	loop {
+		if i >= Iarch(args.len) then break
+		if eq(input, "") && ends_with(".cf", args[i]) then input = args[i]
+		i = i + 1
+	}
+
+	if eq(input, "") then {
+		eprint("cf: --watch: no `.cf` input on the command line\n")
+		exit(2)
+	}
+
+	const Iarch sl = last_slash(input)
+	const Str d = if sl < 0 then "." else slice(0, sl, input)
+
+	return [d]
+}
+
+# `--watch` (cf_cli §2/§6/§7): run the command once, then poll the watched trees (4x/second)
+# and re-run on every change. Each run spawns THIS cf as a child with `--watch` stripped — the
+# child owns every exit path (a failed build must not end the watcher) and each run starts
+# clean. The loop never returns; ^C ends it.
+const run_watch! = ([Str] args, [Str] env): Iarch -> {
+	const [Str] child = strip_watch(args)
+	const Str cfbin = resolve_self!(args, env)
+	const [Str] roots = watch_roots!(child)
+
+	loop {
+		const Iarch fp = fp_roots!(roots)
+		const Iarch rc = run!(cfbin, child, env)
+
+		if rc == 0 then println("cf: watch: ok — waiting for changes (^C stops)")
+		else println("cf: watch: exit ${rc} — waiting for changes (^C stops)")
+
+		loop {
+			sleep_ms(250)
+			if fp_roots!(roots) != fp then break
+		}
+
+		println("")
+	}
+
+	return 0
+}
+
 # The help screen — the accurate command surface of THIS binary (reality), in the shape of
 # [[cf_cli.md]]. It lists only what cf implements today; the commands the spec defers (run/test/
 # lint) are named at the end as not-yet-implemented rather than advertised as working. Printed to
@@ -751,7 +1343,8 @@ const print_help = (): () -> {
 	println("")
 	println("Usage:")
 	println("  cf [c|compile] <file.cf> -o <out> [options]   compile <file.cf> to a native binary")
-	println("  cf format <file|dir> [--check]                format C! source in place       (alias: f)")
+	println("  cf test <file.cf|dir>... [--bail] [--watch]   build and run the targets' case!s (alias: t)")
+	println("  cf format <file|dir>... [--check]             format C! source in place       (alias: f)")
 	println("  cf check <file.cf> [--src <buf>]              validate a module tree, no output")
 	println("  cf lsp                                        serve the Language Server Protocol on stdio")
 	println("  cf docs [<term>]                              browse the standard-library API")
@@ -767,8 +1360,12 @@ const print_help = (): () -> {
 	println("  -P, --preserve-intermediates  keep the emitted QBE IL + asm")
 	println("  --skip-embeds                 emit without baking in std           (bootstrap seed only)")
 	println("  --dump-routing                print each function's escape/alias classification")
+	println("  --oos-probe                   trap stack overflow with prologue probes instead of the guard-page")
+	println("                                signal handler — for hosts that must not own the SIGSEGV handler")
+	println("  --no-oos-trap                 drop the stack-overflow trap entirely (runaway recursion segfaults raw)")
+	println("  --watch                       re-run the command when the watched tree changes (also cf test)")
 	println("")
-	println("Specified but not yet implemented: run, test, lint (see root/specs/cf_cli.md).")
+	println("Specified but not yet implemented: run, lint (see root/specs/cf_cli.md).")
 }
 
 pub const main = ([Str] args, [Str] env) -> {
@@ -782,16 +1379,41 @@ pub const main = ([Str] args, [Str] env) -> {
 	# `cf --version`/`-V` — print the compiler's own version and stop. Distinct from `--set-version`,
 	# which stamps the version of the program being compiled.
 	if is_version_cmd(args) then {
-		println(compiler_version)
+		println(COMPILER_VERSION)
 		exit(0)
 	}
 
+	# `--watch` (cf_cli §2/§6/§7) — the polling re-run loop for `cf test` and a compile. It
+	# branches off before the routes: each iteration re-spawns cf itself with `--watch`
+	# stripped, so every exit path below (a diagnostic's exit(1) included) ends the CHILD,
+	# never the watcher. The other subcommands don't take the flag. (`args.len >= 2` here:
+	# a bare `cf` already took the help exit.)
+	const Bool watched = has_watch(args)
+	&& !is_fmt_cmd(args)
+	&& !eq(args[1], "check")
+	&& !eq(args[1], "lsp")
+	&& !eq(args[1], "docs")
+
+	if watched then {
+		const wa = growing_arena::of(16777216)
+
+		return run_watch!(args, env) in wa
+	}
+
 	# `cf format`/`cf f` — formats source, not a compile; branches off before the pipeline.
+	# Every target is visited; the exit is 1 iff any of them failed (or, with `--check`, needed
+	# reformatting).
 	if is_fmt_cmd(args) then {
 		const fa = growing_arena::of(16777216)
 		const FmtCli fc = fmt_cli_parse(args) in fa
+		let Iarch fworst = 0
 
-		return format_file!(fc.path, fc.check) in fa
+		for p in fc.paths {
+			const Iarch rc = format_target!(p, fc.check) in fa
+			if rc != 0 then fworst = 1
+		}
+
+		return fworst
 	}
 
 	# `cf check <input.cf> [--src <file>]` — the full validation pipeline, no output: located
@@ -826,6 +1448,16 @@ pub const main = ([Str] args, [Str] env) -> {
 			const da = growing_arena::of(16777216)
 
 			return run_def!(args[3], dsrc, dec_of(args[4]), args[5]) in da
+		}
+
+		# `cf lsp type <input.cf> <off> <name> [--src <file>]` — the DEDUCED type of the local
+		# binding at a byte offset, one line (the hover's type oracle).
+		if Iarch(args.len) >= 6 && eq(args[2], "type") then {
+			let Str tsrc = ""
+			if Iarch(args.len) >= 8 && eq(args[6], "--src") then tsrc = args[7]
+			const ta = growing_arena::of(16777216)
+
+			return run_type!(args[3], tsrc, dec_of(args[4]), args[5]) in ta
 		}
 
 		# `cf lsp refs <input.cf> <off> <name> [--src <file>]` — every reference to the local
@@ -880,6 +1512,30 @@ pub const main = ([Str] args, [Str] env) -> {
 		return docs_run!(args) in doca
 	}
 
+	# `cf test`/`cf t` — every target runs (each file or directory through its own merged
+	# build); the exit is 1 iff any of them failed, and `--bail` stops at the first failing
+	# target (its in-run bail already stopped at the first failing case).
+	if is_test_cmd(args) then {
+		const ta = growing_arena::of(16777216)
+		const [Str] targets = test_targets(args)
+		const Bool bail = test_bail(args)
+
+		if Iarch(targets.len) == 0 then {
+			eprint("cf: test: give a file or directory to test — cf test <file.cf|dir>...\n")
+			exit(2)
+		}
+
+		let Iarch tworst = 0
+
+		for t in targets {
+			const Iarch rc = run_test!(t, bail, env) in ta
+			if rc != 0 then tworst = 1
+			if bail && tworst != 0 then return 1
+		}
+
+		return tworst
+	}
+
 	# cf runs its whole compilation under ONE growing arena grafted from the root page (memory_model
 	# §2, §4): main holds no residue on the root, and the pipeline runs `in a`.
 	const a = growing_arena::of(16777216)
@@ -895,8 +1551,15 @@ pub const main = ([Str] args, [Str] env) -> {
 			c.target_arch,
 			c.root_size,
 			c.dump_routing,
+			c.no_inline,
+			c.oos_mode,
 			c.skip_embeds,
 			c.build_version,
+			c.debug,
+			c.instrument,
+			c.is_test,
+			c.is_bail,
+			c.test_files,
 		) in a
 
 		if Iarch(ds.len) > 0 then {

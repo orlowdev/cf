@@ -105,6 +105,9 @@
 (break_expression) @keyword.control
 (continue_expression) @keyword.control
 
+; `uses T` — the context-demand clause between the return type and the `->`
+(uses_clause "uses" @keyword)
+
 (asm_block "asm" @keyword)
 
 ; ---- operators & punctuation -------------------------------------------------
@@ -130,3 +133,10 @@
 (type_pattern (named_type (type_name) @type))
 ; a negated number pattern (`-5`) — the sign is an operator
 (negative_pattern "-" @operator)
+
+; ---- constants -----------------------------------------------------------------
+; An UPPER_SNAKE name is a public value const (`STDOUT`, `K_GLORY`, `NOT_FOUND`).
+; The grammar lexes it as a `type_name` (the two are inseparable without
+; lookahead); this recolor sits LAST so it wins over every earlier type rule.
+((type_name) @constant
+  (#match? @constant "^[A-Z][A-Z0-9_]+$"))

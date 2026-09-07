@@ -1,14 +1,14 @@
-.globl _f118
+.globl _f133
 .p2align 2
-_f118:
+_f133:
 	subq $8, %rsp
 	call _cf_qbe_run
 	addq $8, %rsp
 	ret
 
-.globl _f122
+.globl _f143
 .p2align 2
-_f122:
+_f143:
 	movq %rdi, %rax
 	orq $0x2000000, %rax
 	movq %rsi, %rdi
@@ -23,22 +23,22 @@ _f122:
 1:
 	ret
 
-.globl _f123
+.globl _f144
 .p2align 2
-_f123:
+_f144:
 	movq $1, %rax
 	ret
 
-.globl _f411
+.globl _f503
 .p2align 2
-_f411:
+_f503:
 	movq $0x2000001, %rax
 	syscall
 	ret
 
-.globl _f412
+.globl _f504
 .p2align 2
-_f412:
+_f504:
 	movq $0x2000002, %rax
 	syscall
 	jnc 1f
@@ -132,6 +132,103 @@ _cf_oom:
 	movq $70, %rdi
 	movq $0x2000001, %rax
 	syscall
+
+.globl _cf_oos
+.p2align 2
+_cf_oos:
+	movq $72, %rdi
+	movq $0x2000001, %rax
+	syscall
+
+.globl _cf_oob
+.p2align 2
+_cf_oob:
+	movq $73, %rdi
+	movq $0x2000001, %rax
+	syscall
+
+.globl _cf_oos_data
+.p2align 2
+_cf_oos_data:
+	.data
+	.balign 8
+_cf_oos_win:
+	.quad 1
+	.quad 0
+_cf_oos_dflact:
+	.space 32
+_cf_oos_actbuf:
+	.space 32
+	.zerofill __DATA,__bss,_cf_oos_stk,32768,3
+	.text
+
+.globl _cf_oos_guard_init
+.p2align 2
+_cf_oos_guard_init:
+	pushq %rbp
+	movq %rsp, %rbp
+	pushq %rbx
+	subq $56, %rsp
+	movq %rdi, %rbx
+	movl $3, %edi
+	leaq 16(%rsp), %rsi
+	call _getrlimit
+	movq 16(%rsp), %r8
+	leaq _cf_oos_win(%rip), %r9
+	movq %r8, %rcx
+	shrq $46, %rcx
+	jnz 2f
+	movq %rbx, %rcx
+	subq %r8, %rcx
+	leaq -524288(%rcx), %rdx
+	movq %rdx, (%r9)
+	leaq 2097152(%rcx), %rdx
+	movq %rdx, 8(%r9)
+2:
+	leaq _cf_oos_stk(%rip), %rcx
+	movq %rcx, 16(%rsp)
+	movq $32768, 24(%rsp)
+	movl $0, 32(%rsp)
+	leaq 16(%rsp), %rdi
+	xorl %esi, %esi
+	call _sigaltstack
+	leaq _cf_oos_actbuf(%rip), %rbx
+	leaq _cf_oos_handler(%rip), %rcx
+	movq %rcx, (%rbx)
+	movl $0x41, 12(%rbx)
+	movl $11, %edi
+	movq %rbx, %rsi
+	xorl %edx, %edx
+	call _sigaction
+	movl $10, %edi
+	movq %rbx, %rsi
+	xorl %edx, %edx
+	call _sigaction
+	addq $56, %rsp
+	popq %rbx
+	popq %rbp
+	ret
+
+.globl _cf_oos_handler
+.p2align 2
+_cf_oos_handler:
+	movq 24(%rsi), %r8
+	leaq _cf_oos_win(%rip), %r9
+	movq (%r9), %r10
+	movq 8(%r9), %r11
+	cmpq %r10, %r8
+	jb 1f
+	cmpq %r11, %r8
+	ja 1f
+	jmp _cf_oos
+1:
+	pushq %rbp
+	movq %rsp, %rbp
+	leaq _cf_oos_dflact(%rip), %rsi
+	xorl %edx, %edx
+	call _sigaction
+	popq %rbp
+	ret
 
 .globl _start
 .p2align 2

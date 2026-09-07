@@ -93,9 +93,16 @@ hence functions, which are `const`-bound lambdas).
 ```
 pub const lex = (...) -> ...       (* exported *)
 const scan_ident = (...) -> ...    (* file-private *)
+pub const MAX_DEPTH = 128        (* exported value const — UPPER_SNAKE_CASE required *)
 pub data Token = { ... }         (* exported *)
 pub union TokKind = { ... }      (* exported *)
 ```
+
+An exported **non-function value const** must be **UPPER_SNAKE_CASE**
+(`const_name`, [[ebnf.md]] § Identifiers) — the screaming casing is the
+convention's signal that the name is an immutable module constant. A
+module-private value const may stay snake_case; a function is a `var_name`
+const binding either way.
 
 `pub` lives only on a top-level `declaration`. A `var_decl` used as a block statement is a
 local and takes no `pub`. An `import` may also carry `pub`, but that is a **reexport**
@@ -125,10 +132,11 @@ An import (`[ "pub" ] "import" <module_path> ( [ "::" "{" ... "}" ] | [ "as" ( <
 
 - **A bare path** `import a::b::c` binds the path's **last segment** `c` as a namespace over
   module `a::b::c`'s **whole** exported surface. A use `c::member` expands to
-  `a::b::c::member`. Both planes ride one namespace — `mem::alloc` (a value) and `mem::Arena`
-  (a type) are both reached through `import std::mem`, told apart by the **member's** own
-  casing, not the binding's. (This is the deliberate simplification over the older
-  value-vs-type namespace split: a single `::` path reaches any member.)
+  `a::b::c::member`. Both planes ride one namespace — `mem::alloc` (a value), `io::STDOUT`
+  (a value const) and `mem::Arena` (a type) are all reached through one import, told apart
+  by the **member's** own casing, not the binding's: `var_name` and `const_name` terminals
+  are values, a PascalCase terminal is a type. (This is the deliberate simplification over
+  the older value-vs-type namespace split: a single `::` path reaches any member.)
 - **A renamed path** `import a::b::c as n` binds `n` — not the last segment `c` — as the
   namespace over the same **whole** surface, so `n::member` expands to `a::b::c::member`. The
   rename applies to the namespace binding only (never to `::{ ... }` destructuring). It resolves
@@ -142,8 +150,8 @@ An import (`[ "pub" ] "import" <module_path> ( [ "::" "{" ... "}" ] | [ "as" ( <
   ```
 - **A destructured path** `import a::b::c::{ x, Y }` pulls **named members straight into
   scope**: `x` means `a::b::c::x`, `Y` means `a::b::c::Y`, written bare. A destructured
-  member's own casing says which plane it is (`var_name` → value, `type_name` → type), and it
-  must name a member the module exports.
+  member's own casing says which plane it is (`var_name` or `const_name` → value,
+  PascalCase `type_name` → type), and it must name a member the module exports.
 - **A wildcard** `import a::b::c as *` splices `a::b::c`'s **whole exported surface** into the
   current module **flat** — every member at its own name, no nesting prefix and no enumeration.
   As a **`pub import ... as *`** it reexports the entire surface without re-listing it, so a

@@ -18,7 +18,7 @@ import std::compiler::diag::{ die_at_lc }
 import std::compiler::spans::{ SrcMap, src_map, unat }
 import std::io::file::{ open_read, read, close }
 import std::io::fd::{ Fd, IoRrr }
-import std::comptime::{ embed_dir, EmbeddedFile }
+import std::comptime::{ embed, embed_dir, EmbeddedFile }
 import std::compiler::token::{ Token, is_ident, is_lbrace, is_rbrace, is_pathsep, is_star }
 import std::compiler::ast::{
 	Expr,
@@ -39,7 +39,7 @@ import std::compiler::ast::{
 }
 import std::compiler::lexer::{ lex }
 import std::compiler::typealias::{ strip_type_aliases! }
-import std::compiler::parser::{ Parser, BindEv, parse_program! }
+import std::compiler::parser::{ Parser, BindEv, parse_program!, is_upper_snake }
 
 # Byte-wise Str equality (used to dedup already-loaded module paths).
 
@@ -88,10 +88,10 @@ const build_path! = (Str dir, Str name): Str -> {
 		j = j + 1
 	}
 
-	v = [...v, 46]  # '.'
-	v = [...v, 99]  # 'c'
+	v = [...v, 46] # '.'
+	v = [...v, 99] # 'c'
 	v = [...v, 102] # 'f'
-	v = [...v, 0]   # NUL terminator for `open`
+	v = [...v, 0] # NUL terminator for `open`
 	return Str(v)
 }
 
@@ -364,8 +364,24 @@ const strip_import_namespaces! = (*[Uint8] src, [Token] toks): StripResult -> {
 			&& is_pathsep(toks[j + 1].kind)
 			&& is_ident(toks[j + 2].kind)
 			&& !is_lower_initial(tok_text!(src, toks[j + 2])) then {
-				# `...seg::Type` — a type reached through the namespaces: drop the prefix, keep bare `Type`
-				k = j + 2
+				if is_upper_snake(tok_text!(src, toks[j + 2])) then {
+					# `...seg::MEMBER` — an UPPER_SNAKE value const reached through the namespaces: a
+					# value terminal like any lowercase member, joined and mangled
+					out = [
+						...out,
+						Token({
+							kind: toks[j + 2].kind,
+							ival: toks[j + 2].ival,
+							start: toks[j + 2].start,
+							len: toks[j + 2].len,
+							text: join_ns!(joined, tok_text!(src, toks[j + 2])),
+						}),
+					]
+					k = j + 3
+				} else {
+					# `...seg::Type` — a type reached through the namespaces: drop the prefix, keep bare `Type`
+					k = j + 2
+				}
 			} else {
 				out = [
 					...out,
@@ -379,6 +395,22 @@ const strip_import_namespaces! = (*[Uint8] src, [Token] toks): StripResult -> {
 				]
 				k = j + 1
 			}
+		} else if Iarch(ppre.len) > 0
+		&& k + 2 < Iarch(toks.len)
+		&& is_ident(toks[k + 2].kind)
+		&& is_upper_snake(tok_text!(src, toks[k + 2])) then {
+			# `ns::MEMBER` — an UPPER_SNAKE value const right after the alias: a value member
+			out = [
+				...out,
+				Token({
+					kind: toks[k + 2].kind,
+					ival: toks[k + 2].ival,
+					start: toks[k + 2].start,
+					len: toks[k + 2].len,
+					text: join_ns!(ppre, tok_text!(src, toks[k + 2])),
+				}),
+			]
+			k = k + 3
 		} else if Iarch(ppre.len) > 0 then {
 			# `ns::Type` → drop the leading `ns::`, keep the bare `Type`
 			k = k + 2
@@ -406,7 +438,7 @@ const strip_import_namespaces! = (*[Uint8] src, [Token] toks): StripResult -> {
 				doffs = [...doffs, toks[k].start]
 			}
 
-			if is_lower_initial(segs[ns - 1]) then {
+			if is_value_name(segs[ns - 1]) then {
 				# value member — flat name matches the module's path-prefix-mangled definition
 				out = [
 					...out,
@@ -444,7 +476,7 @@ const join_ns! = (Str prefix, Str member): Str -> {
 		i = i + 1
 	}
 
-	v = [...v, 1]  # ns_sep (0x01) — flags a joined namespace access
+	v = [...v, 1] # ns_sep (0x01) — flags a joined namespace access
 	let Iarch j = 0
 
 	loop {
@@ -500,17 +532,160 @@ const path_eq_pre = (Str a, Str b, Iarch blen): Bool -> {
 	return true
 }
 
+# A teaching rejection for an import whose LAST segment names a MEMBER rather than a module
+# (`import std::comptime::os::target`, with or without `as`): when the path-minus-tail IS a module
+# (on disk or embedded) and the tail is plausibly its member — a pub declaration, a destructured
+# reexport name, or anything behind a wildcard reexport — the import is one segment too deep; say
+# how to spell it. Returns "" otherwise (a genuinely missing import, the caller's plain error
+# stands).
+const leaf_hint! = ([EmbeddedFile] embedded, Str path, Iarch plen, Str impath, Os tos, Arch tarch): Str -> {
+	# the last `/` of the BUILT path splits `<dir><parent>` from `<leaf>.cf`
+	let Iarch lsl = -1
+	let Iarch i = 0
+
+	loop {
+		if i >= plen then break
+		if Iarch(path[i]) == 47 then lsl = i
+		i = i + 1
+	}
+
+	if lsl <= 0 then return ""
+	# probe `<dir><parent>.cf` the way the loader would open it: disk first, then the embed table
+	let [Uint8] pv = []
+	let Iarch j = 0
+
+	loop {
+		if j >= lsl then break
+		pv = [...pv, path[j]]
+		j = j + 1
+	}
+
+	pv = [...pv, 46] # '.'
+	pv = [...pv, 99] # 'c'
+	pv = [...pv, 102] # 'f'
+	const Iarch pplen = Iarch(pv.len)
+	pv = [...pv, 0] # NUL terminator for `open`
+	const Str pp = Str(pv)
+
+	let Bool have = match open_read(pp) {
+		Either.Left(e) -> false,
+		Either.Right(fd) -> {
+			close(fd)
+
+			<- true
+		},
+	}
+
+	if !have then {
+		for ef in embedded {
+			if path_eq_pre(ef.path, pp, pplen) then have = true
+		}
+	}
+
+	if !have then return ""
+	# spell the fix from the IMPORT path: `std/comptime/os/target` → import `std::comptime::os`,
+	# reference `os::target`
+	let Iarch cut = -1
+	let Iarch k = 0
+
+	loop {
+		if k >= Iarch(impath.len) then break
+		if Iarch(impath[k]) == 47 then cut = k
+		k = k + 1
+	}
+
+	if cut <= 0 then return ""
+	let [Uint8] lv0 = []
+	let Iarch t0 = cut + 1
+
+	loop {
+		if t0 >= Iarch(impath.len) then break
+		lv0 = [...lv0, impath[t0]]
+		t0 = t0 + 1
+	}
+
+	const Str leaf0 = Str(lv0)
+	# the parent opens — parse it (one level, nothing registered) and require the tail to look
+	# like a member, so a typo'd MODULE path (`std::nosuch`) keeps the plain missing-module error
+	const Loaded pl = load_module!(pp, "", "", "", 0, 0, tos, tarch, false, false, false)
+	let Bool member = has_pub_func(pl.prog, leaf0)
+
+	if !member then {
+		let Iarch mi = 0
+
+		loop {
+			if mi >= Iarch(pl.prog.imports.len) then break
+			if pl.prog.imports[mi].wildcard then member = true
+			if in_priv(pl.prog.imports[mi].names, leaf0) then member = true
+			mi = mi + 1
+		}
+	}
+
+	if !member then return ""
+	let Iarch pcut = 0 # start of the parent's last segment
+	let [Uint8] ns = []
+	let Iarch m = 0
+
+	loop {
+		if m >= cut then break
+
+		if Iarch(impath[m]) == 47 then {
+			ns = [...ns, 58] # ':'
+			ns = [...ns, 58]
+			pcut = m + 1
+		} else {
+			ns = [...ns, impath[m]]
+		}
+
+		m = m + 1
+	}
+
+	const Str pns = Str(ns)
+	const Str leaf = leaf0
+	let [Uint8] sv = []
+	let Iarch u = pcut
+
+	loop {
+		if u >= cut then break
+		sv = [...sv, impath[u]]
+		u = u + 1
+	}
+
+	const Str pseg = Str(sv)
+
+	return "cf: resolve: `${leaf}` is not a module — import `${pns}` and use `${pseg}::${leaf}` (`as` renames a namespace, not a member)\n"
+}
+
+# The std library baked into this binary: every module under `lib/std`, plus the top-level barrel
+# `lib/std.cf` that sits BESIDE the embedded root (the directory walk never carries it — prepended
+# under its one fixed path). The resolver's disk-miss fallback and the LSP's barrel-surface walk
+# share this one table.
+pub const embedded_std = (): [EmbeddedFile] -> [
+	EmbeddedFile({ path: "lib/std.cf", content: embed("lib/std.cf") }),
+	...embed_dir("lib/std"),
+]
+
 # cf hosts its own standard library: the bytes of every `lib/std` module are baked into the binary
 # by `embed_dir` (std::comptime), so a shipped cf resolves `std::…` imports with NOTHING on disk.
 # Called only when the on-disk `open` failed, so a repo/dev build (lib/std present) never builds the
 # table — it is materialized here, matched by path, and its bytes copied into `buf`. Returns the
 # module's byte length, or dies if the path is neither on disk nor embedded (a real missing import).
-const embed_fallback! = (Str path, Str importer, Iarch iline, Iarch icol, *[Uint8] buf, Iarch cap): Iarch -> {
+const embed_fallback! = (
+	Str path,
+	Str impath,
+	Str importer,
+	Iarch iline,
+	Iarch icol,
+	Os tos,
+	Arch tarch,
+	*[Uint8] buf,
+	Iarch cap,
+): Iarch -> {
 	# drop `build_path!`'s trailing NUL before matching against the bare embedded path.
 	let Iarch plen = Iarch(path.len)
 
 	if plen > 0 && Iarch(path[plen - 1]) == 0 then plen = plen - 1
-	const [EmbeddedFile] embedded = embed_dir("lib/std")
+	const [EmbeddedFile] embedded = embedded_std()
 	let Iarch n = -1
 
 	for ef in embedded {
@@ -535,6 +710,14 @@ const embed_fallback! = (Str path, Str importer, Iarch iline, Iarch icol, *[Uint
 			eprint("cf: cannot open the input file: ")
 			eprint(Str({ bytes: path.bytes, len: plen }))
 			die("\n")
+		}
+		# the tail may name a member of a real module — a leaf import (`std::io::fd::STDIN`, or an
+		# attempted leaf rename `std::comptime::os::target as t`): teach the two-step spelling
+		const Str hint = leaf_hint!(embedded, path, plen, impath, tos, tarch)
+
+		if Iarch(hint.len) > 0 then {
+			if iline > 0 then die_at_lc(importer, iline, icol, hint)
+			die(hint)
 		}
 		# a parsed import carries its stamp — the rejection lands on the `import` line itself
 		# (a synthetic import, stamped 0, keeps the unlocated form)
@@ -561,12 +744,15 @@ pub data Loaded = { Program prog, SrcMap map, [BindEv] evs }
 
 const load_module! = (
 	Str path,
+	Str impath,
 	Str src,
 	Str importer,
 	Iarch iline,
 	Iarch icol,
 	Os target_os,
 	Arch target_arch,
+	Bool bdebug,
+	Bool binstr,
 	Bool track,
 ): Loaded -> {
 	# One module's read buffer — large enough for cf's own sources (its largest module, emit.cf,
@@ -583,7 +769,8 @@ const load_module! = (
 	if Iarch(src.len) > 0 then rpath = src
 
 	const Iarch n = match open_read(rpath) {
-		Either.Left(e) -> embed_fallback!(path, importer, iline, icol, buf, Iarch(buf.len)),
+		Either.Left(e) ->
+			embed_fallback!(path, impath, importer, iline, icol, target_os, target_arch, buf, Iarch(buf.len)),
 		Either.Right(fd) -> {
 			const Iarch k = match read(fd, buf, Uarch(buf.len)) {
 				Either.Left(e) -> die("cf: reading an imported module failed: ${path}\n"),
@@ -611,6 +798,8 @@ const load_module! = (
 		file: path,
 		target_os: target_os,
 		target_arch: target_arch,
+		build_debug: bdebug,
+		build_instrument: binstr,
 		saw_fb: false,
 		saw_fx: false,
 		saw_el: false,
@@ -618,6 +807,7 @@ const load_module! = (
 		track: track,
 		evs: noevs,
 		evb: noevb,
+		arg_mut0: false,
 	})
 	const Program prog = parse_program!(&p)
 	# imports are optional (module_system §4): a full `::` path used without an import contributed its
@@ -676,7 +866,7 @@ const load_module! = (
 # imports are followed: local bindings live in the one file, so the entry's own parse is the
 # whole index (`src` overlays the bytes like `--src` everywhere else).
 pub const entry_binds! = (Str path, Str src, Os target_os, Arch target_arch): Loaded ->
-	load_module!(path, src, "", 0, 0, target_os, target_arch, true)
+	load_module!(path, "", src, "", 0, 0, target_os, target_arch, false, false, true)
 
 # Append every element of `src` onto `dst` (cf has no two-spread merge, so grow one at a
 # time). One helper per declaration list — the payload types differ.
@@ -752,7 +942,7 @@ data Bind = { Str from, Str to }
 # One loaded module, kept UNMANGLED as the resolution source-of-truth. `prefix` is the sanitized
 # import path that loaded it (empty for the entry); `mpath` the resolved file path (the dedup key);
 # `is_geom`/`tag` mark a fixed-suffix geometry module. `prog` is its parsed surface.
-data Modu = { Str prefix, Str mpath, Bool is_geom, Str tag, Program prog }
+data Modu = { Str prefix, Str mpath, Bool is_geom, Str tag, Str ipath, Program prog }
 # The constant resolution context. `mods` is every loaded module; `edir` the entry directory
 # relative import paths resolve against (the brick-narrowing: all relative imports resolve against
 # the entry, matching the loader); `itargets[m][k]` is the module index that module `m`'s import
@@ -799,6 +989,11 @@ const is_lower_initial = (Str n): Bool -> {
 	return true
 }
 
+# A VALUE-member name in the module_system §4 casing split: lowercase-initial (an ordinary
+# value/function) or UPPER_SNAKE_CASE (a value const — screaming means immutable). Only a
+# MIXED-case uppercase-initial name (PascalCase) is a type.
+const is_value_name = (Str n): Bool -> is_lower_initial(n) || is_upper_snake(n)
+
 # The sanitized flat prefix of an import path: `/`→`_`, so `std/mem/raw` → `std_mem_raw`.
 const sanitize_prefix! = (Str path): Str -> {
 	let [Uint8] v = []
@@ -822,7 +1017,8 @@ const sanitize_prefix! = (Str path): Str -> {
 # The resolved file path an import resolves to — `std/`-prefixed under the lib root, everything
 # else against the entry dir (the loader's rule, replayed so `find_mod` matches what was loaded).
 const mod_target_path! = (Str edir, Str impath): Str -> {
-	if has_prefix(impath, "std/") then return build_path!("lib/", impath)
+	# the bare `std` names the top-level barrel `lib/std.cf` — the one std path with no `/`
+	if has_prefix(impath, "std/") || eq(impath, "std") then return build_path!("lib/", impath)
 
 	return build_path!(edir, impath)
 }
@@ -1347,7 +1543,7 @@ const export_names! = (Rctx rc, Iarch idx, Iarch depth): [Str] -> {
 
 	loop {
 		if i >= Iarch(m.prog.funcs.len) then break
-		if m.prog.funcs[i].is_pub && is_lower_initial(m.prog.funcs[i].name)
+		if m.prog.funcs[i].is_pub && is_value_name(m.prog.funcs[i].name)
 			then out = [...out, m.prog.funcs[i].name]
 		i = i + 1
 	}
@@ -1363,7 +1559,7 @@ const export_names! = (Rctx rc, Iarch idx, Iarch depth): [Str] -> {
 
 			loop {
 				if k >= Iarch(m.prog.imports[ii].names.len) then break
-				if is_lower_initial(m.prog.imports[ii].names[k])
+				if is_value_name(m.prog.imports[ii].names[k])
 					then out = [...out, m.prog.imports[ii].names[k]]
 				k = k + 1
 			}
@@ -1425,7 +1621,7 @@ const build_tbl! = (Iarch idx, Rctx rc): [Bind] -> {
 				loop {
 					if k >= Iarch(m.prog.imports[ii].names.len) then break
 					const Str nm = m.prog.imports[ii].names[k]
-					if is_lower_initial(nm)
+					if is_value_name(nm)
 						then tbl = [...tbl, Bind({ from: nm, to: resolve_export!(rc, tidx, nm, 0) })]
 					k = k + 1
 				}
@@ -1510,6 +1706,7 @@ const mangle_module_funcs! = (Iarch idx, Rctx rc): [Func] -> {
 				dfile: f.dfile,
 				dline: f.dline,
 				dcol: f.dcol,
+				uses: f.uses,
 			}),
 		]
 		i = i + 1
@@ -1715,6 +1912,7 @@ const expand_rec = (RecDecl d, [RecDecl] recs, [UnionDecl] unions, Iarch depth):
 		dfile: d.dfile,
 		dline: d.dline,
 		dcol: d.dcol,
+		spreads: d.spreads,
 	})
 }
 
@@ -1897,7 +2095,7 @@ const collapse_member_type! = (Str t, [RecDecl] recs, [UnionDecl] unions, Func f
 	if d < 0 then return t
 	const Str base = str_prefix!(t, d)
 	const Str member = str_suffix!(t, d + 1)
-	const Iarch lb = index_of_byte(base, 91)   # `[` — strip a generic application to the union name
+	const Iarch lb = index_of_byte(base, 91) # `[` — strip a generic application to the union name
 	let Str uname = base
 	if lb >= 0 then uname = str_prefix!(base, lb)
 	const Iarch ui = find_union(unions, uname)
@@ -2020,6 +2218,7 @@ const norm_mt_func! = (Func f, [RecDecl] recs, [UnionDecl] unions): Func -> {
 		dfile: f.dfile,
 		dline: f.dline,
 		dcol: f.dcol,
+		uses: f.uses,
 	})
 }
 
@@ -2627,6 +2826,7 @@ const splat_groups! = ([Func] funcs, [RecDecl] recs, [UnionDecl] unions, [RecDec
 				dfile: f.dfile,
 				dline: f.dline,
 				dcol: f.dcol,
+				uses: f.uses,
 			}),
 		]
 		i = i + 1
@@ -2671,6 +2871,7 @@ const with_asm_sym = (Func f, Str sym): Func -> Func({
 	dfile: f.dfile,
 	dline: f.dline,
 	dcol: f.dcol,
+	uses: f.uses,
 })
 
 # Tag every asm function of a privileged floor module so it emits under its EXACT source symbol
@@ -2714,15 +2915,43 @@ const cat_src_n = ([Str] xs, Iarch n, Str s): [Str] -> {
 }
 
 # The resolved whole-program AST plus every module's line table (spans.cf).
-pub data Resolved = { Program prog, [SrcMap] maps }
+# `modpaths` is the `/`-separated import path of every loaded module (the entry omitted — its names
+# stay bare), so a downstream diagnostic can recover a mangled callee's source spelling.
+pub data Resolved = { Program prog, [SrcMap] maps, [Str] modpaths }
 
-pub const resolve_program! = (Str entry, Str src, Os target_os, Arch target_arch): Resolved -> {
+pub const resolve_program! = (
+	Str entry,
+	Str src,
+	Os target_os,
+	Arch target_arch,
+	Bool bdebug,
+	Bool binstr,
+): Resolved -> {
 	const Str edir = dir_of!(entry)
-	const Loaded l0 = load_module!(entry, src, "", 0, 0, target_os, target_arch, false)
+	const Loaded l0 = load_module!(
+		entry,
+		"",
+		src,
+		"",
+		0,
+		0,
+		target_os,
+		target_arch,
+		bdebug,
+		binstr,
+		false,
+	)
 	const Program root = l0.prog
 	let [SrcMap] maps = [l0.map]
 	# the entry is prefix-empty (its names stay bare — it fixes the naming frame)
-	let [Modu] mods = [Modu({ prefix: "", mpath: entry, is_geom: false, tag: "", prog: root })]
+	let [Modu] mods = [Modu({
+			prefix: "",
+			mpath: entry,
+			is_geom: false,
+			tag: "",
+			ipath: "",
+			prog: root,
+		})]
 	let [Import] work = []
 	# `wsrc[k]` names the module whose import list contributed `work[k]` — a missing file
 	# then reports its importer, not just the unresolvable path
@@ -2739,6 +2968,22 @@ pub const resolve_program! = (Str entry, Str src, Os target_os, Arch target_arch
 		Import({ path: "std/rt/floor", names: floor_none, alias: "", wildcard: false, dline: 0, dcol: 0 }),
 	]
 	wsrc = [...wsrc, entry]
+	# `--instrument`: load the observer runtime unconditionally — emit injects calls to
+	# `std::mem::observe::on_reserve` that no source reaches (the sanitizer model)
+	if binstr then {
+		work = [
+			...work,
+			Import({
+				path: "std/mem/observe",
+				names: floor_none,
+				alias: "",
+				wildcard: false,
+				dline: 0,
+				dcol: 0,
+			}),
+		]
+		wsrc = [...wsrc, entry]
+	}
 	let Iarch wi = 0
 
 	loop {
@@ -2770,18 +3015,25 @@ pub const resolve_program! = (Str entry, Str src, Os target_os, Arch target_arch
 					geom = true
 					mtag = "el"
 				}
+				if eq(im.path, "std/mem/arena/test_arena") then {
+					geom = true
+					mtag = "te"
+				}
 				if eq(im.path, "std/mem/page") then {
 					geom = true
 					mtag = "pg"
 				}
 				const Loaded lw = load_module!(
 					mpath,
+					im.path,
 					"",
 					wsrc[wi],
 					work[wi].dline,
 					work[wi].dcol,
 					target_os,
 					target_arch,
+					bdebug,
+					binstr,
 					false,
 				)
 				const Program m0 = lw.prog
@@ -2789,7 +3041,14 @@ pub const resolve_program! = (Str entry, Str src, Os target_os, Arch target_arch
 				const Program m = if is_floor_impl(im.path) then tag_floor_syms(m0) else m0
 				mods = [
 					...mods,
-					Modu({ prefix: sanitize_prefix!(im.path), mpath: mpath, is_geom: geom, tag: mtag, prog: m }),
+					Modu({
+						prefix: sanitize_prefix!(im.path),
+						mpath: mpath,
+						is_geom: geom,
+						tag: mtag,
+						ipath: im.path,
+						prog: m,
+					}),
 				]
 				work = cat_imports(work, m.imports)
 				wsrc = cat_src_n(wsrc, Iarch(m.imports.len), mpath)
@@ -2840,6 +3099,8 @@ pub const resolve_program! = (Str entry, Str src, Os target_os, Arch target_arch
 	let [UnionDecl] unions = []
 	let [Func] funcs = []
 	let [RecDecl] groups = []
+	# the import path of every non-entry module, for demangling callees in diagnostics
+	let [Str] modpaths = []
 	let Iarch mi = 0
 
 	loop {
@@ -2848,6 +3109,7 @@ pub const resolve_program! = (Str entry, Str src, Os target_os, Arch target_arch
 		unions = cat_unions(unions, mods[mi].prog.unions)
 		groups = cat_recs(groups, mods[mi].prog.groups) # grouped-parameter `type` decls (splatted below)
 		funcs = cat_funcs(funcs, mangle_module_funcs!(mi, rc))
+		if Iarch(mods[mi].ipath.len) > 0 then modpaths = [...modpaths, mods[mi].ipath]
 		mi = mi + 1
 	}
 
@@ -2874,5 +3136,5 @@ pub const resolve_program! = (Str entry, Str src, Os target_os, Arch target_arch
 		groups: nogroups,
 	})
 
-	return Resolved({ prog: rp, maps: maps })
+	return Resolved({ prog: rp, maps: maps, modpaths: modpaths })
 }

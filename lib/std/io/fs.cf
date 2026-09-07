@@ -5,14 +5,77 @@ import std::comptime::os
 import std::comptime::arch
 import std::sys::{ Os, Arch }
 
-if os::target == Os.Darwin then {
-	pub import std::io::fs::arm64::darwin as *
-} else {
-	if os::target == Os.Linux then {
-		if arch::target == Arch.Amd64 then {
-			pub import std::io::fs::amd64::linux as *
-		} else {
-			pub import std::io::fs::linux as *
-		}
+if os::target == Os.Darwin then pub import std::io::fs::arm64::darwin as *
+else if os::target == Os.Linux
+	then if arch::target == Arch.Amd64 then pub import std::io::fs::amd64::linux as *
+	else pub import std::io::fs::linux as *
+
+import std::io::fd::{ DirEntry, IoRrr, entry_is_dir }
+import std::data::{ Either }
+import std::data::str::{ eq }
+
+# Byte-wise `<` on two paths — the walk's deterministic order.
+const path_lt = (Str a, Str b): Bool -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(a.len) || i >= Iarch(b.len) then break
+		if Iarch(a[i]) < Iarch(b[i]) then return true
+		if Iarch(a[i]) > Iarch(b[i]) then return false
+		i = i + 1
 	}
+
+	return Iarch(a.len) < Iarch(b.len)
+}
+
+const sort_paths = ([Str] xs): [Str] -> {
+	let [Str] out = []
+
+	for x in xs {
+		let [Str] next = []
+		let Bool placed = false
+
+		for o in out {
+			if !placed && path_lt(x, o) then {
+				next = [...next, x]
+				placed = true
+			}
+			next = [...next, o]
+		}
+
+		if !placed then next = [...next, x]
+		out = next
+	}
+
+	return out
+}
+
+# Every non-directory entry under `dir`, recursively, as full paths (`<dir>/…`), byte-sorted so a
+# walk is deterministic across filesystems. Dot-entries (`.`, `..`, hidden files, `.git`) are
+# skipped — read a hidden directory explicitly if it is wanted. Symlinks are returned as entries,
+# never followed as directories, so a link cycle cannot loop the walk. An unreadable directory
+# contributes nothing.
+pub const walk_dir! = (Str dir): [Str] -> {
+	let [Str] out = []
+
+	match read_dir!(dir) {
+		Either.Left(e) -> {},
+		Either.Right(entries) -> {
+			for e in entries {
+				if Iarch(e.name.len) > 0 && Iarch(e.name[0]) != 46 then {
+					const Str child = "${dir}/${e.name}"
+
+					if entry_is_dir(e) then {
+						for c in walk_dir!(child) {
+							out = [...out, c]
+						}
+					} else {
+						out = [...out, child]
+					}
+				}
+			}
+		},
+	}
+
+	return sort_paths(out)
 }

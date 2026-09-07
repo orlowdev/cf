@@ -1,0 +1,826 @@
+# specialize — clone-based specialization of demand-carrying fn-VALUE arguments (context.md §4,
+# memory_model §6).
+#
+# A function with a non-empty demand set may ride a fn-typed parameter only into a specialized
+# DIRECT call — the hidden context pointers exist only at direct call sites. This pass runs after
+# monomorph and BEFORE Materialize: every call `f(..., g, ...)` where `g` names a top-level
+# demand-carrying function and `f`'s parameter is fn-typed retargets to a clone `f$d<i>$g` — `f`
+# minus that parameter, with calls through the parameter substituted into direct `g` calls
+# (closures.cf's `Subst` renames the callee). Clone building is name-driven, mirroring the
+# closure lift's `$w` scheme: the rewrite stamps the wanted names, a sweep builds the missing
+# ones (inner layer first), and a clone's own rewritten body may name further clones — built to
+# a fixpoint. Running before Materialize is the point: a clone, and any body newly reachable
+# under a geometry through one (`cb() in ta` becoming `g() in ta`), is materialized, typechecked,
+# lowered, and routed exactly like hand-written source. Capturing closures keep their own
+# lift-time specialization (closures.cf, the `$w` marker); the `$d` marker cannot collide.
+#
+# The node-side rule (memory_model §6): the `in` clause on the substituted call binds per
+# specialization — kept when `g` is `!`, dropped (inert) when `g` is colorless, so one HOF source
+# serves both colors.
+
+import std::compiler::ast::{
+	Expr,
+	Stmt,
+	MatchArm,
+	StmtArm,
+	Seg,
+	FieldInit,
+	Param,
+	Func,
+	Program,
+	with_geom,
+}
+import std::compiler::closures::{ Subst, subst_expr }
+import std::compiler::alloc::{ bound_locals, is_bang_name }
+import std::data::str::{ eq }
+import std::io::console::{ die }
+
+const find_func = ([Func] funcs, Str name): Iarch -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(funcs.len) then break
+		if eq(funcs[i].name, name) then return i
+		i = i + 1
+	}
+
+	return -1
+}
+
+const has_name = ([Str] xs, Str s): Bool -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(xs.len) then break
+		if eq(xs[i], s) then return true
+		i = i + 1
+	}
+
+	return false
+}
+
+const unat = (Expr e): Expr -> match e { Expr.At(_, inner) -> unat(inner), _ -> e }
+
+const arg_var_name = (Expr e): Str -> match unat(e) { Expr.Var(n) -> n, _ -> "" }
+
+# Is `n` a demand-carrying top-level function in scope (not shadowed by a local)?
+const is_demand_fn = (SdCtx c, Str n): Bool -> {
+	if eq(n, "") then return false
+	if has_name(c.bound, n) then return false
+	const Iarch j = find_func(c.funcs, n)
+	if j < 0 then return false
+	if c.funcs[j].is_asm || c.funcs[j].is_intrinsic || c.funcs[j].is_value then return false
+
+	return Iarch(c.funcs[j].uses.len) > 0
+}
+
+const param_is_fn = ([Func] funcs, Iarch ci, Iarch i): Bool -> {
+	if ci < 0 then return false
+	if i >= Iarch(funcs[ci].params.len) then return false
+
+	return eq(funcs[ci].params[i].type_name, "$fn")
+}
+
+# The walk's context: the (stable) function table and the enclosing function's bound names.
+data SdCtx = { [Func] funcs, [Str] bound }
+
+# `f$d<i>$g` — the clone of `f` specialized for `g` at fn-parameter `i`. The `$d<digits>$` marker
+# cannot appear in a source name, and closures.cf's spec parser matches only `$w`.
+const sd_name = (Str base, Iarch cp, Str g): Str -> "${base}\$d${cp}\$${g}"
+
+# The byte index of the LAST `$d<digits>$` marker in `n`, or -1 (the outermost pending layer).
+const sd_marker_at = (Str n): Iarch -> {
+	let Iarch found = -1
+	let Iarch i = 0
+
+	loop {
+		if i + 2 >= Iarch(n.len) then break
+
+		if Iarch(n[i]) == 36 && Iarch(n[i + 1]) == 100 then {
+			let Iarch j = i + 2
+			let Bool digits = false
+
+			loop {
+				if j >= Iarch(n.len) then break
+				const Iarch c = Iarch(n[j])
+				if c == 36 then break
+				if c < 48 || c > 57 then {
+					digits = false
+					j = -1
+				} else digits = true
+				if j < 0 then break
+				j = j + 1
+			}
+
+			if digits && j > 0 && j < Iarch(n.len) then found = i
+		}
+
+		i = i + 1
+	}
+
+	return found
+}
+
+const has_sd_marker = (Str n): Bool -> sd_marker_at(n) >= 0
+
+# One parsed clone request: the base function, the fn-parameter position to drop, the demand
+# function to wire in.
+data SdReq = { Str base, Iarch cp, Str g }
+
+const parse_sd = (Str n): SdReq -> {
+	const Iarch at = sd_marker_at(n)
+	let [Uint8] bb = []
+	let Iarch i = 0
+
+	loop {
+		if i >= at then break
+		bb = [...bb, n[i]]
+		i = i + 1
+	}
+
+	let Iarch cp = 0
+	let Iarch j = at + 2
+
+	loop {
+		const Iarch c = Iarch(n[j])
+		if c == 36 then break
+		cp = cp * 10 + (c - 48)
+		j = j + 1
+	}
+
+	let [Uint8] gb = []
+	let Iarch k = j + 1
+
+	loop {
+		if k >= Iarch(n.len) then break
+		gb = [...gb, n[k]]
+		k = k + 1
+	}
+
+	return SdReq({
+		base: Str({ bytes: bb, len: Iarch(bb.len) }),
+		cp: cp,
+		g: Str({ bytes: gb, len: Iarch(gb.len) }),
+	})
+}
+
+# --- the call-site rewrite ----------------------------------------------------------------------
+
+# Retarget one call: drop every demand-fn argument riding a fn-typed parameter, layering the
+# clone name per dropped position (inner-first, like the closure lift's retarget). The first
+# layer validates the parameter's `$fn` type against the named base; later layers run against a
+# clone name that does not exist yet, so any demand-fn argument is taken (the demand check
+# validated every flow).
+const sd_call! = (SdCtx c, Str callee, [Str] ta, [Expr] args, Str g): Expr -> {
+	const Iarch ci = find_func(c.funcs, callee)
+	let Str cal = callee
+	let [Expr] cur = args
+	let Bool first = true
+
+	loop {
+		let Iarch di = -1
+		let Iarch i = 0
+
+		loop {
+			if i >= Iarch(cur.len) then break
+			if is_demand_fn(c, arg_var_name(cur[i])) then {
+				if first then {
+					if param_is_fn(c.funcs, ci, i) then di = i
+				} else di = i
+			}
+			if di >= 0 then break
+			i = i + 1
+		}
+
+		if di < 0 then break
+		let [Expr] next = []
+		let Iarch a = 0
+
+		loop {
+			if a >= Iarch(cur.len) then break
+			if a != di then next = [...next, cur[a]]
+			a = a + 1
+		}
+
+		cal = sd_name(cal, di, arg_var_name(cur[di]))
+		cur = next
+		first = false
+	}
+
+	return with_geom(Expr.Call(cal, ta, cur, ""), g)
+}
+
+const sd_exprs! = (SdCtx c, [Expr] es): [Expr] -> {
+	let [Expr] out = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(es.len) then break
+		out = [...out, sd_expr!(c, es[i])]
+		i = i + 1
+	}
+
+	return out
+}
+
+const sd_finits! = (SdCtx c, [FieldInit] fs): [FieldInit] -> {
+	let [FieldInit] out = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(fs.len) then break
+		out = [...out, FieldInit({ field: fs[i].field, value: sd_expr!(c, fs[i].value) })]
+		i = i + 1
+	}
+
+	return out
+}
+
+const sd_segs! = (SdCtx c, [Seg] segs): [Seg] -> {
+	let [Seg] out = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(segs.len) then break
+		if segs[i].is_hole
+			then out = [
+			...out,
+			Seg({ is_hole: true, lit: segs[i].lit, name: segs[i].name, expr: sd_expr!(c, segs[i].expr) }),
+		]
+		else out = [...out, segs[i]]
+		i = i + 1
+	}
+
+	return out
+}
+
+const sd_marms! = (SdCtx c, [MatchArm] arms): [MatchArm] -> {
+	let [MatchArm] out = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(arms.len) then break
+		out = [
+			...out,
+			MatchArm({
+				is_wild: arms[i].is_wild,
+				type_name: arms[i].type_name,
+				members: arms[i].members,
+				binds: arms[i].binds,
+				body: sd_expr!(c, arms[i].body),
+			}),
+		]
+		i = i + 1
+	}
+
+	return out
+}
+
+const sd_sarms! = (SdCtx c, [StmtArm] arms): [StmtArm] -> {
+	let [StmtArm] out = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(arms.len) then break
+		out = [
+			...out,
+			StmtArm({
+				is_wild: arms[i].is_wild,
+				type_name: arms[i].type_name,
+				members: arms[i].members,
+				binds: arms[i].binds,
+				body: sd_stmts!(c, arms[i].body),
+			}),
+		]
+		i = i + 1
+	}
+
+	return out
+}
+
+const sd_expr! = (SdCtx c, Expr e): Expr -> match e {
+	Expr.At(o, inner) -> Expr.At(o, sd_expr!(c, inner)),
+	Expr.Call(n, ta, args, g) -> sd_call!(c, n, ta, sd_exprs!(c, args), g),
+	Expr.DeferTap(fn, args) -> Expr.DeferTap(fn, sd_exprs!(c, args)),
+	Expr.Record(n, fs) -> Expr.Record(n, sd_finits!(c, fs)),
+	Expr.Match(scrut, arms) -> Expr.Match(sd_expr!(c, scrut), sd_marms!(c, arms)),
+	Expr.Interp(segs) -> Expr.Interp(sd_segs!(c, segs)),
+	Expr.FieldExpr(b, f) -> Expr.FieldExpr(sd_expr!(c, b), f),
+	Expr.UnionMk(t, mm, args) -> Expr.UnionMk(t, mm, sd_exprs!(c, args)),
+	Expr.ArrayLit(hs, sn, elems, et) -> Expr.ArrayLit(hs, sd_expr!(c, sn), sd_exprs!(c, elems), et),
+	Expr.Index(a, i) -> Expr.Index(a, sd_expr!(c, i)),
+	Expr.IndexField(a, i, f) -> Expr.IndexField(a, sd_expr!(c, i), f),
+	Expr.IndexExpr(b, i) -> Expr.IndexExpr(sd_expr!(c, b), sd_expr!(c, i)),
+	Expr.Tuple(elems) -> Expr.Tuple(sd_exprs!(c, elems)),
+	Expr.Spread(x) -> Expr.Spread(sd_expr!(c, x)),
+	Expr.Buffer(sz) -> Expr.Buffer(sd_expr!(c, sz)),
+	Expr.Loop(ss) -> Expr.Loop(sd_stmts!(c, ss)),
+	Expr.Neg(x) -> Expr.Neg(sd_expr!(c, x)),
+	Expr.Not(x) -> Expr.Not(sd_expr!(c, x)),
+	Expr.BitNot(x) -> Expr.BitNot(sd_expr!(c, x)),
+	Expr.Add(l, r) -> Expr.Add(sd_expr!(c, l), sd_expr!(c, r)),
+	Expr.Sub(l, r) -> Expr.Sub(sd_expr!(c, l), sd_expr!(c, r)),
+	Expr.Mul(l, r) -> Expr.Mul(sd_expr!(c, l), sd_expr!(c, r)),
+	Expr.Div(l, r) -> Expr.Div(sd_expr!(c, l), sd_expr!(c, r)),
+	Expr.Mod(l, r) -> Expr.Mod(sd_expr!(c, l), sd_expr!(c, r)),
+	Expr.BitAnd(l, r) -> Expr.BitAnd(sd_expr!(c, l), sd_expr!(c, r)),
+	Expr.BitOr(l, r) -> Expr.BitOr(sd_expr!(c, l), sd_expr!(c, r)),
+	Expr.BitXor(l, r) -> Expr.BitXor(sd_expr!(c, l), sd_expr!(c, r)),
+	Expr.Shl(l, r) -> Expr.Shl(sd_expr!(c, l), sd_expr!(c, r)),
+	Expr.Shr(l, r) -> Expr.Shr(sd_expr!(c, l), sd_expr!(c, r)),
+	Expr.CmpEq(l, r) -> Expr.CmpEq(sd_expr!(c, l), sd_expr!(c, r)),
+	Expr.CmpNe(l, r) -> Expr.CmpNe(sd_expr!(c, l), sd_expr!(c, r)),
+	Expr.CmpLt(l, r) -> Expr.CmpLt(sd_expr!(c, l), sd_expr!(c, r)),
+	Expr.CmpGt(l, r) -> Expr.CmpGt(sd_expr!(c, l), sd_expr!(c, r)),
+	Expr.CmpLe(l, r) -> Expr.CmpLe(sd_expr!(c, l), sd_expr!(c, r)),
+	Expr.CmpGe(l, r) -> Expr.CmpGe(sd_expr!(c, l), sd_expr!(c, r)),
+	Expr.And(l, r) -> Expr.And(sd_expr!(c, l), sd_expr!(c, r)),
+	Expr.Or(l, r) -> Expr.Or(sd_expr!(c, l), sd_expr!(c, r)),
+	Expr.If(cd, t, e2) -> Expr.If(sd_expr!(c, cd), sd_expr!(c, t), sd_expr!(c, e2)),
+	_ -> e,
+}
+
+const sd_stmt! = (SdCtx c, Stmt s): Stmt -> match s {
+	Stmt.Let(n, mut, ann, e) -> Stmt.Let(n, mut, ann, sd_expr!(c, e)),
+	Stmt.Destructure(pat, mut, e) -> Stmt.Destructure(pat, mut, sd_expr!(c, e)),
+	Stmt.Assign(n, e) -> Stmt.Assign(n, sd_expr!(c, e)),
+	Stmt.FieldAssign(b, f, e) -> Stmt.FieldAssign(b, f, sd_expr!(c, e)),
+	Stmt.DeepFieldAssign(be, f, e) -> Stmt.DeepFieldAssign(sd_expr!(c, be), f, sd_expr!(c, e)),
+	Stmt.IndexAssign(a, i, v) -> Stmt.IndexAssign(a, sd_expr!(c, i), sd_expr!(c, v)),
+	Stmt.Return(e) -> Stmt.Return(sd_expr!(c, e)),
+	Stmt.ForIn(v, a, body) -> Stmt.ForIn(v, a, sd_stmts!(c, body)),
+	Stmt.Loop(ll, body) -> Stmt.Loop(ll, sd_stmts!(c, body)),
+	Stmt.Break(bl) -> Stmt.Break(bl),
+	Stmt.Continue(bl) -> Stmt.Continue(bl),
+	Stmt.IfThen(cd, st) -> Stmt.IfThen(sd_expr!(c, cd), sd_stmt!(c, st)),
+	Stmt.IfElse(cd, t, e) -> Stmt.IfElse(sd_expr!(c, cd), sd_stmt!(c, t), sd_stmt!(c, e)),
+	Stmt.Do(e) -> Stmt.Do(sd_expr!(c, e)),
+	Stmt.Block(ss) -> Stmt.Block(sd_stmts!(c, ss)),
+	Stmt.Match(scrut, arms) -> Stmt.Match(sd_expr!(c, scrut), sd_sarms!(c, arms)),
+	Stmt.Yield(e) -> Stmt.Yield(sd_expr!(c, e)),
+	Stmt.Closure(nm, params, ret, body) -> Stmt.Closure(nm, params, ret, sd_stmts!(c, body)),
+	Stmt.Defer(body) -> Stmt.Defer(sd_stmts!(c, body)),
+}
+
+const sd_stmts! = (SdCtx c, [Stmt] ss): [Stmt] -> {
+	let [Stmt] out = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(ss.len) then break
+		out = [...out, sd_stmt!(c, ss[i])]
+		i = i + 1
+	}
+
+	return out
+}
+
+# --- collecting unbuilt clone names -------------------------------------------------------------
+
+const md_exprs = ([Expr] es): [Str] -> {
+	let [Str] out = []
+
+	for e in es out = [...out, ...md_expr(e)]
+
+	return out
+}
+
+const md_segs = ([Seg] segs): [Str] -> {
+	let [Str] out = []
+
+	for s in segs if s.is_hole then out = [...out, ...md_expr(s.expr)]
+
+	return out
+}
+
+const md_marms = ([MatchArm] arms): [Str] -> {
+	let [Str] out = []
+
+	for a in arms out = [...out, ...md_expr(a.body)]
+
+	return out
+}
+
+const md_sarms = ([StmtArm] arms): [Str] -> {
+	let [Str] out = []
+
+	for a in arms out = [...out, ...md_stmts(a.body)]
+
+	return out
+}
+
+# Every call-target NAME in the expression (recursively) that carries a `$d` marker.
+const md_expr = (Expr e): [Str] -> match e {
+	Expr.At(_, inner) -> md_expr(inner),
+	Expr.Call(n, ta, args, g) -> if has_sd_marker(n) then [...md_exprs(args), n] else md_exprs(args),
+	Expr.DeferTap(fn, args) -> md_exprs(args),
+	Expr.Record(_, fs) -> md_finits(fs),
+	Expr.Match(scrut, arms) -> [...md_expr(scrut), ...md_marms(arms)],
+	Expr.Interp(segs) -> md_segs(segs),
+	Expr.FieldExpr(b, _) -> md_expr(b),
+	Expr.UnionMk(_, _, args) -> md_exprs(args),
+	Expr.ArrayLit(_, sn, elems, _) -> [...md_expr(sn), ...md_exprs(elems)],
+	Expr.Index(_, i) -> md_expr(i),
+	Expr.IndexField(_, i, _) -> md_expr(i),
+	Expr.IndexExpr(b, i) -> [...md_expr(b), ...md_expr(i)],
+	Expr.Tuple(elems) -> md_exprs(elems),
+	Expr.Spread(x) -> md_expr(x),
+	Expr.Buffer(sz) -> md_expr(sz),
+	Expr.Loop(ss) -> md_stmts(ss),
+	Expr.Neg(x) -> md_expr(x),
+	Expr.Not(x) -> md_expr(x),
+	Expr.BitNot(x) -> md_expr(x),
+	Expr.Add(l, r) -> [...md_expr(l), ...md_expr(r)],
+	Expr.Sub(l, r) -> [...md_expr(l), ...md_expr(r)],
+	Expr.Mul(l, r) -> [...md_expr(l), ...md_expr(r)],
+	Expr.Div(l, r) -> [...md_expr(l), ...md_expr(r)],
+	Expr.Mod(l, r) -> [...md_expr(l), ...md_expr(r)],
+	Expr.BitAnd(l, r) -> [...md_expr(l), ...md_expr(r)],
+	Expr.BitOr(l, r) -> [...md_expr(l), ...md_expr(r)],
+	Expr.BitXor(l, r) -> [...md_expr(l), ...md_expr(r)],
+	Expr.Shl(l, r) -> [...md_expr(l), ...md_expr(r)],
+	Expr.Shr(l, r) -> [...md_expr(l), ...md_expr(r)],
+	Expr.CmpEq(l, r) -> [...md_expr(l), ...md_expr(r)],
+	Expr.CmpNe(l, r) -> [...md_expr(l), ...md_expr(r)],
+	Expr.CmpLt(l, r) -> [...md_expr(l), ...md_expr(r)],
+	Expr.CmpGt(l, r) -> [...md_expr(l), ...md_expr(r)],
+	Expr.CmpLe(l, r) -> [...md_expr(l), ...md_expr(r)],
+	Expr.CmpGe(l, r) -> [...md_expr(l), ...md_expr(r)],
+	Expr.And(l, r) -> [...md_expr(l), ...md_expr(r)],
+	Expr.Or(l, r) -> [...md_expr(l), ...md_expr(r)],
+	Expr.If(cd, t, e2) -> [...md_expr(cd), ...md_expr(t), ...md_expr(e2)],
+	_ -> no_strs(),
+}
+
+const no_strs = (): [Str] -> {
+	let [Str] r = []
+
+	return r
+}
+
+const md_finits = ([FieldInit] fs): [Str] -> {
+	let [Str] out = []
+
+	for f in fs out = [...out, ...md_expr(f.value)]
+
+	return out
+}
+
+const md_stmt = (Stmt s): [Str] -> match s {
+	Stmt.Let(_, _, _, e) -> md_expr(e),
+	Stmt.Destructure(_, _, e) -> md_expr(e),
+	Stmt.Assign(_, e) -> md_expr(e),
+	Stmt.FieldAssign(_, _, e) -> md_expr(e),
+	Stmt.DeepFieldAssign(be, _, e) -> [...md_expr(be), ...md_expr(e)],
+	Stmt.IndexAssign(_, i, v) -> [...md_expr(i), ...md_expr(v)],
+	Stmt.Return(e) -> md_expr(e),
+	Stmt.ForIn(_, _, body) -> md_stmts(body),
+	Stmt.Loop(_, body) -> md_stmts(body),
+	Stmt.IfThen(cd, st) -> [...md_expr(cd), ...md_stmt(st)],
+	Stmt.IfElse(cd, t, e) -> [...md_expr(cd), ...md_stmt(t), ...md_stmt(e)],
+	Stmt.Do(e) -> md_expr(e),
+	Stmt.Block(ss) -> md_stmts(ss),
+	Stmt.Match(scrut, arms) -> [...md_expr(scrut), ...md_sarms(arms)],
+	Stmt.Yield(e) -> md_expr(e),
+	Stmt.Closure(_, _, _, body) -> md_stmts(body),
+	Stmt.Defer(body) -> md_stmts(body),
+	_ -> no_strs(),
+}
+
+const md_stmts = ([Stmt] ss): [Str] -> {
+	let [Str] out = []
+
+	for s in ss out = [...out, ...md_stmt(s)]
+
+	return out
+}
+
+const missing_sd = ([Func] funcs): [Str] -> {
+	let [Str] out = []
+
+	for f in funcs {
+		if !f.is_asm then {
+			for n in md_stmts(f.body) {
+				if find_func(funcs, n) < 0 then {
+					if !has_name(out, n) then out = [...out, n]
+				}
+			}
+		}
+	}
+
+	return out
+}
+
+# --- the clone builder --------------------------------------------------------------------------
+
+# Strip the geom clause off direct calls to a COLORLESS `g` (the substituted callback call's
+# `in ta` is inert when the specialized callee is colorless — memory_model §6, node side).
+const gi_expr! = (Str g, Expr e): Expr -> match e {
+	Expr.At(o, inner) -> Expr.At(o, gi_expr!(g, inner)),
+	Expr.Call(n, ta, args, gm) -> if eq(n, g)
+		then Expr.Call(n, ta, gi_exprs!(g, args), "")
+	else with_geom(Expr.Call(n, ta, gi_exprs!(g, args), ""), gm),
+	Expr.DeferTap(fn, args) -> Expr.DeferTap(fn, gi_exprs!(g, args)),
+	Expr.Record(n, fs) -> Expr.Record(n, gi_finits!(g, fs)),
+	Expr.Match(scrut, arms) -> Expr.Match(gi_expr!(g, scrut), gi_marms!(g, arms)),
+	Expr.Interp(segs) -> Expr.Interp(gi_segs!(g, segs)),
+	Expr.FieldExpr(b, f) -> Expr.FieldExpr(gi_expr!(g, b), f),
+	Expr.UnionMk(t, mm, args) -> Expr.UnionMk(t, mm, gi_exprs!(g, args)),
+	Expr.ArrayLit(hs, sn, elems, et) -> Expr.ArrayLit(hs, gi_expr!(g, sn), gi_exprs!(g, elems), et),
+	Expr.Index(a, i) -> Expr.Index(a, gi_expr!(g, i)),
+	Expr.IndexField(a, i, f) -> Expr.IndexField(a, gi_expr!(g, i), f),
+	Expr.IndexExpr(b, i) -> Expr.IndexExpr(gi_expr!(g, b), gi_expr!(g, i)),
+	Expr.Tuple(elems) -> Expr.Tuple(gi_exprs!(g, elems)),
+	Expr.Spread(x) -> Expr.Spread(gi_expr!(g, x)),
+	Expr.Buffer(sz) -> Expr.Buffer(gi_expr!(g, sz)),
+	Expr.Loop(ss) -> Expr.Loop(gi_stmts!(g, ss)),
+	Expr.Neg(x) -> Expr.Neg(gi_expr!(g, x)),
+	Expr.Not(x) -> Expr.Not(gi_expr!(g, x)),
+	Expr.BitNot(x) -> Expr.BitNot(gi_expr!(g, x)),
+	Expr.Add(l, r) -> Expr.Add(gi_expr!(g, l), gi_expr!(g, r)),
+	Expr.Sub(l, r) -> Expr.Sub(gi_expr!(g, l), gi_expr!(g, r)),
+	Expr.Mul(l, r) -> Expr.Mul(gi_expr!(g, l), gi_expr!(g, r)),
+	Expr.Div(l, r) -> Expr.Div(gi_expr!(g, l), gi_expr!(g, r)),
+	Expr.Mod(l, r) -> Expr.Mod(gi_expr!(g, l), gi_expr!(g, r)),
+	Expr.BitAnd(l, r) -> Expr.BitAnd(gi_expr!(g, l), gi_expr!(g, r)),
+	Expr.BitOr(l, r) -> Expr.BitOr(gi_expr!(g, l), gi_expr!(g, r)),
+	Expr.BitXor(l, r) -> Expr.BitXor(gi_expr!(g, l), gi_expr!(g, r)),
+	Expr.Shl(l, r) -> Expr.Shl(gi_expr!(g, l), gi_expr!(g, r)),
+	Expr.Shr(l, r) -> Expr.Shr(gi_expr!(g, l), gi_expr!(g, r)),
+	Expr.CmpEq(l, r) -> Expr.CmpEq(gi_expr!(g, l), gi_expr!(g, r)),
+	Expr.CmpNe(l, r) -> Expr.CmpNe(gi_expr!(g, l), gi_expr!(g, r)),
+	Expr.CmpLt(l, r) -> Expr.CmpLt(gi_expr!(g, l), gi_expr!(g, r)),
+	Expr.CmpGt(l, r) -> Expr.CmpGt(gi_expr!(g, l), gi_expr!(g, r)),
+	Expr.CmpLe(l, r) -> Expr.CmpLe(gi_expr!(g, l), gi_expr!(g, r)),
+	Expr.CmpGe(l, r) -> Expr.CmpGe(gi_expr!(g, l), gi_expr!(g, r)),
+	Expr.And(l, r) -> Expr.And(gi_expr!(g, l), gi_expr!(g, r)),
+	Expr.Or(l, r) -> Expr.Or(gi_expr!(g, l), gi_expr!(g, r)),
+	Expr.If(cd, t, e2) -> Expr.If(gi_expr!(g, cd), gi_expr!(g, t), gi_expr!(g, e2)),
+	_ -> e,
+}
+
+const gi_exprs! = (Str g, [Expr] es): [Expr] -> {
+	let [Expr] out = []
+
+	for e in es out = [...out, gi_expr!(g, e)]
+
+	return out
+}
+
+const gi_finits! = (Str g, [FieldInit] fs): [FieldInit] -> {
+	let [FieldInit] out = []
+
+	for f in fs out = [...out, FieldInit({ field: f.field, value: gi_expr!(g, f.value) })]
+
+	return out
+}
+
+const gi_segs! = (Str g, [Seg] segs): [Seg] -> {
+	let [Seg] out = []
+
+	for s in segs if s.is_hole
+		then out = [...out, Seg({ is_hole: true, lit: s.lit, name: s.name, expr: gi_expr!(g, s.expr) })]
+	else out = [...out, s]
+
+	return out
+}
+
+const gi_marms! = (Str g, [MatchArm] arms): [MatchArm] -> {
+	let [MatchArm] out = []
+
+	for a in arms out = [
+		...out,
+		MatchArm({
+			is_wild: a.is_wild,
+			type_name: a.type_name,
+			members: a.members,
+			binds: a.binds,
+			body: gi_expr!(g, a.body),
+		}),
+	]
+
+	return out
+}
+
+const gi_sarms! = (Str g, [StmtArm] arms): [StmtArm] -> {
+	let [StmtArm] out = []
+
+	for a in arms out = [
+		...out,
+		StmtArm({
+			is_wild: a.is_wild,
+			type_name: a.type_name,
+			members: a.members,
+			binds: a.binds,
+			body: gi_stmts!(g, a.body),
+		}),
+	]
+
+	return out
+}
+
+const gi_stmt! = (Str g, Stmt s): Stmt -> match s {
+	Stmt.Let(n, mut, ann, e) -> Stmt.Let(n, mut, ann, gi_expr!(g, e)),
+	Stmt.Destructure(pat, mut, e) -> Stmt.Destructure(pat, mut, gi_expr!(g, e)),
+	Stmt.Assign(n, e) -> Stmt.Assign(n, gi_expr!(g, e)),
+	Stmt.FieldAssign(b, f, e) -> Stmt.FieldAssign(b, f, gi_expr!(g, e)),
+	Stmt.DeepFieldAssign(be, f, e) -> Stmt.DeepFieldAssign(gi_expr!(g, be), f, gi_expr!(g, e)),
+	Stmt.IndexAssign(a, i, v) -> Stmt.IndexAssign(a, gi_expr!(g, i), gi_expr!(g, v)),
+	Stmt.Return(e) -> Stmt.Return(gi_expr!(g, e)),
+	Stmt.ForIn(v, a, body) -> Stmt.ForIn(v, a, gi_stmts!(g, body)),
+	Stmt.Loop(ll, body) -> Stmt.Loop(ll, gi_stmts!(g, body)),
+	Stmt.Break(bl) -> Stmt.Break(bl),
+	Stmt.Continue(bl) -> Stmt.Continue(bl),
+	Stmt.IfThen(cd, st) -> Stmt.IfThen(gi_expr!(g, cd), gi_stmt!(g, st)),
+	Stmt.IfElse(cd, t, e) -> Stmt.IfElse(gi_expr!(g, cd), gi_stmt!(g, t), gi_stmt!(g, e)),
+	Stmt.Do(e) -> Stmt.Do(gi_expr!(g, e)),
+	Stmt.Block(ss) -> Stmt.Block(gi_stmts!(g, ss)),
+	Stmt.Match(scrut, arms) -> Stmt.Match(gi_expr!(g, scrut), gi_sarms!(g, arms)),
+	Stmt.Yield(e) -> Stmt.Yield(gi_expr!(g, e)),
+	Stmt.Closure(nm, params, ret, body) -> Stmt.Closure(nm, params, ret, gi_stmts!(g, body)),
+	Stmt.Defer(body) -> Stmt.Defer(gi_stmts!(g, body)),
+}
+
+const gi_stmts! = (Str g, [Stmt] ss): [Stmt] -> {
+	let [Stmt] out = []
+
+	for s in ss out = [...out, gi_stmt!(g, s)]
+
+	return out
+}
+
+# Map closures.cf's `subst_expr` over a whole body: the fn parameter's name substituted by the
+# demand function's — `cb(x)` becomes a direct `g(x)` (geom preserved), `Var(cb)` becomes
+# `Var(g)` so a forwarded value re-specializes on the next sweep.
+const sb_stmt = ([Subst] su, Stmt s): Stmt -> match s {
+	Stmt.Let(n, mut, ann, e) -> Stmt.Let(n, mut, ann, subst_expr(e, su)),
+	Stmt.Destructure(pat, mut, e) -> Stmt.Destructure(pat, mut, subst_expr(e, su)),
+	Stmt.Assign(n, e) -> Stmt.Assign(n, subst_expr(e, su)),
+	Stmt.FieldAssign(b, f, e) -> Stmt.FieldAssign(b, f, subst_expr(e, su)),
+	Stmt.DeepFieldAssign(be, f, e) -> Stmt.DeepFieldAssign(subst_expr(be, su), f, subst_expr(e, su)),
+	Stmt.IndexAssign(a, i, v) -> Stmt.IndexAssign(a, subst_expr(i, su), subst_expr(v, su)),
+	Stmt.Return(e) -> Stmt.Return(subst_expr(e, su)),
+	Stmt.ForIn(v, a, body) -> Stmt.ForIn(v, a, sb_stmts(su, body)),
+	Stmt.Loop(ll, body) -> Stmt.Loop(ll, sb_stmts(su, body)),
+	Stmt.Break(bl) -> Stmt.Break(bl),
+	Stmt.Continue(bl) -> Stmt.Continue(bl),
+	Stmt.IfThen(cd, st) -> Stmt.IfThen(subst_expr(cd, su), sb_stmt(su, st)),
+	Stmt.IfElse(cd, t, e) -> Stmt.IfElse(subst_expr(cd, su), sb_stmt(su, t), sb_stmt(su, e)),
+	Stmt.Do(e) -> Stmt.Do(subst_expr(e, su)),
+	Stmt.Block(ss) -> Stmt.Block(sb_stmts(su, ss)),
+	Stmt.Match(scrut, arms) -> Stmt.Match(subst_expr(scrut, su), sb_sarms(su, arms)),
+	Stmt.Yield(e) -> Stmt.Yield(subst_expr(e, su)),
+	Stmt.Closure(nm, params, ret, body) -> Stmt.Closure(nm, params, ret, sb_stmts(su, body)),
+	Stmt.Defer(body) -> Stmt.Defer(sb_stmts(su, body)),
+}
+
+const sb_sarms = ([Subst] su, [StmtArm] arms): [StmtArm] -> {
+	let [StmtArm] out = []
+
+	for a in arms out = [
+		...out,
+		StmtArm({
+			is_wild: a.is_wild,
+			type_name: a.type_name,
+			members: a.members,
+			binds: a.binds,
+			body: sb_stmts(su, a.body),
+		}),
+	]
+
+	return out
+}
+
+const sb_stmts = ([Subst] su, [Stmt] ss): [Stmt] -> {
+	let [Stmt] out = []
+
+	for s in ss out = [...out, sb_stmt(su, s)]
+
+	return out
+}
+
+# Build the clone `nm` names: the base minus its fn parameter at `cp`, the parameter substituted
+# by `g` throughout, the substituted call's geom made inert when `g` is colorless. The base of an
+# inner layer is itself a clone — built first, recursively.
+const build_sd! = ([Func] funcs0, Str nm): [Func] -> {
+	if find_func(funcs0, nm) >= 0 then return funcs0
+	const SdReq rq = parse_sd(nm)
+	let [Func] funcs = funcs0
+
+	if find_func(funcs, rq.base) < 0 && has_sd_marker(rq.base) then funcs = build_sd!(funcs, rq.base)
+	const Iarch bi = find_func(funcs, rq.base)
+	if bi < 0
+		then die("cf: specialize: internal — a `\$d` clone names no base function (${rq.base})\n")
+	if find_func(funcs, rq.g) < 0
+		then die("cf: specialize: internal — a `\$d` clone names no demand function (${rq.g})\n")
+	const Func base = funcs[bi]
+	let [Param] params = []
+	let Iarch p = 0
+
+	loop {
+		if p >= Iarch(base.params.len) then break
+		if p != rq.cp then params = [...params, base.params[p]]
+		p = p + 1
+	}
+
+	const Str pname = base.params[rq.cp].name
+	const [Subst] su = [Subst({ param: pname, repl: Expr.Var(rq.g) })]
+	let [Stmt] body = sb_stmts(su, base.body)
+	if !is_bang_name(rq.g) then body = gi_stmts!(rq.g, body)
+
+	return [
+		...funcs,
+		Func({
+			name: nm,
+			is_pub: false,
+			ret_name: base.ret_name,
+			ret_elem: base.ret_elem,
+			params: params,
+			body: body,
+			is_asm: false,
+			asm_body: base.asm_body,
+			is_value: base.is_value,
+			ret_telems: base.ret_telems,
+			typarams: base.typarams,
+			tbounds: base.tbounds,
+			ret_size: base.ret_size,
+			is_intrinsic: false,
+			asm_sym: "",
+			dfile: base.dfile,
+			dline: base.dline,
+			dcol: base.dcol,
+			uses: base.uses,
+		}),
+	]
+}
+
+const with_body = (Func f, [Stmt] body): Func -> Func({
+	name: f.name,
+	is_pub: f.is_pub,
+	ret_name: f.ret_name,
+	ret_elem: f.ret_elem,
+	params: f.params,
+	body: body,
+	is_asm: f.is_asm,
+	asm_body: f.asm_body,
+	is_value: f.is_value,
+	ret_telems: f.ret_telems,
+	typarams: f.typarams,
+	tbounds: f.tbounds,
+	ret_size: f.ret_size,
+	is_intrinsic: f.is_intrinsic,
+	asm_sym: f.asm_sym,
+	dfile: f.dfile,
+	dline: f.dline,
+	dcol: f.dcol,
+	uses: f.uses,
+})
+
+# Rewrite every body's demand-fn-argument calls to clone names, then build the missing clones to
+# a fixpoint (a clone's substituted body may pass the value onward — rewritten and swept again).
+pub const specialize_fnvals! = (Program prog): Program -> {
+	let [Func] funcs = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(prog.funcs.len) then break
+		const Func f = prog.funcs[i]
+
+		if f.is_asm || f.is_intrinsic || f.is_value then {
+			funcs = [...funcs, f]
+		} else {
+			const SdCtx c = SdCtx({ funcs: prog.funcs, bound: bound_locals(f) })
+			funcs = [...funcs, with_body(f, sd_stmts!(c, f.body))]
+		}
+
+		i = i + 1
+	}
+
+	loop {
+		const [Str] want = missing_sd(funcs)
+		if Iarch(want.len) == 0 then break
+
+		for w in want funcs = build_sd!(funcs, w)
+
+		# a fresh clone's body still holds the SUBSTITUTED value in argument position — rewrite
+		# the new tail so a forwarded demand fn specializes transitively
+		let Iarch k = 0
+
+		loop {
+			if k >= Iarch(funcs.len) then break
+			if has_sd_marker(funcs[k].name) then {
+				const SdCtx c2 = SdCtx({ funcs: funcs, bound: bound_locals(funcs[k]) })
+				funcs[k] = with_body(funcs[k], sd_stmts!(c2, funcs[k].body))
+			}
+			k = k + 1
+		}
+	}
+
+	return Program({
+		imports: prog.imports,
+		recs: prog.recs,
+		unions: prog.unions,
+		funcs: funcs,
+		groups: prog.groups,
+	})
+}

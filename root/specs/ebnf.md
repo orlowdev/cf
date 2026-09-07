@@ -24,7 +24,8 @@ _(temporary)_ are placeholders that will be widened in later rounds.
   comments. Like whitespace, a comment is a lexer concern and is stripped before
   the rules below apply.
 - Identifier casing is part of the grammar: **types are PascalCase**, **values
-  (variable names) are snake_case**.
+  (variable names) are snake_case**, **exported value constants are
+  UPPER_SNAKE_CASE**.
 
 ## Character Classes
 
@@ -45,9 +46,16 @@ hex_digit = dec_digit | "a" | "b" | "c" | "d" | "e" | "f"
 ## Identifiers
 
 ```ebnf
-type_name = uppercase , { uppercase | lowercase | dec_digit } ;         (* PascalCase: Int, Uint8 *)
-var_name  = [ "$" ] , lowercase , { lowercase | dec_digit | "_" } , [ "!" ] ;   (* snake_case: x, the_number, alloc!, $buf *)
+type_name  = uppercase , { uppercase | lowercase | dec_digit } ;         (* PascalCase: Int, Uint8 *)
+var_name   = [ "$" ] , lowercase , { lowercase | dec_digit | "_" } , [ "!" ] ;   (* snake_case: x, the_number, alloc!, $buf *)
+const_name = uppercase , { uppercase | dec_digit | "_" } ;               (* UPPER_SNAKE_CASE: STDOUT, KEY_UP *)
 ```
+
+A `const_name` names a **top-level value const** (see Variable Declaration and
+Visibility) — screaming means immutable. The shapes overlap on a name with no
+lowercase letter (`X`, `FD`): such a name reads as a `const_name` in every value
+position, so a type name should always mix case (`Fd`, not `FD`). Only a
+MIXED-case uppercase-initial name is a type.
 
 A `var_name` may end in a single `!`. Lexically the `!` is part of the
 identifier (`alloc!` is one token). It is the **allocation-effect marker** and
@@ -830,9 +838,33 @@ This is enforced at the grammar level.
 ```ebnf
 let_decl   = "let" , ( type , var_name , [ "=" , expression ]   (* type given: init optional *)
                      | var_name , "=" , expression ) ;          (* no type: init required *)
-const_decl = "const" , [ type ] , var_name , "=" , expression ;
+const_decl = "const" , [ type ] , ( var_name | const_name ) , "=" , expression ;
 var_decl   = let_decl | const_decl | destructure_decl ;   (* destructure_decl: see Destructuring *)
 ```
+
+The `const_name` alternative is the **top-level value const** form (`pub const
+STDOUT = Fd({ ... })` — see Visibility): an **exported** (`pub`) non-function
+value const **must** be a `const_name`; a module-private one may use either
+casing. A function is still a `var_name` const binding (it is a function first,
+a const second), and a **local** `const` statement stays `var_name`.
+
+A top-level value const's value may be a **literal** (its type inferred: a
+string is `Str`, a Bool `Bool`, anything scalar the `Int` word) or a **data
+aggregate construction** — a record (`Fd({ ... })`), a union member
+(`Color.Red`, `IoRrr.Other(e)`), or a field read off another aggregate const
+(`STDOUT.n`). A construction names its own type. Each **reference** to an
+aggregate const constructs the value afresh **in the referencing function's
+ambient** (construction is application — the reference is the construction,
+spliced at the site). An aggregate may only be the const's **whole value**: one
+trapped inside a wider expression (`const BAD = ORIGIN.x + 1`) is rejected —
+the intermediate record would have no geometry to live in.
+
+An aggregate const is **not a value for a mutable place**: `let f = STDOUT`,
+storing one inside a `let` aggregate (`let fds = [STDOUT]`), and assigning one
+into any `let` slot are all rejected — the mutable copy would masquerade as the
+const, and screaming means immutable. Bind it with `const`, pass it as an
+argument, return it, or read a scalar field off it (`let n = STDOUT.n` is a
+plain number and stays legal).
 
 Examples:
 
@@ -904,7 +936,8 @@ allocation-effect marker (see Identifiers and the memory model), part of the
 binding's name — not of the lambda.
 
 ```ebnf
-function       = [ generic_params ] , param_list , [ ":" , type ] , "->" , ( block | expression | asm_block ) ;   (* ":" return set off from the "->" body; asm_block: see Assembly *)
+function       = [ generic_params ] , param_list , [ ":" , type ] , [ uses_clause ] , "->" , ( block | expression | asm_block ) ;   (* ":" return set off from the "->" body; asm_block: see Assembly *)
+uses_clause    = "uses" , type , { "," , type } ;   (* declared context demands — the hidden T pointers this fn needs; see context.md §4 *)
 
 generic_params = "[" , generic_param , { "," , generic_param } , "]" ;   (* ['T] | ['K, 'V] | [Uarch n, 'T] | [NonNegativeInteger 'V] *)
 generic_param  = type_var                                          (* 'T                    — unbounded type variable *)
@@ -916,7 +949,7 @@ param          = [ type ] , var_name | type , record_pattern ;   (* Int32 x  |  
 
 block          = "{" , { statement } , "}" ;
 statement      = var_decl | return_stmt | yield_stmt | assign_stmt | if_stmt | expression ;   (* (temporary) — widened further with more control flow *)
-return_stmt    = "return" , [ expression ] ;                   (* exits the whole function *)
+return_stmt    = "return" , [ expression ] ;                   (* exits the whole function; the expression must START on `return`'s line (it may then span further lines) — a bare `return` before `}`/`,` or a line end returns the unit value *)
 yield_stmt     = "<-" , expression ;                           (* yields a block's value and ends the block (terminal, like return); inside a loop it breaks the loop with that value *)
 ```
 
@@ -957,6 +990,12 @@ Points:
   (`(Int32 x): Int32 -> ...`). Omit it (`(Int32 x) -> ...`) to infer it from the body —
   or for a function that returns nothing. The `->` always immediately precedes the
   body; the `:` return keeps it from colliding with the function *type*'s `->`.
+- **A `uses` clause declares the function's context demands** — the provided
+  types it (transitively) consumes, set between the return type and the `->`
+  (`(Str s): () uses AppConfig -> ...`; [[context.md]] §4). It is `uses` = the
+  hidden `T` pointers, the dual of the `!` that ends a name (which needs the
+  ambient node). Mandatory on a `pub` function, inferred within a module; a
+  contextual keyword, valid only in this signature position.
 - **The body is a `block` or a single `expression`.** `-> a + b` is a
   single-line body whose value is the implicit return; `-> { ... }` is a braced
   block that returns via `return`. So `(Int32 a, Int32 b) -> a + b` and
@@ -1350,9 +1389,12 @@ Points:
   form unambiguous against the one-binder `for x in`.
   `for` is **nameless** — no label. The body is a `branch` (a `block` or a single
   expression), which is what makes it one-lineable (`for i in xs if ...`) and an
-  expression (`... then i else 2`). The iterable is a full `expression`; because
-  expressions never juxtapose (calls always use `()`), the boundary between it
-  and the body is unambiguous — `xs { ... }` and `xs if ...` both split cleanly. The
+  expression (`... then i else 2`). An unbraced body binds exactly one statement
+  wherever it starts — on the header's line or the next (indented) one; only a
+  multi-statement body needs the `{ ... }`. The iterable is a full `expression`;
+  because expressions never juxtapose (calls always use `()`), the boundary
+  between it and the body is unambiguous — `xs { ... }` and `xs if ...` both
+  split cleanly, on one line or across the break. The
   `in` here is the loop's own, distinct from the geometry `in` clause (the `for`
   keyword leads, so there is no clash).
 - **`break` / `continue` are never-typed expressions.** Each takes an optional
@@ -1537,11 +1579,14 @@ declaration = [ "pub" ] , ( data_decl | type_decl | union_decl | var_decl | intr
 ```
 
 `pub` sits before the declaration keyword and applies to **data, types, and
-values** (`let`/`const`, and thus functions, which are `const`-bound lambdas):
+values** (`let`/`const`, and thus functions, which are `const`-bound lambdas).
+An exported **non-function value const** must be UPPER_SNAKE_CASE (`const_name`,
+§ Identifiers) — screaming means immutable; a function keeps its `var_name`:
 
 ```
-pub const x = 1        (* exported — importable *)
-const y = 2            (* module-private *)
+pub const LIMIT = 1        (* exported value const — UPPER_SNAKE_CASE required *)
+const greeting = "hi"      (* module-private value const — snake_case fine *)
+pub const lex = (...) -> ...   (* a function is a var_name const binding *)
 pub data Point = { Int32 x, Int32 y }
 pub type ServerOptions = { Int32 port, Str host }
 ```

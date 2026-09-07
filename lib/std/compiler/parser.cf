@@ -92,6 +92,8 @@ pub data Parser = {
 	Str file,
 	Os target_os,
 	Arch target_arch,
+	Bool build_debug,
+	Bool build_instrument,
 	Bool saw_fb,
 	Bool saw_fx,
 	Bool saw_el,
@@ -108,13 +110,19 @@ pub data Parser = {
 	Bool track,
 	[BindEv] evs,
 	[[BindEv]] evb,
+	# a leading `let` on a call's FIRST argument (`provide(let x)`, context.md §2) — a mutable
+	# context provide. Set by `parse_args!` for the just-parsed call, read+consumed by `parse_call!`
+	# (it stamps a `$let` tyarg on the call). Reset at the start of every `parse_args!`, so it never
+	# leaks between calls.
+	Bool arg_mut0,
 }
 
 # The chunk bound of the bind-event log: a full `evs` block of this many events moves to `evb`.
 const ev_block = (): Iarch -> 128
 
 # One local-binding event for the LSP's goto-definition (`cf lsp def`): a scope OPEN (kind 0)
-# or CLOSE (kind 1) at a byte offset, or a binding of `name` — a parameter (2), a `let`/`const`
+# or CLOSE (kind 1) at a byte offset, or a binding of `name` — a parameter (2; a `['T]` type
+# parameter and a `[Iarch n]` comptime value parameter bind as parameters too), a `let`/`const`
 # local (3), a `for` binder (4), or a match payload bind (5). Replayed in parse order with a
 # depth counter, the innermost binding of a name still in scope at a cursor offset is its
 # definition site. Kind 6 is a USE — every source token the parser reads as a NAME reference
@@ -284,6 +292,21 @@ const slice_eq = (*[Uint8] src, Iarch start, Iarch len, Str word): Bool -> {
 	return true
 }
 
+# Is there a newline between byte offsets `a` (inclusive) and `b` (exclusive)? Decides
+# whether a token STARTS on the same source line as an earlier one — `return`'s value
+# must begin on the keyword's own line.
+const newline_between = (*[Uint8] src, Iarch a, Iarch b): Bool -> {
+	let Iarch i = a
+
+	loop {
+		if i >= b then break
+		if Iarch(src[i]) == 10 then return true
+		i = i + 1
+	}
+
+	return false
+}
+
 # Intern a source slice into an owned `Str` (a binding name / a variable reference),
 # copying the bytes so the name outlives the source buffer.
 const intern! = (*[Uint8] src, Iarch start, Iarch len): Str -> {
@@ -325,13 +348,13 @@ const float_text! = (*[Uint8] src, Iarch start, Iarch len): Str -> {
 # The single byte an escape `\<e>` decodes to (`\n \t \r \0 \\ \" \$`); -1 for an unknown
 # escape (the caller rejects it, locating the escape's own byte).
 const escape_byte = (Iarch e): Iarch -> {
-	if e == 110 then return 10  # \n
-	if e == 116 then return 9   # \t
-	if e == 114 then return 13  # \r
-	if e == 48 then return 0    # \0
-	if e == 92 then return 92   # backslash
-	if e == 34 then return 34   # quote
-	if e == 36 then return 36   # dollar
+	if e == 110 then return 10 # \n
+	if e == 116 then return 9 # \t
+	if e == 114 then return 13 # \r
+	if e == 48 then return 0 # \0
+	if e == 92 then return 92 # backslash
+	if e == 34 then return 34 # quote
+	if e == 36 then return 36 # dollar
 
 	return -1
 }
@@ -371,6 +394,8 @@ const parse_hole! = (*Parser p, Iarch hstart, Iarch hlen): Expr -> {
 		file: p.file,
 		target_os: Os.Darwin,
 		target_arch: Arch.Arm64,
+		build_debug: false,
+		build_instrument: false,
 		saw_fb: false,
 		saw_fx: false,
 		saw_el: false,
@@ -378,6 +403,7 @@ const parse_hole! = (*Parser p, Iarch hstart, Iarch hlen): Expr -> {
 		track: p.track,
 		evs: noevs,
 		evb: hoevb,
+		arg_mut0: false,
 	})
 	const Expr e = parse_expr!(&hp)
 	if !is_eof(peek(&hp))
@@ -527,7 +553,15 @@ const parse_pipe_target! = (*Parser p, Expr piped): Expr -> {
 	let [Str] tys = []
 	if is_lbracket(peek(p)) then tys = parse_tyargs!(p)
 	let [Expr] args = []
-	if is_lparen(peek(p)) then args = parse_args!(p)
+	# a `let`-marked first argument (`x |> provide(let s)`, context.md §2) rides as a `$let` tyarg,
+	# exactly as in `parse_call!`. Read `arg_mut0` only when an arg list was actually parsed — else
+	# it would be stale from an earlier call (`parse_args!` resets it only on entry).
+	let Bool mut0 = false
+	if is_lparen(peek(p)) then {
+		args = parse_args!(p)
+		mut0 = p.arg_mut0
+	}
+	if mut0 then tys = [...tys, "$let"]
 
 	return Expr.At(noff, Expr.Call(name, tys, [...args, piped], ""))
 }
@@ -745,13 +779,20 @@ const parse_if! = (*Parser p): Expr -> {
 # only collect the comma-separated argument expressions.
 const parse_args! = (*Parser p): [Expr] -> {
 	p.pos = p.pos + 1 # `(`
+	p.arg_mut0 = false
 	let [Expr] args = []
 	if !is_rparen(peek(p)) then {
 		loop {
+			# a leading `let` on the FIRST argument marks a MUTABLE context provide — `provide(let x)`
+			# (context.md §2). Consumed here; `parse_call!` reads `arg_mut0` and stamps a `$let` tyarg.
+			if Iarch(args.len) == 0 && kw(p, "let") then {
+				p.pos = p.pos + 1
+				p.arg_mut0 = true
+			}
 			# a `{ ... }` argument is a grouped-parameter literal (a bare `Record` with empty type_name,
 			# expanded to positional field values by the resolve group splat)
 			if is_lbrace(peek(p)) then args = [...args, parse_record_lit!(p, "")]
-				else args = [...args, parse_expr!(p)]
+			else args = [...args, parse_expr!(p)]
 			if !is_comma(peek(p)) then break
 			p.pos = p.pos + 1
 			if is_rparen(peek(p)) then break # trailing comma
@@ -767,8 +808,16 @@ const parse_call! = (*Parser p, Str name): Expr -> {
 	const [Str] no_ty = []
 	# the callee NAME token sits one behind the `(` — the call's span anchor
 	const Iarch noff = p.ebase + p.toks[p.pos - 1].start
+	const [Expr] cargs = parse_args!(p)
+	# a `let`-marked first argument (`provide(let x)`) rides as a `$let` tyarg sentinel — resolve
+	# passes tyargs through untouched, so it reaches the demand pass and emit unread by anything else.
+	let [Str] cty = no_ty
+	if p.arg_mut0 then {
+		let [Str] m = ["$let"]
+		cty = m
+	}
 
-	return Expr.At(noff, Expr.Call(name, no_ty, parse_args!(p), ""))
+	return Expr.At(noff, Expr.Call(name, cty, cargs, ""))
 }
 
 # `f[T1, T2](args)` — a call to a generic function with explicit type arguments. Each type
@@ -857,7 +906,7 @@ const tyargs_shaped = (*Parser p, Iarch br): Bool -> {
 
 			const Iarch c = Iarch(p.src[p.toks[j].start])
 
-			if !((c >= 65 && c <= 90) || c == 39) then return false  # uppercase-initial or `'T`
+			if !((c >= 65 && c <= 90) || c == 39) then return false # uppercase-initial or `'T`
 		}
 
 		j = j + 1
@@ -888,15 +937,15 @@ const callargs_shaped = (*Parser p, Iarch br): Bool -> {
 			depth = depth - 1
 			j = j + 1
 		} else if is_comma(k) || is_intlit(k) then j = j + 1
-					else {
-						if !is_ident(k) then return false
+		else {
+			if !is_ident(k) then return false
 
-						const Iarch c = Iarch(p.src[p.toks[j].start])
+			const Iarch c = Iarch(p.src[p.toks[j].start])
 
-						if !((c >= 65 && c <= 90) || c == 39) then return false  # uppercase-initial or `'T`
+			if !((c >= 65 && c <= 90) || c == 39) then return false # uppercase-initial or `'T`
 
-						j = j + 1
-					}
+			j = j + 1
+		}
 	}
 
 	if j == br + 1 then return false
@@ -1754,7 +1803,7 @@ const parse_let! = (*Parser p, Bool mutable): Stmt -> {
 						"cf: parse: a fixed-array initializer must be a plain array literal of exactly N elements (no spread)\n",
 					)
 				} else if !is_call_e(init)
-						then perr(
+					then perr(
 					p,
 					"cf: parse: a fixed-array binding needs an array literal or an array-returning call\n",
 				)
@@ -1996,8 +2045,8 @@ const parse_for! = (*Parser p): Stmt -> {
 	if !kw(p, "in") then perr(p, "cf: parse: expected `in` in a for-loop\n")
 	p.pos = p.pos + 1
 	# the iterable is a full EXPRESSION (ebnf for_expr) — a name, a field read, a call result.
-	# Expressions never juxtapose, so the boundary before the body (`{` or a same-line statement
-	# head) is unambiguous.
+	# Expressions never juxtapose, so the boundary before the body (`{` or a statement head,
+	# same-line or next-line) is unambiguous.
 	const Iarch it_tok = p.pos
 	const Expr it = parse_expr!(p)
 	const [Stmt] body = parse_for_body!(p)
@@ -2032,19 +2081,19 @@ const parse_for! = (*Parser p): Stmt -> {
 	return Stmt.Block(whole)
 }
 
-# A for-loop's body is a BRANCH (ebnf for_expr): a `{ ... }` block, or a single statement on the
-# SAME line (`for i in xs if odd(i) then s = s + i`).
+# A for-loop's body is a BRANCH (ebnf for_expr): a `{ ... }` block, or a single statement — on
+# the header's own line (`for i in xs if odd(i) then s = s + i`) or the next. The line break is
+# safe: no statement head (a keyword, `<-`, an identifier) can continue the iterable expression,
+# so the body's start is unambiguous wherever it sits. Only a token that cannot head a statement
+# at all (the enclosing `}`, a match-arm `,`, the end of input) means the body is missing.
 const parse_for_body! = (*Parser p): [Stmt] -> {
 	if is_lbrace(peek(p)) then {
 		p.pos = p.pos + 1
 
 		return parse_block!(p)
 	}
-	if nl_before(p, p.pos)
-		then perr(
-		p,
-		"cf: parse: a for-loop body is a `{ ... }` block or a single statement on the same line\n",
-	)
+	if is_rbrace(peek(p)) || is_comma(peek(p)) || is_eof(peek(p))
+		then perr(p, "cf: parse: a for-loop needs a body — a `{ ... }` block or a single statement\n")
 	const [Stmt] one = [parse_stmt!(p)]
 
 	return one
@@ -2144,15 +2193,18 @@ const parse_stmt! = (*Parser p): Stmt -> {
 		return Stmt.Continue(exit_label!(p))
 	}
 	if kw(p, "return") then {
+		const Iarch rkend = p.toks[p.pos].start + p.toks[p.pos].len
 		p.pos = p.pos + 1
 		# a valueless `return` is sugar for `return ()` — the unit value (type_system §6.1);
 		# typecheck then requires a `Unit`-returning fn. cf's grammar has no statement
-		# separator, so a bare `return` is only unambiguous before a boundary token that
-		# cannot begin an expression: `}` (end of block / braced guard body / last match arm)
-		# or `,` (a `,`-separated statement-match arm). Everywhere else `return` greedily
-		# takes the following expression — so a valueless guarded return must be braced
-		# (`if c then { return }`), never `if c then return <more...>` (that returns the value).
+		# separator, so the return value must START on the keyword's own line: before a
+		# boundary token that cannot begin an expression (`}` — end of block / braced guard
+		# body / last match arm — or `,`, a `,`-separated statement-match arm), or when the
+		# next token sits on a LATER line, the `return` is valueless and that token opens an
+		# ordinary (unreachable) statement. An expression that begins on `return`'s line may
+		# still span further lines as usual.
 		if is_rbrace(peek(p)) || is_comma(peek(p)) then return Stmt.Return(Expr.Unit)
+		if newline_between(p.src, rkend, p.toks[p.pos].start) then return Stmt.Return(Expr.Unit)
 		const Expr rv = parse_expr!(p)
 
 		return Stmt.Return(geom_stamp(p, rv, in_clause_name!(p)))
@@ -2367,6 +2419,24 @@ const is_pascal_name = (Str n): Bool -> {
 	return c >= 65 && c <= 90
 }
 
+# An UPPER_SNAKE_CASE name (A-Z, 0-9, `_` only, leading A-Z) — a top-level value CONST
+# (screaming means immutable, ebnf § Identifiers); a TYPE is PascalCase (mixed case),
+# an ordinary value name snake_case. Pub: the resolver's casing split reads it too.
+pub const is_upper_snake = (Str n): Bool -> {
+	if Iarch(n.len) == 0 then return false
+	if !(Iarch(n[0]) >= 65 && Iarch(n[0]) <= 90) then return false
+	let Iarch i = 1
+
+	loop {
+		if i >= Iarch(n.len) then break
+		const Iarch c = Iarch(n[i])
+		if !((c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95) then return false
+		i = i + 1
+	}
+
+	return true
+}
+
 # Is `name` already among the parameters parsed so far?
 const params_has = ([Param] params, Str name): Bool -> {
 	let Iarch i = 0
@@ -2428,6 +2498,9 @@ const parse_tel! = (*Parser p): TupElem -> {
 
 			return tel_fn([...inner, ret])
 		}
+		# a bare `()` with no `->` is the UNIT type (type_system §6.1) — a nullary function type's return
+		# (`() -> ()`) or a unit component; `Unit` and `()` name the same type.
+		if Iarch(inner.len) == 0 then return tel_leaf("Unit")
 		if Iarch(inner.len) < 2 then perr(p, "cf: parse: a tuple type needs at least two elements\n")
 
 		return tel_nest(inner)
@@ -2565,7 +2638,22 @@ const parse_fixed_elem! = (*Parser p): Str -> {
 # A single parameter: `<type> <name>`. A pointer type (`*[Elem]`/`[Elem]`) becomes a
 # pointer parameter (no type name); a bare type-name identifier (`Iarch`, `Bool`, or
 # a record type) is kept in `type_name` for the typecheck phase to resolve.
-const parse_param! = (*Parser p): Param -> {
+const parse_param! = (*Parser p, Bool bare): Param -> {
+	# a BARE lowercase name (no type) — a lambda parameter typed by its surrounding context
+	# (type_system §5.1/§5.2: the expected function type gives the params their types; the
+	# consuming call's function-type parameter supplies it after the monomorph pass). Only a
+	# closure parses these — a top-level function types its parameters. An uppercase single
+	# ident still reads as a type missing its name and rejects below.
+	if bare
+	&& is_ident(peek(p))
+	&& (is_comma(p.toks[p.pos + 1].kind) || is_rparen(p.toks[p.pos + 1].kind))
+	&& !(Iarch(cur_name!(p)[0]) >= 65 && Iarch(cur_name!(p)[0]) <= 90) then {
+		const Str bname = cur_name!(p)
+		bev(p, p.pos, 2, bname)
+		p.pos = p.pos + 1
+
+		return Param({ name: bname, is_ptr: false, type_name: "", elem: "", telems: [], size: 0 })
+	}
 	if is_star(peek(p)) then {
 		p.pos = p.pos + 1 # `*`
 		# `*[Elem]` is a byte pointer (`$ptr`); `*Record` is a mutable record pointer whose
@@ -2658,10 +2746,15 @@ const parse_param! = (*Parser p): Param -> {
 		p.pos = p.pos + 1 # `(`
 		let [TupElem] tel = []
 
-		loop {
-			tel = [...tel, parse_tel!(p)]
-			if !is_comma(peek(p)) then break
-			p.pos = p.pos + 1
+		# an EMPTY `()` is a nullary function type's argument list (`() -> R`) — the unit-type `()` was
+		# taken earlier (it has no `->`), so a `)` here means zero arguments. Guard the position loop the
+		# way `parse_tel!` guards its own nested one, so `() -> R` parses as a parameter, not only nested.
+		if !is_rparen(peek(p)) then {
+			loop {
+				tel = [...tel, parse_tel!(p)]
+				if !is_comma(peek(p)) then break
+				p.pos = p.pos + 1
+			}
 		}
 
 		if !is_rparen(peek(p)) then perr(p, "cf: parse: expected `)` in a parameter type\n")
@@ -2745,10 +2838,20 @@ const lambda_ahead = (*Parser p): Bool -> {
 const parse_closure! = (*Parser p, Str name): Stmt -> {
 	bev(p, p.pos, 0, "") # the closure's scope opens at its `(` — parameters bind into it
 	p.pos = p.pos + 1 # `(`
-	const [Param] params = parse_params!(p)
+	const [Param] params = parse_params!(p, true)
 	if !is_rparen(peek(p)) then perr(p, "cf: parse: expected `)` in a closure\n")
 	p.pos = p.pos + 1
 	const RetSig rs = parse_ret_name!(p)
+	# a closure's return slot is a bare NAME: an array return rides bracket-encoded
+	# (`[Iarch]` — the same spelling a function-type component uses), and a tuple return
+	# has no carrier at all — rejected cleanly (a record names the positions anyway)
+	if eq(rs.name, "$tuple")
+		then perr(
+		p,
+		"cf: parse: a closure cannot declare a tuple return — return a record, or use a named function\n",
+	)
+	let Str crn = rs.name
+	if eq(rs.name, "$dyn") then crn = "[${rs.elem}]"
 	if !is_arrow(peek(p)) then perr(p, "cf: parse: expected `->` in a closure\n")
 	p.pos = p.pos + 1
 	const [Stmt] nobody = []
@@ -2757,7 +2860,7 @@ const parse_closure! = (*Parser p, Str name): Stmt -> {
 		const [Stmt] body = parse_block!(p)
 		bev(p, p.pos, 1, "")
 
-		return Stmt.Closure(name, params, rs.name, body)
+		return Stmt.Closure(name, params, crn, body)
 	}
 	# an expression body: nested anonymous lambdas hoist INTO this closure (they may capture its
 	# parameters), while lambdas queued by the enclosing statement stay shelved outside
@@ -2769,17 +2872,17 @@ const parse_closure! = (*Parser p, Str name): Stmt -> {
 	p.pending = [...shelved]
 	bev(p, p.pos, 1, "")
 
-	return Stmt.Closure(name, params, rs.name, one)
+	return Stmt.Closure(name, params, crn, one)
 }
 
 # The parenthesised parameter list; a repeated name is rejected. Any arity is
 # accepted here — `main`'s ≤3 cap is a whole-program rule checked at resolve time.
-const parse_params! = (*Parser p): [Param] -> {
+const parse_params! = (*Parser p, Bool bare): [Param] -> {
 	let [Param] params = []
 	if is_rparen(peek(p)) then return params
 
 	loop {
-		const Param pm = parse_param!(p)
+		const Param pm = parse_param!(p, bare)
 		if params_has(params, pm.name) then perr(p, "cf: parse: duplicate parameter name\n")
 		params = [...params, pm]
 		if !is_comma(peek(p)) then break
@@ -2842,6 +2945,25 @@ const parse_ret_name! = (*Parser p): RetSig -> {
 	const Str n = parse_member_type!(p)
 
 	return RetSig({ name: n, elem: "", telems: [], size: 0 })
+}
+
+# Parse an optional `uses T1, T2, ...` context-demand clause (context.md §4) — the declared hidden
+# `T` demands, written between the return type and the `->`. `uses` is a contextual keyword: it can
+# only appear in this signature position, so it never shadows a like-named binding elsewhere. Each
+# demand is a nominal type name (a plain record, or a generic application kept as a bracketed
+# string for the monomorph pass). The `uses` token is already confirmed by the caller.
+const parse_uses! = (*Parser p): [Str] -> {
+	p.pos = p.pos + 1 # `uses`
+	let [Str] r = []
+
+	loop {
+		if !is_ident(peek(p)) then perr(p, "cf: parse: expected a type name in a `uses` clause\n")
+		r = [...r, parse_type_ref!(p)]
+		if !is_comma(peek(p)) then break
+		p.pos = p.pos + 1
+	}
+
+	return r
 }
 
 # Split an `asm "..."` body string into segments — literal runs and `${param}` holes —
@@ -2915,6 +3037,10 @@ const parse_typarams! = (*Parser p): TyParams -> {
 			if !is_ident(peek(p))
 				then perr(p, "cf: parse: a bound or value-parameter type must be followed by a name\n")
 		}
+		# the variable BINDS like a parameter (kind 2) into the declaration's scope — its uses in
+		# the signature, fields, and body log kind-6 events, so goto/refs/rename resolve a `'T`
+		# (or a comptime value parameter's name) exactly like a local's
+		bev(p, p.pos, 2, cur_name!(p))
 		tps = [...tps, cur_name!(p)]
 		tbs = [...tbs, bound]
 		p.pos = p.pos + 1
@@ -3083,6 +3209,7 @@ const parse_func! = (*Parser p): Func -> {
 			ret_elem: vrs.elem,
 			params: vnoparams,
 			body: vibody,
+			uses: vintp,
 			is_asm: false,
 			asm_body: vinoasm,
 			is_value: true,
@@ -3103,6 +3230,7 @@ const parse_func! = (*Parser p): Func -> {
 	let [Str] typarams = []
 	let [Str] tbounds = []
 	if typarams_ahead(p) then {
+		bev(p, p.pos, 0, "") # a generic function's scope opens EARLY, at the `[` — its type params bind into it
 		const TyParams tpb = parse_typarams!(p)
 		typarams = tpb.names
 		tbounds = tpb.bounds
@@ -3110,9 +3238,10 @@ const parse_func! = (*Parser p): Func -> {
 	const [Str] no_tp = []
 	# `[pub] const NAME = <expr>` with no `(` — a top-level VALUE const (module_system /
 	# ebnf § Modules), modeled as a nullary function returning the value; a bare reference
-	# to NAME auto-calls it (typecheck/emit). Its return type is inferred from a LITERAL value:
-	# a string (`Str`) or a Bool (`Bool`) keeps its type, anything else defaults to the `Int`
-	# word (`ret_name` "") — cf's value consts are literals (flags, sizes, greetings).
+	# to NAME auto-calls it (typecheck/emit). Its return type is inferred from the value:
+	# a string (`Str`) or a Bool (`Bool`) literal keeps its type, a data-aggregate
+	# CONSTRUCTION (`Fd({...})`, `Color.Red`) its constructed type, anything else defaults
+	# to the `Int` word (`ret_name` "").
 	if !is_lparen(peek(p)) then {
 		if is_intrin
 			then perr(
@@ -3120,17 +3249,36 @@ const parse_func! = (*Parser p): Func -> {
 			"cf: parse: an `intrinsic` needs a parameter list — `intrinsic name = (args): Ret`\n",
 		)
 		if Iarch(typarams.len) > 0 then perr(p, "cf: parse: a top-level value const cannot be generic\n")
-		# a value name is lowercase-initial (uppercase-initial is a TYPE) — ebnf § Identifiers
-		if Iarch(name[0]) >= 65 && Iarch(name[0]) <= 90
+		# a value-const name is snake_case or UPPER_SNAKE_CASE (screaming means immutable);
+		# a MIXED-case uppercase-initial name is a TYPE — ebnf § Identifiers
+		if !is_upper_snake(name) && Iarch(name[0]) >= 65 && Iarch(name[0]) <= 90
 			then perr(
 			p,
-			"cf: parse: a value name must be lowercase — an uppercase-initial name is a type\n",
+			"cf: parse: a value name must be snake_case or UPPER_SNAKE_CASE — a PascalCase name is a type\n",
+		)
+		# an EXPORTED value const must scream (ebnf § Visibility) — the casing is the
+		# convention's immutability signal at every use site; private consts may stay lowercase
+		if is_pub && !is_upper_snake(name)
+			then perr(
+			p,
+			"cf: parse: an exported value const must be UPPER_SNAKE_CASE — screaming means immutable\n",
 		)
 		const [Param] noparams = []
 		const [Stmt] vempty = []
 		const Expr vexpr = parse_expr!(p)
 
-		const Str vret = match unat(vexpr) { Expr.StrLit(_) -> "Str", Expr.BoolLit(_) -> "Bool", _ -> "" }
+		# the const's type from its value: a Str/Bool literal keeps its type (else the Int
+		# word); a CONSTRUCTION names its type — `Fd({...})` (a record), `IoRrr.Other(e)` (a
+		# payload member), `Color.Red` (a tag-only member parses as a PascalCase field base;
+		# an UPPER_SNAKE base is instead a fellow-CONST read (`STDOUT.n`), a word)
+		const Str vret = match unat(vexpr) {
+			Expr.StrLit(_) -> "Str",
+			Expr.BoolLit(_) -> "Bool",
+			Expr.Record(tn, _) -> tn,
+			Expr.UnionMk(tn, _, _) -> tn,
+			Expr.Field(b, _) -> if is_pascal_name(b) && !is_upper_snake(b) then b else "",
+			_ -> "",
+		}
 
 		const [Stmt] vbody = [...vempty, Stmt.Return(vexpr)]
 		const [Seg] vnoasm = []
@@ -3142,6 +3290,7 @@ const parse_func! = (*Parser p): Func -> {
 			ret_elem: "",
 			params: noparams,
 			body: vbody,
+			uses: no_tp,
 			is_asm: false,
 			asm_body: vnoasm,
 			is_value: true,
@@ -3156,12 +3305,19 @@ const parse_func! = (*Parser p): Func -> {
 			dcol: 0,
 		})
 	}
-	bev(p, p.pos, 0, "") # the function's scope opens at its `(` — parameters bind into it
+	# the function's scope opens at its `(` — parameters bind into it (a generic's opened
+	# already, back at its `['T]`)
+	if Iarch(typarams.len) == 0 then bev(p, p.pos, 0, "")
 	p.pos = p.pos + 1
-	const [Param] params = parse_params!(p)
+	const [Param] params = parse_params!(p, false)
 	if !is_rparen(peek(p)) then perr(p, "cf: parse: expected `)`\n")
 	p.pos = p.pos + 1
 	const RetSig rs = parse_ret_name!(p)
+	# an optional `uses T1, T2, ...` context-demand clause (context.md §4), between the return type
+	# and the `->`. Only a real function bears one; an `intrinsic` stops at its signature (its demand
+	# surface is fixed by the compiler), so the clause is not read for one.
+	let [Str] uses_cl = []
+	if !is_intrin && kw(p, "uses") then uses_cl = parse_uses!(p)
 	# an `intrinsic` stops at its signature — no `->`, no body; the compiler supplies it.
 	if is_intrin then {
 		if is_arrow(peek(p))
@@ -3177,6 +3333,7 @@ const parse_func! = (*Parser p): Func -> {
 			ret_elem: rs.elem,
 			params: params,
 			body: ibody,
+			uses: uses_cl,
 			is_asm: false,
 			asm_body: inoasm,
 			is_value: false,
@@ -3211,6 +3368,7 @@ const parse_func! = (*Parser p): Func -> {
 			ret_elem: rs.elem,
 			params: params,
 			body: nobody,
+			uses: uses_cl,
 			is_asm: true,
 			asm_body: segs,
 			is_value: false,
@@ -3237,6 +3395,7 @@ const parse_func! = (*Parser p): Func -> {
 			ret_elem: rs.elem,
 			params: params,
 			body: body,
+			uses: uses_cl,
 			is_asm: false,
 			asm_body: noasm,
 			is_value: false,
@@ -3264,6 +3423,7 @@ const parse_func! = (*Parser p): Func -> {
 		ret_elem: rs.elem,
 		params: params,
 		body: one,
+		uses: uses_cl,
 		is_asm: false,
 		asm_body: noasm,
 		is_value: false,
@@ -3292,6 +3452,7 @@ const parse_data! = (*Parser p): RecDecl -> {
 	let [Str] typarams = []
 	let [Str] tbounds = []
 	if typarams_ahead(p) then {
+		bev(p, p.pos, 0, "") # a generic record's scope opens at the `[` — its type params bind into it
 		const TyParams tpb = parse_typarams!(p)
 		typarams = tpb.names
 		tbounds = tpb.bounds
@@ -3300,8 +3461,11 @@ const parse_data! = (*Parser p): RecDecl -> {
 	p.pos = p.pos + 1
 	if !is_lbrace(peek(p)) then perr(p, "cf: parse: expected `{` in a data declaration\n")
 	p.pos = p.pos + 1
+	const RecDecl rec = parse_record_body!(p, name, typarams, tbounds)
+	# a generic record's scope closes after its body — the type params stay declaration-local
+	if Iarch(typarams.len) > 0 then bev(p, p.pos, 1, "")
 
-	return parse_record_body!(p, name, typarams, tbounds)
+	return rec
 }
 
 # Parse a record/group FIELD BODY — the fields between `{` and `}` (the opening `{` already
@@ -3314,6 +3478,10 @@ const parse_record_body! = (*Parser p, Str name, [Str] typarams, [Str] tbounds):
 	let [[TupElem]] ftelems = []
 	let [Bool] fptrs = []
 	let [Iarch] fsizes = []
+	# the NOMINAL declaration-spread sources (context.md §5): each `...Src` source name, kept
+	# alongside the flattened fields so the demand pass can discharge a `uses Src` through a provide
+	# of a record that declares `...Src`. Resolve carries this list through the field flatten.
+	let [Str] spreads = []
 	const [TupElem] no_tel = []
 
 	loop {
@@ -3337,6 +3505,7 @@ const parse_record_body! = (*Parser p, Str name, [Str] typarams, [Str] tbounds):
 				then perr(p, "cf: parse: cannot spread a generic type application in a declaration\n")
 			fields = [...fields, src]
 			ftypes = [...ftypes, "$spread"]
+			spreads = [...spreads, src]
 			felems = [...felems, ""]
 			ftelems = [...ftelems, no_tel]
 			fptrs = [...fptrs, false]
@@ -3447,6 +3616,7 @@ const parse_record_body! = (*Parser p, Str name, [Str] typarams, [Str] tbounds):
 		dfile: "",
 		dline: 0,
 		dcol: 0,
+		spreads: spreads,
 	})
 }
 
@@ -3466,6 +3636,7 @@ const parse_group! = (*Parser p): RecDecl -> {
 	let [Str] typarams = []
 	let [Str] tbounds = []
 	if typarams_ahead(p) then {
+		bev(p, p.pos, 0, "") # a generic group's scope opens at the `[` — its type params bind into it
 		const TyParams tpb = parse_typarams!(p)
 		typarams = tpb.names
 		tbounds = tpb.bounds
@@ -3475,6 +3646,8 @@ const parse_group! = (*Parser p): RecDecl -> {
 	if !is_lbrace(peek(p)) then perr(p, "cf: parse: expected `{` in a group `type` declaration\n")
 	p.pos = p.pos + 1
 	const RecDecl g = parse_record_body!(p, name, typarams, tbounds)
+	# a generic group's scope closes after its body — the type params stay declaration-local
+	if Iarch(typarams.len) > 0 then bev(p, p.pos, 1, "")
 	if Iarch(g.fields.len) == 0
 		then perr(p, "cf: parse: a grouped-parameter `type` must declare at least one field\n")
 	# reject a duplicate field name AND a `...` declaration spread (a group is never used as a record,
@@ -3513,6 +3686,7 @@ const parse_union! = (*Parser p): UnionDecl -> {
 	let [Str] typarams = []
 	let [Str] tbounds = []
 	if typarams_ahead(p) then {
+		bev(p, p.pos, 0, "") # a generic union's scope opens at the `[` — its type params bind into it
 		const TyParams tpb = parse_typarams!(p)
 		typarams = tpb.names
 		tbounds = tpb.bounds
@@ -3618,6 +3792,8 @@ const parse_union! = (*Parser p): UnionDecl -> {
 
 	if !is_rbrace(peek(p)) then perr(p, "cf: parse: expected `}` in a union declaration\n")
 	p.pos = p.pos + 1
+	# a generic union's scope closes after its body — the type params stay declaration-local
+	if Iarch(typarams.len) > 0 then bev(p, p.pos, 1, "")
 
 	return UnionDecl({
 		name: name,
@@ -3885,6 +4061,28 @@ const comptime_tok_is = (Str t, Str nsprefix): Bool -> {
 	return str_tail_eq(t, n + 1, "target") || str_tail_eq(t, n + 1, "current")
 }
 
+# Does a strip-minted comptime token read `std_comptime_build<sep><fact>`? Returns the
+# fact name (`debug`/`instrument`) or "" — a build fact is a BARE Bool condition
+# (`if build::debug then ...`), no comparison operand.
+const comptime_build_fact = (Str t): Str -> {
+	const Str nsprefix = "std_comptime_build"
+	const Iarch n = Iarch(nsprefix.len)
+	if Iarch(t.len) <= n then return ""
+	let Iarch i = 0
+
+	loop {
+		if i >= n then break
+		if t[i] != nsprefix[i] then return ""
+		i = i + 1
+	}
+
+	if Iarch(t[n]) != 1 && Iarch(t[n]) != 95 then return "" # the ns-sep (0x01) or `_` (full path)
+	if str_tail_eq(t, n + 1, "debug") then return "debug"
+	if str_tail_eq(t, n + 1, "instrument") then return "instrument"
+
+	return ""
+}
+
 # Evaluate a comptime condition at PARSE TIME against the build target (module_system §6/§7):
 # `<os|arch>::<member> <op> <Enum>.<Variant>` — `member` is `target`/`current` (equal on a
 # non-cross build), `op` is `==`/`!=`, and `Enum` matches the namespace (`os`→`Os`, `arch`→`Arch`).
@@ -3896,6 +4094,10 @@ const parse_cond! = (*Parser p): Bool -> {
 		p,
 		"cf: parse: expected a comptime target (`os::target`) in a comptime condition\n",
 	)
+	# a build FACT (`build::debug` / `build::instrument`) is a bare Bool — no operand
+	const Str bfact = comptime_build_fact(head)
+	if eq(bfact, "debug") then return p.build_debug
+	if eq(bfact, "instrument") then return p.build_instrument
 	let Bool is_os = false
 	let Bool is_arch = false
 
@@ -4007,6 +4209,120 @@ const parse_comptime_if! = (*Parser p): Program -> {
 # Parse a single top-level item into a one-item `Program` fragment: an import, a
 # `data`/`union`/`type` declaration, a function (each optionally `pub`), or a nested comptime
 # `if` (which yields its winning branch's items).
+# Does the callee name end in `target` (`case!`/`todo!`)? By the time parse runs, resolve's token
+# pass
+# has collapsed a `::`-path use into ONE mangled ident — `std::test::case!` becomes `std_test_case!`
+# —
+# so the kind is recognized as the name's suffix, whatever separator the mangle used. A pure suffix
+# compare, so it allocates nothing. (Top-level calls are only ever `case!`/`todo!`, so a user name
+# that
+# merely ends in `case!` and appears at the top level would be an error regardless.)
+const seg_is = (Str callee, Str target): Bool -> {
+	const Iarch cl = Iarch(callee.len)
+	const Iarch tl = Iarch(target.len)
+	if cl < tl then return false
+	let Iarch k = 0
+
+	loop {
+		if k >= tl then break
+		if Iarch(callee[cl - tl + k]) != Iarch(target[k]) then return false
+		k = k + 1
+	}
+
+	return true
+}
+
+# Build a plain (non-generic, no-param) synthetic function — the shape both a case's spliced body
+# and
+# its runner wrapper take. Fields the test synthesis never uses default to empty.
+const mk_test_func = (Str name, Bool is_pub, Str ret_name, [Stmt] body, Str dfile): Func -> Func({
+	name: name,
+	is_pub: is_pub,
+	ret_name: ret_name,
+	ret_elem: "",
+	params: [],
+	body: body,
+	uses: [],
+	is_asm: false,
+	asm_body: [],
+	is_value: false,
+	ret_telems: [],
+	typarams: [],
+	tbounds: [],
+	ret_size: 0,
+	is_intrinsic: false,
+	asm_sym: "",
+	dfile: dfile,
+	dline: 0,
+	dcol: 0,
+})
+
+# A top-level `case!`/`todo!` (testing.md §1): the one non-declaration a module may carry, since cf
+# has no top-level statements. The compiler's knowledge of the two calls is purely POSITIONAL —
+# `case!`/`todo!` are real `std::test` functions (testing.md §3), so all this does is hoist the
+# body lambda to a top-level `__cf_body_<n>!` function (capture-free by position; the marker is
+# always stamped since a body's color is unknowable at parse — alloc.cf exempts the prefix from
+# the over-mark direction) and mint the one-line `__cf_run_<n>!` registration the runner tallies:
+# `return std_test_case!(desc, __cf_body_<n>!)`. The body value is a demand-carrying fn at a
+# specialized direct call (context.md §4); everything per-case — accumulator, provide, arena,
+# reporting teardown — lives in `case!`'s own std source. Under `cf test` a synthesized `main`
+# drives every `__cf_run_*!`; any other build leaves them unreached, so they cost the artifact
+# nothing. The injected import loads `std/test`; the body's own references are the user's imports.
+const parse_toplevel_case! = (*Parser p): Program -> {
+	if !is_ident(peek(p)) then perr(p, "cf: parse: expected a declaration or a `case!`/`todo!` call\n")
+	const Str callee = cur_name!(p)
+	const Bool is_todo = seg_is(callee, "todo!")
+	if !seg_is(callee, "case!") && !is_todo
+		then perr(
+		p,
+		"cf: parse: a top-level call must be `case!` or `todo!` — cf has no top-level statements\n",
+	)
+	const Iarch nid = p.pos
+	p.pos = p.pos + 1 # callee
+	if !is_lparen(peek(p))
+		then perr(p, "cf: parse: `case!` takes a description and a `() -> { ... }` body\n")
+	p.pos = p.pos + 1 # `(`
+	if !is_strlit(peek(p))
+		then perr(p, "cf: parse: `case!`'s first argument is a description string\n")
+	const Iarch dstart = p.toks[p.pos].start
+	const Iarch dlen = p.toks[p.pos].len
+	p.pos = p.pos + 1
+	const Expr descExpr = parse_string!(p, dstart, dlen)
+	if !is_comma(peek(p))
+		then perr(p, "cf: parse: `case!(description, () -> { ... })` needs a comma\n")
+	p.pos = p.pos + 1
+	if !is_lparen(peek(p)) then perr(p, "cf: parse: `case!`'s body is a `() -> { ... }`\n")
+	p.pos = p.pos + 1
+	if !is_rparen(peek(p))
+		then perr(p, "cf: parse: `case!`'s body takes no parameters — `() -> { ... }`\n")
+	p.pos = p.pos + 1
+	if !is_arrow(peek(p)) then perr(p, "cf: parse: expected `->` in `case!`'s body\n")
+	p.pos = p.pos + 1
+	if !is_lbrace(peek(p)) then perr(p, "cf: parse: `case!`'s body must be a `{ ... }` block\n")
+	p.pos = p.pos + 1
+	const [Stmt] body = parse_block!(p) # parses the body, consumes `}`
+	if !is_rparen(peek(p)) then perr(p, "cf: parse: expected `)` to close `case!`\n")
+	p.pos = p.pos + 1
+
+	# the synthesized calls are built AFTER resolve's token pass, so they carry the FINAL mangled
+	# name resolve looks up directly: `std::test::case!` → `std_test_case!`. The injected import
+	# loads the module.
+	const Str rn = "__cf_run_${int_to_dec!(nid)}!"
+	const Str bn = "__cf_body_${int_to_dec!(nid)}!"
+	const Func bodyf = mk_test_func(bn, false, "Unit", body, p.file)
+	const Str entry = if is_todo then "std_test_todo!" else "std_test_case!"
+	const [Stmt] rbody = [Stmt.Return(Expr.Call(entry, [], [descExpr, Expr.Var(bn)], ""))]
+	const Func runf = mk_test_func(rn, false, "Uarch", rbody, p.file)
+	const [Str] tnames = ["Verdicts"]
+	const [Import] imps = [
+		Import({ path: "std/test", names: tnames, alias: "", wildcard: false, dline: 0, dcol: 0 }),
+	]
+	const [RecDecl] norec = []
+	const [UnionDecl] nouni = []
+
+	return Program({ imports: imps, recs: norec, unions: nouni, funcs: [bodyf, runf], groups: norec })
+}
+
 const parse_item! = (*Parser p): Program -> {
 	if kw(p, "if") then return parse_comptime_if!(p)
 	let [Import] imports = []
@@ -4028,8 +4344,11 @@ const parse_item! = (*Parser p): Program -> {
 	} else if heads(p, "static") then {
 		# a module-level `static [N Uint8] NAME` — a BSS byte buffer, modeled as a value-const Func
 		funcs = [...funcs, parse_static!(p)]
-	} else {
+	} else if kw(p, "pub") || kw(p, "const") || kw(p, "intrinsic") then {
 		funcs = [...funcs, parse_func!(p)]
+	} else {
+		# the only non-declaration a module may carry: a top-level `case!`/`todo!` (testing.md §1)
+		return parse_toplevel_case!(p)
 	}
 
 	return Program({ imports: imports, recs: recs, unions: unions, funcs: funcs, groups: groups })
@@ -4086,6 +4405,7 @@ const parse_static! = (*Parser p): Func -> {
 		ret_elem: "Uint8",
 		params: noparams,
 		body: body,
+		uses: no_tp,
 		is_asm: false,
 		asm_body: noasm,
 		is_value: true,

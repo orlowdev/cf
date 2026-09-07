@@ -1,0 +1,85 @@
+# std::test — unit tests that live beside the code they check (testing.md).
+#
+# A test file carries its cases inline, at the top level, as calls:
+#
+#   std::test::case!("adds two numbers", () -> {
+#     add(2, 2) |> std::test::equals(4)
+#   })
+#
+#   std::test::todo!("overflow wraps", () -> {
+#     add(max, 1) |> std::test::equals(min)
+#   })
+#
+# The calls are a deliberate shape: cf has no top-level statements, so a case — the one thing that
+# must sit beside a module's real declarations without being one — borrows the only top-level form
+# there is, a call. The compiler's knowledge of them is purely POSITIONAL (testing.md §1): a
+# top-level expression is legal iff it is one of these two calls, and each registers as an entry
+# the `cf test` runner drives; any other build leaves them unreached, so tests cost a shipped
+# program nothing.
+#
+# `case!` and `todo!` themselves are ORDINARY functions below — the whole per-case lifecycle is
+# std source, nothing spliced, nothing compiler-lowered. The body callback is a demand-carrying fn
+# value at a specialized direct call (context.md §4): the assertions' `uses Verdicts` demand rides
+# the value into the per-body clone, where `case!`'s own provide discharges it.
+import std::io::console::{ print, println }
+import std::mem::ctx
+import std::mem::arena::test_arena
+
+# The verdict accumulator a case provides on its `test_arena` (testing.md §3): the case description,
+# how many assertions ran, and how many failed. A `let` provide of shared mutable state (context.md
+# §3) — each assertion consumes it and appends in place; the reporting teardown reads it at case
+# close. Layout is load-bearing: the teardown reads these fields by raw offset (desc@0, count@16,
+# fails@24), so append fields only at the end.
+pub data Verdicts = { Str desc, Uarch count, Uarch fails }
+
+# `structural_eq(expected, actual)` — the comparison behind `equals`, supplied by the compiler
+# (testing.md §4): true when the two are structurally equal (primitives by value, `Str` by bytes;
+# records, arrays, and unions join in a later stage). A bodyless intrinsic — emit generates the
+# per-type compare at the call site, so it never runs as an ordinary call.
+pub intrinsic structural_eq = ['T]('T expected, 'T actual): Bool
+
+# Append one verdict onto the case's accumulator (testing.md §4): a colorless in-place mutation of
+# the `let` verdict provide (context.md §1). The whole case body runs regardless of earlier results
+# —
+# a case fails if ANY verdict did — so this only accumulates; it never aborts.
+pub const verdict_push = (Bool ok): () uses Verdicts -> {
+	let v = std::mem::ctx::consume(Verdicts)
+	v.count = v.count + 1
+	if !ok then {
+		v.fails = v.fails + 1
+	}
+}
+
+# `equals(expected, actual)` — the canonical assertion (testing.md §4). Written data-last in a pipe
+# (`actual |> equals(expected)`), it compares structurally and appends the verdict. Colorless: it
+# reads and mutates the case's `let` verdict provide, allocating nothing (`uses Verdicts`).
+pub const equals = ['T]('T expected, 'T actual): () uses Verdicts ->
+	verdict_push(structural_eq(expected, actual))
+
+# Print the report's per-line module prefix (`<mod> -> `, testing.md §5) — called by the
+# synthesized runner before each case; the case's teardown (or `todo!`) completes the line.
+pub const report_prefix = (Str m): () -> print(m)
+
+# One test case (testing.md §3) — the whole per-case lifecycle, five lines of ordinary C!:
+# a fresh accumulator in the AMBIENT node (one bracket above the case arena, so the tally reads it
+# after the teardown's rewind), the `test_arena` grafted inside the provide's extent with the
+# reporting teardown deferred, and the body pinned to the arena — `cb() in ta` binds when the
+# specialized body is `!` and is inert when it is colorless (memory_model §6, node side). Returns
+# the case's fail count for the runner's tally.
+pub const case! = (Str desc, () -> () cb): Uarch -> {
+	let Verdicts vd = { desc: desc, count: 0, fails: 0 }
+	const ta = test_arena::of(65536)
+		|> std::mem::ctx::provide(let vd)
+		|> defer test_arena::destroy
+	cb() in ta
+
+	return vd.fails
+}
+
+# A pending case (testing.md §5): `cb` is type-checked like any case body but never called, and
+# the case stays outside the pass/fail tally — flipping `todo!` to `case!` is a one-word edit.
+pub const todo! = (Str desc, () -> () cb): Uarch -> {
+	println("⋯ ${desc} (todo)")
+
+	return 0
+}

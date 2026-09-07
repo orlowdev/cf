@@ -3,7 +3,7 @@
 # instead of carrying copies that could drift.
 
 import std::compiler::spans::{ unat }
-import std::compiler::ast::{ Expr, TupElem }
+import std::compiler::ast::{ Expr, Stmt, Func, TupElem }
 
 # A leaf tuple position (a scalar/Str/record/word, named `name`, no sub-structure) and a
 # NESTED tuple position (its own positions in `sub`). Together these build the recursive
@@ -40,6 +40,104 @@ const str_eq_tel = (Str a, Str b): Bool -> {
 	}
 
 	return true
+}
+
+# An aggregate-CONSTRUCTION value-const body — a record (`Fd({...})`), a payload member
+# (`IoRrr.Other(e)`), or a `Type.Member` / `CONST.field` read (an uppercase-initial Field
+# base). Such a body allocates (or reads through a const that does), so it cannot run as an
+# ambient-less nullary function: the inline pass splices it into every referencing body
+# (which has a geometry ambient) and emit skips the original.
+pub const is_agg_const_val = (Expr e): Bool -> match unat(e) {
+	Expr.Record(_, _) -> true,
+	Expr.UnionMk(_, _, _) -> true,
+	Expr.Field(b, _) -> lead_upper(b),
+	# the inline fold rewrites a const-base read (`CHAIN = STDOUT.n`) to a field read OFF the
+	# spliced construction — post-fold consumers (emit's skip) must still recognize the body
+	Expr.FieldExpr(b, _) -> is_agg_const_val(b),
+	_ -> false,
+}
+
+# Does this value-const FUNCTION (`is_value`, a single `return`) carry an aggregate-
+# construction body? The SEED of `agg_val_names` below.
+pub const agg_val_body = (Func f): Bool -> {
+	if !f.is_value then return false
+	if Iarch(f.body.len) != 1 then return false
+
+	return match f.body[0] { Stmt.Return(e) -> is_agg_const_val(e), _ -> false }
+}
+
+# The CLOSED set of aggregate value-const NAMES in a function table: seeded by the shape
+# check (`agg_val_body`), then closed over consts whose body READS one already in the set —
+# `pub const CHAIN = STDOUT.n` (a field off it) or `= STDOUT` (a bare alias). The closure is
+# by NAME, not by casing: after the import flatten a cross-module base is mangled
+# (`deps_desc…STDOUT`), so the shape sniff alone cannot see it. Every consumer of the "is
+# this const aggregate?" question — materialize's allocation scan, inline's mandatory fold,
+# emit's skip — reads THIS set, so the passes always agree.
+pub const agg_val_names = ([Func] funcs): [Str] -> {
+	let [Str] out = []
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(funcs.len) then break
+		if agg_val_body(funcs[i]) then out = [...out, funcs[i].name]
+		i = i + 1
+	}
+
+	loop {
+		let Bool changed = false
+		let Iarch k = 0
+
+		loop {
+			if k >= Iarch(funcs.len) then break
+			const Func f = funcs[k]
+			if f.is_value && Iarch(f.body.len) == 1 && !name_in_avn(out, f.name) then {
+				match f.body[0] {
+					Stmt.Return(e) -> {
+						match unat(e) {
+							Expr.Field(b, _) -> {
+								if name_in_avn(out, b) then {
+									out = [...out, f.name]
+									changed = true
+								}
+							},
+							Expr.Var(b) -> {
+								if name_in_avn(out, b) then {
+									out = [...out, f.name]
+									changed = true
+								}
+							},
+							_ -> {},
+						}
+					},
+					_ -> {},
+				}
+			}
+			k = k + 1
+		}
+
+		if !changed then break
+	}
+
+	return out
+}
+
+const name_in_avn = ([Str] xs, Str s): Bool -> {
+	let Iarch i = 0
+
+	loop {
+		if i >= Iarch(xs.len) then break
+		if str_eq_tel(xs[i], s) then return true
+		i = i + 1
+	}
+
+	return false
+}
+
+const lead_upper = (Str n): Bool -> {
+	if Iarch(n.len) == 0 then return false
+	const Iarch c = Iarch(n[0])
+
+	return c >= 65 && c <= 90
 }
 
 # A payload SUB-PATTERN guard, encoded in a match arm's bind string by its first byte: `=` a
@@ -126,7 +224,7 @@ pub const spread_inner = (Expr e): Expr -> match unat(e) { Expr.Spread(x) -> x, 
 # returns the inner element name (the bytes between the outer brackets).
 pub const is_nested = (Str elem): Bool -> if Iarch(elem.len) == 0
 	then false
-	else Iarch(elem[0]) == 91
+else Iarch(elem[0]) == 91
 
 # The inner element name of a nested array name `elem` (`[Str]` → `Str`).
 pub const nested_inner! = (Str elem): Str -> {
@@ -154,7 +252,7 @@ pub const is_fixed_name = (Str name): Bool -> fixed_bits(name) != 0
 # machine stack (QBE `alloc`), reclaimed at frame exit, rather than on a geometry node.
 pub const is_stack_name = (Str name): Bool -> if Iarch(name.len) == 0
 	then false
-	else Iarch(name[0]) == 36
+else Iarch(name[0]) == 36
 
 # The bit width of a fixed-width integer type `name` (8/16/32/64), `0` if `name` is not one.
 pub const fixed_bits = (Str name): Iarch -> {

@@ -1,14 +1,15 @@
 # docscan — extract the public API documentation from cf source, live.
 #
-# `cf docs` reads the standard-library `.cf` files as they are on disk (no cache, no index) and
-# pulls
+# `cf docs` starts from the standard-library copy embedded in the binary and layers the on-disk
+# `lib/std` (live, module-over-snapshot) on top — no cache, no index — and pulls
 # out every `pub` definition together with the `#` comment block written directly above it. It is a
 # line-oriented text scan — cf-syntax-aware but not the full parser — so a definition's own
 # signature
 # line is its synopsis and the comment above it is its prose. Compiler-side (it knows what a
 # `pub const`/`data`/`union`/`intrinsic` is); the TUI that presents the result lives in `docs`.
 import std::io::file::{ read_file! }
-import std::io::fs::{ read_dir! }
+import std::io::fs::{ walk_dir! }
+import std::comptime::{ embed_dir, EmbeddedFile }
 import std::io::fd::{ IoRrr, DirEntry, entry_is_dir }
 import std::data::str::{ starts_with, ends_with, eq, split, slice, replace, is_empty }
 import std::data::array
@@ -495,32 +496,51 @@ const scan_file! = (Str path): [Def] -> {
 	return out
 }
 
-# Recursively scan a directory tree for `.cf` files, returning every definition. Skips `.`/`..`;
-# descends into subdirectories; a directory that cannot be read contributes nothing.
+# Recursively scan a directory tree for `.cf` files, returning every definition —
+# `std::io::fs::walk_dir!` supplies the sorted recursive file list.
 const scan_dir! = (Str dir): [Def] -> {
-	const Either[IoRrr, [DirEntry]] r = read_dir!(dir)
 	let [Def] defs = []
 
-	match r {
-		Either.Left(e) -> {},
-		Either.Right(entries) -> {
-			for e in entries {
-				if !eq(e.name, ".") && !eq(e.name, "..") then {
-					const Str child = "${dir}/${e.name}"
+	for f in walk_dir!(dir) if ends_with(".cf", f) then defs = [...defs, ...scan_file!(f)]
 
-					if entry_is_dir(e) then {
-						defs = [...defs, ...scan_dir!(child)]
-					} else if ends_with(".cf", e.name) then {
-						defs = [...defs, ...scan_file!(child)]
-					}
-				}
-			}
-		},
+	return defs
+}
+
+# Scan the standard library baked into the binary (`std::comptime::embed_dir`) — unlike the
+# compiler's per-import probe, docs wants the WHOLE corpus, so every embedded `.cf` is scanned and
+# the user browses the result.
+const scan_embedded! = (): [Def] -> {
+	let [Def] defs = []
+
+	for ef in embed_dir("lib/std") {
+		if ends_with(".cf", ef.path)
+			then defs = [...defs, ...scan_content!(ef.content, path_to_module(ef.path))]
 	}
 
 	return defs
 }
 
-# Scan the whole standard library (under `lib/std`, resolved from the current directory the same way
-# the compiler resolves `std::` imports).
-pub const scan_std! = (): [Def] -> scan_dir!("lib/std")
+# Is any definition in `defs` from `module`?
+const has_module = ([Def] defs, Str module): Bool -> {
+	let Bool found = false
+
+	for d in defs if eq(d.module, module) then found = true
+
+	return found
+}
+
+# Scan the whole standard library. The copy embedded in the binary is ALWAYS the base — `cf docs`
+# answers wherever the binary runs — and the on-disk `lib/std` (resolved from the current directory
+# the same way the compiler resolves `std::` imports) is layered on top: a module found on disk
+# replaces its embedded snapshot, so live edits and new files win.
+pub const scan_std! = (): [Def] -> {
+	const [Def] base = scan_embedded!()
+	const [Def] disk = scan_dir!("lib/std")
+	let [Def] out = []
+
+	for b in base if !has_module(disk, b.module) then out = [...out, b]
+
+	for d in disk out = [...out, d]
+
+	return out
+}

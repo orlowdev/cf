@@ -44,15 +44,22 @@ pub data Cli = {
 	Arch target_arch,
 	Iarch root_size,
 	Bool dump_routing,
+	Bool no_inline,
+	Iarch oos_mode,
+	Bool debug,
+	Bool instrument,
 	Bool full,
 	Str output,
 	Bool preserve,
 	Bool skip_embeds,
 	Str build_version,
+	Bool is_test,
+	Bool is_bail,
+	[Str] test_files,
 }
 
-# The parsed `format` subcommand line: the target `path` and the `--check` gate (cf_cli §7).
-pub data FmtCli = { Str path, Bool check }
+# The parsed `format` subcommand line: the target `paths` and the `--check` gate (cf_cli §7).
+pub data FmtCli = { [Str] paths, Bool check }
 
 # Is this a `cf format`/`cf f` invocation? (The subcommand name is the FIRST argument after the
 # program name.) Every other first argument — a flag or a path — is the legacy positional compile
@@ -62,6 +69,67 @@ pub const is_fmt_cmd = ([Str] args): Bool -> {
 	const Str cmd = args[1]
 
 	return eq(cmd, "format") || eq(cmd, "f")
+}
+
+# Is this a `cf test`/`cf t` invocation (cf_cli §7)? The subcommand name is the first argument after
+# the program name.
+pub const is_test_cmd = ([Str] args): Bool -> {
+	if Iarch(args.len) < 2 then return false
+	const Str cmd = args[1]
+
+	return eq(cmd, "test") || eq(cmd, "t")
+}
+
+# Does the argv carry `--watch` anywhere (cf_cli §2/§6/§7)? The watch loop (cf.cf) strips the
+# token and re-runs the remaining command on every change of the watched tree.
+pub const has_watch = ([Str] args): Bool -> {
+	let Iarch i = 1
+
+	loop {
+		if i >= Iarch(args.len) then break
+		if eq(args[i], "--watch") then return true
+		i = i + 1
+	}
+
+	return false
+}
+
+# `args` without every `--watch` token — the argv a watch iteration re-runs as a child.
+pub const strip_watch = ([Str] args): [Str] -> {
+	let [Str] out = []
+
+	for a in args if !eq(a, "--watch") then out = [...out, a]
+
+	return out
+}
+
+# Does the `cf test` argv carry `--bail` (stop at the first failing case)?
+pub const test_bail = ([Str] args): Bool -> {
+	let Iarch i = 2
+
+	loop {
+		if i >= Iarch(args.len) then break
+		if eq(args[i], "--bail") then return true
+		i = i + 1
+	}
+
+	return false
+}
+
+# The `<file|dir>` targets of `cf test` — every non-flag positional after the subcommand, in
+# the order given.
+pub const test_targets = ([Str] args): [Str] -> {
+	let [Str] out = []
+	let Iarch i = 2
+
+	loop {
+		if i >= Iarch(args.len) then break
+		const Str a = args[i]
+		if Iarch(a.len) > 0 && Iarch(a[0]) != 45 then out = [...out, a]
+		i = i + 1
+	}
+
+	return out
 }
 
 # Is this a bare `cf --version`/`cf -V` query? It prints the compiler's OWN version and exits
@@ -102,28 +170,25 @@ pub const is_help_cmd = ([Str] args): Bool -> {
 	return false
 }
 
-# Parse `cf format [--check] <file>` — the arguments after the subcommand name (index 2 on).
-# `--check` may appear in any position; the one positional argument is the file path.
+# Parse `cf format [--check] <file|dir>...` — the arguments after the subcommand name (index 2
+# on). `--check` may appear in any position; every other argument is a target path, each visited
+# in the order given.
 pub const fmt_cli_parse = ([Str] args): FmtCli -> {
-	let Str path = ""
+	let [Str] paths = []
 	let Bool check = false
-	let Bool got = false
 	let Iarch i = 2
 
 	loop {
 		if i >= Iarch(args.len) then break
 		const Str a = args[i]
-		if eq(a, "--check") then check = true else {
-			path = a
-			got = true
-		}
+		if eq(a, "--check") then check = true else paths = [...paths, a]
 		i = i + 1
 	}
 
-	if !got then eprint("cf: usage: cf format [--check] <file>\n")
-	if !got then exit(2)
+	if Iarch(paths.len) == 0 then eprint("cf: usage: cf format [--check] <file|dir>...\n")
+	if Iarch(paths.len) == 0 then exit(2)
 
-	return FmtCli({ path: path, check: check })
+	return FmtCli({ paths: paths, check: check })
 }
 
 # A non-negative decimal, for `--root-size`. Non-digit bytes are skipped (so `1048576` parses; there
@@ -163,9 +228,22 @@ pub const cli_parse! = ([Str] args): Cli -> {
 	let Arch tarch = host_arch()
 	let Iarch rsize = 1048576
 	let Bool dumpr = false
+	# `--no-inline`: skip the pre-emit inliner — the 1:1 lowering for codegen debugging.
+	let Bool noinl = false
+	# the OOS trap mode: 0 (default) = the guard-page signal handler; 1 (`--oos-probe`) =
+	# the prologue stack probes instead; 2 (`--no-oos-trap`) = neither, raw segfault
+	let Iarch oosm = 0
+	# `--debug`/`-g`: emit debug information — real symbol names + line directives. Passive
+	# observability only (profilers, backtraces); it never changes what the program does.
+	let Bool dbg = false
+	# `--instrument`: swap in the memory geometries' accounting hook variants (build::instrument).
+	# Separate from `--debug`: instrumentation perturbs the hot path a time profile measures.
+	let Bool instr = false
 	let Bool full = false
 	let Str output = ""
 	let Bool preserve = false
+	let Bool bail = false
+	let [Str] ntf = []
 	# `--skip-embeds`: emit no `embed`/`embed_dir` file data — for bootstrap intermediates (the seed),
 	# which must stay free of the baked stdlib. The shipped `var/cf` is built WITHOUT it, so it hosts
 	# std.
@@ -192,6 +270,36 @@ pub const cli_parse! = ([Str] args): Cli -> {
 
 		if eq(a, "--dump-routing") then {
 			dumpr = true
+			i = i + 1
+			continue
+		}
+		if eq(a, "--no-inline") then {
+			noinl = true
+			i = i + 1
+			continue
+		}
+		if eq(a, "--oos-probe") then {
+			oosm = 1
+			i = i + 1
+			continue
+		}
+		if eq(a, "--no-oos-trap") then {
+			oosm = 2
+			i = i + 1
+			continue
+		}
+		if eq(a, "--debug") || eq(a, "-g") then {
+			dbg = true
+			i = i + 1
+			continue
+		}
+		if eq(a, "--instrument") then {
+			instr = true
+			i = i + 1
+			continue
+		}
+		if eq(a, "--bail") then {
+			bail = true
 			i = i + 1
 			continue
 		}
@@ -287,11 +395,18 @@ pub const cli_parse! = ([Str] args): Cli -> {
 			target_arch: tarch,
 			root_size: rsize,
 			dump_routing: dumpr,
+			no_inline: noinl,
+			oos_mode: oosm,
+			debug: dbg,
+			instrument: instr,
 			full: true,
 			output: output,
 			preserve: preserve,
 			skip_embeds: skip,
 			build_version: bver,
+			is_test: false,
+			is_bail: bail,
+			test_files: ntf,
 		})
 	}
 
@@ -310,10 +425,17 @@ pub const cli_parse! = ([Str] args): Cli -> {
 		target_arch: tarch,
 		root_size: rsize,
 		dump_routing: dumpr,
+		no_inline: noinl,
+		oos_mode: oosm,
+		debug: dbg,
+		instrument: instr,
 		full: false,
 		output: "",
 		preserve: preserve,
 		skip_embeds: skip,
 		build_version: bver,
+		is_test: false,
+		is_bail: bail,
+		test_files: ntf,
 	})
 }

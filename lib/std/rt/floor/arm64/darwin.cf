@@ -97,6 +97,129 @@ pub const _cf_oom = (): () -> asm "
 	svc #0x80
 "
 
+pub const _cf_oos = (): () -> asm "
+	mov x0, #72
+	mov x16, #1
+	svc #0x80
+"
+
+pub const _cf_oob = (): () -> asm "
+	mov x0, #73
+	mov x16, #1
+	svc #0x80
+"
+
+# The OOS guard-page handler's statics, floor-owned (only the two functions below touch
+# them, and floor-side definition keeps the bootstrap clean — a seed-built cf0 that predates
+# them still links this floor): the si_addr window [lo, hi] attributing a fault to stack
+# overflow ({1, 0} = empty, the pre-init and unlimited-rlimit state — no address matches),
+# the zeroed SIG_DFL act for the not-ours re-raise, the scratch act the installer fills, and
+# the alternate signal stack the handler runs on (the exhausted thread stack cannot host it).
+# The labels are floor-local; the leading label the emitter adds for this pseudo-function
+# points harmlessly at the section switch.
+pub const _cf_oos_data = (): () -> asm "
+	.data
+	.balign 8
+_cf_oos_win:
+	.quad 1
+	.quad 0
+_cf_oos_dflact:
+	.space 32
+_cf_oos_actbuf:
+	.space 32
+	.zerofill __DATA,__bss,_cf_oos_stk,32768,3
+	.text
+"
+
+# The OOS guard-page handler (the zero-steady-state-cost replacement for the prologue stack
+# probes — same observable, `cf_oos` exit 72). `cf_oos_guard_init(anchor)` runs once from
+# `main`'s prologue (anchor = main's frame address): it reads RLIMIT_STACK and stores the
+# si_addr attribution window [anchor - rlim - 512K, anchor - rlim + 2M] into `_cf_oos_win`
+# (the kernel's argv/env strings sit between the anchor and the true stack top, so the true
+# bottom lands inside the +2M slack; an unlimited rlimit keeps the empty {1, 0} window —
+# faults then stay raw, conservatively), registers the static alternate signal stack (the
+# exhausted thread stack cannot host the handler), and installs `cf_oos_handler` for SIGSEGV
+# and SIGBUS (darwin delivers guard-page protection faults as either). Installation goes
+# through libc `sigaction` — the kernel bounces delivery through libc's private `__sigtramp`,
+# so a raw syscall cannot register a handler here; we already link -lSystem for the embedded
+# QBE (the one sanctioned libc exception, see the build notes).
+pub const _cf_oos_guard_init = (): () -> asm "
+	stp x29, x30, [sp, #-64]!
+	mov x29, sp
+	str x19, [sp, #56]
+	mov x19, x0
+	mov x0, #3
+	add x1, sp, #16
+	bl _getrlimit
+	ldr x9, [sp, #16]
+	adrp x10, _cf_oos_win@PAGE
+	add x10, x10, _cf_oos_win@PAGEOFF
+	lsr x11, x9, #46
+	cbnz x11, 2f
+	sub x12, x19, x9
+	mov x13, #524288
+	sub x13, x12, x13
+	str x13, [x10]
+	mov x14, #2097152
+	add x14, x12, x14
+	str x14, [x10, #8]
+2:
+	adrp x11, _cf_oos_stk@PAGE
+	add x11, x11, _cf_oos_stk@PAGEOFF
+	str x11, [sp, #16]
+	mov x12, #32768
+	str x12, [sp, #24]
+	str wzr, [sp, #32]
+	add x0, sp, #16
+	mov x1, #0
+	bl _sigaltstack
+	adrp x13, _cf_oos_actbuf@PAGE
+	add x13, x13, _cf_oos_actbuf@PAGEOFF
+	adrp x14, _cf_oos_handler@PAGE
+	add x14, x14, _cf_oos_handler@PAGEOFF
+	str x14, [x13]
+	mov w15, #0x41
+	str w15, [x13, #12]
+	mov x0, #11
+	mov x1, x13
+	mov x2, #0
+	bl _sigaction
+	mov x0, #10
+	mov x1, x13
+	mov x2, #0
+	bl _sigaction
+	ldr x19, [sp, #56]
+	ldp x29, x30, [sp], #64
+	ret
+"
+
+# The handler: SA_SIGINFO hands (sig, siginfo*, ucontext*) in x0/x1/x2; darwin's siginfo
+# carries the fault address at +24. Inside the window → the stack overflowed → `cf_oos`
+# (exit 72, the probe's exact observable). Outside → not ours: reinstall SIG_DFL for this
+# signal and return, so the retried instruction dies raw — a wild-pointer crash is never
+# masked as OOS. Async-signal territory: compares, one libc sigaction, no allocation.
+pub const _cf_oos_handler = (): () -> asm "
+	ldr x9, [x1, #24]
+	adrp x10, _cf_oos_win@PAGE
+	add x10, x10, _cf_oos_win@PAGEOFF
+	ldr x11, [x10]
+	ldr x12, [x10, #8]
+	cmp x9, x11
+	b.lo 1f
+	cmp x9, x12
+	b.hi 1f
+	b _cf_oos
+1:
+	stp x29, x30, [sp, #-16]!
+	mov x29, sp
+	adrp x1, _cf_oos_dflact@PAGE
+	add x1, x1, _cf_oos_dflact@PAGEOFF
+	mov x2, #0
+	bl _sigaction
+	ldp x29, x30, [sp], #16
+	ret
+"
+
 # The freestanding entry (arm64/darwin). The kernel hands `_start` argc/argv/envp in x0/x1/x2; it
 # seeds the root page, then ALWAYS builds argv AND env through the pre-main QBE bridges (the uniform
 # entry ABI — `main` receives the node in x0 and args/env in x1/x2, ignoring what it doesn't
